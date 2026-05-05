@@ -789,7 +789,7 @@ owner_resource_bindings := {}
             org_keyring: None,
         };
 
-        let body = signed_policy_artifact_policy_body(&[artifact.clone()]).unwrap();
+        let body = signed_policy_artifact_policy_body(std::slice::from_ref(&artifact)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["rego_text"], artifact.rego_text);
         assert_eq!(

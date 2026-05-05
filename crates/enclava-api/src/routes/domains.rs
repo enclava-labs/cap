@@ -20,8 +20,10 @@ use axum::{
 };
 use base64::Engine;
 use chrono::{Duration, Utc};
-use hickory_resolver::TokioAsyncResolver;
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{CLOUDFLARE, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RData;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -534,14 +536,23 @@ async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
     // Use the system resolver if configured; otherwise fall back to public
     // resolvers (Cloudflare 1.1.1.1, Google 8.8.8.8). Either way the live
     // record is fetched fresh -- not from any operator-side cache.
-    let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
+    let resolver = match TokioResolver::builder_tokio().and_then(|builder| builder.build()) {
         Ok(r) => r,
-        Err(_) => TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default()),
+        Err(_) => TokioResolver::builder_with_config(
+            ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+            TokioRuntimeProvider::default(),
+        )
+        .with_options(ResolverOpts::default())
+        .build()
+        .map_err(|e| e.to_string())?,
     };
     let response = resolver.txt_lookup(name).await.map_err(|e| e.to_string())?;
     let mut out = Vec::new();
-    for rdata in response.iter() {
-        for chunk in rdata.iter() {
+    for record in response.answers() {
+        let RData::TXT(rdata) = &record.data else {
+            continue;
+        };
+        for chunk in rdata.txt_data.iter() {
             if let Ok(s) = std::str::from_utf8(chunk) {
                 out.push(s.to_string());
             }
