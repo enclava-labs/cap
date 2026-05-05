@@ -70,8 +70,8 @@ Trustee-verified attestation claims.
 For customer/CI-signed artifacts, `enclava-init` verifies the policy artifact
 with the descriptor signing key after proving the descriptor and keyring
 membership chain. `platform-trustee-policy-pubkey-hex` and
-`signing-service-pubkey-hex` are optional compatibility fallback keys for
-legacy platform-signed artifacts.
+`signing-service-pubkey-hex` may still appear in older generated config, but
+they are no longer accepted as policy artifact signature fallback keys.
 
 Until Phase 3's Trustee patches deploy, the flag defaults to false and the
 binary releases seeds with a loud `tracing::error!` saying verification was

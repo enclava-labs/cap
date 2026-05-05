@@ -378,10 +378,11 @@ pub async fn apply_deployment_manifests(
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
     set_app_status(&pool, app.id, "creating").await?;
 
-    if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
-        crate::kbs::write_signed_policy_artifact(
+    if signed_policy_artifact.is_some() {
+        crate::kbs::reconcile_signed_policy_artifacts(
+            &pool,
             kbs_policy_config.as_ref(),
-            signed_policy_artifact,
+            signed_policy_artifact.as_ref(),
         )
         .await?;
     } else {

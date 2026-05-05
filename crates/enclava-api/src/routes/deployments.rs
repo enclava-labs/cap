@@ -72,7 +72,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
     signing_service_pubkey_hex: Option<&str>,
 ) -> Result<crate::signing_service::SignedPolicyArtifact, (StatusCode, Json<serde_json::Value>)> {
     if let Some(provided_artifact) = provided_artifact {
-        let artifact =
+        let mut artifact =
             crate::signing_service::decode_optional_policy_artifact(Some(provided_artifact))
                 .map_err(signing_error_response)?
                 .ok_or_else(|| {
@@ -86,6 +86,9 @@ pub(crate) async fn resolve_signed_policy_artifact(
             .map_err(signing_error_response)?;
         artifacts
             .validate_customer_signed_artifact(&artifact)
+            .map_err(signing_error_response)?;
+        artifacts
+            .attach_customer_authority(&mut artifact)
             .map_err(signing_error_response)?;
         return Ok(artifact);
     }
@@ -109,12 +112,15 @@ pub(crate) async fn resolve_signed_policy_artifact(
             "error": "platform signing-service fallback requires SIGNING_SERVICE_PUBKEY_HEX"
         })),
     ))?;
-    let signed = signing_service
+    let mut signed = signing_service
         .sign(&artifacts.sign_request())
         .await
         .map_err(signing_error_response)?;
     artifacts
         .validate_signed_artifact(&signed, signing_service_pubkey_hex)
+        .map_err(signing_error_response)?;
+    artifacts
+        .attach_customer_authority(&mut signed)
         .map_err(signing_error_response)?;
     Ok(signed)
 }
@@ -279,6 +285,19 @@ pub struct DeployResources {
     pub cpu: Option<String>,
     pub memory: Option<String>,
     pub storage: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RollbackRequest {
+    #[serde(default)]
+    pub deployment_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RollbackResponse {
+    pub deployment_id: Uuid,
+    pub rolled_back_to: Uuid,
+    pub status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -800,7 +819,8 @@ pub async fn rollback(
     auth: AuthContext,
     State(state): State<AppState>,
     Path(app_name): Path<String>,
-) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
+    Json(body): Json<RollbackRequest>,
+) -> Result<(StatusCode, Json<RollbackResponse>), (StatusCode, Json<serde_json::Value>)> {
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -817,25 +837,99 @@ pub async fn rollback(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    let prev: Deployment = sqlx::query_as(
-        "SELECT * FROM deployments
-         WHERE app_id = $1 AND status = 'healthy'
-         ORDER BY created_at DESC
-         OFFSET 1 LIMIT 1",
+    let prev: Deployment = if let Some(deployment_id) = body.deployment_id {
+        sqlx::query_as(
+            "SELECT * FROM deployments
+             WHERE app_id = $1 AND id = $2 AND status = 'healthy'",
+        )
+        .bind(app.id)
+        .bind(deployment_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            Json(
+                serde_json::json!({"error": "rollback target deployment not found or not healthy"}),
+            ),
+        ))?
+    } else {
+        sqlx::query_as(
+            "SELECT * FROM deployments
+             WHERE app_id = $1 AND status = 'healthy'
+             ORDER BY created_at DESC
+             OFFSET 1 LIMIT 1",
+        )
+        .bind(app.id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no previous deployment to rollback to"})),
+        ))?
+    };
+
+    let image = prev
+        .spec_snapshot
+        .get("image")
+        .and_then(serde_json::Value::as_str)
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "rollback target is missing image in spec snapshot"})),
+        ))?
+        .to_string();
+    let image_digest = prev.image_digest.clone().ok_or((
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": "rollback target is missing image digest"})),
+    ))?;
+
+    let rollback_artifact =
+        crate::signing_service::load_workload_artifact_binding(&state.db, app.id, prev.id)
+            .await
+            .map_err(signing_error_response)?;
+
+    if customer_signed_deploy_required(
+        state.attestation.as_ref(),
+        state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
+    ) && rollback_artifact.is_none()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "rollback target has no stored customer-signed policy artifact"
+            })),
+        ));
+    }
+
+    let container_name = "web";
+    sqlx::query(
+        "UPDATE app_containers
+         SET image_ref = $1, image_digest = $2
+         WHERE app_id = $3 AND name = $4",
     )
+    .bind(&image)
+    .bind(Some(&image_digest))
     .bind(app.id)
-    .fetch_optional(&state.db)
+    .bind(container_name)
+    .execute(&state.db)
     .await
     .map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "database error"})),
         )
-    })?
-    .ok_or((
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error": "no previous deployment to rollback to"})),
-    ))?;
+    })?;
 
     let deploy_id = Uuid::new_v4();
     sqlx::query(
@@ -866,19 +960,80 @@ pub async fn rollback(
     .execute(&state.db)
     .await;
 
-    let deployment: Deployment = sqlx::query_as("SELECT * FROM deployments WHERE id = $1")
-        .bind(deploy_id)
-        .fetch_one(&state.db)
+    let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
+    let db = state.db.clone();
+    let attestation = state.attestation.clone();
+    let kbs_policy = state.kbs_policy.clone();
+    let api_url = state.api_url.clone();
+    let apply_app = app.clone();
+    let apply_permits = state.deployment_apply_permits.clone();
+    let (workload_artifact_binding, signed_policy_artifact) = rollback_artifact.unzip();
+    tokio::spawn(async move {
+        let _apply_permit = match apply_permits.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                let error_message = format!("deployment apply limiter closed: {}", e);
+                let _ = crate::deploy::set_deployment_status(
+                    &db,
+                    deploy_id,
+                    "failed",
+                    None,
+                    Some(&error_message),
+                    true,
+                )
+                .await;
+                let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
+                tracing::error!(
+                    app_id = %apply_app.id,
+                    deployment_id = %deploy_id,
+                    error = %error_message,
+                    "failed to acquire rollback apply permit"
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = crate::deploy::apply_deployment_manifests(
+            crate::deploy::ApplyDeploymentManifestsRequest {
+                pool: db.clone(),
+                app: apply_app.clone(),
+                deployment_id: deploy_id,
+                attestation_config: attestation,
+                kbs_policy_config: kbs_policy,
+                api_signing_pubkey,
+                api_url,
+                workload_artifact_binding,
+                signed_policy_artifact,
+            },
+        )
         .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
+        {
+            let error_message = e.to_string();
+            let _ = crate::deploy::set_deployment_status(
+                &db,
+                deploy_id,
+                "failed",
+                None,
+                Some(&error_message),
+                true,
             )
-        })?;
+            .await;
+            let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
+            tracing::error!(
+                app_id = %apply_app.id,
+                deployment_id = %deploy_id,
+                error = %error_message,
+                "failed to apply rollback manifests"
+            );
+        }
+    });
 
     Ok((
         StatusCode::CREATED,
-        Json(DeploymentResponse::from_deployment(deployment, &app)),
+        Json(RollbackResponse {
+            deployment_id: deploy_id,
+            rolled_back_to: prev.id,
+            status: "deploying".to_string(),
+        }),
     ))
 }

@@ -24,6 +24,8 @@ pub struct SignedPolicyArtifact {
     pub agent_policy_sha256: String,
     pub signature: String,
     pub verify_pubkey_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_keyring: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -47,6 +49,7 @@ pub fn sign_policy_artifact(
     signing_key_id: String,
     rego_text: String,
     generated_agent_policy: &GeneratedAgentPolicy,
+    org_keyring: Option<serde_json::Value>,
     signed_at: DateTime<Utc>,
 ) -> SignedPolicyArtifact {
     let rego_hash: [u8; 32] = Sha256::digest(rego_text.as_bytes()).into();
@@ -80,6 +83,7 @@ pub fn sign_policy_artifact(
         agent_policy_sha256: hex::encode(agent_policy_hash),
         signature: hex::encode(signature.to_bytes()),
         verify_pubkey_b64: B64.encode(descriptor_signing_pubkey.to_bytes()),
+        org_keyring,
     }
 }
 

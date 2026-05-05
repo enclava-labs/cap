@@ -83,6 +83,9 @@ pub struct VerifyInputs<'a> {
     pub artifacts: &'a ArtifactsBundle,
     pub cc_init_data_claims: &'a CcInitDataClaims,
     pub local_cc_init_data_toml: &'a [u8],
+    /// Deprecated compatibility fields. Policy artifacts must verify with the
+    /// descriptor signing key; platform/signing-service fallback keys are not
+    /// accepted here.
     pub platform_trustee_policy_pubkey: Option<&'a VerifyingKey>,
     pub signing_service_pubkey: Option<&'a VerifyingKey>,
 }
@@ -276,8 +279,8 @@ fn parse_kbs_attestation_token_payload(payload: &serde_json::Value) -> Result<St
 fn verify_policy_envelope_signature(
     env: &PolicyEnvelope,
     descriptor_signing_pubkey: &[u8; 32],
-    platform_trustee_policy_pubkey: Option<&VerifyingKey>,
-    signing_service_pubkey: Option<&VerifyingKey>,
+    _platform_trustee_policy_pubkey: Option<&VerifyingKey>,
+    _signing_service_pubkey: Option<&VerifyingKey>,
 ) -> Result<()> {
     let msg = ce_v1_policy_envelope_message(env)?;
     let sig = Signature::from_bytes(&env.signature);
@@ -287,20 +290,8 @@ fn verify_policy_envelope_signature(
         return Ok(());
     }
 
-    for fallback in [platform_trustee_policy_pubkey, signing_service_pubkey]
-        .into_iter()
-        .flatten()
-    {
-        if fallback.verify(&msg, &sig).is_ok() {
-            tracing::warn!(
-                "accepted policy artifact signature through platform fallback key; customer-signed artifacts should use descriptor_signing_pubkey"
-            );
-            return Ok(());
-        }
-    }
-
     Err(InitError::TrusteePolicy(
-        "policy envelope sig did not verify with descriptor key or configured fallback key".into(),
+        "policy envelope sig did not verify with descriptor key".into(),
     ))
 }
 
@@ -692,7 +683,7 @@ mod tests {
         let sk = SigningKey::generate(&mut OsRng);
         let pk = sk.verifying_key();
         let env = mk_envelope(&sk, metadata_for("package x\n"), "package x\n");
-        verify_policy_envelope_signature(&env, &[0u8; 32], Some(&pk), None).unwrap();
+        verify_policy_envelope_signature(&env, &pk.to_bytes(), None, None).unwrap();
     }
 
     #[test]
@@ -701,7 +692,7 @@ mod tests {
         let pk = sk.verifying_key();
         let mut env = mk_envelope(&sk, metadata_for("package x\n"), "package x\n");
         env.rego_text = "package y\n".into();
-        assert!(verify_policy_envelope_signature(&env, &[0u8; 32], Some(&pk), None).is_err());
+        assert!(verify_policy_envelope_signature(&env, &pk.to_bytes(), None, None).is_err());
     }
 
     #[test]
@@ -873,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_chain_passes_for_valid_inputs() {
+    fn end_to_end_chain_rejects_platform_signed_artifact_even_with_fallback_keys() {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
         let descriptor = descriptor_json();
@@ -891,7 +882,8 @@ mod tests {
             platform_trustee_policy_pubkey: Some(&signer_pk),
             signing_service_pubkey: Some(&signer_pk),
         };
-        verify_chain(&inputs).expect("chain should pass");
+        let err = verify_chain(&inputs).unwrap_err();
+        assert!(matches!(err, InitError::TrusteePolicy(s) if s.contains("policy envelope sig")));
     }
 
     #[test]
@@ -950,21 +942,20 @@ mod tests {
 
     #[test]
     fn end_to_end_chain_rejects_rego_mismatch() {
-        let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
         let descriptor = descriptor_json();
         let keyring = keyring_json(&deployer, "deployer");
         let rego = "package enclava\n";
         let cc_toml = b"x";
         let (mut bundle, mut env, cc, signer_pk, _) =
-            build_inputs(&descriptor, keyring, rego, &signing, &deployer, cc_toml);
+            build_inputs(&descriptor, keyring, rego, &deployer, &deployer, cc_toml);
 
         // Point expected_kbs_policy_hash at one rego, but ship a different one.
         env.rego_text = "package different\n".into();
         // Re-sign the (now-different) envelope so we don't fail at step "envelope sig"
         // and instead reach step 6.
         let new_msg = ce_v1_policy_envelope_message(&env).unwrap();
-        env.signature = signing.sign(&new_msg).to_bytes();
+        env.signature = deployer.sign(&new_msg).to_bytes();
         bundle.signed_policy_artifact = env.clone();
 
         let inputs = VerifyInputs {

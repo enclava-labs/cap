@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::api::{Api, Patch, PatchParams};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::time::{Duration, Instant};
 use uuid::Uuid;
@@ -17,6 +17,7 @@ pub struct KbsPolicyConfig {
     pub policy_key: String,
     pub deployment_name: String,
     pub required: bool,
+    pub signed_policy_retention: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +62,17 @@ struct KbsTlsBinding {
     namespace: String,
     service_account: String,
     tenant_instance_identity_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SignedPolicyArtifactSet<'a> {
+    schema_version: &'static str,
+    artifacts: &'a [crate::signing_service::SignedPolicyArtifact],
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct SignedPolicyArtifactRow {
+    signed_policy_artifact: serde_json::Value,
 }
 
 pub async fn ensure_owner_binding(
@@ -187,7 +199,7 @@ pub async fn reconcile_policy(
     config: Option<&KbsPolicyConfig>,
 ) -> Result<(), KbsPolicyError> {
     let Some(config) = config else {
-        return Ok(());
+        return Err(KbsPolicyError::NotConfigured);
     };
 
     let bindings: Vec<KbsOwnerBinding> = sqlx::query_as(
@@ -249,19 +261,59 @@ pub async fn reconcile_policy(
     Ok(())
 }
 
-pub async fn write_signed_policy_artifact(
+pub async fn reconcile_signed_policy_artifacts(
+    db: &PgPool,
     config: Option<&KbsPolicyConfig>,
-    artifact: &crate::signing_service::SignedPolicyArtifact,
+    extra_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
 ) -> Result<(), KbsPolicyError> {
     let Some(config) = config else {
         return Err(KbsPolicyError::NotConfigured);
     };
 
+    let rows: Vec<SignedPolicyArtifactRow> = sqlx::query_as(
+        r#"
+        WITH ranked AS (
+            SELECT wa.signed_policy_artifact,
+                   row_number() OVER (
+                       PARTITION BY wa.app_id
+                       ORDER BY d.created_at DESC
+                   ) AS rn
+            FROM workload_artifacts wa
+            JOIN deployments d ON d.id = wa.deploy_id AND d.app_id = wa.app_id
+            WHERE d.status::text IN ('pending', 'applying', 'watching', 'healthy')
+        )
+        SELECT signed_policy_artifact
+        FROM ranked
+        WHERE rn <= $1
+        ORDER BY rn
+        "#,
+    )
+    .bind(config.signed_policy_retention)
+    .fetch_all(db)
+    .await?;
+
+    if rows.is_empty() && extra_artifact.is_none() {
+        return Ok(());
+    }
+
+    let mut artifacts: Vec<crate::signing_service::SignedPolicyArtifact> = rows
+        .into_iter()
+        .map(|row| serde_json::from_value(row.signed_policy_artifact))
+        .collect::<Result<_, _>>()?;
+
+    if let Some(extra_artifact) = extra_artifact
+        && !artifacts.iter().any(|artifact| {
+            artifact.metadata.descriptor_core_hash == extra_artifact.metadata.descriptor_core_hash
+        })
+    {
+        artifacts.push(extra_artifact.clone());
+    }
+
     let client = kube::Client::try_default().await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     let cm = cm_api.get(&config.configmap_name).await?;
     let mut data = cm.data.unwrap_or_default();
-    let next_policy = signed_policy_artifact_policy_body(artifact)?;
+    let next_policy = signed_policy_artifact_policy_body(&artifacts)?;
 
     if data.get(&config.policy_key) != Some(&next_policy) {
         data.insert(config.policy_key.clone(), next_policy);
@@ -285,18 +337,30 @@ pub async fn write_signed_policy_artifact(
 }
 
 fn signed_policy_artifact_policy_body(
-    artifact: &crate::signing_service::SignedPolicyArtifact,
+    artifacts: &[crate::signing_service::SignedPolicyArtifact],
 ) -> Result<String, KbsPolicyError> {
-    Ok(serde_json::to_string(artifact)?)
+    if let [artifact] = artifacts {
+        return Ok(serde_json::to_string(artifact)?);
+    }
+    Ok(serde_json::to_string(&SignedPolicyArtifactSet {
+        schema_version: "enclava-signed-policy-set-v1",
+        artifacts,
+    })?)
 }
 
 fn is_signed_policy_artifact_body(policy: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(policy) else {
         return false;
     };
-    value.get("metadata").is_some()
+    let is_single = value.get("metadata").is_some()
         && value.get("rego_text").is_some()
-        && value.get("signature").is_some()
+        && value.get("signature").is_some();
+    let is_set = value
+        .get("artifacts")
+        .and_then(serde_json::Value::as_array)
+        .map(|artifacts| !artifacts.is_empty())
+        .unwrap_or(false);
+    is_single || is_set
 }
 
 async fn restart_trustee_deployment(
@@ -573,6 +637,11 @@ pub fn config_from_env() -> Option<KbsPolicyConfig> {
         deployment_name: std::env::var("KBS_POLICY_DEPLOYMENT")
             .unwrap_or_else(|_| "trustee-deployment".to_string()),
         required,
+        signed_policy_retention: std::env::var("KBS_SIGNED_POLICY_RETENTION")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2),
     })
 }
 
@@ -717,9 +786,10 @@ owner_resource_bindings := {}
             agent_policy_sha256: "11".repeat(32),
             signature: "ee".repeat(64),
             verify_pubkey_b64: "ZmFrZS1wdWJrZXk=".to_string(),
+            org_keyring: None,
         };
 
-        let body = signed_policy_artifact_policy_body(&artifact).unwrap();
+        let body = signed_policy_artifact_policy_body(&[artifact.clone()]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["rego_text"], artifact.rego_text);
         assert_eq!(
@@ -727,5 +797,40 @@ owner_resource_bindings := {}
             artifact.metadata.policy_template_id
         );
         assert!(!body.contains("BEGIN CAP MANAGED"));
+    }
+
+    #[test]
+    fn multiple_signed_policy_artifacts_are_written_as_policy_set() {
+        let artifact = crate::signing_service::SignedPolicyArtifact {
+            metadata: crate::signing_service::PolicyMetadata {
+                app_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                deploy_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                descriptor_core_hash: "aa".repeat(32),
+                descriptor_signing_pubkey: "bb".repeat(32),
+                platform_release_version: "platform-2026.04".to_string(),
+                policy_template_id: "trustee-resource-policy-v1".to_string(),
+                policy_template_sha256: "cc".repeat(32),
+                agent_policy_sha256: "11".repeat(32),
+                genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+                signed_at: "2026-04-01T12:30:00+00:00".to_string(),
+                key_id: "policy-test-key-v1".to_string(),
+            },
+            rego_text: "package policy\n\ndefault allow := false\n".to_string(),
+            rego_sha256: "dd".repeat(32),
+            agent_policy_text: "package agent_policy\n\ndefault CreateContainerRequest := true\n"
+                .to_string(),
+            agent_policy_sha256: "11".repeat(32),
+            signature: "ee".repeat(64),
+            verify_pubkey_b64: "ZmFrZS1wdWJrZXk=".to_string(),
+            org_keyring: None,
+        };
+
+        let body =
+            signed_policy_artifact_policy_body(&[artifact.clone(), artifact.clone()]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(parsed["schema_version"], "enclava-signed-policy-set-v1");
+        assert_eq!(parsed["artifacts"].as_array().unwrap().len(), 2);
+        assert!(is_signed_policy_artifact_body(&body));
     }
 }

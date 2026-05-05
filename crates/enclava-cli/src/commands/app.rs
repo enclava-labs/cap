@@ -521,6 +521,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         signing_key_id.clone(),
         rendered_policy,
         &generated_agent_policy,
+        Some(serde_json::to_value(&keyring_envelope)?),
         Utc::now(),
     );
 

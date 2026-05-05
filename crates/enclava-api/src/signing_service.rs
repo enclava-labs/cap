@@ -121,6 +121,8 @@ pub struct SignedPolicyArtifact {
     pub agent_policy_sha256: String,
     pub signature: String,
     pub verify_pubkey_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_keyring: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +144,7 @@ pub struct PolicyMetadata {
 pub struct DeploymentSigningArtifacts {
     pub customer_descriptor_blob: String,
     pub org_keyring_blob: String,
+    pub org_keyring_envelope: serde_json::Value,
     pub descriptor: DeploymentDescriptor,
     pub descriptor_signature: [u8; 64],
     pub descriptor_signing_key_id: String,
@@ -349,6 +352,34 @@ impl DeploymentSigningArtifacts {
             &self.descriptor_signing_pubkey,
             "artifact.verify_pubkey_b64",
         )?;
+        Ok(())
+    }
+
+    pub fn attach_customer_authority(
+        &self,
+        artifact: &mut SignedPolicyArtifact,
+    ) -> Result<(), SigningServiceError> {
+        if let Some(existing) = artifact.org_keyring.as_ref() {
+            let existing: OrgKeyringEnvelope = serde_json::from_value(existing.clone())?;
+            if keyring_fingerprint(&existing.keyring) != self.org_keyring_fingerprint {
+                return Err(SigningServiceError::Mismatch(
+                    "artifact.org_keyring does not match deployment org_keyring".into(),
+                ));
+            }
+            if existing.signature != self.org_keyring_signature {
+                return Err(SigningServiceError::Mismatch(
+                    "artifact.org_keyring.signature".into(),
+                ));
+            }
+            if existing.signing_pubkey != self.org_keyring_signing_pubkey {
+                return Err(SigningServiceError::Mismatch(
+                    "artifact.org_keyring.signing_pubkey".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        artifact.org_keyring = Some(self.org_keyring_envelope.clone());
         Ok(())
     }
 
@@ -633,12 +664,15 @@ pub fn decode_optional_blobs(
         decode_json_blob("customer_descriptor_blob", &customer_descriptor_blob)?;
     let keyring_envelope: OrgKeyringEnvelope =
         decode_json_blob("org_keyring_blob", &org_keyring_blob)?;
+    let org_keyring_envelope: serde_json::Value =
+        decode_json_blob("org_keyring_blob", &org_keyring_blob)?;
     let descriptor_core_hash = descriptor_core_hash(&descriptor_envelope.descriptor);
     let org_keyring_fingerprint = keyring_fingerprint(&keyring_envelope.keyring);
 
     Ok(Some(DeploymentSigningArtifacts {
         customer_descriptor_blob,
         org_keyring_blob,
+        org_keyring_envelope,
         descriptor: descriptor_envelope.descriptor,
         descriptor_signature: descriptor_envelope.signature,
         descriptor_signing_key_id: descriptor_envelope.signing_key_id,
@@ -702,6 +736,58 @@ pub async fn persist_workload_artifacts(
     Ok(())
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct StoredWorkloadArtifactRow {
+    descriptor_core_hash: Vec<u8>,
+    org_keyring_payload: serde_json::Value,
+    signed_policy_artifact: serde_json::Value,
+}
+
+pub async fn load_workload_artifact_binding(
+    pool: &PgPool,
+    app_id: Uuid,
+    deploy_id: Uuid,
+) -> Result<Option<(WorkloadArtifactBinding, SignedPolicyArtifact)>, SigningServiceError> {
+    let Some(row) = sqlx::query_as::<_, StoredWorkloadArtifactRow>(
+        "SELECT descriptor_core_hash, org_keyring_payload, signed_policy_artifact
+         FROM workload_artifacts
+         WHERE app_id = $1 AND deploy_id = $2",
+    )
+    .bind(app_id)
+    .bind(deploy_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let descriptor_core_hash: [u8; 32] =
+        row.descriptor_core_hash
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                SigningServiceError::Blob(format!(
+                    "descriptor_core_hash must be 32 bytes, got {}",
+                    bytes.len()
+                ))
+            })?;
+    let org_keyring: OrgKeyring = serde_json::from_value(row.org_keyring_payload)?;
+    let signed_policy_artifact: SignedPolicyArtifact =
+        serde_json::from_value(row.signed_policy_artifact)?;
+    let descriptor_signing_pubkey = decode_hex32(
+        "artifact.metadata.descriptor_signing_pubkey",
+        &signed_policy_artifact.metadata.descriptor_signing_pubkey,
+    )?;
+
+    Ok(Some((
+        WorkloadArtifactBinding {
+            descriptor_core_hash,
+            descriptor_signing_pubkey,
+            org_keyring_fingerprint: keyring_fingerprint(&org_keyring),
+        },
+        signed_policy_artifact,
+    )))
+}
+
 #[derive(Debug, Deserialize)]
 struct DeploymentDescriptorEnvelope {
     descriptor: DeploymentDescriptor,
@@ -712,13 +798,13 @@ struct DeploymentDescriptorEnvelope {
     signing_pubkey: [u8; 32],
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrgKeyringEnvelope {
     keyring: OrgKeyring,
-    #[serde(deserialize_with = "deserialize_sig")]
+    #[serde(with = "hex_signature_array")]
     signature: [u8; 64],
     #[allow(dead_code)]
-    #[serde(deserialize_with = "deserialize_pubkey")]
+    #[serde(with = "hex_bytes32")]
     signing_pubkey: [u8; 32],
 }
 
@@ -811,6 +897,21 @@ mod hex_bytes32 {
         let s = String::deserialize(d)?;
         let bytes = hex::decode(&s).map_err(D::Error::custom)?;
         bytes.try_into().map_err(|_| D::Error::custom("len != 32"))
+    }
+}
+
+mod hex_signature_array {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(b: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(b))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+        use serde::de::Error;
+        let s = String::deserialize(d)?;
+        let bytes = hex::decode(&s).map_err(D::Error::custom)?;
+        bytes.try_into().map_err(|_| D::Error::custom("len != 64"))
     }
 }
 
@@ -976,6 +1077,16 @@ mod tests {
         DeploymentSigningArtifacts {
             customer_descriptor_blob: "{}".to_string(),
             org_keyring_blob: "{}".to_string(),
+            org_keyring_envelope: serde_json::json!({
+                "keyring": {
+                    "org_id": "11111111-1111-1111-1111-111111111111",
+                    "version": 1,
+                    "members": [],
+                    "updated_at": "2026-04-01T00:00:00Z"
+                },
+                "signature": "cc".repeat(64),
+                "signing_pubkey": "dd".repeat(32)
+            }),
             descriptor_core_hash: descriptor_core_hash(&descriptor),
             descriptor,
             descriptor_signature: [0xaa; 64],
@@ -1025,6 +1136,7 @@ mod tests {
             agent_policy_sha256: hex::encode(agent_policy_hash),
             signature: hex::encode(signature.to_bytes()),
             verify_pubkey_b64: B64.encode(signing_key.verifying_key().to_bytes()),
+            org_keyring: None,
         }
     }
 
