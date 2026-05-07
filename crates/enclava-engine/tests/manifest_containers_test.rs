@@ -113,7 +113,7 @@ fn proxy_container_name_and_port() {
     assert!(
         ports
             .iter()
-            .any(|p| { p.container_port == 8081 && p.name.as_deref() == Some("attestation-http") })
+            .any(|p| { p.container_port == 8081 && p.name.as_deref() == Some("attest-http") })
     );
     assert!(
         ports

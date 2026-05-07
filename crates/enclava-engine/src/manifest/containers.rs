@@ -565,7 +565,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         ports: Some(vec![
             ContainerPort {
                 container_port: 8081,
-                name: Some("attestation-http".to_string()),
+                name: Some("attest-http".to_string()),
                 ..Default::default()
             },
             ContainerPort {
