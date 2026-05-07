@@ -437,16 +437,16 @@ async fn main() {
     let trustee_attestation_verify_url =
         load_url_env("TRUSTEE_ATTESTATION_VERIFY_URL", trustee_required)
             .expect("failed to load Trustee attestation verify URL");
+    // The signed release identifies the signing-service key and default URL,
+    // but the transport address is deployment-local. CAP may need an internal
+    // cluster DNS name while customer tooling uses the public API broker.
     let signing_service_url = load_url_value(
         "PLATFORM_SIGNING_SERVICE_URL",
-        release_env_value(
-            "PLATFORM_SIGNING_SERVICE_URL",
+        env_nonempty("PLATFORM_SIGNING_SERVICE_URL").or_else(|| {
             platform_release
                 .as_ref()
-                .map(|release| release.signing_service_url.as_str()),
-            trustee_required,
-        )
-        .expect("failed to resolve platform signing service URL"),
+                .map(|release| release.signing_service_url.clone())
+        }),
         trustee_required,
     )
     .expect("failed to load platform signing service URL");
