@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
@@ -9,6 +9,9 @@ use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{kbs_fetch, luks, seeds, socket, trustee_verify, unlock, writes};
 
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
+const DEFAULT_KBS_PROXY_HEALTH_WAIT_SECONDS: u64 = 300;
+const DEFAULT_KBS_PROXY_HEALTH_POLL_SECONDS: u64 = 2;
+const KBS_PROXY_HEALTH_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -286,11 +289,134 @@ fn acquire_owner_seed_autounlock(cfg: &Config) -> Result<OwnerSeed> {
         .kbs_resource_path
         .as_deref()
         .ok_or_else(|| anyhow!("autounlock mode requires kbs_resource_path"))?;
+    wait_for_kbs_proxy_health_if_needed(url).context("waiting for local KBS proxy health")?;
     let client = kbs_fetch::KbsClient::new(url.into(), path.into());
     let wrap = client
         .fetch_wrap_key()
         .with_context(|| "fetching wrap key from KBS")?;
     Ok(OwnerSeed(*wrap.as_bytes()))
+}
+
+fn wait_for_kbs_proxy_health_if_needed(kbs_url: &str) -> Result<()> {
+    let wait_timeout = kbs_proxy_health_wait_timeout(kbs_url);
+    if wait_timeout.is_zero() {
+        return Ok(());
+    }
+    let poll = kbs_proxy_health_poll_interval();
+    let health_url = kbs_proxy_health_url(kbs_url);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(
+            KBS_PROXY_HEALTH_REQUEST_TIMEOUT_SECONDS,
+        ))
+        .build()
+        .context("building KBS proxy health client")?;
+
+    tracing::info!(
+        url = %health_url,
+        wait_seconds = wait_timeout.as_secs(),
+        poll_seconds = poll.as_secs(),
+        "waiting for local KBS proxy before autounlock"
+    );
+
+    let started = Instant::now();
+    loop {
+        match client.get(&health_url).send() {
+            Ok(resp) if kbs_proxy_health_status_is_ready(resp.status().as_u16()) => {
+                tracing::info!(
+                    elapsed_seconds = started.elapsed().as_secs(),
+                    status = resp.status().as_u16(),
+                    "local KBS proxy ready"
+                );
+                return Ok(());
+            }
+            Ok(resp) => {
+                tracing::debug!(
+                    status = resp.status().as_u16(),
+                    "local KBS proxy health not ready"
+                );
+            }
+            Err(err) => {
+                tracing::debug!(
+                    error = %err,
+                    "local KBS proxy health request failed"
+                );
+            }
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed >= wait_timeout {
+            return Err(anyhow!(
+                "timed out after {}s waiting for {}",
+                wait_timeout.as_secs(),
+                health_url
+            ));
+        }
+        std::thread::sleep(poll.min(wait_timeout - elapsed));
+    }
+}
+
+fn kbs_proxy_health_wait_timeout(kbs_url: &str) -> Duration {
+    let explicit = std::env::var("ENCLAVA_INIT_KBS_PROXY_HEALTH_WAIT_SECONDS")
+        .ok()
+        .or_else(|| std::env::var("KBS_PROXY_HEALTH_WAIT_SECONDS").ok());
+    if let Some(value) = explicit {
+        return parse_positive_seconds(&value)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::ZERO);
+    }
+    if is_local_kbs_proxy_url(kbs_url) {
+        Duration::from_secs(DEFAULT_KBS_PROXY_HEALTH_WAIT_SECONDS)
+    } else {
+        Duration::ZERO
+    }
+}
+
+fn kbs_proxy_health_poll_interval() -> Duration {
+    let explicit = std::env::var("ENCLAVA_INIT_KBS_PROXY_HEALTH_POLL_SECONDS")
+        .ok()
+        .or_else(|| std::env::var("KBS_PROXY_HEALTH_POLL_SECONDS").ok());
+    explicit
+        .as_deref()
+        .and_then(parse_positive_seconds)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_KBS_PROXY_HEALTH_POLL_SECONDS))
+}
+
+fn parse_positive_seconds(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok().filter(|seconds| *seconds > 0)
+}
+
+fn kbs_proxy_health_url(kbs_url: &str) -> String {
+    if let Ok(value) = std::env::var("ENCLAVA_INIT_ATTESTATION_PROXY_HEALTH_URL")
+        .or_else(|_| std::env::var("ATTESTATION_PROXY_HEALTH_URL"))
+    {
+        if !value.trim().is_empty() {
+            return value;
+        }
+    }
+
+    let trimmed = kbs_url.trim_end_matches('/');
+    let base = trimmed
+        .strip_suffix("/cdh/resource")
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    format!("{base}/health")
+}
+
+fn is_local_kbs_proxy_url(kbs_url: &str) -> bool {
+    reqwest::Url::parse(kbs_url)
+        .ok()
+        .and_then(|url| {
+            Some(matches!(
+                (url.host_str()?, url.port_or_known_default()),
+                ("127.0.0.1" | "localhost", Some(8081))
+            ))
+        })
+        .unwrap_or_else(|| kbs_url.contains("127.0.0.1:8081") || kbs_url.contains("localhost:8081"))
+}
+
+fn kbs_proxy_health_status_is_ready(status: u16) -> bool {
+    status == 200 || status == 423
 }
 
 fn open_luks_volumes(cfg: &Config, owner: &OwnerSeed) -> Result<()> {
@@ -625,5 +751,40 @@ mod tests {
         assert_eq!(validate_sentinel_name("web").unwrap(), "web");
         assert!(validate_sentinel_name("../web").is_err());
         assert!(validate_sentinel_name("web/sidecar").is_err());
+    }
+
+    #[test]
+    fn kbs_proxy_health_url_strips_cdh_resource_suffix() {
+        assert_eq!(
+            kbs_proxy_health_url("http://127.0.0.1:8081/cdh/resource"),
+            "http://127.0.0.1:8081/health"
+        );
+        assert_eq!(
+            kbs_proxy_health_url("http://127.0.0.1:8081/cdh/resource/"),
+            "http://127.0.0.1:8081/health"
+        );
+        assert_eq!(
+            kbs_proxy_health_url("http://127.0.0.1:8081/custom"),
+            "http://127.0.0.1:8081/custom/health"
+        );
+    }
+
+    #[test]
+    fn local_kbs_proxy_detection_matches_loopback_8081() {
+        assert!(is_local_kbs_proxy_url("http://127.0.0.1:8081/cdh/resource"));
+        assert!(is_local_kbs_proxy_url("http://localhost:8081/cdh/resource"));
+        assert!(!is_local_kbs_proxy_url(
+            "http://127.0.0.1:8080/cdh/resource"
+        ));
+        assert!(!is_local_kbs_proxy_url(
+            "https://kbs.example.test/cdh/resource"
+        ));
+    }
+
+    #[test]
+    fn kbs_proxy_health_accepts_ready_statuses() {
+        assert!(kbs_proxy_health_status_is_ready(200));
+        assert!(kbs_proxy_health_status_is_ready(423));
+        assert!(!kbs_proxy_health_status_is_ready(503));
     }
 }
