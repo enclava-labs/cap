@@ -6,6 +6,7 @@ pub struct ApiClient {
     base_url: String,
     http: reqwest::Client,
     auth_token: Option<String>,
+    org_hint: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -30,6 +31,7 @@ impl ApiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
             auth_token,
+            org_hint: None,
         }
     }
 
@@ -38,7 +40,13 @@ impl ApiClient {
         config: &crate::config::CliConfig,
         creds: &crate::config::Credentials,
     ) -> Self {
-        Self::new(&config.api_url, creds.auth_token().map(|s| s.to_string()))
+        let mut client = Self::new(&config.api_url, creds.auth_token().map(|s| s.to_string()));
+        client.org_hint = config
+            .org
+            .as_ref()
+            .map(|org| org.trim().to_string())
+            .filter(|org| !org.is_empty());
+        client
     }
 
     fn url(&self, path: &str) -> String {
@@ -55,6 +63,15 @@ impl ApiClient {
                 message: format!("invalid auth token: {e}"),
             })?,
         );
+        if let Some(org) = &self.org_hint {
+            headers.insert(
+                "X-Enclava-Org",
+                HeaderValue::from_str(org).map_err(|e| ApiError::Api {
+                    status: 0,
+                    message: format!("invalid org header: {e}"),
+                })?,
+            );
+        }
         Ok(headers)
     }
 
