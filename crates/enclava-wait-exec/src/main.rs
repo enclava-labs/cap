@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
@@ -60,6 +61,7 @@ fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
             started_dir.display()
         )
     })?;
+    let _ = fs::set_permissions(started_dir, fs::Permissions::from_mode(0o1777));
     let sentinel = started_dir.join(name);
     let mut file = OpenOptions::new()
         .create(true)
@@ -114,6 +116,10 @@ mod tests {
         let dir = unique_dir();
         signal_started(&dir, "web").unwrap();
         assert!(dir.join("web").exists());
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o7777,
+            0o1777
+        );
         let pid = fs::read_to_string(dir.join("web")).unwrap();
         assert_eq!(pid.trim(), process::id().to_string());
         fs::remove_dir_all(dir).unwrap();

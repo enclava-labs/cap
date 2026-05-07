@@ -587,6 +587,8 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             env("CADDY_SEED_PATH", "/state/caddy/seed"),
             env("VOLUME_MOUNT_POINT", "/state/tls-state"),
             env("XDG_DATA_HOME", "/state/tls-state/caddy"),
+            env("XDG_CONFIG_HOME", "/state/tls-state/caddy/config"),
+            env("HOME", "/state/tls-state"),
             env("ENCLAVA_CONTAINER_NAME", "tenant-ingress"),
             env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"),
             env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),

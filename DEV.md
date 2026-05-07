@@ -19,5 +19,9 @@
   `/usr/local/bin/enclava-wait-exec`. CAP sets the app command to that path; the
   helper writes the started sentinel with its PID, waits for
   `/run/enclava/init-ready`, then execs the workload command.
+- The helper must make `/run/enclava/containers` a shared writable sticky
+  directory (`chmod 1777`) before writing its sentinel. App and tenant-ingress
+  run under different non-root UIDs, so the first helper to create the
+  directory cannot leave it at the default `0755` mode.
 - Platform sidecar images that CAP wraps, currently `caddy-ingress`, must also
   include `/usr/local/bin/enclava-wait-exec`.

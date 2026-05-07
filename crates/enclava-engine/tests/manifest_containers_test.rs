@@ -246,6 +246,36 @@ fn caddy_container_reads_seed_from_state_caddy() {
     assert_eq!(found.value.as_deref(), Some("/state/caddy/seed"));
 }
 
+#[test]
+fn caddy_container_uses_writable_caddy_runtime_dirs() {
+    let c = build_caddy_container(&sample_app());
+    let env = c.env.as_ref().unwrap();
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "XDG_DATA_HOME")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/state/tls-state/caddy")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "XDG_CONFIG_HOME")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/state/tls-state/caddy/config")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "HOME")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/state/tls-state")
+    );
+}
+
 // === enclava-init mounter sidecar ===
 
 #[test]
