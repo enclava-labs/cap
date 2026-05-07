@@ -318,10 +318,10 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
 /// the Trustee policy verification chain, writes per-component HKDF seeds to
 /// /state/{caddy,app}/seed, bind-mounts the decrypted paths into app/caddy
 /// mount namespaces, marks itself ready, and then stays alive. Live Kata
-/// SEV-SNP validation showed Kubernetes mountPropagation becomes a Kata direct
-/// volume and can hit the runtime filename limit, so app/caddy start under an
-/// in-image `enclava-wait-exec` helper and signal this sidecar with their PIDs
-/// before it opens the devices.
+/// SEV-SNP validation showed the worker runtime must combine block hotplug with
+/// `virtio-9p` filesystem sharing. CAP avoids Kubernetes mountPropagation, so
+/// app/caddy start under an in-image `enclava-wait-exec` helper and signal this
+/// sidecar with their PIDs before it opens the devices.
 ///
 /// The sidecar needs device-mapper and mount namespace rights. App and caddy
 /// remain unprivileged and only consume the decrypted mountpoints.

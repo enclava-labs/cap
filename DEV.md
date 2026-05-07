@@ -7,9 +7,11 @@
   for the raw Block PVC/LUKS path.
 - `attestation-proxy` runs as a regular sidecar. App, tenant-ingress, and
   `enclava-init` also start as regular containers.
-- Do not use Kubernetes `mountPropagation` for the decrypted state EmptyDirs on
-  the SNP runtime. Kata treats those as direct volumes; on k0s the generated
-  direct-volume filename can exceed the filesystem component limit. CAP uses
+- Do not use Kubernetes `mountPropagation` for decrypted state on the SNP
+  runtime. The worker runtime must use `shared_fs = "virtio-9p"` plus
+  `disable_block_device_use = false`: `virtio-fs` fails on the current
+  QEMU/IOMMU path, while `shared_fs = "none"` makes ordinary ConfigMap/EmptyDir
+  mounts hit Kata direct-volume filename limits. CAP uses
   `shareProcessNamespace: true`: wait-exec writes each workload PID, and
   `enclava-init` bind-mounts decrypted LUKS paths into those mount namespaces
   inside the guest.
