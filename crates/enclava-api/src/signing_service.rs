@@ -20,6 +20,8 @@ use uuid::Uuid;
 
 use crate::models::App;
 
+const DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS: u64 = 120;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SigningServiceError {
     #[error("customer_descriptor_blob and org_keyring_blob must be provided together")]
@@ -28,6 +30,8 @@ pub enum SigningServiceError {
     ArtifactWithoutBlobs,
     #[error("invalid signing service URL: {0}")]
     InvalidUrl(String),
+    #[error("invalid signing service timeout: {0}")]
+    InvalidTimeout(String),
     #[error("blob decode error: {0}")]
     Blob(String),
     #[error("signing artifact does not match deployment: {0}")]
@@ -59,6 +63,15 @@ impl SigningServiceClient {
         base_url: String,
         bearer_token: Option<String>,
     ) -> Result<Self, SigningServiceError> {
+        let timeout = signing_service_timeout_from_env()?;
+        Self::new_with_timeout(base_url, bearer_token, timeout)
+    }
+
+    pub fn new_with_timeout(
+        base_url: String,
+        bearer_token: Option<String>,
+        timeout: Duration,
+    ) -> Result<Self, SigningServiceError> {
         let mut base_url = Url::parse(&base_url)
             .map_err(|err| SigningServiceError::InvalidUrl(err.to_string()))?;
         if !matches!(base_url.scheme(), "http" | "https") {
@@ -72,7 +85,7 @@ impl SigningServiceClient {
         }
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(15))
+            .timeout(timeout)
             .build()?;
         Ok(Self {
             base_url,
@@ -143,6 +156,27 @@ impl SigningServiceClient {
         }
         Ok(response.json().await?)
     }
+}
+
+fn signing_service_timeout_from_env() -> Result<Duration, SigningServiceError> {
+    parse_signing_service_timeout(std::env::var("PLATFORM_SIGNING_SERVICE_TIMEOUT_SECONDS").ok())
+}
+
+fn parse_signing_service_timeout(raw: Option<String>) -> Result<Duration, SigningServiceError> {
+    let Some(raw) = raw else {
+        return Ok(Duration::from_secs(DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS));
+    };
+    let seconds = raw.parse::<u64>().map_err(|err| {
+        SigningServiceError::InvalidTimeout(format!(
+            "PLATFORM_SIGNING_SERVICE_TIMEOUT_SECONDS must be an integer number of seconds: {err}"
+        ))
+    })?;
+    if seconds == 0 {
+        return Err(SigningServiceError::InvalidTimeout(
+            "PLATFORM_SIGNING_SERVICE_TIMEOUT_SECONDS must be greater than zero".to_string(),
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 #[derive(Debug, Serialize)]
@@ -1070,6 +1104,30 @@ mod tests {
         AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec,
         VolumeSpec,
     };
+
+    #[test]
+    fn signing_service_timeout_defaults_to_genpolicy_friendly_value() {
+        assert_eq!(
+            parse_signing_service_timeout(None).unwrap(),
+            Duration::from_secs(DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS)
+        );
+        assert_eq!(
+            parse_signing_service_timeout(Some("180".to_string())).unwrap(),
+            Duration::from_secs(180)
+        );
+    }
+
+    #[test]
+    fn signing_service_timeout_rejects_invalid_values() {
+        assert!(matches!(
+            parse_signing_service_timeout(Some("0".to_string())).unwrap_err(),
+            SigningServiceError::InvalidTimeout(_)
+        ));
+        assert!(matches!(
+            parse_signing_service_timeout(Some("abc".to_string())).unwrap_err(),
+            SigningServiceError::InvalidTimeout(_)
+        ));
+    }
 
     fn descriptor() -> DeploymentDescriptor {
         DeploymentDescriptor {

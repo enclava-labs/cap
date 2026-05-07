@@ -41,6 +41,7 @@ pub(crate) fn signing_error_response(
             StatusCode::BAD_GATEWAY
         }
         SigningServiceError::InvalidUrl(_)
+        | SigningServiceError::InvalidTimeout(_)
         | SigningServiceError::Db(_)
         | SigningServiceError::Serde(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
