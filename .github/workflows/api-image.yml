@@ -4,12 +4,17 @@ on:
   push:
     branches: ['main']
     paths:
+    - '.github/workflows/api-image.yml'
     - 'crates/enclava-api/**'
     - 'crates/enclava-common/**'
     - 'crates/enclava-engine/**'
   pull_request:
     paths:
+    - '.github/workflows/api-image.yml'
     - 'crates/enclava-api/**'
+    - 'crates/enclava-common/**'
+    - 'crates/enclava-engine/**'
+  workflow_dispatch:
 
 jobs:
   build-and-push:
