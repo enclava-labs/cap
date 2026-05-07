@@ -7,9 +7,11 @@
 //! modprobe them via `io.katacontainers.config.agent.kernel_modules`.
 //!
 //! Live Kata SEV-SNP validation showed LUKS format/open/mount works in the
-//! guest, but creating workload containers after the mount exists fails on the
-//! current runtime. CAP therefore starts app/caddy under wait-exec helpers
-//! first, then runs this mounter sidecar and keeps it alive for the pod lifetime.
+//! guest, but Kubernetes mountPropagation for the decrypted EmptyDirs becomes a
+//! Kata direct volume and can hit runtime path limits. CAP therefore starts
+//! app/caddy under wait-exec helpers first, then this mounter sidecar bind-mounts
+//! the decrypted paths into their mount namespaces and stays alive for the pod
+//! lifetime.
 //! Fresh LUKS2 volumes are formatted ext4 before the first mount, so the
 //! runtime image must include `mkfs.ext4`.
 

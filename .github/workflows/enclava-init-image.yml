@@ -8,12 +8,14 @@ on:
       - 'Cargo.lock'
       - 'crates/enclava-common/**'
       - 'crates/enclava-init/**'
+      - 'crates/enclava-wait-exec/**'
   pull_request:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/enclava-common/**'
       - 'crates/enclava-init/**'
+      - 'crates/enclava-wait-exec/**'
 
 jobs:
   build-and-push:

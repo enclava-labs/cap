@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{self, Command};
 use std::thread;
 use std::time::Duration;
 
@@ -61,11 +61,14 @@ fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
         )
     })?;
     let sentinel = started_dir.join(name);
-    OpenOptions::new()
+    let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&sentinel)
+        .map_err(|err| format!("failed to write sentinel {}: {err}", sentinel.display()))?;
+    use std::io::Write;
+    writeln!(file, "{}", process::id())
         .map_err(|err| format!("failed to write sentinel {}: {err}", sentinel.display()))?;
     Ok(())
 }
@@ -111,6 +114,8 @@ mod tests {
         let dir = unique_dir();
         signal_started(&dir, "web").unwrap();
         assert!(dir.join("web").exists());
+        let pid = fs::read_to_string(dir.join("web")).unwrap();
+        assert_eq!(pid.trim(), process::id().to_string());
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -88,19 +88,13 @@ pub fn cap_app_oci_runtime_spec(input: CapAppOciRuntimeSpecInput) -> OciRuntimeS
         source: "state-mount".to_string(),
         destination: "/state".to_string(),
         mount_type: "kubernetes-volume".to_string(),
-        options: vec![
-            "rw".to_string(),
-            "mountPropagation=HostToContainer".to_string(),
-        ],
+        options: vec!["rw".to_string()],
     }];
     mounts.extend(input.storage_paths.iter().map(|path| Mount {
         source: format!("state-mount:{}", storage_subdir(path)),
         destination: path.clone(),
         mount_type: "kubernetes-volume-subpath".to_string(),
-        options: vec![
-            "rw".to_string(),
-            "mountPropagation=HostToContainer".to_string(),
-        ],
+        options: vec!["rw".to_string()],
     }));
 
     OciRuntimeSpec {

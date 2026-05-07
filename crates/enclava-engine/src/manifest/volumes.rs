@@ -2,8 +2,9 @@
 //!
 //! Phase 5 default: raw Block PVCs are passed only to enclava-init. The
 //! decrypted filesystems are mounted into shared EmptyDir mountpoint volumes
-//! (`state-mount`, `tls-state-mount`) that app/caddy consume with
-//! mountPropagation. Workload images carry the static wait/exec helper.
+//! (`state-mount`, `tls-state-mount`) that app/caddy consume after enclava-init
+//! bind-mounts decrypted paths inside the shared Kata guest. Workload images
+//! carry the static wait/exec helper.
 
 use k8s_openapi::api::core::v1::{
     ConfigMapVolumeSource, EmptyDirVolumeSource, PersistentVolumeClaim, PersistentVolumeClaimSpec,

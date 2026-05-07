@@ -23,7 +23,7 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 toml_edit = "0.22"
 thiserror = { workspace = true }
-nix = { version = "0.29", features = ["user", "fs", "mount"] }
+nix = { version = "0.29", features = ["user", "fs", "mount", "sched"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 hex = { version = "0.4", features = ["serde"] }

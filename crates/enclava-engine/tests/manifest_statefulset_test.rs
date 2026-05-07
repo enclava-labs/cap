@@ -74,6 +74,14 @@ fn statefulset_pod_spec_disables_service_links() {
 }
 
 #[test]
+fn statefulset_shares_process_namespace_for_in_guest_bind_mounts() {
+    let app = sample_app();
+    let sts = generate_statefulset(&app);
+    let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+    assert_eq!(pod_spec.share_process_namespace, Some(true));
+}
+
+#[test]
 fn statefulset_has_kata_runtime_annotation() {
     let app = sample_app();
     let sts = generate_statefulset(&app);

@@ -128,6 +128,7 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
                     service_account_name: Some(app.service_account.clone()),
                     automount_service_account_token: Some(false),
                     enable_service_links: Some(false),
+                    share_process_namespace: Some(true),
                     node_selector: Some(node_selector),
                     security_context: Some(PodSecurityContext {
                         fs_group: Some(10001),

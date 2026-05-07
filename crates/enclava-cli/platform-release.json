@@ -1,19 +1,19 @@
 {
   "payload": {
     "schema_version": "v1",
-    "platform_release_version": "dev-2026.05.07-stateful-no-init",
+    "platform_release_version": "dev-2026.05.07-stateful-pid-binds",
     "signing_service_url": "http://10.0.0.2:18080",
     "signing_service_pubkey_hex": "50bc3000f8aaba75b5aa47e45d64d5cf24c891e9711336e881797fe8a63c575d",
     "policy_template_id": "trustee-resource-policy-v1",
     "policy_template_sha256": "e808dd6a40402bad50ea9522cdcd60b6739b78e21006942f4072a08355a24f10",
     "policy_template_text": "package policy\n\nimport rego.v1\n\ndefault allow := false\n\n# Template variables are rendered by the signing service only.\n# CAP API never writes or edits this file directly.\nexpected_init_data_hash := \"{{init_data_hash}}\"\nexpected_image_digest := \"{{image_digest}}\"\nexpected_signer_subject := \"{{signer_subject}}\"\nexpected_signer_issuer := \"{{signer_issuer}}\"\nexpected_namespace := \"{{namespace}}\"\nexpected_service_account := \"{{service_account}}\"\nexpected_identity_hash := \"{{identity_hash}}\"\nexpected_resource_path := \"{{kbs_resource_path}}\"\n\nallow if {\n  input.method == \"GET\"\n  attested_workload\n  requested_resource_path == expected_resource_path\n}\n\nallow if {\n  input.method == \"PUT\"\n  attested_workload\n  requested_resource_path == expected_resource_path\n  input.request.body.operation == \"rekey\"\n  input.request.body.receipt.pubkey_hash_matches\n  input.request.body.receipt.signature_valid\n  input.request.body.receipt.payload.purpose == \"enclava-rekey-v1\"\n  input.request.body.receipt.payload.resource_path == requested_resource_path\n  input.request.body.value_hash_matches\n}\n\nallow if {\n  input.method == \"DELETE\"\n  attested_workload\n  requested_resource_path == expected_resource_path\n  input.request.body.operation == \"teardown\"\n  input.request.body.receipt.pubkey_hash_matches\n  input.request.body.receipt.signature_valid\n  input.request.body.receipt.payload.purpose == \"enclava-teardown-v1\"\n  input.request.body.receipt.payload.resource_path == requested_resource_path\n}\n\nattested_workload if {\n  input.snp.init_data_hash == expected_init_data_hash\n  input.init_data_claims.image_digest == expected_image_digest\n  input.init_data_claims.signer_identity.subject == expected_signer_subject\n  input.init_data_claims.signer_identity.issuer == expected_signer_issuer\n  input.init_data_claims.namespace == expected_namespace\n  input.init_data_claims.service_account == expected_service_account\n  input.init_data_claims.identity_hash == expected_identity_hash\n}\n\nrequested_resource_path := concat(\"/\", input[\"resource-path\"])\n",
     "attestation_proxy_image": "ghcr.io/enclava-ai/attestation-proxy@sha256:996c32b0726a90d82c08ae095b4bfbe01e47617cf929dc1eed3bd981f4e8155d",
-    "caddy_ingress_image": "ghcr.io/enclava-ai/caddy-ingress@sha256:11cfffe58d2217b9fe43330238fe47bd93745bddbf6c1ad354470543e1d4b11f",
+    "caddy_ingress_image": "ghcr.io/enclava-ai/caddy-ingress@sha256:aa863a7a4fd14a6c37b11a35398e63871f7423f0c0d5945ae6f1d935bad37b6a",
     "expected_firmware_measurement": "0000000000000000000000000000000000000000000000000000000000000000",
     "expected_runtime_class": "kata-qemu-snp",
     "genpolicy_version": "kata-containers/genpolicy@3.28.0+660e3bb6535b141c84430acb25b159857278d596",
-    "created_at": "2026-05-07T13:41:32Z"
+    "created_at": "2026-05-07T19:39:36Z"
   },
-  "signature": "9b952e5a8d41cf15124550ab63942df1805872b32fbabcaf5dadbfe23c169e8435edb0caa655a49983c57432d3265ce1b21b6319397ce72995c14ba81cc43308",
+  "signature": "82a1cf8814a38400becf80899ea21be9f2d6d6b8474e12014789065e8c7dbeae34fd1dd77b95c0c526dcef34fcd1a201a660c43cc5e4fe052ec0abfd74c0b10e",
   "signing_pubkey": "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd"
 }

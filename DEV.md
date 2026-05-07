@@ -7,9 +7,15 @@
   for the raw Block PVC/LUKS path.
 - `attestation-proxy` runs as a regular sidecar. App, tenant-ingress, and
   `enclava-init` also start as regular containers.
+- Do not use Kubernetes `mountPropagation` for the decrypted state EmptyDirs on
+  the SNP runtime. Kata treats those as direct volumes; on k0s the generated
+  direct-volume filename can exceed the filesystem component limit. CAP uses
+  `shareProcessNamespace: true`: wait-exec writes each workload PID, and
+  `enclava-init` bind-mounts decrypted LUKS paths into those mount namespaces
+  inside the guest.
 - Customer workload images must include an executable at
   `/usr/local/bin/enclava-wait-exec`. CAP sets the app command to that path; the
-  helper writes the started sentinel, waits for `/run/enclava/init-ready`, then
-  execs the workload command.
+  helper writes the started sentinel with its PID, waits for
+  `/run/enclava/init-ready`, then execs the workload command.
 - Platform sidecar images that CAP wraps, currently `caddy-ingress`, must also
   include `/usr/local/bin/enclava-wait-exec`.

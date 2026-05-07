@@ -4,7 +4,7 @@
 //! bootstrap_script.sh) and reshapes app/caddy to drop privileged + shell
 //! interpolation. App/caddy processes start under an argv-preserving
 //! `enclava-wait-exec` helper that must already exist in their images, then
-//! `enclava-init` opens LUKS and stays alive as the mount propagation source.
+//! `enclava-init` opens LUKS and stays alive as the in-guest bind-mount source.
 //! The legacy bootstrap_script.sh path is still emittable behind the
 //! `LEGACY_BOOTSTRAP_SCRIPT=true` env var so existing pods can be reconciled
 //! without disruption; new deploys default to the enclava-init shape.
@@ -195,14 +195,12 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
         volume_mounts.push(VolumeMount {
             name: "state-mount".to_string(),
             mount_path: "/state".to_string(),
-            mount_propagation: Some("HostToContainer".to_string()),
             ..Default::default()
         });
         volume_mounts.extend(primary.storage_paths.iter().map(|path| VolumeMount {
             name: "state-mount".to_string(),
             mount_path: path.clone(),
             sub_path: Some(storage_subdir(path)),
-            mount_propagation: Some("HostToContainer".to_string()),
             ..Default::default()
         }));
     }
@@ -318,14 +316,15 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
 /// Performs Argon2id-based unlock or KBS autounlock, opens both LUKS block
 /// PVCs, mounts the decrypted filesystems into shared mountpoint volumes, runs
 /// the Trustee policy verification chain, writes per-component HKDF seeds to
-/// /state/{caddy,app}/seed, marks itself ready, and then stays alive. Live
-/// Kata SEV-SNP validation showed containers must already be started before
-/// the LUKS mount is created, so app/caddy start under an in-image
-/// `enclava-wait-exec` helper and signal this sidecar before it opens the
-/// devices.
+/// /state/{caddy,app}/seed, bind-mounts the decrypted paths into app/caddy
+/// mount namespaces, marks itself ready, and then stays alive. Live Kata
+/// SEV-SNP validation showed Kubernetes mountPropagation becomes a Kata direct
+/// volume and can hit the runtime filename limit, so app/caddy start under an
+/// in-image `enclava-wait-exec` helper and signal this sidecar with their PIDs
+/// before it opens the devices.
 ///
-/// The sidecar needs device-mapper and mount propagation rights. App and
-/// caddy remain unprivileged and only consume the decrypted mountpoints.
+/// The sidecar needs device-mapper and mount namespace rights. App and caddy
+/// remain unprivileged and only consume the decrypted mountpoints.
 pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
     Container {
         name: "enclava-init".to_string(),
@@ -345,13 +344,11 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             VolumeMount {
                 name: "state-mount".to_string(),
                 mount_path: "/state".to_string(),
-                mount_propagation: Some("Bidirectional".to_string()),
                 ..Default::default()
             },
             VolumeMount {
                 name: "tls-state-mount".to_string(),
                 mount_path: "/state/tls-state".to_string(),
-                mount_propagation: Some("Bidirectional".to_string()),
                 ..Default::default()
             },
             VolumeMount {
@@ -383,9 +380,9 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             run_as_group: Some(0),
             run_as_non_root: Some(false),
             read_only_root_filesystem: Some(true),
-            // cryptsetup luksOpen and mount propagation need SYS_ADMIN. The
-            // workload containers keep an unprivileged context and never
-            // receive the raw block devices.
+            // cryptsetup luksOpen and in-guest namespace bind mounts need
+            // SYS_ADMIN. The workload containers keep an unprivileged context
+            // and never receive the raw block devices.
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".to_string()]),
                 add: Some(vec!["SYS_ADMIN".to_string()]),
@@ -651,13 +648,11 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         volume_mounts.push(VolumeMount {
             name: "state-mount".to_string(),
             mount_path: "/state".to_string(),
-            mount_propagation: Some("HostToContainer".to_string()),
             ..Default::default()
         });
         volume_mounts.push(VolumeMount {
             name: "tls-state-mount".to_string(),
             mount_path: "/state/tls-state".to_string(),
-            mount_propagation: Some("HostToContainer".to_string()),
             ..Default::default()
         });
     }

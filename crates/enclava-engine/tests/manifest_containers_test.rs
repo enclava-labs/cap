@@ -75,7 +75,7 @@ fn app_container_mounts_state_filesystem() {
     let vm = c.volume_mounts.as_ref().unwrap();
     let m = vm.iter().find(|m| m.name == "state-mount").unwrap();
     assert_eq!(m.mount_path, "/state");
-    assert_eq!(m.mount_propagation.as_deref(), Some("HostToContainer"));
+    assert_eq!(m.mount_propagation.as_deref(), None);
     assert!(c.volume_devices.is_none());
 }
 
@@ -88,7 +88,7 @@ fn app_container_preserves_declared_storage_paths_as_subpaths() {
         .find(|m| m.name == "state-mount" && m.mount_path == "/app/data")
         .unwrap();
     assert_eq!(m.sub_path.as_deref(), Some("app-data"));
-    assert_eq!(m.mount_propagation.as_deref(), Some("HostToContainer"));
+    assert_eq!(m.mount_propagation.as_deref(), None);
     assert_eq!(
         c.env
             .as_ref()
@@ -234,7 +234,7 @@ fn caddy_container_mounts_tls_state_filesystem() {
     let vm = c.volume_mounts.as_ref().unwrap();
     let m = vm.iter().find(|m| m.name == "tls-state-mount").unwrap();
     assert_eq!(m.mount_path, "/state/tls-state");
-    assert_eq!(m.mount_propagation.as_deref(), Some("HostToContainer"));
+    assert_eq!(m.mount_propagation.as_deref(), None);
     assert!(c.volume_devices.is_none());
 }
 
@@ -312,12 +312,6 @@ fn enclava_init_container_mounts_both_luks_devices_and_unlock_socket() {
     assert!(vm.iter().any(|m| m.name == "enclava-init-config"));
     let state_mount = vm.iter().find(|m| m.name == "state-mount").unwrap();
     let tls_mount = vm.iter().find(|m| m.name == "tls-state-mount").unwrap();
-    assert_eq!(
-        state_mount.mount_propagation.as_deref(),
-        Some("Bidirectional")
-    );
-    assert_eq!(
-        tls_mount.mount_propagation.as_deref(),
-        Some("Bidirectional")
-    );
+    assert_eq!(state_mount.mount_propagation.as_deref(), None);
+    assert_eq!(tls_mount.mount_propagation.as_deref(), None);
 }

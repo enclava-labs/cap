@@ -11,7 +11,18 @@ use enclava_init::{kbs_fetch, luks, seeds, socket, trustee_verify, unlock, write
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
 
 fn main() -> ExitCode {
-    if std::env::args().nth(1).as_deref() == Some("--probe-ready") {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some("--bind-mount-into-ns") {
+        return match run_bind_mount_into_ns(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("enclava-init namespace bind: {e:#}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    if args.first().map(String::as_str) == Some("--probe-ready") {
         return if ready_file_exists(&ready_file_path()) {
             ExitCode::SUCCESS
         } else {
@@ -45,10 +56,11 @@ fn run() -> Result<()> {
     let cfg = Config::load(&cfg_path).with_context(|| format!("loading {}", cfg_path.display()))?;
     let stay_alive = stay_alive_enabled();
     let ready_file = ready_file_path();
+    let mut workload_namespaces = Vec::new();
     if stay_alive {
         clear_ready_file(&ready_file)
             .with_context(|| format!("clearing stale ready file {}", ready_file.display()))?;
-        wait_for_container_start_sentinels()
+        workload_namespaces = wait_for_container_start_sentinels()
             .context("waiting for workload containers to start before mounting LUKS")?;
     }
 
@@ -74,6 +86,11 @@ fn run() -> Result<()> {
     }
 
     write_per_component_seeds(&cfg, &owner)?;
+
+    if stay_alive {
+        bind_mounts_into_workload_namespaces(&cfg, &workload_namespaces)
+            .context("binding decrypted mounts into workload namespaces")?;
+    }
 
     if stay_alive {
         mark_ready_file(&ready_file)
@@ -107,7 +124,13 @@ fn started_dir_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/run/enclava/containers"))
 }
 
-fn wait_for_container_start_sentinels() -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkloadNamespace {
+    name: String,
+    pid: u32,
+}
+
+fn wait_for_container_start_sentinels() -> Result<Vec<WorkloadNamespace>> {
     let names = std::env::var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS").unwrap_or_default();
     let containers = names
         .split(',')
@@ -116,7 +139,7 @@ fn wait_for_container_start_sentinels() -> Result<()> {
         .map(validate_sentinel_name)
         .collect::<Result<Vec<_>>>()?;
     if containers.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let dir = started_dir_path();
@@ -125,21 +148,59 @@ fn wait_for_container_start_sentinels() -> Result<()> {
         containers = containers.join(","),
         "waiting for workload containers to start before opening LUKS"
     );
+    let wait_timeout = container_start_wait_timeout();
+    let deadline = std::time::Instant::now() + wait_timeout;
     loop {
-        let missing = containers
-            .iter()
-            .filter(|name| !ready_file_exists(&dir.join(name.as_str())))
-            .cloned()
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            return Ok(());
+        let mut pending = Vec::new();
+        let mut namespaces = Vec::new();
+        for name in &containers {
+            let sentinel = dir.join(name);
+            match read_sentinel_pid(&sentinel) {
+                Ok(pid) => namespaces.push(WorkloadNamespace {
+                    name: name.clone(),
+                    pid,
+                }),
+                Err(err) => pending.push(format!("{name}: {err}")),
+            }
         }
+        if pending.is_empty() {
+            return Ok(namespaces);
+        }
+        let pending_text = pending.join(", ");
         tracing::debug!(
-            missing = missing.join(","),
+            pending = %pending_text,
             "workload containers not started yet"
         );
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "timed out after {}s waiting for workload container sentinels: {}",
+                wait_timeout.as_secs(),
+                pending_text
+            ));
+        }
         std::thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn container_start_wait_timeout() -> Duration {
+    std::env::var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(300))
+}
+
+fn read_sentinel_pid(path: &Path) -> Result<u32> {
+    let text = std::fs::read_to_string(path)?;
+    let pid = text
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| anyhow!("sentinel does not contain a numeric pid"))?;
+    if !Path::new(&format!("/proc/{pid}/ns/mnt")).exists() {
+        return Err(anyhow!("sentinel pid {pid} has no mount namespace"));
+    }
+    Ok(pid)
 }
 
 fn validate_sentinel_name(name: &str) -> Result<String> {
@@ -299,6 +360,111 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
             .with_context(|| format!("chown {}", dir.display()))?;
     }
 
+    Ok(())
+}
+
+fn bind_mounts_into_workload_namespaces(
+    cfg: &Config,
+    workloads: &[WorkloadNamespace],
+) -> Result<()> {
+    if dev_no_luks_override() {
+        tracing::warn!("ENCLAVA_INIT_DEV_NO_LUKS=true — skipping workload namespace bind mounts");
+        return Ok(());
+    }
+
+    let self_pid = std::process::id();
+    for workload in workloads {
+        bind_for_workload(cfg, self_pid, workload)?;
+    }
+    Ok(())
+}
+
+fn bind_for_workload(cfg: &Config, self_pid: u32, workload: &WorkloadNamespace) -> Result<()> {
+    let mut mounts = Vec::new();
+    if workload.name == "tenant-ingress" {
+        mounts.push((
+            namespace_source(self_pid, &cfg.state.mount_path),
+            PathBuf::from(&cfg.state.mount_path),
+        ));
+        mounts.push((
+            namespace_source(self_pid, &cfg.tls_state.mount_path),
+            PathBuf::from(&cfg.tls_state.mount_path),
+        ));
+    } else {
+        mounts.push((
+            namespace_source(self_pid, &cfg.state.mount_path),
+            PathBuf::from(&cfg.state.mount_path),
+        ));
+        for bind in &cfg.app_bind_mounts {
+            mounts.push((
+                namespace_source(
+                    self_pid,
+                    &app_bind_mount_dir(Path::new(&cfg.state.mount_path), &bind.subdir)?
+                        .to_string_lossy(),
+                ),
+                PathBuf::from(&bind.mount_path),
+            ));
+        }
+    }
+
+    for (source, target) in mounts {
+        bind_mount_into_namespace(workload.pid, &source, &target).with_context(|| {
+            format!(
+                "binding {} to {} in {} pid {}",
+                source.display(),
+                target.display(),
+                workload.name,
+                workload.pid
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn namespace_source(pid: u32, mount_path: &str) -> PathBuf {
+    let rel = mount_path.trim_start_matches('/');
+    PathBuf::from(format!("/proc/{pid}/root/{rel}"))
+}
+
+fn bind_mount_into_namespace(pid: u32, source: &Path, target: &Path) -> Result<()> {
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .arg("--bind-mount-into-ns")
+        .arg(pid.to_string())
+        .arg(source)
+        .arg(target)
+        .status()
+        .with_context(|| format!("spawning namespace binder for pid {pid}"))?;
+    if !status.success() {
+        return Err(anyhow!("namespace binder exited with {status}"));
+    }
+    Ok(())
+}
+
+fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
+    if args.len() != 3 {
+        return Err(anyhow!(
+            "--bind-mount-into-ns requires <pid> <source> <target>"
+        ));
+    }
+    let pid = args[0]
+        .parse::<u32>()
+        .map_err(|_| anyhow!("invalid pid {}", args[0]))?;
+    let source = PathBuf::from(&args[1]);
+    let target = PathBuf::from(&args[2]);
+    let ns = std::fs::File::open(format!("/proc/{pid}/ns/mnt"))
+        .with_context(|| format!("opening mount namespace for pid {pid}"))?;
+    nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNS)
+        .with_context(|| format!("setns to pid {pid} mount namespace"))?;
+    std::fs::create_dir_all(&target)
+        .with_context(|| format!("creating target {}", target.display()))?;
+    nix::mount::mount(
+        Some(source.as_path()),
+        target.as_path(),
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
+        None::<&str>,
+    )
+    .with_context(|| format!("bind mounting {} to {}", source.display(), target.display()))?;
     Ok(())
 }
 
