@@ -13,35 +13,50 @@ use crate::types::ConfidentialApp;
 pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
     let mut hard = BTreeMap::new();
 
-    // CPU. ResourceQuota admission accounts every container plus RuntimeClass
-    // overhead. Keep these constants aligned with manifest/containers.rs and
-    // the kata-qemu-snp RuntimeClass used by the StatefulSet.
+    // CPU. ResourceQuota admission accounts the sum of regular containers,
+    // the largest init container, and RuntimeClass overhead. Keep these
+    // constants aligned with manifest/containers.rs and the kata-qemu-snp
+    // RuntimeClass used by the StatefulSet.
     hard.insert(
         "requests.cpu".to_string(),
-        Quantity(sum_cpu_quantities(&["250m", "100m", "100m", "1"])),
+        Quantity(sum_cpu_quantities(&[
+            "250m", // workload
+            "100m", // tenant-ingress
+            "50m",  // enclava-init sidecar
+            "100m", // max init container: attestation-proxy
+            "1",    // kata-qemu-snp overhead
+        ])),
     );
     hard.insert(
         "limits.cpu".to_string(),
         Quantity(sum_cpu_quantities(&[
-            &app.resources.cpu,
-            "500m",
-            "500m",
-            "1",
+            &app.resources.cpu, // workload
+            "500m",             // tenant-ingress
+            "250m",             // enclava-init sidecar
+            "500m",             // max init container: attestation-proxy
+            "1",                // kata-qemu-snp overhead
         ])),
     );
 
     // Memory. See CPU note above.
     hard.insert(
         "requests.memory".to_string(),
-        Quantity(sum_memory_quantities(&["512Mi", "128Mi", "128Mi", "4Gi"])),
+        Quantity(sum_memory_quantities(&[
+            "512Mi", // workload
+            "128Mi", // tenant-ingress
+            "64Mi",  // enclava-init sidecar
+            "128Mi", // max init container: attestation-proxy
+            "4Gi",   // kata-qemu-snp overhead
+        ])),
     );
     hard.insert(
         "limits.memory".to_string(),
         Quantity(sum_memory_quantities(&[
-            &app.resources.memory,
-            "256Mi",
-            "256Mi",
-            "4Gi",
+            &app.resources.memory, // workload
+            "256Mi",               // tenant-ingress
+            "128Mi",               // enclava-init sidecar
+            "256Mi",               // max init container: attestation-proxy
+            "4Gi",                 // kata-qemu-snp overhead
         ])),
     );
 

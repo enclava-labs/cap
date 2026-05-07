@@ -17,8 +17,8 @@ fn resource_quota_has_cpu_limits() {
     let app = sample_app();
     let rq = generate_resource_quota(&app);
     let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
-    assert_eq!(hard.get("requests.cpu").unwrap().0, "1450m");
-    assert_eq!(hard.get("limits.cpu").unwrap().0, "3");
+    assert_eq!(hard.get("requests.cpu").unwrap().0, "1500m");
+    assert_eq!(hard.get("limits.cpu").unwrap().0, "3250m");
 }
 
 #[test]
@@ -26,8 +26,8 @@ fn resource_quota_has_memory_limits() {
     let app = sample_app();
     let rq = generate_resource_quota(&app);
     let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
-    assert_eq!(hard.get("requests.memory").unwrap().0, "4864Mi");
-    assert_eq!(hard.get("limits.memory").unwrap().0, "5632Mi");
+    assert_eq!(hard.get("requests.memory").unwrap().0, "4928Mi");
+    assert_eq!(hard.get("limits.memory").unwrap().0, "5760Mi");
 }
 
 #[test]
