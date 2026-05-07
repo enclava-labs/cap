@@ -1,7 +1,6 @@
 //! Volume + VCT shape tests. Phase 5 default: unlock-socket emptyDir,
-//! shared decrypted mountpoint EmptyDirs, static wait/exec helper EmptyDir,
-//! enclava-init-config ConfigMap volume, no Cloudflare-token secret. PVCs stay
-//! raw Block devices for LUKS.
+//! shared decrypted mountpoint EmptyDirs, enclava-init-config ConfigMap volume,
+//! no Cloudflare-token secret. PVCs stay raw Block devices for LUKS.
 
 use enclava_engine::manifest::volumes::{build_volume_claim_templates, build_volumes};
 use enclava_engine::testutil::sample_app;
@@ -46,17 +45,16 @@ fn volumes_has_startup_fallback_configmap() {
 }
 
 #[test]
-fn volumes_has_enclava_tools_emptydir() {
-    let vols = build_volumes(&sample_app());
-    let v = vols.iter().find(|v| v.name == "enclava-tools").unwrap();
-    assert!(v.empty_dir.is_some());
-}
-
-#[test]
 fn volumes_have_shared_decrypted_mountpoints() {
     let vols = build_volumes(&sample_app());
     assert!(vols.iter().any(|v| v.name == "state-mount"));
     assert!(vols.iter().any(|v| v.name == "tls-state-mount"));
+}
+
+#[test]
+fn volumes_do_not_include_enclava_tools_emptydir() {
+    let vols = build_volumes(&sample_app());
+    assert!(vols.iter().all(|v| v.name != "enclava-tools"));
 }
 
 #[test]

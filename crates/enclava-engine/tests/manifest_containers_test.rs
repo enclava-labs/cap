@@ -5,7 +5,7 @@
 
 use enclava_engine::manifest::containers::{
     ENCLAVA_WAIT_EXEC_PATH, build_app_container, build_attestation_proxy_container,
-    build_caddy_container, build_enclava_init_container, build_enclava_tools_container,
+    build_caddy_container, build_enclava_init_container,
 };
 use enclava_engine::testutil::sample_app;
 
@@ -45,6 +45,7 @@ fn app_container_starts_under_wait_wrapper() {
         c.command.as_ref().unwrap(),
         &vec![ENCLAVA_WAIT_EXEC_PATH.to_string()]
     );
+    assert_eq!(ENCLAVA_WAIT_EXEC_PATH, "/usr/local/bin/enclava-wait-exec");
     let env = c.env.as_ref().unwrap();
     assert_eq!(
         env.iter()
@@ -56,7 +57,7 @@ fn app_container_starts_under_wait_wrapper() {
     );
     let vm = c.volume_mounts.as_ref().unwrap();
     assert!(vm.iter().any(|m| m.name == "startup"));
-    assert!(vm.iter().any(|m| m.name == "enclava-tools"));
+    assert!(vm.iter().all(|m| m.name != "enclava-tools"));
     assert!(vm.iter().any(|m| m.name == "unlock-socket"));
 }
 
@@ -197,12 +198,14 @@ fn caddy_container_command_is_argv_not_shell() {
 }
 
 #[test]
-fn caddy_container_mounts_static_wait_exec_helper() {
+fn caddy_container_uses_in_image_static_wait_exec_helper() {
     let c = build_caddy_container(&sample_app());
+    assert_eq!(
+        c.command.as_ref().unwrap(),
+        &vec!["/usr/local/bin/enclava-wait-exec".to_string()]
+    );
     let vm = c.volume_mounts.as_ref().unwrap();
-    let m = vm.iter().find(|m| m.name == "enclava-tools").unwrap();
-    assert_eq!(m.mount_path, "/enclava-tools");
-    assert_eq!(m.read_only, Some(true));
+    assert!(vm.iter().all(|m| m.name != "enclava-tools"));
 }
 
 #[test]
@@ -244,27 +247,6 @@ fn caddy_container_reads_seed_from_state_caddy() {
 }
 
 // === enclava-init mounter sidecar ===
-
-#[test]
-fn enclava_tools_container_installs_static_wait_exec_helper() {
-    let c = build_enclava_tools_container(&sample_app());
-    assert_eq!(c.name, "enclava-tools");
-    assert_eq!(
-        c.command.as_ref().unwrap(),
-        &vec!["/bin/sh".to_string(), "-ec".to_string()]
-    );
-    assert!(
-        c.args
-            .as_ref()
-            .unwrap()
-            .iter()
-            .any(|arg| arg.contains("/usr/local/bin/enclava-wait-exec"))
-    );
-    let sc = c.security_context.as_ref().unwrap();
-    assert_eq!(sc.privileged, Some(false));
-    let caps = sc.capabilities.as_ref().unwrap();
-    assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
-}
 
 #[test]
 fn enclava_init_container_is_mounter_sidecar_and_keeps_only_sys_admin() {

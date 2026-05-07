@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use crate::manifest::cc_init_data;
 use crate::manifest::containers::{
     build_app_container, build_attestation_proxy_container, build_caddy_container,
-    build_enclava_init_container, build_enclava_tools_container, legacy_bootstrap_enabled,
+    build_enclava_init_container, legacy_bootstrap_enabled,
 };
 use crate::manifest::volumes::{build_volume_claim_templates, build_volumes};
 use crate::types::ConfidentialApp;
@@ -65,15 +65,12 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     );
     sts_labels.insert("app".to_string(), app.name.clone());
 
-    // Phase 5 split: attestation-proxy runs as a native Kubernetes sidecar
-    // (initContainer with restartPolicy=Always; requires K8s >=1.28 where
-    // sidecar containers are stable). A one-shot tools initContainer installs
-    // the static wait/exec helper. App and caddy start under that helper and
-    // signal enclava-init. enclava-init then opens LUKS, runs the in-TEE
-    // Trustee policy verification chain, writes per-component seeds, marks
-    // ready, and stays alive as the mount propagation source. Live Kata
-    // SEV-SNP validation showed creating later containers after the LUKS mount
-    // exists fails with EINVAL.
+    // Stateful Kata SEV-SNP pods must not gate workload creation through
+    // initContainers. Live validation showed the reliable contract is to start
+    // all long-running containers together, let app/caddy wait under
+    // `enclava-wait-exec`, then have enclava-init open LUKS and mark ready.
+    // Customer workload images are therefore required to include
+    // /usr/local/bin/enclava-wait-exec.
     let (init_containers, containers) = if legacy {
         (
             None,
@@ -84,12 +81,11 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
             ],
         )
     } else {
-        let mut proxy = build_attestation_proxy_container(app);
-        proxy.restart_policy = Some("Always".to_string());
         (
-            Some(vec![proxy, build_enclava_tools_container(app)]),
+            None,
             vec![
                 build_app_container(app),
+                build_attestation_proxy_container(app),
                 build_caddy_container(app),
                 build_enclava_init_container(app),
             ],

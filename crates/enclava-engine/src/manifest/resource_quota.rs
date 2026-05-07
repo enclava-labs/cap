@@ -13,17 +13,17 @@ use crate::types::ConfidentialApp;
 pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
     let mut hard = BTreeMap::new();
 
-    // CPU. ResourceQuota admission accounts the sum of regular containers,
-    // the largest init container, and RuntimeClass overhead. Keep these
-    // constants aligned with manifest/containers.rs and the kata-qemu-snp
-    // RuntimeClass used by the StatefulSet.
+    // CPU. ResourceQuota admission accounts the sum of regular containers and
+    // RuntimeClass overhead. Keep these constants aligned with
+    // manifest/containers.rs and the kata-qemu-snp RuntimeClass used by the
+    // StatefulSet.
     hard.insert(
         "requests.cpu".to_string(),
         Quantity(sum_cpu_quantities(&[
             "250m", // workload
+            "100m", // attestation-proxy
             "100m", // tenant-ingress
             "50m",  // enclava-init sidecar
-            "100m", // max init container: attestation-proxy
             "1",    // kata-qemu-snp overhead
         ])),
     );
@@ -31,9 +31,9 @@ pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
         "limits.cpu".to_string(),
         Quantity(sum_cpu_quantities(&[
             &app.resources.cpu, // workload
+            "500m",             // attestation-proxy
             "500m",             // tenant-ingress
             "250m",             // enclava-init sidecar
-            "500m",             // max init container: attestation-proxy
             "1",                // kata-qemu-snp overhead
         ])),
     );
@@ -43,9 +43,9 @@ pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
         "requests.memory".to_string(),
         Quantity(sum_memory_quantities(&[
             "512Mi", // workload
+            "128Mi", // attestation-proxy
             "128Mi", // tenant-ingress
             "64Mi",  // enclava-init sidecar
-            "128Mi", // max init container: attestation-proxy
             "4Gi",   // kata-qemu-snp overhead
         ])),
     );
@@ -53,9 +53,9 @@ pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
         "limits.memory".to_string(),
         Quantity(sum_memory_quantities(&[
             &app.resources.memory, // workload
+            "256Mi",               // attestation-proxy
             "256Mi",               // tenant-ingress
             "128Mi",               // enclava-init sidecar
-            "256Mi",               // max init container: attestation-proxy
             "4Gi",                 // kata-qemu-snp overhead
         ])),
     );

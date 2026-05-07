@@ -97,9 +97,9 @@ fn generate_all_manifests_returns_all_resources() {
 
     // StatefulSet
     assert_eq!(m.statefulset.metadata.name.as_deref(), Some("test-app"));
-    // Phase 5: native sidecar proxy + one-shot tools installer in
-    // initContainers, then 3 steady-state containers (app + caddy +
-    // enclava-init mounter).
+    // Phase 5: stateful Kata SEV-SNP uses normal steady-state containers only.
+    // App/caddy carry the wait helper in their images; attestation-proxy and
+    // enclava-init run as regular sidecars.
     let pod = m
         .statefulset
         .spec
@@ -109,15 +109,13 @@ fn generate_all_manifests_returns_all_resources() {
         .spec
         .as_ref()
         .unwrap();
-    assert_eq!(pod.containers.len(), 3);
-    let init_names: Vec<&str> = pod
-        .init_containers
-        .as_ref()
-        .unwrap()
-        .iter()
-        .map(|c| c.name.as_str())
-        .collect();
-    assert_eq!(init_names, vec!["attestation-proxy", "enclava-tools"]);
+    assert_eq!(pod.containers.len(), 4);
+    assert!(pod.init_containers.is_none());
+    let names: Vec<&str> = pod.containers.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"web"));
+    assert!(names.contains(&"attestation-proxy"));
+    assert!(names.contains(&"tenant-ingress"));
+    assert!(names.contains(&"enclava-init"));
 
     // enclava-init ConfigMap is generated.
     assert_eq!(

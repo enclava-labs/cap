@@ -28,10 +28,10 @@ The checked-in `crates/enclava-init/Dockerfile` installs `libcryptsetup12` and
 `e2fsprogs`.
 
 The same image also carries `/usr/local/bin/enclava-wait-exec`, a static musl
-helper copied into a shared `enclava-tools` EmptyDir before workload containers
-start. Workload containers execute that helper instead of a shell script: it
-writes `/run/enclava/containers/<name>`, waits for `/run/enclava/init-ready`,
-then `exec`s the original workload argv.
+helper. Workload and platform sidecar images that CAP wraps must include an
+executable at the same path. The helper writes
+`/run/enclava/containers/<name>`, waits for `/run/enclava/init-ready`, then
+`exec`s the original workload argv.
 
 ## Configuration
 
@@ -42,9 +42,9 @@ Loaded from `/etc/enclava-init/config.toml` (override via
 Two raw Block PVCs are always opened: the durable app/state device
 (`/dev/csi0` mapped to `cap-state`, mounted at `/state`) and the disposable
 tls-state device (`/dev/csi1` mapped to `cap-tls-state`, mounted at
-`/state/tls-state`). The initContainer mounts those decrypted filesystems into
-shared mountpoint volumes with mount propagation; app and Caddy never receive
-the raw block devices.
+`/state/tls-state`). The `enclava-init` sidecar mounts those decrypted
+filesystems into shared mountpoint volumes with mount propagation; app and
+Caddy never receive the raw block devices.
 
 ## Modes
 

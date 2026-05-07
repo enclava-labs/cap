@@ -17,7 +17,8 @@ that gates app startup until after the mount.
 
 The viable contract is:
 
-1. Start workload containers first under a small wait wrapper.
+1. Start workload containers first under a small wait wrapper. For CAP
+   stateful pods, this means no initContainers in the Block PVC/LUKS path.
 2. Each workload wrapper writes `/run/enclava/containers/<name>` and waits for
    `/run/enclava/init-ready`.
 3. The privileged `enclava-init` mounter sidecar waits for those sentinels,
@@ -49,9 +50,8 @@ The viable contract is:
 - Use the app/caddy-starts-first wait-wrapper plus long-running mounter sidecar
   pattern.
 - Keep app/caddy unprivileged and without raw block devices.
-- Treat the POSIX-shell wait wrapper as a v1 portability caveat; shell-less
-  workload images need a future static wait-exec helper or an explicit
-  workload command contract.
+- Workload images, and platform sidecar images that CAP wraps, must include an
+  executable at `/usr/local/bin/enclava-wait-exec`.
 - Add this smoke as a CI/manual gate for each Kata or guest-kernel version bump.
 
 ## Sources

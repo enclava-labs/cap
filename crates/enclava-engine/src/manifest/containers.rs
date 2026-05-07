@@ -2,13 +2,12 @@
 //!
 //! Phase 5 introduces a fourth container `enclava-init` (Rust replacement for
 //! bootstrap_script.sh) and reshapes app/caddy to drop privileged + shell
-//! interpolation. A one-shot `enclava-tools` initContainer installs the static
-//! `enclava-wait-exec` helper into a shared tools volume; app/caddy processes
-//! start under that argv-preserving helper, then `enclava-init` opens LUKS and
-//! stays alive as the mount propagation source. The legacy bootstrap_script.sh
-//! path is still emittable behind the `LEGACY_BOOTSTRAP_SCRIPT=true` env var so
-//! existing pods can be reconciled without disruption; new deploys default to
-//! the enclava-init shape.
+//! interpolation. App/caddy processes start under an argv-preserving
+//! `enclava-wait-exec` helper that must already exist in their images, then
+//! `enclava-init` opens LUKS and stays alive as the mount propagation source.
+//! The legacy bootstrap_script.sh path is still emittable behind the
+//! `LEGACY_BOOTSTRAP_SCRIPT=true` env var so existing pods can be reconciled
+//! without disruption; new deploys default to the enclava-init shape.
 
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EnvVar, ExecAction, Probe, SecurityContext,
@@ -44,7 +43,7 @@ pub fn enclava_init_image() -> String {
     image
 }
 
-pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
+pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
 
 fn ownership_mode_str(mode: UnlockMode) -> &'static str {
     match mode {
@@ -189,12 +188,6 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             ..Default::default()
         });
         volume_mounts.push(VolumeMount {
-            name: "enclava-tools".to_string(),
-            mount_path: "/enclava-tools".to_string(),
-            read_only: Some(true),
-            ..Default::default()
-        });
-        volume_mounts.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),
             ..Default::default()
@@ -320,56 +313,6 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
     }
 }
 
-/// Build the one-shot tools installer initContainer.
-///
-/// The workload images may not have `/bin/sh`, so app/caddy do not run a shell
-/// wrapper. This container copies a static helper from the enclava-init image
-/// into an EmptyDir mounted by the workload containers.
-pub fn build_enclava_tools_container(_app: &ConfidentialApp) -> Container {
-    Container {
-        name: "enclava-tools".to_string(),
-        image: Some(enclava_init_image()),
-        command: Some(vec!["/bin/sh".to_string(), "-ec".to_string()]),
-        args: Some(vec![
-            "cp /usr/local/bin/enclava-wait-exec /enclava-tools/enclava-wait-exec && chmod 0555 /enclava-tools/enclava-wait-exec".to_string(),
-        ]),
-        volume_mounts: Some(vec![VolumeMount {
-            name: "enclava-tools".to_string(),
-            mount_path: "/enclava-tools".to_string(),
-            ..Default::default()
-        }]),
-        security_context: Some(SecurityContext {
-            privileged: Some(false),
-            allow_privilege_escalation: Some(false),
-            run_as_user: Some(0),
-            run_as_group: Some(0),
-            run_as_non_root: Some(false),
-            read_only_root_filesystem: Some(true),
-            capabilities: Some(Capabilities {
-                drop: Some(vec!["ALL".to_string()]),
-                add: None,
-            }),
-            ..Default::default()
-        }),
-        resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
-            requests: Some({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity("16Mi".to_string()));
-                m.insert("cpu".to_string(), Quantity("10m".to_string()));
-                m
-            }),
-            limits: Some({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity("32Mi".to_string()));
-                m.insert("cpu".to_string(), Quantity("50m".to_string()));
-                m
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
 /// Build the enclava-init mounter sidecar (Phase 5).
 ///
 /// Performs Argon2id-based unlock or KBS autounlock, opens both LUKS block
@@ -377,8 +320,9 @@ pub fn build_enclava_tools_container(_app: &ConfidentialApp) -> Container {
 /// the Trustee policy verification chain, writes per-component HKDF seeds to
 /// /state/{caddy,app}/seed, marks itself ready, and then stays alive. Live
 /// Kata SEV-SNP validation showed containers must already be started before
-/// the LUKS mount is created, so app/caddy start under `enclava-wait-exec` and
-/// signal this sidecar before it opens the devices.
+/// the LUKS mount is created, so app/caddy start under an in-image
+/// `enclava-wait-exec` helper and signal this sidecar before it opens the
+/// devices.
 ///
 /// The sidecar needs device-mapper and mount propagation rights. App and
 /// caddy remain unprivileged and only consume the decrypted mountpoints.
@@ -699,12 +643,6 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             ..Default::default()
         });
     } else {
-        volume_mounts.push(VolumeMount {
-            name: "enclava-tools".to_string(),
-            mount_path: "/enclava-tools".to_string(),
-            read_only: Some(true),
-            ..Default::default()
-        });
         volume_mounts.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),

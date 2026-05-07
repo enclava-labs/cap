@@ -184,30 +184,29 @@ fn statefulset_has_kernel_params_annotation() {
 }
 
 #[test]
-fn statefulset_phase5_split_init_and_steady_state_containers() {
-    // Phase 5: attestation-proxy is a native sidecar initContainer. A one-shot
-    // tools initContainer installs the static wait/exec helper. App/caddy start
-    // under that helper, then enclava-init runs as the mounter sidecar.
+fn statefulset_phase5_uses_only_steady_state_containers() {
+    // Stateful Kata SEV-SNP pods use normal containers only: app/caddy start
+    // under their in-image wait helper, attestation-proxy is a normal sidecar,
+    // and enclava-init is the long-running mounter sidecar.
     let app = sample_app();
     let sts = generate_statefulset(&app);
     let pod = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
 
-    let init = pod.init_containers.as_ref().unwrap();
-    let init_names: Vec<&str> = init.iter().map(|c| c.name.as_str()).collect();
-    assert!(init_names.contains(&"attestation-proxy"));
-    assert!(init_names.contains(&"enclava-tools"));
-    assert!(!init_names.contains(&"enclava-init"));
-
-    let proxy = init.iter().find(|c| c.name == "attestation-proxy").unwrap();
-    assert_eq!(proxy.restart_policy.as_deref(), Some("Always"));
-    let tools = init.iter().find(|c| c.name == "enclava-tools").unwrap();
-    assert!(tools.restart_policy.is_none());
+    assert!(pod.init_containers.is_none());
 
     let names: Vec<&str> = pod.containers.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"web"));
+    assert!(names.contains(&"attestation-proxy"));
     assert!(names.contains(&"tenant-ingress"));
     assert!(names.contains(&"enclava-init"));
-    assert!(!names.contains(&"attestation-proxy"));
+    assert_eq!(names.len(), 4);
+
+    let proxy = pod
+        .containers
+        .iter()
+        .find(|c| c.name == "attestation-proxy")
+        .unwrap();
+    assert!(proxy.restart_policy.is_none());
 }
 
 #[test]
@@ -263,7 +262,7 @@ fn statefulset_has_volumes() {
         .unwrap();
     assert!(volumes.iter().any(|v| v.name == "ownership-signal"));
     assert!(volumes.iter().any(|v| v.name == "unlock-socket"));
-    assert!(volumes.iter().any(|v| v.name == "enclava-tools"));
+    assert!(volumes.iter().all(|v| v.name != "enclava-tools"));
     assert!(volumes.iter().any(|v| v.name == "enclava-init-config"));
     // Phase 5 default does not mount Cloudflare DNS-01 token nor the legacy bootstrap script.
     assert!(volumes.iter().all(|v| v.name != "tls-cloudflare-token"));

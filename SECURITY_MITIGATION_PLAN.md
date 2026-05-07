@@ -235,7 +235,7 @@ The remaining critical-path work splits between in-repo phases (above) and **out
 | Trustee has attestation-gated workload-resource write API for `*-owner` resources | `trustee/kbs/src/api_server.rs:457-600, 495, 481` |
 | `replace_bindings_block` preserves operator-written policy outside CAP markers | `cap/crates/enclava-api/src/kbs.rs:615-679` |
 | Cosign verifier uses platform pubkey only | `cap/crates/enclava-api/src/cosign.rs:114, 179` |
-| Tenant pod is StatefulSet, replicas=1; attestation-proxy is a native sidecar initContainer; one-shot `enclava-tools` installs static wait-exec; app/caddy start under that helper; `enclava-init` is the long-running LUKS mounter sidecar | `cap/crates/enclava-engine/src/manifest/{statefulset.rs,containers.rs,volumes.rs}`; `cap/crates/enclava-wait-exec/src/main.rs` |
+| Tenant pod is StatefulSet, replicas=1; attestation-proxy is a regular sidecar; app/caddy start under `/usr/local/bin/enclava-wait-exec` supplied by their images; `enclava-init` is the long-running LUKS mounter sidecar; the stateful Block PVC path uses no initContainers | `cap/crates/enclava-engine/src/manifest/{statefulset.rs,containers.rs,volumes.rs}`; `cap/crates/enclava-wait-exec/src/main.rs` |
 | App container drops privileged + SYS_ADMIN and waits on `/run/enclava/init-ready` before execing the workload argv | `cap/crates/enclava-engine/src/manifest/containers.rs`; `cap/crates/enclava-wait-exec/src/main.rs` |
 | Caddy drops privileged + SYS_ADMIN, keeps only NET_BIND_SERVICE, and waits on `/run/enclava/init-ready` before execing Caddy | `cap/crates/enclava-engine/src/manifest/containers.rs`; `cap/crates/enclava-wait-exec/src/main.rs` |
 | Attestation-proxy non-root by default, internal HTTP on 8081, external TLS on 8443 | `cap/crates/enclava-engine/src/manifest/containers.rs`; `attestation-proxy/src/main.rs` |
@@ -286,17 +286,17 @@ The remaining critical-path work splits between in-repo phases (above) and **out
 ### D3. Pod layout (rev5: attestation-proxy is also the steady-state receipt signer)
 ```
 Pod (StatefulSet, replicas=1)
-├── attestation-proxy   (native sidecar: initContainer with restartPolicy=Always)
+├── attestation-proxy   (regular sidecar container)
 │                        listens HTTP 8081 for in-pod sidecars and TLS 8443
 │                        for the Service's external attestation port;
 │                        self-signed cert, SPKI bound in SNP report_data;
 │                        long-lived; OWNS THE RECEIPT-SIGNING ROLE for Phase 10
 ├── caddy               (regular container, drops privileged + SYS_ADMIN)
-│                        starts under /enclava-tools/enclava-wait-exec,
+│                        starts under /usr/local/bin/enclava-wait-exec,
 │                        signals it is running, then waits for /run/enclava/init-ready
 │                        listens 443, ACME TLS-ALPN-01, reads /state/caddy/seed
 ├── app                 (regular container, drops privileged + SYS_ADMIN)
-│                        starts under /enclava-tools/enclava-wait-exec,
+│                        starts under /usr/local/bin/enclava-wait-exec,
 │                        signals it is running, then waits for /run/enclava/init-ready
 │                        reads /state/app/seed
 └── enclava-init        (long-running mounter sidecar)
@@ -1020,7 +1020,7 @@ Caddy/HAProxy config: structured builders, no `format!` of validated user input.
 
 ### Phase 5 — In-TEE unlock model: enclava-init + attestation-proxy with TLS (2.5–3 weeks)
 
-**Goal:** Replace the 646-line `bootstrap_script.sh` with Rust `enclava-init` unlock/mount logic. Move attestation-proxy to a native Kubernetes sidecar that terminates its own TLS with the attestation-bound self-signed cert. On the current Kata SNP runtime, app/caddy must start before the LUKS mount exists, so Phase 5 uses an argv-preserving static wait-exec helper for app/caddy and a long-running `enclava-init` mounter sidecar.
+**Goal:** Replace the 646-line `bootstrap_script.sh` with Rust `enclava-init` unlock/mount logic. Run attestation-proxy as a regular sidecar that terminates its own TLS with the attestation-bound self-signed cert. On the current Kata SNP runtime, app/caddy must start before the LUKS mount exists, so Phase 5 uses an argv-preserving static wait-exec helper from the app/caddy images and a long-running `enclava-init` mounter sidecar.
 
 **Findings addressed:** Highs around privileged root containers + SYS_ADMIN, runtime install, shell-interpolated user command.
 
@@ -1058,10 +1058,10 @@ attestation-proxy enhancements (separate `attestation-proxy` repo):
 This makes the receipt-signing primitive ship in Phase 5. Phase 6 uses it for rekey/teardown. Phase 10 uses it for unlock-mode transitions. The same per-pod ephemeral key signs all three receipt types; CE-v1's `purpose` label provides domain separation between them.
 
 Pod manifest (`crates/enclava-engine/src/manifest/`):
-- `statefulset.rs`: split into `initContainers` (attestation-proxy with `restartPolicy: Always`) and `containers` (app, caddy, long-running `enclava-init` mounter)
-- `containers.rs`: app/caddy drop `privileged: true` and `SYS_ADMIN`; they start under `/enclava-tools/enclava-wait-exec`, signal `/run/enclava/containers/<name>`, wait for `/run/enclava/init-ready`, then `exec` the original argv
+- `statefulset.rs`: render all stateful workload components as regular containers (app, attestation-proxy, caddy, long-running `enclava-init` mounter); the Block PVC/LUKS path intentionally has no initContainers
+- `containers.rs`: app/caddy drop `privileged: true` and `SYS_ADMIN`; they start under `/usr/local/bin/enclava-wait-exec` supplied by their images, signal `/run/enclava/containers/<name>`, wait for `/run/enclava/init-ready`, then `exec` the original argv
 - `containers.rs`: `enclava-init` waits for app/caddy sentinels, opens/mounts LUKS, writes seeds, marks ready, and stays alive as the mount propagation source
-- `volumes.rs`: add `emptyDir { medium: Memory }` `unlock-socket` mounted in attestation-proxy, app, caddy, and enclava-init at `/run/enclava`; add `enclava-tools` EmptyDir for the static wait-exec helper; keep startup ConfigMap only as a fallback for app images that provide no argv
+- `volumes.rs`: add `emptyDir { medium: Memory }` `unlock-socket` mounted in attestation-proxy, app, caddy, and enclava-init at `/run/enclava`; keep startup ConfigMap only as a fallback for app images that provide no argv
 
 Bootstrap script remnants:
 - Most of `bootstrap_script.sh` deleted
@@ -1788,7 +1788,7 @@ Rev9 surfaced 1 critical (the receipt-pubkey-binding-was-unrecoverable bug — I
 Biggest remaining unknowns:
 - **Trustee upstream cooperation** for signed-policy enforcement (Phase 3), receipt-gated writes (Phase 6), workload-attested policy read (rev9 finding #2), `receipt_pubkey_sha256` SNP-claim exposure (rev9 critical-fix consequence), SNP claim rename `init_data` → `init_data_hash` (rev11 finding #4), and the `POST /kbs/v0/attestation/verify` callback for the workload artifacts endpoint (rev14 finding #2). Six upstream patches stacked — the schedule risk continues to be Trustee maintainer coordination, not plan design.
 - **kata-containers/genpolicy version pinning** — platform release must pin a specific genpolicy version so customer descriptor → policy is reproducible across CLI and signing service
-- Phase 5 live Kata SNP LUKS/mount propagation is verified with app/caddy-starts-first + mounter-sidecar ordering; shell-less workload image support is addressed by the static `enclava-wait-exec` helper
+- Phase 5 live Kata SNP LUKS/mount propagation is verified with app/caddy-starts-first + mounter-sidecar ordering; customer/platform images that CAP wraps must include the static `enclava-wait-exec` helper
 - Let's Encrypt `validationmethods=tls-alpn-01` support for the platform's account (open decision #4)
 - Platform CI/CD signing infrastructure existence (open decision #14)
 - Existing operator-added rules in production Trustee policies (Phase 3 audit)
