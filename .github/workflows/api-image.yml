@@ -6,12 +6,14 @@ on:
     paths:
     - '.github/workflows/api-image.yml'
     - 'crates/enclava-api/**'
+    - 'crates/enclava-cli/platform-release.json'
     - 'crates/enclava-common/**'
     - 'crates/enclava-engine/**'
   pull_request:
     paths:
     - '.github/workflows/api-image.yml'
     - 'crates/enclava-api/**'
+    - 'crates/enclava-cli/platform-release.json'
     - 'crates/enclava-common/**'
     - 'crates/enclava-engine/**'
   workflow_dispatch:
