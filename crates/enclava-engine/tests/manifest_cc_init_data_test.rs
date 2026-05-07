@@ -134,10 +134,12 @@ fn data_claims_include_required_rego_descriptor_anchors() {
     );
     assert_eq!(data["runtime_class"].as_str().unwrap(), "kata-qemu-snp");
 
-    let sidecars = data
-        .get("sidecar_digests")
-        .and_then(toml::Value::as_table)
-        .unwrap();
+    let sidecars: serde_json::Value = serde_json::from_str(
+        data.get("sidecar_digests")
+            .and_then(toml::Value::as_str)
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         sidecars["attestation_proxy"].as_str().unwrap(),
         app.attestation.proxy_image.digest()
@@ -300,9 +302,10 @@ fn toml_binds_runtime_class() {
 fn toml_binds_sidecar_digests() {
     let app = sample_app();
     let toml = build_toml(&app);
-    assert!(toml.contains("[data.sidecar_digests]"));
-    assert!(toml.contains("attestation_proxy = \"sha256:1111"));
-    assert!(toml.contains("caddy_ingress = \"sha256:2222"));
+    assert!(toml.contains(
+        "sidecar_digests = '{\"attestation_proxy\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"caddy_ingress\":\"sha256:2222"
+    ));
+    assert!(!toml.contains("[data.sidecar_digests]"));
 }
 
 #[test]

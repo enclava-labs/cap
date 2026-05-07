@@ -140,17 +140,13 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
     toml.push_str(&identity_toml);
     toml.push_str("'''\n");
 
-    // Phase 11: bind sidecar digests so the customer-signed
-    // descriptor can chain `expected_cc_init_data_hash` to the exact runtime
-    // identity. enclava-init re-derives these and refuses to start on mismatch.
-    toml.push('\n');
-    toml.push_str("[data.sidecar_digests]\n");
+    // Phase 11: bind sidecar digests so the customer-signed descriptor can
+    // chain `expected_cc_init_data_hash` to the exact runtime identity. Kata's
+    // initdata parser expects every [data] value to be a string, so keep the
+    // structured claim as a JSON string instead of a nested TOML table.
     toml.push_str(&format!(
-        "attestation_proxy = \"{}\"\n",
-        app.attestation.proxy_image.digest()
-    ));
-    toml.push_str(&format!(
-        "caddy_ingress = \"{}\"\n",
+        "sidecar_digests = '{{\"attestation_proxy\":\"{}\",\"caddy_ingress\":\"{}\"}}'\n",
+        app.attestation.proxy_image.digest(),
         app.attestation.caddy_image.digest()
     ));
 

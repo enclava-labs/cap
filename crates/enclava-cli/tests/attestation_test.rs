@@ -80,10 +80,7 @@ service_account = "{}"
 identity_hash = "{}"
 signer_identity_subject = "{}"
 signer_identity_issuer = "{}"
-
-[data.sidecar_digests]
-attestation_proxy = "{}"
-caddy_ingress = "{}"
+sidecar_digests = '{{"attestation_proxy":"{}","caddy_ingress":"{}"}}'
 "#,
         descriptor.image_digest,
         descriptor.expected_runtime_class,

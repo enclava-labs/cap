@@ -396,11 +396,31 @@ fn parse_identity_hash(
 fn parse_sidecar_digests(
     data: &toml::map::Map<String, toml::Value>,
 ) -> Result<BTreeMap<String, String>, AttestationError> {
-    let table = data
+    let value = data
         .get("sidecar_digests")
-        .and_then(toml::Value::as_table)
         .ok_or(AttestationError::MissingClaim("sidecar_digests"))?;
-    Ok(table
+
+    if let Some(table) = value.as_table() {
+        return Ok(table
+            .iter()
+            .filter_map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|digest| (key.clone(), digest.to_string()))
+            })
+            .collect());
+    }
+
+    let Some(raw_json) = value.as_str() else {
+        return Err(AttestationError::MissingClaim("sidecar_digests"));
+    };
+    let parsed: serde_json::Value = serde_json::from_str(raw_json)
+        .map_err(|_| AttestationError::MissingClaim("sidecar_digests"))?;
+    let object = parsed
+        .as_object()
+        .ok_or(AttestationError::MissingClaim("sidecar_digests"))?;
+
+    Ok(object
         .iter()
         .filter_map(|(key, value)| {
             value
