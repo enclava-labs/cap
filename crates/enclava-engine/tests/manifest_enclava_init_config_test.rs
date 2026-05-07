@@ -41,7 +41,7 @@ fn config_toml_has_required_unlock_inputs() {
     let cm = generate_enclava_init_configmap(&sample_app());
     let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
     assert!(toml_text.contains("argon2-salt-hex = \""));
-    assert!(toml_text.contains("kbs-url = \"http://127.0.0.1:8081/cdh/resource\""));
+    assert!(toml_text.contains("kbs-url = \"http://127.0.0.1:8006/cdh/resource\""));
     assert!(toml_text.contains(
         "kbs-resource-path = \"default/cap-test-org-test-app-test-app-owner/seed-encrypted\""
     ));
@@ -68,7 +68,7 @@ fn config_toml_places_runtime_keys_at_document_root() {
 
     assert_eq!(
         root.get("kbs-url").and_then(toml::Value::as_str),
-        Some("http://127.0.0.1:8081/cdh/resource")
+        Some("http://127.0.0.1:8006/cdh/resource")
     );
     assert_eq!(
         root.get("kbs-resource-path").and_then(toml::Value::as_str),

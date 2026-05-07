@@ -777,6 +777,9 @@ mod tests {
             "http://127.0.0.1:8080/cdh/resource"
         ));
         assert!(!is_local_kbs_proxy_url(
+            "http://127.0.0.1:8006/cdh/resource"
+        ));
+        assert!(!is_local_kbs_proxy_url(
             "https://kbs.example.test/cdh/resource"
         ));
     }

@@ -1,5 +1,5 @@
 //! Autounlock-mode KBS read of the wrap key via the local Confidential Data
-//! Hub (CDH) endpoint exposed by the Kata agent / attestation-proxy.
+//! Hub (CDH) endpoint exposed by the Kata agent.
 //!
 //! The CDH endpoint forwards to Trustee with the workload's SNP attestation
 //! token. Trustee's resource policy gates release. This client is the
