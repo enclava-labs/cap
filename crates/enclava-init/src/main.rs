@@ -9,9 +9,13 @@ use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{kbs_fetch, luks, seeds, socket, trustee_verify, unlock, writes};
 
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
+const DEFAULT_ERROR_FILE: &str = "/run/enclava/init-error";
 const DEFAULT_KBS_PROXY_HEALTH_WAIT_SECONDS: u64 = 300;
 const DEFAULT_KBS_PROXY_HEALTH_POLL_SECONDS: u64 = 2;
 const KBS_PROXY_HEALTH_REQUEST_TIMEOUT_SECONDS: u64 = 5;
+const DEFAULT_KBS_FETCH_ATTEMPTS: u32 = 30;
+const DEFAULT_KBS_FETCH_RETRY_SLEEP_SECONDS: u64 = 2;
+const DEFAULT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS: u64 = 10;
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -45,6 +49,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            record_failure_file(&format!("{e:#}\n"));
             tracing::error!(error = %e, "enclava-init failed");
             eprintln!("enclava-init: {e:#}");
             ExitCode::from(1)
@@ -59,6 +64,7 @@ fn run() -> Result<()> {
     let cfg = Config::load(&cfg_path).with_context(|| format!("loading {}", cfg_path.display()))?;
     let stay_alive = stay_alive_enabled();
     let ready_file = ready_file_path();
+    clear_error_file(&error_file_path());
     let mut workload_namespaces = Vec::new();
     if stay_alive {
         clear_ready_file(&ready_file)
@@ -119,6 +125,12 @@ fn ready_file_path() -> PathBuf {
     std::env::var("ENCLAVA_INIT_READY_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_READY_FILE))
+}
+
+fn error_file_path() -> PathBuf {
+    std::env::var("ENCLAVA_INIT_ERROR_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ERROR_FILE))
 }
 
 fn started_dir_path() -> PathBuf {
@@ -225,6 +237,21 @@ fn clear_ready_file(path: &Path) -> Result<()> {
     }
 }
 
+fn clear_error_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(path = %path.display(), error = %e, "failed to clear error file"),
+    }
+}
+
+fn record_failure_file(message: &str) {
+    let path = error_file_path();
+    if let Err(err) = writes::atomic_write(&path, message.as_bytes(), 0o644) {
+        eprintln!("enclava-init: failed to write {}: {err}", path.display());
+    }
+}
+
 fn mark_ready_file(path: &Path) -> Result<()> {
     writes::atomic_write(path, b"ready\n", 0o644).map_err(Into::into)
 }
@@ -290,11 +317,44 @@ fn acquire_owner_seed_autounlock(cfg: &Config) -> Result<OwnerSeed> {
         .as_deref()
         .ok_or_else(|| anyhow!("autounlock mode requires kbs_resource_path"))?;
     wait_for_kbs_proxy_health_if_needed(url).context("waiting for local KBS proxy health")?;
-    let client = kbs_fetch::KbsClient::new(url.into(), path.into());
-    let wrap = client
-        .fetch_wrap_key()
-        .with_context(|| "fetching wrap key from KBS")?;
+    let mut client = kbs_fetch::KbsClient::new(url.into(), path.into());
+    client.timeout = kbs_fetch_request_timeout();
+    let wrap =
+        fetch_wrap_key_with_retries(&client).with_context(|| "fetching wrap key from KBS")?;
     Ok(OwnerSeed(*wrap.as_bytes()))
+}
+
+fn fetch_wrap_key_with_retries(
+    client: &kbs_fetch::KbsClient,
+) -> Result<enclava_init::secrets::WrapKey> {
+    let attempts = kbs_fetch_attempts();
+    let sleep = kbs_fetch_retry_sleep_interval();
+
+    for attempt in 1..=attempts {
+        match client.fetch_wrap_key() {
+            Ok(wrap_key) => return Ok(wrap_key),
+            Err(err) => {
+                let err_text = err.to_string();
+                if attempt == attempts {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "KBS fetch failed after {attempts} attempt(s); last error: {err_text}"
+                        )
+                    });
+                }
+                tracing::warn!(
+                    attempt,
+                    attempts,
+                    retry_sleep_seconds = sleep.as_secs(),
+                    error = %err_text,
+                    "KBS autounlock fetch failed; retrying"
+                );
+                std::thread::sleep(sleep);
+            }
+        }
+    }
+
+    Err(anyhow!("KBS fetch did not run"))
 }
 
 fn wait_for_kbs_proxy_health_if_needed(kbs_url: &str) -> Result<()> {
@@ -380,6 +440,35 @@ fn kbs_proxy_health_poll_interval() -> Duration {
         .and_then(parse_positive_seconds)
         .map(Duration::from_secs)
         .unwrap_or_else(|| Duration::from_secs(DEFAULT_KBS_PROXY_HEALTH_POLL_SECONDS))
+}
+
+fn kbs_fetch_attempts() -> u32 {
+    std::env::var("ENCLAVA_INIT_KBS_FETCH_RETRIES")
+        .ok()
+        .or_else(|| std::env::var("KBS_FETCH_RETRIES").ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|attempts| *attempts > 0)
+        .unwrap_or(DEFAULT_KBS_FETCH_ATTEMPTS)
+}
+
+fn kbs_fetch_retry_sleep_interval() -> Duration {
+    let seconds = std::env::var("ENCLAVA_INIT_KBS_FETCH_RETRY_SLEEP_SECONDS")
+        .ok()
+        .or_else(|| std::env::var("KBS_FETCH_RETRY_SLEEP_SECONDS").ok())
+        .as_deref()
+        .and_then(parse_positive_seconds)
+        .unwrap_or(DEFAULT_KBS_FETCH_RETRY_SLEEP_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+fn kbs_fetch_request_timeout() -> Duration {
+    let seconds = std::env::var("ENCLAVA_INIT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS")
+        .ok()
+        .or_else(|| std::env::var("KBS_FETCH_REQUEST_TIMEOUT_SECONDS").ok())
+        .as_deref()
+        .and_then(parse_positive_seconds)
+        .unwrap_or(DEFAULT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS);
+    Duration::from_secs(seconds)
 }
 
 fn parse_positive_seconds(value: &str) -> Option<u64> {

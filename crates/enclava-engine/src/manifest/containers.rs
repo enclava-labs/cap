@@ -334,11 +334,15 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             env("ENCLAVA_INIT_CONFIG", "/etc/enclava-init/config.toml"),
             env("ENCLAVA_INIT_STAY_ALIVE", "true"),
             env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
+            env("ENCLAVA_INIT_ERROR_FILE", "/run/enclava/init-error"),
             env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
             env(
                 "ENCLAVA_INIT_WAIT_FOR_CONTAINERS",
                 &format!("{},tenant-ingress", app.primary_container().unwrap().name),
             ),
+            env("ENCLAVA_INIT_KBS_FETCH_RETRIES", "30"),
+            env("ENCLAVA_INIT_KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
+            env("ENCLAVA_INIT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
         ]),
         volume_mounts: Some(vec![
             VolumeMount {
