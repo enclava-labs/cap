@@ -56,6 +56,35 @@ fn config_toml_parses() {
 }
 
 #[test]
+fn config_toml_places_runtime_keys_at_document_root() {
+    let cm = generate_enclava_init_configmap(&sample_app());
+    let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
+    let parsed: toml::Value = toml::from_str(toml_text).expect("config.toml must parse");
+    let root = parsed.as_table().expect("config.toml root must be a table");
+    let tls_state = root
+        .get("tls-state")
+        .and_then(toml::Value::as_table)
+        .expect("tls-state must be a table");
+
+    assert_eq!(
+        root.get("kbs-url").and_then(toml::Value::as_str),
+        Some("http://127.0.0.1:8081/cdh/resource")
+    );
+    assert_eq!(
+        root.get("kbs-resource-path").and_then(toml::Value::as_str),
+        Some("default/cap-test-org-test-app-test-app-owner/seed-encrypted")
+    );
+    assert_eq!(
+        root.get("trustee-policy-read-available")
+            .and_then(toml::Value::as_bool),
+        Some(false)
+    );
+    assert!(!tls_state.contains_key("kbs-url"));
+    assert!(!tls_state.contains_key("kbs-resource-path"));
+    assert!(!tls_state.contains_key("trustee-policy-read-available"));
+}
+
+#[test]
 fn config_toml_defaults_trustee_policy_read_to_false() {
     // Phase 3 patches haven't shipped; verification stays SKIPPED until then.
     let cm = generate_enclava_init_configmap(&sample_app());
@@ -106,5 +135,27 @@ fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
     )));
     assert_eq!(cc_toml, &cc_init_data::build_toml(&app));
 
-    let _: toml::Value = toml::from_str(toml_text).expect("config.toml must parse");
+    let parsed: toml::Value = toml::from_str(toml_text).expect("config.toml must parse");
+    let root = parsed.as_table().expect("config.toml root must be a table");
+    assert_eq!(
+        root.get("trustee-policy-read-available")
+            .and_then(toml::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        root.get("workload-artifacts-url")
+            .and_then(toml::Value::as_str),
+        Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts")
+    );
+    assert_eq!(
+        root.get("trustee-policy-url").and_then(toml::Value::as_str),
+        Some("http://kbs.trustee.svc/resource-policy/default/body")
+    );
+    assert!(
+        !root
+            .get("tls-state")
+            .and_then(toml::Value::as_table)
+            .unwrap()
+            .contains_key("trustee-policy-read-available")
+    );
 }

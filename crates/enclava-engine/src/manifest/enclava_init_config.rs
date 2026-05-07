@@ -64,25 +64,8 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     out.push_str(&format!("caddy-uid = {CADDY_UID}\n"));
     out.push_str(&format!("caddy-gid = {CADDY_GID}\n"));
     out.push_str(&format!("argon2-salt-hex = \"{}\"\n", argon2_salt_hex(app)));
-    out.push_str("\n[state]\n");
-    out.push_str(&format!(
-        "device = \"{}\"\n",
-        app.storage.app_data.device_path
-    ));
-    out.push_str("mapping-name = \"cap-state\"\n");
-    out.push_str("mount-path = \"/state\"\n");
-    out.push_str("hkdf-info = \"state-luks-key\"\n");
-    out.push_str("\n[tls-state]\n");
-    out.push_str(&format!(
-        "device = \"{}\"\n",
-        app.storage.tls_data.device_path
-    ));
-    out.push_str("mapping-name = \"cap-tls-state\"\n");
-    out.push_str("mount-path = \"/state/tls-state\"\n");
-    out.push_str("hkdf-info = \"tls-state-luks-key\"\n");
 
     if app.unlock_mode == UnlockMode::Auto {
-        out.push('\n');
         out.push_str(&format!("kbs-url = \"{LOCAL_CDH_RESOURCE_URL}\"\n"));
         out.push_str(&format!(
             "kbs-resource-path = \"{}\"\n",
@@ -91,7 +74,7 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     }
 
     if app.attestation.trustee_policy_read_available {
-        out.push_str("\ntrustee-policy-read-available = true\n");
+        out.push_str("trustee-policy-read-available = true\n");
         out.push_str("cc-init-data-path = \"/etc/enclava-init/cc-init-data.toml\"\n");
         push_required_option(
             &mut out,
@@ -123,6 +106,23 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
         out.push_str("# stays SKIPPED with a loud error log until this flips true.\n");
         out.push_str("trustee-policy-read-available = false\n");
     }
+
+    out.push_str("\n[state]\n");
+    out.push_str(&format!(
+        "device = \"{}\"\n",
+        app.storage.app_data.device_path
+    ));
+    out.push_str("mapping-name = \"cap-state\"\n");
+    out.push_str("mount-path = \"/state\"\n");
+    out.push_str("hkdf-info = \"state-luks-key\"\n");
+    out.push_str("\n[tls-state]\n");
+    out.push_str(&format!(
+        "device = \"{}\"\n",
+        app.storage.tls_data.device_path
+    ));
+    out.push_str("mapping-name = \"cap-tls-state\"\n");
+    out.push_str("mount-path = \"/state/tls-state\"\n");
+    out.push_str("hkdf-info = \"tls-state-luks-key\"\n");
 
     if let Some(primary) = app.primary_container() {
         for path in &primary.storage_paths {
