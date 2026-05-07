@@ -219,39 +219,19 @@ fn confidential_app_for_cc_hash(
     })
 }
 
-#[derive(serde::Serialize)]
-struct AgentPolicyRequest<'a> {
-    descriptor: &'a enclava_cli::descriptor::DeploymentDescriptor,
-}
-
-#[derive(serde::Deserialize)]
-struct AgentPolicyResponse {
-    agent_policy_text: String,
-    agent_policy_sha256: String,
-    genpolicy_version_pin: String,
-}
-
 async fn fetch_generated_agent_policy(
+    api: &ApiClient,
     release: &PlatformRelease,
     descriptor: &enclava_cli::descriptor::DeploymentDescriptor,
 ) -> Result<GeneratedAgentPolicy, Box<dyn std::error::Error>> {
-    let url = format!(
-        "{}/agent-policy",
-        release.signing_service_url.trim_end_matches('/')
-    );
-    let response = reqwest::Client::new()
-        .post(url)
-        .json(&AgentPolicyRequest { descriptor })
-        .send()
+    let response = api
+        .generate_agent_policy(
+            &descriptor.app_name,
+            &AgentPolicyRequest {
+                descriptor: descriptor.clone(),
+            },
+        )
         .await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(
-            format!("policy signing service genpolicy preflight failed: {status}: {body}").into(),
-        );
-    }
-    let response: AgentPolicyResponse = response.json().await?;
     if response.genpolicy_version_pin != release.genpolicy_version {
         return Err(format!(
             "policy signing service genpolicy version {} does not match signed platform release {}",
@@ -494,7 +474,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         descriptor_signing_pubkey: deployer_key.public.to_bytes(),
         org_keyring_fingerprint,
     };
-    let generated_agent_policy = fetch_generated_agent_policy(&release, &descriptor).await?;
+    let generated_agent_policy = fetch_generated_agent_policy(api, &release, &descriptor).await?;
     descriptor.expected_agent_policy_hash = generated_agent_policy.policy_sha256;
     let cc_app = confidential_app_for_cc_hash(
         app,

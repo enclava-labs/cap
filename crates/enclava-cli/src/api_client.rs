@@ -230,6 +230,22 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn generate_agent_policy(
+        &self,
+        app_name: &str,
+        req: &AgentPolicyRequest,
+    ) -> Result<AgentPolicyResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/apps/{app_name}/agent-policy")))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     // --- Status ---
 
     pub async fn get_status(&self, app_name: &str) -> Result<AppStatus, ApiError> {
@@ -529,6 +545,24 @@ impl ApiClient {
             .http
             .get(self.url(&format!("/orgs/{org_name}/keyring")))
             .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn bootstrap_signing_service_owner(
+        &self,
+        org_name: &str,
+        req: &BootstrapSigningServiceRequest,
+    ) -> Result<BootstrapSigningServiceResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url(&format!(
+                "/orgs/{org_name}/keyring/bootstrap-signing-service"
+            )))
+            .headers(self.auth_headers()?)
+            .json(req)
             .send()
             .await?;
         let resp = self.check_response(resp).await?;

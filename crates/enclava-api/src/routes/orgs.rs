@@ -163,6 +163,18 @@ pub struct OrgKeyringResponse {
     pub fingerprint: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BootstrapSigningServiceRequest {
+    pub owner_pubkey_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BootstrapSigningServiceResponse {
+    pub org_id: Uuid,
+    pub state: String,
+    pub owner_pubkey_fingerprint: String,
+}
+
 type KeyringRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Deserialize)]
@@ -497,6 +509,56 @@ pub async fn get_keyring(
         signature: hex::encode(signature),
         signing_pubkey: hex::encode(signing_pubkey),
         fingerprint,
+    }))
+}
+
+pub async fn bootstrap_signing_service_owner(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(org_name): Path<String>,
+    Json(body): Json<BootstrapSigningServiceRequest>,
+) -> Result<Json<BootstrapSigningServiceResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_scope(&auth, "org:admin")?;
+    let (org_id, caller_role) = active_membership(&state, auth.user_id, &org_name).await?;
+    scopes::require_admin_role(caller_role)?;
+
+    let owner_pubkey = decode_hex_len("owner_pubkey_hex", &body.owner_pubkey_hex, 32)?;
+    let latest_signing_pubkey: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT usk.pubkey
+         FROM org_keyrings ok
+         JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
+         WHERE ok.org_id = $1
+         ORDER BY ok.version DESC
+         LIMIT 1",
+    )
+    .bind(org_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| db_error())?;
+    let latest_signing_pubkey =
+        latest_signing_pubkey.ok_or_else(|| bad_request("org keyring must be uploaded first"))?;
+    if latest_signing_pubkey != owner_pubkey {
+        return Err(bad_request(
+            "owner_pubkey_hex must match the latest org keyring signing owner",
+        ));
+    }
+
+    let signing_service = state.signing_service.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "platform signing service is not configured"})),
+    ))?;
+    let response = signing_service
+        .bootstrap_org(&crate::signing_service::BootstrapOrgRequest {
+            org_id,
+            owner_pubkey_hex: hex::encode(owner_pubkey),
+        })
+        .await
+        .map_err(crate::routes::deployments::signing_error_response)?;
+
+    Ok(Json(BootstrapSigningServiceResponse {
+        org_id: response.org_id,
+        state: response.state,
+        owner_pubkey_fingerprint: response.owner_pubkey_fingerprint,
     }))
 }
 

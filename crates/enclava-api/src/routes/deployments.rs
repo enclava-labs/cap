@@ -6,7 +6,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::middleware::AuthContext;
+use crate::auth::{middleware::AuthContext, scopes};
 use crate::models::{App, Deployment};
 use crate::state::AppState;
 
@@ -293,6 +293,18 @@ pub struct RollbackRequest {
     pub deployment_id: Option<Uuid>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AgentPolicyRequest {
+    pub descriptor: enclava_common::descriptor::DeploymentDescriptor,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentPolicyResponse {
+    pub agent_policy_text: String,
+    pub agent_policy_sha256: String,
+    pub genpolicy_version_pin: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct RollbackResponse {
     pub deployment_id: Uuid,
@@ -333,6 +345,71 @@ impl DeploymentResponse {
             completed_at: d.completed_at,
         }
     }
+}
+
+/// POST /apps/{name}/agent-policy -- authenticated genpolicy preflight broker.
+pub async fn generate_agent_policy(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(app_name): Path<String>,
+    Json(body): Json<AgentPolicyRequest>,
+) -> Result<Json<AgentPolicyResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_scope(&auth, "apps:write")?;
+
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+        .bind(auth.org_id)
+        .bind(&app_name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "app not found"})),
+        ))?;
+
+    let descriptor = &body.descriptor;
+    let expected_identity_hash = hex::decode(&app.tenant_instance_identity_hash).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "stored app identity hash is invalid"})),
+        )
+    })?;
+    if descriptor.org_id != auth.org_id
+        || descriptor.app_id != app.id
+        || descriptor.app_name != app.name
+        || descriptor.namespace != app.namespace
+        || descriptor.service_account != app.service_account
+        || descriptor.identity_hash.as_slice() != expected_identity_hash.as_slice()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "descriptor does not match the authenticated app"
+            })),
+        ));
+    }
+
+    let signing_service = state.signing_service.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "platform signing service is not configured"})),
+    ))?;
+    let response = signing_service
+        .agent_policy(&crate::signing_service::AgentPolicyRequest {
+            descriptor: body.descriptor,
+        })
+        .await
+        .map_err(signing_error_response)?;
+
+    Ok(Json(AgentPolicyResponse {
+        agent_policy_text: response.agent_policy_text,
+        agent_policy_sha256: response.agent_policy_sha256,
+        genpolicy_version_pin: response.genpolicy_version_pin,
+    }))
 }
 
 /// POST /apps/{name}/deploy -- deploy or update an app.

@@ -119,6 +119,18 @@ pub struct DeployResponse {
     pub app_domain: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AgentPolicyRequest {
+    pub descriptor: enclava_common::descriptor::DeploymentDescriptor,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AgentPolicyResponse {
+    pub agent_policy_text: String,
+    pub agent_policy_sha256: String,
+    pub genpolicy_version_pin: String,
+}
+
 // --- Status ---
 
 #[derive(Debug, Deserialize)]
@@ -366,6 +378,18 @@ pub struct OrgKeyringResponse {
     pub signature: String,
     pub signing_pubkey: String,
     pub fingerprint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BootstrapSigningServiceRequest {
+    pub owner_pubkey_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BootstrapSigningServiceResponse {
+    pub org_id: String,
+    pub state: String,
+    pub owner_pubkey_fingerprint: String,
 }
 
 #[derive(Debug, Deserialize)]

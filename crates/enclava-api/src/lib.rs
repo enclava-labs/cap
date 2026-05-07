@@ -78,6 +78,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/orgs/{name}/keyring",
             axum::routing::get(routes::orgs::get_keyring).put(routes::orgs::put_keyring),
+        )
+        .route(
+            "/orgs/{name}/keyring/bootstrap-signing-service",
+            axum::routing::post(routes::orgs::bootstrap_signing_service_owner),
         );
 
     // App routes (authenticated)
@@ -99,6 +103,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/apps/{name}/deploy",
             axum::routing::post(routes::deployments::deploy),
+        )
+        .route(
+            "/apps/{name}/agent-policy",
+            axum::routing::post(routes::deployments::generate_agent_policy),
         )
         .route(
             "/apps/{name}/deployments",

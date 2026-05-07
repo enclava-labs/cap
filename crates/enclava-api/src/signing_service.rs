@@ -101,6 +101,73 @@ impl SigningServiceClient {
         }
         Ok(response.json().await?)
     }
+
+    pub async fn agent_policy(
+        &self,
+        request: &AgentPolicyRequest,
+    ) -> Result<AgentPolicyResponse, SigningServiceError> {
+        let url = self
+            .base_url
+            .join("agent-policy")
+            .map_err(|err| SigningServiceError::InvalidUrl(err.to_string()))?;
+        let mut builder = self.http.post(url).json(request);
+        if let Some(token) = self.bearer_token.as_deref() {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(SigningServiceError::Upstream { status, body });
+        }
+        Ok(response.json().await?)
+    }
+
+    pub async fn bootstrap_org(
+        &self,
+        request: &BootstrapOrgRequest,
+    ) -> Result<BootstrapOrgResponse, SigningServiceError> {
+        let url = self
+            .base_url
+            .join("bootstrap-org")
+            .map_err(|err| SigningServiceError::InvalidUrl(err.to_string()))?;
+        let mut builder = self.http.post(url).json(request);
+        if let Some(token) = self.bearer_token.as_deref() {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(SigningServiceError::Upstream { status, body });
+        }
+        Ok(response.json().await?)
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct AgentPolicyRequest {
+    pub descriptor: DeploymentDescriptor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPolicyResponse {
+    pub agent_policy_text: String,
+    pub agent_policy_sha256: String,
+    pub genpolicy_version_pin: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BootstrapOrgRequest {
+    pub org_id: Uuid,
+    pub owner_pubkey_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapOrgResponse {
+    pub org_id: Uuid,
+    pub state: String,
+    pub owner_pubkey_fingerprint: String,
 }
 
 #[derive(Debug, Serialize)]

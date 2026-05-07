@@ -3,8 +3,8 @@ use ed25519_dalek::VerifyingKey;
 
 use enclava_cli::api_client::ApiClient;
 use enclava_cli::api_types::{
-    CreateOrgRequest, InviteRequest, OrgKeyringResponse, PutOrgKeyringRequest,
-    RegisterPublicKeyRequest,
+    BootstrapSigningServiceRequest, CreateOrgRequest, InviteRequest, OrgKeyringResponse,
+    PutOrgKeyringRequest, RegisterPublicKeyRequest,
 };
 use enclava_cli::config::{self, CliPaths};
 
@@ -168,7 +168,6 @@ async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Erro
         verify_keyring,
     };
     use enclava_cli::keys;
-    use enclava_cli::platform_release::PlatformRelease;
     use uuid::Uuid;
 
     fn parse_pubkey(hex_in: &str) -> Result<VerifyingKey, Box<dyn std::error::Error>> {
@@ -265,34 +264,24 @@ async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Erro
     }
 
     async fn bootstrap_signing_service_owner(
+        api: &ApiClient,
+        org_name: &str,
         org: Uuid,
         owner_pubkey: &VerifyingKey,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        #[derive(serde::Deserialize)]
-        struct BootstrapResponse {
-            state: String,
-            owner_pubkey_fingerprint: String,
-        }
-
-        let release = PlatformRelease::load_verified()?;
-        let url = format!(
-            "{}/bootstrap-org",
-            release.signing_service_url.trim_end_matches('/')
-        );
-        let response = reqwest::Client::new()
-            .post(&url)
-            .json(&serde_json::json!({
-                "org_id": org,
-                "owner_pubkey_hex": hex::encode(owner_pubkey.to_bytes()),
-            }))
-            .send()
+        let parsed = api
+            .bootstrap_signing_service_owner(
+                org_name,
+                &BootstrapSigningServiceRequest {
+                    owner_pubkey_hex: hex::encode(owner_pubkey.to_bytes()),
+                },
+            )
             .await?;
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            return Err(format!("signing-service bootstrap failed ({status}): {body}").into());
+        if parsed.org_id != org.to_string() {
+            return Err(
+                "CAP API returned an unexpected org id from signing-service bootstrap".into(),
+            );
         }
-        let parsed: BootstrapResponse = serde_json::from_str(&body)?;
         let expected = hex::encode(owner_pubkey.to_bytes());
         if parsed.owner_pubkey_fingerprint != expected {
             return Err("signing-service returned an unexpected owner fingerprint".into());
@@ -356,7 +345,7 @@ async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Erro
             store_keyring_envelope(&org, &env)?;
             upload_keyring(&api, &org_name, &env).await?;
             if !skip_signing_service_bootstrap {
-                bootstrap_signing_service_owner(org, &key.public).await?;
+                bootstrap_signing_service_owner(&api, &org_name, org, &key.public).await?;
             }
 
             println!("Initialized keyring for {org_name} ({org})");
