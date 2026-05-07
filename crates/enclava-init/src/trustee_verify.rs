@@ -614,6 +614,7 @@ mod tests {
             "namespace": "cap-abcd1234-demo",
             "service_account": "cap-demo-sa",
             "identity_hash": "09".repeat(32),
+            "image_ref": "ghcr.io/enclava-ai/demo@sha256:aaaa",
             "image_digest": "sha256:aaaa",
             "signer_identity": {
                 "subject": "https://github.com/x/y/.github/workflows/build.yml",

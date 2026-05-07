@@ -31,6 +31,7 @@ pub struct DeploymentDescriptorBuildInput {
     pub namespace: String,
     pub service_account: String,
     pub identity_hash: [u8; 32],
+    pub image_ref: String,
     pub image_digest: String,
     pub signer_identity: SignerIdentity,
     pub oci_runtime_spec: OciRuntimeSpec,
@@ -236,6 +237,7 @@ pub fn build_descriptor(input: DeploymentDescriptorBuildInput) -> DeploymentDesc
         namespace: input.namespace,
         service_account: input.service_account,
         identity_hash: input.identity_hash,
+        image_ref: input.image_ref,
         image_digest: input.image_digest,
         signer_identity: input.signer_identity,
         oci_runtime_spec: input.oci_runtime_spec,
@@ -290,6 +292,7 @@ mod tests {
             namespace: "cap-abcd1234-demo".to_string(),
             service_account: "cap-demo-sa".to_string(),
             identity_hash: [9; 32],
+            image_ref: "ghcr.io/enclava-ai/demo@sha256:aaaa".to_string(),
             image_digest: "sha256:aaaa".to_string(),
             signer_identity: SignerIdentity {
                 subject: "https://github.com/x/y/.github/workflows/build.yml".to_string(),
@@ -349,6 +352,34 @@ mod tests {
         d.expected_kbs_policy_hash = [0xFE; 32];
         let h2 = descriptor_core_hash(&d);
         assert_eq!(h1, h2, "core hash must NOT include expected_*_hash fields");
+    }
+
+    #[test]
+    fn canonical_bytes_include_image_ref() {
+        let mut d_a = fixed_descriptor();
+        let mut d_b = d_a.clone();
+        d_b.image_ref = "ghcr.io/enclava-ai/other@sha256:aaaa".to_string();
+
+        assert_ne!(
+            descriptor_core_canonical_bytes(&d_a),
+            descriptor_core_canonical_bytes(&d_b),
+            "core bytes must bind the full digest-pinned image reference"
+        );
+        assert_ne!(
+            descriptor_canonical_bytes(&d_a),
+            descriptor_canonical_bytes(&d_b),
+            "signed bytes must bind the full digest-pinned image reference"
+        );
+
+        d_a.image_ref = d_b.image_ref.clone();
+        assert_eq!(
+            descriptor_core_canonical_bytes(&d_a),
+            descriptor_core_canonical_bytes(&d_b)
+        );
+        assert_eq!(
+            descriptor_canonical_bytes(&d_a),
+            descriptor_canonical_bytes(&d_b)
+        );
     }
 
     #[test]

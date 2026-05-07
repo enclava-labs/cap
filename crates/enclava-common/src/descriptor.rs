@@ -102,6 +102,7 @@ pub struct DeploymentDescriptor {
     #[serde(with = "hex_bytes32")]
     pub identity_hash: [u8; 32],
 
+    pub image_ref: String,
     pub image_digest: String,
     pub signer_identity: SignerIdentity,
     pub oci_runtime_spec: OciRuntimeSpec,
@@ -291,6 +292,7 @@ fn descriptor_records<'a>(
         ("namespace", d.namespace.as_bytes()),
         ("service_account", d.service_account.as_bytes()),
         ("identity_hash", &d.identity_hash),
+        ("image_ref", d.image_ref.as_bytes()),
         ("image_digest", d.image_digest.as_bytes()),
         ("signer_identity", &sub.signer_hash),
         ("oci_runtime_spec", &sub.oci_hash),

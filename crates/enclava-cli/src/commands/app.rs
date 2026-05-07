@@ -459,6 +459,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             .clone()
             .unwrap_or_else(|| format!("cap-{}-sa", app.name)),
         identity_hash,
+        image_ref: image_ref.digest_ref(),
         image_digest: image_ref.digest().to_string(),
         signer_identity,
         oci_runtime_spec: cap_app_oci_runtime_spec(CapAppOciRuntimeSpecInput {
