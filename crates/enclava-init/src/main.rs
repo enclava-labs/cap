@@ -64,7 +64,6 @@ fn run() -> Result<()> {
     let cfg = Config::load(&cfg_path).with_context(|| format!("loading {}", cfg_path.display()))?;
     let stay_alive = stay_alive_enabled();
     let ready_file = ready_file_path();
-    clear_error_file(&error_file_path());
     let mut workload_namespaces = Vec::new();
     if stay_alive {
         clear_ready_file(&ready_file)
@@ -77,6 +76,7 @@ fn run() -> Result<()> {
         Mode::Password => acquire_owner_seed_password(&cfg)?,
         Mode::Autounlock => acquire_owner_seed_autounlock(&cfg)?,
     };
+    clear_error_file(&error_file_path());
 
     // Derive per-volume LUKS keys and open both devices BEFORE running the
     // verification chain. If verification fails we still need LUKS open to
@@ -250,6 +250,15 @@ fn record_failure_file(message: &str) {
     if let Err(err) = writes::atomic_write(&path, message.as_bytes(), 0o644) {
         eprintln!("enclava-init: failed to write {}: {err}", path.display());
     }
+    let termination_path = std::env::var("ENCLAVA_INIT_TERMINATION_LOG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/dev/termination-log"));
+    if let Err(err) = writes::atomic_write(&termination_path, message.as_bytes(), 0o644) {
+        eprintln!(
+            "enclava-init: failed to write {}: {err}",
+            termination_path.display()
+        );
+    }
 }
 
 fn mark_ready_file(path: &Path) -> Result<()> {
@@ -291,6 +300,7 @@ fn acquire_owner_seed_password(cfg: &Config) -> Result<OwnerSeed> {
 
         match request {
             socket::UnlockRequest::OwnerSeed(seed) => {
+                clear_error_file(&error_file_path());
                 socket::reply_ok(&mut stream).ok();
                 return Ok(seed);
             }
@@ -305,6 +315,7 @@ fn acquire_owner_seed_password(cfg: &Config) -> Result<OwnerSeed> {
 
                 match unlock::derive_owner_seed(&password, &salt) {
                     Ok(seed) => {
+                        clear_error_file(&error_file_path());
                         socket::reply_ok(&mut stream).ok();
                         return Ok(seed);
                     }
