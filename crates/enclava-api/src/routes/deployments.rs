@@ -604,6 +604,12 @@ pub async fn deploy(
         }
         None => None,
     };
+    let signed_container_port = signing_artifacts
+        .as_ref()
+        .and_then(|artifacts| crate::deploy::descriptor_primary_port(&artifacts.descriptor));
+    let signed_storage_paths = signing_artifacts
+        .as_ref()
+        .and_then(|artifacts| crate::deploy::descriptor_storage_paths(&artifacts.descriptor));
     let container_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM app_containers WHERE app_id = $1 AND name = $2)",
     )
@@ -621,12 +627,18 @@ pub async fn deploy(
     if container_exists {
         sqlx::query(
             "UPDATE app_containers
-             SET image_ref = $1, image_digest = $2, command = COALESCE($3, command)
-             WHERE app_id = $4 AND name = $5",
+             SET image_ref = $1,
+                 image_digest = $2,
+                 command = COALESCE($3, command),
+                 port = COALESCE($4, port),
+                 storage_paths = COALESCE($5, storage_paths)
+             WHERE app_id = $6 AND name = $7",
         )
         .bind(&body.image)
         .bind(Some(&image_digest))
         .bind(signed_workload_command.as_ref())
+        .bind(signed_container_port)
+        .bind(signed_storage_paths.as_ref())
         .bind(app.id)
         .bind(container_name)
         .execute(&state.db)
@@ -639,8 +651,8 @@ pub async fn deploy(
         })?;
     } else {
         sqlx::query(
-            "INSERT INTO app_containers (id, app_id, name, image_ref, image_digest, command, is_primary)
-             VALUES ($1, $2, $3, $4, $5, $6, true)",
+            "INSERT INTO app_containers (id, app_id, name, image_ref, image_digest, command, port, storage_paths, is_primary)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)",
         )
         .bind(Uuid::new_v4())
         .bind(app.id)
@@ -648,6 +660,8 @@ pub async fn deploy(
         .bind(&body.image)
         .bind(Some(&image_digest))
         .bind(signed_workload_command.as_ref())
+        .bind(signed_container_port)
+        .bind(signed_storage_paths.as_ref())
         .execute(&state.db)
         .await
         .map_err(|_| {
@@ -1053,6 +1067,12 @@ pub async fn rollback(
         })?,
         None => None,
     };
+    let rollback_container_port = rollback_descriptor
+        .as_ref()
+        .and_then(crate::deploy::descriptor_primary_port);
+    let rollback_storage_paths = rollback_descriptor
+        .as_ref()
+        .and_then(crate::deploy::descriptor_storage_paths);
     if customer_signed_deploy_required(
         state.attestation.as_ref(),
         state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
@@ -1069,12 +1089,18 @@ pub async fn rollback(
     let container_name = "web";
     sqlx::query(
         "UPDATE app_containers
-         SET image_ref = $1, image_digest = $2, command = COALESCE($3, command)
-         WHERE app_id = $4 AND name = $5",
+         SET image_ref = $1,
+             image_digest = $2,
+             command = COALESCE($3, command),
+             port = COALESCE($4, port),
+             storage_paths = COALESCE($5, storage_paths)
+         WHERE app_id = $6 AND name = $7",
     )
     .bind(&image)
     .bind(Some(&image_digest))
     .bind(rollback_workload_command.as_ref())
+    .bind(rollback_container_port)
+    .bind(rollback_storage_paths.as_ref())
     .bind(app.id)
     .bind(container_name)
     .execute(&state.db)

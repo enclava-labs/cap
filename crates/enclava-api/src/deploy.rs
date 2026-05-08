@@ -68,6 +68,33 @@ pub(crate) fn serialize_workload_command(
     }
 }
 
+pub(crate) fn descriptor_primary_port(
+    descriptor: &enclava_common::descriptor::DeploymentDescriptor,
+) -> Option<i32> {
+    descriptor
+        .oci_runtime_spec
+        .ports
+        .first()
+        .and_then(|port| i32::try_from(port.container_port).ok())
+}
+
+pub(crate) fn descriptor_storage_paths(
+    descriptor: &enclava_common::descriptor::DeploymentDescriptor,
+) -> Option<Vec<String>> {
+    let paths = descriptor
+        .oci_runtime_spec
+        .mounts
+        .iter()
+        .filter(|mount| {
+            mount.mount_type == "kubernetes-volume-subpath"
+                || mount.source.starts_with("state-mount:")
+        })
+        .map(|mount| mount.destination.clone())
+        .filter(|path| path != "/state")
+        .collect::<Vec<_>>();
+    if paths.is_empty() { None } else { Some(paths) }
+}
+
 fn deserialize_workload_command(command: Option<&str>) -> Option<Vec<String>> {
     let raw = command?;
     let trimmed = raw.trim();
@@ -82,12 +109,24 @@ fn deserialize_workload_command(command: Option<&str>) -> Option<Vec<String>> {
     }
 }
 
-pub(crate) fn set_primary_workload_command(app: &mut ConfidentialApp, command: &[String]) {
-    if command.is_empty() {
-        return;
-    }
+pub(crate) fn set_primary_descriptor_runtime(
+    app: &mut ConfidentialApp,
+    descriptor: &enclava_common::descriptor::DeploymentDescriptor,
+) {
+    let command = &descriptor.oci_runtime_spec.args;
+    let port = descriptor_primary_port(descriptor).and_then(|port| u16::try_from(port).ok());
+    let storage_paths = descriptor_storage_paths(descriptor);
+
     for container in app.containers.iter_mut().filter(|c| c.is_primary) {
-        container.command = Some(command.to_vec());
+        if !command.is_empty() {
+            container.command = Some(command.to_vec());
+        }
+        if let Some(port) = port {
+            container.port = Some(port);
+        }
+        if let Some(paths) = storage_paths.clone() {
+            container.storage_paths = paths;
+        }
     }
 }
 
@@ -222,6 +261,177 @@ pub async fn record_deployment_result(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use enclava_common::descriptor::{
+        Capabilities, DeploymentDescriptor, EnvVar, Mount, OciRuntimeSpec, Port, Resources,
+        SecurityContext, Sidecars, SignerIdentity,
+    };
+
+    fn nutshell_descriptor() -> DeploymentDescriptor {
+        DeploymentDescriptor {
+            schema_version: "v1".to_string(),
+            org_id: uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            org_slug: "8f346820".to_string(),
+            app_id: uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            app_name: "nutshell".to_string(),
+            deploy_id: uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+            created_at: chrono::Utc.with_ymd_and_hms(2026, 5, 8, 12, 0, 0).unwrap(),
+            nonce: [1; 32],
+            app_domain: "nutshell.8f346820.enclava.dev".to_string(),
+            tee_domain: "nutshell.8f346820.tee.enclava.dev".to_string(),
+            custom_domains: Vec::new(),
+            namespace: "cap-nutshell-first-customer-nutshell".to_string(),
+            service_account: "cap-nutshell-sa".to_string(),
+            identity_hash: [2; 32],
+            image_ref:
+                "ghcr.io/freedomcashlabs/nutshell@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            image_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            signer_identity: SignerIdentity {
+                subject:
+                    "https://github.com/freedomcashlabs/nutshell/.github/workflows/docker.yaml@refs/heads/main"
+                        .to_string(),
+                issuer: "https://token.actions.githubusercontent.com".to_string(),
+            },
+            oci_runtime_spec: OciRuntimeSpec {
+                command: vec!["/usr/local/bin/enclava-wait-exec".to_string()],
+                args: vec!["/usr/local/bin/app".to_string()],
+                env: vec![EnvVar {
+                    name: "APP_SEED_PATH".to_string(),
+                    value: "/run/enclava/seeds/app/seed".to_string(),
+                }],
+                ports: vec![Port {
+                    container_port: 3338,
+                    protocol: "TCP".to_string(),
+                }],
+                mounts: vec![
+                    Mount {
+                        source: "state-mount".to_string(),
+                        destination: "/state".to_string(),
+                        mount_type: "kubernetes-volume".to_string(),
+                        options: vec!["rw".to_string()],
+                    },
+                    Mount {
+                        source: "state-mount:data".to_string(),
+                        destination: "/data".to_string(),
+                        mount_type: "kubernetes-volume-subpath".to_string(),
+                        options: vec!["rw".to_string()],
+                    },
+                ],
+                capabilities: Capabilities::default(),
+                security_context: SecurityContext::default(),
+                resources: Resources::default(),
+            },
+            sidecars: Sidecars {
+                attestation_proxy_digest:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                caddy_digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_string(),
+            },
+            expected_firmware_measurement: [3; 32],
+            expected_runtime_class: "kata-qemu-snp".to_string(),
+            kbs_resource_path: "default/cap-nutshell-first-customer-nutshell-owner".to_string(),
+            unlock_mode: "password".to_string(),
+            policy_template_id: "enclava-kbs-policy-v1".to_string(),
+            policy_template_sha256: [4; 32],
+            platform_release_version: "test".to_string(),
+            expected_agent_policy_hash: [5; 32],
+            expected_cc_init_data_hash: [6; 32],
+            expected_kbs_policy_hash: [7; 32],
+        }
+    }
+
+    #[test]
+    fn signed_descriptor_runtime_fields_match_nutshell_expectations() {
+        let descriptor = nutshell_descriptor();
+
+        assert_eq!(
+            serialize_workload_command(&descriptor.oci_runtime_spec.args).unwrap(),
+            Some("[\"/usr/local/bin/app\"]".to_string())
+        );
+        assert_eq!(descriptor_primary_port(&descriptor), Some(3338));
+        assert_eq!(
+            descriptor_storage_paths(&descriptor),
+            Some(vec!["/data".to_string()])
+        );
+    }
+
+    #[test]
+    fn descriptor_runtime_overrides_stale_primary_container_fields() {
+        let descriptor = nutshell_descriptor();
+        let mut app = ConfidentialApp {
+            app_id: descriptor.app_id,
+            name: descriptor.app_name.clone(),
+            namespace: descriptor.namespace.clone(),
+            instance_id: "nutshell-test".to_string(),
+            tenant_id: descriptor.org_slug.clone(),
+            bootstrap_owner_pubkey_hash: "00".repeat(32),
+            tenant_instance_identity_hash: hex::encode(descriptor.identity_hash),
+            service_account: descriptor.service_account.clone(),
+            signer_identity_subject: Some(descriptor.signer_identity.subject.clone()),
+            signer_identity_issuer: Some(descriptor.signer_identity.issuer.clone()),
+            containers: vec![Container {
+                name: "web".to_string(),
+                image: ImageRef::parse(&descriptor.image_ref).unwrap(),
+                port: Some(8080),
+                command: None,
+                env: std::collections::HashMap::new(),
+                storage_paths: Vec::new(),
+                is_primary: true,
+            }],
+            storage: StorageSpec::new("5Gi", "2Gi"),
+            unlock_mode: UnlockMode::Password,
+            domain: DomainSpec {
+                platform_domain: descriptor.app_domain.clone(),
+                tee_domain: descriptor.tee_domain.clone(),
+                custom_domain: None,
+            },
+            api_signing_pubkey: String::new(),
+            api_url: String::new(),
+            resources: ResourceLimits {
+                cpu: "1".to_string(),
+                memory: "1Gi".to_string(),
+            },
+            attestation: AttestationConfig {
+                proxy_image: ImageRef::parse(
+                    "ghcr.io/enclava-ai/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )
+                .unwrap(),
+                caddy_image: ImageRef::parse(
+                    "ghcr.io/enclava-ai/caddy-ingress@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                )
+                .unwrap(),
+                acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+                trustee_policy_read_available: true,
+                workload_artifacts_url: None,
+                trustee_policy_url: None,
+                local_workload_artifacts_json: None,
+                local_trustee_policy_json: None,
+                platform_trustee_policy_pubkey_hex: None,
+                signing_service_pubkey_hex: None,
+            },
+            egress_allowlist: Vec::new(),
+            workload_artifact_binding: None,
+            generated_agent_policy: None,
+        };
+
+        set_primary_descriptor_runtime(&mut app, &descriptor);
+
+        let primary = app.primary_container().unwrap();
+        assert_eq!(
+            primary.command,
+            Some(vec!["/usr/local/bin/app".to_string()])
+        );
+        assert_eq!(primary.port, Some(3338));
+        assert_eq!(primary.storage_paths, vec!["/data".to_string()]);
+    }
 }
 
 pub async fn set_deployment_status(

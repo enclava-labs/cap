@@ -536,6 +536,8 @@ pub async fn update_unlock_mode(
     let mut workload_artifact_binding = None;
     let mut signed_policy_artifact = None;
     let mut signed_workload_command = None;
+    let mut signed_container_port = None;
+    let mut signed_storage_paths = None;
     if let Some(artifacts) = signing_artifacts.as_ref() {
         let image_digest_ref = image_digest.as_deref().ok_or((
             StatusCode::BAD_REQUEST,
@@ -554,6 +556,8 @@ pub async fn update_unlock_mode(
                     Json(serde_json::json!({"error": "command serialization error"})),
                 )
             })?;
+        signed_container_port = crate::deploy::descriptor_primary_port(&artifacts.descriptor);
+        signed_storage_paths = crate::deploy::descriptor_storage_paths(&artifacts.descriptor);
         let attestation = state.attestation.as_ref().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -576,7 +580,7 @@ pub async fn update_unlock_mode(
                 Json(serde_json::json!({"error": e.to_string()})),
             )
         })?;
-        crate::deploy::set_primary_workload_command(&mut app_spec, &workload_command);
+        crate::deploy::set_primary_descriptor_runtime(&mut app_spec, &artifacts.descriptor);
         let binding = artifacts.binding();
         app_spec.workload_artifact_binding = Some(binding.clone());
 
@@ -627,11 +631,20 @@ pub async fn update_unlock_mode(
             )
         })?;
 
-    if let Some(command) = signed_workload_command.as_ref() {
+    if signed_workload_command.is_some()
+        || signed_container_port.is_some()
+        || signed_storage_paths.is_some()
+    {
         sqlx::query(
-            "UPDATE app_containers SET command = $1 WHERE app_id = $2 AND is_primary = true",
+            "UPDATE app_containers
+             SET command = COALESCE($1, command),
+                 port = COALESCE($2, port),
+                 storage_paths = COALESCE($3, storage_paths)
+             WHERE app_id = $4 AND is_primary = true",
         )
-        .bind(command)
+        .bind(signed_workload_command.as_ref())
+        .bind(signed_container_port)
+        .bind(signed_storage_paths.as_ref())
         .bind(app.id)
         .execute(&mut *tx)
         .await
