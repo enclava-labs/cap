@@ -28,6 +28,8 @@ pub struct AppState {
     pub tee_domain_suffix: String,
     /// HTTP client for outbound requests.
     pub http_client: reqwest::Client,
+    /// HTTP client for fixed internal Trustee/KBS calls.
+    pub trustee_http_client: reqwest::Client,
     /// HTTP client for tenant TEE endpoints. Test environments may use staging
     /// ACME certificates that are not trusted by the public WebPKI roots.
     pub tee_http_client: reqwest::Client,

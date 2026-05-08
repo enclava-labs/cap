@@ -51,7 +51,7 @@ pub async fn artifacts(State(state): State<AppState>, headers: HeaderMap) -> imp
     };
 
     let verify_response = match state
-        .http_client
+        .trustee_http_client
         .post(verify_url)
         .json(&json!({ "token": token }))
         .send()

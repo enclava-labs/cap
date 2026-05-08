@@ -15,10 +15,9 @@ use crate::manifest::containers::{
 use crate::manifest::volumes::{build_volume_claim_templates, build_volumes};
 use crate::types::ConfidentialApp;
 
-const KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cluster.local:8080";
-
 pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     let (cc_init_data_encoded, cc_init_data_hash) = cc_init_data::compute_cc_init_data(app);
+    let kbs_url = cc_init_data::trustee_kbs_url();
 
     let mut pod_labels = BTreeMap::new();
     pod_labels.insert("app".to_string(), app.name.clone());
@@ -30,7 +29,7 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     );
     annotations.insert(
         "io.katacontainers.config.hypervisor.kernel_params".to_string(),
-        format!("agent.aa_kbc_params=cc_kbc::{KBS_URL} agent.guest_components_rest_api=all"),
+        format!("agent.aa_kbc_params=cc_kbc::{kbs_url} agent.guest_components_rest_api=all"),
     );
     annotations.insert(
         "io.katacontainers.config.hypervisor.cc_init_data".to_string(),

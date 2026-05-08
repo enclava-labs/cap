@@ -39,6 +39,31 @@ fn tee_accepts_invalid_certs() -> bool {
         || env_flag("TENANT_TEE_ACCEPT_INVALID_CERTS")
 }
 
+fn build_trustee_http_client() -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15));
+
+    if let Some(cert_pem) = env_nonempty("TRUSTEE_KBS_CA_CERT_PEM") {
+        let cert_pem = cert_pem.replace("\\n", "\n");
+        let cert = reqwest::Certificate::from_pem(cert_pem.as_bytes())
+            .map_err(|err| anyhow::anyhow!("invalid TRUSTEE_KBS_CA_CERT_PEM: {err}"))?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    if let Some(cert_path) = env_nonempty("TRUSTEE_KBS_CA_CERT_PATH") {
+        let cert_pem = std::fs::read(&cert_path)
+            .map_err(|err| anyhow::anyhow!("failed to read TRUSTEE_KBS_CA_CERT_PATH: {err}"))?;
+        let cert = reqwest::Certificate::from_pem(&cert_pem)
+            .map_err(|err| anyhow::anyhow!("invalid TRUSTEE_KBS_CA_CERT_PATH PEM: {err}"))?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    builder
+        .build()
+        .map_err(|err| anyhow::anyhow!("failed to build Trustee HTTP client: {err}"))
+}
+
 fn read_key_file(path: &str) -> anyhow::Result<Vec<u8>> {
     std::fs::read(path).map_err(|e| anyhow::anyhow!("failed to read key file {}: {}", path, e))
 }
@@ -489,6 +514,8 @@ async fn main() {
     let outbound_config = enclava_api::clients::ClientConfig::from_env();
     let http_client = enclava_api::clients::build_guarded_client(&outbound_config)
         .expect("failed to build SSRF-defended outbound HTTP client");
+    let trustee_http_client =
+        build_trustee_http_client().expect("failed to build Trustee HTTP client");
 
     let state = AppState {
         db: pool,
@@ -500,6 +527,7 @@ async fn main() {
         platform_domain,
         tee_domain_suffix,
         http_client,
+        trustee_http_client,
         tee_http_client,
         btcpay_webhook_secret,
         attestation,

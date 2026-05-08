@@ -174,6 +174,22 @@ fn proxy_container_name_and_port() {
     let env = c.env.as_ref().unwrap();
     assert_eq!(
         env.iter()
+            .find(|e| e.name == "ATTESTATION_BIND")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("127.0.0.1")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ATTESTATION_TLS_BIND")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("0.0.0.0")
+    );
+    assert_eq!(
+        env.iter()
             .find(|e| e.name == "ATTESTATION_TLS_PORT")
             .unwrap()
             .value
@@ -187,6 +203,14 @@ fn proxy_container_name_and_port() {
             .value
             .as_deref(),
         Some("test-app.abcd1234.tee.enclava.dev")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "KBS_RESOURCE_URL")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource")
     );
 }
 

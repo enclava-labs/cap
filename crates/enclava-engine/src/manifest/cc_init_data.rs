@@ -9,7 +9,28 @@ use std::io::Write;
 
 use crate::types::ConfidentialApp;
 
-const KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cluster.local:8080";
+pub const DEFAULT_KBS_URL: &str =
+    "http://kbs-service.trustee-operator-system.svc.cluster.local:8080";
+
+/// Trustee KBS base URL written into Kata guest components config.
+///
+/// Production deployments should set this to the HTTPS KBS service URL and
+/// provide `TRUSTEE_KBS_CA_CERT_PEM` so AA/CDH can verify the KBS server cert.
+pub fn trustee_kbs_url() -> String {
+    nonempty_env("TRUSTEE_KBS_URL").unwrap_or_else(|| DEFAULT_KBS_URL.to_string())
+}
+
+/// Optional PEM root used by AA/CDH to trust the Trustee KBS HTTPS listener.
+pub fn trustee_kbs_ca_cert_pem() -> Option<String> {
+    nonempty_env("TRUSTEE_KBS_CA_CERT_PEM").map(|value| value.replace("\\n", "\n"))
+}
+
+pub fn trustee_kbs_resource_url() -> String {
+    format!(
+        "{}/kbs/v0/resource",
+        trustee_kbs_url().trim_end_matches('/')
+    )
+}
 
 /// Build the cc_init_data TOML string for a ConfidentialApp.
 ///
@@ -20,6 +41,8 @@ const KBS_URL: &str = "http://kbs-service.trustee-operator-system.svc.cluster.lo
 /// - cdh.toml: confidential data hub config pointing to KBS
 /// - identity.toml: tenant/instance identity for ownership binding
 pub fn build_toml(app: &ConfidentialApp) -> String {
+    let kbs_url = trustee_kbs_url();
+    let kbs_ca_cert_pem = trustee_kbs_ca_cert_pem();
     let primary = app
         .primary_container()
         .expect("app must have a primary container");
@@ -123,7 +146,10 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
     toml.push_str("\"aa.toml\" = '''\n");
     toml.push_str("[token_configs]\n");
     toml.push_str("[token_configs.kbs]\n");
-    toml.push_str(&format!("url = \"{KBS_URL}\"\n"));
+    toml.push_str(&format!("url = \"{}\"\n", toml_basic_string(&kbs_url)));
+    if let Some(cert) = &kbs_ca_cert_pem {
+        append_multiline_basic_string(&mut toml, "cert", cert);
+    }
     toml.push_str("'''\n");
     toml.push('\n');
 
@@ -131,7 +157,10 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
     toml.push_str("\"cdh.toml\" = '''\n");
     toml.push_str("[kbc]\n");
     toml.push_str("name = \"cc_kbc\"\n");
-    toml.push_str(&format!("url = \"{KBS_URL}\"\n"));
+    toml.push_str(&format!("url = \"{}\"\n", toml_basic_string(&kbs_url)));
+    if let Some(cert) = &kbs_ca_cert_pem {
+        append_multiline_basic_string(&mut toml, "kbs_cert", cert);
+    }
     toml.push_str("'''\n");
 
     // identity.toml (always present per OID-1)
@@ -165,6 +194,26 @@ fn required_claim<'a>(name: &str, value: Option<&'a str>) -> &'a str {
 
 fn assert_non_empty(name: &str, value: &str) {
     assert!(!value.is_empty(), "cc_init_data requires non-empty {name}");
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn toml_basic_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn append_multiline_basic_string(toml: &mut String, key: &str, value: &str) {
+    let value = value.trim();
+    assert!(
+        !value.contains("\"\"\""),
+        "cc_init_data {key} must not contain TOML multiline string delimiter"
+    );
+    toml.push_str(&format!("{key} = \"\"\"\n{value}\n\"\"\"\n"));
 }
 
 fn build_agent_policy(

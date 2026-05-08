@@ -1,5 +1,13 @@
 # CAP Development Notes
 
+## Build Tooling
+
+- Trustee/KBS and CoCo verifier builds on Fedora/RHEL hosts need the DNF
+  packages `protobuf-compiler`, `clang20`, and `clang20-devel` installed.
+- When building Trustee-side validation tools for release, include the
+  all-verifier feature set rather than only AMD SEV-SNP so the platform can add
+  other TEE backends without rebuilding the toolchain shape.
+
 ## Stateful Kata SEV-SNP Pods
 
 - Stateful confidential workloads must use normal long-running containers only.

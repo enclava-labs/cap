@@ -15,6 +15,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
+use crate::manifest::cc_init_data;
 use crate::types::{CaddyTlsMode, ConfidentialApp};
 use enclava_common::types::UnlockMode;
 
@@ -472,6 +473,8 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("ATTESTATION_PROFILE", "coco-sev-snp"),
         env("ATTESTATION_RUNTIME_CLASS", "kata-qemu-snp"),
         env("ATTESTATION_WORKLOAD_IMAGE", &primary.image.digest_ref()),
+        env("ATTESTATION_BIND", "127.0.0.1"),
+        env("ATTESTATION_TLS_BIND", "0.0.0.0"),
         env("ATTESTATION_TLS_PORT", "8443"),
         env("TEE_DOMAIN", &app.domain.tee_domain),
         env("STORAGE_OWNERSHIP_MODE", mode),
@@ -479,6 +482,10 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("OWNER_CIPHERTEXT_BACKEND", "kbs-resource"),
         env("OWNER_SEED_HANDOFF_SLOTS", "app-data"),
         env("OWNERSHIP_MOUNT_PATH", "/run/ownership-signal"),
+        env(
+            "KBS_RESOURCE_URL",
+            &cc_init_data::trustee_kbs_resource_url(),
+        ),
         env("KBS_RESOURCE_CACHE_SECONDS", "300"),
         env("KBS_RESOURCE_FAILURE_CACHE_SECONDS", "30"),
         env("KBS_FETCH_RETRIES", "120"),
@@ -491,6 +498,9 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
             "ENCLAVA_INIT_UNLOCK_SOCKET",
             "/run/enclava/unlock.sock",
         ));
+    }
+    if let Some(cert) = cc_init_data::trustee_kbs_ca_cert_pem() {
+        env_vars.push(env("KBS_RESOURCE_CA_CERT_PEM", &cert));
     }
 
     Container {

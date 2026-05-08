@@ -70,7 +70,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
     state: &AppState,
     artifacts: &crate::signing_service::DeploymentSigningArtifacts,
     provided_artifact: Option<String>,
-    signing_service_pubkey_hex: Option<&str>,
+    _signing_service_pubkey_hex: Option<&str>,
 ) -> Result<crate::signing_service::SignedPolicyArtifact, (StatusCode, Json<serde_json::Value>)> {
     if let Some(provided_artifact) = provided_artifact {
         let mut artifact =
@@ -109,36 +109,12 @@ pub(crate) async fn resolve_signed_policy_artifact(
         return Ok(artifact);
     }
 
-    if state.require_customer_signed_policy_artifact {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "customer-signed signed_policy_artifact is required; platform signing-service fallback is disabled"
-            })),
-        ));
-    }
-
-    let signing_service = state.signing_service.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({"error": "platform signing service is not configured"})),
-    ))?;
-    let signing_service_pubkey_hex = signing_service_pubkey_hex.ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
+    Err((
+        StatusCode::BAD_REQUEST,
         Json(serde_json::json!({
-            "error": "platform signing-service fallback requires SIGNING_SERVICE_PUBKEY_HEX"
+            "error": "customer-signed signed_policy_artifact is required; platform signing-service fallback is disabled"
         })),
-    ))?;
-    let mut signed = signing_service
-        .sign(&artifacts.sign_request())
-        .await
-        .map_err(signing_error_response)?;
-    artifacts
-        .validate_signed_artifact(&signed, signing_service_pubkey_hex)
-        .map_err(signing_error_response)?;
-    artifacts
-        .attach_customer_authority(&mut signed)
-        .map_err(signing_error_response)?;
-    Ok(signed)
+    ))
 }
 
 /// Pick the right cosign `VerificationPolicy` for a stored signer identity.
