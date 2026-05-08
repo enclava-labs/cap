@@ -243,14 +243,7 @@ impl TeeClient {
         let resp = self.http.get(self.url("/status")).send().await?;
         let resp = self.check_response(resp).await?;
         let body = resp.json::<serde_json::Value>().await?;
-        let state = body
-            .get("ownership_state")
-            .or_else(|| body.get("state"))
-            .and_then(|value| value.as_str());
-        let unlock_state = body.get("unlock_state").and_then(|value| value.as_str());
-
-        Ok(matches!(state, Some("claimed" | "unlocked"))
-            || matches!(unlock_state, Some("unlocked")))
+        Ok(claim_state_json_is_successful(&body))
     }
 
     // --- Ownership operations (direct to TEE, no API token) ---
@@ -447,6 +440,17 @@ impl TeeClient {
         };
         Ok((transition_attestation, self.with_http(pinned_http)))
     }
+}
+
+fn claim_state_json_is_successful(body: &serde_json::Value) -> bool {
+    let state = body
+        .get("ownership_state")
+        .or_else(|| body.get("state"))
+        .and_then(|value| value.as_str());
+    let unlock_state = body.get("unlock_state").and_then(|value| value.as_str());
+
+    matches!(state, Some("claimed" | "locked" | "unlocking" | "unlocked"))
+        || matches!(unlock_state, Some("locked" | "unlocking" | "unlocked"))
 }
 
 fn change_password_body(current_password: &str, new_password: &str) -> serde_json::Value {
@@ -1119,6 +1123,19 @@ mod tests {
         .expect("parse challenge");
         assert_eq!(parsed.nonce, "abc");
         assert_eq!(parsed.ttl_seconds, 300);
+    }
+
+    #[test]
+    fn locked_status_means_ownership_is_already_claimed() {
+        assert!(super::claim_state_json_is_successful(
+            &serde_json::json!({"state": "locked"})
+        ));
+        assert!(super::claim_state_json_is_successful(
+            &serde_json::json!({"ownership_state": "locked"})
+        ));
+        assert!(!super::claim_state_json_is_successful(
+            &serde_json::json!({"state": "unclaimed"})
+        ));
     }
 
     #[test]
