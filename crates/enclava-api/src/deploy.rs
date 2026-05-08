@@ -261,6 +261,7 @@ pub async fn record_deployment_result(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
