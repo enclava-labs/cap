@@ -686,7 +686,7 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             run_as_user: Some(10002),
             run_as_group: Some(10002),
             run_as_non_root: Some(true),
-            read_only_root_filesystem: Some(true),
+            read_only_root_filesystem: Some(false),
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".to_string()]),
                 add: Some(vec!["NET_BIND_SERVICE".to_string()]),
