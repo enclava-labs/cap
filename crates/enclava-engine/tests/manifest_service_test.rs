@@ -1,5 +1,6 @@
 use enclava_engine::manifest::service::generate_service;
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::CaddyTlsMode;
 
 #[test]
 fn service_name_and_namespace() {
@@ -22,6 +23,27 @@ fn service_has_https_port() {
         .find(|p| p.name.as_deref() == Some("https"))
         .unwrap();
     assert_eq!(https.port, 443);
+    assert_eq!(
+        https.target_port.as_ref().unwrap(),
+        &k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(443)
+    );
+}
+
+#[test]
+fn service_internal_tls_maps_https_to_caddy_high_port() {
+    let mut app = sample_app();
+    app.attestation.caddy_tls_mode = CaddyTlsMode::Internal;
+    let svc = generate_service(&app);
+    let ports = svc.spec.as_ref().unwrap().ports.as_ref().unwrap();
+    let https = ports
+        .iter()
+        .find(|p| p.name.as_deref() == Some("https"))
+        .unwrap();
+    assert_eq!(https.port, 443);
+    assert_eq!(
+        https.target_port.as_ref().unwrap(),
+        &k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(10443)
+    );
 }
 
 #[test]

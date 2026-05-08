@@ -80,7 +80,7 @@ The overlay assumes cert-manager with a `letsencrypt-prod` ClusterIssuer and an
 | `SKIP_COSIGN_VERIFY` | dev only | unset | If `1`, bypass cosign signature verification |
 | `ATTESTATION_PROXY_IMAGE` | yes (deploy) | — | Digest-pinned attestation-proxy image (`name@sha256:...`) |
 | `CADDY_INGRESS_IMAGE` | yes (deploy) | — | Digest-pinned tenant ingress Caddy image (`name@sha256:...`) |
-| `TENANT_CADDY_TLS_MODE` | no | `acme` | Tenant Caddy issuer mode. Use `internal` only for staging/live-smoke loops with insecure client TLS verification |
+| `TENANT_CADDY_TLS_MODE` | no | `acme` | Tenant Caddy issuer mode. Use `internal` only for staging/live-smoke loops with insecure client TLS verification; set consistently on CAP API and policy signing-service |
 | `TENANT_CADDY_ACME_CA` | no | Let's Encrypt production | ACME directory URL used when `TENANT_CADDY_TLS_MODE=acme` |
 | `CLOUDFLARE_API_TOKEN` | no | — | Cloudflare API token used by CAP to manage tenant A/AAAA records |
 | `CLOUDFLARE_ZONE_NAME` | no | `enclava.dev` | Cloudflare zone name CAP manages |

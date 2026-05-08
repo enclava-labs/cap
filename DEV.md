@@ -39,9 +39,11 @@
   Nutshell `enclava.toml` and Dockerfile state contract, then runs the focused
   CAP and signing-service tests that catch descriptor/runtime/policy drift.
 - For fast live smoke tests, set CAP API `TENANT_CADDY_TLS_MODE=internal`.
-  This renders tenant Caddy with `tls internal`, avoiding external ACME latency
-  while the CLI/client is already using staging or insecure TLS verification.
-  Production must leave this unset or set it to `acme`.
+  Set the same env var on policy signing-service. This renders tenant Caddy
+  with `tls internal` on high port `10443`, maps Service port `443` to that
+  high port, and avoids external ACME latency while the CLI/client is already
+  using staging or insecure TLS verification. Production must leave this unset
+  or set it to `acme`.
 - Only use the live cluster after this local gate passes. Keep the customer
   StatefulSet scaled to zero between live attempts and inspect the rendered pod
   spec before unlocking so simple command/port/mount mistakes do not boot a TEE

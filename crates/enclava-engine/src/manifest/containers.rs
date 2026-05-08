@@ -15,7 +15,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
-use crate::types::ConfidentialApp;
+use crate::types::{CaddyTlsMode, ConfidentialApp};
 use enclava_common::types::UnlockMode;
 
 /// True when the operator has opted back into the legacy bootstrap_script.sh
@@ -46,6 +46,9 @@ pub fn enclava_init_image() -> String {
 pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
 pub const APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
 pub const CADDY_SEED_PATH: &str = "/run/enclava/seeds/caddy/seed";
+pub const CADDY_ACME_TLS_PORT: i32 = 443;
+pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
+pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/tmp/caddy";
 pub const CADDY_TLS_STATE_MOUNT_PATH: &str = "/state/tls-state";
 pub const CADDY_TLS_STATE_PATH: &str = "/state/tls-state/tenant-ingress";
 
@@ -560,6 +563,10 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
 /// no `CF_API_TOKEN` env and no `tls-cloudflare-token` secret mount.
 pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
     let legacy = legacy_bootstrap_enabled();
+    let tls_port = match app.attestation.caddy_tls_mode {
+        CaddyTlsMode::Acme => CADDY_ACME_TLS_PORT,
+        CaddyTlsMode::Internal => CADDY_INTERNAL_TLS_PORT,
+    };
 
     let env_vars = if legacy {
         vec![
@@ -583,6 +590,22 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             env("KBS_FETCH_RETRIES", "120"),
             env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
             env("KBS_FETCH_MAX_SLEEP_SECONDS", "10"),
+        ]
+    } else if app.attestation.caddy_tls_mode == CaddyTlsMode::Internal {
+        vec![
+            env_field_ref("POD_NAME", "metadata.name"),
+            env_field_ref("POD_NAMESPACE", "metadata.namespace"),
+            env("CADDY_SEED_PATH", CADDY_SEED_PATH),
+            env("VOLUME_MOUNT_POINT", CADDY_INTERNAL_RUNTIME_PATH),
+            env("XDG_DATA_HOME", CADDY_INTERNAL_RUNTIME_PATH),
+            env(
+                "XDG_CONFIG_HOME",
+                &format!("{CADDY_INTERNAL_RUNTIME_PATH}/config"),
+            ),
+            env("HOME", CADDY_INTERNAL_RUNTIME_PATH),
+            env("ENCLAVA_CONTAINER_NAME", "tenant-ingress"),
+            env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"),
+            env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
         ]
     } else {
         vec![
@@ -709,7 +732,7 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         command,
         args,
         ports: Some(vec![ContainerPort {
-            container_port: 443,
+            container_port: tls_port,
             name: Some("https".to_string()),
             ..Default::default()
         }]),
@@ -734,7 +757,7 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         }),
         readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
             tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
-                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(443),
+                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(tls_port),
                 ..Default::default()
             }),
             initial_delay_seconds: Some(180),

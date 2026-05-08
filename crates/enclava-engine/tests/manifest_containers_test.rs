@@ -8,6 +8,7 @@ use enclava_engine::manifest::containers::{
     build_caddy_container, build_enclava_init_container,
 };
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::CaddyTlsMode;
 
 // === App container (Phase 5 default) ===
 
@@ -206,6 +207,21 @@ fn caddy_container_name_and_port() {
 }
 
 #[test]
+fn caddy_container_internal_tls_uses_high_port() {
+    let mut app = sample_app();
+    app.attestation.caddy_tls_mode = CaddyTlsMode::Internal;
+    let c = build_caddy_container(&app);
+    let ports = c.ports.as_ref().unwrap();
+    assert!(ports.iter().any(|p| p.container_port == 10443));
+    let probe = c.readiness_probe.as_ref().unwrap();
+    let tcp = probe.tcp_socket.as_ref().unwrap();
+    assert_eq!(
+        tcp.port,
+        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(10443)
+    );
+}
+
+#[test]
 fn caddy_container_is_unprivileged_with_only_net_bind() {
     let c = build_caddy_container(&sample_app());
     let sc = c.security_context.as_ref().unwrap();
@@ -321,6 +337,38 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .value
             .as_deref(),
         Some("/state/tls-state/tenant-ingress")
+    );
+}
+
+#[test]
+fn caddy_container_internal_tls_uses_tmp_runtime_dirs() {
+    let mut app = sample_app();
+    app.attestation.caddy_tls_mode = CaddyTlsMode::Internal;
+    let c = build_caddy_container(&app);
+    let env = c.env.as_ref().unwrap();
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "XDG_DATA_HOME")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/tmp/caddy")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "XDG_CONFIG_HOME")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/tmp/caddy/config")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "HOME")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/tmp/caddy")
     );
 }
 

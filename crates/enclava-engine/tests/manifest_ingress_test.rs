@@ -113,6 +113,11 @@ fn caddyfile_internal_tls_mode_skips_acme() {
     let cm = generate_ingress_configmap(&app);
     let data = cm.data.as_ref().unwrap();
     let caddyfile = data.get("Caddyfile").unwrap();
+    assert!(caddyfile.contains("admin off"));
+    assert!(caddyfile.contains("persist_config off"));
+    assert!(caddyfile.contains("auto_https disable_redirects"));
+    assert!(caddyfile.contains("storage file_system /tmp/caddy"));
+    assert!(caddyfile.contains("test-app.abcd1234.enclava.dev:10443"));
     assert!(caddyfile.contains("tls internal"));
     assert!(!caddyfile.contains("acme_ca "));
     assert!(!caddyfile.contains("issuer acme"));

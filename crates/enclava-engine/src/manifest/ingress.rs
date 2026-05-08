@@ -17,7 +17,9 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
-use super::containers::CADDY_TLS_STATE_PATH;
+use super::containers::{
+    CADDY_INTERNAL_RUNTIME_PATH, CADDY_INTERNAL_TLS_PORT, CADDY_TLS_STATE_PATH,
+};
 use crate::types::{CaddyTlsMode, ConfidentialApp};
 
 #[derive(Debug, thiserror::Error)]
@@ -183,19 +185,42 @@ pub fn render_caddyfile(app: &ConfidentialApp) -> Result<String, IngressRenderEr
 fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     let mut out = String::new();
     out.push_str("{\n");
+    if spec.tls_mode == CaddyTlsMode::Internal {
+        out.push_str("  admin off\n");
+        out.push_str("  persist_config off\n");
+        out.push_str("  auto_https disable_redirects\n");
+    }
     out.push_str("  email ");
     out.push_str(&spec.contact_email);
     out.push('\n');
     out.push_str("  storage file_system ");
-    out.push_str(CADDY_TLS_STATE_PATH);
-    out.push_str("/caddy\n");
+    match spec.tls_mode {
+        CaddyTlsMode::Acme => {
+            out.push_str(CADDY_TLS_STATE_PATH);
+            out.push_str("/caddy\n");
+        }
+        CaddyTlsMode::Internal => {
+            out.push_str(CADDY_INTERNAL_RUNTIME_PATH);
+            out.push('\n');
+        }
+    }
     if spec.tls_mode == CaddyTlsMode::Acme {
         out.push_str("  acme_ca ");
         out.push_str(&spec.acme_ca);
         out.push('\n');
     }
     out.push_str("}\n");
-    out.push_str(&spec.hosts.join(", "));
+    if spec.tls_mode == CaddyTlsMode::Internal {
+        let hosts = spec
+            .hosts
+            .iter()
+            .map(|host| format!("{host}:{CADDY_INTERNAL_TLS_PORT}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&hosts);
+    } else {
+        out.push_str(&spec.hosts.join(", "));
+    }
     out.push_str(" {\n");
     match spec.tls_mode {
         CaddyTlsMode::Acme => {

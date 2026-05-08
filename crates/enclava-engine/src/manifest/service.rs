@@ -3,12 +3,18 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use std::collections::BTreeMap;
 
-use crate::types::ConfidentialApp;
+use super::containers::{CADDY_ACME_TLS_PORT, CADDY_INTERNAL_TLS_PORT};
+use crate::types::{CaddyTlsMode, ConfidentialApp};
 
 /// Generate a Service with HTTPS (443) and attestation (8081) ports.
 ///
 /// Matches the live shape at components/templates/confidential-workload/service.yaml.
 pub fn generate_service(app: &ConfidentialApp) -> Service {
+    let caddy_target_port = match app.attestation.caddy_tls_mode {
+        CaddyTlsMode::Acme => CADDY_ACME_TLS_PORT,
+        CaddyTlsMode::Internal => CADDY_INTERNAL_TLS_PORT,
+    };
+
     let mut labels = BTreeMap::new();
     labels.insert(
         "app.kubernetes.io/managed-by".to_string(),
@@ -37,7 +43,7 @@ pub fn generate_service(app: &ConfidentialApp) -> Service {
                 ServicePort {
                     name: Some("https".to_string()),
                     port: 443,
-                    target_port: Some(IntOrString::Int(443)),
+                    target_port: Some(IntOrString::Int(caddy_target_port)),
                     ..Default::default()
                 },
                 ServicePort {
