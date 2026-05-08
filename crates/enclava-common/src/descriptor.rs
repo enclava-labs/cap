@@ -112,6 +112,7 @@ pub struct DeploymentDescriptor {
     pub expected_firmware_measurement: [u8; 32],
     pub expected_runtime_class: String,
     pub kbs_resource_path: String,
+    pub unlock_mode: String,
 
     pub policy_template_id: String,
     #[serde(with = "hex_bytes32")]
@@ -306,6 +307,7 @@ fn descriptor_records<'a>(
             d.expected_runtime_class.as_bytes(),
         ),
         ("kbs_resource_path", d.kbs_resource_path.as_bytes()),
+        ("unlock_mode", d.unlock_mode.as_bytes()),
         ("policy_template_id", d.policy_template_id.as_bytes()),
         ("policy_template_sha256", &d.policy_template_sha256),
         (

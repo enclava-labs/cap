@@ -58,6 +58,7 @@ fn fixed_descriptor() -> DeploymentDescriptor {
         expected_firmware_measurement: [3; 32],
         expected_runtime_class: "kata-qemu-snp".to_string(),
         kbs_resource_path: "default/cap-abcd1234-demo-tls-owner".to_string(),
+        unlock_mode: "password".to_string(),
         policy_template_id: "kbs-release-policy-v3".to_string(),
         policy_template_sha256: [4; 32],
         platform_release_version: "platform-2026.04".to_string(),

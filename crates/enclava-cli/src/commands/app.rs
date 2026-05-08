@@ -460,6 +460,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             "default/{}-{}-owner/seed-encrypted",
             app.namespace, app.name
         ),
+        unlock_mode: deploy_unlock_mode.to_string(),
         policy_template_id: release.policy_template_id.clone(),
         policy_template_sha256,
         platform_release_version: release.platform_release_version.clone(),

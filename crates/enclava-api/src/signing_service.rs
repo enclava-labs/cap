@@ -317,6 +317,9 @@ impl DeploymentSigningArtifacts {
         if self.descriptor.image_digest != image_digest {
             return Err(SigningServiceError::Mismatch("image_digest".into()));
         }
+        if self.descriptor.unlock_mode != app_unlock_mode(app.unlock_mode) {
+            return Err(SigningServiceError::Mismatch("unlock_mode".into()));
+        }
         if self.descriptor.signer_identity.subject
             != app.signer_identity_subject.clone().unwrap_or_default()
         {
@@ -654,6 +657,13 @@ impl DeploymentSigningArtifacts {
             policy_sha256,
             genpolicy_version_pin: artifact.metadata.genpolicy_version_pin.clone(),
         })
+    }
+}
+
+fn app_unlock_mode(mode: crate::models::UnlockMode) -> &'static str {
+    match mode {
+        crate::models::UnlockMode::Auto => "auto",
+        crate::models::UnlockMode::Password => "password",
     }
 }
 
@@ -1188,6 +1198,7 @@ mod tests {
             expected_firmware_measurement: [3; 32],
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-abcd1234-demo-owner".to_string(),
+            unlock_mode: "password".to_string(),
             policy_template_id: "enclava-kbs-policy-v1".to_string(),
             policy_template_sha256: [4; 32],
             platform_release_version: "cap-test".to_string(),
@@ -1229,6 +1240,33 @@ mod tests {
             org_keyring_signature: [0xcc; 64],
             org_keyring_signing_pubkey: [0xdd; 32],
             org_keyring_fingerprint: [0xdd; 32],
+        }
+    }
+
+    fn api_app_for_descriptor(
+        descriptor: &DeploymentDescriptor,
+        unlock_mode: crate::models::UnlockMode,
+    ) -> App {
+        App {
+            id: descriptor.app_id,
+            org_id: descriptor.org_id,
+            name: descriptor.app_name.clone(),
+            namespace: descriptor.namespace.clone(),
+            instance_id: "demo-instance".to_string(),
+            tenant_id: descriptor.org_slug.clone(),
+            service_account: descriptor.service_account.clone(),
+            bootstrap_owner_pubkey_hash: "aa".repeat(32),
+            tenant_instance_identity_hash: hex::encode(descriptor.identity_hash),
+            unlock_mode,
+            domain: descriptor.app_domain.clone(),
+            tee_domain: Some(descriptor.tee_domain.clone()),
+            custom_domain: None,
+            status: crate::models::AppStatus::Creating,
+            signer_identity_subject: Some(descriptor.signer_identity.subject.clone()),
+            signer_identity_issuer: Some(descriptor.signer_identity.issuer.clone()),
+            signer_identity_set_at: Some("2026-04-01T00:00:00Z".parse().unwrap()),
+            created_at: "2026-04-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-04-01T00:00:00Z".parse().unwrap(),
         }
     }
 
@@ -1305,6 +1343,20 @@ mod tests {
         assert_eq!(decoded.descriptor_signing_pubkey, [0xbb; 32]);
         assert_eq!(decoded.descriptor_signature, [0xaa; 64]);
         assert_ne!(decoded.org_keyring_fingerprint, [0; 32]);
+    }
+
+    #[test]
+    fn rejects_descriptor_unlock_mode_that_does_not_match_app() {
+        let mut descriptor = descriptor();
+        descriptor.unlock_mode = "auto".to_string();
+        let artifacts = signing_artifacts(descriptor.clone());
+        let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+        let err = artifacts
+            .validate_deployment_inputs(&app, &descriptor.image_digest)
+            .unwrap_err();
+
+        assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "unlock_mode"));
     }
 
     #[test]

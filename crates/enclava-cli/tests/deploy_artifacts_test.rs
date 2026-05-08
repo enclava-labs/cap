@@ -211,6 +211,7 @@ fn deploy_descriptor_and_keyring_envelopes_serialize_for_deploy_request() {
         expected_firmware_measurement: [2; 32],
         expected_runtime_class: "kata-qemu-snp".to_string(),
         kbs_resource_path: "default/cap-acme-demo-owner".to_string(),
+        unlock_mode: "password".to_string(),
         policy_template_id: "enclava-kbs-policy-v1".to_string(),
         policy_template_sha256: [3; 32],
         platform_release_version: "0.1.0".to_string(),

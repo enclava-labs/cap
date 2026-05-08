@@ -646,6 +646,7 @@ mod tests {
             "expected_firmware_measurement": "03".repeat(32),
             "expected_runtime_class": "kata-qemu-snp",
             "kbs_resource_path": "default/cap-abcd1234-demo-owner",
+            "unlock_mode": "password",
             "policy_template_id": "tmpl-default",
             "policy_template_sha256": "04".repeat(32),
             "platform_release_version": "v1.2.3",
