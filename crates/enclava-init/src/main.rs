@@ -584,6 +584,12 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
     chown::chown_recursive(tls_state_root, caddy_identity)
         .with_context(|| format!("chown {}", tls_state_root.display()))?;
 
+    let caddy_tls_dir = caddy_tls_bind_dir(tls_state_root);
+    std::fs::create_dir_all(&caddy_tls_dir)
+        .with_context(|| format!("creating {}", caddy_tls_dir.display()))?;
+    chown::chown_recursive(&caddy_tls_dir, caddy_identity)
+        .with_context(|| format!("chown {}", caddy_tls_dir.display()))?;
+
     let app_seed_dir = Path::new(&cfg.state_root).join("app");
     std::fs::create_dir_all(&app_seed_dir)
         .with_context(|| format!("creating {}", app_seed_dir.display()))?;
@@ -631,8 +637,9 @@ fn bind_mounts_into_workload_namespaces(
 fn bind_for_workload(cfg: &Config, self_pid: u32, workload: &WorkloadNamespace) -> Result<()> {
     let mut mounts = Vec::new();
     if workload.name == "tenant-ingress" {
+        let caddy_source = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
         mounts.push((
-            namespace_source(self_pid, &cfg.tls_state.mount_path),
+            namespace_source(self_pid, &caddy_source.to_string_lossy()),
             PathBuf::from(&cfg.tls_state.mount_path),
         ));
     } else {
@@ -754,6 +761,10 @@ fn app_bind_mount_dir(state_root: &Path, subdir: &str) -> Result<PathBuf> {
         return Err(anyhow!("invalid app bind mount subdir: {subdir}"));
     }
     Ok(state_root.join(rel))
+}
+
+fn caddy_tls_bind_dir(tls_state_root: &Path) -> PathBuf {
+    tls_state_root.join("tenant-ingress")
 }
 
 fn numeric_identity(uid: u32, gid: u32) -> ExecIdentity {
@@ -925,6 +936,14 @@ mod tests {
 
         assert!(paths_resolve_to_same_object(&one, &one).unwrap());
         assert!(!paths_resolve_to_same_object(&one, &two).unwrap());
+    }
+
+    #[test]
+    fn caddy_tls_bind_source_is_below_tls_state_root() {
+        assert_eq!(
+            caddy_tls_bind_dir(Path::new("/state/tls-state")),
+            PathBuf::from("/state/tls-state/tenant-ingress")
+        );
     }
 
     #[test]
