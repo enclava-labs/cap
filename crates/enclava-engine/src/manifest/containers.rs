@@ -46,7 +46,8 @@ pub fn enclava_init_image() -> String {
 pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
 pub const APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
 pub const CADDY_SEED_PATH: &str = "/run/enclava/seeds/caddy/seed";
-pub const CADDY_TLS_STATE_PATH: &str = "/tmp/enclava-tls-state";
+pub const CADDY_TLS_STATE_MOUNT_PATH: &str = "/state/tls-state";
+pub const CADDY_TLS_STATE_PATH: &str = "/state/tls-state/tenant-ingress";
 
 fn ownership_mode_str(mode: UnlockMode) -> &'static str {
     match mode {
@@ -554,7 +555,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
 ///
 /// Phase 5 default: unprivileged, NET_BIND_SERVICE only for port 443. Reads
 /// its seed from `/run/enclava/seeds/caddy/seed` and TLS material from
-/// `/tmp/enclava-tls-state`. The Cloudflare
+/// `/state/tls-state/tenant-ingress`. The Cloudflare
 /// DNS-01 path is gone — Phase 0 cut over to TLS-ALPN-01 — so caddy carries
 /// no `CF_API_TOKEN` env and no `tls-cloudflare-token` secret mount.
 pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
@@ -651,6 +652,12 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         volume_mounts.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),
+            ..Default::default()
+        });
+        volume_mounts.push(VolumeMount {
+            name: "tls-state-mount".to_string(),
+            mount_path: CADDY_TLS_STATE_MOUNT_PATH.to_string(),
+            mount_propagation: Some("HostToContainer".to_string()),
             ..Default::default()
         });
     }

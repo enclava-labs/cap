@@ -272,11 +272,14 @@ fn caddy_container_does_not_mount_cloudflare_token() {
 }
 
 #[test]
-fn caddy_container_uses_rootfs_tls_bind_target() {
+fn caddy_container_mounts_tls_state_filesystem() {
     let c = build_caddy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
     assert!(vm.iter().all(|m| m.name != "state-mount"));
-    assert!(vm.iter().all(|m| m.name != "tls-state-mount"));
+    let tls = vm.iter().find(|m| m.name == "tls-state-mount").unwrap();
+    assert_eq!(tls.mount_path, "/state/tls-state");
+    assert_eq!(tls.mount_propagation.as_deref(), Some("HostToContainer"));
+    assert!(vm.iter().all(|m| m.sub_path.is_none()));
     assert!(c.volume_devices.is_none());
 }
 
@@ -301,7 +304,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/tmp/enclava-tls-state/caddy")
+        Some("/state/tls-state/tenant-ingress/caddy")
     );
     assert_eq!(
         env.iter()
@@ -309,7 +312,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/tmp/enclava-tls-state/caddy/config")
+        Some("/state/tls-state/tenant-ingress/caddy/config")
     );
     assert_eq!(
         env.iter()
@@ -317,7 +320,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/tmp/enclava-tls-state")
+        Some("/state/tls-state/tenant-ingress")
     );
 }
 

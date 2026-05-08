@@ -17,6 +17,7 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
+use super::containers::CADDY_TLS_STATE_PATH;
 use crate::types::ConfidentialApp;
 
 #[derive(Debug, thiserror::Error)]
@@ -181,7 +182,9 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     out.push_str("  email ");
     out.push_str(&spec.contact_email);
     out.push('\n');
-    out.push_str("  storage file_system /tmp/enclava-tls-state/caddy\n");
+    out.push_str("  storage file_system ");
+    out.push_str(CADDY_TLS_STATE_PATH);
+    out.push_str("/caddy\n");
     out.push_str("  acme_ca ");
     out.push_str(&spec.acme_ca);
     out.push('\n');

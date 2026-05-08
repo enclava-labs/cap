@@ -42,7 +42,7 @@ fn caddyfile_uses_rootfs_tls_storage_path() {
     let cm = generate_ingress_configmap(&app);
     let data = cm.data.as_ref().unwrap();
     let caddyfile = data.get("Caddyfile").unwrap();
-    assert!(caddyfile.contains("storage file_system /tmp/enclava-tls-state/caddy"));
+    assert!(caddyfile.contains("storage file_system /state/tls-state/tenant-ingress/caddy"));
 }
 
 #[test]
