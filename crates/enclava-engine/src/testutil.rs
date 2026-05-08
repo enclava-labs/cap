@@ -69,6 +69,8 @@ pub fn sample_app() -> ConfidentialApp {
             trustee_policy_read_available: false,
             workload_artifacts_url: None,
             trustee_policy_url: None,
+            local_workload_artifacts_json: None,
+            local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
         },

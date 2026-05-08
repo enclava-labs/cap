@@ -22,6 +22,7 @@ use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
 use enclava_common::descriptor::{
     DeploymentDescriptor, descriptor_canonical_bytes, descriptor_core_hash,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -220,28 +221,48 @@ impl ArtifactFetcher {
             .timeout(self.timeout)
             .build()
             .map_err(|e| InitError::Kbs(format!("client build: {e}")))?;
-        let bundle: ArtifactsBundle = client
-            .get(&self.workload_artifacts_url)
-            .header(
-                "Authorization",
-                format!("Attestation {}", self.kbs_attestation_token),
-            )
-            .send()
-            .and_then(|r| r.error_for_status())
-            .and_then(|r| r.json())
-            .map_err(|e| InitError::Kbs(format!("fetch artifacts: {e}")))?;
-        let policy: PolicyEnvelope = client
-            .get(&self.trustee_policy_url)
-            .header(
-                "Authorization",
-                format!("Attestation {}", self.kbs_attestation_token),
-            )
-            .send()
-            .and_then(|r| r.error_for_status())
-            .and_then(|r| r.json())
-            .map_err(|e| InitError::Kbs(format!("fetch policy: {e}")))?;
+        let bundle: ArtifactsBundle = fetch_json(
+            &client,
+            &self.workload_artifacts_url,
+            &self.kbs_attestation_token,
+            "fetch artifacts",
+        )?;
+        let policy: PolicyEnvelope = fetch_json(
+            &client,
+            &self.trustee_policy_url,
+            &self.kbs_attestation_token,
+            "fetch policy",
+        )?;
         Ok((bundle, policy))
     }
+}
+
+fn fetch_json<T: DeserializeOwned>(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    attestation_token: &str,
+    context: &str,
+) -> Result<T> {
+    if let Some(path) = url.strip_prefix("file://") {
+        let bytes = std::fs::read(path)
+            .map_err(|e| InitError::Kbs(format!("{context} file {path}: {e}")))?;
+        return serde_json::from_slice(&bytes)
+            .map_err(|e| InitError::Kbs(format!("{context} file {path} json: {e}")));
+    }
+
+    client
+        .get(url)
+        .header("Authorization", format!("Attestation {attestation_token}"))
+        .send()
+        .map_err(|e| request_error(&format!("{context} send"), url, e))?
+        .error_for_status()
+        .map_err(|e| request_error(&format!("{context} status"), url, e))?
+        .json()
+        .map_err(|e| request_error(&format!("{context} json"), url, e))
+}
+
+fn request_error(context: &str, url: &str, err: reqwest::Error) -> InitError {
+    InitError::Kbs(format!("{context} {url}: {err}; debug={err:?}"))
 }
 
 pub fn resolve_kbs_attestation_token(
@@ -566,6 +587,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
+    use tempfile::tempdir;
 
     const AGENT_POLICY: &str = "package agent_policy\n\ndefault CreateContainerRequest := true\n";
 
@@ -842,6 +864,41 @@ mod tests {
             signing_sk.verifying_key(),
             descriptor_sk.verifying_key(),
         )
+    }
+
+    #[test]
+    fn artifact_fetcher_reads_file_urls() {
+        let deployer = SigningKey::generate(&mut OsRng);
+        let descriptor = descriptor_json();
+        let keyring = keyring_json(&deployer, "deployer");
+        let rego = "package enclava\ndefault allow := false\n";
+        let (bundle, env, _, _, _) = build_inputs(
+            &descriptor,
+            keyring,
+            rego,
+            &deployer,
+            &deployer,
+            b"placeholder cc_init_data",
+        );
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("workload-artifacts.json");
+        let policy_path = dir.path().join("trustee-policy.json");
+        std::fs::write(&bundle_path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        std::fs::write(&policy_path, serde_json::to_vec(&env).unwrap()).unwrap();
+
+        let fetcher = ArtifactFetcher {
+            workload_artifacts_url: format!("file://{}", bundle_path.display()),
+            trustee_policy_url: format!("file://{}", policy_path.display()),
+            kbs_attestation_token: "unused-for-file".into(),
+            timeout: Duration::from_secs(1),
+        };
+        let (fetched_bundle, fetched_policy) = fetcher.fetch().unwrap();
+        assert_eq!(fetched_bundle.descriptor_payload, bundle.descriptor_payload);
+        assert_eq!(
+            fetched_bundle.descriptor_signature,
+            bundle.descriptor_signature
+        );
+        assert_eq!(fetched_policy, env);
     }
 
     #[test]

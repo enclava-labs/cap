@@ -210,6 +210,8 @@ fn confidential_app_for_cc_hash(
             trustee_policy_read_available: true,
             workload_artifacts_url: None,
             trustee_policy_url: None,
+            local_workload_artifacts_json: None,
+            local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
             signing_service_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
         },

@@ -13,6 +13,8 @@ use enclava_common::canonical::ce_v1_hash;
 use enclava_common::types::UnlockMode;
 
 const LOCAL_KATA_CDH_RESOURCE_URL: &str = "http://127.0.0.1:8006/cdh/resource";
+const LOCAL_WORKLOAD_ARTIFACTS_PATH: &str = "/etc/enclava-init/workload-artifacts.json";
+const LOCAL_TRUSTEE_POLICY_PATH: &str = "/etc/enclava-init/trustee-policy.json";
 const APP_UID: u32 = 10001;
 const APP_GID: u32 = 10001;
 const CADDY_UID: u32 = 10002;
@@ -37,6 +39,12 @@ pub fn generate_enclava_init_configmap(app: &ConfidentialApp) -> ConfigMap {
             "cc-init-data.toml".to_string(),
             cc_init_data::build_toml(app),
         );
+        if let Some(json) = app.attestation.local_workload_artifacts_json.as_ref() {
+            data.insert("workload-artifacts.json".to_string(), json.clone());
+        }
+        if let Some(json) = app.attestation.local_trustee_policy_json.as_ref() {
+            data.insert("trustee-policy.json".to_string(), json.clone());
+        }
     }
 
     ConfigMap {
@@ -79,12 +87,22 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
         push_required_option(
             &mut out,
             "workload-artifacts-url",
-            app.attestation.workload_artifacts_url.as_deref(),
+            app.attestation
+                .local_workload_artifacts_json
+                .as_ref()
+                .map(|_| format!("file://{LOCAL_WORKLOAD_ARTIFACTS_PATH}"))
+                .as_deref()
+                .or(app.attestation.workload_artifacts_url.as_deref()),
         );
         push_required_option(
             &mut out,
             "trustee-policy-url",
-            app.attestation.trustee_policy_url.as_deref(),
+            app.attestation
+                .local_trustee_policy_json
+                .as_ref()
+                .map(|_| format!("file://{LOCAL_TRUSTEE_POLICY_PATH}"))
+                .as_deref()
+                .or(app.attestation.trustee_policy_url.as_deref()),
         );
         out.push_str(
             "kbs-attestation-token-url = \"http://127.0.0.1:8006/aa/token?token_type=kbs\"\n",

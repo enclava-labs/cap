@@ -159,3 +159,36 @@ fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
             .contains_key("trustee-policy-read-available")
     );
 }
+
+#[test]
+fn config_toml_prefers_local_verification_artifacts_when_present() {
+    let mut app = sample_app();
+    app.attestation.trustee_policy_read_available = true;
+    app.attestation.workload_artifacts_url =
+        Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts".to_string());
+    app.attestation.trustee_policy_url =
+        Some("http://kbs.trustee.svc/resource-policy/default/body".to_string());
+    app.attestation.local_workload_artifacts_json = Some("{\"bundle\":true}".to_string());
+    app.attestation.local_trustee_policy_json = Some("{\"policy\":true}".to_string());
+
+    let cm = generate_enclava_init_configmap(&app);
+    let data = cm.data.as_ref().unwrap();
+    let toml_text = data.get("config.toml").unwrap();
+
+    assert_eq!(
+        data.get("workload-artifacts.json").map(String::as_str),
+        Some("{\"bundle\":true}")
+    );
+    assert_eq!(
+        data.get("trustee-policy.json").map(String::as_str),
+        Some("{\"policy\":true}")
+    );
+    assert!(
+        toml_text.contains(
+            "workload-artifacts-url = \"file:///etc/enclava-init/workload-artifacts.json\""
+        )
+    );
+    assert!(
+        toml_text.contains("trustee-policy-url = \"file:///etc/enclava-init/trustee-policy.json\"")
+    );
+}

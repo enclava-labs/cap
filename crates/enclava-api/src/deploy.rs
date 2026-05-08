@@ -28,6 +28,8 @@ pub struct ApplyDeploymentManifestsRequest {
     pub api_url: String,
     pub workload_artifact_binding: Option<WorkloadArtifactBinding>,
     pub signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
+    pub local_workload_artifacts_json: Option<String>,
+    pub local_trustee_policy_json: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -339,6 +341,8 @@ pub async fn apply_deployment_manifests(
         api_url,
         workload_artifact_binding,
         signed_policy_artifact,
+        local_workload_artifacts_json,
+        local_trustee_policy_json,
     } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
     let mut app_spec = build_confidential_app(
@@ -350,6 +354,12 @@ pub async fn apply_deployment_manifests(
     )
     .await?;
     app_spec.workload_artifact_binding = workload_artifact_binding;
+    if let (Some(workload_artifacts), Some(trustee_policy)) =
+        (local_workload_artifacts_json, local_trustee_policy_json)
+    {
+        app_spec.attestation.local_workload_artifacts_json = Some(workload_artifacts);
+        app_spec.attestation.local_trustee_policy_json = Some(trustee_policy);
+    }
     if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
         let policy_sha256: [u8; 32] = hex::decode(&signed_policy_artifact.agent_policy_sha256)
             .map_err(|err| DeployError::Validation(format!("agent_policy_sha256: {err}")))?

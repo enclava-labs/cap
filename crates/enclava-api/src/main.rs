@@ -269,6 +269,8 @@ fn load_attestation_config(
         trustee_policy_read_available,
         workload_artifacts_url,
         trustee_policy_url,
+        local_workload_artifacts_json: None,
+        local_trustee_policy_json: None,
         platform_trustee_policy_pubkey_hex,
         signing_service_pubkey_hex,
     }

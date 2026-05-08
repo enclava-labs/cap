@@ -886,6 +886,74 @@ pub async fn persist_workload_artifacts(
     Ok(())
 }
 
+pub fn workload_artifacts_json(
+    artifacts: &DeploymentSigningArtifacts,
+    signed_policy_artifact: &SignedPolicyArtifact,
+) -> Result<String, SigningServiceError> {
+    let value = serde_json::json!({
+        "descriptor_payload": serde_json::to_value(&artifacts.descriptor)?,
+        "descriptor_signature": hex::encode(artifacts.descriptor_signature),
+        "descriptor_signing_key_id": artifacts.descriptor_signing_key_id,
+        "org_keyring_payload": serde_json::to_value(&artifacts.org_keyring)?,
+        "org_keyring_signature": hex::encode(artifacts.org_keyring_signature),
+        "signed_policy_artifact": serde_json::to_value(signed_policy_artifact)?,
+    });
+    Ok(serde_json::to_string(&value)?)
+}
+
+pub fn trustee_policy_json(
+    signed_policy_artifact: &SignedPolicyArtifact,
+) -> Result<String, SigningServiceError> {
+    Ok(serde_json::to_string(signed_policy_artifact)?)
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct StoredWorkloadArtifactsJsonRow {
+    descriptor_payload: serde_json::Value,
+    descriptor_signature: Vec<u8>,
+    descriptor_signing_key_id: String,
+    org_keyring_payload: serde_json::Value,
+    org_keyring_signature: Vec<u8>,
+    signed_policy_artifact: serde_json::Value,
+}
+
+pub async fn load_workload_artifacts_json(
+    pool: &PgPool,
+    app_id: Uuid,
+    deploy_id: Uuid,
+) -> Result<Option<(String, String)>, SigningServiceError> {
+    let Some(row) = sqlx::query_as::<_, StoredWorkloadArtifactsJsonRow>(
+        "SELECT descriptor_payload, descriptor_signature, descriptor_signing_key_id,
+                org_keyring_payload, org_keyring_signature, signed_policy_artifact
+         FROM workload_artifacts
+         WHERE app_id = $1 AND deploy_id = $2",
+    )
+    .bind(app_id)
+    .bind(deploy_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let artifacts = serde_json::json!({
+        "descriptor_payload": row.descriptor_payload,
+        "descriptor_signature": hex::encode(row.descriptor_signature),
+        "descriptor_signing_key_id": row.descriptor_signing_key_id,
+        "org_keyring_payload": row.org_keyring_payload,
+        "org_keyring_signature": hex::encode(row.org_keyring_signature),
+        "signed_policy_artifact": row.signed_policy_artifact,
+    });
+    let policy = artifacts
+        .get("signed_policy_artifact")
+        .cloned()
+        .ok_or_else(|| SigningServiceError::Blob("signed_policy_artifact missing".into()))?;
+    Ok(Some((
+        serde_json::to_string(&artifacts)?,
+        serde_json::to_string(&policy)?,
+    )))
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct StoredWorkloadArtifactRow {
     descriptor_core_hash: Vec<u8>,
@@ -1647,6 +1715,8 @@ mod tests {
                 trustee_policy_read_available: true,
                 workload_artifacts_url: Some("https://api.example.test/artifacts".to_string()),
                 trustee_policy_url: Some("https://kbs.example.test/policy".to_string()),
+                local_workload_artifacts_json: None,
+                local_trustee_policy_json: None,
                 platform_trustee_policy_pubkey_hex: Some("bb".repeat(32)),
                 signing_service_pubkey_hex: Some("bb".repeat(32)),
             },

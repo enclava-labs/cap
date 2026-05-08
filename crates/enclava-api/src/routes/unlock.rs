@@ -716,12 +716,24 @@ pub async fn update_unlock_mode(
     .await;
 
     let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
+    let local_verification_artifacts =
+        match (signing_artifacts.as_ref(), signed_policy_artifact.as_ref()) {
+            (Some(artifacts), Some(signed)) => Some((
+                crate::signing_service::workload_artifacts_json(artifacts, signed)
+                    .map_err(crate::routes::deployments::signing_error_response)?,
+                crate::signing_service::trustee_policy_json(signed)
+                    .map_err(crate::routes::deployments::signing_error_response)?,
+            )),
+            _ => None,
+        };
     let db = state.db.clone();
     let attestation = state.attestation.clone();
     let kbs_policy = state.kbs_policy.clone();
     let api_url = state.api_url.clone();
     let apply_app = updated_app.clone();
     let apply_permits = state.deployment_apply_permits.clone();
+    let (local_workload_artifacts_json, local_trustee_policy_json) =
+        local_verification_artifacts.unzip();
     tokio::spawn(async move {
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
@@ -758,6 +770,8 @@ pub async fn update_unlock_mode(
                 api_url,
                 workload_artifact_binding,
                 signed_policy_artifact,
+                local_workload_artifacts_json,
+                local_trustee_policy_json,
             },
         )
         .await

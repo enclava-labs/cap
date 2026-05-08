@@ -125,6 +125,14 @@ pub struct AttestationConfig {
     /// Trustee workload-attested active policy body endpoint for this platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trustee_policy_url: Option<String>,
+    /// Local workload artifact bundle JSON to mount into enclava-init when
+    /// direct in-TEE egress to CAP is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_workload_artifacts_json: Option<String>,
+    /// Local policy artifact JSON to mount into enclava-init when direct
+    /// in-TEE egress to Trustee is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_trustee_policy_json: Option<String>,
     /// Platform Ed25519 public key for Trustee policy artifacts, hex encoded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_trustee_policy_pubkey_hex: Option<String>,
