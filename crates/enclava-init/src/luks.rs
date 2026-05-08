@@ -16,10 +16,15 @@
 
 use std::path::{Path, PathBuf};
 
-use libcryptsetup_rs::{CryptInit, consts::flags::CryptActivate, consts::vals::EncryptionFormat};
+use libcryptsetup_rs::{
+    CryptInit, CryptParamsLuks2, CryptParamsLuks2Ref, consts::flags::CryptActivate,
+    consts::vals::EncryptionFormat,
+};
 
 use crate::errors::{InitError, Result};
 use crate::secrets::DerivedSeed;
+
+const LUKS2_SECTOR_SIZE: u32 = 512;
 
 /// Path to the activated mapper device.
 #[derive(Debug, Clone)]
@@ -43,14 +48,27 @@ pub fn is_formatted(device: &Path) -> Result<bool> {
 pub fn format(device: &Path, key: &DerivedSeed) -> Result<()> {
     let mut dev = CryptInit::init(device)
         .map_err(|e| InitError::Luks(format!("init {}: {e}", device.display())))?;
+    let params = CryptParamsLuks2 {
+        pbkdf: None,
+        integrity: None,
+        integrity_params: None,
+        data_alignment: 0,
+        data_device: None,
+        sector_size: LUKS2_SECTOR_SIZE,
+        label: None,
+        subsystem: None,
+    };
+    let mut params: CryptParamsLuks2Ref<'_> = (&params)
+        .try_into()
+        .map_err(|e| InitError::Luks(format!("luks2 params: {e}")))?;
 
     dev.context_handle()
-        .format::<()>(
+        .format(
             EncryptionFormat::Luks2,
             ("aes", "xts-plain64"),
             None,
             libcryptsetup_rs::Either::Right(64),
-            None,
+            Some(&mut params),
         )
         .map_err(|e| InitError::Luks(format!("format: {e}")))?;
 
