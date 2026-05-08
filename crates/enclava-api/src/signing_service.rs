@@ -459,6 +459,45 @@ impl DeploymentSigningArtifacts {
         Ok(())
     }
 
+    pub fn validate_canonical_agent_policy(
+        &self,
+        artifact: &SignedPolicyArtifact,
+        generated: &AgentPolicyResponse,
+    ) -> Result<(), SigningServiceError> {
+        let generated_hash = decode_hex32(
+            "generated_agent_policy.agent_policy_sha256",
+            &generated.agent_policy_sha256,
+        )?;
+        let generated_actual: [u8; 32] =
+            Sha256::digest(generated.agent_policy_text.as_bytes()).into();
+        if generated_hash != generated_actual {
+            return Err(SigningServiceError::Mismatch(
+                "generated_agent_policy.agent_policy_sha256".into(),
+            ));
+        }
+        if self.descriptor.expected_agent_policy_hash != generated_hash {
+            return Err(SigningServiceError::Mismatch(
+                "generated_agent_policy.expected_agent_policy_hash".into(),
+            ));
+        }
+        if artifact.agent_policy_sha256 != generated.agent_policy_sha256 {
+            return Err(SigningServiceError::Mismatch(
+                "canonical_agent_policy_sha256".into(),
+            ));
+        }
+        if artifact.agent_policy_text != generated.agent_policy_text {
+            return Err(SigningServiceError::Mismatch(
+                "canonical_agent_policy_text".into(),
+            ));
+        }
+        if artifact.metadata.genpolicy_version_pin != generated.genpolicy_version_pin {
+            return Err(SigningServiceError::Mismatch(
+                "canonical_genpolicy_version_pin".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn attach_customer_authority(
         &self,
         artifact: &mut SignedPolicyArtifact,
@@ -1306,6 +1345,14 @@ mod tests {
         }
     }
 
+    fn agent_policy_response_for(artifact: &SignedPolicyArtifact) -> AgentPolicyResponse {
+        AgentPolicyResponse {
+            agent_policy_text: artifact.agent_policy_text.clone(),
+            agent_policy_sha256: artifact.agent_policy_sha256.clone(),
+            genpolicy_version_pin: artifact.metadata.genpolicy_version_pin.clone(),
+        }
+    }
+
     #[test]
     fn decodes_descriptor_and_keyring_blobs() {
         let descriptor = descriptor();
@@ -1422,6 +1469,39 @@ mod tests {
         artifacts
             .validate_customer_signed_artifact(&artifact)
             .unwrap();
+    }
+
+    #[test]
+    fn validates_customer_artifact_against_canonical_agent_policy() {
+        let artifacts = signing_artifacts(descriptor());
+        let signing_key = SigningKey::from_bytes(&[0x33; 32]);
+        let artifact = signed_policy_artifact(&artifacts, &signing_key);
+        let generated = agent_policy_response_for(&artifact);
+
+        artifacts
+            .validate_canonical_agent_policy(&artifact, &generated)
+            .unwrap();
+    }
+
+    #[test]
+    fn rejects_customer_artifact_when_descriptor_policy_hash_is_stale() {
+        let artifacts = signing_artifacts(descriptor());
+        let signing_key = SigningKey::from_bytes(&[0x33; 32]);
+        let artifact = signed_policy_artifact(&artifacts, &signing_key);
+        let agent_policy_text =
+            "package agent_policy\n\ndefault CreateContainerRequest := false\n".to_string();
+        let generated = AgentPolicyResponse {
+            agent_policy_sha256: hex::encode(Sha256::digest(agent_policy_text.as_bytes())),
+            agent_policy_text,
+            genpolicy_version_pin: artifact.metadata.genpolicy_version_pin.clone(),
+        };
+
+        let err = artifacts
+            .validate_canonical_agent_policy(&artifact, &generated)
+            .unwrap_err();
+        assert!(
+            matches!(err, SigningServiceError::Mismatch(field) if field == "generated_agent_policy.expected_agent_policy_hash")
+        );
     }
 
     #[test]

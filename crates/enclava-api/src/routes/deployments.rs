@@ -88,6 +88,21 @@ pub(crate) async fn resolve_signed_policy_artifact(
         artifacts
             .validate_customer_signed_artifact(&artifact)
             .map_err(signing_error_response)?;
+        let signing_service = state.signing_service.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "canonical agent policy validation requires the platform policy generator"
+            })),
+        ))?;
+        let generated = signing_service
+            .agent_policy(&crate::signing_service::AgentPolicyRequest {
+                descriptor: artifacts.descriptor.clone(),
+            })
+            .await
+            .map_err(signing_error_response)?;
+        artifacts
+            .validate_canonical_agent_policy(&artifact, &generated)
+            .map_err(signing_error_response)?;
         artifacts
             .attach_customer_authority(&mut artifact)
             .map_err(signing_error_response)?;
