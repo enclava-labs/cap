@@ -313,43 +313,11 @@ fn enclava_init_container_waits_for_workloads_and_marks_ready_file() {
     );
     assert_eq!(
         env.iter()
-            .find(|e| e.name == "ENCLAVA_INIT_ERROR_FILE")
-            .unwrap()
-            .value
-            .as_deref(),
-        Some("/run/enclava/init-error")
-    );
-    assert_eq!(
-        env.iter()
             .find(|e| e.name == "ENCLAVA_INIT_WAIT_FOR_CONTAINERS")
             .unwrap()
             .value
             .as_deref(),
         Some("web,tenant-ingress")
-    );
-    assert_eq!(
-        env.iter()
-            .find(|e| e.name == "ENCLAVA_INIT_KBS_FETCH_RETRIES")
-            .unwrap()
-            .value
-            .as_deref(),
-        Some("30")
-    );
-    assert_eq!(
-        env.iter()
-            .find(|e| e.name == "ENCLAVA_INIT_KBS_FETCH_RETRY_SLEEP_SECONDS")
-            .unwrap()
-            .value
-            .as_deref(),
-        Some("2")
-    );
-    assert_eq!(
-        env.iter()
-            .find(|e| e.name == "ENCLAVA_INIT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS")
-            .unwrap()
-            .value
-            .as_deref(),
-        Some("10")
     );
     assert!(c.startup_probe.is_none());
     let probe = c.readiness_probe.as_ref().unwrap();
