@@ -164,6 +164,7 @@ fn mkfs_ext4(mapper_path: &Path) -> Result<()> {
 fn format_with_cryptsetup_cli(device: &Path, key: &DerivedSeed) -> Result<()> {
     with_key_file(key, |key_file| {
         let args = vec![
+            "--debug".to_string(),
             "luksFormat".to_string(),
             path_arg(device)?,
             "--key-file".to_string(),
@@ -185,6 +186,7 @@ fn format_with_cryptsetup_cli(device: &Path, key: &DerivedSeed) -> Result<()> {
 fn open_with_cryptsetup_cli(device: &Path, mapping_name: &str, key: &DerivedSeed) -> Result<()> {
     with_key_file(key, |key_file| {
         let args = vec![
+            "--debug".to_string(),
             "luksOpen".to_string(),
             path_arg(device)?,
             mapping_name.to_string(),
@@ -259,11 +261,16 @@ fn run_command(program: &str, args: &[String]) -> Result<()> {
 }
 
 fn truncate_output(value: &str) -> String {
-    const LIMIT: usize = 2048;
+    const EDGE: usize = 2048;
+    const LIMIT: usize = EDGE * 2;
     if value.len() <= LIMIT {
         value.to_string()
     } else {
-        format!("{}...[truncated]", &value[..LIMIT])
+        format!(
+            "{}...[truncated]...{}",
+            &value[..EDGE],
+            &value[value.len() - EDGE..]
+        )
     }
 }
 
