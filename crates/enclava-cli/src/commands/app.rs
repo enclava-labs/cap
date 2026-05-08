@@ -717,11 +717,17 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     // owner claims storage, so waiting for app-level readiness deadlocks.
     // Instead, wait for the TEE bootstrap endpoint and claim directly.
     let needs_initial_claim = if is_password_mode {
-        api.get_unlock_status(&app_name)
+        match api
+            .get_unlock_status(&app_name)
             .await
             .ok()
             .and_then(|status| status.ownership_state)
-            .is_none_or(|state| state == "unclaimed")
+            .as_deref()
+        {
+            Some("unclaimed") => true,
+            Some(_) => false,
+            None => app.tenant_instance_identity_hash.is_none(),
+        }
     } else {
         false
     };
