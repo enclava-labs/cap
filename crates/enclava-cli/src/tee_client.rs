@@ -11,6 +11,7 @@ use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use serde::Deserialize;
+use sev::parser::ByteParser;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -20,6 +21,8 @@ use enclava_common::canonical::ce_v1_hash;
 
 use crate::api_types::{SignedReceiptResponse, TransitionReceiptAttestation};
 use crate::attestation::{tee_tls_transcript_hash, validate_snp_report_with_der_chain};
+
+const AMD_KDS_BASE_URL: &str = "https://kdsintf.amd.com";
 
 /// Direct HTTPS client for the attestation proxy running inside a TEE.
 /// All requests go to https://{app-domain}/.well-known/confidential/...
@@ -432,7 +435,8 @@ impl TeeClient {
         let evidence = B64_STANDARD
             .decode(attestation.evidence.payload_b64.as_bytes())
             .map_err(|_| TeeError::Attestation("evidence payload is not base64".to_string()))?;
-        verify_evidence_report_data(&attestation.evidence, &evidence, &expected_report_data)?;
+        verify_evidence_report_data(&attestation.evidence, &evidence, &expected_report_data)
+            .await?;
         let evidence_sha256 = hex::encode(Sha256::digest(evidence));
         let transition_attestation = TransitionReceiptAttestation {
             tee_domain: endpoint.host,
@@ -506,7 +510,7 @@ fn verify_receipt_matches_attestation(
     Ok(())
 }
 
-fn verify_evidence_report_data(
+async fn verify_evidence_report_data(
     evidence: &AttestationEvidence,
     evidence_bytes: &[u8],
     expected_report_data: &[u8; 64],
@@ -523,12 +527,10 @@ fn verify_evidence_report_data(
     };
 
     if let Some(snp_report_bytes) = extract_snp_report_bytes(&evidence_json) {
-        let chain = extract_snp_der_chain(&evidence_json).ok_or_else(|| {
-            TeeError::Attestation(
-                "SNP evidence contains a raw report but is missing ARK/ASK/VCEK DER certificates"
-                    .to_string(),
-            )
-        })?;
+        let chain = match extract_snp_der_chain(&evidence_json) {
+            Some(chain) => chain,
+            None => fetch_snp_der_chain_from_kds(&snp_report_bytes).await?,
+        };
         let report = validate_snp_report_with_der_chain(
             &snp_report_bytes,
             &chain.ark_der,
@@ -597,6 +599,10 @@ fn extract_snp_report_bytes(value: &serde_json::Value) -> Option<Vec<u8>> {
                         | "attestationreport"
                         | "attestationreportbytes"
                 );
+                if is_report_key && let Some(bytes) = extract_structured_snp_report_bytes(candidate)
+                {
+                    return Some(bytes);
+                }
                 if is_report_key
                     && let Some(bytes) = parse_bytes_value(candidate)
                     && bytes.len() == 1184
@@ -614,11 +620,174 @@ fn extract_snp_report_bytes(value: &serde_json::Value) -> Option<Vec<u8>> {
 }
 
 fn extract_snp_der_chain(value: &serde_json::Value) -> Option<SnpDerChain> {
+    if let Some(chain) = extract_coco_cert_chain(value) {
+        return Some(chain);
+    }
     Some(SnpDerChain {
         ark_der: extract_named_bytes(value, &["ark", "arkder", "arkcert", "arkcertificate"])?,
         ask_der: extract_named_bytes(value, &["ask", "askder", "askcert", "askcertificate"])?,
         vcek_der: extract_named_bytes(value, &["vcek", "vcekder", "vcekcert", "vcekcertificate"])?,
     })
+}
+
+async fn fetch_snp_der_chain_from_kds(snp_report_bytes: &[u8]) -> Result<SnpDerChain, TeeError> {
+    let report = sev::firmware::guest::AttestationReport::from_bytes(snp_report_bytes)
+        .map_err(|err| TeeError::Attestation(format!("SNP report parse failed: {err}")))?;
+    let (ark_der, ask_der) = builtin_snp_ca_der_chain(&report)?;
+    let vcek_url = amd_kds_vcek_url(&report, AMD_KDS_BASE_URL)?;
+    let vcek_der = reqwest::Client::builder()
+        .https_only(true)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?
+        .get(vcek_url)
+        .send()
+        .await
+        .map_err(|err| TeeError::Attestation(format!("AMD KDS VCEK request failed: {err}")))?
+        .error_for_status()
+        .map_err(|err| TeeError::Attestation(format!("AMD KDS VCEK fetch failed: {err}")))?
+        .bytes()
+        .await
+        .map_err(|err| TeeError::Attestation(format!("AMD KDS VCEK body read failed: {err}")))?
+        .to_vec();
+
+    Ok(SnpDerChain {
+        ark_der,
+        ask_der,
+        vcek_der,
+    })
+}
+
+fn builtin_snp_ca_der_chain(
+    report: &sev::firmware::guest::AttestationReport,
+) -> Result<(Vec<u8>, Vec<u8>), TeeError> {
+    let generation = snp_report_generation(report)?;
+    let (ark, ask) = match generation {
+        sev::Generation::Milan => (
+            sev::certs::snp::builtin::milan::ark(),
+            sev::certs::snp::builtin::milan::ask(),
+        ),
+        sev::Generation::Genoa => (
+            sev::certs::snp::builtin::genoa::ark(),
+            sev::certs::snp::builtin::genoa::ask(),
+        ),
+        sev::Generation::Turin => (
+            sev::certs::snp::builtin::turin::ark(),
+            sev::certs::snp::builtin::turin::ask(),
+        ),
+    };
+    let ark_der = ark
+        .map_err(|err| TeeError::Attestation(format!("AMD ARK parse failed: {err}")))?
+        .to_der()
+        .map_err(|err| TeeError::Attestation(format!("AMD ARK DER encode failed: {err}")))?;
+    let ask_der = ask
+        .map_err(|err| TeeError::Attestation(format!("AMD ASK parse failed: {err}")))?
+        .to_der()
+        .map_err(|err| TeeError::Attestation(format!("AMD ASK DER encode failed: {err}")))?;
+    Ok((ark_der, ask_der))
+}
+
+fn amd_kds_vcek_url(
+    report: &sev::firmware::guest::AttestationReport,
+    base_url: &str,
+) -> Result<String, TeeError> {
+    if report.chip_id == [0u8; 64] {
+        return Err(TeeError::Attestation(
+            "SNP report masks chip_id; cannot fetch VCEK from AMD KDS".to_string(),
+        ));
+    }
+    if report.key_info.signing_key() != 0 {
+        return Err(TeeError::Attestation(
+            "SNP report was not signed by VCEK; AMD KDS VCEK fallback is not applicable"
+                .to_string(),
+        ));
+    }
+
+    let generation = snp_report_generation(report)?;
+    let tcb = report.reported_tcb;
+    let hw_id = hex::encode(report.chip_id);
+    let base = base_url.trim_end_matches('/');
+    if matches!(generation, sev::Generation::Turin) {
+        let fmc = tcb.fmc.ok_or_else(|| {
+            TeeError::Attestation("Turin SNP report missing fmc TCB value".to_string())
+        })?;
+        Ok(format!(
+            "{base}/vcek/v1/{}/{hw_id}?fmcSPL={fmc:02}&blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}",
+            generation.titlecase(),
+            tcb.bootloader,
+            tcb.tee,
+            tcb.snp,
+            tcb.microcode
+        ))
+    } else {
+        Ok(format!(
+            "{base}/vcek/v1/{}/{hw_id}?blSPL={:02}&teeSPL={:02}&snpSPL={:02}&ucodeSPL={:02}",
+            generation.titlecase(),
+            tcb.bootloader,
+            tcb.tee,
+            tcb.snp,
+            tcb.microcode
+        ))
+    }
+}
+
+fn snp_report_generation(
+    report: &sev::firmware::guest::AttestationReport,
+) -> Result<sev::Generation, TeeError> {
+    let family = report.cpuid_fam_id.ok_or_else(|| {
+        TeeError::Attestation("SNP report missing CPUID family for VCEK lookup".to_string())
+    })?;
+    let model = report.cpuid_mod_id.ok_or_else(|| {
+        TeeError::Attestation("SNP report missing CPUID model for VCEK lookup".to_string())
+    })?;
+    sev::Generation::identify_cpu(family, model)
+        .map_err(|err| TeeError::Attestation(format!("unknown SNP CPU generation: {err}")))
+}
+
+fn extract_structured_snp_report_bytes(value: &serde_json::Value) -> Option<Vec<u8>> {
+    if !value.is_object() {
+        return None;
+    }
+    let report: sev::firmware::guest::AttestationReport =
+        serde_json::from_value(value.clone()).ok()?;
+    let bytes = report.to_bytes().ok()?;
+    Some(bytes.as_ref().to_vec())
+}
+
+fn extract_coco_cert_chain(value: &serde_json::Value) -> Option<SnpDerChain> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(values) = map.get("cert_chain").and_then(serde_json::Value::as_array) {
+                let mut ark_der = None;
+                let mut ask_der = None;
+                let mut vcek_der = None;
+
+                for entry in values {
+                    let cert_type = entry
+                        .get("cert_type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(normalize_json_key)?;
+                    let data = entry.get("data").and_then(parse_bytes_value)?;
+                    match cert_type.as_str() {
+                        "ark" => ark_der = Some(data),
+                        "ask" | "asvk" => ask_der = Some(data),
+                        "vcek" | "vlek" => vcek_der = Some(data),
+                        _ => {}
+                    }
+                }
+
+                if ark_der.is_some() && ask_der.is_some() && vcek_der.is_some() {
+                    return Some(SnpDerChain {
+                        ark_der: ark_der?,
+                        ask_der: ask_der?,
+                        vcek_der: vcek_der?,
+                    });
+                }
+            }
+            map.values().find_map(extract_coco_cert_chain)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(extract_coco_cert_chain),
+        _ => None,
+    }
 }
 
 fn extract_named_bytes(value: &serde_json::Value, normalized_names: &[&str]) -> Option<Vec<u8>> {
@@ -899,6 +1068,7 @@ fn leaf_spki_der(cert_der: &[u8]) -> Result<Vec<u8>, TeeError> {
 #[cfg(test)]
 mod tests {
     use super::{TeeClient, accepts_invalid_tee_certs, normalize_unlock_mode};
+    use sev::parser::ByteParser;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -977,8 +1147,8 @@ mod tests {
         assert_eq!(normalize_unlock_mode("auto"), "auto");
     }
 
-    #[test]
-    fn verifies_attestation_evidence_report_data_binding() {
+    #[tokio::test]
+    async fn verifies_attestation_evidence_report_data_binding() {
         let _guard = env_lock();
         unsafe {
             std::env::set_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY", "true");
@@ -993,14 +1163,16 @@ mod tests {
             })),
         };
 
-        super::verify_evidence_report_data(&evidence, b"", &expected).unwrap();
+        super::verify_evidence_report_data(&evidence, b"", &expected)
+            .await
+            .unwrap();
         unsafe {
             std::env::remove_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY");
         }
     }
 
-    #[test]
-    fn rejects_attestation_evidence_report_data_mismatch() {
+    #[tokio::test]
+    async fn rejects_attestation_evidence_report_data_mismatch() {
         let _guard = env_lock();
         unsafe {
             std::env::set_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY", "true");
@@ -1015,14 +1187,18 @@ mod tests {
             })),
         };
 
-        assert!(super::verify_evidence_report_data(&evidence, b"", &expected).is_err());
+        assert!(
+            super::verify_evidence_report_data(&evidence, b"", &expected)
+                .await
+                .is_err()
+        );
         unsafe {
             std::env::remove_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY");
         }
     }
 
-    #[test]
-    fn rejects_json_only_attestation_evidence_by_default() {
+    #[tokio::test]
+    async fn rejects_json_only_attestation_evidence_by_default() {
         let _guard = env_lock();
         unsafe {
             std::env::remove_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY");
@@ -1037,7 +1213,92 @@ mod tests {
             })),
         };
 
-        let err = super::verify_evidence_report_data(&evidence, b"", &expected).unwrap_err();
+        let err = super::verify_evidence_report_data(&evidence, b"", &expected)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("raw AMD SNP report"));
+    }
+
+    #[test]
+    fn extracts_coco_structured_snp_report_bytes() {
+        let mut report = sev::firmware::guest::AttestationReport {
+            version: 3,
+            cpuid_fam_id: Some(25),
+            cpuid_mod_id: Some(160),
+            cpuid_step: Some(2),
+            ..Default::default()
+        };
+        report.report_data = [0x42; 64];
+
+        let expected = report.to_bytes().unwrap().as_ref().to_vec();
+        let evidence = serde_json::json!({
+            "attestation_report": serde_json::to_value(report).unwrap(),
+        });
+
+        assert_eq!(
+            super::extract_snp_report_bytes(&evidence).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn extracts_coco_cert_chain_by_cert_type() {
+        let evidence = serde_json::json!({
+            "cert_chain": [
+                {"cert_type": "ASK", "data": [4, 5, 6]},
+                {"cert_type": "VCEK", "data": [7, 8, 9]},
+                {"cert_type": "ARK", "data": [1, 2, 3]}
+            ]
+        });
+
+        let chain = super::extract_snp_der_chain(&evidence).unwrap();
+        assert_eq!(chain.ark_der, vec![1, 2, 3]);
+        assert_eq!(chain.ask_der, vec![4, 5, 6]);
+        assert_eq!(chain.vcek_der, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn builds_amd_kds_vcek_url_from_snp_report() {
+        let report = sev::firmware::guest::AttestationReport {
+            version: 3,
+            cpuid_fam_id: Some(25),
+            cpuid_mod_id: Some(160),
+            cpuid_step: Some(2),
+            reported_tcb: sev::firmware::host::TcbVersion {
+                fmc: None,
+                bootloader: 10,
+                tee: 0,
+                snp: 24,
+                microcode: 84,
+            },
+            chip_id: [0xab; 64],
+            ..Default::default()
+        };
+
+        let url = super::amd_kds_vcek_url(&report, "https://kdsintf.amd.com/").unwrap();
+
+        assert_eq!(
+            url,
+            format!(
+                "https://kdsintf.amd.com/vcek/v1/Genoa/{}?blSPL=10&teeSPL=00&snpSPL=24&ucodeSPL=84",
+                "ab".repeat(64)
+            )
+        );
+    }
+
+    #[test]
+    fn loads_builtin_amd_snp_ca_chain_for_report_generation() {
+        let report = sev::firmware::guest::AttestationReport {
+            version: 3,
+            cpuid_fam_id: Some(25),
+            cpuid_mod_id: Some(160),
+            cpuid_step: Some(2),
+            ..Default::default()
+        };
+
+        let (ark_der, ask_der) = super::builtin_snp_ca_der_chain(&report).unwrap();
+
+        assert!(ark_der.starts_with(&[0x30]));
+        assert!(ask_der.starts_with(&[0x30]));
     }
 }

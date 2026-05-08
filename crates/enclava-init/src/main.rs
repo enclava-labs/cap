@@ -275,36 +275,53 @@ fn acquire_owner_seed_password(cfg: &Config) -> Result<OwnerSeed> {
         .ok_or_else(|| anyhow!("password mode requires argon2_salt_hex in config"))?;
     let salt = hex::decode(salt_hex).context("decoding argon2_salt_hex")?;
 
-    let listener = socket::bind(Path::new(&cfg.unlock_socket))?;
-    tracing::info!(socket = %cfg.unlock_socket, "awaiting password");
+    let listener =
+        socket::bind_with_peer_gid(Path::new(&cfg.unlock_socket), unlock_socket_peer_gid())?;
+    tracing::info!(socket = %cfg.unlock_socket, "awaiting unlock request");
 
     loop {
-        let now = unlock::now_secs();
-        if let Err(e) = unlock::check_rate_limit(Path::new(&cfg.attempts_path), now) {
-            return Err(anyhow!("rate limit: {e}"));
-        }
-
         let (mut stream, _) = listener.accept()?;
-        let pw_str = match socket::read_password_line(&mut stream) {
-            Ok(s) => s,
+        let request = match socket::read_unlock_request(&mut stream) {
+            Ok(request) => request,
             Err(e) => {
                 let _ = socket::reply_err(&mut stream, &format!("read: {e}"));
                 continue;
             }
         };
-        let password = Password::from_plaintext(&pw_str);
-        unlock::record_attempt(Path::new(&cfg.attempts_path), now)?;
 
-        match unlock::derive_owner_seed(&password, &salt) {
-            Ok(seed) => {
+        match request {
+            socket::UnlockRequest::OwnerSeed(seed) => {
                 socket::reply_ok(&mut stream).ok();
                 return Ok(seed);
             }
-            Err(e) => {
-                socket::reply_err(&mut stream, &format!("derive: {e}")).ok();
+            socket::UnlockRequest::Password(pw_str) => {
+                let now = unlock::now_secs();
+                if let Err(e) = unlock::check_rate_limit(Path::new(&cfg.attempts_path), now) {
+                    return Err(anyhow!("rate limit: {e}"));
+                }
+
+                let password = Password::from_plaintext(&pw_str);
+                unlock::record_attempt(Path::new(&cfg.attempts_path), now)?;
+
+                match unlock::derive_owner_seed(&password, &salt) {
+                    Ok(seed) => {
+                        socket::reply_ok(&mut stream).ok();
+                        return Ok(seed);
+                    }
+                    Err(e) => {
+                        socket::reply_err(&mut stream, &format!("derive: {e}")).ok();
+                    }
+                }
             }
         }
     }
+}
+
+fn unlock_socket_peer_gid() -> Option<u32> {
+    std::env::var("ENCLAVA_INIT_UNLOCK_SOCKET_GID")
+        .ok()
+        .as_deref()
+        .and_then(parse_positive_u32)
 }
 
 fn acquire_owner_seed_autounlock(cfg: &Config) -> Result<OwnerSeed> {
@@ -473,6 +490,10 @@ fn kbs_fetch_request_timeout() -> Duration {
 
 fn parse_positive_seconds(value: &str) -> Option<u64> {
     value.parse::<u64>().ok().filter(|seconds| *seconds > 0)
+}
+
+fn parse_positive_u32(value: &str) -> Option<u32> {
+    value.parse::<u32>().ok().filter(|value| *value > 0)
 }
 
 fn kbs_proxy_health_url(kbs_url: &str) -> String {

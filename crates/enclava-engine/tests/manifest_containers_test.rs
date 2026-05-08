@@ -155,6 +155,15 @@ fn proxy_container_mounts_unlock_socket() {
     let vm = c.volume_mounts.as_ref().unwrap();
     let m = vm.iter().find(|m| m.name == "unlock-socket").unwrap();
     assert_eq!(m.mount_path, "/run/enclava");
+    let env = c.env.as_ref().unwrap();
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ENCLAVA_INIT_UNLOCK_SOCKET")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/run/enclava/unlock.sock")
+    );
 }
 
 // === Caddy ===
@@ -318,6 +327,14 @@ fn enclava_init_container_waits_for_workloads_and_marks_ready_file() {
             .value
             .as_deref(),
         Some("web,tenant-ingress")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ENCLAVA_INIT_UNLOCK_SOCKET_GID")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("65532")
     );
     assert!(c.startup_probe.is_none());
     let probe = c.readiness_probe.as_ref().unwrap();

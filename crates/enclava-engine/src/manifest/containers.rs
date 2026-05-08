@@ -335,6 +335,7 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             env("ENCLAVA_INIT_STAY_ALIVE", "true"),
             env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
             env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
+            env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "65532"),
             env(
                 "ENCLAVA_INIT_WAIT_FOR_CONTAINERS",
                 &format!("{},tenant-ingress", app.primary_container().unwrap().name),
@@ -477,7 +478,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
     let mode = ownership_mode_str(app.unlock_mode);
     let legacy = legacy_bootstrap_enabled();
 
-    let env_vars = vec![
+    let mut env_vars = vec![
         env("ATTESTATION_WORKLOAD_CONTAINER", &primary.name),
         env_field_ref("ATTESTATION_POD_NAME", "metadata.name"),
         env_field_ref("ATTESTATION_POD_NAMESPACE", "metadata.namespace"),
@@ -498,6 +499,12 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("KBS_FETCH_MAX_SLEEP_SECONDS", "10"),
         env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
     ];
+    if !legacy {
+        env_vars.push(env(
+            "ENCLAVA_INIT_UNLOCK_SOCKET",
+            "/run/enclava/unlock.sock",
+        ));
+    }
 
     Container {
         name: "attestation-proxy".to_string(),
