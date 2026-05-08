@@ -272,7 +272,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/tls-state/caddy")
+        Some("/tmp/enclava-tls-state/caddy")
     );
     assert_eq!(
         env.iter()
@@ -280,7 +280,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/tls-state/caddy/config")
+        Some("/tmp/enclava-tls-state/caddy/config")
     );
     assert_eq!(
         env.iter()
@@ -288,7 +288,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/tls-state")
+        Some("/tmp/enclava-tls-state")
     );
 }
 
