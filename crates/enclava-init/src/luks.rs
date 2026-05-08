@@ -14,7 +14,11 @@
 //! Fresh LUKS2 volumes are formatted ext4 before the first mount, so the
 //! runtime image must include `mkfs.ext4`.
 
+use std::fs::{OpenOptions, remove_file};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use libcryptsetup_rs::{
     CryptInit, CryptParamsLuks2, CryptParamsLuks2Ref, consts::flags::CryptActivate,
@@ -25,6 +29,7 @@ use crate::errors::{InitError, Result};
 use crate::secrets::DerivedSeed;
 
 const LUKS2_SECTOR_SIZE: u32 = 512;
+static KEY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Path to the activated mapper device.
 #[derive(Debug, Clone)]
@@ -62,15 +67,22 @@ pub fn format(device: &Path, key: &DerivedSeed) -> Result<()> {
         .try_into()
         .map_err(|e| InitError::Luks(format!("luks2 params: {e}")))?;
 
-    dev.context_handle()
-        .format(
-            EncryptionFormat::Luks2,
-            ("aes", "xts-plain64"),
-            None,
-            libcryptsetup_rs::Either::Right(64),
-            Some(&mut params),
-        )
-        .map_err(|e| InitError::Luks(format!("format: {e}")))?;
+    if let Err(err) = dev.context_handle().format(
+        EncryptionFormat::Luks2,
+        ("aes", "xts-plain64"),
+        None,
+        libcryptsetup_rs::Either::Right(64),
+        Some(&mut params),
+    ) {
+        tracing::warn!(
+            device = %device.display(),
+            error = %err,
+            "libcryptsetup format failed; falling back to cryptsetup CLI"
+        );
+        format_with_cryptsetup_cli(device, key).map_err(|cli_err| {
+            InitError::Luks(format!("format: {err}; cli fallback: {cli_err}"))
+        })?;
+    }
 
     dev.keyslot_handle()
         .add_by_key(
@@ -95,14 +107,22 @@ pub fn open(device: &Path, mapping_name: &str, key: &DerivedSeed) -> Result<Luks
         .load::<()>(Some(EncryptionFormat::Luks2), None)
         .map_err(|e| InitError::Luks(format!("load: {e}")))?;
 
-    dev.activate_handle()
-        .activate_by_passphrase(
-            Some(mapping_name),
-            None,
-            key.as_bytes(),
-            CryptActivate::empty(),
-        )
-        .map_err(|e| InitError::Luks(format!("activate: {e}")))?;
+    if let Err(err) = dev.activate_handle().activate_by_passphrase(
+        Some(mapping_name),
+        None,
+        key.as_bytes(),
+        CryptActivate::empty(),
+    ) {
+        tracing::warn!(
+            device = %device.display(),
+            mapping = mapping_name,
+            error = %err,
+            "libcryptsetup activate failed; falling back to cryptsetup CLI"
+        );
+        open_with_cryptsetup_cli(device, mapping_name, key).map_err(|cli_err| {
+            InitError::Luks(format!("activate: {err}; cli fallback: {cli_err}"))
+        })?;
+    }
 
     Ok(LuksOpened {
         mapper_path: PathBuf::from(format!("/dev/mapper/{mapping_name}")),
@@ -139,6 +159,112 @@ fn mkfs_ext4(mapper_path: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn format_with_cryptsetup_cli(device: &Path, key: &DerivedSeed) -> Result<()> {
+    with_key_file(key, |key_file| {
+        let args = vec![
+            "luksFormat".to_string(),
+            path_arg(device)?,
+            "--key-file".to_string(),
+            path_arg(key_file)?,
+            "--type".to_string(),
+            "luks2".to_string(),
+            "--cipher".to_string(),
+            "aes-xts-plain64".to_string(),
+            "--key-size".to_string(),
+            "512".to_string(),
+            "--sector-size".to_string(),
+            "512".to_string(),
+            "--batch-mode".to_string(),
+        ];
+        run_command("cryptsetup", &args)
+    })
+}
+
+fn open_with_cryptsetup_cli(device: &Path, mapping_name: &str, key: &DerivedSeed) -> Result<()> {
+    with_key_file(key, |key_file| {
+        let args = vec![
+            "luksOpen".to_string(),
+            path_arg(device)?,
+            mapping_name.to_string(),
+            "--key-file".to_string(),
+            path_arg(key_file)?,
+        ];
+        run_command("cryptsetup", &args)
+    })
+}
+
+fn with_key_file<F>(key: &DerivedSeed, f: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let key_file = temporary_key_path();
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&key_file)
+        .map_err(|e| InitError::Luks(format!("create key file {}: {e}", key_file.display())))?;
+    file.write_all(key.as_bytes())
+        .map_err(|e| InitError::Luks(format!("write key file {}: {e}", key_file.display())))?;
+    file.sync_all()
+        .map_err(|e| InitError::Luks(format!("sync key file {}: {e}", key_file.display())))?;
+    drop(file);
+
+    let result = f(&key_file);
+    wipe_key_file(&key_file, key.as_bytes().len());
+    result
+}
+
+fn temporary_key_path() -> PathBuf {
+    let counter = KEY_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    PathBuf::from(format!(
+        "/run/enclava/luks-key-{}-{counter}",
+        std::process::id()
+    ))
+}
+
+fn wipe_key_file(path: &Path, len: usize) {
+    if let Ok(mut file) = OpenOptions::new().write(true).open(path) {
+        let zeros = vec![0u8; len];
+        let _ = file.write_all(&zeros);
+        let _ = file.sync_all();
+    }
+    let _ = remove_file(path);
+}
+
+fn path_arg(path: &Path) -> Result<String> {
+    path.to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| InitError::Luks(format!("non-utf8 path {}", path.display())))
+}
+
+fn run_command(program: &str, args: &[String]) -> Result<()> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| InitError::Luks(format!("{program}: {e}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(InitError::Luks(format!(
+        "{program} exited with {}: stdout={} stderr={}",
+        output.status,
+        truncate_output(stdout.trim()),
+        truncate_output(stderr.trim())
+    )))
+}
+
+fn truncate_output(value: &str) -> String {
+    const LIMIT: usize = 2048;
+    if value.len() <= LIMIT {
+        value.to_string()
+    } else {
+        format!("{}...[truncated]", &value[..LIMIT])
+    }
 }
 
 /// Mount `mapper_path` (a filesystem) at `mount_point`.

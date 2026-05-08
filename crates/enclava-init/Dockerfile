@@ -23,6 +23,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
+      cryptsetup-bin \
       e2fsprogs \
       libcryptsetup12 && \
     rm -rf /var/lib/apt/lists/*
