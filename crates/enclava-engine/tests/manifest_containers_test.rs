@@ -132,6 +132,26 @@ fn app_container_has_no_kubernetes_subpath_mounts() {
     );
 }
 
+#[test]
+fn app_container_uses_tcp_readiness_without_liveness() {
+    let c = build_app_container(&sample_app());
+    assert!(c.liveness_probe.is_none());
+
+    let startup = c.startup_probe.as_ref().unwrap();
+    assert_eq!(
+        startup.tcp_socket.as_ref().unwrap().port,
+        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
+    );
+    assert!(startup.http_get.is_none());
+
+    let readiness = c.readiness_probe.as_ref().unwrap();
+    assert_eq!(
+        readiness.tcp_socket.as_ref().unwrap().port,
+        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
+    );
+    assert!(readiness.http_get.is_none());
+}
+
 // === Attestation proxy ===
 
 #[test]

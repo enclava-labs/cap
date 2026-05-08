@@ -269,21 +269,9 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             }),
             ..Default::default()
         }),
-        liveness_probe: Some(k8s_openapi::api::core::v1::Probe {
-            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                path: Some("/health".to_string()),
-                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                    app_port as i32,
-                ),
-                ..Default::default()
-            }),
-            initial_delay_seconds: Some(480),
-            period_seconds: Some(15),
-            ..Default::default()
-        }),
+        liveness_probe: None,
         startup_probe: Some(k8s_openapi::api::core::v1::Probe {
-            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                path: Some("/health".to_string()),
+            tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
                 port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
                     app_port as i32,
                 ),
@@ -294,8 +282,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             ..Default::default()
         }),
         readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
-            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                path: Some("/health".to_string()),
+            tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
                 port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
                     app_port as i32,
                 ),
