@@ -515,6 +515,21 @@ async fn verify_evidence_report_data(
     evidence_bytes: &[u8],
     expected_report_data: &[u8; 64],
 ) -> Result<(), TeeError> {
+    verify_evidence_report_data_with_json_fallback(
+        evidence,
+        evidence_bytes,
+        expected_report_data,
+        allows_json_report_data_only(),
+    )
+    .await
+}
+
+async fn verify_evidence_report_data_with_json_fallback(
+    evidence: &AttestationEvidence,
+    evidence_bytes: &[u8],
+    expected_report_data: &[u8; 64],
+    allow_json_report_data_only: bool,
+) -> Result<(), TeeError> {
     let evidence_json = evidence
         .json
         .as_ref()
@@ -546,7 +561,7 @@ async fn verify_evidence_report_data(
         return Ok(());
     }
 
-    if !allows_json_report_data_only() {
+    if !allow_json_report_data_only {
         return Err(TeeError::Attestation(
             "attestation evidence does not contain a raw AMD SNP report".to_string(),
         ));
@@ -1149,10 +1164,6 @@ mod tests {
 
     #[tokio::test]
     async fn verifies_attestation_evidence_report_data_binding() {
-        let _guard = env_lock();
-        unsafe {
-            std::env::set_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY", "true");
-        }
         let expected = [0x42; 64];
         let evidence = super::AttestationEvidence {
             payload_b64: String::new(),
@@ -1163,20 +1174,13 @@ mod tests {
             })),
         };
 
-        super::verify_evidence_report_data(&evidence, b"", &expected)
+        super::verify_evidence_report_data_with_json_fallback(&evidence, b"", &expected, true)
             .await
             .unwrap();
-        unsafe {
-            std::env::remove_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY");
-        }
     }
 
     #[tokio::test]
     async fn rejects_attestation_evidence_report_data_mismatch() {
-        let _guard = env_lock();
-        unsafe {
-            std::env::set_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY", "true");
-        }
         let expected = [0x42; 64];
         let evidence = super::AttestationEvidence {
             payload_b64: String::new(),
@@ -1188,21 +1192,14 @@ mod tests {
         };
 
         assert!(
-            super::verify_evidence_report_data(&evidence, b"", &expected)
+            super::verify_evidence_report_data_with_json_fallback(&evidence, b"", &expected, true)
                 .await
                 .is_err()
         );
-        unsafe {
-            std::env::remove_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY");
-        }
     }
 
     #[tokio::test]
     async fn rejects_json_only_attestation_evidence_by_default() {
-        let _guard = env_lock();
-        unsafe {
-            std::env::remove_var("ENCLAVA_TEE_DEV_ALLOW_JSON_REPORT_DATA_ONLY");
-        }
         let expected = [0x42; 64];
         let evidence = super::AttestationEvidence {
             payload_b64: String::new(),
@@ -1213,9 +1210,10 @@ mod tests {
             })),
         };
 
-        let err = super::verify_evidence_report_data(&evidence, b"", &expected)
-            .await
-            .unwrap_err();
+        let err =
+            super::verify_evidence_report_data_with_json_fallback(&evidence, b"", &expected, false)
+                .await
+                .unwrap_err();
         assert!(err.to_string().contains("raw AMD SNP report"));
     }
 
