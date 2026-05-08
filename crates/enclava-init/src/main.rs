@@ -674,15 +674,29 @@ fn namespace_source(pid: u32, mount_path: &str) -> PathBuf {
 }
 
 fn bind_mount_into_namespace(pid: u32, source: &Path, target: &Path) -> Result<()> {
-    let status = std::process::Command::new(std::env::current_exe()?)
+    let output = std::process::Command::new(std::env::current_exe()?)
         .arg("--bind-mount-into-ns")
         .arg(pid.to_string())
         .arg(source)
         .arg(target)
-        .status()
+        .output()
         .with_context(|| format!("spawning namespace binder for pid {pid}"))?;
-    if !status.success() {
-        return Err(anyhow!("namespace binder exited with {status}"));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = [stderr.trim(), stdout.trim()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        if detail.is_empty() {
+            return Err(anyhow!("namespace binder exited with {}", output.status));
+        }
+        return Err(anyhow!(
+            "namespace binder exited with {}: {}",
+            output.status,
+            detail
+        ));
     }
     Ok(())
 }
@@ -698,14 +712,18 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         .map_err(|_| anyhow!("invalid pid {}", args[0]))?;
     let source = PathBuf::from(&args[1]);
     let target = PathBuf::from(&args[2]);
+    let source_dir = std::fs::File::open(&source)
+        .with_context(|| format!("opening source {}", source.display()))?;
     let ns = std::fs::File::open(format!("/proc/{pid}/ns/mnt"))
         .with_context(|| format!("opening mount namespace for pid {pid}"))?;
     nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNS)
         .with_context(|| format!("setns to pid {pid} mount namespace"))?;
     std::fs::create_dir_all(&target)
         .with_context(|| format!("creating target {}", target.display()))?;
+    use std::os::fd::AsRawFd;
+    let pinned_source = PathBuf::from(format!("/proc/self/fd/{}", source_dir.as_raw_fd()));
     nix::mount::mount(
-        Some(source.as_path()),
+        Some(pinned_source.as_path()),
         target.as_path(),
         None::<&str>,
         nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
