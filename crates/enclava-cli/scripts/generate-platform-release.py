@@ -75,6 +75,10 @@ def canonical_platform_release_bytes(payload: dict[str, str]) -> bytes:
             ("policy_template_text", payload["policy_template_text"].encode()),
             ("attestation_proxy_image", payload["attestation_proxy_image"].encode()),
             ("caddy_ingress_image", payload["caddy_ingress_image"].encode()),
+            ("trustee_kbs_url", payload["trustee_kbs_url"].encode()),
+            ("trustee_kbs_ca_cert_pem", payload["trustee_kbs_ca_cert_pem"].encode()),
+            ("tenant_caddy_tls_mode", payload["tenant_caddy_tls_mode"].encode()),
+            ("tenant_caddy_acme_ca", payload["tenant_caddy_acme_ca"].encode()),
             (
                 "expected_firmware_measurement",
                 hex32_bytes(
@@ -98,6 +102,10 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
         "POLICY_TEMPLATE_ID": "policy_template_id",
         "ATTESTATION_PROXY_IMAGE": "attestation_proxy_image",
         "CADDY_INGRESS_IMAGE": "caddy_ingress_image",
+        "TRUSTEE_KBS_URL": "trustee_kbs_url",
+        "TRUSTEE_KBS_CA_CERT_PEM": "trustee_kbs_ca_cert_pem",
+        "TENANT_CADDY_TLS_MODE": "tenant_caddy_tls_mode",
+        "TENANT_CADDY_ACME_CA": "tenant_caddy_acme_ca",
         "EXPECTED_FIRMWARE_MEASUREMENT": "expected_firmware_measurement",
         "EXPECTED_RUNTIME_CLASS": "expected_runtime_class",
         "GENPOLICY_VERSION": "genpolicy_version",
@@ -125,6 +133,12 @@ def validate_payload(payload: dict[str, str]) -> None:
     for field in ["attestation_proxy_image", "caddy_ingress_image"]:
         if not GHCR_DIGEST_RE.fullmatch(payload[field]):
             raise ValueError(f"{field} must be a ghcr.io/enclava-ai digest-pinned ref")
+    if not payload["trustee_kbs_url"].startswith(("http://", "https://")):
+        raise ValueError("trustee_kbs_url must be http or https")
+    if payload["tenant_caddy_tls_mode"] not in ("acme", "internal"):
+        raise ValueError("tenant_caddy_tls_mode must be acme or internal")
+    if not payload["tenant_caddy_acme_ca"].startswith(("http://", "https://")):
+        raise ValueError("tenant_caddy_acme_ca must be http or https")
     hex32_bytes("signing_service_pubkey_hex", payload["signing_service_pubkey_hex"])
     hex32_bytes("policy_template_sha256", payload["policy_template_sha256"])
     hex32_bytes(

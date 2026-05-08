@@ -212,6 +212,13 @@ fn proxy_container_name_and_port() {
             .as_deref(),
         Some("http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource")
     );
+    let readiness = c.readiness_probe.as_ref().unwrap();
+    let http_get = readiness.http_get.as_ref().unwrap();
+    assert_eq!(
+        http_get.port,
+        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(8443)
+    );
+    assert_eq!(http_get.scheme.as_deref(), Some("HTTPS"));
 }
 
 #[test]

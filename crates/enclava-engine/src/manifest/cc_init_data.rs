@@ -32,6 +32,21 @@ pub fn trustee_kbs_resource_url() -> String {
     )
 }
 
+#[derive(Debug, Clone)]
+pub struct CcInitDataOptions {
+    pub kbs_url: String,
+    pub kbs_ca_cert_pem: Option<String>,
+}
+
+impl CcInitDataOptions {
+    pub fn from_env() -> Self {
+        Self {
+            kbs_url: trustee_kbs_url(),
+            kbs_ca_cert_pem: trustee_kbs_ca_cert_pem(),
+        }
+    }
+}
+
 /// Build the cc_init_data TOML string for a ConfidentialApp.
 ///
 /// The TOML structure matches the Python template in init_data.py exactly.
@@ -41,8 +56,12 @@ pub fn trustee_kbs_resource_url() -> String {
 /// - cdh.toml: confidential data hub config pointing to KBS
 /// - identity.toml: tenant/instance identity for ownership binding
 pub fn build_toml(app: &ConfidentialApp) -> String {
-    let kbs_url = trustee_kbs_url();
-    let kbs_ca_cert_pem = trustee_kbs_ca_cert_pem();
+    build_toml_with_options(app, &CcInitDataOptions::from_env())
+}
+
+pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOptions) -> String {
+    let kbs_url = options.kbs_url.clone();
+    let kbs_ca_cert_pem = options.kbs_ca_cert_pem.clone();
     let primary = app
         .primary_container()
         .expect("app must have a primary container");
@@ -341,8 +360,20 @@ pub fn encode_cc_init_data(toml: &str) -> String {
 /// Returns (encoded_base64, sha256_hash).
 pub fn compute_cc_init_data(app: &ConfidentialApp) -> (String, String) {
     let toml = build_toml(app);
-    let hash = sha256_hex(&toml);
-    let encoded = encode_cc_init_data(&toml);
+    encode_and_hash_toml(&toml)
+}
+
+pub fn compute_cc_init_data_with_options(
+    app: &ConfidentialApp,
+    options: &CcInitDataOptions,
+) -> (String, String) {
+    let toml = build_toml_with_options(app, options);
+    encode_and_hash_toml(&toml)
+}
+
+fn encode_and_hash_toml(toml: &str) -> (String, String) {
+    let hash = sha256_hex(toml);
+    let encoded = encode_cc_init_data(toml);
     (encoded, hash)
 }
 

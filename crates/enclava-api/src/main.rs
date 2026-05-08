@@ -32,6 +32,26 @@ fn load_caddy_tls_mode() -> anyhow::Result<CaddyTlsMode> {
     }
 }
 
+fn require_env_matches_release(
+    name: &str,
+    expected: &str,
+    redact_values: bool,
+) -> anyhow::Result<()> {
+    let Some(actual) = env_nonempty(name) else {
+        anyhow::bail!("{name} is required by signed platform release");
+    };
+    if actual.trim() != expected.trim() {
+        if redact_values {
+            anyhow::bail!("{name} conflicts with signed platform release");
+        }
+        anyhow::bail!(
+            "{name} conflicts with signed platform release: env `{actual}` != release `{}`",
+            expected.trim()
+        );
+    }
+    Ok(())
+}
+
 fn tee_accepts_invalid_certs() -> bool {
     std::env::var("TENANT_TEE_TLS_MODE")
         .map(|mode| matches!(mode.as_str(), "staging" | "insecure"))
@@ -296,11 +316,22 @@ fn load_attestation_config(
     Ok(AttestationConfig {
         proxy_image: parse_image_ref("ATTESTATION_PROXY_IMAGE", &proxy_image_ref)?,
         caddy_image: parse_image_ref("CADDY_INGRESS_IMAGE", &caddy_image_ref)?,
-        acme_ca_url: std::env::var("TENANT_CADDY_ACME_CA")
-            .ok()
-            .filter(|url| !url.trim().is_empty())
-            .unwrap_or_else(enclava_engine::types::default_acme_ca_url),
-        caddy_tls_mode: load_caddy_tls_mode()?,
+        acme_ca_url: release_env_value(
+            "TENANT_CADDY_ACME_CA",
+            platform_release.map(|release| release.tenant_caddy_acme_ca.as_str()),
+            false,
+        )?
+        .unwrap_or_else(enclava_engine::types::default_acme_ca_url),
+        caddy_tls_mode: match release_env_value(
+            "TENANT_CADDY_TLS_MODE",
+            platform_release.map(|release| release.tenant_caddy_tls_mode.as_str()),
+            false,
+        )? {
+            Some(mode) => mode
+                .parse::<CaddyTlsMode>()
+                .map_err(|err| anyhow::anyhow!("TENANT_CADDY_TLS_MODE: {err}"))?,
+            None => load_caddy_tls_mode()?,
+        },
         trustee_policy_read_available,
         workload_artifacts_url,
         trustee_policy_url,
@@ -379,6 +410,32 @@ async fn main() {
             genpolicy_version = %release.genpolicy_version,
             "signed platform release loaded"
         );
+        for (name, expected) in [
+            ("TRUSTEE_KBS_URL", release.trustee_kbs_url.as_str()),
+            (
+                "TENANT_CADDY_TLS_MODE",
+                release.tenant_caddy_tls_mode.as_str(),
+            ),
+            (
+                "TENANT_CADDY_ACME_CA",
+                release.tenant_caddy_acme_ca.as_str(),
+            ),
+        ] {
+            if let Err(e) = require_env_matches_release(name, expected, false) {
+                eprintln!("startup refused: {e}");
+                std::process::exit(1);
+            }
+        }
+        if !release.trustee_kbs_ca_cert_pem.trim().is_empty()
+            && let Err(e) = require_env_matches_release(
+                "TRUSTEE_KBS_CA_CERT_PEM",
+                &release.trustee_kbs_ca_cert_pem,
+                true,
+            )
+        {
+            eprintln!("startup refused: {e}");
+            std::process::exit(1);
+        }
     }
 
     // Phase 11: cosign-verify the platform-controlled sidecars before serving

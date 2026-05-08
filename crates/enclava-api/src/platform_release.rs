@@ -59,6 +59,10 @@ pub struct PlatformRelease {
     pub policy_template_text: String,
     pub attestation_proxy_image: String,
     pub caddy_ingress_image: String,
+    pub trustee_kbs_url: String,
+    pub trustee_kbs_ca_cert_pem: String,
+    pub tenant_caddy_tls_mode: String,
+    pub tenant_caddy_acme_ca: String,
     pub expected_firmware_measurement: String,
     pub expected_runtime_class: String,
     pub genpolicy_version: String,
@@ -169,6 +173,19 @@ pub fn canonical_platform_release_bytes(
             "caddy_ingress_image",
             release.caddy_ingress_image.as_bytes(),
         ),
+        ("trustee_kbs_url", release.trustee_kbs_url.as_bytes()),
+        (
+            "trustee_kbs_ca_cert_pem",
+            release.trustee_kbs_ca_cert_pem.as_bytes(),
+        ),
+        (
+            "tenant_caddy_tls_mode",
+            release.tenant_caddy_tls_mode.as_bytes(),
+        ),
+        (
+            "tenant_caddy_acme_ca",
+            release.tenant_caddy_acme_ca.as_bytes(),
+        ),
         (
             "expected_firmware_measurement",
             &expected_firmware_measurement,
@@ -227,6 +244,31 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
                 message: err.to_string(),
             })?;
     }
+    let kbs_url = reqwest::Url::parse(&release.trustee_kbs_url).map_err(|err| {
+        PlatformReleaseError::InvalidField {
+            field: "trustee_kbs_url",
+            message: err.to_string(),
+        }
+    })?;
+    if !matches!(kbs_url.scheme(), "http" | "https") {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "trustee_kbs_url",
+            message: "scheme must be http or https".to_string(),
+        });
+    }
+    release
+        .tenant_caddy_tls_mode
+        .parse::<enclava_engine::types::CaddyTlsMode>()
+        .map_err(|err| PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_tls_mode",
+            message: err,
+        })?;
+    reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
+        PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_acme_ca",
+            message: err.to_string(),
+        }
+    })?;
     if release.genpolicy_version.trim().is_empty()
         || release.genpolicy_version.contains("unconfigured")
         || release.genpolicy_version.contains("unpinned")

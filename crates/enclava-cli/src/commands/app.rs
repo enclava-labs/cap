@@ -206,8 +206,11 @@ fn confidential_app_for_cc_hash(
         attestation: AttestationConfig {
             proxy_image: enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?,
             caddy_image: enclava_common::image::ImageRef::parse(&release.caddy_ingress_image)?,
-            acme_ca_url: enclava_engine::types::default_acme_ca_url(),
-            caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
+            acme_ca_url: release.tenant_caddy_acme_ca.clone(),
+            caddy_tls_mode: release
+                .tenant_caddy_tls_mode
+                .parse::<enclava_engine::types::CaddyTlsMode>()
+                .map_err(|err| format!("platform release tenant_caddy_tls_mode: {err}"))?,
             trustee_policy_read_available: true,
             workload_artifacts_url: None,
             trustee_policy_url: None,
@@ -500,8 +503,14 @@ pub(crate) async fn build_signed_deploy_blobs(
             bootstrap_owner_pubkey_hash: bootstrap_pubkey_hash,
         },
     )?;
+    let cc_init_options = cc_init_data::CcInitDataOptions {
+        kbs_url: release.trustee_kbs_url.clone(),
+        kbs_ca_cert_pem: (!release.trustee_kbs_ca_cert_pem.trim().is_empty())
+            .then(|| release.trustee_kbs_ca_cert_pem.clone()),
+    };
     let cc_init_data_hash: [u8; 32] =
-        Sha256::digest(cc_init_data::build_toml(&cc_app).as_bytes()).into();
+        Sha256::digest(cc_init_data::build_toml_with_options(&cc_app, &cc_init_options).as_bytes())
+            .into();
     descriptor.expected_cc_init_data_hash = cc_init_data_hash;
     let rendered_policy = render_trustee_policy(&release.policy_template_text, &descriptor)?;
     descriptor.expected_kbs_policy_hash = Sha256::digest(rendered_policy.as_bytes()).into();

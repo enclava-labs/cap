@@ -540,7 +540,8 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
             http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
                 path: Some("/health".to_string()),
-                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(8081),
+                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(8443),
+                scheme: Some("HTTPS".to_string()),
                 ..Default::default()
             }),
             initial_delay_seconds: Some(10),
