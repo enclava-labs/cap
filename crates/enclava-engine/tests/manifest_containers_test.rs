@@ -238,12 +238,14 @@ fn caddy_container_does_not_mount_cloudflare_token() {
 }
 
 #[test]
-fn caddy_container_mounts_tls_state_filesystem() {
+fn caddy_container_uses_state_mount_for_tls_bind_target() {
     let c = build_caddy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
-    let m = vm.iter().find(|m| m.name == "tls-state-mount").unwrap();
-    assert_eq!(m.mount_path, "/state/tls-state");
-    assert_eq!(m.mount_propagation.as_deref(), None);
+    assert!(
+        vm.iter()
+            .any(|m| m.name == "state-mount" && m.mount_path == "/state")
+    );
+    assert!(vm.iter().all(|m| m.name != "tls-state-mount"));
     assert!(c.volume_devices.is_none());
 }
 

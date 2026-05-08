@@ -560,7 +560,8 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
 ///
 /// Phase 5 default: unprivileged, NET_BIND_SERVICE only for port 443. Reads
 /// its seed from `/run/enclava/seeds/caddy/seed` and TLS material from
-/// `/state/tls-state` (both written / opened by enclava-init). The Cloudflare
+/// `/state/tls-state` (opened by enclava-init and bind-mounted into this
+/// namespace after the helper reports its PID). The Cloudflare
 /// DNS-01 path is gone — Phase 0 cut over to TLS-ALPN-01 — so caddy carries
 /// no `CF_API_TOKEN` env and no `tls-cloudflare-token` secret mount.
 pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
@@ -659,11 +660,6 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         volume_mounts.push(VolumeMount {
             name: "state-mount".to_string(),
             mount_path: "/state".to_string(),
-            ..Default::default()
-        });
-        volume_mounts.push(VolumeMount {
-            name: "tls-state-mount".to_string(),
-            mount_path: "/state/tls-state".to_string(),
             ..Default::default()
         });
     }
