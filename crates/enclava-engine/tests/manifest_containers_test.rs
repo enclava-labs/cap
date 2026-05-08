@@ -66,7 +66,7 @@ fn app_container_reads_seed_from_state_app() {
     let c = build_app_container(&sample_app());
     let env = c.env.as_ref().unwrap();
     let found = env.iter().find(|e| e.name == "APP_SEED_PATH").unwrap();
-    assert_eq!(found.value.as_deref(), Some("/state/app/seed"));
+    assert_eq!(found.value.as_deref(), Some("/run/enclava/seeds/app/seed"));
 }
 
 #[test]
@@ -252,7 +252,10 @@ fn caddy_container_reads_seed_from_state_caddy() {
     let c = build_caddy_container(&sample_app());
     let env = c.env.as_ref().unwrap();
     let found = env.iter().find(|e| e.name == "CADDY_SEED_PATH").unwrap();
-    assert_eq!(found.value.as_deref(), Some("/state/caddy/seed"));
+    assert_eq!(
+        found.value.as_deref(),
+        Some("/run/enclava/seeds/caddy/seed")
+    );
 }
 
 #[test]

@@ -59,6 +59,7 @@ pub struct CapAppOciRuntimeSpecInput {
 }
 
 pub const CAP_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
+pub const CAP_APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
 pub const CAP_APP_UID: u32 = 10001;
 pub const CAP_APP_GID: u32 = 10001;
 pub const CAP_APP_CPU_REQUEST: &str = "250m";
@@ -102,7 +103,7 @@ pub fn cap_app_oci_runtime_spec(input: CapAppOciRuntimeSpecInput) -> OciRuntimeS
         command: vec![CAP_WAIT_EXEC_PATH.to_string()],
         args: input.workload_command,
         env: vec![
-            named_value("APP_SEED_PATH", "/state/app/seed"),
+            named_value("APP_SEED_PATH", CAP_APP_SEED_PATH),
             named_value("VOLUME_MOUNT_POINT", "/state"),
             named_value("ENCLAVA_CONTAINER_NAME", &input.container_name),
             named_value("ENCLAVA_STARTED_DIR", "/run/enclava/containers"),

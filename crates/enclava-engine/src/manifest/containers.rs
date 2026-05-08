@@ -44,6 +44,8 @@ pub fn enclava_init_image() -> String {
 }
 
 pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
+pub const APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
+pub const CADDY_SEED_PATH: &str = "/run/enclava/seeds/caddy/seed";
 
 fn ownership_mode_str(mode: UnlockMode) -> &'static str {
     match mode {
@@ -82,7 +84,7 @@ fn storage_subdir(path: &str) -> String {
 /// Build the app container.
 ///
 /// Phase 5 default: unprivileged, drops ALL caps, reads its seed from
-/// `/state/app/seed` written by the enclava-init sidecar. The user's
+/// `/run/enclava/seeds/app/seed` written by the enclava-init sidecar. The user's
 /// command is passed as a proper argv list — no `sh -c` interpolation.
 pub fn build_app_container(app: &ConfidentialApp) -> Container {
     let primary = app
@@ -131,7 +133,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "8"),
         ]);
     } else {
-        env_vars.push(env("APP_SEED_PATH", "/state/app/seed"));
+        env_vars.push(env("APP_SEED_PATH", APP_SEED_PATH));
         env_vars.push(env("VOLUME_MOUNT_POINT", "/state"));
         env_vars.push(env("ENCLAVA_CONTAINER_NAME", &primary.name));
         env_vars.push(env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"));
@@ -557,7 +559,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
 /// Build the caddy tenant-ingress sidecar container.
 ///
 /// Phase 5 default: unprivileged, NET_BIND_SERVICE only for port 443. Reads
-/// its seed from `/state/caddy/seed` and TLS material from
+/// its seed from `/run/enclava/seeds/caddy/seed` and TLS material from
 /// `/state/tls-state` (both written / opened by enclava-init). The Cloudflare
 /// DNS-01 path is gone — Phase 0 cut over to TLS-ALPN-01 — so caddy carries
 /// no `CF_API_TOKEN` env and no `tls-cloudflare-token` secret mount.
@@ -591,7 +593,7 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         vec![
             env_field_ref("POD_NAME", "metadata.name"),
             env_field_ref("POD_NAMESPACE", "metadata.namespace"),
-            env("CADDY_SEED_PATH", "/state/caddy/seed"),
+            env("CADDY_SEED_PATH", CADDY_SEED_PATH),
             env("VOLUME_MOUNT_POINT", "/state/tls-state"),
             env("XDG_DATA_HOME", "/state/tls-state/caddy"),
             env("XDG_CONFIG_HOME", "/state/tls-state/caddy/config"),

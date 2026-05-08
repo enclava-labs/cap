@@ -16,6 +16,8 @@ const KBS_PROXY_HEALTH_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_KBS_FETCH_ATTEMPTS: u32 = 30;
 const DEFAULT_KBS_FETCH_RETRY_SLEEP_SECONDS: u64 = 2;
 const DEFAULT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS: u64 = 10;
+const SHARED_APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
+const SHARED_CADDY_SEED_PATH: &str = "/run/enclava/seeds/caddy/seed";
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -630,18 +632,10 @@ fn bind_for_workload(cfg: &Config, self_pid: u32, workload: &WorkloadNamespace) 
     let mut mounts = Vec::new();
     if workload.name == "tenant-ingress" {
         mounts.push((
-            namespace_source(self_pid, &cfg.state.mount_path),
-            PathBuf::from(&cfg.state.mount_path),
-        ));
-        mounts.push((
             namespace_source(self_pid, &cfg.tls_state.mount_path),
             PathBuf::from(&cfg.tls_state.mount_path),
         ));
     } else {
-        mounts.push((
-            namespace_source(self_pid, &cfg.state.mount_path),
-            PathBuf::from(&cfg.state.mount_path),
-        ));
         for bind in &cfg.app_bind_mounts {
             mounts.push((
                 namespace_source(
@@ -875,13 +869,24 @@ fn write_per_component_seeds(cfg: &Config, owner: &OwnerSeed) -> Result<()> {
 
     let caddy_path = Path::new(&cfg.state_root).join("caddy/seed");
     let app_path = Path::new(&cfg.state_root).join("app/seed");
+    let shared_caddy_path = Path::new(SHARED_CADDY_SEED_PATH);
+    let shared_app_path = Path::new(SHARED_APP_SEED_PATH);
 
     writes::atomic_write(&caddy_path, caddy_seed.as_bytes(), 0o600)?;
     writes::atomic_write(&app_path, app_seed.as_bytes(), 0o600)?;
+    writes::atomic_write(shared_caddy_path, caddy_seed.as_bytes(), 0o600)?;
+    writes::atomic_write(shared_app_path, app_seed.as_bytes(), 0o600)?;
     chown::chown(&caddy_path, numeric_identity(cfg.caddy_uid, cfg.caddy_gid))
         .with_context(|| format!("chown {}", caddy_path.display()))?;
     chown::chown(&app_path, numeric_identity(cfg.app_uid, cfg.app_gid))
         .with_context(|| format!("chown {}", app_path.display()))?;
+    chown::chown(
+        shared_caddy_path,
+        numeric_identity(cfg.caddy_uid, cfg.caddy_gid),
+    )
+    .with_context(|| format!("chown {}", shared_caddy_path.display()))?;
+    chown::chown(shared_app_path, numeric_identity(cfg.app_uid, cfg.app_gid))
+        .with_context(|| format!("chown {}", shared_app_path.display()))?;
 
     Ok(())
 }
