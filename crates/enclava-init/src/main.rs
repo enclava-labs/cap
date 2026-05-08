@@ -722,6 +722,15 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         .with_context(|| format!("creating target {}", target.display()))?;
     use std::os::fd::AsRawFd;
     let pinned_source = PathBuf::from(format!("/proc/self/fd/{}", source_dir.as_raw_fd()));
+    if paths_resolve_to_same_object(&pinned_source, &target).with_context(|| {
+        format!(
+            "checking whether {} is already mounted at {}",
+            source.display(),
+            target.display()
+        )
+    })? {
+        return Ok(());
+    }
     nix::mount::mount(
         Some(pinned_source.as_path()),
         target.as_path(),
@@ -731,6 +740,13 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     )
     .with_context(|| format!("bind mounting {} to {}", source.display(), target.display()))?;
     Ok(())
+}
+
+fn paths_resolve_to_same_object(a: &Path, b: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let a_meta = std::fs::metadata(a).with_context(|| format!("stat {}", a.display()))?;
+    let b_meta = std::fs::metadata(b).with_context(|| format!("stat {}", b.display()))?;
+    Ok(a_meta.dev() == b_meta.dev() && a_meta.ino() == b_meta.ino())
 }
 
 fn app_bind_mount_dir(state_root: &Path, subdir: &str) -> Result<PathBuf> {
@@ -890,6 +906,18 @@ mod tests {
         assert_eq!(validate_sentinel_name("web").unwrap(), "web");
         assert!(validate_sentinel_name("../web").is_err());
         assert!(validate_sentinel_name("web/sidecar").is_err());
+    }
+
+    #[test]
+    fn same_object_check_detects_identical_and_distinct_dirs() {
+        let dir = tempdir().unwrap();
+        let one = dir.path().join("one");
+        let two = dir.path().join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+
+        assert!(paths_resolve_to_same_object(&one, &one).unwrap());
+        assert!(!paths_resolve_to_same_object(&one, &two).unwrap());
     }
 
     #[test]
