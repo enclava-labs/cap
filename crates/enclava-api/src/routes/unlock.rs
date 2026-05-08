@@ -557,7 +557,9 @@ pub async fn update_unlock_mode(
                 )
             })?;
         signed_container_port = crate::deploy::descriptor_primary_port(&artifacts.descriptor);
-        signed_storage_paths = crate::deploy::descriptor_storage_paths(&artifacts.descriptor);
+        signed_storage_paths = Some(crate::deploy::descriptor_storage_paths(
+            &artifacts.descriptor,
+        ));
         let attestation = state.attestation.as_ref().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({

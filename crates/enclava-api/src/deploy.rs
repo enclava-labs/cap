@@ -80,8 +80,8 @@ pub(crate) fn descriptor_primary_port(
 
 pub(crate) fn descriptor_storage_paths(
     descriptor: &enclava_common::descriptor::DeploymentDescriptor,
-) -> Option<Vec<String>> {
-    let paths = descriptor
+) -> Vec<String> {
+    descriptor
         .oci_runtime_spec
         .mounts
         .iter()
@@ -91,8 +91,7 @@ pub(crate) fn descriptor_storage_paths(
         })
         .map(|mount| mount.destination.clone())
         .filter(|path| path != "/state")
-        .collect::<Vec<_>>();
-    if paths.is_empty() { None } else { Some(paths) }
+        .collect()
 }
 
 fn deserialize_workload_command(command: Option<&str>) -> Option<Vec<String>> {
@@ -124,9 +123,7 @@ pub(crate) fn set_primary_descriptor_runtime(
         if let Some(port) = port {
             container.port = Some(port);
         }
-        if let Some(paths) = storage_paths.clone() {
-            container.storage_paths = paths;
-        }
+        container.storage_paths = storage_paths.clone();
     }
 }
 
@@ -359,7 +356,7 @@ mod tests {
         assert_eq!(descriptor_primary_port(&descriptor), Some(3338));
         assert_eq!(
             descriptor_storage_paths(&descriptor),
-            Some(vec!["/data".to_string()])
+            vec!["/data".to_string()]
         );
     }
 
@@ -431,6 +428,75 @@ mod tests {
         );
         assert_eq!(primary.port, Some(3338));
         assert_eq!(primary.storage_paths, vec!["/data".to_string()]);
+    }
+
+    #[test]
+    fn signed_descriptor_without_subpath_mounts_clears_stale_storage_paths() {
+        let mut descriptor = nutshell_descriptor();
+        descriptor
+            .oci_runtime_spec
+            .mounts
+            .retain(|mount| mount.destination == "/state");
+        let mut app = ConfidentialApp {
+            app_id: descriptor.app_id,
+            name: descriptor.app_name.clone(),
+            namespace: descriptor.namespace.clone(),
+            instance_id: "nutshell-test".to_string(),
+            tenant_id: descriptor.org_slug.clone(),
+            bootstrap_owner_pubkey_hash: "00".repeat(32),
+            tenant_instance_identity_hash: hex::encode(descriptor.identity_hash),
+            service_account: descriptor.service_account.clone(),
+            signer_identity_subject: Some(descriptor.signer_identity.subject.clone()),
+            signer_identity_issuer: Some(descriptor.signer_identity.issuer.clone()),
+            containers: vec![Container {
+                name: "web".to_string(),
+                image: ImageRef::parse(&descriptor.image_ref).unwrap(),
+                port: Some(8080),
+                command: None,
+                env: std::collections::HashMap::new(),
+                storage_paths: vec!["/data".to_string()],
+                is_primary: true,
+            }],
+            storage: StorageSpec::new("5Gi", "2Gi"),
+            unlock_mode: UnlockMode::Password,
+            domain: DomainSpec {
+                platform_domain: descriptor.app_domain.clone(),
+                tee_domain: descriptor.tee_domain.clone(),
+                custom_domain: None,
+            },
+            api_signing_pubkey: String::new(),
+            api_url: String::new(),
+            resources: ResourceLimits {
+                cpu: "1".to_string(),
+                memory: "1Gi".to_string(),
+            },
+            attestation: AttestationConfig {
+                proxy_image: ImageRef::parse(
+                    "ghcr.io/enclava-ai/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )
+                .unwrap(),
+                caddy_image: ImageRef::parse(
+                    "ghcr.io/enclava-ai/caddy-ingress@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                )
+                .unwrap(),
+                acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+                trustee_policy_read_available: true,
+                workload_artifacts_url: None,
+                trustee_policy_url: None,
+                local_workload_artifacts_json: None,
+                local_trustee_policy_json: None,
+                platform_trustee_policy_pubkey_hex: None,
+                signing_service_pubkey_hex: None,
+            },
+            egress_allowlist: Vec::new(),
+            workload_artifact_binding: None,
+            generated_agent_policy: None,
+        };
+
+        set_primary_descriptor_runtime(&mut app, &descriptor);
+
+        assert!(descriptor_storage_paths(&descriptor).is_empty());
+        assert!(app.primary_container().unwrap().storage_paths.is_empty());
     }
 }
 

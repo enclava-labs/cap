@@ -609,7 +609,7 @@ pub async fn deploy(
         .and_then(|artifacts| crate::deploy::descriptor_primary_port(&artifacts.descriptor));
     let signed_storage_paths = signing_artifacts
         .as_ref()
-        .and_then(|artifacts| crate::deploy::descriptor_storage_paths(&artifacts.descriptor));
+        .map(|artifacts| crate::deploy::descriptor_storage_paths(&artifacts.descriptor));
     let container_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM app_containers WHERE app_id = $1 AND name = $2)",
     )
@@ -1072,7 +1072,7 @@ pub async fn rollback(
         .and_then(crate::deploy::descriptor_primary_port);
     let rollback_storage_paths = rollback_descriptor
         .as_ref()
-        .and_then(crate::deploy::descriptor_storage_paths);
+        .map(crate::deploy::descriptor_storage_paths);
     if customer_signed_deploy_required(
         state.attestation.as_ref(),
         state.signing_service.is_some() || state.require_customer_signed_policy_artifact,

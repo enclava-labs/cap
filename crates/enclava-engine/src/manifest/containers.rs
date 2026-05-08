@@ -194,6 +194,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
         volume_mounts.push(VolumeMount {
             name: "state-mount".to_string(),
             mount_path: "/state".to_string(),
+            mount_propagation: Some("HostToContainer".to_string()),
             ..Default::default()
         });
     }
@@ -338,11 +339,13 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             VolumeMount {
                 name: "state-mount".to_string(),
                 mount_path: "/state".to_string(),
+                mount_propagation: Some("Bidirectional".to_string()),
                 ..Default::default()
             },
             VolumeMount {
                 name: "tls-state-mount".to_string(),
                 mount_path: "/state/tls-state".to_string(),
+                mount_propagation: Some("Bidirectional".to_string()),
                 ..Default::default()
             },
             VolumeMount {

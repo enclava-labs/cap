@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 # Build stage
 FROM rust:1.88-alpine AS builder
 
@@ -11,9 +13,14 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-# Build static binary
-RUN cargo build --release --bin enclava-api && \
-    strip /build/target/release/enclava-api
+# Build static binary. The cache mounts make local and GitHub rebuilds reuse
+# downloaded crates and incremental artifacts across small API/engine edits.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --bin enclava-api && \
+    cp /build/target/release/enclava-api /usr/local/bin/enclava-api && \
+    strip /usr/local/bin/enclava-api
 
 # Runtime stage
 FROM alpine:3.20
@@ -26,7 +33,7 @@ RUN addgroup -g 1000 enclava && \
     adduser -D -u 1000 -G enclava enclava
 
 # Copy binary from builder
-COPY --from=builder /build/target/release/enclava-api /usr/local/bin/enclava-api
+COPY --from=builder /usr/local/bin/enclava-api /usr/local/bin/enclava-api
 
 # Set permissions
 RUN chown enclava:enclava /usr/local/bin/enclava-api

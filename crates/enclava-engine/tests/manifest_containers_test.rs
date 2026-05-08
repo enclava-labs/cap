@@ -75,7 +75,7 @@ fn app_container_mounts_state_filesystem() {
     let vm = c.volume_mounts.as_ref().unwrap();
     let m = vm.iter().find(|m| m.name == "state-mount").unwrap();
     assert_eq!(m.mount_path, "/state");
-    assert_eq!(m.mount_propagation.as_deref(), None);
+    assert_eq!(m.mount_propagation.as_deref(), Some("HostToContainer"));
     assert!(c.volume_devices.is_none());
 }
 
@@ -98,7 +98,7 @@ fn app_container_leaves_declared_storage_paths_for_enclava_init_bind_mounts() {
             .unwrap()
             .mount_propagation
             .as_deref(),
-        None
+        Some("HostToContainer")
     );
     assert_eq!(
         c.env
@@ -395,6 +395,12 @@ fn enclava_init_container_mounts_both_luks_devices_and_unlock_socket() {
     assert!(vm.iter().any(|m| m.name == "enclava-init-config"));
     let state_mount = vm.iter().find(|m| m.name == "state-mount").unwrap();
     let tls_mount = vm.iter().find(|m| m.name == "tls-state-mount").unwrap();
-    assert_eq!(state_mount.mount_propagation.as_deref(), None);
-    assert_eq!(tls_mount.mount_propagation.as_deref(), None);
+    assert_eq!(
+        state_mount.mount_propagation.as_deref(),
+        Some("Bidirectional")
+    );
+    assert_eq!(
+        tls_mount.mount_propagation.as_deref(),
+        Some("Bidirectional")
+    );
 }
