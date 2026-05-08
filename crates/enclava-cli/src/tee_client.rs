@@ -16,6 +16,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use x509_cert::der::{Decode, Encode};
 
+use enclava_common::canonical::ce_v1_hash;
+
 use crate::api_types::{SignedReceiptResponse, TransitionReceiptAttestation};
 use crate::attestation::{tee_tls_transcript_hash, validate_snp_report_with_der_chain};
 
@@ -420,10 +422,12 @@ impl TeeClient {
             "runtime_data_binding.receipt_pubkey_sha256",
             &attestation.runtime_data_binding.receipt_pubkey_sha256,
         )?;
-        let mut expected_report_data = [0u8; 64];
-        let transcript = tee_tls_transcript_hash(&endpoint.host, &nonce, &leaf_spki_sha256);
-        expected_report_data[..32].copy_from_slice(&transcript);
-        expected_report_data[32..].copy_from_slice(&receipt_pubkey_sha256);
+        let expected_report_data = tee_tls_report_data(
+            &endpoint.host,
+            &nonce,
+            &leaf_spki_sha256,
+            &receipt_pubkey_sha256,
+        );
 
         let evidence = B64_STANDARD
             .decode(attestation.evidence.payload_b64.as_bytes())
@@ -454,6 +458,24 @@ fn normalize_unlock_mode(mode: &str) -> &str {
         "password" => "password",
         other => other,
     }
+}
+
+fn tee_tls_report_data(
+    domain: &str,
+    nonce: &[u8; 32],
+    leaf_spki_sha256: &[u8; 32],
+    receipt_pubkey_sha256: &[u8; 32],
+) -> [u8; 64] {
+    let transcript_hash = tee_tls_transcript_hash(domain, nonce, leaf_spki_sha256);
+    let binding_hash = ce_v1_hash(&[
+        ("purpose", b"enclava-tee-report-data-v1"),
+        ("transcript_hash", &transcript_hash),
+        ("receipt_pubkey_sha256", receipt_pubkey_sha256),
+    ]);
+    let binding_hex = hex::encode(binding_hash);
+    let mut report_data = [0u8; 64];
+    report_data.copy_from_slice(binding_hex.as_bytes());
+    report_data
 }
 
 fn verify_receipt_matches_attestation(
