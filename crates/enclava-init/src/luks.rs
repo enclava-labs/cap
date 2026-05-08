@@ -178,6 +178,7 @@ fn format_with_cryptsetup_cli(device: &Path, key: &DerivedSeed) -> Result<()> {
             "--sector-size".to_string(),
             "512".to_string(),
             "--batch-mode".to_string(),
+            "--disable-locks".to_string(),
         ];
         run_command("cryptsetup", &args)
     })
@@ -192,6 +193,7 @@ fn open_with_cryptsetup_cli(device: &Path, mapping_name: &str, key: &DerivedSeed
             mapping_name.to_string(),
             "--key-file".to_string(),
             path_arg(key_file)?,
+            "--disable-locks".to_string(),
         ];
         run_command("cryptsetup", &args)
     })
