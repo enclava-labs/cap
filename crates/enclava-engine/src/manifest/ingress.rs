@@ -18,7 +18,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
 use super::containers::CADDY_TLS_STATE_PATH;
-use crate::types::ConfidentialApp;
+use crate::types::{CaddyTlsMode, ConfidentialApp};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngressRenderError {
@@ -35,6 +35,7 @@ struct CaddyfileSpec {
     hosts: Vec<String>,
     app_port: u16,
     acme_ca: String,
+    tls_mode: CaddyTlsMode,
     contact_email: String,
 }
 
@@ -62,13 +63,16 @@ impl CaddyfileSpec {
         }
         let app_port = app.primary_container().and_then(|c| c.port).unwrap_or(8080);
         let acme_ca = app.attestation.acme_ca_url.trim().to_string();
-        validate_https_url(&acme_ca)?;
+        if app.attestation.caddy_tls_mode == CaddyTlsMode::Acme {
+            validate_https_url(&acme_ca)?;
+        }
         let contact_email = "infra@enclava.dev".to_string();
         validate_email(&contact_email)?;
         Ok(Self {
             hosts,
             app_port,
             acme_ca,
+            tls_mode: app.attestation.caddy_tls_mode,
             contact_email,
         })
     }
@@ -185,19 +189,28 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     out.push_str("  storage file_system ");
     out.push_str(CADDY_TLS_STATE_PATH);
     out.push_str("/caddy\n");
-    out.push_str("  acme_ca ");
-    out.push_str(&spec.acme_ca);
-    out.push('\n');
+    if spec.tls_mode == CaddyTlsMode::Acme {
+        out.push_str("  acme_ca ");
+        out.push_str(&spec.acme_ca);
+        out.push('\n');
+    }
     out.push_str("}\n");
     out.push_str(&spec.hosts.join(", "));
     out.push_str(" {\n");
-    // Phase 0/5: TLS-ALPN-01 only — DNS-01 / Cloudflare path is gone.
-    // Caddy default ACME issuers cover ALPN; no per-app credentials needed.
-    out.push_str("  tls {\n");
-    out.push_str("    issuer acme {\n");
-    out.push_str("      disable_http_challenge\n");
-    out.push_str("    }\n");
-    out.push_str("  }\n");
+    match spec.tls_mode {
+        CaddyTlsMode::Acme => {
+            // Phase 0/5: TLS-ALPN-01 only — DNS-01 / Cloudflare path is gone.
+            // Caddy default ACME issuers cover ALPN; no per-app credentials needed.
+            out.push_str("  tls {\n");
+            out.push_str("    issuer acme {\n");
+            out.push_str("      disable_http_challenge\n");
+            out.push_str("    }\n");
+            out.push_str("  }\n");
+        }
+        CaddyTlsMode::Internal => {
+            out.push_str("  tls internal\n");
+        }
+    }
     out.push_str("  @attestation-proxy path /v1/attestation /v1/attestation/* /unlock\n");
     out.push_str("  handle @attestation-proxy {\n");
     out.push_str("    reverse_proxy 127.0.0.1:8081\n");

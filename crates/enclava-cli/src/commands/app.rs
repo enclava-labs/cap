@@ -207,6 +207,7 @@ fn confidential_app_for_cc_hash(
             proxy_image: enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?,
             caddy_image: enclava_common::image::ImageRef::parse(&release.caddy_ingress_image)?,
             acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+            caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
             trustee_policy_read_available: true,
             workload_artifacts_url: None,
             trustee_policy_url: None,

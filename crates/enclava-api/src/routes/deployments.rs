@@ -179,6 +179,7 @@ mod classifier_tests {
             caddy_image: ImageRef::parse("ghcr.io/enclava-ai/caddy-ingress@sha256:31a43cbfce0399cc83d22aabcb25346badcddfb46f4984eccd410c22e691ca6f")
                 .unwrap(),
             acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+            caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
             trustee_policy_read_available: false,
             workload_artifacts_url: None,
             trustee_policy_url: None,

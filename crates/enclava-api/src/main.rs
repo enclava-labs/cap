@@ -1,7 +1,7 @@
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use enclava_common::image::ImageRef;
-use enclava_engine::types::AttestationConfig;
+use enclava_engine::types::{AttestationConfig, CaddyTlsMode};
 use rand::rngs::OsRng;
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -21,6 +21,15 @@ fn env_nonempty(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn load_caddy_tls_mode() -> anyhow::Result<CaddyTlsMode> {
+    match env_nonempty("TENANT_CADDY_TLS_MODE") {
+        Some(mode) => mode
+            .parse::<CaddyTlsMode>()
+            .map_err(|err| anyhow::anyhow!("TENANT_CADDY_TLS_MODE: {err}")),
+        None => Ok(CaddyTlsMode::Acme),
+    }
 }
 
 fn tee_accepts_invalid_certs() -> bool {
@@ -266,6 +275,7 @@ fn load_attestation_config(
             .ok()
             .filter(|url| !url.trim().is_empty())
             .unwrap_or_else(enclava_engine::types::default_acme_ca_url),
+        caddy_tls_mode: load_caddy_tls_mode()?,
         trustee_policy_read_available,
         workload_artifacts_url,
         trustee_policy_url,

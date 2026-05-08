@@ -1,5 +1,6 @@
 use enclava_engine::manifest::ingress::generate_ingress_configmap;
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::CaddyTlsMode;
 
 #[test]
 fn ingress_configmap_name() {
@@ -103,6 +104,18 @@ fn caddyfile_uses_configured_acme_ca() {
     let data = cm.data.as_ref().unwrap();
     let caddyfile = data.get("Caddyfile").unwrap();
     assert!(caddyfile.contains("acme_ca https://acme-staging-v02.api.letsencrypt.org/directory"));
+}
+
+#[test]
+fn caddyfile_internal_tls_mode_skips_acme() {
+    let mut app = sample_app();
+    app.attestation.caddy_tls_mode = CaddyTlsMode::Internal;
+    let cm = generate_ingress_configmap(&app);
+    let data = cm.data.as_ref().unwrap();
+    let caddyfile = data.get("Caddyfile").unwrap();
+    assert!(caddyfile.contains("tls internal"));
+    assert!(!caddyfile.contains("acme_ca "));
+    assert!(!caddyfile.contains("issuer acme"));
 }
 
 #[test]

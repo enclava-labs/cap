@@ -406,6 +406,7 @@ mod tests {
                 )
                 .unwrap(),
                 acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+                caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
                 trustee_policy_read_available: true,
                 workload_artifacts_url: None,
                 trustee_policy_url: None,
@@ -480,6 +481,7 @@ mod tests {
                 )
                 .unwrap(),
                 acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+                caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
                 trustee_policy_read_available: true,
                 workload_artifacts_url: None,
                 trustee_policy_url: None,

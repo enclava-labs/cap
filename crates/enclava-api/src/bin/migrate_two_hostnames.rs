@@ -24,7 +24,7 @@ use enclava_api::edge::{
     BackendTag, EdgeRouteConfig, SniRoute, backend_name_for, ensure_haproxy_routes,
 };
 use enclava_api::models::App;
-use enclava_engine::types::AttestationConfig;
+use enclava_engine::types::{AttestationConfig, CaddyTlsMode};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -189,6 +189,10 @@ fn load_attestation_for_migration() -> Option<AttestationConfig> {
             .ok()
             .filter(|url| !url.trim().is_empty())
             .unwrap_or_else(enclava_engine::types::default_acme_ca_url),
+        caddy_tls_mode: std::env::var("TENANT_CADDY_TLS_MODE")
+            .ok()
+            .and_then(|mode| mode.parse::<CaddyTlsMode>().ok())
+            .unwrap_or_default(),
         trustee_policy_read_available: false,
         workload_artifacts_url: None,
         trustee_policy_url: None,

@@ -105,6 +105,39 @@ pub struct EgressRule {
     pub ports: Vec<u16>,
 }
 
+/// Tenant Caddy TLS issuer mode.
+///
+/// Production uses ACME TLS-ALPN-01. Internal mode is intended for fast
+/// development/live-smoke loops where clients already run with `curl -k` or
+/// CAP's staging/insecure TLS mode and external ACME would only add latency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaddyTlsMode {
+    #[default]
+    Acme,
+    Internal,
+}
+
+impl CaddyTlsMode {
+    pub fn is_default(mode: &Self) -> bool {
+        *mode == Self::Acme
+    }
+}
+
+impl std::str::FromStr for CaddyTlsMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "acme" => Ok(Self::Acme),
+            "internal" => Ok(Self::Internal),
+            other => Err(format!(
+                "invalid tenant Caddy TLS mode {other:?}; expected acme or internal"
+            )),
+        }
+    }
+}
+
 /// Attestation proxy configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationConfig {
@@ -115,6 +148,9 @@ pub struct AttestationConfig {
     /// ACME directory URL used by tenant Caddy for TLS-ALPN-01 issuance.
     #[serde(default = "default_acme_ca_url")]
     pub acme_ca_url: String,
+    /// TLS issuer mode for tenant Caddy.
+    #[serde(default, skip_serializing_if = "CaddyTlsMode::is_default")]
+    pub caddy_tls_mode: CaddyTlsMode,
     /// Enables in-TEE Trustee policy verification once the Trustee workload
     /// policy-read and CAP workload-artifact endpoints are deployed.
     #[serde(default)]

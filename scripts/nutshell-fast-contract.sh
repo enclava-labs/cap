@@ -112,6 +112,7 @@ PY
 
 run cargo fmt --all -- --check
 run cargo test -p enclava-engine --test manifest_containers_test app_container_
+run cargo test -p enclava-engine --test manifest_ingress_test caddyfile_
 run cargo test -p enclava-cli --test deploy_artifacts_test
 run cargo test -p enclava-api deploy::tests
 

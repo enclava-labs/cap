@@ -66,6 +66,7 @@ pub fn sample_app() -> ConfidentialApp {
             )
             .unwrap(),
             acme_ca_url: default_acme_ca_url(),
+            caddy_tls_mode: CaddyTlsMode::Acme,
             trustee_policy_read_available: false,
             workload_artifacts_url: None,
             trustee_policy_url: None,
