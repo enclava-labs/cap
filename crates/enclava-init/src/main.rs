@@ -714,17 +714,14 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         .map_err(|_| anyhow!("invalid pid {}", args[0]))?;
     let source = PathBuf::from(&args[1]);
     let target = PathBuf::from(&args[2]);
-    let source_dir = std::fs::File::open(&source)
-        .with_context(|| format!("opening source {}", source.display()))?;
+    std::fs::metadata(&source).with_context(|| format!("stat source {}", source.display()))?;
     let ns = std::fs::File::open(format!("/proc/{pid}/ns/mnt"))
         .with_context(|| format!("opening mount namespace for pid {pid}"))?;
     nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNS)
         .with_context(|| format!("setns to pid {pid} mount namespace"))?;
     std::fs::create_dir_all(&target)
         .with_context(|| format!("creating target {}", target.display()))?;
-    use std::os::fd::AsRawFd;
-    let pinned_source = PathBuf::from(format!("/proc/self/fd/{}", source_dir.as_raw_fd()));
-    if paths_resolve_to_same_object(&pinned_source, &target).with_context(|| {
+    if paths_resolve_to_same_object(&source, &target).with_context(|| {
         format!(
             "checking whether {} is already mounted at {}",
             source.display(),
@@ -736,7 +733,7 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     // Bind each target explicitly. Recursive bind can fold the sibling
     // tls-state mount back through the pod mount topology and return EINVAL.
     nix::mount::mount(
-        Some(pinned_source.as_path()),
+        Some(source.as_path()),
         target.as_path(),
         None::<&str>,
         nix::mount::MsFlags::MS_BIND,
