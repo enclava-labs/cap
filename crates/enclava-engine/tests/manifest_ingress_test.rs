@@ -37,6 +37,15 @@ fn caddyfile_contains_app_port() {
 }
 
 #[test]
+fn caddyfile_uses_rootfs_tls_storage_path() {
+    let app = sample_app();
+    let cm = generate_ingress_configmap(&app);
+    let data = cm.data.as_ref().unwrap();
+    let caddyfile = data.get("Caddyfile").unwrap();
+    assert!(caddyfile.contains("storage file_system /tls-state/caddy"));
+}
+
+#[test]
 fn caddyfile_has_attestation_proxy_route() {
     let app = sample_app();
     let cm = generate_ingress_configmap(&app);

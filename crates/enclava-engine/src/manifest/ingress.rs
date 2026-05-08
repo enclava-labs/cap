@@ -181,7 +181,7 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     out.push_str("  email ");
     out.push_str(&spec.contact_email);
     out.push('\n');
-    out.push_str("  storage file_system /state/tls-state/caddy\n");
+    out.push_str("  storage file_system /tls-state/caddy\n");
     out.push_str("  acme_ca ");
     out.push_str(&spec.acme_ca);
     out.push('\n');

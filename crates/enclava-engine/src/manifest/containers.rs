@@ -46,6 +46,7 @@ pub fn enclava_init_image() -> String {
 pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
 pub const APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
 pub const CADDY_SEED_PATH: &str = "/run/enclava/seeds/caddy/seed";
+pub const CADDY_TLS_STATE_PATH: &str = "/tls-state";
 
 fn ownership_mode_str(mode: UnlockMode) -> &'static str {
     match mode {
@@ -560,7 +561,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
 ///
 /// Phase 5 default: unprivileged, NET_BIND_SERVICE only for port 443. Reads
 /// its seed from `/run/enclava/seeds/caddy/seed` and TLS material from
-/// `/state/tls-state` (opened by enclava-init and bind-mounted into this
+/// `/tls-state` (opened by enclava-init and bind-mounted into this
 /// namespace after the helper reports its PID). The Cloudflare
 /// DNS-01 path is gone — Phase 0 cut over to TLS-ALPN-01 — so caddy carries
 /// no `CF_API_TOKEN` env and no `tls-cloudflare-token` secret mount.
@@ -595,10 +596,13 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             env_field_ref("POD_NAME", "metadata.name"),
             env_field_ref("POD_NAMESPACE", "metadata.namespace"),
             env("CADDY_SEED_PATH", CADDY_SEED_PATH),
-            env("VOLUME_MOUNT_POINT", "/state/tls-state"),
-            env("XDG_DATA_HOME", "/state/tls-state/caddy"),
-            env("XDG_CONFIG_HOME", "/state/tls-state/caddy/config"),
-            env("HOME", "/state/tls-state"),
+            env("VOLUME_MOUNT_POINT", CADDY_TLS_STATE_PATH),
+            env("XDG_DATA_HOME", &format!("{CADDY_TLS_STATE_PATH}/caddy")),
+            env(
+                "XDG_CONFIG_HOME",
+                &format!("{CADDY_TLS_STATE_PATH}/caddy/config"),
+            ),
+            env("HOME", CADDY_TLS_STATE_PATH),
             env("ENCLAVA_CONTAINER_NAME", "tenant-ingress"),
             env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"),
             env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
@@ -655,11 +659,6 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         volume_mounts.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),
-            ..Default::default()
-        });
-        volume_mounts.push(VolumeMount {
-            name: "state-mount".to_string(),
-            mount_path: "/state".to_string(),
             ..Default::default()
         });
     }

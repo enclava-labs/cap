@@ -238,13 +238,10 @@ fn caddy_container_does_not_mount_cloudflare_token() {
 }
 
 #[test]
-fn caddy_container_uses_state_mount_for_tls_bind_target() {
+fn caddy_container_uses_rootfs_tls_bind_target() {
     let c = build_caddy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
-    assert!(
-        vm.iter()
-            .any(|m| m.name == "state-mount" && m.mount_path == "/state")
-    );
+    assert!(vm.iter().all(|m| m.name != "state-mount"));
     assert!(vm.iter().all(|m| m.name != "tls-state-mount"));
     assert!(c.volume_devices.is_none());
 }
@@ -270,7 +267,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/tls-state/caddy")
+        Some("/tls-state/caddy")
     );
     assert_eq!(
         env.iter()
@@ -278,7 +275,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/tls-state/caddy/config")
+        Some("/tls-state/caddy/config")
     );
     assert_eq!(
         env.iter()
@@ -286,7 +283,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/tls-state")
+        Some("/tls-state")
     );
 }
 

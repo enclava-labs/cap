@@ -16,6 +16,7 @@ const KBS_PROXY_HEALTH_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 const DEFAULT_KBS_FETCH_ATTEMPTS: u32 = 30;
 const DEFAULT_KBS_FETCH_RETRY_SLEEP_SECONDS: u64 = 2;
 const DEFAULT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS: u64 = 10;
+const CADDY_TLS_TARGET_PATH: &str = "/tls-state";
 const SHARED_APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
 const SHARED_CADDY_SEED_PATH: &str = "/run/enclava/seeds/caddy/seed";
 
@@ -640,7 +641,7 @@ fn bind_for_workload(cfg: &Config, self_pid: u32, workload: &WorkloadNamespace) 
         let caddy_source = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
         mounts.push((
             namespace_source(self_pid, &caddy_source.to_string_lossy()),
-            PathBuf::from(&cfg.tls_state.mount_path),
+            PathBuf::from(CADDY_TLS_TARGET_PATH),
         ));
     } else {
         for bind in &cfg.app_bind_mounts {
@@ -944,6 +945,7 @@ mod tests {
             caddy_tls_bind_dir(Path::new("/state/tls-state")),
             PathBuf::from("/state/tls-state/tenant-ingress")
         );
+        assert_eq!(CADDY_TLS_TARGET_PATH, "/tls-state");
     }
 
     #[test]
