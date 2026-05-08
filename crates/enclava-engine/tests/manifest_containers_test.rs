@@ -80,15 +80,44 @@ fn app_container_mounts_state_filesystem() {
 }
 
 #[test]
-fn app_container_preserves_declared_storage_paths_as_subpaths() {
+fn app_container_leaves_declared_storage_paths_for_enclava_init_bind_mounts() {
     let c = build_app_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
-    let m = vm
-        .iter()
-        .find(|m| m.name == "state-mount" && m.mount_path == "/app/data")
-        .unwrap();
-    assert_eq!(m.sub_path.as_deref(), Some("app-data"));
-    assert_eq!(m.mount_propagation.as_deref(), None);
+    assert!(
+        vm.iter()
+            .any(|m| m.name == "state-mount" && m.mount_path == "/state")
+    );
+    assert!(
+        vm.iter()
+            .all(|m| !(m.name == "state-mount" && m.mount_path == "/app/data"))
+    );
+    assert!(vm.iter().all(|m| m.sub_path.is_none()));
+    assert_eq!(
+        vm.iter()
+            .find(|m| m.name == "state-mount" && m.mount_path == "/state")
+            .unwrap()
+            .mount_propagation
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        c.env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|e| e.name == "VOLUME_MOUNT_POINT")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/state")
+    );
+}
+
+#[test]
+fn app_container_has_no_kubernetes_subpath_mounts() {
+    let c = build_app_container(&sample_app());
+    let vm = c.volume_mounts.as_ref().unwrap();
+    assert!(vm.iter().all(|m| m.sub_path.is_none()));
     assert_eq!(
         c.env
             .as_ref()

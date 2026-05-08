@@ -145,12 +145,16 @@ fn cap_oci_runtime_spec_matches_rendered_app_container_fields() {
 
     let rendered_mounts = rendered.volume_mounts.unwrap();
     for mount in &descriptor_oci.mounts {
+        if mount.destination != "/state" {
+            continue;
+        }
         let rendered_mount = rendered_mounts
             .iter()
             .find(|m| m.mount_path == mount.destination)
             .unwrap();
         assert_eq!(rendered_mount.mount_propagation.as_deref(), None);
     }
+    assert!(rendered_mounts.iter().all(|m| m.sub_path.is_none()));
 }
 
 #[test]
