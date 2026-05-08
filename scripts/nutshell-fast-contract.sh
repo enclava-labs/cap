@@ -48,6 +48,7 @@ except ModuleNotFoundError as exc:
 root = pathlib.Path(sys.argv[1])
 config = tomllib.loads((root / "enclava.toml").read_text())
 dockerfile = (root / "Dockerfile").read_text()
+entrypoint = (root / "docker" / "app-entrypoint.sh").read_text()
 
 
 def expect(name: str, actual, expected):
@@ -67,6 +68,7 @@ required = [
     "CASHU_DIR=/state/data",
     "HOME=/state/data",
     "MINT_DATABASE=/state/data/mint",
+    "MINT_AUTH_DATABASE=/state/data/mint",
     "TMPDIR=/state/data/tmp",
     "XDG_CACHE_HOME=/state/data/.cache",
     "--home-dir /state/data",
@@ -80,6 +82,7 @@ for stale in [
     "CASHU_DIR=/data",
     "HOME=/data",
     "MINT_DATABASE=/data",
+    "MINT_AUTH_DATABASE=/data",
     "TMPDIR=/data",
     "XDG_CACHE_HOME=/data",
     "--home-dir /data",
@@ -87,6 +90,22 @@ for stale in [
 ]:
     if stale in dockerfile:
         raise SystemExit(f"Dockerfile still contains stale /data setting: {stale}")
+
+for text in [
+    "${MINT_DATABASE:=/state/data/mint}",
+    "${MINT_AUTH_DATABASE:=/state/data/mint}",
+    "${TMPDIR:=/state/data/tmp}",
+]:
+    if text not in entrypoint:
+        raise SystemExit(f"app-entrypoint.sh missing expected default: {text}")
+
+for stale in [
+    "${MINT_DATABASE:=/data/mint}",
+    "${MINT_AUTH_DATABASE:=/data/mint}",
+    "${TMPDIR:=/data/tmp}",
+]:
+    if stale in entrypoint:
+        raise SystemExit(f"app-entrypoint.sh still contains stale /data default: {stale}")
 
 print("Nutshell descriptor and image defaults match CAP /state contract")
 PY
