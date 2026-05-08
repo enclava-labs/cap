@@ -858,6 +858,7 @@ async fn claim_initial_ownership(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
     let tee = TeeClient::new(&endpoint.tee_url);
+    let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     let challenge = tee.bootstrap_challenge().await?;
 
