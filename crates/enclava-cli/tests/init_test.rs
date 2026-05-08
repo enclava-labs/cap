@@ -11,7 +11,7 @@ paths = ["/data"]
 size = "5Gi"
 
 [unlock]
-mode = "auto"
+mode = "password"
 
 [resources]
 cpu = "1"

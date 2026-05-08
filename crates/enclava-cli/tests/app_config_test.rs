@@ -12,7 +12,7 @@ port = 8080
     assert_eq!(config.storage.paths, vec!["/data"]);
     assert_eq!(config.storage.size, "5Gi");
     assert_eq!(config.storage.tls_size, "2Gi");
-    assert_eq!(config.unlock.mode, "auto");
+    assert_eq!(config.unlock.mode, "password");
     assert!(config.services.is_empty());
     assert_eq!(config.resources.cpu, "1");
     assert_eq!(config.resources.memory, "1Gi");

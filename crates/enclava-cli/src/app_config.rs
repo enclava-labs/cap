@@ -62,7 +62,7 @@ pub struct UnlockSection {
 }
 
 fn default_unlock_mode() -> String {
-    "auto".to_string()
+    "password".to_string()
 }
 
 impl Default for UnlockSection {

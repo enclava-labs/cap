@@ -186,7 +186,7 @@ pub struct CreateAppRequest {
 }
 
 fn default_unlock_mode() -> String {
-    "auto".to_string()
+    "password".to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -791,7 +791,17 @@ pub async fn rotate_signer(
 
 #[cfg(test)]
 mod signer_request_tests {
-    use super::RotateSignerRequest;
+    use super::{CreateAppRequest, RotateSignerRequest};
+
+    #[test]
+    fn create_request_defaults_to_password_unlock() {
+        let body: CreateAppRequest = serde_json::from_value(serde_json::json!({
+            "name": "demo",
+        }))
+        .unwrap();
+
+        assert_eq!(body.unlock_mode, "password");
+    }
 
     #[test]
     fn initial_set_call_omits_token() {
