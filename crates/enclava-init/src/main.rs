@@ -731,11 +731,13 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     })? {
         return Ok(());
     }
+    // Bind each target explicitly. Recursive bind can fold the sibling
+    // tls-state mount back through the pod mount topology and return EINVAL.
     nix::mount::mount(
         Some(pinned_source.as_path()),
         target.as_path(),
         None::<&str>,
-        nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
+        nix::mount::MsFlags::MS_BIND,
         None::<&str>,
     )
     .with_context(|| format!("bind mounting {} to {}", source.display(), target.display()))?;
