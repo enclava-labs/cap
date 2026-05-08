@@ -535,6 +535,7 @@ pub async fn update_unlock_mode(
     signed_app.unlock_mode = requested.model_value();
     let mut workload_artifact_binding = None;
     let mut signed_policy_artifact = None;
+    let mut signed_workload_command = None;
     if let Some(artifacts) = signing_artifacts.as_ref() {
         let image_digest_ref = image_digest.as_deref().ok_or((
             StatusCode::BAD_REQUEST,
@@ -545,6 +546,14 @@ pub async fn update_unlock_mode(
         artifacts
             .validate_deployment_inputs(&signed_app, image_digest_ref)
             .map_err(crate::routes::deployments::signing_error_response)?;
+        let workload_command = artifacts.descriptor.oci_runtime_spec.args.clone();
+        signed_workload_command = crate::deploy::serialize_workload_command(&workload_command)
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "command serialization error"})),
+                )
+            })?;
         let attestation = state.attestation.as_ref().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -567,6 +576,7 @@ pub async fn update_unlock_mode(
                 Json(serde_json::json!({"error": e.to_string()})),
             )
         })?;
+        crate::deploy::set_primary_workload_command(&mut app_spec, &workload_command);
         let binding = artifacts.binding();
         app_spec.workload_artifact_binding = Some(binding.clone());
 
@@ -616,6 +626,22 @@ pub async fn update_unlock_mode(
                 Json(serde_json::json!({"error": "database error"})),
             )
         })?;
+
+    if let Some(command) = signed_workload_command.as_ref() {
+        sqlx::query(
+            "UPDATE app_containers SET command = $1 WHERE app_id = $2 AND is_primary = true",
+        )
+        .bind(command)
+        .bind(app.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
+    }
 
     sqlx::query(
         "INSERT INTO unlock_transition_receipts

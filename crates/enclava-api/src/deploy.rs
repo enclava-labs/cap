@@ -58,6 +58,39 @@ pub enum DeployError {
     EdgeRoute(#[from] crate::edge::EdgeRouteError),
 }
 
+pub(crate) fn serialize_workload_command(
+    command: &[String],
+) -> Result<Option<String>, serde_json::Error> {
+    if command.is_empty() {
+        Ok(None)
+    } else {
+        serde_json::to_string(command).map(Some)
+    }
+}
+
+fn deserialize_workload_command(command: Option<&str>) -> Option<Vec<String>> {
+    let raw = command?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    match serde_json::from_str::<Vec<String>>(trimmed) {
+        Ok(argv) if !argv.is_empty() => Some(argv),
+        Ok(_) => None,
+        Err(_) => Some(vec![raw.to_string()]),
+    }
+}
+
+pub(crate) fn set_primary_workload_command(app: &mut ConfidentialApp, command: &[String]) {
+    if command.is_empty() {
+        return;
+    }
+    for container in app.containers.iter_mut().filter(|c| c.is_primary) {
+        container.command = Some(command.to_vec());
+    }
+}
+
 /// Build a ConfidentialApp spec from database state.
 /// This is the bridge between the API's data model and the engine's input type.
 pub async fn build_confidential_app(
@@ -105,7 +138,7 @@ pub async fn build_confidential_app(
             name: row.name.clone(),
             image,
             port: row.port.map(|p| p as u16),
-            command: row.command.as_ref().map(|c| vec![c.clone()]),
+            command: deserialize_workload_command(row.command.as_deref()),
             env: std::collections::HashMap::new(),
             storage_paths,
             is_primary: row.is_primary,

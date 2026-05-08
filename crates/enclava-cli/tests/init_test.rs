@@ -5,10 +5,12 @@ fn init_generates_valid_toml() {
 [app]
 name = "test-app"
 port = 3000
+command = ["/usr/local/bin/app"]
 
 [storage]
 paths = ["/data"]
 size = "5Gi"
+tls_size = "2Gi"
 
 [unlock]
 mode = "password"
@@ -24,4 +26,5 @@ timeout = 5
 "#;
     let config = enclava_cli::app_config::AppConfig::parse(toml_str).unwrap();
     assert_eq!(config.app.name, "test-app");
+    assert_eq!(config.app.command, vec!["/usr/local/bin/app".to_string()]);
 }

@@ -592,6 +592,18 @@ pub async fn deploy(
 
     // Update container image in DB
     let container_name = body.container_name.as_deref().unwrap_or("web");
+    let signed_workload_command = match signing_artifacts.as_ref() {
+        Some(artifacts) => {
+            crate::deploy::serialize_workload_command(&artifacts.descriptor.oci_runtime_spec.args)
+                .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "command serialization error"})),
+                )
+            })?
+        }
+        None => None,
+    };
     let container_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM app_containers WHERE app_id = $1 AND name = $2)",
     )
@@ -608,10 +620,13 @@ pub async fn deploy(
 
     if container_exists {
         sqlx::query(
-            "UPDATE app_containers SET image_ref = $1, image_digest = $2 WHERE app_id = $3 AND name = $4",
+            "UPDATE app_containers
+             SET image_ref = $1, image_digest = $2, command = COALESCE($3, command)
+             WHERE app_id = $4 AND name = $5",
         )
         .bind(&body.image)
         .bind(Some(&image_digest))
+        .bind(signed_workload_command.as_ref())
         .bind(app.id)
         .bind(container_name)
         .execute(&state.db)
@@ -624,14 +639,15 @@ pub async fn deploy(
         })?;
     } else {
         sqlx::query(
-            "INSERT INTO app_containers (id, app_id, name, image_ref, image_digest, is_primary)
-             VALUES ($1, $2, $3, $4, $5, true)",
+            "INSERT INTO app_containers (id, app_id, name, image_ref, image_digest, command, is_primary)
+             VALUES ($1, $2, $3, $4, $5, $6, true)",
         )
         .bind(Uuid::new_v4())
         .bind(app.id)
         .bind(container_name)
         .bind(&body.image)
         .bind(Some(&image_digest))
+        .bind(signed_workload_command.as_ref())
         .execute(&state.db)
         .await
         .map_err(|_| {
@@ -1007,6 +1023,10 @@ pub async fn rollback(
         crate::signing_service::load_workload_artifact_binding(&state.db, app.id, prev.id)
             .await
             .map_err(signing_error_response)?;
+    let rollback_descriptor =
+        crate::signing_service::load_workload_descriptor(&state.db, app.id, prev.id)
+            .await
+            .map_err(signing_error_response)?;
 
     if customer_signed_deploy_required(
         state.attestation.as_ref(),
@@ -1021,14 +1041,40 @@ pub async fn rollback(
         ));
     }
 
+    let rollback_workload_command = match rollback_descriptor.as_ref() {
+        Some(descriptor) => crate::deploy::serialize_workload_command(
+            &descriptor.oci_runtime_spec.args,
+        )
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "command serialization error"})),
+            )
+        })?,
+        None => None,
+    };
+    if customer_signed_deploy_required(
+        state.attestation.as_ref(),
+        state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
+    ) && rollback_workload_command.is_none()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "rollback target has no signed workload command"
+            })),
+        ));
+    }
+
     let container_name = "web";
     sqlx::query(
         "UPDATE app_containers
-         SET image_ref = $1, image_digest = $2
-         WHERE app_id = $3 AND name = $4",
+         SET image_ref = $1, image_digest = $2, command = COALESCE($3, command)
+         WHERE app_id = $4 AND name = $5",
     )
     .bind(&image)
     .bind(Some(&image_digest))
+    .bind(rollback_workload_command.as_ref())
     .bind(app.id)
     .bind(container_name)
     .execute(&state.db)

@@ -26,10 +26,12 @@ fn generate_enclava_toml(name: &str, port: u16) -> String {
         r#"[app]
 name = "{name}"
 port = {port}
+command = ["/usr/local/bin/app"]
 
 [storage]
 paths = ["/data"]
 size = "5Gi"
+tls_size = "2Gi"
 
 [unlock]
 mode = "password"

@@ -21,6 +21,8 @@ pub struct AppConfig {
 pub struct AppSection {
     pub name: String,
     pub port: u16,
+    #[serde(default)]
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +194,12 @@ impl AppConfig {
                     "unlock mode must be 'auto' or 'password', got '{other}'"
                 )));
             }
+        }
+
+        if self.app.command.iter().any(|arg| arg.is_empty()) {
+            return Err(AppConfigError::Validation(
+                "app command entries cannot be empty".to_string(),
+            ));
         }
 
         Ok(())

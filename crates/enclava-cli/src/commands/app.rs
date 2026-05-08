@@ -337,6 +337,12 @@ pub(crate) async fn build_signed_deploy_blobs(
         return Err("deployment descriptor signing requires --image to be digest-pinned".into());
     }
     let deploy_unlock_mode = target_unlock_mode.unwrap_or(app.unlock_mode.as_str());
+    if app_config.app.command.is_empty() {
+        return Err(
+            "app.command in enclava.toml must specify the workload argv, for example [\"/usr/local/bin/app\"]"
+                .into(),
+        );
+    }
 
     let release = PlatformRelease::load_verified()?;
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
@@ -447,7 +453,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         oci_runtime_spec: cap_app_oci_runtime_spec(CapAppOciRuntimeSpecInput {
             container_name: "web".to_string(),
             port: app_config.app.port,
-            workload_command: Vec::new(),
+            workload_command: app_config.app.command.clone(),
             storage_paths: app_config.storage.paths.clone(),
             cpu_limit: app_config.resources.cpu.clone(),
             memory_limit: app_config.resources.memory.clone(),

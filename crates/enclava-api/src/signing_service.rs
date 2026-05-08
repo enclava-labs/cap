@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
 use enclava_common::descriptor::{DeploymentDescriptor, descriptor_core_hash};
+use enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH;
 use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -281,6 +282,7 @@ impl DeploymentSigningArtifacts {
         app: &App,
         image_digest: &str,
     ) -> Result<(), SigningServiceError> {
+        self.validate_workload_runtime_spec()?;
         if self.descriptor.org_id != app.org_id {
             return Err(SigningServiceError::Mismatch("org_id".into()));
         }
@@ -336,6 +338,32 @@ impl DeploymentSigningArtifacts {
         }
         if self.org_keyring.org_id != app.org_id {
             return Err(SigningServiceError::Mismatch("org_keyring.org_id".into()));
+        }
+        Ok(())
+    }
+
+    fn validate_workload_runtime_spec(&self) -> Result<(), SigningServiceError> {
+        let command = &self.descriptor.oci_runtime_spec.command;
+        if command.len() != 1 || command[0] != ENCLAVA_WAIT_EXEC_PATH {
+            return Err(SigningServiceError::Mismatch(
+                "oci_runtime_spec.command".into(),
+            ));
+        }
+        if self.descriptor.oci_runtime_spec.args.is_empty() {
+            return Err(SigningServiceError::Mismatch(
+                "oci_runtime_spec.args".into(),
+            ));
+        }
+        if self
+            .descriptor
+            .oci_runtime_spec
+            .args
+            .iter()
+            .any(|arg| arg.is_empty())
+        {
+            return Err(SigningServiceError::Mismatch(
+                "oci_runtime_spec.args".into(),
+            ));
         }
         Ok(())
     }
@@ -954,6 +982,27 @@ pub async fn load_workload_artifacts_json(
     )))
 }
 
+pub async fn load_workload_descriptor(
+    pool: &PgPool,
+    app_id: Uuid,
+    deploy_id: Uuid,
+) -> Result<Option<DeploymentDescriptor>, SigningServiceError> {
+    let Some(descriptor_payload) = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT descriptor_payload
+         FROM workload_artifacts
+         WHERE app_id = $1 AND deploy_id = $2",
+    )
+    .bind(app_id)
+    .bind(deploy_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(serde_json::from_value(descriptor_payload)?))
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct StoredWorkloadArtifactRow {
     descriptor_core_hash: Vec<u8>,
@@ -1274,8 +1323,8 @@ mod tests {
                 issuer: "https://token.actions.githubusercontent.com".to_string(),
             },
             oci_runtime_spec: OciRuntimeSpec {
-                command: vec![],
-                args: vec![],
+                command: vec![ENCLAVA_WAIT_EXEC_PATH.to_string()],
+                args: vec!["/usr/local/bin/app".to_string()],
                 env: vec![EnvVar {
                     name: "RUST_LOG".to_string(),
                     value: "info".to_string(),
@@ -1472,6 +1521,22 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "unlock_mode"));
+    }
+
+    #[test]
+    fn rejects_descriptor_without_workload_command() {
+        let mut descriptor = descriptor();
+        descriptor.oci_runtime_spec.args.clear();
+        let artifacts = signing_artifacts(descriptor.clone());
+        let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+        let err = artifacts
+            .validate_deployment_inputs(&app, &descriptor.image_digest)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, SigningServiceError::Mismatch(field) if field == "oci_runtime_spec.args")
+        );
     }
 
     #[test]

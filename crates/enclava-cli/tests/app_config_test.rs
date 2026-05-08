@@ -8,6 +8,7 @@ port = 8080
     let config = enclava_cli::app_config::AppConfig::parse(toml_str).unwrap();
     assert_eq!(config.app.name, "my-api");
     assert_eq!(config.app.port, 8080);
+    assert!(config.app.command.is_empty());
     // Defaults
     assert_eq!(config.storage.paths, vec!["/data"]);
     assert_eq!(config.storage.size, "5Gi");
@@ -25,6 +26,7 @@ fn parse_full_toml() {
 [app]
 name = "my-saas"
 port = 3000
+command = ["/usr/local/bin/app", "--serve"]
 
 [storage]
 paths = ["/app/data", "/app/uploads"]
@@ -55,6 +57,10 @@ timeout = 5
     let config = enclava_cli::app_config::AppConfig::parse(toml_str).unwrap();
     assert_eq!(config.app.name, "my-saas");
     assert_eq!(config.app.port, 3000);
+    assert_eq!(
+        config.app.command,
+        vec!["/usr/local/bin/app".to_string(), "--serve".to_string()]
+    );
     assert_eq!(config.storage.paths, vec!["/app/data", "/app/uploads"]);
     assert_eq!(config.storage.size, "10Gi");
     assert_eq!(config.storage.tls_size, "4Gi");
@@ -97,6 +103,18 @@ mode = "magic"
 "#;
     let err = enclava_cli::app_config::AppConfig::parse(toml_str).unwrap_err();
     assert!(err.to_string().contains("unlock"));
+}
+
+#[test]
+fn parse_rejects_empty_command_arg() {
+    let toml_str = r#"
+[app]
+name = "test"
+port = 3000
+command = [""]
+"#;
+    let err = enclava_cli::app_config::AppConfig::parse(toml_str).unwrap_err();
+    assert!(err.to_string().contains("command"));
 }
 
 #[test]
