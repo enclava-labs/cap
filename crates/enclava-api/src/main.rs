@@ -7,7 +7,8 @@ use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use enclava_api::{
-    auth::jwt, build_router, dns::DnsConfig, platform_release::PlatformRelease, state::AppState,
+    acme::AcmeConfig, auth::jwt, build_router, dns::DnsConfig, platform_release::PlatformRelease,
+    state::AppState,
 };
 
 fn env_flag(name: &str) -> bool {
@@ -297,8 +298,28 @@ fn load_attestation_config(
         anyhow::bail!("missing CADDY_INGRESS_IMAGE");
     };
 
+    let acme_ca_url = release_env_value(
+        "TENANT_CADDY_ACME_CA",
+        platform_release.map(|release| release.tenant_caddy_acme_ca.as_str()),
+        false,
+    )?
+    .unwrap_or_else(enclava_engine::types::default_acme_ca_url);
+    let caddy_tls_mode = match release_env_value(
+        "TENANT_CADDY_TLS_MODE",
+        platform_release.map(|release| release.tenant_caddy_tls_mode.as_str()),
+        false,
+    )? {
+        Some(mode) => mode
+            .parse::<CaddyTlsMode>()
+            .map_err(|err| anyhow::anyhow!("TENANT_CADDY_TLS_MODE: {err}"))?,
+        None => load_caddy_tls_mode()?,
+    };
     let workload_artifacts_url =
         load_url_env("WORKLOAD_ARTIFACTS_URL", trustee_policy_read_available)?;
+    let tls_certificate_broker_url = load_url_env(
+        "TLS_CERTIFICATE_BROKER_URL",
+        trustee_policy_read_available && caddy_tls_mode == CaddyTlsMode::Dns01Broker,
+    )?;
     let trustee_policy_url = load_url_env("TRUSTEE_POLICY_URL", trustee_policy_read_available)?;
     let release_pubkey =
         platform_release.map(|release| release.signing_service_pubkey_hex.as_str());
@@ -316,24 +337,11 @@ fn load_attestation_config(
     Ok(AttestationConfig {
         proxy_image: parse_image_ref("ATTESTATION_PROXY_IMAGE", &proxy_image_ref)?,
         caddy_image: parse_image_ref("CADDY_INGRESS_IMAGE", &caddy_image_ref)?,
-        acme_ca_url: release_env_value(
-            "TENANT_CADDY_ACME_CA",
-            platform_release.map(|release| release.tenant_caddy_acme_ca.as_str()),
-            false,
-        )?
-        .unwrap_or_else(enclava_engine::types::default_acme_ca_url),
-        caddy_tls_mode: match release_env_value(
-            "TENANT_CADDY_TLS_MODE",
-            platform_release.map(|release| release.tenant_caddy_tls_mode.as_str()),
-            false,
-        )? {
-            Some(mode) => mode
-                .parse::<CaddyTlsMode>()
-                .map_err(|err| anyhow::anyhow!("TENANT_CADDY_TLS_MODE: {err}"))?,
-            None => load_caddy_tls_mode()?,
-        },
+        acme_ca_url,
+        caddy_tls_mode,
         trustee_policy_read_available,
         workload_artifacts_url,
+        tls_certificate_broker_url,
         trustee_policy_url,
         local_workload_artifacts_json: None,
         local_trustee_policy_json: None,
@@ -380,8 +388,55 @@ fn load_dns_config() -> anyhow::Result<Option<DnsConfig>> {
     }))
 }
 
+fn load_acme_config(attestation: Option<&AttestationConfig>) -> anyhow::Result<Option<AcmeConfig>> {
+    let broker_enabled = attestation
+        .and_then(|cfg| cfg.tls_certificate_broker_url.as_ref())
+        .is_some()
+        || env_nonempty("TLS_CERTIFICATE_BROKER_URL").is_some();
+    if !broker_enabled {
+        return Ok(None);
+    }
+    let directory_url = env_nonempty("ACME_DIRECTORY_URL")
+        .or_else(|| attestation.map(|cfg| cfg.acme_ca_url.clone()))
+        .unwrap_or_else(enclava_engine::types::default_acme_ca_url);
+    reqwest::Url::parse(&directory_url)
+        .map_err(|err| anyhow::anyhow!("invalid ACME_DIRECTORY_URL: {err}"))?;
+    let account_credentials_path =
+        env_nonempty("ACME_ACCOUNT_CREDENTIALS_PATH").map(std::path::PathBuf::from);
+    let dns_propagation_wait = std::env::var("ACME_DNS_PROPAGATION_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or_else(|| std::time::Duration::from_secs(30));
+    Ok(Some(AcmeConfig {
+        directory_url,
+        account_credentials_path,
+        dns_propagation_wait,
+    }))
+}
+
+fn load_trustee_attestation_verify_bearer_token(
+    verify_url: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let token = env_nonempty("TRUSTEE_ATTESTATION_VERIFY_BEARER_TOKEN");
+    if verify_url.is_some() && token.is_none() {
+        anyhow::bail!(
+            "TRUSTEE_ATTESTATION_VERIFY_BEARER_TOKEN is required when \
+             TRUSTEE_ATTESTATION_VERIFY_URL is set"
+        );
+    }
+
+    Ok(token)
+}
+
+fn install_default_rustls_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 #[tokio::main]
 async fn main() {
+    install_default_rustls_crypto_provider();
+
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -523,6 +578,7 @@ async fn main() {
     let attestation = load_attestation_config(platform_release.as_ref())
         .expect("failed to load attestation config");
     let dns = load_dns_config().expect("failed to load DNS config");
+    let acme = load_acme_config(attestation.as_ref()).expect("failed to load ACME config");
     let kbs_policy = enclava_api::kbs::config_from_env();
     let trustee_required = attestation
         .as_ref()
@@ -531,6 +587,9 @@ async fn main() {
     let trustee_attestation_verify_url =
         load_url_env("TRUSTEE_ATTESTATION_VERIFY_URL", trustee_required)
             .expect("failed to load Trustee attestation verify URL");
+    let trustee_attestation_verify_bearer_token =
+        load_trustee_attestation_verify_bearer_token(trustee_attestation_verify_url.as_deref())
+            .expect("failed to load Trustee attestation verify bearer token");
     // The signed release identifies the signing-service key and default URL,
     // but the transport address is deployment-local. CAP may need an internal
     // cluster DNS name while customer tooling uses the public API broker.
@@ -589,8 +648,10 @@ async fn main() {
         btcpay_webhook_secret,
         attestation,
         dns,
+        acme,
         kbs_policy,
         trustee_attestation_verify_url,
+        trustee_attestation_verify_bearer_token,
         signing_service,
         require_customer_signed_policy_artifact,
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_applies)),
@@ -610,4 +671,22 @@ async fn main() {
     )
     .await
     .expect("server error");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn api_startup_installs_rustls_crypto_provider() {
+        let source = include_str!("main.rs");
+        let main_body = source
+            .split("#[tokio::main]")
+            .nth(1)
+            .and_then(|s| s.split("#[cfg(test)]").next())
+            .expect("main body");
+        let expected = concat!("install_default", "_rustls_crypto_provider();");
+        assert!(
+            main_body.contains(expected),
+            "API startup must install a rustls CryptoProvider before building ACME/HTTP clients"
+        );
+    }
 }

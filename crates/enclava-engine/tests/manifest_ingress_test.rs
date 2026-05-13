@@ -43,7 +43,7 @@ fn caddyfile_uses_rootfs_tls_storage_path() {
     let cm = generate_ingress_configmap(&app);
     let data = cm.data.as_ref().unwrap();
     let caddyfile = data.get("Caddyfile").unwrap();
-    assert!(caddyfile.contains("storage file_system /state/tls-state/tenant-ingress/caddy"));
+    assert!(caddyfile.contains("storage file_system /run/enclava/caddy-runtime"));
 }
 
 #[test]
@@ -92,7 +92,19 @@ fn caddyfile_defaults_to_letsencrypt_production() {
     let cm = generate_ingress_configmap(&app);
     let data = cm.data.as_ref().unwrap();
     let caddyfile = data.get("Caddyfile").unwrap();
-    assert!(caddyfile.contains("acme_ca https://acme-v02.api.letsencrypt.org/directory"));
+    assert!(caddyfile.contains("dir https://acme-v02.api.letsencrypt.org/directory"));
+    assert!(caddyfile.contains("test-app.abcd1234.enclava.dev:10443"));
+}
+
+#[test]
+fn caddyfile_acme_mode_disables_extra_caddy_runtime_surfaces() {
+    let app = sample_app();
+    let cm = generate_ingress_configmap(&app);
+    let data = cm.data.as_ref().unwrap();
+    let caddyfile = data.get("Caddyfile").unwrap();
+    assert!(caddyfile.contains("admin off"));
+    assert!(caddyfile.contains("persist_config off"));
+    assert!(caddyfile.contains("auto_https disable_redirects"));
 }
 
 #[test]
@@ -103,7 +115,28 @@ fn caddyfile_uses_configured_acme_ca() {
     let cm = generate_ingress_configmap(&app);
     let data = cm.data.as_ref().unwrap();
     let caddyfile = data.get("Caddyfile").unwrap();
-    assert!(caddyfile.contains("acme_ca https://acme-staging-v02.api.letsencrypt.org/directory"));
+    assert!(caddyfile.contains("dir https://acme-staging-v02.api.letsencrypt.org/directory"));
+    assert!(caddyfile.contains(
+        "issuer acme {\n      dir https://acme-staging-v02.api.letsencrypt.org/directory"
+    ));
+}
+
+#[test]
+fn caddyfile_dns01_broker_mode_uses_static_enclave_owned_certificate() {
+    let mut app = sample_app();
+    app.attestation.caddy_tls_mode = CaddyTlsMode::Dns01Broker;
+
+    let cm = generate_ingress_configmap(&app);
+    let data = cm.data.as_ref().unwrap();
+    let caddyfile = data.get("Caddyfile").unwrap();
+
+    assert!(caddyfile.contains("test-app.abcd1234.enclava.dev:10443"));
+    assert!(caddyfile.contains(
+        "tls /run/enclava/caddy-runtime/certificates/tls.crt /run/enclava/caddy-runtime/certificates/tls.key"
+    ));
+    assert!(!caddyfile.contains("issuer acme"));
+    assert!(!caddyfile.contains("dns cloudflare"));
+    assert!(!caddyfile.contains("CF_API_TOKEN"));
 }
 
 #[test]
@@ -116,10 +149,10 @@ fn caddyfile_internal_tls_mode_skips_acme() {
     assert!(caddyfile.contains("admin off"));
     assert!(caddyfile.contains("persist_config off"));
     assert!(caddyfile.contains("auto_https disable_redirects"));
-    assert!(caddyfile.contains("storage file_system /tmp/caddy"));
+    assert!(caddyfile.contains("storage file_system /run/enclava/caddy-runtime"));
     assert!(caddyfile.contains("test-app.abcd1234.enclava.dev:10443"));
     assert!(caddyfile.contains("tls internal"));
-    assert!(!caddyfile.contains("acme_ca "));
+    assert!(!caddyfile.contains(" ca https://"));
     assert!(!caddyfile.contains("issuer acme"));
 }
 
@@ -154,5 +187,5 @@ fn custom_domain_keeps_platform_domain_in_site_block() {
     let caddyfile = cm.data.as_ref().unwrap().get("Caddyfile").unwrap();
     assert!(caddyfile.contains("test-app.abcd1234.enclava.dev"));
     assert!(caddyfile.contains("app.example.com"));
-    assert!(caddyfile.contains("test-app.abcd1234.enclava.dev, app.example.com"));
+    assert!(caddyfile.contains("test-app.abcd1234.enclava.dev:10443, app.example.com:10443"));
 }

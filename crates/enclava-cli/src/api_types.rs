@@ -158,7 +158,12 @@ pub struct LogLine {
 #[derive(Debug, Deserialize)]
 pub struct ConfigTokenResponse {
     pub token: String,
-    pub expires_at: String,
+    #[serde(default)]
+    pub tee_url: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub expires_in_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -232,9 +237,27 @@ pub struct TransitionReceiptAttestation {
     pub attestation_evidence_sha256: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct ConfigKeysResponse {
     pub keys: Vec<ConfigKeyMeta>,
+}
+
+impl<'de> Deserialize<'de> for ConfigKeysResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Wrapped { keys: Vec<ConfigKeyMeta> },
+            Bare(Vec<ConfigKeyMeta>),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::Wrapped { keys } | Wire::Bare(keys) => Ok(Self { keys }),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -414,4 +437,57 @@ pub struct UnlockEndpointResponse {
 pub struct ApiErrorBody {
     pub error: String,
     pub detail: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigKeysResponse, ConfigTokenResponse};
+
+    #[test]
+    fn config_token_accepts_live_api_shape() {
+        let parsed: ConfigTokenResponse = serde_json::from_value(serde_json::json!({
+            "token": "jwt",
+            "tee_url": "https://app.example/.well-known/confidential/config",
+            "expires_in_seconds": 300,
+        }))
+        .expect("live config-token response should decode");
+
+        assert_eq!(parsed.token, "jwt");
+        assert_eq!(
+            parsed.tee_url.as_deref(),
+            Some("https://app.example/.well-known/confidential/config")
+        );
+        assert_eq!(parsed.expires_in_seconds, Some(300));
+        assert_eq!(parsed.expires_at, None);
+    }
+
+    #[test]
+    fn config_keys_accepts_live_api_array_shape() {
+        let parsed: ConfigKeysResponse = serde_json::from_value(serde_json::json!([
+            {
+                "key": "DATABASE_URL",
+                "updated_at": "2026-05-09T17:00:00Z"
+            }
+        ]))
+        .expect("live config key list response should decode");
+
+        assert_eq!(parsed.keys.len(), 1);
+        assert_eq!(parsed.keys[0].key, "DATABASE_URL");
+    }
+
+    #[test]
+    fn config_keys_accepts_wrapped_shape() {
+        let parsed: ConfigKeysResponse = serde_json::from_value(serde_json::json!({
+            "keys": [
+                {
+                    "key": "DATABASE_URL",
+                    "updated_at": "2026-05-09T17:00:00Z"
+                }
+            ]
+        }))
+        .expect("wrapped config key list response should decode");
+
+        assert_eq!(parsed.keys.len(), 1);
+        assert_eq!(parsed.keys[0].key, "DATABASE_URL");
+    }
 }

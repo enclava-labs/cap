@@ -49,6 +49,7 @@ fn volumes_have_shared_decrypted_mountpoints() {
     let vols = build_volumes(&sample_app());
     assert!(vols.iter().any(|v| v.name == "state-mount"));
     assert!(vols.iter().any(|v| v.name == "tls-state-mount"));
+    assert!(vols.iter().all(|v| v.name != "caddy-runtime"));
 }
 
 #[test]

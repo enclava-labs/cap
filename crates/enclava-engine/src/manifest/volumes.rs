@@ -78,7 +78,7 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             name: "unlock-socket".to_string(),
             empty_dir: Some(EmptyDirVolumeSource {
                 medium: Some("Memory".to_string()),
-                size_limit: Some(Quantity("1Mi".to_string())),
+                size_limit: Some(Quantity("16Mi".to_string())),
             }),
             ..Default::default()
         });

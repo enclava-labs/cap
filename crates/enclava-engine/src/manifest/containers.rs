@@ -47,11 +47,9 @@ pub fn enclava_init_image() -> String {
 pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
 pub const APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
 pub const CADDY_SEED_PATH: &str = "/run/enclava/seeds/caddy/seed";
-pub const CADDY_ACME_TLS_PORT: i32 = 443;
+pub const CADDY_ACME_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
-pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/tmp/caddy";
-pub const CADDY_TLS_STATE_MOUNT_PATH: &str = "/state/tls-state";
-pub const CADDY_TLS_STATE_PATH: &str = "/state/tls-state/tenant-ingress";
+pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 
 fn ownership_mode_str(mode: UnlockMode) -> &'static str {
     match mode {
@@ -279,7 +277,11 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
                 ..Default::default()
             }),
             period_seconds: Some(10),
-            failure_threshold: Some(60),
+            // Password-mode workloads start under enclava-wait-exec and may
+            // spend several minutes waiting for unlock/config before the app
+            // can bind its port. Keep the startup budget long enough to avoid
+            // killing the workload before it has been allowed to start.
+            failure_threshold: Some(180),
             ..Default::default()
         }),
         readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
@@ -312,6 +314,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
 /// The sidecar needs device-mapper and mount namespace rights. App and caddy
 /// remain unprivileged and only consume the decrypted mountpoints.
 pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
+    let wait_containers = format!("{},tenant-ingress", app.primary_container().unwrap().name);
     Container {
         name: "enclava-init".to_string(),
         image: Some(enclava_init_image()),
@@ -321,11 +324,8 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             env("ENCLAVA_INIT_STAY_ALIVE", "true"),
             env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
             env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
-            env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "65532"),
-            env(
-                "ENCLAVA_INIT_WAIT_FOR_CONTAINERS",
-                &format!("{},tenant-ingress", app.primary_container().unwrap().name),
-            ),
+            env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "10001"),
+            env("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", &wait_containers),
         ]),
         volume_mounts: Some(vec![
             VolumeMount {
@@ -388,7 +388,7 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             }),
             limits: Some({
                 let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity("128Mi".to_string()));
+                m.insert("memory".to_string(), Quantity("512Mi".to_string()));
                 m.insert("cpu".to_string(), Quantity("250m".to_string()));
                 m
             }),
@@ -414,11 +414,25 @@ fn enclava_init_ready_probe() -> Probe {
 }
 
 fn proxy_volume_mounts(legacy: bool) -> Vec<VolumeMount> {
-    let mut v = vec![VolumeMount {
-        name: "ownership-signal".to_string(),
-        mount_path: "/run/ownership-signal".to_string(),
-        ..Default::default()
-    }];
+    let mut v = vec![
+        VolumeMount {
+            name: "ownership-signal".to_string(),
+            mount_path: "/run/ownership-signal".to_string(),
+            ..Default::default()
+        },
+        VolumeMount {
+            name: "state-mount".to_string(),
+            mount_path: "/data".to_string(),
+            mount_propagation: Some("HostToContainer".to_string()),
+            ..Default::default()
+        },
+        VolumeMount {
+            name: "state-mount".to_string(),
+            mount_path: "/state".to_string(),
+            mount_propagation: Some("HostToContainer".to_string()),
+            ..Default::default()
+        },
+    ];
     if !legacy {
         v.push(VolumeMount {
             name: "unlock-socket".to_string(),
@@ -448,8 +462,8 @@ fn proxy_security_context(legacy: bool) -> SecurityContext {
             allow_privilege_escalation: Some(false),
             read_only_root_filesystem: Some(true),
             run_as_non_root: Some(true),
-            run_as_user: Some(65532),
-            run_as_group: Some(65532),
+            run_as_user: Some(10001),
+            run_as_group: Some(10001),
             capabilities: Some(Capabilities {
                 add: None,
                 drop: Some(vec!["ALL".to_string()]),
@@ -477,6 +491,8 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("ATTESTATION_TLS_BIND", "0.0.0.0"),
         env("ATTESTATION_TLS_PORT", "8443"),
         env("TEE_DOMAIN", &app.domain.tee_domain),
+        env("CAP_API_SIGNING_PUBKEY", &app.api_signing_pubkey),
+        env("CAP_CONFIG_DIR", "/state/.enclava/config"),
         env("STORAGE_OWNERSHIP_MODE", mode),
         env("INSTANCE_ID", &app.owner_instance_id()),
         env("OWNER_CIPHERTEXT_BACKEND", "kbs-resource"),
@@ -554,15 +570,15 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
 
 /// Build the caddy tenant-ingress sidecar container.
 ///
-/// Phase 5 default: unprivileged, NET_BIND_SERVICE only for port 443. Reads
-/// its seed from `/run/enclava/seeds/caddy/seed` and TLS material from
-/// `/state/tls-state/tenant-ingress`. The Cloudflare
+/// Phase 5 default: unprivileged and listens on a high HTTPS port. Reads
+/// its seed from `/run/enclava/seeds/caddy/seed` and persists Caddy runtime
+/// state through an init-managed handoff directory under `/run/enclava`. The Cloudflare
 /// DNS-01 path is gone — Phase 0 cut over to TLS-ALPN-01 — so caddy carries
 /// no `CF_API_TOKEN` env and no `tls-cloudflare-token` secret mount.
 pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
     let legacy = legacy_bootstrap_enabled();
     let tls_port = match app.attestation.caddy_tls_mode {
-        CaddyTlsMode::Acme => CADDY_ACME_TLS_PORT,
+        CaddyTlsMode::Acme | CaddyTlsMode::Dns01Broker => CADDY_ACME_TLS_PORT,
         CaddyTlsMode::Internal => CADDY_INTERNAL_TLS_PORT,
     };
 
@@ -610,13 +626,13 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             env_field_ref("POD_NAME", "metadata.name"),
             env_field_ref("POD_NAMESPACE", "metadata.namespace"),
             env("CADDY_SEED_PATH", CADDY_SEED_PATH),
-            env("VOLUME_MOUNT_POINT", CADDY_TLS_STATE_PATH),
-            env("XDG_DATA_HOME", &format!("{CADDY_TLS_STATE_PATH}/caddy")),
+            env("VOLUME_MOUNT_POINT", CADDY_INTERNAL_RUNTIME_PATH),
+            env("XDG_DATA_HOME", CADDY_INTERNAL_RUNTIME_PATH),
             env(
                 "XDG_CONFIG_HOME",
-                &format!("{CADDY_TLS_STATE_PATH}/caddy/config"),
+                &format!("{CADDY_INTERNAL_RUNTIME_PATH}/config"),
             ),
-            env("HOME", CADDY_TLS_STATE_PATH),
+            env("HOME", CADDY_INTERNAL_RUNTIME_PATH),
             env("ENCLAVA_CONTAINER_NAME", "tenant-ingress"),
             env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"),
             env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
@@ -640,7 +656,7 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         (
             Some(vec![ENCLAVA_WAIT_EXEC_PATH.to_string()]),
             Some(vec![
-                "caddy".to_string(),
+                "/usr/bin/caddy".to_string(),
                 "run".to_string(),
                 "--config".to_string(),
                 "/etc/caddy/Caddyfile".to_string(),
@@ -675,12 +691,6 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             mount_path: "/run/enclava".to_string(),
             ..Default::default()
         });
-        volume_mounts.push(VolumeMount {
-            name: "tls-state-mount".to_string(),
-            mount_path: CADDY_TLS_STATE_MOUNT_PATH.to_string(),
-            mount_propagation: Some("HostToContainer".to_string()),
-            ..Default::default()
-        });
     }
 
     let security_context = if legacy {
@@ -709,7 +719,7 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             read_only_root_filesystem: Some(false),
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".to_string()]),
-                add: Some(vec!["NET_BIND_SERVICE".to_string()]),
+                add: None,
             }),
             ..Default::default()
         }

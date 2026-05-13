@@ -2,6 +2,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand};
 use dialoguer::{Input, Password};
 use ed25519_dalek::{Signer, SigningKey};
+use std::time::{Duration, Instant};
 
 use enclava_cli::api_client::ApiClient;
 use enclava_cli::api_types::UpdateUnlockModeRequest;
@@ -179,8 +180,43 @@ pub async fn unlock(args: UnlockArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     println!("Unlocking {app_name}...");
     tee.unlock(&password).await?;
+    wait_for_unlock_completion(&tee).await?;
     println!("Storage unlocked. App is starting.");
     Ok(())
+}
+
+async fn wait_for_unlock_completion(tee: &TeeClient) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let status = tee.status_json().await?;
+        let state = status
+            .get("state")
+            .or_else(|| status.get("unlock_state"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        match state {
+            "unlocked" => return Ok(()),
+            "error" => {
+                let detail = status
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unlock failed");
+                return Err(detail.to_string().into());
+            }
+            "locked" => {
+                let detail = status
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unlock did not complete");
+                return Err(detail.to_string().into());
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for unlock completion".into());
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>> {

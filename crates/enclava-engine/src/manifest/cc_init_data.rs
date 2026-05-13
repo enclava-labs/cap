@@ -1,7 +1,6 @@
 //! cc_init_data generation: TOML + gzip + base64.
 //!
 //! Ports the Python implementation at platform_api/manifests/init_data.py.
-//! The output must be byte-for-byte compatible for cc_init_data annotations.
 //! The SHA256 hash is computed on the uncompressed TOML string.
 
 use sha2::{Digest, Sha256};
@@ -49,7 +48,8 @@ impl CcInitDataOptions {
 
 /// Build the cc_init_data TOML string for a ConfidentialApp.
 ///
-/// The TOML structure matches the Python template in init_data.py exactly.
+/// The TOML structure follows the Python template in init_data.py, with all
+/// interpolated scalar values emitted through a TOML-safe string encoder.
 /// It contains:
 /// - policy.rego: agent policy with image digest and namespace
 /// - aa.toml: attestation agent config pointing to KBS
@@ -96,28 +96,78 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         &app.tenant_instance_identity_hash,
     );
 
-    // This format matches init_data.py _TOML_TEMPLATE exactly.
-    // Whitespace and quoting must be identical for hash compatibility.
+    // Keep this layout stable: descriptor signatures commit to the resulting
+    // cc_init_data hash.
     let mut toml = String::new();
     toml.push_str("version = \"0.1.0\"\nalgorithm = \"sha256\"\n");
     toml.push('\n');
     toml.push_str("[data]\n");
-    toml.push_str(&format!("image_digest = \"{}\"\n", image_digest));
-    toml.push_str(&format!("runtime_class = \"{}\"\n", DEFAULT_RUNTIME_CLASS));
-    toml.push_str(&format!("namespace = \"{}\"\n", app.namespace));
-    toml.push_str(&format!("service_account = \"{}\"\n", app.service_account));
-    toml.push_str(&format!(
-        "identity_hash = \"{}\"\n",
-        app.tenant_instance_identity_hash
-    ));
-    toml.push_str(&format!(
-        "signer_identity_subject = \"{}\"\n",
-        signer_identity_subject
-    ));
-    toml.push_str(&format!(
-        "signer_identity_issuer = \"{}\"\n",
-        signer_identity_issuer
-    ));
+    push_toml_string(&mut toml, "image_digest", &image_digest);
+    push_toml_string(&mut toml, "runtime_class", DEFAULT_RUNTIME_CLASS);
+    push_toml_string(&mut toml, "namespace", &app.namespace);
+    push_toml_string(&mut toml, "service_account", &app.service_account);
+    push_toml_string(
+        &mut toml,
+        "argon2_salt_hex",
+        &crate::manifest::enclava_init_config::argon2_salt_hex(app),
+    );
+    push_toml_string(
+        &mut toml,
+        "kbs_url",
+        crate::manifest::enclava_init_config::LOCAL_KATA_CDH_RESOURCE_URL,
+    );
+    push_toml_string(&mut toml, "kbs_resource_path", &app.owner_resource_path());
+    push_toml_string(
+        &mut toml,
+        "kbs_attestation_token_url",
+        crate::manifest::enclava_init_config::LOCAL_KBS_ATTESTATION_TOKEN_URL,
+    );
+    if app.attestation.trustee_policy_read_available {
+        if let Some(url) = app
+            .attestation
+            .local_workload_artifacts_json
+            .as_ref()
+            .map(|_| "file:///etc/enclava-init/workload-artifacts.json")
+            .or(app.attestation.workload_artifacts_url.as_deref())
+        {
+            push_toml_string(&mut toml, "workload_artifacts_url", url);
+        }
+        if let Some(url) = app.attestation.tls_certificate_broker_url.as_deref() {
+            push_toml_string(&mut toml, "tls_certificate_broker_url", url);
+            push_toml_string(
+                &mut toml,
+                "tls_certificate_hostnames",
+                &serde_json::to_string(&tls_certificate_hostnames(app))
+                    .expect("hostname list serialization is infallible"),
+            );
+        }
+        if let Some(url) = app
+            .attestation
+            .local_trustee_policy_json
+            .as_ref()
+            .map(|_| "file:///etc/enclava-init/trustee-policy.json")
+            .or(app.attestation.trustee_policy_url.as_deref())
+        {
+            push_toml_string(&mut toml, "trustee_policy_url", url);
+        }
+        if let Some(pubkey) = &app.attestation.platform_trustee_policy_pubkey_hex {
+            push_toml_string(&mut toml, "platform_trustee_policy_pubkey_hex", pubkey);
+        }
+        if let Some(pubkey) = &app.attestation.signing_service_pubkey_hex {
+            push_toml_string(&mut toml, "signing_service_pubkey_hex", pubkey);
+        }
+    }
+    push_toml_string(
+        &mut toml,
+        "identity_hash",
+        &app.tenant_instance_identity_hash,
+    );
+    push_toml_string(
+        &mut toml,
+        "signer_identity_subject",
+        signer_identity_subject,
+    );
+    push_toml_string(&mut toml, "signer_identity_issuer", signer_identity_issuer);
     if let Some(binding) = &app.workload_artifact_binding {
         toml.push_str(&format!(
             "descriptor_core_hash = \"{}\"\n",
@@ -165,9 +215,9 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     toml.push_str("\"aa.toml\" = '''\n");
     toml.push_str("[token_configs]\n");
     toml.push_str("[token_configs.kbs]\n");
-    toml.push_str(&format!("url = \"{}\"\n", toml_basic_string(&kbs_url)));
+    push_toml_string(&mut toml, "url", &kbs_url);
     if let Some(cert) = &kbs_ca_cert_pem {
-        append_multiline_basic_string(&mut toml, "cert", cert);
+        push_toml_string(&mut toml, "cert", cert.trim());
     }
     toml.push_str("'''\n");
     toml.push('\n');
@@ -176,9 +226,9 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     toml.push_str("\"cdh.toml\" = '''\n");
     toml.push_str("[kbc]\n");
     toml.push_str("name = \"cc_kbc\"\n");
-    toml.push_str(&format!("url = \"{}\"\n", toml_basic_string(&kbs_url)));
+    push_toml_string(&mut toml, "url", &kbs_url);
     if let Some(cert) = &kbs_ca_cert_pem {
-        append_multiline_basic_string(&mut toml, "kbs_cert", cert);
+        push_toml_string(&mut toml, "kbs_cert", cert.trim());
     }
     toml.push_str("'''\n");
 
@@ -192,11 +242,12 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     // chain `expected_cc_init_data_hash` to the exact runtime identity. Kata's
     // initdata parser expects every [data] value to be a string, so keep the
     // structured claim as a JSON string instead of a nested TOML table.
-    toml.push_str(&format!(
-        "sidecar_digests = '{{\"attestation_proxy\":\"{}\",\"caddy_ingress\":\"{}\"}}'\n",
-        app.attestation.proxy_image.digest(),
-        app.attestation.caddy_image.digest()
-    ));
+    let sidecar_digests = serde_json::json!({
+        "attestation_proxy": app.attestation.proxy_image.digest(),
+        "caddy_ingress": app.attestation.caddy_image.digest(),
+    })
+    .to_string();
+    push_toml_string(&mut toml, "sidecar_digests", &sidecar_digests);
 
     toml
 }
@@ -222,17 +273,26 @@ fn nonempty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn toml_basic_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+fn push_toml_string(toml: &mut String, key: &str, value: &str) {
+    toml.push_str(key);
+    toml.push_str(" = ");
+    toml.push_str(&toml_string(value));
+    toml.push('\n');
 }
 
-fn append_multiline_basic_string(toml: &mut String, key: &str, value: &str) {
-    let value = value.trim();
-    assert!(
-        !value.contains("\"\"\""),
-        "cc_init_data {key} must not contain TOML multiline string delimiter"
-    );
-    toml.push_str(&format!("{key} = \"\"\"\n{value}\n\"\"\"\n"));
+fn tls_certificate_hostnames(app: &ConfidentialApp) -> Vec<String> {
+    let mut hosts = vec![app.domain.platform_domain.clone()];
+    if let Some(custom) = app.domain.custom_domain.as_ref()
+        && !custom.is_empty()
+        && !hosts.iter().any(|host| host == custom)
+    {
+        hosts.push(custom.clone());
+    }
+    hosts
+}
+
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).expect("string serialization is infallible")
 }
 
 fn build_agent_policy(
@@ -326,13 +386,17 @@ fn build_identity_toml(
     bootstrap_owner_pubkey_hash: &str,
     identity_hash: &str,
 ) -> String {
-    format!(
-        "tenant_id = \"{tenant_id}\"\n\
-         instance_id = \"{instance_id}\"\n\
-         owner_resource_type = \"{owner_resource_type}\"\n\
-         bootstrap_owner_pubkey_hash = \"{bootstrap_owner_pubkey_hash}\"\n\
-         tenant_instance_identity_hash = \"{identity_hash}\"\n"
-    )
+    let mut out = String::new();
+    push_toml_string(&mut out, "tenant_id", tenant_id);
+    push_toml_string(&mut out, "instance_id", instance_id);
+    push_toml_string(&mut out, "owner_resource_type", owner_resource_type);
+    push_toml_string(
+        &mut out,
+        "bootstrap_owner_pubkey_hash",
+        bootstrap_owner_pubkey_hash,
+    );
+    push_toml_string(&mut out, "tenant_instance_identity_hash", identity_hash);
+    out
 }
 
 /// Compute SHA256 hex digest of the TOML string.

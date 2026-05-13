@@ -160,6 +160,36 @@ async fn find_record(
     Ok(body.result.into_iter().next())
 }
 
+async fn find_record_by_type(
+    client: &reqwest::Client,
+    config: &DnsConfig,
+    zone_id: &str,
+    record_type: &str,
+    hostname: &str,
+) -> Result<Option<CloudflareRecord>, DnsError> {
+    let response = client
+        .get(format!(
+            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type={record_type}&name={hostname}&per_page=100"
+        ))
+        .bearer_auth(&config.cloudflare_api_token)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(DnsError::Cloudflare(format!(
+            "record lookup for '{hostname}' returned HTTP {}",
+            response.status()
+        )));
+    }
+
+    let body: CloudflareList<CloudflareRecord> = response.json().await?;
+    if !body.success {
+        return Err(DnsError::Cloudflare(cloudflare_error(&body.errors)));
+    }
+
+    Ok(body.result.into_iter().next())
+}
+
 async fn create_record(
     client: &reqwest::Client,
     config: &DnsConfig,
@@ -176,6 +206,43 @@ async fn create_record(
             "name": hostname,
             "content": config.target,
             "ttl": 300,
+            "proxied": false,
+        }))
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body: CloudflareSingle<CloudflareRecord> = response.json().await?;
+    if !status.is_success() || !body.success {
+        return Err(DnsError::Cloudflare(format!(
+            "create record for '{hostname}' failed: {}",
+            cloudflare_error(&body.errors)
+        )));
+    }
+
+    body.result
+        .ok_or_else(|| DnsError::Cloudflare("create record response had no result".to_string()))
+}
+
+async fn create_record_by_type(
+    client: &reqwest::Client,
+    config: &DnsConfig,
+    zone_id: &str,
+    record_type: &str,
+    hostname: &str,
+    content: &str,
+    ttl: u32,
+) -> Result<CloudflareRecord, DnsError> {
+    let response = client
+        .post(format!(
+            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
+        ))
+        .bearer_auth(&config.cloudflare_api_token)
+        .json(&serde_json::json!({
+            "type": record_type,
+            "name": hostname,
+            "content": content,
+            "ttl": ttl,
             "proxied": false,
         }))
         .send()
@@ -227,6 +294,104 @@ async fn update_record(
 
     body.result
         .ok_or_else(|| DnsError::Cloudflare("update record response had no result".to_string()))
+}
+
+async fn update_record_by_type(
+    client: &reqwest::Client,
+    config: &DnsConfig,
+    zone_id: &str,
+    record_id: &str,
+    record_type: &str,
+    hostname: &str,
+    content: &str,
+    ttl: u32,
+) -> Result<CloudflareRecord, DnsError> {
+    let response = client
+        .put(format!(
+            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
+        ))
+        .bearer_auth(&config.cloudflare_api_token)
+        .json(&serde_json::json!({
+            "type": record_type,
+            "name": hostname,
+            "content": content,
+            "ttl": ttl,
+            "proxied": false,
+        }))
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body: CloudflareSingle<CloudflareRecord> = response.json().await?;
+    if !status.is_success() || !body.success {
+        return Err(DnsError::Cloudflare(format!(
+            "update record for '{hostname}' failed: {}",
+            cloudflare_error(&body.errors)
+        )));
+    }
+
+    body.result
+        .ok_or_else(|| DnsError::Cloudflare("update record response had no result".to_string()))
+}
+
+pub async fn ensure_txt_record(
+    client: &reqwest::Client,
+    config: &DnsConfig,
+    hostname: &str,
+    content: &str,
+) -> Result<(), DnsError> {
+    if !config.manages_hostname(hostname) {
+        return Err(DnsError::OutsideManagedZone(hostname.to_string()));
+    }
+    let zone_id = resolve_zone_id(client, config).await?;
+    let existing = find_record_by_type(client, config, &zone_id, "TXT", hostname).await?;
+    match existing {
+        Some(record) => {
+            update_record_by_type(
+                client, config, &zone_id, &record.id, "TXT", hostname, content, 60,
+            )
+            .await?;
+        }
+        None => {
+            create_record_by_type(client, config, &zone_id, "TXT", hostname, content, 60).await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn delete_txt_record(
+    client: &reqwest::Client,
+    config: &DnsConfig,
+    hostname: &str,
+    _content: &str,
+) -> Result<(), DnsError> {
+    if !config.manages_hostname(hostname) {
+        return Err(DnsError::OutsideManagedZone(hostname.to_string()));
+    }
+    let zone_id = resolve_zone_id(client, config).await?;
+    let Some(record) = find_record_by_type(client, config, &zone_id, "TXT", hostname).await? else {
+        return Ok(());
+    };
+    let response = client
+        .delete(format!(
+            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{}",
+            record.id
+        ))
+        .bearer_auth(&config.cloudflare_api_token)
+        .send()
+        .await?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    let status = response.status();
+    let body: CloudflareSingle<serde_json::Value> = response.json().await?;
+    if !status.is_success() || !body.success {
+        return Err(DnsError::Cloudflare(format!(
+            "delete record for '{hostname}' failed: {}",
+            cloudflare_error(&body.errors)
+        )));
+    }
+    Ok(())
 }
 
 pub async fn ensure_dns_record(

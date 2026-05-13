@@ -143,6 +143,8 @@ fn app_container_uses_tcp_readiness_without_liveness() {
         k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
     );
     assert!(startup.http_get.is_none());
+    assert_eq!(startup.period_seconds, Some(10));
+    assert_eq!(startup.failure_threshold, Some(180));
 
     let readiness = c.readiness_probe.as_ref().unwrap();
     assert_eq!(
@@ -206,6 +208,14 @@ fn proxy_container_name_and_port() {
     );
     assert_eq!(
         env.iter()
+            .find(|e| e.name == "CAP_API_SIGNING_PUBKEY")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("test-pubkey-placeholder")
+    );
+    assert_eq!(
+        env.iter()
             .find(|e| e.name == "KBS_RESOURCE_URL")
             .unwrap()
             .value
@@ -226,7 +236,8 @@ fn proxy_container_is_non_root() {
     let c = build_attestation_proxy_container(&sample_app());
     let sc = c.security_context.as_ref().unwrap();
     assert_eq!(sc.run_as_non_root, Some(true));
-    assert_eq!(sc.run_as_user, Some(65532));
+    assert_eq!(sc.run_as_user, Some(10001));
+    assert_eq!(sc.run_as_group, Some(10001));
     assert_eq!(sc.read_only_root_filesystem, Some(true));
 }
 
@@ -247,6 +258,41 @@ fn proxy_container_mounts_unlock_socket() {
     );
 }
 
+#[test]
+fn proxy_container_mounts_state_filesystem_for_config_storage() {
+    let c = build_attestation_proxy_container(&sample_app());
+    let vm = c.volume_mounts.as_ref().unwrap();
+    let legacy_m = vm
+        .iter()
+        .find(|m| m.name == "state-mount" && m.mount_path == "/data")
+        .unwrap();
+    assert_eq!(
+        legacy_m.mount_propagation.as_deref(),
+        Some("HostToContainer")
+    );
+    assert!(legacy_m.sub_path.is_none());
+
+    let app_visible_m = vm
+        .iter()
+        .find(|m| m.name == "state-mount" && m.mount_path == "/state")
+        .unwrap();
+    assert_eq!(
+        app_visible_m.mount_propagation.as_deref(),
+        Some("HostToContainer")
+    );
+    assert!(app_visible_m.sub_path.is_none());
+
+    let env = c.env.as_ref().unwrap();
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "CAP_CONFIG_DIR")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/state/.enclava/config")
+    );
+}
+
 // === Caddy ===
 
 #[test]
@@ -254,7 +300,7 @@ fn caddy_container_name_and_port() {
     let c = build_caddy_container(&sample_app());
     assert_eq!(c.name, "tenant-ingress");
     let ports = c.ports.as_ref().unwrap();
-    assert!(ports.iter().any(|p| p.container_port == 443));
+    assert!(ports.iter().any(|p| p.container_port == 10443));
 }
 
 #[test]
@@ -273,7 +319,7 @@ fn caddy_container_internal_tls_uses_high_port() {
 }
 
 #[test]
-fn caddy_container_is_unprivileged_with_only_net_bind() {
+fn caddy_container_is_unprivileged_without_bind_capabilities() {
     let c = build_caddy_container(&sample_app());
     let sc = c.security_context.as_ref().unwrap();
     assert_eq!(sc.privileged, Some(false));
@@ -284,22 +330,20 @@ fn caddy_container_is_unprivileged_with_only_net_bind() {
     assert_eq!(sc.read_only_root_filesystem, Some(false));
     let caps = sc.capabilities.as_ref().unwrap();
     assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
-    assert_eq!(
-        caps.add.as_deref(),
-        Some(&["NET_BIND_SERVICE".to_string()][..])
-    );
+    assert!(caps.add.as_deref().unwrap_or_default().is_empty());
 }
 
 #[test]
-fn caddy_container_command_is_argv_not_shell() {
+fn caddy_container_waits_for_init_ready_before_starting_caddy() {
     let c = build_caddy_container(&sample_app());
-    let cmd = c.command.as_ref().unwrap();
-    assert_eq!(cmd, &vec![ENCLAVA_WAIT_EXEC_PATH.to_string()]);
-    let args = c.args.as_ref().unwrap();
     assert_eq!(
-        args,
+        c.command.as_ref().unwrap(),
+        &vec!["/usr/local/bin/enclava-wait-exec".to_string()]
+    );
+    assert_eq!(
+        c.args.as_ref().unwrap(),
         &vec![
-            "caddy".to_string(),
+            "/usr/bin/caddy".to_string(),
             "run".to_string(),
             "--config".to_string(),
             "/etc/caddy/Caddyfile".to_string(),
@@ -308,12 +352,8 @@ fn caddy_container_command_is_argv_not_shell() {
 }
 
 #[test]
-fn caddy_container_uses_in_image_static_wait_exec_helper() {
+fn caddy_container_does_not_mount_extra_tools() {
     let c = build_caddy_container(&sample_app());
-    assert_eq!(
-        c.command.as_ref().unwrap(),
-        &vec!["/usr/local/bin/enclava-wait-exec".to_string()]
-    );
     let vm = c.volume_mounts.as_ref().unwrap();
     assert!(vm.iter().all(|m| m.name != "enclava-tools"));
 }
@@ -339,14 +379,16 @@ fn caddy_container_does_not_mount_cloudflare_token() {
 }
 
 #[test]
-fn caddy_container_mounts_tls_state_filesystem() {
+fn caddy_container_mounts_runtime_handoff_for_persistence() {
     let c = build_caddy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
     assert!(vm.iter().all(|m| m.name != "state-mount"));
-    let tls = vm.iter().find(|m| m.name == "tls-state-mount").unwrap();
-    assert_eq!(tls.mount_path, "/state/tls-state");
-    assert_eq!(tls.mount_propagation.as_deref(), Some("HostToContainer"));
-    assert!(vm.iter().all(|m| m.sub_path.is_none()));
+    assert!(vm.iter().all(|m| m.name != "tls-state-mount"));
+    assert!(vm.iter().all(|m| m.name != "caddy-runtime"));
+    let shared_mount = vm.iter().find(|m| m.name == "unlock-socket").unwrap();
+    assert_eq!(shared_mount.mount_path, "/run/enclava");
+    assert!(shared_mount.mount_propagation.is_none());
+    assert!(shared_mount.sub_path.is_none());
     assert!(c.volume_devices.is_none());
 }
 
@@ -371,7 +413,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/tls-state/tenant-ingress/caddy")
+        Some("/run/enclava/caddy-runtime")
     );
     assert_eq!(
         env.iter()
@@ -379,7 +421,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/tls-state/tenant-ingress/caddy/config")
+        Some("/run/enclava/caddy-runtime/config")
     );
     assert_eq!(
         env.iter()
@@ -387,7 +429,7 @@ fn caddy_container_uses_writable_caddy_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/tls-state/tenant-ingress")
+        Some("/run/enclava/caddy-runtime")
     );
 }
 
@@ -403,7 +445,7 @@ fn caddy_container_internal_tls_uses_tmp_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/tmp/caddy")
+        Some("/run/enclava/caddy-runtime")
     );
     assert_eq!(
         env.iter()
@@ -411,7 +453,7 @@ fn caddy_container_internal_tls_uses_tmp_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/tmp/caddy/config")
+        Some("/run/enclava/caddy-runtime/config")
     );
     assert_eq!(
         env.iter()
@@ -419,7 +461,7 @@ fn caddy_container_internal_tls_uses_tmp_runtime_dirs() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/tmp/caddy")
+        Some("/run/enclava/caddy-runtime")
     );
 }
 
@@ -472,7 +514,7 @@ fn enclava_init_container_waits_for_workloads_and_marks_ready_file() {
             .unwrap()
             .value
             .as_deref(),
-        Some("65532")
+        Some("10001")
     );
     assert!(c.startup_probe.is_none());
     let probe = c.readiness_probe.as_ref().unwrap();
@@ -487,6 +529,35 @@ fn enclava_init_container_waits_for_workloads_and_marks_ready_file() {
 }
 
 #[test]
+fn enclava_init_container_waits_for_tenant_ingress_sentinel() {
+    let mut app = sample_app();
+    app.containers[0].storage_paths.clear();
+
+    let c = build_enclava_init_container(&app);
+    let env = c.env.as_ref().unwrap();
+
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ENCLAVA_INIT_WAIT_FOR_CONTAINERS")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("web,tenant-ingress")
+    );
+}
+
+#[test]
+fn enclava_init_container_has_memory_for_unlock_verification_and_certificate_provisioning() {
+    let c = build_enclava_init_container(&sample_app());
+    let resources = c.resources.as_ref().unwrap();
+    let requests = resources.requests.as_ref().unwrap();
+    let limits = resources.limits.as_ref().unwrap();
+
+    assert_eq!(requests.get("memory").unwrap().0, "64Mi");
+    assert_eq!(limits.get("memory").unwrap().0, "512Mi");
+}
+
+#[test]
 fn enclava_init_container_mounts_both_luks_devices_and_unlock_socket() {
     let c = build_enclava_init_container(&sample_app());
     let vd = c.volume_devices.as_ref().unwrap();
@@ -495,6 +566,7 @@ fn enclava_init_container_mounts_both_luks_devices_and_unlock_socket() {
     let vm = c.volume_mounts.as_ref().unwrap();
     assert!(vm.iter().any(|m| m.name == "unlock-socket"));
     assert!(vm.iter().any(|m| m.name == "enclava-init-config"));
+    assert!(vm.iter().all(|m| m.name != "caddy-runtime"));
     let state_mount = vm.iter().find(|m| m.name == "state-mount").unwrap();
     let tls_mount = vm.iter().find(|m| m.name == "tls-state-mount").unwrap();
     assert_eq!(

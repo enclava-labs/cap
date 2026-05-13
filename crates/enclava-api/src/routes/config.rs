@@ -24,6 +24,10 @@ pub struct ConfigTokenResponse {
     pub expires_in_seconds: u64,
 }
 
+fn config_token_instance_id(app: &App) -> String {
+    format!("{}-{}", app.namespace, app.name)
+}
+
 /// POST /apps/{name}/config-token -- issue a short-lived JWT for config writes.
 pub async fn issue_config_token_route(
     auth: AuthContext,
@@ -54,7 +58,7 @@ pub async fn issue_config_token_route(
         auth.user_id,
         auth.org_id,
         app.id,
-        &app.instance_id,
+        &config_token_instance_id(&app),
         vec!["config:write".to_string()],
     )
     .map_err(|e| {
@@ -222,4 +226,38 @@ pub async fn delete_config_meta(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::config_token_instance_id;
+    use crate::models::{App, AppStatus, UnlockMode};
+    use uuid::Uuid;
+
+    #[test]
+    fn config_token_instance_id_matches_attestation_proxy_owner_instance_id() {
+        let app = App {
+            id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            name: "demo".to_string(),
+            namespace: "cap-a826eb13-demo".to_string(),
+            instance_id: "demo".to_string(),
+            tenant_id: "a826eb13".to_string(),
+            service_account: "cap-demo-sa".to_string(),
+            bootstrap_owner_pubkey_hash: "00".repeat(32),
+            tenant_instance_identity_hash: "11".repeat(32),
+            unlock_mode: UnlockMode::Password,
+            domain: "demo.a826eb13.enclava.dev".to_string(),
+            tee_domain: Some("demo.a826eb13.tee.enclava.dev".to_string()),
+            custom_domain: None,
+            status: AppStatus::Running,
+            signer_identity_subject: None,
+            signer_identity_issuer: None,
+            signer_identity_set_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(config_token_instance_id(&app), "cap-a826eb13-demo-demo");
+    }
 }

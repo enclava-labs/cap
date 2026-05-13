@@ -135,8 +135,8 @@ def validate_payload(payload: dict[str, str]) -> None:
             raise ValueError(f"{field} must be a ghcr.io/enclava-ai digest-pinned ref")
     if not payload["trustee_kbs_url"].startswith(("http://", "https://")):
         raise ValueError("trustee_kbs_url must be http or https")
-    if payload["tenant_caddy_tls_mode"] not in ("acme", "internal"):
-        raise ValueError("tenant_caddy_tls_mode must be acme or internal")
+    if payload["tenant_caddy_tls_mode"] not in ("acme", "dns01-broker", "internal"):
+        raise ValueError("tenant_caddy_tls_mode must be acme, dns01-broker, or internal")
     if not payload["tenant_caddy_acme_ca"].startswith(("http://", "https://")):
         raise ValueError("tenant_caddy_acme_ca must be http or https")
     hex32_bytes("signing_service_pubkey_hex", payload["signing_service_pubkey_hex"])

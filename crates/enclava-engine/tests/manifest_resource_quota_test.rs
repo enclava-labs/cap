@@ -27,7 +27,7 @@ fn resource_quota_has_memory_limits() {
     let rq = generate_resource_quota(&app);
     let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
     assert_eq!(hard.get("requests.memory").unwrap().0, "4928Mi");
-    assert_eq!(hard.get("limits.memory").unwrap().0, "5760Mi");
+    assert_eq!(hard.get("limits.memory").unwrap().0, "6Gi");
 }
 
 #[test]

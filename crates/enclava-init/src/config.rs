@@ -80,6 +80,12 @@ pub struct Config {
     pub workload_artifacts_url: Option<String>,
 
     #[serde(default)]
+    pub tls_certificate_broker_url: Option<String>,
+
+    #[serde(default)]
+    pub tls_certificate_hostnames: Vec<String>,
+
+    #[serde(default)]
     pub trustee_policy_url: Option<String>,
 
     #[serde(default = "default_kbs_attestation_token_url")]
@@ -174,7 +180,44 @@ hkdf-info = "tls-state-luks-key"
             c.kbs_attestation_token_url,
             "http://127.0.0.1:8006/aa/token?token_type=kbs"
         );
+        assert!(c.tls_certificate_broker_url.is_none());
+        assert!(c.tls_certificate_hostnames.is_empty());
         assert!(c.app_bind_mounts.is_empty());
+    }
+
+    #[test]
+    fn parses_tls_certificate_broker_config() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            r#"
+mode = "autounlock"
+kbs-url = "http://kbs"
+kbs-resource-path = "default/x/wrap-owner"
+tls-certificate-broker-url = "http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
+tls-certificate-hostnames = ["app.example.test"]
+
+[state]
+device = "/dev/csi0"
+mapping-name = "cap-state"
+mount-path = "/state/app-data"
+hkdf-info = "state-luks-key"
+
+[tls-state]
+device = "/dev/csi1"
+mapping-name = "cap-tls-state"
+mount-path = "/state/tls-state"
+hkdf-info = "tls-state-luks-key"
+"#,
+        )
+        .unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(
+            c.tls_certificate_broker_url.as_deref(),
+            Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate")
+        );
+        assert_eq!(c.tls_certificate_hostnames, vec!["app.example.test"]);
     }
 
     #[test]

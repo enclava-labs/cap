@@ -4,7 +4,7 @@ use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -62,6 +62,30 @@ fn parse_config_vars(vars: &[String]) -> Result<Vec<(String, String)>, Box<dyn s
             Ok((key.to_string(), value.to_string()))
         })
         .collect()
+}
+
+fn parse_config_inputs(
+    vars: &[String],
+    file_vars: &[String],
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    let mut pairs = parse_config_vars(vars)?;
+    for entry in file_vars {
+        let (key, path) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("invalid config file format '{entry}': expected KEY=PATH"))?;
+        let value = std::fs::read_to_string(path)
+            .map_err(|err| format!("failed to read config file for {key} at {path}: {err}"))?;
+        pairs.push((key.to_string(), value.trim_end_matches(['\r', '\n']).to_string()));
+    }
+    Ok(pairs)
+}
+
+fn deploy_should_unlock_before_config(
+    is_password_mode: bool,
+    needs_initial_claim: bool,
+    has_config_pairs: bool,
+) -> bool {
+    is_password_mode && !needs_initial_claim && has_config_pairs
 }
 
 fn parse_hex32(name: &str, value: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
@@ -197,7 +221,7 @@ fn confidential_app_for_cc_hash(
             tee_domain: app.tee_domain.clone().unwrap_or_else(|| app.domain.clone()),
             custom_domain: app.custom_domain.clone(),
         },
-        api_signing_pubkey: String::new(),
+        api_signing_pubkey: std::env::var("ENCLAVA_API_SIGNING_PUBKEY").unwrap_or_default(),
         api_url: String::new(),
         resources: ResourceLimits {
             cpu: app_config.resources.cpu.clone(),
@@ -213,9 +237,10 @@ fn confidential_app_for_cc_hash(
                 .map_err(|err| format!("platform release tenant_caddy_tls_mode: {err}"))?,
             trustee_policy_read_available: true,
             workload_artifacts_url: None,
+            tls_certificate_broker_url: tls_certificate_broker_url_for_cc_hash(&release),
             trustee_policy_url: None,
-            local_workload_artifacts_json: None,
-            local_trustee_policy_json: None,
+            local_workload_artifacts_json: Some("{}".to_string()),
+            local_trustee_policy_json: Some("{}".to_string()),
             platform_trustee_policy_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
             signing_service_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
         },
@@ -223,6 +248,20 @@ fn confidential_app_for_cc_hash(
         workload_artifact_binding: Some(workload_artifact_binding),
         generated_agent_policy: Some(generated_agent_policy),
     })
+}
+
+fn tls_certificate_broker_url_for_cc_hash(release: &PlatformRelease) -> Option<String> {
+    let mode = release
+        .tenant_caddy_tls_mode
+        .parse::<enclava_engine::types::CaddyTlsMode>()
+        .ok()?;
+    if mode != enclava_engine::types::CaddyTlsMode::Dns01Broker {
+        return None;
+    }
+    std::env::var("TLS_CERTIFICATE_BROKER_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 async fn fetch_generated_agent_policy(
@@ -466,6 +505,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             attestation_proxy_digest: proxy_image.digest().to_string(),
             caddy_digest: caddy_image.digest().to_string(),
         },
+        api_signing_pubkey: std::env::var("ENCLAVA_API_SIGNING_PUBKEY").unwrap_or_default(),
         expected_firmware_measurement: release.expected_firmware_measurement_bytes()?,
         expected_runtime_class: release.expected_runtime_class.clone(),
         kbs_resource_path: format!(
@@ -655,6 +695,9 @@ pub struct DeployArgs {
     /// Set config key=value pairs delivered to TEE after boot
     #[arg(long = "set", value_name = "KEY=VALUE")]
     pub config_vars: Vec<String>,
+    /// Set config key from a local file without exposing the value in process arguments.
+    #[arg(long = "set-file", value_name = "KEY=PATH")]
+    pub config_file_vars: Vec<String>,
 }
 
 pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -666,7 +709,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     };
     let app_name = app_config.app.name.clone();
 
-    let config_pairs = parse_config_vars(&args.config_vars)?;
+    let config_pairs = parse_config_inputs(&args.config_vars, &args.config_file_vars)?;
     let (api, paths, cli_config) = build_api_client()?;
     let creds = config::load_credentials(&paths)?;
     let app = api.get_app(&app_name).await?;
@@ -741,6 +784,9 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         }
     } else {
         wait_for_deploy_runtime(&api, &app_name, max_wait, poll_interval, &pb).await?;
+        if deploy_should_unlock_before_config(is_password_mode, false, !config_pairs.is_empty()) {
+            ensure_password_storage_unlocked_for_config(&api, &app_name, &pb).await?;
+        }
     }
 
     // Phase 4: Push config if --set was used
@@ -750,10 +796,15 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
 
         // Get config token from API
         let token_resp = api.get_config_token(&app_name).await?;
-        let tee = TeeClient::new(&resp.app_domain);
+        let tee = token_resp
+            .tee_url
+            .as_deref()
+            .map(TeeClient::from_config_url)
+            .unwrap_or_else(|| TeeClient::new(&resp.app_domain));
 
         for (key, value) in &config_pairs {
             tee.config_set(key, value, &token_resp.token).await?;
+            api.sync_config_key(&app_name, key, false).await?;
         }
     }
 
@@ -871,6 +922,81 @@ async fn wait_for_deploy_runtime(
         }
 
         tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn ensure_password_storage_unlocked_for_config(
+    api: &ApiClient,
+    app_name: &str,
+    pb: &ProgressBar,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = api.get_unlock_endpoint(app_name).await?;
+    let tee = TeeClient::new(&endpoint.tee_url);
+    let status = tee.status_json().await?;
+    let state = tee_unlock_state(&status);
+
+    match state {
+        "unlocked" => Ok(()),
+        "locked" => {
+            pb.set_message("Unlocking storage before config delivery...");
+            let password = dialoguer::Password::new()
+                .with_prompt("Unlock password")
+                .interact()?;
+            tee.unlock(&password).await?;
+            wait_for_deploy_unlock_completion(&tee).await?;
+            Ok(())
+        }
+        "unclaimed" => {
+            Err("storage ownership is unclaimed; claim ownership before setting config".into())
+        }
+        "error" => {
+            let detail = status
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("storage unlock failed");
+            Err(detail.to_string().into())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn tee_unlock_state(status: &serde_json::Value) -> &str {
+    status
+        .get("state")
+        .or_else(|| status.get("unlock_state"))
+        .or_else(|| status.get("ownership_state"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+}
+
+async fn wait_for_deploy_unlock_completion(
+    tee: &TeeClient,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let status = tee.status_json().await?;
+        match tee_unlock_state(&status) {
+            "unlocked" => return Ok(()),
+            "error" => {
+                let detail = status
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unlock failed");
+                return Err(detail.to_string().into());
+            }
+            "locked" => {
+                let detail = status
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unlock did not complete");
+                return Err(detail.to_string().into());
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for unlock completion".into());
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
@@ -1214,4 +1340,223 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     spinner.finish_with_message(format!("App '{app_name}' destroyed."));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enclava_cli::app_config::{AppSection, ResourcesSection, StorageSection, UnlockSection};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_release() -> PlatformRelease {
+        PlatformRelease {
+            schema_version: "v1".to_string(),
+            platform_release_version: "test".to_string(),
+            signing_service_url: "https://signing.example.test".to_string(),
+            signing_service_pubkey_hex: "11".repeat(32),
+            policy_template_id: "trustee-resource-policy-v1".to_string(),
+            policy_template_sha256: "22".repeat(32),
+            policy_template_text: "package policy\n".to_string(),
+            attestation_proxy_image:
+                "ghcr.io/enclava-ai/attestation-proxy@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            caddy_ingress_image:
+                "ghcr.io/enclava-ai/caddy-ingress@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            trustee_kbs_url: "https://kbs.example.test:8080".to_string(),
+            trustee_kbs_ca_cert_pem: String::new(),
+            tenant_caddy_tls_mode: "internal".to_string(),
+            tenant_caddy_acme_ca: "https://acme-staging-v02.api.letsencrypt.org/directory"
+                .to_string(),
+            expected_firmware_measurement: "00".repeat(32),
+            expected_runtime_class: "kata-qemu-snp".to_string(),
+            genpolicy_version: "test-genpolicy".to_string(),
+            created_at: "2026-05-09T00:00:00Z".to_string(),
+        }
+    }
+
+    fn test_app_response() -> AppResponse {
+        AppResponse {
+            id: "22222222-2222-2222-2222-222222222222".to_string(),
+            name: "demo".to_string(),
+            namespace: "cap-org-demo".to_string(),
+            instance_id: "org-22222222".to_string(),
+            service_account: Some("cap-demo-sa".to_string()),
+            bootstrap_owner_pubkey_hash: Some("33".repeat(32)),
+            tenant_instance_identity_hash: Some("44".repeat(32)),
+            domain: "demo.org.enclava.dev".to_string(),
+            tee_domain: Some("demo.org.tee.enclava.dev".to_string()),
+            custom_domain: None,
+            status: "created".to_string(),
+            unlock_mode: "password".to_string(),
+            signer_identity_subject: Some(
+                "https://github.com/acme/demo/.github/workflows/image.yml@refs/heads/main"
+                    .to_string(),
+            ),
+            signer_identity_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
+            created_at: "2026-05-09T00:00:00Z".to_string(),
+        }
+    }
+
+    fn test_app_config() -> AppConfig {
+        AppConfig {
+            app: AppSection {
+                name: "demo".to_string(),
+                port: 3338,
+                command: vec!["/bin/demo".to_string()],
+            },
+            storage: StorageSection {
+                paths: vec!["/data".to_string()],
+                size: "1Gi".to_string(),
+                tls_size: "1Gi".to_string(),
+            },
+            unlock: UnlockSection {
+                mode: "password".to_string(),
+            },
+            services: HashMap::new(),
+            resources: ResourcesSection {
+                cpu: "1".to_string(),
+                memory: "1Gi".to_string(),
+            },
+            health: None,
+        }
+    }
+
+    #[test]
+    fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
+        let app = confidential_app_for_cc_hash(
+            &test_app_response(),
+            &test_app_config(),
+            ConfidentialAppForCcHash {
+                image: enclava_common::image::ImageRef::parse(
+                    "ghcr.io/acme/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                )
+                .unwrap(),
+                release: &test_release(),
+                workload_artifact_binding: WorkloadArtifactBinding {
+                    descriptor_core_hash: [1; 32],
+                    descriptor_signing_pubkey: [2; 32],
+                    org_keyring_fingerprint: [3; 32],
+                },
+                generated_agent_policy: GeneratedAgentPolicy {
+                    policy_text: "package agent_policy\n".to_string(),
+                    policy_sha256: Sha256::digest(b"package agent_policy\n").into(),
+                    genpolicy_version_pin: "test-genpolicy".to_string(),
+                },
+                unlock_mode: "password",
+                tenant_id: "org".to_string(),
+                tenant_instance_identity_hash: [4; 32],
+                bootstrap_owner_pubkey_hash: "33".repeat(32),
+            },
+        )
+        .unwrap();
+
+        let cc_toml = cc_init_data::build_toml_with_options(
+            &app,
+            &cc_init_data::CcInitDataOptions {
+                kbs_url: "https://kbs.example.test:8080".to_string(),
+                kbs_ca_cert_pem: None,
+            },
+        );
+
+        assert!(cc_toml.contains(
+            "workload_artifacts_url = \"file:///etc/enclava-init/workload-artifacts.json\""
+        ));
+        assert!(
+            cc_toml
+                .contains("trustee_policy_url = \"file:///etc/enclava-init/trustee-policy.json\"")
+        );
+    }
+
+    #[test]
+    fn signed_cc_hash_app_includes_dns01_broker_url_when_release_uses_broker_mode() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: this test serializes access with ENV_LOCK because environment
+        // variables are process-global in Rust 2024.
+        unsafe {
+            std::env::set_var(
+                "TLS_CERTIFICATE_BROKER_URL",
+                "http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate",
+            );
+        }
+        let mut release = test_release();
+        release.tenant_caddy_tls_mode = "dns01-broker".to_string();
+
+        let app = confidential_app_for_cc_hash(
+            &test_app_response(),
+            &test_app_config(),
+            ConfidentialAppForCcHash {
+                image: enclava_common::image::ImageRef::parse(
+                    "ghcr.io/acme/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                )
+                .unwrap(),
+                release: &release,
+                workload_artifact_binding: WorkloadArtifactBinding {
+                    descriptor_core_hash: [1; 32],
+                    descriptor_signing_pubkey: [2; 32],
+                    org_keyring_fingerprint: [3; 32],
+                },
+                generated_agent_policy: GeneratedAgentPolicy {
+                    policy_text: "package agent_policy\n".to_string(),
+                    policy_sha256: Sha256::digest(b"package agent_policy\n").into(),
+                    genpolicy_version_pin: "test-genpolicy".to_string(),
+                },
+                unlock_mode: "password",
+                tenant_id: "org".to_string(),
+                tenant_instance_identity_hash: [4; 32],
+                bootstrap_owner_pubkey_hash: "33".repeat(32),
+            },
+        )
+        .unwrap();
+
+        let cc_toml = cc_init_data::build_toml_with_options(
+            &app,
+            &cc_init_data::CcInitDataOptions {
+                kbs_url: "https://kbs.example.test:8080".to_string(),
+                kbs_ca_cert_pem: None,
+            },
+        );
+
+        assert!(cc_toml.contains(
+            "tls_certificate_broker_url = \"http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate\""
+        ));
+        assert!(cc_toml.contains("tls_certificate_hostnames = \"[\\\"demo.org.enclava.dev\\\"]\""));
+        unsafe {
+            std::env::remove_var("TLS_CERTIFICATE_BROKER_URL");
+        }
+    }
+
+    #[test]
+    fn deploy_unlocks_existing_password_storage_before_config_push() {
+        assert!(deploy_should_unlock_before_config(true, false, true));
+        assert!(!deploy_should_unlock_before_config(true, true, true));
+        assert!(!deploy_should_unlock_before_config(true, false, false));
+        assert!(!deploy_should_unlock_before_config(false, false, true));
+    }
+
+    #[test]
+    fn parse_config_inputs_reads_values_from_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let secret_path = temp.path().join("spark-api-key");
+        std::fs::write(&secret_path, "secret-value\n").unwrap();
+
+        let pairs = parse_config_inputs(
+            &["MINT_BACKEND_BOLT11_SAT=SparkWallet".to_string()],
+            &[format!("MINT_SPARK_API_KEY={}", secret_path.display())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "MINT_BACKEND_BOLT11_SAT".to_string(),
+                    "SparkWallet".to_string()
+                ),
+                ("MINT_SPARK_API_KEY".to_string(), "secret-value".to_string()),
+            ]
+        );
+    }
 }

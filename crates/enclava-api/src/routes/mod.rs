@@ -9,3 +9,4 @@ pub mod status;
 pub mod unlock;
 pub mod users;
 pub mod workload;
+pub mod workload_tls;

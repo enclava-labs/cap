@@ -55,7 +55,7 @@ pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
             &app.resources.memory, // workload
             "256Mi",               // attestation-proxy
             "256Mi",               // tenant-ingress
-            "128Mi",               // enclava-init sidecar
+            "512Mi",               // enclava-init sidecar
             "4Gi",                 // kata-qemu-snp overhead
         ])),
     );

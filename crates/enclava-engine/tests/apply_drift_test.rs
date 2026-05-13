@@ -32,6 +32,23 @@ fn manifest_hash_is_consistent_for_drift() {
     assert_eq!(manifest_hash(&m1), manifest_hash(&m2));
 }
 
+#[test]
+fn manifest_hash_changes_when_enclava_init_configmap_changes() {
+    let app = sample_app();
+    let mut m1 = generate_all_manifests(&app);
+    let mut m2 = generate_all_manifests(&app);
+    m2.enclava_init_configmap
+        .data
+        .as_mut()
+        .unwrap()
+        .insert("config.toml".to_string(), "tampered = true\n".to_string());
+
+    assert_ne!(manifest_hash(&m1), manifest_hash(&m2));
+
+    m1.enclava_init_configmap = m2.enclava_init_configmap.clone();
+    assert_eq!(manifest_hash(&m1), manifest_hash(&m2));
+}
+
 /// Integration test: requires a running cluster.
 #[tokio::test]
 #[ignore]

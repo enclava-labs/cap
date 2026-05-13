@@ -157,6 +157,12 @@ impl TeeClient {
         }
     }
 
+    pub fn from_config_url(config_url: &str) -> Self {
+        let trimmed = config_url.trim_end_matches('/');
+        let base = trimmed.strip_suffix("/config").unwrap_or(trimmed);
+        Self::new(base)
+    }
+
     fn with_http(&self, http: reqwest::Client) -> Self {
         Self {
             confidential_base_url: self.confidential_base_url.clone(),
@@ -229,6 +235,12 @@ impl TeeClient {
 
     /// Get the TEE's ownership and unlock status.
     pub async fn status(&self) -> Result<TeeStatusResponse, TeeError> {
+        let resp = self.http.get(self.url("/status")).send().await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn status_json(&self) -> Result<serde_json::Value, TeeError> {
         let resp = self.http.get(self.url("/status")).send().await?;
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
@@ -1110,6 +1122,16 @@ mod tests {
         assert_eq!(
             tee.url("/bootstrap/challenge"),
             "https://app.enclava.dev/.well-known/confidential/bootstrap/challenge"
+        );
+    }
+
+    #[test]
+    fn accepts_api_returned_config_base() {
+        let tee =
+            TeeClient::from_config_url("https://app.enclava.dev/.well-known/confidential/config");
+        assert_eq!(
+            tee.url("/config/MY_KEY"),
+            "https://app.enclava.dev/.well-known/confidential/config/MY_KEY"
         );
     }
 

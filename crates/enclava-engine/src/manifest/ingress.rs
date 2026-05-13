@@ -18,9 +18,12 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
 use super::containers::{
-    CADDY_INTERNAL_RUNTIME_PATH, CADDY_INTERNAL_TLS_PORT, CADDY_TLS_STATE_PATH,
+    CADDY_ACME_TLS_PORT, CADDY_INTERNAL_RUNTIME_PATH, CADDY_INTERNAL_TLS_PORT,
 };
 use crate::types::{CaddyTlsMode, ConfidentialApp};
+
+const BROKER_CERT_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.crt";
+const BROKER_KEY_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.key";
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngressRenderError {
@@ -185,29 +188,26 @@ pub fn render_caddyfile(app: &ConfidentialApp) -> Result<String, IngressRenderEr
 fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     let mut out = String::new();
     out.push_str("{\n");
-    if spec.tls_mode == CaddyTlsMode::Internal {
-        out.push_str("  admin off\n");
-        out.push_str("  persist_config off\n");
-        out.push_str("  auto_https disable_redirects\n");
-    }
+    out.push_str("  admin off\n");
+    out.push_str("  persist_config off\n");
+    out.push_str("  auto_https disable_redirects\n");
     out.push_str("  email ");
     out.push_str(&spec.contact_email);
     out.push('\n');
     out.push_str("  storage file_system ");
     match spec.tls_mode {
         CaddyTlsMode::Acme => {
-            out.push_str(CADDY_TLS_STATE_PATH);
-            out.push_str("/caddy\n");
+            out.push_str(CADDY_INTERNAL_RUNTIME_PATH);
+            out.push('\n');
+        }
+        CaddyTlsMode::Dns01Broker => {
+            out.push_str(CADDY_INTERNAL_RUNTIME_PATH);
+            out.push('\n');
         }
         CaddyTlsMode::Internal => {
             out.push_str(CADDY_INTERNAL_RUNTIME_PATH);
             out.push('\n');
         }
-    }
-    if spec.tls_mode == CaddyTlsMode::Acme {
-        out.push_str("  acme_ca ");
-        out.push_str(&spec.acme_ca);
-        out.push('\n');
     }
     out.push_str("}\n");
     if spec.tls_mode == CaddyTlsMode::Internal {
@@ -219,7 +219,13 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
             .join(", ");
         out.push_str(&hosts);
     } else {
-        out.push_str(&spec.hosts.join(", "));
+        let hosts = spec
+            .hosts
+            .iter()
+            .map(|host| format!("{host}:{CADDY_ACME_TLS_PORT}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&hosts);
     }
     out.push_str(" {\n");
     match spec.tls_mode {
@@ -228,9 +234,19 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
             // Caddy default ACME issuers cover ALPN; no per-app credentials needed.
             out.push_str("  tls {\n");
             out.push_str("    issuer acme {\n");
+            out.push_str("      dir ");
+            out.push_str(&spec.acme_ca);
+            out.push('\n');
             out.push_str("      disable_http_challenge\n");
             out.push_str("    }\n");
             out.push_str("  }\n");
+        }
+        CaddyTlsMode::Dns01Broker => {
+            out.push_str("  tls ");
+            out.push_str(BROKER_CERT_PATH);
+            out.push(' ');
+            out.push_str(BROKER_KEY_PATH);
+            out.push('\n');
         }
         CaddyTlsMode::Internal => {
             out.push_str("  tls internal\n");

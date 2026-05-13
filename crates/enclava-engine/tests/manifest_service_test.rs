@@ -25,7 +25,7 @@ fn service_has_https_port() {
     assert_eq!(https.port, 443);
     assert_eq!(
         https.target_port.as_ref().unwrap(),
-        &k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(443)
+        &k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(10443)
     );
 }
 

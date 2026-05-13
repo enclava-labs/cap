@@ -539,6 +539,7 @@ pub async fn update_unlock_mode(
     let mut signed_container_port = None;
     let mut signed_storage_paths = None;
     if let Some(artifacts) = signing_artifacts.as_ref() {
+        let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
         let image_digest_ref = image_digest.as_deref().ok_or((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -546,7 +547,7 @@ pub async fn update_unlock_mode(
             })),
         ))?;
         artifacts
-            .validate_deployment_inputs(&signed_app, image_digest_ref)
+            .validate_deployment_inputs(&signed_app, image_digest_ref, &api_signing_pubkey)
             .map_err(crate::routes::deployments::signing_error_response)?;
         let workload_command = artifacts.descriptor.oci_runtime_spec.args.clone();
         signed_workload_command = crate::deploy::serialize_workload_command(&workload_command)
@@ -567,7 +568,6 @@ pub async fn update_unlock_mode(
             })),
         ))?;
         let signing_service_pubkey_hex = attestation.signing_service_pubkey_hex.as_deref();
-        let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
         let mut app_spec = crate::deploy::build_confidential_app(
             &state.db,
             &signed_app,

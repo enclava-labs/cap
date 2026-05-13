@@ -11,7 +11,7 @@ use crate::types::{CaddyTlsMode, ConfidentialApp};
 /// Matches the live shape at components/templates/confidential-workload/service.yaml.
 pub fn generate_service(app: &ConfidentialApp) -> Service {
     let caddy_target_port = match app.attestation.caddy_tls_mode {
-        CaddyTlsMode::Acme => CADDY_ACME_TLS_PORT,
+        CaddyTlsMode::Acme | CaddyTlsMode::Dns01Broker => CADDY_ACME_TLS_PORT,
         CaddyTlsMode::Internal => CADDY_INTERNAL_TLS_PORT,
     };
 

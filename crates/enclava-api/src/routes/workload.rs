@@ -50,12 +50,14 @@ pub async fn artifacts(State(state): State<AppState>, headers: HeaderMap) -> imp
             .into_response();
     };
 
-    let verify_response = match state
-        .trustee_http_client
-        .post(verify_url)
-        .json(&json!({ "token": token }))
-        .send()
-        .await
+    let verify_response = match trustee_attestation_verify_request(
+        &state.trustee_http_client,
+        verify_url,
+        token,
+        state.trustee_attestation_verify_bearer_token.as_deref(),
+    )
+    .send()
+    .await
     {
         Ok(response) => response,
         Err(err) => {
@@ -176,7 +178,7 @@ pub async fn artifacts(State(state): State<AppState>, headers: HeaderMap) -> imp
         .into_response()
 }
 
-fn attestation_bearer(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn attestation_bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
     value
         .strip_prefix("Attestation ")
@@ -185,11 +187,26 @@ fn attestation_bearer(headers: &HeaderMap) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
-fn extract_descriptor_core_hash(value: &Value) -> Option<Vec<u8>> {
+pub(crate) fn trustee_attestation_verify_request(
+    client: &reqwest::Client,
+    verify_url: &str,
+    workload_token: &str,
+    caller_bearer_token: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client
+        .post(verify_url)
+        .json(&json!({ "token": workload_token }));
+    match caller_bearer_token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
+}
+
+pub(crate) fn extract_descriptor_core_hash(value: &Value) -> Option<Vec<u8>> {
     extract_hex_claim(value, "descriptor_core_hash")
 }
 
-fn extract_init_data_hash(value: &Value) -> Option<Vec<u8>> {
+pub(crate) fn extract_init_data_hash(value: &Value) -> Option<Vec<u8>> {
     extract_hex_claim(value, "init_data_hash")
 }
 
@@ -209,7 +226,7 @@ fn extract_hex_claim(value: &Value, key: &str) -> Option<Vec<u8>> {
     }
 }
 
-fn parse_hex32(value: &str) -> Option<Vec<u8>> {
+pub(crate) fn parse_hex32(value: &str) -> Option<Vec<u8>> {
     let trimmed = value.trim();
     if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -258,6 +275,34 @@ mod tests {
                 "init_data_hash": "not-hex"
             }))
             .is_none()
+        );
+    }
+
+    #[test]
+    fn trustee_verify_request_attaches_internal_bearer_without_replacing_workload_token() {
+        let request = trustee_attestation_verify_request(
+            &reqwest::Client::new(),
+            "https://kbs.example.test/kbs/v0/attestation/verify",
+            "workload-attestation-token",
+            Some("internal-cap-token"),
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer internal-cap-token")
+        );
+        let body = request
+            .body()
+            .and_then(|body| body.as_bytes())
+            .expect("request body should be buffered JSON");
+        assert_eq!(
+            serde_json::from_slice::<Value>(body).unwrap(),
+            json!({ "token": "workload-attestation-token" })
         );
     }
 }

@@ -333,6 +333,7 @@ mod tests {
                 caddy_digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
                     .to_string(),
             },
+            api_signing_pubkey: "test-api-signing-pubkey".to_string(),
             expected_firmware_measurement: [3; 32],
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-nutshell-first-customer-nutshell-owner".to_string(),
@@ -410,6 +411,7 @@ mod tests {
                 caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
                 trustee_policy_read_available: true,
                 workload_artifacts_url: None,
+            tls_certificate_broker_url: None,
                 trustee_policy_url: None,
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,
@@ -485,6 +487,7 @@ mod tests {
                 caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
                 trustee_policy_read_available: true,
                 workload_artifacts_url: None,
+            tls_certificate_broker_url: None,
                 trustee_policy_url: None,
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,

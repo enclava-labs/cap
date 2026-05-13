@@ -105,6 +105,10 @@ fn data_claims_include_required_rego_descriptor_anchors() {
         "namespace",
         "service_account",
         "identity_hash",
+        "argon2_salt_hex",
+        "kbs_url",
+        "kbs_resource_path",
+        "kbs_attestation_token_url",
         "runtime_class",
     ] {
         let value = data.get(key).and_then(toml::Value::as_str).unwrap();
@@ -132,6 +136,22 @@ fn data_claims_include_required_rego_descriptor_anchors() {
         data["identity_hash"].as_str().unwrap(),
         app.tenant_instance_identity_hash
     );
+    assert_eq!(
+        data["argon2_salt_hex"].as_str().unwrap(),
+        cm_argon2_salt_hex(&app)
+    );
+    assert_eq!(
+        data["kbs_resource_path"].as_str().unwrap(),
+        app.owner_resource_path()
+    );
+    assert_eq!(
+        data["kbs_url"].as_str().unwrap(),
+        "http://127.0.0.1:8006/cdh/resource"
+    );
+    assert_eq!(
+        data["kbs_attestation_token_url"].as_str().unwrap(),
+        "http://127.0.0.1:8006/aa/token?token_type=kbs"
+    );
     assert_eq!(data["runtime_class"].as_str().unwrap(), "kata-qemu-snp");
 
     let sidecars: serde_json::Value = serde_json::from_str(
@@ -147,6 +167,44 @@ fn data_claims_include_required_rego_descriptor_anchors() {
     assert_eq!(
         sidecars["caddy_ingress"].as_str().unwrap(),
         app.attestation.caddy_image.digest()
+    );
+}
+
+fn cm_argon2_salt_hex(app: &enclava_engine::types::ConfidentialApp) -> String {
+    let cm = enclava_engine::manifest::enclava_init_config::generate_enclava_init_configmap(app);
+    let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
+    toml::from_str::<toml::Value>(toml_text)
+        .unwrap()
+        .get("argon2-salt-hex")
+        .and_then(toml::Value::as_str)
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn toml_serializes_adversarial_claim_values_without_breakout() {
+    let mut app = sample_app();
+    app.signer_identity_subject = Some("subject\"with\nnewline\rbackslash\\'''\"\"\"".to_string());
+    app.signer_identity_issuer = Some("issuer] [data]\npolicy.rego = true".to_string());
+    app.namespace = "cap-test-org-test-app".to_string();
+    app.service_account = "cap-test-app-sa".to_string();
+
+    let toml = build_toml(&app);
+    let parsed: toml::Value = toml::from_str(&toml).expect("cc_init_data TOML must parse");
+    let data = parsed.get("data").and_then(toml::Value::as_table).unwrap();
+
+    assert_eq!(
+        data["signer_identity_subject"].as_str(),
+        app.signer_identity_subject.as_deref()
+    );
+    assert_eq!(
+        data["signer_identity_issuer"].as_str(),
+        app.signer_identity_issuer.as_deref()
+    );
+    assert!(
+        data.get("policy.rego")
+            .and_then(toml::Value::as_str)
+            .is_some()
     );
 }
 
@@ -302,9 +360,18 @@ fn toml_binds_runtime_class() {
 fn toml_binds_sidecar_digests() {
     let app = sample_app();
     let toml = build_toml(&app);
-    assert!(toml.contains(
-        "sidecar_digests = '{\"attestation_proxy\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"caddy_ingress\":\"sha256:2222"
-    ));
+    let parsed: toml::Value = toml::from_str(&toml).unwrap();
+    let data = parsed.get("data").and_then(toml::Value::as_table).unwrap();
+    let sidecars: serde_json::Value =
+        serde_json::from_str(data["sidecar_digests"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        sidecars["attestation_proxy"].as_str().unwrap(),
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    );
+    assert_eq!(
+        sidecars["caddy_ingress"].as_str().unwrap(),
+        "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    );
     assert!(!toml.contains("[data.sidecar_digests]"));
 }
 

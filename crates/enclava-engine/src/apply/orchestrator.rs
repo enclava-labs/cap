@@ -39,6 +39,7 @@ pub fn manifest_hash(manifests: &GeneratedManifests) -> String {
         serde_json::to_value(&manifests.bootstrap_configmap).unwrap_or_default(),
         serde_json::to_value(&manifests.startup_configmap).unwrap_or_default(),
         serde_json::to_value(&manifests.ingress_configmap).unwrap_or_default(),
+        serde_json::to_value(&manifests.enclava_init_configmap).unwrap_or_default(),
         serde_json::to_value(&manifests.statefulset).unwrap_or_default(),
         manifests.kbs_owner_binding.1.clone(),
     ];

@@ -281,6 +281,7 @@ impl DeploymentSigningArtifacts {
         &self,
         app: &App,
         image_digest: &str,
+        api_signing_pubkey: &str,
     ) -> Result<(), SigningServiceError> {
         self.validate_workload_runtime_spec()?;
         if self.descriptor.org_id != app.org_id {
@@ -318,6 +319,9 @@ impl DeploymentSigningArtifacts {
         }
         if self.descriptor.image_digest != image_digest {
             return Err(SigningServiceError::Mismatch("image_digest".into()));
+        }
+        if self.descriptor.api_signing_pubkey != api_signing_pubkey {
+            return Err(SigningServiceError::Mismatch("api_signing_pubkey".into()));
         }
         if self.descriptor.unlock_mode != app_unlock_mode(app.unlock_mode) {
             return Err(SigningServiceError::Mismatch("unlock_mode".into()));
@@ -1351,6 +1355,7 @@ mod tests {
                     "sha256:2222222222222222222222222222222222222222222222222222222222222222"
                         .to_string(),
             },
+            api_signing_pubkey: "test-api-signing-pubkey".to_string(),
             expected_firmware_measurement: [3; 32],
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-abcd1234-demo-owner".to_string(),
@@ -1517,10 +1522,29 @@ mod tests {
         let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
 
         let err = artifacts
-            .validate_deployment_inputs(&app, &descriptor.image_digest)
+            .validate_deployment_inputs(
+                &app,
+                &descriptor.image_digest,
+                &descriptor.api_signing_pubkey,
+            )
             .unwrap_err();
 
         assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "unlock_mode"));
+    }
+
+    #[test]
+    fn rejects_descriptor_for_different_api_signing_key() {
+        let descriptor = descriptor();
+        let artifacts = signing_artifacts(descriptor.clone());
+        let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+        let err = artifacts
+            .validate_deployment_inputs(&app, &descriptor.image_digest, "other-api-signing-pubkey")
+            .unwrap_err();
+
+        assert!(
+            matches!(err, SigningServiceError::Mismatch(field) if field == "api_signing_pubkey")
+        );
     }
 
     #[test]
@@ -1531,7 +1555,11 @@ mod tests {
         let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
 
         let err = artifacts
-            .validate_deployment_inputs(&app, &descriptor.image_digest)
+            .validate_deployment_inputs(
+                &app,
+                &descriptor.image_digest,
+                &descriptor.api_signing_pubkey,
+            )
             .unwrap_err();
 
         assert!(
@@ -1780,6 +1808,7 @@ mod tests {
                 caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
                 trustee_policy_read_available: true,
                 workload_artifacts_url: Some("https://api.example.test/artifacts".to_string()),
+                tls_certificate_broker_url: None,
                 trustee_policy_url: Some("https://kbs.example.test/policy".to_string()),
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,

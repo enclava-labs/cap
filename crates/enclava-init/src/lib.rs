@@ -20,6 +20,7 @@ pub mod luks;
 pub mod secrets;
 pub mod seeds;
 pub mod socket;
+pub mod tls_certificate;
 pub mod trustee_verify;
 pub mod unlock;
 pub mod writes;

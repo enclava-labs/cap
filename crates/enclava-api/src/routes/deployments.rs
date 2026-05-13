@@ -66,6 +66,16 @@ pub(crate) fn customer_signed_deploy_required(
             .unwrap_or(false)
 }
 
+pub(crate) fn select_local_signed_artifact_delivery(
+    attestation: &mut enclava_engine::types::AttestationConfig,
+) {
+    // Signed descriptor hashes must commit to the same artifact delivery mode
+    // that apply uses. The actual JSON is persisted later; only the local file
+    // URLs are embedded in cc_init_data.
+    attestation.local_workload_artifacts_json = Some("{}".to_string());
+    attestation.local_trustee_policy_json = Some("{}".to_string());
+}
+
 pub(crate) async fn resolve_signed_policy_artifact(
     state: &AppState,
     artifacts: &crate::signing_service::DeploymentSigningArtifacts,
@@ -158,6 +168,7 @@ mod classifier_tests {
             caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
             trustee_policy_read_available: false,
             workload_artifacts_url: None,
+            tls_certificate_broker_url: None,
             trustee_policy_url: None,
             local_workload_artifacts_json: None,
             local_trustee_policy_json: None,
@@ -217,6 +228,19 @@ mod classifier_tests {
         cfg.platform_trustee_policy_pubkey_hex = None;
         cfg.trustee_policy_read_available = true;
         assert!(customer_signed_deploy_required(Some(&cfg), false));
+    }
+
+    #[test]
+    fn signed_deploy_hash_validation_uses_local_artifact_delivery_mode() {
+        let mut cfg = attestation_config();
+        cfg.trustee_policy_read_available = true;
+        cfg.workload_artifacts_url = Some("https://api.example.test/workload-artifacts".into());
+        cfg.trustee_policy_url = Some("https://kbs.example.test/resource-policy/body".into());
+
+        select_local_signed_artifact_delivery(&mut cfg);
+
+        assert_eq!(cfg.local_workload_artifacts_json.as_deref(), Some("{}"));
+        assert_eq!(cfg.local_trustee_policy_json.as_deref(), Some("{}"));
     }
 }
 
@@ -652,8 +676,9 @@ pub async fn deploy(
     let mut workload_artifact_binding = None;
     let mut signed_policy_artifact = None;
     if let Some(artifacts) = signing_artifacts.as_ref() {
+        let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
         artifacts
-            .validate_deployment_inputs(&app, &image_digest)
+            .validate_deployment_inputs(&app, &image_digest, &api_signing_pubkey)
             .map_err(signing_error_response)?;
         let attestation = state.attestation.as_ref().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -662,7 +687,6 @@ pub async fn deploy(
             })),
         ))?;
         let signing_service_pubkey_hex = attestation.signing_service_pubkey_hex.as_deref();
-        let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
         let mut app_spec = crate::deploy::build_confidential_app(
             &state.db,
             &app,
@@ -692,8 +716,30 @@ pub async fn deploy(
                 .generated_agent_policy(&signed)
                 .map_err(signing_error_response)?,
         );
+        select_local_signed_artifact_delivery(&mut app_spec.attestation);
         let (_encoded, cc_init_data_hash) =
             enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+        let expected_cc_init_data_hash =
+            hex::encode(artifacts.descriptor.expected_cc_init_data_hash);
+        if expected_cc_init_data_hash != cc_init_data_hash {
+            tracing::warn!(
+                expected_cc_init_data_hash = %expected_cc_init_data_hash,
+                actual_cc_init_data_hash = %cc_init_data_hash,
+                namespace = %app_spec.namespace,
+                service_account = %app_spec.service_account,
+                platform_domain = %app_spec.domain.platform_domain,
+                custom_domain = ?app_spec.domain.custom_domain,
+                attestation_proxy_image = ?app_spec.attestation.proxy_image,
+                caddy_image = ?app_spec.attestation.caddy_image,
+                caddy_tls_mode = ?app_spec.attestation.caddy_tls_mode,
+                tls_certificate_broker_url = ?app_spec.attestation.tls_certificate_broker_url,
+                local_workload_artifacts = app_spec.attestation.local_workload_artifacts_json.is_some(),
+                local_trustee_policy = app_spec.attestation.local_trustee_policy_json.is_some(),
+                generated_agent_policy_sha256 = %hex::encode(app_spec.generated_agent_policy.as_ref().map(|policy| policy.policy_sha256).unwrap_or([0; 32])),
+                descriptor_core_hash = %hex::encode(binding.descriptor_core_hash),
+                "signed deployment cc_init_data hash mismatch"
+            );
+        }
         artifacts
             .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
             .map_err(signing_error_response)?;

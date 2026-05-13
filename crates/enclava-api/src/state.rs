@@ -1,3 +1,4 @@
+use crate::acme::AcmeConfig;
 use crate::dns::DnsConfig;
 use crate::kbs::KbsPolicyConfig;
 use crate::signing_service::SigningServiceClient;
@@ -39,11 +40,17 @@ pub struct AppState {
     pub attestation: Option<AttestationConfig>,
     /// Cloudflare DNS settings for CAP-managed tenant host records.
     pub dns: Option<DnsConfig>,
+    /// ACME settings for the workload-attested DNS-01 certificate broker.
+    pub acme: Option<AcmeConfig>,
     /// Trustee KBS policy settings for CAP-managed owner-resource bindings.
     pub kbs_policy: Option<KbsPolicyConfig>,
     /// Trustee callback used to validate workload attestation tokens before
     /// returning descriptor/keyring/policy artifacts to a pod.
     pub trustee_attestation_verify_url: Option<String>,
+    /// Internal shared bearer token CAP presents to Trustee's attestation
+    /// verification endpoint. This authenticates CAP as the verifier caller;
+    /// the workload attestation token remains in the JSON request body.
+    pub trustee_attestation_verify_bearer_token: Option<String>,
     /// Off-cluster policy signing service. When signed descriptor/keyring
     /// blobs are supplied on deploy, CAP forwards them here and persists the
     /// returned signed policy artifact.

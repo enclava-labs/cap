@@ -115,6 +115,7 @@ pub struct EgressRule {
 pub enum CaddyTlsMode {
     #[default]
     Acme,
+    Dns01Broker,
     Internal,
 }
 
@@ -130,9 +131,10 @@ impl std::str::FromStr for CaddyTlsMode {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "acme" => Ok(Self::Acme),
+            "dns01-broker" | "dns-01-broker" | "broker" => Ok(Self::Dns01Broker),
             "internal" => Ok(Self::Internal),
             other => Err(format!(
-                "invalid tenant Caddy TLS mode {other:?}; expected acme or internal"
+                "invalid tenant Caddy TLS mode {other:?}; expected acme, dns01-broker, or internal"
             )),
         }
     }
@@ -158,6 +160,12 @@ pub struct AttestationConfig {
     /// CAP API workload-attested artifact endpoint reachable from the workload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_artifacts_url: Option<String>,
+    /// CAP API workload-attested DNS-01 certificate broker endpoint. In
+    /// broker mode, enclava-init generates the tenant TLS key inside the TEE,
+    /// submits a CSR over this endpoint, and writes the returned chain into
+    /// Caddy's shared runtime directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_certificate_broker_url: Option<String>,
     /// Trustee workload-attested active policy body endpoint for this platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trustee_policy_url: Option<String>,

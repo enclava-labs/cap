@@ -1,3 +1,4 @@
+pub mod acme;
 pub mod auth;
 pub mod billing;
 pub mod clients;
@@ -217,8 +218,16 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::get(routes::workload::artifacts),
         )
         .route(
+            "/api/v1/workload/tls/dns01-certificate",
+            axum::routing::post(routes::workload_tls::dns01_certificate),
+        )
+        .route(
             "/workload/artifacts",
             axum::routing::get(routes::workload::artifacts),
+        )
+        .route(
+            "/workload/tls/dns01-certificate",
+            axum::routing::post(routes::workload_tls::dns01_certificate),
         );
 
     let api_routes = Router::new()

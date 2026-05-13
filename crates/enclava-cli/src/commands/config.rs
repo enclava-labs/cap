@@ -70,18 +70,23 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let (api, _paths, _cli_config) = build_api_client()?;
-
-            // Get app info to resolve TEE URL
             let app = api.get_app(&app_name).await?;
-            let tee_domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
 
             // Get config token from API (authorization)
             let token_resp = api.get_config_token(&app_name).await?;
 
             // Write directly to TEE (value delivery)
-            let tee = TeeClient::new(tee_domain);
+            let tee = token_resp
+                .tee_url
+                .as_deref()
+                .map(TeeClient::from_config_url)
+                .unwrap_or_else(|| {
+                    let tee_domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
+                    TeeClient::new(tee_domain)
+                });
             for (key, value) in &pairs {
                 tee.config_set(key, value, &token_resp.token).await?;
+                api.sync_config_key(&app_name, key, false).await?;
                 println!("Set {key}");
             }
 
@@ -107,19 +112,23 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
         ConfigCommand::Unset { key, app } => {
             let app_name = resolve_app_name(&app)?;
             let (api, _paths, _cli_config) = build_api_client()?;
-
-            // Get app info
             let app_info = api.get_app(&app_name).await?;
-            let tee_domain = app_info
-                .custom_domain
-                .as_deref()
-                .unwrap_or(&app_info.domain);
 
             // Get config token from API
             let token_resp = api.get_config_token(&app_name).await?;
 
             // Delete from TEE
-            let tee = TeeClient::new(tee_domain);
+            let tee = token_resp
+                .tee_url
+                .as_deref()
+                .map(TeeClient::from_config_url)
+                .unwrap_or_else(|| {
+                    let tee_domain = app_info
+                        .custom_domain
+                        .as_deref()
+                        .unwrap_or(&app_info.domain);
+                    TeeClient::new(tee_domain)
+                });
             tee.config_unset(&key, &token_resp.token).await?;
 
             // Delete metadata from API

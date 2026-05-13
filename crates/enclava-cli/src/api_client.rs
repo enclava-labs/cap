@@ -302,6 +302,26 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn sync_config_key(
+        &self,
+        app_name: &str,
+        key: &str,
+        deleted: bool,
+    ) -> Result<(), ApiError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/apps/{app_name}/config/sync")))
+            .headers(self.auth_headers()?)
+            .json(&serde_json::json!({
+                "key_name": key,
+                "deleted": deleted,
+            }))
+            .send()
+            .await?;
+        self.check_response(resp).await?;
+        Ok(())
+    }
+
     pub async fn delete_config_meta(&self, app_name: &str, key: &str) -> Result<(), ApiError> {
         let resp = self
             .http

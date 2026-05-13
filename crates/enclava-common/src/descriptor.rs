@@ -107,6 +107,8 @@ pub struct DeploymentDescriptor {
     pub signer_identity: SignerIdentity,
     pub oci_runtime_spec: OciRuntimeSpec,
     pub sidecars: Sidecars,
+    #[serde(default)]
+    pub api_signing_pubkey: String,
 
     #[serde(with = "hex_bytes32")]
     pub expected_firmware_measurement: [u8; 32],
@@ -298,6 +300,7 @@ fn descriptor_records<'a>(
         ("signer_identity", &sub.signer_hash),
         ("oci_runtime_spec", &sub.oci_hash),
         ("sidecars", &sub.sidecar_hash),
+        ("api_signing_pubkey", d.api_signing_pubkey.as_bytes()),
         (
             "expected_firmware_measurement",
             &d.expected_firmware_measurement,

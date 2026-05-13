@@ -95,6 +95,10 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
         }));
     }
 
+    for rule in tls_certificate_broker_egress_rules(app) {
+        egress.push(rule);
+    }
+
     for rule in &app.egress_allowlist {
         egress.push(egress_rule_value(rule));
     }
@@ -144,4 +148,90 @@ fn egress_rule_value(rule: &EgressRule) -> Value {
         "toFQDNs": [{ "matchName": rule.host }],
         "toPorts": [{ "ports": ports }],
     })
+}
+
+fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
+    let Some(url) = app.attestation.tls_certificate_broker_url.as_deref() else {
+        return Vec::new();
+    };
+    let Some((scheme, rest)) = url.trim().split_once("://") else {
+        return Vec::new();
+    };
+    let Some(authority) = rest.split('/').next().map(str::trim) else {
+        return Vec::new();
+    };
+    if authority.is_empty() {
+        return Vec::new();
+    }
+    let host = authority
+        .strip_prefix('[')
+        .and_then(|value| value.split_once(']').map(|(host, _)| host))
+        .unwrap_or_else(|| authority.split(':').next().unwrap_or(authority))
+        .trim();
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        return Vec::new();
+    }
+    let port = explicit_url_port(authority).unwrap_or(match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => return Vec::new(),
+    });
+
+    if let Some((service_name, namespace)) = kubernetes_service_name(host) {
+        let mut rules = vec![json!({
+            "toServices": [
+                {
+                    "k8sService": {
+                        "namespace": namespace,
+                        "serviceName": service_name
+                    }
+                }
+            ],
+            "toPorts": [{ "ports": [{ "port": port.to_string(), "protocol": "TCP" }] }],
+        })];
+        if service_name == "cap-api" {
+            rules.push(json!({
+                "toEndpoints": [
+                    {
+                        "matchLabels": {
+                            "io.kubernetes.pod.namespace": namespace,
+                            "app.kubernetes.io/name": service_name
+                        }
+                    }
+                ],
+                "toPorts": [{ "ports": [{ "port": "3000", "protocol": "TCP" }] }],
+            }));
+        }
+        return rules;
+    }
+
+    vec![json!({
+        "toFQDNs": [{ "matchName": host }],
+        "toPorts": [{ "ports": [{ "port": port.to_string(), "protocol": "TCP" }] }],
+    })]
+}
+
+fn explicit_url_port(authority: &str) -> Option<u16> {
+    if authority.starts_with('[') {
+        return authority
+            .split_once("]:")
+            .and_then(|(_, port)| port.parse().ok());
+    }
+    let mut parts = authority.split(':');
+    let _host = parts.next()?;
+    let port = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    port.parse().ok()
+}
+
+fn kubernetes_service_name(host: &str) -> Option<(&str, &str)> {
+    let parts: Vec<&str> = host.split('.').collect();
+    match parts.as_slice() {
+        [service, namespace, "svc"] | [service, namespace, "svc", "cluster", "local"] => {
+            Some((*service, *namespace))
+        }
+        _ => None,
+    }
 }

@@ -100,6 +100,9 @@ fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
     app.attestation.trustee_policy_read_available = true;
     app.attestation.workload_artifacts_url =
         Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts".to_string());
+    app.attestation.tls_certificate_broker_url = Some(
+        "http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate".to_string(),
+    );
     app.attestation.trustee_policy_url =
         Some("http://kbs.trustee.svc/resource-policy/default/body".to_string());
     app.attestation.platform_trustee_policy_pubkey_hex = Some("11".repeat(32));
@@ -115,6 +118,10 @@ fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
     assert!(toml_text.contains(
         "workload-artifacts-url = \"http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts\""
     ));
+    assert!(toml_text.contains(
+        "tls-certificate-broker-url = \"http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate\""
+    ));
+    assert!(toml_text.contains("tls-certificate-hostnames = [\"test-app.abcd1234.enclava.dev\"]"));
     assert!(
         toml_text.contains(
             "trustee-policy-url = \"http://kbs.trustee.svc/resource-policy/default/body\""
@@ -146,6 +153,20 @@ fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
         root.get("workload-artifacts-url")
             .and_then(toml::Value::as_str),
         Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts")
+    );
+    assert_eq!(
+        root.get("tls-certificate-broker-url")
+            .and_then(toml::Value::as_str),
+        Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate")
+    );
+    assert_eq!(
+        root.get("tls-certificate-hostnames")
+            .and_then(toml::Value::as_array)
+            .map(|hosts| hosts
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>()),
+        Some(vec!["test-app.abcd1234.enclava.dev"])
     );
     assert_eq!(
         root.get("trustee-policy-url").and_then(toml::Value::as_str),

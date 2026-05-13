@@ -12,7 +12,9 @@ use crate::types::ConfidentialApp;
 use enclava_common::canonical::ce_v1_hash;
 use enclava_common::types::UnlockMode;
 
-const LOCAL_KATA_CDH_RESOURCE_URL: &str = "http://127.0.0.1:8006/cdh/resource";
+pub(crate) const LOCAL_KATA_CDH_RESOURCE_URL: &str = "http://127.0.0.1:8006/cdh/resource";
+pub(crate) const LOCAL_KBS_ATTESTATION_TOKEN_URL: &str =
+    "http://127.0.0.1:8006/aa/token?token_type=kbs";
 const LOCAL_WORKLOAD_ARTIFACTS_PATH: &str = "/etc/enclava-init/workload-artifacts.json";
 const LOCAL_TRUSTEE_POLICY_PATH: &str = "/etc/enclava-init/trustee-policy.json";
 const APP_UID: u32 = 10001;
@@ -94,6 +96,14 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
                 .as_deref()
                 .or(app.attestation.workload_artifacts_url.as_deref()),
         );
+        if let Some(url) = app.attestation.tls_certificate_broker_url.as_deref() {
+            push_optional_option(&mut out, "tls-certificate-broker-url", Some(url));
+            push_string_array(
+                &mut out,
+                "tls-certificate-hostnames",
+                &tls_certificate_hostnames(app),
+            );
+        }
         push_required_option(
             &mut out,
             "trustee-policy-url",
@@ -104,9 +114,9 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
                 .as_deref()
                 .or(app.attestation.trustee_policy_url.as_deref()),
         );
-        out.push_str(
-            "kbs-attestation-token-url = \"http://127.0.0.1:8006/aa/token?token_type=kbs\"\n",
-        );
+        out.push_str(&format!(
+            "kbs-attestation-token-url = \"{LOCAL_KBS_ATTESTATION_TOKEN_URL}\"\n",
+        ));
         push_optional_option(
             &mut out,
             "platform-trustee-policy-pubkey-hex",
@@ -156,7 +166,7 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     out
 }
 
-fn argon2_salt_hex(app: &ConfidentialApp) -> String {
+pub(crate) fn argon2_salt_hex(app: &ConfidentialApp) -> String {
     hex::encode(ce_v1_hash(&[
         ("purpose", b"enclava-init-argon2-salt-v1"),
         ("app_id", app.app_id.as_bytes().as_slice()),
@@ -176,6 +186,17 @@ fn toml_string(s: &str) -> String {
     serde_json::to_string(s).expect("string serialization is infallible")
 }
 
+fn tls_certificate_hostnames(app: &ConfidentialApp) -> Vec<String> {
+    let mut hosts = vec![app.domain.platform_domain.clone()];
+    if let Some(custom) = app.domain.custom_domain.as_ref()
+        && !custom.is_empty()
+        && !hosts.iter().any(|host| host == custom)
+    {
+        hosts.push(custom.clone());
+    }
+    hosts
+}
+
 fn push_required_option(out: &mut String, key: &str, value: Option<&str>) {
     let value = value.unwrap_or_else(|| panic!("missing required enclava-init config key {key}"));
     out.push_str(&format!("{key} = {}\n", toml_string(value)));
@@ -185,4 +206,13 @@ fn push_optional_option(out: &mut String, key: &str, value: Option<&str>) {
     if let Some(value) = value {
         out.push_str(&format!("{key} = {}\n", toml_string(value)));
     }
+}
+
+fn push_string_array(out: &mut String, key: &str, values: &[String]) {
+    let encoded = values
+        .iter()
+        .map(|value| toml_string(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!("{key} = [{encoded}]\n"));
 }

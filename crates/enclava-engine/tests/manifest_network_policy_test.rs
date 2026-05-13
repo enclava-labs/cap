@@ -151,6 +151,65 @@ fn default_egress_includes_acme_endpoints() {
 }
 
 #[test]
+fn dns01_broker_url_is_allowed_for_static_certificate_provisioning() {
+    let mut app = sample_app();
+    app.attestation.tls_certificate_broker_url = Some(
+        "https://cap-test01-enclava.enclava.dev/api/v1/workload/tls/dns01-certificate"
+            .to_string(),
+    );
+
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    let broker_rule = egress
+        .iter()
+        .find(|rule| {
+            rule["toFQDNs"][0]["matchName"].as_str()
+                == Some("cap-test01-enclava.enclava.dev")
+        })
+        .expect("broker FQDN egress rule");
+
+    assert_eq!(broker_rule["toPorts"][0]["ports"][0]["port"], "443");
+    assert_eq!(broker_rule["toPorts"][0]["ports"][0]["protocol"], "TCP");
+}
+
+#[test]
+fn dns01_broker_kubernetes_service_url_is_allowed_for_static_certificate_provisioning() {
+    let mut app = sample_app();
+    app.attestation.tls_certificate_broker_url = Some(
+        "http://cap-api.cap-test01.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
+            .to_string(),
+    );
+
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    let broker_rule = egress
+        .iter()
+        .find(|rule| {
+            rule["toServices"][0]["k8sService"]["namespace"].as_str() == Some("cap-test01")
+                && rule["toServices"][0]["k8sService"]["serviceName"].as_str() == Some("cap-api")
+        })
+        .expect("broker Kubernetes service egress rule");
+
+    assert_eq!(broker_rule["toPorts"][0]["ports"][0]["port"], "80");
+    assert_eq!(broker_rule["toPorts"][0]["ports"][0]["protocol"], "TCP");
+
+    let cap_api_endpoint_rule = egress
+        .iter()
+        .find(|rule| {
+            rule["toEndpoints"][0]["matchLabels"]["io.kubernetes.pod.namespace"].as_str()
+                == Some("cap-test01")
+                && rule["toEndpoints"][0]["matchLabels"]["app.kubernetes.io/name"].as_str()
+                    == Some("cap-api")
+        })
+        .expect("broker CAP API endpoint egress rule");
+    assert_eq!(cap_api_endpoint_rule["toPorts"][0]["ports"][0]["port"], "3000");
+    assert_eq!(
+        cap_api_endpoint_rule["toPorts"][0]["ports"][0]["protocol"],
+        "TCP"
+    );
+}
+
+#[test]
 fn empty_egress_allowlist_renders_zero_extra_rules() {
     let mut app = sample_app();
     app.egress_allowlist = Vec::new();
