@@ -4,6 +4,7 @@
 /tools
 # Agent scratch (never commit)
 .claude/
+.Codex/
 .remember/
 docs/superpowers/
 
@@ -20,3 +21,5 @@ private-age-key*
 *.swp
 .idea/
 .vscode/
+__pycache__/
+*.py[cod]
