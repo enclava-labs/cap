@@ -873,7 +873,7 @@ fn seed_caddy_runtime_handoff_at<F>(
 where
     F: FnOnce(&Path, chown::ExecIdentity) -> Result<()>,
 {
-    sync_dir_contents(&persistent, runtime)
+    sync_dir_contents(persistent, runtime)
         .with_context(|| format!("copying {} to {}", persistent.display(), runtime.display()))?;
     chown_runtime(runtime, caddy_identity).with_context(|| format!("chown {}", runtime.display()))
 }
