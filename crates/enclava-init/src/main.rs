@@ -3,14 +3,14 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
 use enclava_init::config::{Config, Mode, VolumeConfig};
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
     kbs_fetch, luks, seeds, socket, tls_certificate, trustee_verify, unlock, writes,
 };
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
 const DEFAULT_ERROR_FILE: &str = "/run/enclava/init-error";
@@ -63,7 +63,9 @@ fn main() -> ExitCode {
             tracing::error!(error = %e, "enclava-init failed");
             eprintln!("enclava-init: {e:#}");
             if stay_alive_enabled() {
-                tracing::error!("enclava-init failed; keeping sidecar alive so diagnostics remain readable");
+                tracing::error!(
+                    "enclava-init failed; keeping sidecar alive so diagnostics remain readable"
+                );
                 stay_alive_after_failure();
             }
             ExitCode::from(1)
@@ -873,8 +875,7 @@ where
 {
     sync_dir_contents(&persistent, runtime)
         .with_context(|| format!("copying {} to {}", persistent.display(), runtime.display()))?;
-    chown_runtime(runtime, caddy_identity)
-        .with_context(|| format!("chown {}", runtime.display()))
+    chown_runtime(runtime, caddy_identity).with_context(|| format!("chown {}", runtime.display()))
 }
 
 fn provision_static_tls_certificate(cfg: &Config) -> Result<()> {
@@ -1033,8 +1034,8 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         .map_err(|_| anyhow!("invalid pid {}", args[0]))?;
     let source = PathBuf::from(&args[1]);
     let target = PathBuf::from(&args[2]);
-    let source_dir =
-        std::fs::File::open(&source).with_context(|| format!("open source {}", source.display()))?;
+    let source_dir = std::fs::File::open(&source)
+        .with_context(|| format!("open source {}", source.display()))?;
     std::fs::metadata(&source).with_context(|| format!("stat source {}", source.display()))?;
     let ns = std::fs::File::open(format!("/proc/{pid}/ns/mnt"))
         .with_context(|| format!("opening mount namespace for pid {pid}"))?;
@@ -1348,7 +1349,10 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(std::fs::read(dst.join("certificates/tls.key")).unwrap(), b"key");
+        assert_eq!(
+            std::fs::read(dst.join("certificates/tls.key")).unwrap(),
+            b"key"
+        );
         assert_eq!(chowned, vec![(dst, caddy_identity)]);
     }
 

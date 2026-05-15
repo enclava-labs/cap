@@ -202,7 +202,9 @@ hkdf-info = "tls-state-luks-key"
 
         assert_eq!(
             local_cc_init_data_hash(&cfg).unwrap(),
-            Some(hex::encode(Sha256::digest(b"descriptor_core_hash = \"abc\"\n")))
+            Some(hex::encode(Sha256::digest(
+                b"descriptor_core_hash = \"abc\"\n"
+            )))
         );
     }
 }

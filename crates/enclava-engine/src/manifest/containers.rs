@@ -605,22 +605,6 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
             env("KBS_FETCH_MAX_SLEEP_SECONDS", "10"),
         ]
-    } else if app.attestation.caddy_tls_mode == CaddyTlsMode::Internal {
-        vec![
-            env_field_ref("POD_NAME", "metadata.name"),
-            env_field_ref("POD_NAMESPACE", "metadata.namespace"),
-            env("CADDY_SEED_PATH", CADDY_SEED_PATH),
-            env("VOLUME_MOUNT_POINT", CADDY_INTERNAL_RUNTIME_PATH),
-            env("XDG_DATA_HOME", CADDY_INTERNAL_RUNTIME_PATH),
-            env(
-                "XDG_CONFIG_HOME",
-                &format!("{CADDY_INTERNAL_RUNTIME_PATH}/config"),
-            ),
-            env("HOME", CADDY_INTERNAL_RUNTIME_PATH),
-            env("ENCLAVA_CONTAINER_NAME", "tenant-ingress"),
-            env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"),
-            env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
-        ]
     } else {
         vec![
             env_field_ref("POD_NAME", "metadata.name"),

@@ -154,8 +154,7 @@ fn default_egress_includes_acme_endpoints() {
 fn dns01_broker_url_is_allowed_for_static_certificate_provisioning() {
     let mut app = sample_app();
     app.attestation.tls_certificate_broker_url = Some(
-        "https://cap-test01-enclava.enclava.dev/api/v1/workload/tls/dns01-certificate"
-            .to_string(),
+        "https://cap-test01-enclava.enclava.dev/api/v1/workload/tls/dns01-certificate".to_string(),
     );
 
     let val = generate_network_policy(&app);
@@ -163,8 +162,7 @@ fn dns01_broker_url_is_allowed_for_static_certificate_provisioning() {
     let broker_rule = egress
         .iter()
         .find(|rule| {
-            rule["toFQDNs"][0]["matchName"].as_str()
-                == Some("cap-test01-enclava.enclava.dev")
+            rule["toFQDNs"][0]["matchName"].as_str() == Some("cap-test01-enclava.enclava.dev")
         })
         .expect("broker FQDN egress rule");
 
@@ -202,7 +200,10 @@ fn dns01_broker_kubernetes_service_url_is_allowed_for_static_certificate_provisi
                     == Some("cap-api")
         })
         .expect("broker CAP API endpoint egress rule");
-    assert_eq!(cap_api_endpoint_rule["toPorts"][0]["ports"][0]["port"], "3000");
+    assert_eq!(
+        cap_api_endpoint_rule["toPorts"][0]["ports"][0]["port"],
+        "3000"
+    );
     assert_eq!(
         cap_api_endpoint_rule["toPorts"][0]["ports"][0]["protocol"],
         "TCP"

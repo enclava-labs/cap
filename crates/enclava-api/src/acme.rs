@@ -55,35 +55,36 @@ pub async fn issue_dns01_certificate(
     let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
 
     let mut challenge_records = Vec::new();
-    let mut authorizations = order.authorizations();
-    while let Some(result) = authorizations.next().await {
-        let mut authz = result?;
-        match authz.status {
-            AuthorizationStatus::Pending => {}
-            AuthorizationStatus::Valid => continue,
-            other => return Err(AcmeError::AuthorizationStatus(other)),
+    {
+        let mut authorizations = order.authorizations();
+        while let Some(result) = authorizations.next().await {
+            let mut authz = result?;
+            match authz.status {
+                AuthorizationStatus::Pending => {}
+                AuthorizationStatus::Valid => continue,
+                other => return Err(AcmeError::AuthorizationStatus(other)),
+            }
+            let mut challenge = authz.challenge(ChallengeType::Dns01).ok_or_else(|| {
+                AcmeError::AccountLoad("ACME order has no DNS-01 challenge".into())
+            })?;
+            let hostname = challenge.identifier().to_string();
+            let record_name = format!("_acme-challenge.{hostname}");
+            let record_value = challenge.key_authorization().dns_value();
+            dns::ensure_txt_record(http_client, dns_config, &record_name, &record_value).await?;
+            challenge_records.push((record_name.clone(), record_value.clone()));
+            if let Err(err) = wait_for_txt_record(
+                &record_name,
+                &record_value,
+                acme_config.dns_propagation_wait,
+            )
+            .await
+            {
+                cleanup_challenges(http_client, dns_config, &challenge_records).await;
+                return Err(err);
+            }
+            challenge.set_ready().await?;
         }
-        let mut challenge = authz
-            .challenge(ChallengeType::Dns01)
-            .ok_or_else(|| AcmeError::AccountLoad("ACME order has no DNS-01 challenge".into()))?;
-        let hostname = challenge.identifier().to_string();
-        let record_name = format!("_acme-challenge.{hostname}");
-        let record_value = challenge.key_authorization().dns_value();
-        dns::ensure_txt_record(http_client, dns_config, &record_name, &record_value).await?;
-        challenge_records.push((record_name.clone(), record_value.clone()));
-        if let Err(err) = wait_for_txt_record(
-            &record_name,
-            &record_value,
-            acme_config.dns_propagation_wait,
-        )
-        .await
-        {
-            cleanup_challenges(http_client, dns_config, &challenge_records).await;
-            return Err(err);
-        }
-        challenge.set_ready().await?;
     }
-    drop(authorizations);
 
     let status = order.poll_ready(&RetryPolicy::default()).await?;
     if status != OrderStatus::Ready {

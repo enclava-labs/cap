@@ -77,6 +77,13 @@ struct CloudflareRecord {
     id: String,
 }
 
+struct RecordPayload<'a> {
+    record_type: &'a str,
+    hostname: &'a str,
+    content: &'a str,
+    ttl: u32,
+}
+
 fn cloudflare_error(errors: &[CloudflareApiError]) -> String {
     if errors.is_empty() {
         return "unknown error".to_string();
@@ -301,10 +308,7 @@ async fn update_record_by_type(
     config: &DnsConfig,
     zone_id: &str,
     record_id: &str,
-    record_type: &str,
-    hostname: &str,
-    content: &str,
-    ttl: u32,
+    payload: RecordPayload<'_>,
 ) -> Result<CloudflareRecord, DnsError> {
     let response = client
         .put(format!(
@@ -312,10 +316,10 @@ async fn update_record_by_type(
         ))
         .bearer_auth(&config.cloudflare_api_token)
         .json(&serde_json::json!({
-            "type": record_type,
-            "name": hostname,
-            "content": content,
-            "ttl": ttl,
+            "type": payload.record_type,
+            "name": payload.hostname,
+            "content": payload.content,
+            "ttl": payload.ttl,
             "proxied": false,
         }))
         .send()
@@ -325,7 +329,8 @@ async fn update_record_by_type(
     let body: CloudflareSingle<CloudflareRecord> = response.json().await?;
     if !status.is_success() || !body.success {
         return Err(DnsError::Cloudflare(format!(
-            "update record for '{hostname}' failed: {}",
+            "update record for '{}' failed: {}",
+            payload.hostname,
             cloudflare_error(&body.errors)
         )));
     }
@@ -348,7 +353,16 @@ pub async fn ensure_txt_record(
     match existing {
         Some(record) => {
             update_record_by_type(
-                client, config, &zone_id, &record.id, "TXT", hostname, content, 60,
+                client,
+                config,
+                &zone_id,
+                &record.id,
+                RecordPayload {
+                    record_type: "TXT",
+                    hostname,
+                    content,
+                    ttl: 60,
+                },
             )
             .await?;
         }

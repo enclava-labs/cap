@@ -75,7 +75,10 @@ fn parse_config_inputs(
             .ok_or_else(|| format!("invalid config file format '{entry}': expected KEY=PATH"))?;
         let value = std::fs::read_to_string(path)
             .map_err(|err| format!("failed to read config file for {key} at {path}: {err}"))?;
-        pairs.push((key.to_string(), value.trim_end_matches(['\r', '\n']).to_string()));
+        pairs.push((
+            key.to_string(),
+            value.trim_end_matches(['\r', '\n']).to_string(),
+        ));
     }
     Ok(pairs)
 }
@@ -237,7 +240,7 @@ fn confidential_app_for_cc_hash(
                 .map_err(|err| format!("platform release tenant_caddy_tls_mode: {err}"))?,
             trustee_policy_read_available: true,
             workload_artifacts_url: None,
-            tls_certificate_broker_url: tls_certificate_broker_url_for_cc_hash(&release),
+            tls_certificate_broker_url: tls_certificate_broker_url_for_cc_hash(release),
             trustee_policy_url: None,
             local_workload_artifacts_json: Some("{}".to_string()),
             local_trustee_policy_json: Some("{}".to_string()),
