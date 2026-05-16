@@ -53,11 +53,58 @@ fn require_env_matches_release(
     Ok(())
 }
 
-fn tee_accepts_invalid_certs() -> bool {
-    std::env::var("TENANT_TEE_TLS_MODE")
-        .map(|mode| matches!(mode.as_str(), "staging" | "insecure"))
-        .unwrap_or(false)
-        || env_flag("TENANT_TEE_ACCEPT_INVALID_CERTS")
+fn build_tenant_tee_http_client() -> anyhow::Result<reqwest::Client> {
+    build_tenant_tee_http_client_with_env(|name| std::env::var(name).ok())
+}
+
+fn tenant_tee_root_certificate_from_pem(
+    source: &'static str,
+    cert_pem: &[u8],
+) -> anyhow::Result<Vec<reqwest::Certificate>> {
+    if !cert_pem
+        .windows(b"-----BEGIN CERTIFICATE-----".len())
+        .any(|window| window == b"-----BEGIN CERTIFICATE-----")
+    {
+        anyhow::bail!("{source} does not contain a PEM certificate");
+    }
+    reqwest::Certificate::from_pem_bundle(cert_pem)
+        .map_err(|err| anyhow::anyhow!("invalid {source}: {err}"))
+}
+
+fn build_tenant_tee_http_client_with_env(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .danger_accept_invalid_certs(
+            lookup("TENANT_TEE_TLS_MODE")
+                .map(|mode| matches!(mode.as_str(), "staging" | "insecure"))
+                .unwrap_or(false)
+                || lookup("TENANT_TEE_ACCEPT_INVALID_CERTS").is_some_and(|value| {
+                    matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
+                }),
+        )
+        .https_only(true);
+
+    if let Some(cert_pem) = lookup("TENANT_TEE_CA_CERT_PEM") {
+        let cert_pem = cert_pem.replace("\\n", "\n");
+        for cert in
+            tenant_tee_root_certificate_from_pem("TENANT_TEE_CA_CERT_PEM", cert_pem.as_bytes())?
+        {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    if let Some(cert_path) = lookup("TENANT_TEE_CA_CERT_PATH") {
+        let cert_pem = std::fs::read(&cert_path)
+            .map_err(|err| anyhow::anyhow!("failed to read TENANT_TEE_CA_CERT_PATH: {err}"))?;
+        for cert in tenant_tee_root_certificate_from_pem("TENANT_TEE_CA_CERT_PATH", &cert_pem)? {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    builder
+        .build()
+        .map_err(|err| anyhow::anyhow!("failed to build tenant TEE HTTP client: {err}"))
 }
 
 fn build_trustee_http_client() -> anyhow::Result<reqwest::Client> {
@@ -621,11 +668,8 @@ async fn main() {
         max_concurrent_applies,
         "configured deployment apply concurrency"
     );
-    let tee_http_client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(tee_accepts_invalid_certs())
-        .https_only(true)
-        .build()
-        .expect("failed to build tenant TEE HTTP client");
+    let tee_http_client =
+        build_tenant_tee_http_client().expect("failed to build tenant TEE HTTP client");
 
     let outbound_config = enclava_api::clients::ClientConfig::from_env();
     let http_client = enclava_api::clients::build_guarded_client(&outbound_config)
@@ -675,6 +719,8 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn api_startup_installs_rustls_crypto_provider() {
         let source = include_str!("main.rs");
@@ -687,6 +733,20 @@ mod tests {
         assert!(
             main_body.contains(expected),
             "API startup must install a rustls CryptoProvider before building ACME/HTTP clients"
+        );
+    }
+
+    #[test]
+    fn tenant_tee_http_client_reads_configured_ca_pem() {
+        let err = build_tenant_tee_http_client_with_env(|name| match name {
+            "TENANT_TEE_CA_CERT_PEM" => Some("not a pem certificate".to_string()),
+            _ => None,
+        })
+        .expect_err("invalid configured tenant TEE CA PEM should be rejected");
+
+        assert!(
+            err.to_string().contains("TENANT_TEE_CA_CERT_PEM"),
+            "error should name the invalid tenant TEE CA env var: {err}"
         );
     }
 }

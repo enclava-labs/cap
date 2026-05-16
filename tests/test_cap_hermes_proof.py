@@ -53,6 +53,29 @@ class CapHermesProofTests(unittest.TestCase):
         )
         self.assertTrue(proof.manifest_has_signature(manifest))
 
+    def test_manifest_digest_accepts_hermes_policy_workload_image(self):
+        manifest = {
+            "expected": {
+                "workload_image": (
+                    "ghcr.io/enclava-ai/hermes-agent-enclava@"
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                )
+            }
+        }
+
+        self.assertEqual(
+            proof.extract_manifest_digest(manifest),
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+
+    def test_detached_manifest_signature_bundle_counts_as_signed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "hermes-policy.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            Path(f"{manifest_path}.sigstore.json").write_text('{"bundle": true}', encoding="utf-8")
+
+            self.assertTrue(proof.detached_manifest_signature_exists(manifest_path))
+
     def test_config_ready_finds_boolean_and_string_values(self):
         self.assertTrue(proof.find_bool_key({"nested": {"config_ready": "ok"}}, {"config_ready"}))
         self.assertFalse(proof.find_bool_key({"configReady": "false"}, {"configReady"}))

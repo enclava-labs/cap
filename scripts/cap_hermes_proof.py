@@ -148,8 +148,11 @@ def extract_manifest_digest(manifest: Any) -> str | None:
         manifest,
         {
             "image_digest",
+            "image_ref",
+            "workload_image",
             "digest",
             "expected_image_digest",
+            "expected_workload_image",
             "container_image_digest",
         },
     )
@@ -168,6 +171,17 @@ def manifest_has_signature(manifest: Any) -> bool:
     if isinstance(manifest, list):
         return any(manifest_has_signature(value) for value in manifest)
     return False
+
+
+def detached_manifest_signature_exists(manifest_path: Path) -> bool:
+    return any(
+        candidate.exists() and candidate.stat().st_size > 0
+        for candidate in (
+            Path(f"{manifest_path}.sigstore.json"),
+            manifest_path.with_suffix(manifest_path.suffix + ".sigstore.json"),
+            manifest_path.with_name(manifest_path.name + ".sigstore.json"),
+        )
+    )
 
 
 def find_bool_key(value: Any, key_names: set[str]) -> bool | None:
@@ -526,10 +540,18 @@ def main(argv: list[str]) -> int:
         try:
             manifest = load_json_file(manifest_path)
             manifest_digest = extract_manifest_digest(manifest)
-            signature_text = "signature present" if manifest_has_signature(manifest) else "signature not found"
-            if args.require_signed_manifest and not manifest_has_signature(manifest):
+            inline_signature = manifest_has_signature(manifest)
+            detached_signature = detached_manifest_signature_exists(manifest_path)
+            signature_present = inline_signature or detached_signature
+            if detached_signature and not inline_signature:
+                signature_text = "detached signature bundle present"
+            elif inline_signature:
+                signature_text = "signature present"
+            else:
+                signature_text = "signature not found"
+            if args.require_signed_manifest and not signature_present:
                 status = FAIL
-            elif manifest_has_signature(manifest):
+            elif signature_present:
                 status = PASS
             else:
                 status = WARN
