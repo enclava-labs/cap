@@ -95,8 +95,14 @@ pub(crate) async fn resolve_signed_policy_artifact(
             .validate_customer_authority(&state.db)
             .await
             .map_err(signing_error_response)?;
+        let signing_service_pubkey_hex = _signing_service_pubkey_hex.ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "platform signing-service pubkey required for signed_policy_artifact verification"
+            })),
+        ))?;
         artifacts
-            .validate_customer_signed_artifact(&artifact)
+            .validate_signed_artifact(&artifact, signing_service_pubkey_hex)
             .map_err(signing_error_response)?;
         let signing_service = state.signing_service.as_ref().ok_or((
             StatusCode::SERVICE_UNAVAILABLE,
