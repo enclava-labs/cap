@@ -174,14 +174,62 @@ def manifest_has_signature(manifest: Any) -> bool:
 
 
 def detached_manifest_signature_exists(manifest_path: Path) -> bool:
-    return any(
-        candidate.exists() and candidate.stat().st_size > 0
-        for candidate in (
-            Path(f"{manifest_path}.sigstore.json"),
-            manifest_path.with_suffix(manifest_path.suffix + ".sigstore.json"),
-            manifest_path.with_name(manifest_path.name + ".sigstore.json"),
-        )
+    return detached_manifest_signature_path(manifest_path) is not None
+
+
+def detached_manifest_signature_path(manifest_path: Path) -> Path | None:
+    for candidate in (
+        Path(f"{manifest_path}.sigstore.json"),
+        manifest_path.with_suffix(manifest_path.suffix + ".sigstore.json"),
+        manifest_path.with_name(manifest_path.name + ".sigstore.json"),
+    ):
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return candidate
+    return None
+
+
+def cosign_verify_blob_args(
+    manifest_path: Path,
+    bundle_path: Path,
+    certificate_identity: str,
+    certificate_oidc_issuer: str,
+) -> list[str]:
+    return [
+        "cosign",
+        "verify-blob",
+        "--bundle",
+        str(bundle_path),
+        "--certificate-identity",
+        certificate_identity,
+        "--certificate-oidc-issuer",
+        certificate_oidc_issuer,
+        str(manifest_path),
+    ]
+
+
+def verify_cosign_blob(
+    manifest_path: Path,
+    bundle_path: Path,
+    certificate_identity: str,
+    certificate_oidc_issuer: str,
+    timeout: float,
+) -> str:
+    result = subprocess.run(
+        cosign_verify_blob_args(
+            manifest_path,
+            bundle_path,
+            certificate_identity,
+            certificate_oidc_issuer,
+        ),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
     )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "cosign verify-blob failed").strip()
+        raise ProofError(detail[:360])
+    return (result.stdout or result.stderr or "cosign verify-blob succeeded").strip()
 
 
 def find_bool_key(value: Any, key_names: set[str]) -> bool | None:
@@ -503,6 +551,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--expected-image-digest", default=os.getenv("EXPECTED_IMAGE_DIGEST"))
     parser.add_argument("--manifest", type=Path, default=os.getenv("CAP_PROOF_MANIFEST"))
     parser.add_argument("--require-signed-manifest", action="store_true")
+    parser.add_argument("--require-cosign-verify", action="store_true")
+    parser.add_argument("--cosign-certificate-identity", default=os.getenv("CAP_PROOF_COSIGN_IDENTITY"))
+    parser.add_argument(
+        "--cosign-certificate-oidc-issuer",
+        default=os.getenv("CAP_PROOF_COSIGN_ISSUER"),
+    )
     parser.add_argument("--public-health-url", default=os.getenv("CAP_PUBLIC_HEALTH_URL"))
     parser.add_argument("--public-health-path", default=os.getenv("CAP_PUBLIC_HEALTH_PATH", "/health"))
     parser.add_argument("--confidential-base-url", default=os.getenv("CAP_CONFIDENTIAL_BASE_URL"))
@@ -541,15 +595,33 @@ def main(argv: list[str]) -> int:
             manifest = load_json_file(manifest_path)
             manifest_digest = extract_manifest_digest(manifest)
             inline_signature = manifest_has_signature(manifest)
-            detached_signature = detached_manifest_signature_exists(manifest_path)
-            signature_present = inline_signature or detached_signature
-            if detached_signature and not inline_signature:
+            detached_signature = detached_manifest_signature_path(manifest_path)
+            signature_present = inline_signature or detached_signature is not None
+            cosign_verified = False
+            if detached_signature and args.cosign_certificate_identity and args.cosign_certificate_oidc_issuer:
+                verify_cosign_blob(
+                    manifest_path,
+                    detached_signature,
+                    args.cosign_certificate_identity,
+                    args.cosign_certificate_oidc_issuer,
+                    args.timeout,
+                )
+                cosign_verified = True
+            if detached_signature and cosign_verified:
+                signature_text = "detached signature bundle cosign verified"
+            elif detached_signature and not inline_signature:
                 signature_text = "detached signature bundle present"
             elif inline_signature:
                 signature_text = "signature present"
             else:
                 signature_text = "signature not found"
-            if args.require_signed_manifest and not signature_present:
+            if args.require_cosign_verify and not cosign_verified:
+                status = FAIL
+                if not detached_signature:
+                    signature_text = "cosign verification required but detached bundle not found"
+                elif not args.cosign_certificate_identity or not args.cosign_certificate_oidc_issuer:
+                    signature_text = "cosign verification required but identity/issuer missing"
+            elif args.require_signed_manifest and not signature_present:
                 status = FAIL
             elif signature_present:
                 status = PASS

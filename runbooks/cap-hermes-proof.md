@@ -21,7 +21,10 @@ export HERMES_API_PATH="/health"
 
 python3 scripts/cap_hermes_proof.py \
   --manifest "$CAP_PROOF_MANIFEST" \
-  --require-signed-manifest
+  --require-signed-manifest \
+  --require-cosign-verify \
+  --cosign-certificate-identity "https://github.com/enclava-ai/hermes-agent/.github/workflows/enclava-build.yml@refs/heads/<branch>" \
+  --cosign-certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```
 
 If you already ran `enclava login`, `CAP_API_URL` and `CAP_API_TOKEN` can be omitted; the script falls back to `~/.enclava/config.toml` and `~/.enclava/credentials.toml`.
@@ -37,7 +40,7 @@ For staging endpoints with temporary certificates, add `--insecure-tls`. For app
 - Confidential `/.well-known/confidential/status` is reachable.
 - `config_ready=true` is exposed by confidential status or public health.
 - `/.well-known/confidential/attestation` returns a fresh nonce-bound response for the live TLS leaf SPKI, and parseable SNP `report_data` matches when exposed.
-- A supplied manifest JSON is parseable, digest-bearing, and signature-bearing when `--require-signed-manifest` is set.
+- A supplied manifest JSON is parseable, digest-bearing, and signature-bearing when `--require-signed-manifest` is set. With `--require-cosign-verify`, the adjacent `.sigstore.json` bundle is verified with `cosign verify-blob` against the expected GitHub Actions identity.
 - If `API_SERVER_KEY` is set, one Hermes API request succeeds.
 
 The script prints a demo-readable PASS/WARN/FAIL/SKIP table and exits non-zero on any FAIL.

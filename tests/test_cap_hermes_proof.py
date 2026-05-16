@@ -72,9 +72,24 @@ class CapHermesProofTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             manifest_path = Path(tmp) / "hermes-policy.json"
             manifest_path.write_text("{}", encoding="utf-8")
-            Path(f"{manifest_path}.sigstore.json").write_text('{"bundle": true}', encoding="utf-8")
+            bundle_path = Path(f"{manifest_path}.sigstore.json")
+            bundle_path.write_text('{"bundle": true}', encoding="utf-8")
 
             self.assertTrue(proof.detached_manifest_signature_exists(manifest_path))
+            self.assertEqual(proof.detached_manifest_signature_path(manifest_path), bundle_path)
+
+    def test_cosign_verify_blob_args_include_identity_and_bundle(self):
+        args = proof.cosign_verify_blob_args(
+            Path("/tmp/policy.json"),
+            Path("/tmp/policy.json.sigstore.json"),
+            "https://github.com/example/repo/.github/workflows/build.yml@refs/heads/main",
+            "https://token.actions.githubusercontent.com",
+        )
+
+        self.assertEqual(args[0], "cosign")
+        self.assertIn("--bundle", args)
+        self.assertIn("--certificate-identity", args)
+        self.assertEqual(args[-1], "/tmp/policy.json")
 
     def test_config_ready_finds_boolean_and_string_values(self):
         self.assertTrue(proof.find_bool_key({"nested": {"config_ready": "ok"}}, {"config_ready"}))
