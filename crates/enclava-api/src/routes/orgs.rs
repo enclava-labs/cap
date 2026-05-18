@@ -108,7 +108,11 @@ pub async fn create_org(
     Ok((StatusCode::CREATED, Json(org.into())))
 }
 
-/// GET /orgs -- list user's organizations (excludes personal orgs).
+fn list_orgs_api_key_org_filter(auth: &AuthContext) -> Option<Uuid> {
+    auth.api_key.as_ref().map(|_| auth.org_id)
+}
+
+/// GET /orgs -- list user's organizations.
 pub async fn list_orgs(
     auth: AuthContext,
     State(state): State<AppState>,
@@ -116,10 +120,13 @@ pub async fn list_orgs(
     let orgs: Vec<Organization> = sqlx::query_as(
         "SELECT o.* FROM organizations o
          JOIN memberships m ON m.org_id = o.id
-         WHERE m.user_id = $1 AND o.is_personal = false AND m.removed_at IS NULL
+         WHERE m.user_id = $1
+           AND m.removed_at IS NULL
+           AND ($2::uuid IS NULL OR o.id = $2)
          ORDER BY o.name",
     )
     .bind(auth.user_id)
+    .bind(list_orgs_api_key_org_filter(&auth))
     .fetch_all(&state.db)
     .await
     .map_err(|_| {
@@ -793,4 +800,40 @@ pub async fn remove_member(
     tx.commit().await.map_err(|_| db_error())?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::api_key::ValidatedApiKey;
+
+    fn auth_context(api_key: Option<ValidatedApiKey>) -> AuthContext {
+        AuthContext {
+            user_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            org_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            org_name: "personal".to_string(),
+            role: Role::Owner,
+            api_key,
+        }
+    }
+
+    #[test]
+    fn list_orgs_session_includes_all_user_orgs() {
+        let auth = auth_context(None);
+
+        assert_eq!(list_orgs_api_key_org_filter(&auth), None);
+    }
+
+    #[test]
+    fn list_orgs_api_key_is_limited_to_bound_org() {
+        let org_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let auth = auth_context(Some(ValidatedApiKey {
+            id: Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+            org_id,
+            created_by: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            scopes: vec!["apps:read".to_string()],
+        }));
+
+        assert_eq!(list_orgs_api_key_org_filter(&auth), Some(org_id));
+    }
 }
