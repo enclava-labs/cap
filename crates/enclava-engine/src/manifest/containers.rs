@@ -192,6 +192,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
         volume_mounts.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),
+            read_only: Some(true),
             ..Default::default()
         });
         volume_mounts.push(VolumeMount {
@@ -324,7 +325,7 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             env("ENCLAVA_INIT_STAY_ALIVE", "true"),
             env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
             env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
-            env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "10001"),
+            env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "65532"),
             env("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", &wait_containers),
         ]),
         volume_mounts: Some(vec![
@@ -462,8 +463,8 @@ fn proxy_security_context(legacy: bool) -> SecurityContext {
             allow_privilege_escalation: Some(false),
             read_only_root_filesystem: Some(true),
             run_as_non_root: Some(true),
-            run_as_user: Some(10001),
-            run_as_group: Some(10001),
+            run_as_user: Some(65532),
+            run_as_group: Some(65532),
             capabilities: Some(Capabilities {
                 add: None,
                 drop: Some(vec!["ALL".to_string()]),
@@ -673,6 +674,7 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         volume_mounts.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),
+            read_only: Some(true),
             ..Default::default()
         });
     }
