@@ -203,54 +203,32 @@ fn wait_for_container_start_sentinels() -> Result<Vec<WorkloadNamespace>> {
         containers = containers.join(","),
         "waiting for workload containers before bind-mounting decrypted volumes"
     );
-    let wait_timeout = container_start_wait_timeout();
-    let deadline = std::time::Instant::now() + wait_timeout;
-    loop {
-        let mut pending = Vec::new();
-        let mut namespaces = Vec::new();
-        for name in &containers {
-            let sentinel = dir.join(name);
-            match read_sentinel_pid(&sentinel).or_else(|sentinel_err| {
-                find_workload_pid_by_env(Path::new("/proc"), name).with_context(|| {
-                    format!(
-                        "sentinel {} unavailable ({sentinel_err}) and /proc fallback failed",
-                        sentinel.display()
-                    )
-                })
-            }) {
-                Ok(pid) => namespaces.push(WorkloadNamespace {
-                    name: name.clone(),
-                    pid,
-                }),
-                Err(err) => pending.push(format!("{name}: {err}")),
-            }
+    let mut pending = Vec::new();
+    let mut namespaces = Vec::new();
+    for name in &containers {
+        let sentinel = dir.join(name);
+        match read_sentinel_pid(&sentinel).or_else(|sentinel_err| {
+            find_workload_pid_by_env(Path::new("/proc"), name).with_context(|| {
+                format!(
+                    "sentinel {} unavailable ({sentinel_err}) and /proc fallback failed",
+                    sentinel.display()
+                )
+            })
+        }) {
+            Ok(pid) => namespaces.push(WorkloadNamespace {
+                name: name.clone(),
+                pid,
+            }),
+            Err(err) => pending.push(format!("{name}: {err}")),
         }
-        if pending.is_empty() {
-            return Ok(namespaces);
-        }
-        let pending_text = pending.join(", ");
-        tracing::debug!(
-            pending = %pending_text,
-            "workload containers not started yet"
-        );
-        if std::time::Instant::now() >= deadline {
-            return Err(anyhow!(
-                "timed out after {}s waiting for workload container sentinels: {}",
-                wait_timeout.as_secs(),
-                pending_text
-            ));
-        }
-        std::thread::sleep(Duration::from_secs(1));
     }
-}
-
-fn container_start_wait_timeout() -> Duration {
-    std::env::var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS_TIMEOUT_SECONDS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or_else(|| Duration::from_secs(300))
+    if !pending.is_empty() {
+        tracing::warn!(
+            pending = %pending.join(", "),
+            "continuing without some workload namespace bind mounts"
+        );
+    }
+    Ok(namespaces)
 }
 
 fn read_sentinel_pid(path: &Path) -> Result<u32> {
