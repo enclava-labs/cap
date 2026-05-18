@@ -520,6 +520,14 @@ pub async fn bootstrap_signing_service_owner(
 ) -> Result<Json<BootstrapSigningServiceResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_scope(&auth, "org:admin")?;
     let (org_id, caller_role) = active_membership(&state, auth.user_id, &org_name).await?;
+    if auth.api_key.is_some() && auth.org_id != org_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "API key is restricted to its organization"
+            })),
+        ));
+    }
     scopes::require_admin_role(caller_role)?;
 
     let owner_pubkey = decode_hex_len("owner_pubkey_hex", &body.owner_pubkey_hex, 32)?;
