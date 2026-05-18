@@ -210,7 +210,14 @@ fn wait_for_container_start_sentinels() -> Result<Vec<WorkloadNamespace>> {
         let mut namespaces = Vec::new();
         for name in &containers {
             let sentinel = dir.join(name);
-            match read_sentinel_pid(&sentinel) {
+            match read_sentinel_pid(&sentinel).or_else(|sentinel_err| {
+                find_workload_pid_by_env(Path::new("/proc"), name).with_context(|| {
+                    format!(
+                        "sentinel {} unavailable ({sentinel_err}) and /proc fallback failed",
+                        sentinel.display()
+                    )
+                })
+            }) {
                 Ok(pid) => namespaces.push(WorkloadNamespace {
                     name: name.clone(),
                     pid,
@@ -252,10 +259,40 @@ fn read_sentinel_pid(path: &Path) -> Result<u32> {
         .trim()
         .parse::<u32>()
         .map_err(|_| anyhow!("sentinel does not contain a numeric pid"))?;
-    if !Path::new(&format!("/proc/{pid}/ns/mnt")).exists() {
+    validate_pid_mount_namespace(Path::new("/proc"), pid)?;
+    Ok(pid)
+}
+
+fn find_workload_pid_by_env(proc_root: &Path, name: &str) -> Result<u32> {
+    let expected = format!("ENCLAVA_CONTAINER_NAME={name}");
+    for entry in std::fs::read_dir(proc_root)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let environ = match std::fs::read(entry.path().join("environ")) {
+            Ok(environ) => environ,
+            Err(_) => continue,
+        };
+        if environ
+            .split(|byte| *byte == 0)
+            .any(|var| var == expected.as_bytes())
+        {
+            validate_pid_mount_namespace(proc_root, pid)?;
+            return Ok(pid);
+        }
+    }
+    Err(anyhow!("no running workload helper found for {name}"))
+}
+
+fn validate_pid_mount_namespace(proc_root: &Path, pid: u32) -> Result<()> {
+    if !proc_root.join(pid.to_string()).join("ns/mnt").exists() {
         return Err(anyhow!("sentinel pid {pid} has no mount namespace"));
     }
-    Ok(pid)
+    Ok(())
 }
 
 fn validate_sentinel_name(name: &str) -> Result<String> {
@@ -1494,5 +1531,34 @@ trustee_policy_url = "file:///policy.json"
             owner_seed_stage < workload_wait_stage,
             "enclava-init must accept claim/unlock before waiting on workload sentinels"
         );
+    }
+
+    #[test]
+    fn workload_pid_fallback_finds_wait_exec_process_by_container_name() {
+        let dir = tempdir().unwrap();
+        let proc_dir = dir.path().join("123");
+        std::fs::create_dir_all(proc_dir.join("ns")).unwrap();
+        std::fs::write(
+            proc_dir.join("environ"),
+            b"PATH=/usr/bin\0ENCLAVA_CONTAINER_NAME=tenant-ingress\0",
+        )
+        .unwrap();
+        std::fs::write(proc_dir.join("ns/mnt"), b"").unwrap();
+
+        let pid = find_workload_pid_by_env(dir.path(), "tenant-ingress").unwrap();
+
+        assert_eq!(pid, 123);
+    }
+
+    #[test]
+    fn workload_pid_fallback_rejects_missing_mount_namespace() {
+        let dir = tempdir().unwrap();
+        let proc_dir = dir.path().join("456");
+        std::fs::create_dir_all(&proc_dir).unwrap();
+        std::fs::write(proc_dir.join("environ"), b"ENCLAVA_CONTAINER_NAME=web\0").unwrap();
+
+        let err = find_workload_pid_by_env(dir.path(), "web").unwrap_err();
+
+        assert!(err.to_string().contains("mount namespace"));
     }
 }
