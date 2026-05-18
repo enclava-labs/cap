@@ -5,6 +5,7 @@ pub mod config;
 pub mod deployments;
 pub mod domains;
 pub mod orgs;
+pub mod secret_agent;
 pub mod status;
 pub mod unlock;
 pub mod users;

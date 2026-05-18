@@ -118,6 +118,23 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::post(routes::deployments::rollback),
         );
 
+    // Secret Agent hosted-Hermes compatibility routes. These wrap CAP's native
+    // org/app/deploy/config-token model behind the small provisioning API used
+    // by Secret Agent.
+    let secret_agent_routes = Router::new()
+        .route(
+            "/v1/deployments",
+            axum::routing::post(routes::secret_agent::create_deployment),
+        )
+        .route(
+            "/v1/deployments/{deployment_id}/status",
+            axum::routing::get(routes::secret_agent::deployment_status),
+        )
+        .route(
+            "/v1/deployments/{deployment_id}/config-token",
+            axum::routing::post(routes::secret_agent::config_token),
+        );
+
     // Config routes (authenticated)
     let config_routes = Router::new()
         .route(
@@ -236,6 +253,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(org_routes)
         .merge(app_routes)
         .merge(deploy_routes)
+        .merge(secret_agent_routes)
         .merge(config_routes)
         .merge(domain_routes)
         .merge(status_routes)
