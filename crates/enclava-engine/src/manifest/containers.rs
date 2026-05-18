@@ -45,8 +45,8 @@ pub fn enclava_init_image() -> String {
 }
 
 pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
-pub const APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
-pub const CADDY_SEED_PATH: &str = "/run/enclava/seeds/caddy/seed";
+pub const APP_SEED_PATH: &str = "/state/app/seed";
+pub const CADDY_SEED_PATH: &str = "/state/caddy/seed";
 pub const CADDY_ACME_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
@@ -84,7 +84,7 @@ fn env_field_ref(name: &str, field_path: &str) -> EnvVar {
 /// Build the app container.
 ///
 /// Phase 5 default: unprivileged, drops ALL caps, reads its seed from
-/// `/run/enclava/seeds/app/seed` written by the enclava-init sidecar. The user's
+/// `/state/app/seed` written by the enclava-init sidecar. The user's
 /// command is passed as a proper argv list — no `sh -c` interpolation.
 pub fn build_app_container(app: &ConfidentialApp) -> Container {
     let primary = app
@@ -571,7 +571,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
 /// Build the caddy tenant-ingress sidecar container.
 ///
 /// Phase 5 default: unprivileged and listens on a high HTTPS port. Reads
-/// its seed from `/run/enclava/seeds/caddy/seed` and persists Caddy runtime
+/// its seed from `/state/caddy/seed` and persists Caddy runtime
 /// state through an init-managed handoff directory under `/run/enclava`. The Cloudflare
 /// DNS-01 path is gone — Phase 0 cut over to TLS-ALPN-01 — so caddy carries
 /// no `CF_API_TOKEN` env and no `tls-cloudflare-token` secret mount.
