@@ -323,7 +323,7 @@ pub async fn put_keyring(
 ) -> Result<(StatusCode, Json<OrgKeyringResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_scope(&auth, "org:admin")?;
     let (org_id, caller_role) = active_membership(&state, auth.user_id, &org_name).await?;
-    scopes::require_admin_role(caller_role)?;
+    scopes::require_owner_role(caller_role)?;
 
     if body.version < 1 {
         return Err(bad_request("version must be positive"));
