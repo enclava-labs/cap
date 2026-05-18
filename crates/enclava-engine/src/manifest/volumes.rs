@@ -56,6 +56,11 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             ..Default::default()
         });
         v.push(Volume {
+            name: "enclava-tools".to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+        v.push(Volume {
             name: "startup".to_string(),
             config_map: Some(ConfigMapVolumeSource {
                 name: format!("{}-startup", app.name),
@@ -65,6 +70,11 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             ..Default::default()
         });
     } else {
+        v.push(Volume {
+            name: "enclava-tools".to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
         v.push(Volume {
             name: "startup".to_string(),
             config_map: Some(ConfigMapVolumeSource {

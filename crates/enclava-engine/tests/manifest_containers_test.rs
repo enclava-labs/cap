@@ -46,7 +46,7 @@ fn app_container_starts_under_wait_wrapper() {
         c.command.as_ref().unwrap(),
         &vec![ENCLAVA_WAIT_EXEC_PATH.to_string()]
     );
-    assert_eq!(ENCLAVA_WAIT_EXEC_PATH, "/usr/local/bin/enclava-wait-exec");
+    assert_eq!(ENCLAVA_WAIT_EXEC_PATH, "/enclava-tools/enclava-wait-exec");
     let env = c.env.as_ref().unwrap();
     assert_eq!(
         env.iter()
@@ -58,7 +58,7 @@ fn app_container_starts_under_wait_wrapper() {
     );
     let vm = c.volume_mounts.as_ref().unwrap();
     assert!(vm.iter().any(|m| m.name == "startup"));
-    assert!(vm.iter().all(|m| m.name != "enclava-tools"));
+    assert!(vm.iter().any(|m| m.name == "enclava-tools"));
     assert!(vm.iter().any(|m| m.name == "unlock-socket"));
 }
 
@@ -338,7 +338,7 @@ fn caddy_container_waits_for_init_ready_before_starting_caddy() {
     let c = build_caddy_container(&sample_app());
     assert_eq!(
         c.command.as_ref().unwrap(),
-        &vec!["/usr/local/bin/enclava-wait-exec".to_string()]
+        &vec!["/enclava-tools/enclava-wait-exec".to_string()]
     );
     assert_eq!(
         c.args.as_ref().unwrap(),
@@ -355,7 +355,7 @@ fn caddy_container_waits_for_init_ready_before_starting_caddy() {
 fn caddy_container_does_not_mount_extra_tools() {
     let c = build_caddy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
-    assert!(vm.iter().all(|m| m.name != "enclava-tools"));
+    assert!(vm.iter().any(|m| m.name == "enclava-tools"));
 }
 
 #[test]

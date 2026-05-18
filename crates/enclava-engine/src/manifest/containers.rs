@@ -44,7 +44,7 @@ pub fn enclava_init_image() -> String {
     image
 }
 
-pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
+pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
 pub const APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
 pub const CADDY_SEED_PATH: &str = "/run/enclava/seeds/caddy/seed";
 pub const CADDY_ACME_TLS_PORT: i32 = 10443;
@@ -183,6 +183,12 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             },
         ]);
     } else {
+        volume_mounts.push(VolumeMount {
+            name: "enclava-tools".to_string(),
+            mount_path: "/enclava-tools".to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
         volume_mounts.push(VolumeMount {
             name: "startup".to_string(),
             mount_path: "/startup".to_string(),
@@ -391,6 +397,37 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
                 m.insert("memory".to_string(), Quantity("512Mi".to_string()));
                 m.insert("cpu".to_string(), Quantity("250m".to_string()));
                 m
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+
+pub fn build_enclava_tools_init_container() -> Container {
+    Container {
+        name: "enclava-tools".to_string(),
+        image: Some(enclava_init_image()),
+        command: Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec".to_string(),
+        ]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "enclava-tools".to_string(),
+            mount_path: "/work".to_string(),
+            ..Default::default()
+        }]),
+        security_context: Some(SecurityContext {
+            allow_privilege_escalation: Some(false),
+            read_only_root_filesystem: Some(true),
+            run_as_non_root: Some(false),
+            run_as_user: Some(0),
+            run_as_group: Some(0),
+            capabilities: Some(Capabilities {
+                add: None,
+                drop: Some(vec!["ALL".to_string()]),
             }),
             ..Default::default()
         }),
@@ -670,6 +707,12 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             ..Default::default()
         });
     } else {
+        volume_mounts.push(VolumeMount {
+            name: "enclava-tools".to_string(),
+            mount_path: "/enclava-tools".to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
         volume_mounts.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),

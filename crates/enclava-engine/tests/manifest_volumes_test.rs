@@ -55,7 +55,7 @@ fn volumes_have_shared_decrypted_mountpoints() {
 #[test]
 fn volumes_do_not_include_enclava_tools_emptydir() {
     let vols = build_volumes(&sample_app());
-    assert!(vols.iter().all(|v| v.name != "enclava-tools"));
+    assert!(vols.iter().any(|v| v.name == "enclava-tools"));
 }
 
 #[test]

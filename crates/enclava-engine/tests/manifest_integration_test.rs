@@ -110,7 +110,7 @@ fn generate_all_manifests_returns_all_resources() {
         .as_ref()
         .unwrap();
     assert_eq!(pod.containers.len(), 4);
-    assert!(pod.init_containers.is_none());
+    assert_eq!(pod.init_containers.as_ref().map(|v| v.len()), Some(1));
     let names: Vec<&str> = pod.containers.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"web"));
     assert!(names.contains(&"attestation-proxy"));
