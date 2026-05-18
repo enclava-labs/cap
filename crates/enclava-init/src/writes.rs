@@ -2,10 +2,11 @@
 //! leaves only the tmp file at a sibling path; the destination is either the
 //! prior contents or absent — never a partial write.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::errors::Result;
 
@@ -15,23 +16,34 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
         .ok_or_else(|| crate::errors::InitError::Config("seed path has no parent".into()))?;
     fs::create_dir_all(parent)?;
 
-    let tmp = parent.join(format!(
-        ".{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("seed")
-    ));
-
-    {
-        let mut f: File = OpenOptions::new()
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("seed");
+    let mut tmp = None;
+    for attempt in 0..16_u32 {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let candidate = parent.join(format!(".{file_name}.{nonce}.{attempt}.tmp"));
+        let opened = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(mode)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+            .open(&candidate);
+        match opened {
+            Ok(mut f) => {
+                f.write_all(bytes)?;
+                f.sync_all()?;
+                tmp = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
     }
+    let tmp = tmp.ok_or_else(|| {
+        crate::errors::InitError::Config(format!("failed to allocate temporary path for {file_name}"))
+    })?;
 
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -71,5 +83,20 @@ mod tests {
         std::fs::write(&tmp, b"partial").unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"original");
         assert!(tmp.exists());
+    }
+
+    #[test]
+    fn atomic_write_ignores_existing_predictable_tmp_symlink() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path();
+        let dest = parent.join("seed");
+        let target = parent.join("target");
+        fs::write(&target, b"target").unwrap();
+        std::os::unix::fs::symlink(&target, parent.join(".seed.tmp")).unwrap();
+
+        atomic_write(&dest, b"new-seed", 0o600).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), b"new-seed");
+        assert_eq!(fs::read(&target).unwrap(), b"target");
     }
 }
