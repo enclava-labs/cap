@@ -215,6 +215,12 @@ pub struct ArtifactFetcher {
     pub timeout: Duration,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SignedPolicyArtifactSet {
+    schema_version: String,
+    artifacts: Vec<PolicyEnvelope>,
+}
+
 impl ArtifactFetcher {
     pub fn fetch(&self) -> Result<(ArtifactsBundle, PolicyEnvelope)> {
         let client = reqwest::blocking::Client::builder()
@@ -227,14 +233,45 @@ impl ArtifactFetcher {
             &self.kbs_attestation_token,
             "fetch artifacts",
         )?;
-        let policy: PolicyEnvelope = fetch_json(
+        let policy_body: serde_json::Value = fetch_json(
             &client,
             &self.trustee_policy_url,
             &self.kbs_attestation_token,
             "fetch policy",
         )?;
+        let policy = parse_trustee_policy_body(policy_body, &bundle)?;
         Ok((bundle, policy))
     }
+}
+
+fn parse_trustee_policy_body(
+    policy_body: serde_json::Value,
+    bundle: &ArtifactsBundle,
+) -> Result<PolicyEnvelope> {
+    if let Ok(policy) = serde_json::from_value::<PolicyEnvelope>(policy_body.clone()) {
+        return Ok(policy);
+    }
+    let policy_set: SignedPolicyArtifactSet = serde_json::from_value(policy_body).map_err(|e| {
+        InitError::Kbs(format!("fetch policy: unsupported policy body format: {e}"))
+    })?;
+    if policy_set.schema_version != "enclava-signed-policy-set-v1" {
+        return Err(InitError::Kbs(format!(
+            "fetch policy: unsupported policy set schema_version={}",
+            policy_set.schema_version
+        )));
+    }
+    policy_set
+        .artifacts
+        .into_iter()
+        .find(|artifact| {
+            artifact.metadata.descriptor_core_hash
+                == bundle.signed_policy_artifact.metadata.descriptor_core_hash
+        })
+        .ok_or_else(|| {
+            InitError::TrusteePolicy(
+                "active Trustee policy set did not include matching workload artifact".into(),
+            )
+        })
 }
 
 fn fetch_json<T: DeserializeOwned>(
@@ -898,6 +935,47 @@ mod tests {
             fetched_bundle.descriptor_signature,
             bundle.descriptor_signature
         );
+        assert_eq!(fetched_policy, env);
+    }
+
+    #[test]
+    fn artifact_fetcher_reads_policy_set_and_selects_matching_artifact() {
+        let deployer = SigningKey::generate(&mut OsRng);
+        let descriptor = descriptor_json();
+        let keyring = keyring_json(&deployer, "deployer");
+        let rego = "package enclava\ndefault allow := false\n";
+        let (bundle, env, _, _, _) = build_inputs(
+            &descriptor,
+            keyring,
+            rego,
+            &deployer,
+            &deployer,
+            b"placeholder cc_init_data",
+        );
+        let mut non_matching_metadata = env.metadata.clone();
+        non_matching_metadata.descriptor_core_hash = "ff".repeat(32);
+        let non_matching_env = mk_envelope(
+            &deployer,
+            non_matching_metadata,
+            "package enclava\ndefault allow := true\n",
+        );
+        let policy_set = serde_json::json!({
+            "schema_version": "enclava-signed-policy-set-v1",
+            "artifacts": [non_matching_env, env.clone()],
+        });
+        let dir = tempdir().unwrap();
+        let bundle_path = dir.path().join("workload-artifacts.json");
+        let policy_path = dir.path().join("trustee-policy-set.json");
+        std::fs::write(&bundle_path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+        std::fs::write(&policy_path, serde_json::to_vec(&policy_set).unwrap()).unwrap();
+
+        let fetcher = ArtifactFetcher {
+            workload_artifacts_url: format!("file://{}", bundle_path.display()),
+            trustee_policy_url: format!("file://{}", policy_path.display()),
+            kbs_attestation_token: "unused-for-file".into(),
+            timeout: Duration::from_secs(1),
+        };
+        let (_, fetched_policy) = fetcher.fetch().unwrap();
         assert_eq!(fetched_policy, env);
     }
 

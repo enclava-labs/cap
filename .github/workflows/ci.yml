@@ -118,6 +118,8 @@ jobs:
         run: |
           cargo build --release --bin enclava-api
           cargo build --release --bin enclava
+        env:
+          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
 
       - name: Build prod-strict release path
         run: |
@@ -126,6 +128,8 @@ jobs:
           cargo build --release -p enclava-api --features prod-strict
           cargo build --release -p enclava-cli --features prod-strict
           cargo build --release -p enclava-init --features prod-strict
+        env:
+          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
 
       - name: Verify prod-strict rejects debug-only features
         run: |

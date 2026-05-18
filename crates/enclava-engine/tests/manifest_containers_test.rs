@@ -46,7 +46,7 @@ fn app_container_starts_under_wait_wrapper() {
         c.command.as_ref().unwrap(),
         &vec![ENCLAVA_WAIT_EXEC_PATH.to_string()]
     );
-    assert_eq!(ENCLAVA_WAIT_EXEC_PATH, "/usr/local/bin/enclava-wait-exec");
+    assert_eq!(ENCLAVA_WAIT_EXEC_PATH, "/enclava-tools/enclava-wait-exec");
     let env = c.env.as_ref().unwrap();
     assert_eq!(
         env.iter()
@@ -58,7 +58,7 @@ fn app_container_starts_under_wait_wrapper() {
     );
     let vm = c.volume_mounts.as_ref().unwrap();
     assert!(vm.iter().any(|m| m.name == "startup"));
-    assert!(vm.iter().all(|m| m.name != "enclava-tools"));
+    assert!(vm.iter().any(|m| m.name == "enclava-tools"));
     assert!(vm.iter().any(|m| m.name == "unlock-socket"));
 }
 
@@ -67,7 +67,7 @@ fn app_container_reads_seed_from_state_app() {
     let c = build_app_container(&sample_app());
     let env = c.env.as_ref().unwrap();
     let found = env.iter().find(|e| e.name == "APP_SEED_PATH").unwrap();
-    assert_eq!(found.value.as_deref(), Some("/run/enclava/seeds/app/seed"));
+    assert_eq!(found.value.as_deref(), Some("/state/app/seed"));
 }
 
 #[test]
@@ -245,8 +245,9 @@ fn proxy_container_is_non_root() {
 fn proxy_container_mounts_unlock_socket() {
     let c = build_attestation_proxy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
-    let m = vm.iter().find(|m| m.name == "unlock-socket").unwrap();
-    assert_eq!(m.mount_path, "/run/enclava");
+    let m = vm.iter().find(|m| m.name == "unlock-channel").unwrap();
+    assert_eq!(m.mount_path, "/run/enclava-unlock");
+    assert!(vm.iter().all(|m| m.name != "unlock-socket"));
     let env = c.env.as_ref().unwrap();
     assert_eq!(
         env.iter()
@@ -254,7 +255,7 @@ fn proxy_container_mounts_unlock_socket() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/run/enclava/unlock.sock")
+        Some("/run/enclava-unlock/unlock.sock")
     );
 }
 
@@ -338,7 +339,7 @@ fn caddy_container_waits_for_init_ready_before_starting_caddy() {
     let c = build_caddy_container(&sample_app());
     assert_eq!(
         c.command.as_ref().unwrap(),
-        &vec!["/usr/local/bin/enclava-wait-exec".to_string()]
+        &vec!["/enclava-tools/enclava-wait-exec".to_string()]
     );
     assert_eq!(
         c.args.as_ref().unwrap(),
@@ -355,7 +356,7 @@ fn caddy_container_waits_for_init_ready_before_starting_caddy() {
 fn caddy_container_does_not_mount_extra_tools() {
     let c = build_caddy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
-    assert!(vm.iter().all(|m| m.name != "enclava-tools"));
+    assert!(vm.iter().any(|m| m.name == "enclava-tools"));
 }
 
 #[test]
@@ -397,10 +398,7 @@ fn caddy_container_reads_seed_from_state_caddy() {
     let c = build_caddy_container(&sample_app());
     let env = c.env.as_ref().unwrap();
     let found = env.iter().find(|e| e.name == "CADDY_SEED_PATH").unwrap();
-    assert_eq!(
-        found.value.as_deref(),
-        Some("/run/enclava/seeds/caddy/seed")
-    );
+    assert_eq!(found.value.as_deref(), Some("/state/caddy/seed"));
 }
 
 #[test]
@@ -565,6 +563,7 @@ fn enclava_init_container_mounts_both_luks_devices_and_unlock_socket() {
     assert!(vd.iter().any(|d| d.name == "tls-state"));
     let vm = c.volume_mounts.as_ref().unwrap();
     assert!(vm.iter().any(|m| m.name == "unlock-socket"));
+    assert!(vm.iter().any(|m| m.name == "unlock-channel"));
     assert!(vm.iter().any(|m| m.name == "enclava-init-config"));
     assert!(vm.iter().all(|m| m.name != "caddy-runtime"));
     let state_mount = vm.iter().find(|m| m.name == "state-mount").unwrap();

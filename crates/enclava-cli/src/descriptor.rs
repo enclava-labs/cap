@@ -59,8 +59,8 @@ pub struct CapAppOciRuntimeSpecInput {
     pub memory_limit: String,
 }
 
-pub const CAP_WAIT_EXEC_PATH: &str = "/usr/local/bin/enclava-wait-exec";
-pub const CAP_APP_SEED_PATH: &str = "/run/enclava/seeds/app/seed";
+pub const CAP_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
+pub const CAP_APP_SEED_PATH: &str = "/state/app/seed";
 pub const CAP_APP_UID: u32 = 10001;
 pub const CAP_APP_GID: u32 = 10001;
 pub const CAP_APP_CPU_REQUEST: &str = "250m";

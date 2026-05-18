@@ -14,11 +14,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const BUNDLED_PLATFORM_RELEASE: &str = include_str!("../platform-release.json");
-
-// Fixture release root used for the checked-in development release artifact.
-// Production release builds can replace this by setting
-// ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX at compile time.
-const FALLBACK_RELEASE_ROOT_PUBKEY_HEX: &str =
+#[cfg(test)]
+const TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str =
     "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd";
 
 #[derive(Debug, Error)]
@@ -34,6 +31,8 @@ pub enum PlatformReleaseError {
         field: &'static str,
         message: String,
     },
+    #[error("platform release root pubkey is not configured at compile time")]
+    MissingRootPubkey,
     #[error("platform release signature pubkey is not the pinned root")]
     RootMismatch,
     #[error("platform release signature verification failed: {0}")]
@@ -102,11 +101,13 @@ impl PlatformRelease {
 pub fn verify_envelope(
     envelope: PlatformReleaseEnvelope,
 ) -> Result<PlatformRelease, PlatformReleaseError> {
-    let pinned = hex32(
-        "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX",
-        option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
-            .unwrap_or(FALLBACK_RELEASE_ROOT_PUBKEY_HEX),
-    )?;
+    #[cfg(test)]
+    let configured_root = option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
+        .unwrap_or(TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX);
+    #[cfg(not(test))]
+    let configured_root = option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
+        .ok_or(PlatformReleaseError::MissingRootPubkey)?;
+    let pinned = hex32("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX", configured_root)?;
     let signing = hex32("signing_pubkey", &envelope.signing_pubkey)?;
     if signing != pinned {
         return Err(PlatformReleaseError::RootMismatch);

@@ -293,26 +293,43 @@ fn decode_hex_len(
     Ok(bytes)
 }
 
+fn require_api_key_org(
+    auth: &AuthContext,
+    org_id: Uuid,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if auth.api_key.is_some() && auth.org_id != org_id {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "API key is restricted to its organization"
+            })),
+        ));
+    }
+    Ok(())
+}
+
 async fn active_membership(
     state: &AppState,
-    user_id: Uuid,
+    auth: &AuthContext,
     org_name: &str,
 ) -> Result<(Uuid, Role), (StatusCode, Json<serde_json::Value>)> {
-    sqlx::query_as(
+    let (org_id, role) = sqlx::query_as(
         "SELECT o.id, m.role as \"role: _\"
          FROM organizations o
          JOIN memberships m ON m.org_id = o.id
          WHERE o.name = $1 AND m.user_id = $2 AND m.removed_at IS NULL",
     )
     .bind(org_name)
-    .bind(user_id)
+    .bind(auth.user_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|_| db_error())?
     .ok_or((
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({"error": "organization not found"})),
-    ))
+    ))?;
+    require_api_key_org(auth, org_id)?;
+    Ok((org_id, role))
 }
 
 pub async fn put_keyring(
@@ -322,8 +339,8 @@ pub async fn put_keyring(
     Json(body): Json<PutOrgKeyringRequest>,
 ) -> Result<(StatusCode, Json<OrgKeyringResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_scope(&auth, "org:admin")?;
-    let (org_id, caller_role) = active_membership(&state, auth.user_id, &org_name).await?;
-    scopes::require_admin_role(caller_role)?;
+    let (org_id, caller_role) = active_membership(&state, &auth, &org_name).await?;
+    scopes::require_owner_role(caller_role)?;
 
     if body.version < 1 {
         return Err(bad_request("version must be positive"));
@@ -476,7 +493,7 @@ pub async fn get_keyring(
     Path(org_name): Path<String>,
 ) -> Result<Json<OrgKeyringResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_member(&auth)?;
-    let (org_id, _) = active_membership(&state, auth.user_id, &org_name).await?;
+    let (org_id, _) = active_membership(&state, &auth, &org_name).await?;
 
     let row: Option<KeyringRow> = sqlx::query_as(
         "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey
@@ -519,7 +536,7 @@ pub async fn bootstrap_signing_service_owner(
     Json(body): Json<BootstrapSigningServiceRequest>,
 ) -> Result<Json<BootstrapSigningServiceResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_scope(&auth, "org:admin")?;
-    let (org_id, caller_role) = active_membership(&state, auth.user_id, &org_name).await?;
+    let (org_id, caller_role) = active_membership(&state, &auth, &org_name).await?;
     scopes::require_admin_role(caller_role)?;
 
     let owner_pubkey = decode_hex_len("owner_pubkey_hex", &body.owner_pubkey_hex, 32)?;
@@ -588,6 +605,7 @@ pub async fn invite_member(
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({"error": "organization not found"})),
     ))?;
+    require_api_key_org(&auth, org_id)?;
 
     scopes::require_admin_role(caller_role)?;
 
@@ -673,6 +691,7 @@ pub async fn list_members(
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({"error": "organization not found"})),
     ))?;
+    require_api_key_org(&auth, org_id)?;
 
     let members: Vec<(Uuid, String, Role)> = sqlx::query_as(
         "SELECT u.id, u.display_name, m.role as \"role: _\"
@@ -723,6 +742,7 @@ pub async fn remove_member(
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({"error": "organization not found"})),
     ))?;
+    require_api_key_org(&auth, org_id)?;
 
     scopes::require_admin_role(caller_role)?;
 

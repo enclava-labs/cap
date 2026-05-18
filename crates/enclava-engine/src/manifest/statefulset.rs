@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use crate::manifest::cc_init_data;
 use crate::manifest::containers::{
     build_app_container, build_attestation_proxy_container, build_caddy_container,
-    build_enclava_init_container, legacy_bootstrap_enabled,
+    build_enclava_init_container, build_enclava_tools_init_container, legacy_bootstrap_enabled,
 };
 use crate::manifest::volumes::{build_volume_claim_templates, build_volumes};
 use crate::types::ConfidentialApp;
@@ -81,7 +81,7 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
         )
     } else {
         (
-            None,
+            Some(vec![build_enclava_tools_init_container()]),
             vec![
                 build_app_container(app),
                 build_attestation_proxy_container(app),

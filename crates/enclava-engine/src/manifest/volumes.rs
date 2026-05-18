@@ -56,6 +56,11 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             ..Default::default()
         });
         v.push(Volume {
+            name: "enclava-tools".to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+        v.push(Volume {
             name: "startup".to_string(),
             config_map: Some(ConfigMapVolumeSource {
                 name: format!("{}-startup", app.name),
@@ -65,6 +70,11 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             ..Default::default()
         });
     } else {
+        v.push(Volume {
+            name: "enclava-tools".to_string(),
+            empty_dir: Some(EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
         v.push(Volume {
             name: "startup".to_string(),
             config_map: Some(ConfigMapVolumeSource {
@@ -79,6 +89,14 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             empty_dir: Some(EmptyDirVolumeSource {
                 medium: Some("Memory".to_string()),
                 size_limit: Some(Quantity("16Mi".to_string())),
+            }),
+            ..Default::default()
+        });
+        v.push(Volume {
+            name: "unlock-channel".to_string(),
+            empty_dir: Some(EmptyDirVolumeSource {
+                medium: Some("Memory".to_string()),
+                size_limit: Some(Quantity("1Mi".to_string())),
             }),
             ..Default::default()
         });

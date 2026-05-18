@@ -17,6 +17,8 @@ fn config_toml_has_both_volume_blocks() {
     assert!(toml_text.contains("[state]"));
     assert!(toml_text.contains("[tls-state]"));
     assert!(toml_text.contains("state-root = \"/state\""));
+    assert!(toml_text.contains("unlock-socket = \"/run/enclava-unlock/unlock.sock\""));
+    assert!(toml_text.contains("attempts-path = \"/run/enclava-unlock/unlock-attempts\""));
     assert!(toml_text.contains("mount-path = \"/state\""));
     assert!(toml_text.contains("mount-path = \"/state/tls-state\""));
     assert!(toml_text.contains("hkdf-info = \"state-luks-key\""));

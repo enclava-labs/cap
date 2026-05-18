@@ -55,9 +55,8 @@ pub struct AppState {
     /// blobs are supplied on deploy, CAP forwards them here and persists the
     /// returned signed policy artifact.
     pub signing_service: Option<SigningServiceClient>,
-    /// When true, CAP refuses to mint policy artifacts through the platform
-    /// signing-service fallback and requires callers to submit a
-    /// customer-signed artifact with the deploy/redeploy request.
+    /// When true, CAP requires callers to submit signed descriptor/keyring
+    /// blobs even if no platform signing-service URL is configured.
     pub require_customer_signed_policy_artifact: bool,
     /// Cluster-wide apply backpressure for this API instance. Applying a CAP
     /// deployment starts a Kata VM and attaches Longhorn volumes; bursts can

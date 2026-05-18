@@ -200,7 +200,7 @@ fn statefulset_phase5_uses_only_steady_state_containers() {
     let sts = generate_statefulset(&app);
     let pod = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
 
-    assert!(pod.init_containers.is_none());
+    assert_eq!(pod.init_containers.as_ref().map(|v| v.len()), Some(1));
 
     let names: Vec<&str> = pod.containers.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"web"));
@@ -270,7 +270,8 @@ fn statefulset_has_volumes() {
         .unwrap();
     assert!(volumes.iter().any(|v| v.name == "ownership-signal"));
     assert!(volumes.iter().any(|v| v.name == "unlock-socket"));
-    assert!(volumes.iter().all(|v| v.name != "enclava-tools"));
+    assert!(volumes.iter().any(|v| v.name == "unlock-channel"));
+    assert!(volumes.iter().any(|v| v.name == "enclava-tools"));
     assert!(volumes.iter().any(|v| v.name == "enclava-init-config"));
     // Phase 5 default does not mount Cloudflare DNS-01 token nor the legacy bootstrap script.
     assert!(volumes.iter().all(|v| v.name != "tls-cloudflare-token"));

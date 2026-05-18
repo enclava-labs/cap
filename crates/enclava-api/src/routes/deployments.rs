@@ -80,8 +80,32 @@ pub(crate) async fn resolve_signed_policy_artifact(
     state: &AppState,
     artifacts: &crate::signing_service::DeploymentSigningArtifacts,
     provided_artifact: Option<String>,
-    _signing_service_pubkey_hex: Option<&str>,
+    signing_service_pubkey_hex: Option<&str>,
 ) -> Result<crate::signing_service::SignedPolicyArtifact, (StatusCode, Json<serde_json::Value>)> {
+    artifacts
+        .validate_customer_authority(&state.db)
+        .await
+        .map_err(signing_error_response)?;
+    let signing_service_pubkey_hex = signing_service_pubkey_hex.ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "platform signing-service pubkey required for signed_policy_artifact verification"
+        })),
+    ))?;
+    let signing_service = state.signing_service.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "canonical policy validation requires the platform signing service"
+        })),
+    ))?;
+
+    let generated = signing_service
+        .agent_policy(&crate::signing_service::AgentPolicyRequest {
+            descriptor: artifacts.descriptor.clone(),
+        })
+        .await
+        .map_err(signing_error_response)?;
+
     if let Some(provided_artifact) = provided_artifact {
         let mut artifact =
             crate::signing_service::decode_optional_policy_artifact(Some(provided_artifact))
@@ -91,40 +115,34 @@ pub(crate) async fn resolve_signed_policy_artifact(
                         crate::signing_service::SigningServiceError::ArtifactWithoutBlobs,
                     )
                 })?;
-        artifacts
-            .validate_customer_authority(&state.db)
-            .await
-            .map_err(signing_error_response)?;
-        artifacts
-            .validate_customer_signed_artifact(&artifact)
-            .map_err(signing_error_response)?;
-        let signing_service = state.signing_service.as_ref().ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "canonical agent policy validation requires the platform policy generator"
-            })),
-        ))?;
-        let generated = signing_service
-            .agent_policy(&crate::signing_service::AgentPolicyRequest {
-                descriptor: artifacts.descriptor.clone(),
-            })
-            .await
-            .map_err(signing_error_response)?;
-        artifacts
-            .validate_canonical_agent_policy(&artifact, &generated)
-            .map_err(signing_error_response)?;
-        artifacts
-            .attach_customer_authority(&mut artifact)
-            .map_err(signing_error_response)?;
-        return Ok(artifact);
+        if artifacts
+            .validate_signed_artifact(&artifact, signing_service_pubkey_hex)
+            .is_ok()
+        {
+            artifacts
+                .validate_canonical_agent_policy(&artifact, &generated)
+                .map_err(signing_error_response)?;
+            artifacts
+                .attach_customer_authority(&mut artifact)
+                .map_err(signing_error_response)?;
+            return Ok(artifact);
+        }
     }
 
-    Err((
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({
-            "error": "customer-signed signed_policy_artifact is required; platform signing-service fallback is disabled"
-        })),
-    ))
+    let mut artifact = signing_service
+        .sign(&artifacts.sign_request())
+        .await
+        .map_err(signing_error_response)?;
+    artifacts
+        .validate_signed_artifact(&artifact, signing_service_pubkey_hex)
+        .map_err(signing_error_response)?;
+    artifacts
+        .validate_canonical_agent_policy(&artifact, &generated)
+        .map_err(signing_error_response)?;
+    artifacts
+        .attach_customer_authority(&mut artifact)
+        .map_err(signing_error_response)?;
+    Ok(artifact)
 }
 
 /// Pick the right cosign `VerificationPolicy` for a stored signer identity.
@@ -1073,7 +1091,7 @@ pub async fn rollback(
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "rollback target has no stored customer-signed policy artifact"
+                "error": "rollback target has no stored signed policy artifact"
             })),
         ));
     }

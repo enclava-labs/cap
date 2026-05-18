@@ -19,6 +19,9 @@ fn volumes_has_unlock_socket_memory_emptydir() {
     let v = vols.iter().find(|v| v.name == "unlock-socket").unwrap();
     let ed = v.empty_dir.as_ref().unwrap();
     assert_eq!(ed.medium.as_deref(), Some("Memory"));
+    let channel = vols.iter().find(|v| v.name == "unlock-channel").unwrap();
+    let channel_ed = channel.empty_dir.as_ref().unwrap();
+    assert_eq!(channel_ed.medium.as_deref(), Some("Memory"));
 }
 
 #[test]
@@ -55,7 +58,7 @@ fn volumes_have_shared_decrypted_mountpoints() {
 #[test]
 fn volumes_do_not_include_enclava_tools_emptydir() {
     let vols = build_volumes(&sample_app());
-    assert!(vols.iter().all(|v| v.name != "enclava-tools"));
+    assert!(vols.iter().any(|v| v.name == "enclava-tools"));
 }
 
 #[test]

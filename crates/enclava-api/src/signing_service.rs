@@ -390,73 +390,8 @@ impl DeploymentSigningArtifacts {
         artifact: &SignedPolicyArtifact,
         signing_service_pubkey_hex: &str,
     ) -> Result<(), SigningServiceError> {
-        let metadata = &artifact.metadata;
-        if metadata.app_id != self.descriptor.app_id.to_string() {
-            return Err(SigningServiceError::Mismatch(
-                "artifact.metadata.app_id".into(),
-            ));
-        }
-        if metadata.deploy_id != self.descriptor.deploy_id.to_string() {
-            return Err(SigningServiceError::Mismatch(
-                "artifact.metadata.deploy_id".into(),
-            ));
-        }
-        if metadata.descriptor_core_hash != hex::encode(self.descriptor_core_hash) {
-            return Err(SigningServiceError::Mismatch(
-                "artifact.metadata.descriptor_core_hash".into(),
-            ));
-        }
-        if metadata.descriptor_signing_pubkey != hex::encode(self.descriptor_signing_pubkey) {
-            return Err(SigningServiceError::Mismatch(
-                "artifact.metadata.descriptor_signing_pubkey".into(),
-            ));
-        }
-        if metadata.platform_release_version != self.descriptor.platform_release_version {
-            return Err(SigningServiceError::Mismatch(
-                "artifact.metadata.platform_release_version".into(),
-            ));
-        }
-        if metadata.policy_template_id != self.descriptor.policy_template_id {
-            return Err(SigningServiceError::Mismatch(
-                "artifact.metadata.policy_template_id".into(),
-            ));
-        }
-        if metadata.policy_template_sha256 != hex::encode(self.descriptor.policy_template_sha256) {
-            return Err(SigningServiceError::Mismatch(
-                "artifact.metadata.policy_template_sha256".into(),
-            ));
-        }
-        if metadata.agent_policy_sha256 != artifact.agent_policy_sha256 {
-            return Err(SigningServiceError::Mismatch(
-                "artifact.metadata.agent_policy_sha256".into(),
-            ));
-        }
-
+        self.validate_signed_artifact_common(artifact)?;
         let rego_hash: [u8; 32] = Sha256::digest(artifact.rego_text.as_bytes()).into();
-        let artifact_rego_hash = decode_hex32("rego_sha256", &artifact.rego_sha256)?;
-        if artifact_rego_hash != rego_hash {
-            return Err(SigningServiceError::Mismatch("artifact.rego_sha256".into()));
-        }
-        if self.descriptor.expected_kbs_policy_hash != rego_hash {
-            return Err(SigningServiceError::Mismatch(
-                "expected_kbs_policy_hash".into(),
-            ));
-        }
-        let agent_policy_hash: [u8; 32] =
-            Sha256::digest(artifact.agent_policy_text.as_bytes()).into();
-        let artifact_agent_policy_hash =
-            decode_hex32("agent_policy_sha256", &artifact.agent_policy_sha256)?;
-        if artifact_agent_policy_hash != agent_policy_hash {
-            return Err(SigningServiceError::Mismatch(
-                "artifact.agent_policy_sha256".into(),
-            ));
-        }
-        if self.descriptor.expected_agent_policy_hash != agent_policy_hash {
-            return Err(SigningServiceError::Mismatch(
-                "expected_agent_policy_hash".into(),
-            ));
-        }
-
         verify_signed_policy_artifact(artifact, &rego_hash, signing_service_pubkey_hex)?;
         Ok(())
     }
@@ -473,21 +408,6 @@ impl DeploymentSigningArtifacts {
             ));
         }
         self.verify_matches_latest_cap_keyring(pool).await?;
-        Ok(())
-    }
-
-    pub fn validate_customer_signed_artifact(
-        &self,
-        artifact: &SignedPolicyArtifact,
-    ) -> Result<(), SigningServiceError> {
-        self.validate_signed_artifact_common(artifact)?;
-        let rego_hash: [u8; 32] = Sha256::digest(artifact.rego_text.as_bytes()).into();
-        verify_signed_policy_artifact_with_pubkey(
-            artifact,
-            &rego_hash,
-            &self.descriptor_signing_pubkey,
-            "artifact.verify_pubkey_b64",
-        )?;
         Ok(())
     }
 
@@ -1621,15 +1541,32 @@ mod tests {
     }
 
     #[test]
-    fn validates_customer_signed_policy_artifact_with_descriptor_key() {
-        let signing_key = SigningKey::from_bytes(&[0x33; 32]);
-        let mut artifacts = signing_artifacts(descriptor());
-        artifacts.descriptor_signing_pubkey = signing_key.verifying_key().to_bytes();
-        let artifact = signed_policy_artifact(&artifacts, &signing_key);
+    fn validates_customer_supplied_policy_artifact_with_platform_key() {
+        let artifacts = signing_artifacts(descriptor());
+        let platform_key = SigningKey::from_bytes(&[0x33; 32]);
+        let artifact = signed_policy_artifact(&artifacts, &platform_key);
+        let platform_pubkey_hex = hex::encode(platform_key.verifying_key().to_bytes());
 
         artifacts
-            .validate_customer_signed_artifact(&artifact)
+            .validate_signed_artifact(&artifact, &platform_pubkey_hex)
             .unwrap();
+    }
+
+    #[test]
+    fn rejects_descriptor_key_signed_customer_supplied_policy_artifact() {
+        let descriptor_key = SigningKey::from_bytes(&[0x33; 32]);
+        let platform_key = SigningKey::from_bytes(&[0x44; 32]);
+        let mut artifacts = signing_artifacts(descriptor());
+        artifacts.descriptor_signing_pubkey = descriptor_key.verifying_key().to_bytes();
+        let artifact = signed_policy_artifact(&artifacts, &descriptor_key);
+        let platform_pubkey_hex = hex::encode(platform_key.verifying_key().to_bytes());
+
+        let err = artifacts
+            .validate_signed_artifact(&artifact, &platform_pubkey_hex)
+            .unwrap_err();
+        assert!(
+            matches!(err, SigningServiceError::Mismatch(field) if field == "artifact.verify_pubkey_b64")
+        );
     }
 
     #[test]
@@ -1666,15 +1603,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_customer_signed_policy_artifact_from_other_key() {
-        let signing_key = SigningKey::from_bytes(&[0x33; 32]);
+    fn rejects_customer_supplied_policy_artifact_from_unconfigured_key() {
+        let platform_key = SigningKey::from_bytes(&[0x33; 32]);
         let other_key = SigningKey::from_bytes(&[0x44; 32]);
-        let mut artifacts = signing_artifacts(descriptor());
-        artifacts.descriptor_signing_pubkey = signing_key.verifying_key().to_bytes();
+        let artifacts = signing_artifacts(descriptor());
         let artifact = signed_policy_artifact(&artifacts, &other_key);
+        let platform_pubkey_hex = hex::encode(platform_key.verifying_key().to_bytes());
 
         let err = artifacts
-            .validate_customer_signed_artifact(&artifact)
+            .validate_signed_artifact(&artifact, &platform_pubkey_hex)
             .unwrap_err();
         assert!(matches!(err, SigningServiceError::Mismatch(_)));
     }
@@ -1686,9 +1623,10 @@ mod tests {
         artifacts.descriptor.expected_kbs_policy_hash = [0xee; 32];
         artifacts.descriptor_signing_pubkey = signing_key.verifying_key().to_bytes();
         let artifact = signed_policy_artifact(&artifacts, &signing_key);
+        let configured_pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
 
         let err = artifacts
-            .validate_customer_signed_artifact(&artifact)
+            .validate_signed_artifact(&artifact, &configured_pubkey_hex)
             .unwrap_err();
         assert!(
             matches!(err, SigningServiceError::Mismatch(field) if field == "expected_kbs_policy_hash")

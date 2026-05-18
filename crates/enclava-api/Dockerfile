@@ -3,6 +3,9 @@
 # Build stage
 FROM rust:1.88-alpine AS builder
 
+ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+ENV ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX}
+
 # Install musl build dependencies
 RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf
 

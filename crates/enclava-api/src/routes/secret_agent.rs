@@ -84,7 +84,7 @@ pub async fn create_deployment(
             Json(response_from_parts(
                 body.deployment_id,
                 &existing.app,
-                existing.deployment.as_ref(),
+                Some(&existing.deployment),
                 Some(image.to_string()),
                 body.manifest_ref,
                 Some("attestation-policy:cap-native".to_string()),
@@ -170,9 +170,9 @@ pub async fn deployment_status(
     Ok(Json(response_from_parts(
         deployment_id,
         &found.app,
-        found.deployment.as_ref(),
+        Some(&found.deployment),
         latest_image_for_app(&state, found.app.id).await?,
-        latest_manifest_ref(found.deployment.as_ref()),
+        latest_manifest_ref(Some(&found.deployment)),
         Some("attestation-policy:cap-native".to_string()),
     )))
 }
@@ -201,7 +201,7 @@ pub async fn config_token(
 
 struct FoundSecretAgentDeployment {
     app: App,
-    deployment: Option<Deployment>,
+    deployment: Deployment,
 }
 
 async fn find_secret_agent_deployment(
@@ -214,7 +214,7 @@ async fn find_secret_agent_deployment(
         return Ok(None);
     };
 
-    let deployment = sqlx::query_as(
+    let Some(deployment) = sqlx::query_as(
         "SELECT d.*
            FROM deployments d
           WHERE d.app_id = $1
@@ -226,7 +226,10 @@ async fn find_secret_agent_deployment(
     .bind(deployment_id.to_string())
     .fetch_optional(&state.db)
     .await
-    .map_err(|_| internal_server_error())?;
+    .map_err(|_| internal_server_error())?
+    else {
+        return Ok(None);
+    };
 
     Ok(Some(FoundSecretAgentDeployment { app, deployment }))
 }

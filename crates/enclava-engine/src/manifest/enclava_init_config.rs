@@ -69,6 +69,8 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     let mut out = String::new();
     out.push_str(&format!("mode = \"{mode}\"\n"));
     out.push_str("state-root = \"/state\"\n");
+    out.push_str("unlock-socket = \"/run/enclava-unlock/unlock.sock\"\n");
+    out.push_str("attempts-path = \"/run/enclava-unlock/unlock-attempts\"\n");
     out.push_str(&format!("app-uid = {APP_UID}\n"));
     out.push_str(&format!("app-gid = {APP_GID}\n"));
     out.push_str(&format!("caddy-uid = {CADDY_UID}\n"));
