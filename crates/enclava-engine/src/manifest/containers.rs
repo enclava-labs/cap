@@ -51,6 +51,21 @@ pub const CADDY_ACME_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 
+fn shell_escape_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    let escaped = arg.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
+}
+
+fn shell_escape_argv(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_escape_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn ownership_mode_str(mode: UnlockMode) -> &'static str {
     match mode {
         UnlockMode::Auto => "auto-unlock",
@@ -142,7 +157,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
 
     let (command, args): (Option<Vec<String>>, Option<Vec<String>>) = if legacy {
         let user_cmd = if let Some(ref cmd) = primary.command {
-            cmd.join(" ")
+            shell_escape_argv(cmd)
         } else {
             "/bin/sh -c 'exec /usr/local/bin/app'".to_string()
         };
