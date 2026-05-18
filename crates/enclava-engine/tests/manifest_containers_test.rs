@@ -5,7 +5,7 @@
 
 use enclava_engine::manifest::containers::{
     ENCLAVA_WAIT_EXEC_PATH, build_app_container, build_attestation_proxy_container,
-    build_caddy_container, build_enclava_init_container,
+    build_caddy_container, build_enclava_init_container, build_enclava_tools_init_container,
 };
 use enclava_engine::testutil::sample_app;
 use enclava_engine::types::CaddyTlsMode;
@@ -553,6 +553,19 @@ fn enclava_init_container_has_memory_for_unlock_verification_and_certificate_pro
 
     assert_eq!(requests.get("memory").unwrap().0, "64Mi");
     assert_eq!(limits.get("memory").unwrap().0, "512Mi");
+}
+
+#[test]
+fn enclava_tools_init_container_has_resources_for_tenant_quota() {
+    let c = build_enclava_tools_init_container();
+    let resources = c.resources.as_ref().unwrap();
+    let requests = resources.requests.as_ref().unwrap();
+    let limits = resources.limits.as_ref().unwrap();
+
+    assert_eq!(requests.get("cpu").unwrap().0, "10m");
+    assert_eq!(requests.get("memory").unwrap().0, "16Mi");
+    assert_eq!(limits.get("cpu").unwrap().0, "50m");
+    assert_eq!(limits.get("memory").unwrap().0, "64Mi");
 }
 
 #[test]

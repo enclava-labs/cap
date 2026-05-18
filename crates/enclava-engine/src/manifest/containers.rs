@@ -451,6 +451,21 @@ pub fn build_enclava_tools_init_container() -> Container {
             }),
             ..Default::default()
         }),
+        resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
+            requests: Some({
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("memory".to_string(), Quantity("16Mi".to_string()));
+                m.insert("cpu".to_string(), Quantity("10m".to_string()));
+                m
+            }),
+            limits: Some({
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("memory".to_string(), Quantity("64Mi".to_string()));
+                m.insert("cpu".to_string(), Quantity("50m".to_string()));
+                m
+            }),
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
