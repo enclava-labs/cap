@@ -81,13 +81,9 @@ fn run() -> Result<()> {
     validate_configmap_transport_against_signed_cc_init_data(&cfg)?;
     let stay_alive = stay_alive_enabled();
     let ready_file = ready_file_path();
-    let mut workload_namespaces = Vec::new();
     if stay_alive {
-        record_stage("waiting for workload containers").ok();
         clear_ready_file(&ready_file)
             .with_context(|| format!("clearing stale ready file {}", ready_file.display()))?;
-        workload_namespaces = wait_for_container_start_sentinels()
-            .context("waiting for workload containers to start before mounting LUKS")?;
     }
 
     record_stage("waiting for owner seed").ok();
@@ -122,6 +118,9 @@ fn run() -> Result<()> {
     write_per_component_seeds(&cfg, &owner)?;
 
     if stay_alive {
+        record_stage("waiting for workload containers").ok();
+        let workload_namespaces = wait_for_container_start_sentinels()
+            .context("waiting for workload containers before bind-mounting decrypted volumes")?;
         record_stage("binding workload mount namespaces").ok();
         bind_mounts_into_workload_namespaces(&cfg, &workload_namespaces)
             .context("binding decrypted mounts into workload namespaces")?;
@@ -202,7 +201,7 @@ fn wait_for_container_start_sentinels() -> Result<Vec<WorkloadNamespace>> {
     tracing::info!(
         dir = %dir.display(),
         containers = containers.join(","),
-        "waiting for workload containers to start before opening LUKS"
+        "waiting for workload containers before bind-mounting decrypted volumes"
     );
     let wait_timeout = container_start_wait_timeout();
     let deadline = std::time::Instant::now() + wait_timeout;
@@ -1479,5 +1478,21 @@ trustee_policy_url = "file:///policy.json"
 
         let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
         assert!(err.to_string().contains("kbs-resource-path"));
+    }
+
+    #[test]
+    fn password_unlock_socket_is_reached_before_waiting_on_workload_namespaces() {
+        let source = include_str!("main.rs");
+        let owner_seed_stage = source
+            .find("record_stage(\"waiting for owner seed\")")
+            .expect("owner seed stage marker");
+        let workload_wait_stage = source
+            .find("record_stage(\"waiting for workload containers\")")
+            .expect("workload wait stage marker");
+
+        assert!(
+            owner_seed_stage < workload_wait_stage,
+            "enclava-init must accept claim/unlock before waiting on workload sentinels"
+        );
     }
 }
