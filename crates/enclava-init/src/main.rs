@@ -1085,10 +1085,6 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn mount_source_path_for_namespace_bind(source: &Path) -> &Path {
-    source
-}
-
 fn mount_source_path_after_workload_chroot(source: &Path) -> PathBuf {
     let source = source.to_string_lossy();
     let Some(rest) = source.strip_prefix("/proc/") else {
@@ -1313,18 +1309,6 @@ mod tests {
 
         assert!(paths_resolve_to_same_object(&one, &one).unwrap());
         assert!(!paths_resolve_to_same_object(&one, &two).unwrap());
-    }
-
-    #[test]
-    fn namespace_bind_keeps_cross_namespace_proc_source_path() {
-        let dir = tempdir().unwrap();
-        let source = dir.path().join("source");
-        std::fs::create_dir_all(&source).unwrap();
-        let _source_dir = std::fs::File::open(&source).unwrap();
-
-        let mount_source = mount_source_path_for_namespace_bind(&source);
-
-        assert_eq!(mount_source, source.as_path());
     }
 
     #[test]
