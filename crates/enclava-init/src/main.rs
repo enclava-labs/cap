@@ -1057,10 +1057,10 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     nix::unistd::chroot(&workload_root)
         .with_context(|| format!("chroot to workload root {}", workload_root.display()))?;
     std::env::set_current_dir("/").context("entering chroot /")?;
-    let source_mount_path = mount_source_path_for_namespace_bind(&source);
+    let source_mount_path = mount_source_path_after_workload_chroot(&source);
     std::fs::create_dir_all(&target)
         .with_context(|| format!("creating target {}", target.display()))?;
-    if paths_resolve_to_same_object(source_mount_path, &target).with_context(|| {
+    if paths_resolve_to_same_object(&source_mount_path, &target).with_context(|| {
         format!(
             "checking whether {} is already mounted at {}",
             source.display(),
@@ -1071,12 +1071,11 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     }
     // Bind each target explicitly. Recursive bind can fold the sibling
     // tls-state mount back through the pod mount topology and return EINVAL.
-    // Do not use /proc/self/fd for the source here: live Kata rejects that
-    // bind source with EINVAL after setns. The source is already a cross-
-    // namespace /proc/<init-pid>/root/... path and remains resolvable from the
-    // workload mount namespace after chrooting into the workload root.
+    // Do not use /proc/self/fd or /proc/<pid>/root for the source here: live
+    // Kata rejects those bind sources with EINVAL. After chrooting into the
+    // workload root, the propagated /state mount is visible at its normal path.
     nix::mount::mount(
-        Some(source_mount_path),
+        Some(source_mount_path.as_path()),
         target.as_path(),
         None::<&str>,
         nix::mount::MsFlags::MS_BIND,
@@ -1088,6 +1087,20 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
 
 fn mount_source_path_for_namespace_bind(source: &Path) -> &Path {
     source
+}
+
+fn mount_source_path_after_workload_chroot(source: &Path) -> PathBuf {
+    let source = source.to_string_lossy();
+    let Some(rest) = source.strip_prefix("/proc/") else {
+        return PathBuf::from(source.as_ref());
+    };
+    let Some((pid, path)) = rest.split_once("/root/") else {
+        return PathBuf::from(source.as_ref());
+    };
+    if !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return PathBuf::from(source.as_ref());
+    }
+    PathBuf::from("/").join(path)
 }
 
 fn workload_proc_root_path(pid: u32) -> PathBuf {
@@ -1319,6 +1332,15 @@ mod tests {
         let root = workload_proc_root_path(42);
 
         assert_eq!(root, PathBuf::from("/proc/42/root"));
+    }
+
+    #[test]
+    fn namespace_bind_chroot_source_strips_init_proc_root() {
+        let source = Path::new("/proc/10/root/state/data");
+
+        let stripped = mount_source_path_after_workload_chroot(source);
+
+        assert_eq!(stripped, PathBuf::from("/state/data"));
     }
 
     #[test]
