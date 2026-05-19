@@ -247,7 +247,11 @@ fn proxy_container_mounts_unlock_socket() {
     let vm = c.volume_mounts.as_ref().unwrap();
     let m = vm.iter().find(|m| m.name == "unlock-channel").unwrap();
     assert_eq!(m.mount_path, "/run/enclava-unlock");
-    assert!(vm.iter().all(|m| m.name != "unlock-socket"));
+    let ready_m = vm
+        .iter()
+        .find(|m| m.name == "unlock-socket" && m.mount_path == "/run/enclava")
+        .unwrap();
+    assert_eq!(ready_m.read_only, Some(true));
     let env = c.env.as_ref().unwrap();
     assert_eq!(
         env.iter()
