@@ -9,8 +9,6 @@ use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
     kbs_fetch, luks, seeds, socket, tls_certificate, trustee_verify, unlock, writes,
 };
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
 const DEFAULT_ERROR_FILE: &str = "/run/enclava/init-error";
@@ -1046,7 +1044,7 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         .map_err(|_| anyhow!("invalid pid {}", args[0]))?;
     let source = PathBuf::from(&args[1]);
     let target = PathBuf::from(&args[2]);
-    let source_dir = std::fs::File::open(&source)
+    let _source_dir = std::fs::File::open(&source)
         .with_context(|| format!("open source {}", source.display()))?;
     std::fs::metadata(&source).with_context(|| format!("stat source {}", source.display()))?;
     let ns = std::fs::File::open(format!("/proc/{pid}/ns/mnt"))
@@ -1055,8 +1053,8 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         .with_context(|| format!("setns to pid {pid} mount namespace"))?;
     std::fs::create_dir_all(&target)
         .with_context(|| format!("creating target {}", target.display()))?;
-    let source_fd_path = mount_source_fd_path(&source_dir);
-    if paths_resolve_to_same_object(&source_fd_path, &target).with_context(|| {
+    let source_mount_path = mount_source_path_for_namespace_bind(&source);
+    if paths_resolve_to_same_object(source_mount_path, &target).with_context(|| {
         format!(
             "checking whether {} is already mounted at {}",
             source.display(),
@@ -1067,8 +1065,12 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     }
     // Bind each target explicitly. Recursive bind can fold the sibling
     // tls-state mount back through the pod mount topology and return EINVAL.
+    // Do not use /proc/self/fd for the source here: live Kata rejects that
+    // bind source with EINVAL after setns. The source is already a cross-
+    // namespace /proc/<init-pid>/root/... path and remains resolvable from the
+    // workload mount namespace.
     nix::mount::mount(
-        Some(source_fd_path.as_path()),
+        Some(source_mount_path),
         target.as_path(),
         None::<&str>,
         nix::mount::MsFlags::MS_BIND,
@@ -1078,8 +1080,8 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn mount_source_fd_path(source_dir: &std::fs::File) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{}", source_dir.as_raw_fd()))
+fn mount_source_path_for_namespace_bind(source: &Path) -> &Path {
+    source
 }
 
 fn paths_resolve_to_same_object(a: &Path, b: &Path) -> Result<bool> {
@@ -1291,16 +1293,15 @@ mod tests {
     }
 
     #[test]
-    fn namespace_bind_uses_open_source_fd_path() {
+    fn namespace_bind_keeps_cross_namespace_proc_source_path() {
         let dir = tempdir().unwrap();
         let source = dir.path().join("source");
         std::fs::create_dir_all(&source).unwrap();
-        let source_dir = std::fs::File::open(&source).unwrap();
+        let _source_dir = std::fs::File::open(&source).unwrap();
 
-        let fd_path = mount_source_fd_path(&source_dir);
+        let mount_source = mount_source_path_for_namespace_bind(&source);
 
-        assert!(fd_path.starts_with("/proc/self/fd"));
-        assert!(paths_resolve_to_same_object(&fd_path, &source).unwrap());
+        assert_eq!(mount_source, source.as_path());
     }
 
     #[test]
