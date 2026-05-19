@@ -84,9 +84,10 @@ pub struct VerifyInputs<'a> {
     pub artifacts: &'a ArtifactsBundle,
     pub cc_init_data_claims: &'a CcInitDataClaims,
     pub local_cc_init_data_toml: &'a [u8],
-    /// Deprecated compatibility fields. Policy artifacts must verify with the
-    /// descriptor signing key; platform/signing-service fallback keys are not
-    /// accepted here.
+    /// Preferred policy producer keys. When a signing-service key is pinned in
+    /// signed cc_init_data it is authoritative; descriptor-key policy signing is
+    /// only a legacy fallback for older releases with no configured platform
+    /// policy key.
     pub platform_trustee_policy_pubkey: Option<&'a VerifyingKey>,
     pub signing_service_pubkey: Option<&'a VerifyingKey>,
 }
@@ -337,11 +338,28 @@ fn parse_kbs_attestation_token_payload(payload: &serde_json::Value) -> Result<St
 fn verify_policy_envelope_signature(
     env: &PolicyEnvelope,
     descriptor_signing_pubkey: &[u8; 32],
-    _platform_trustee_policy_pubkey: Option<&VerifyingKey>,
-    _signing_service_pubkey: Option<&VerifyingKey>,
+    platform_trustee_policy_pubkey: Option<&VerifyingKey>,
+    signing_service_pubkey: Option<&VerifyingKey>,
 ) -> Result<()> {
     let msg = ce_v1_policy_envelope_message(env)?;
     let sig = Signature::from_bytes(&env.signature);
+
+    if let Some(signing_service_key) = signing_service_pubkey {
+        return signing_service_key.verify(&msg, &sig).map_err(|_| {
+            InitError::TrusteePolicy(
+                "policy envelope sig did not verify with signing service key".into(),
+            )
+        });
+    }
+
+    if let Some(platform_key) = platform_trustee_policy_pubkey {
+        return platform_key.verify(&msg, &sig).map_err(|_| {
+            InitError::TrusteePolicy(
+                "policy envelope sig did not verify with platform trustee policy key".into(),
+            )
+        });
+    }
+
     let descriptor_key = VerifyingKey::from_bytes(descriptor_signing_pubkey)
         .map_err(|e| InitError::TrusteePolicy(format!("descriptor policy pubkey: {e}")))?;
     if descriptor_key.verify(&msg, &sig).is_ok() {
@@ -1001,7 +1019,7 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_chain_rejects_platform_signed_artifact_even_with_fallback_keys() {
+    fn end_to_end_chain_accepts_platform_signed_artifact_with_signing_service_key() {
         let signing = SigningKey::generate(&mut OsRng);
         let deployer = SigningKey::generate(&mut OsRng);
         let descriptor = descriptor_json();
@@ -1019,8 +1037,32 @@ mod tests {
             platform_trustee_policy_pubkey: Some(&signer_pk),
             signing_service_pubkey: Some(&signer_pk),
         };
+        verify_chain(&inputs).expect("platform-signed chain should pass");
+    }
+
+    #[test]
+    fn end_to_end_chain_rejects_descriptor_signed_artifact_when_signing_service_key_is_configured()
+    {
+        let signing = SigningKey::generate(&mut OsRng);
+        let deployer = SigningKey::generate(&mut OsRng);
+        let descriptor = descriptor_json();
+        let keyring = keyring_json(&deployer, "deployer");
+        let rego = "package enclava\ndefault allow := false\n";
+        let cc_toml = b"placeholder cc_init_data";
+        let (bundle, env, cc, _, _) =
+            build_inputs(&descriptor, keyring, rego, &deployer, &deployer, cc_toml);
+        let signer_pk = signing.verifying_key();
+
+        let inputs = VerifyInputs {
+            policy_envelope: &env,
+            artifacts: &bundle,
+            cc_init_data_claims: &cc,
+            local_cc_init_data_toml: cc_toml,
+            platform_trustee_policy_pubkey: Some(&signer_pk),
+            signing_service_pubkey: Some(&signer_pk),
+        };
         let err = verify_chain(&inputs).unwrap_err();
-        assert!(matches!(err, InitError::TrusteePolicy(s) if s.contains("policy envelope sig")));
+        assert!(matches!(err, InitError::TrusteePolicy(s) if s.contains("signing service key")));
     }
 
     #[test]
