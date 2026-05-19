@@ -1051,11 +1051,16 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         .with_context(|| format!("opening mount namespace for pid {pid}"))?;
     nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNS)
         .with_context(|| format!("setns to pid {pid} mount namespace"))?;
+    let workload_root = workload_proc_root_path(pid);
+    std::env::set_current_dir(&workload_root)
+        .with_context(|| format!("entering workload root {}", workload_root.display()))?;
+    nix::unistd::chroot(&workload_root)
+        .with_context(|| format!("chroot to workload root {}", workload_root.display()))?;
+    std::env::set_current_dir("/").context("entering chroot /")?;
     let source_mount_path = mount_source_path_for_namespace_bind(&source);
-    let target_mount_path = mount_target_path_for_namespace_bind(pid, &target);
-    std::fs::create_dir_all(&target_mount_path)
+    std::fs::create_dir_all(&target)
         .with_context(|| format!("creating target {}", target.display()))?;
-    if paths_resolve_to_same_object(source_mount_path, &target_mount_path).with_context(|| {
+    if paths_resolve_to_same_object(source_mount_path, &target).with_context(|| {
         format!(
             "checking whether {} is already mounted at {}",
             source.display(),
@@ -1069,10 +1074,10 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     // Do not use /proc/self/fd for the source here: live Kata rejects that
     // bind source with EINVAL after setns. The source is already a cross-
     // namespace /proc/<init-pid>/root/... path and remains resolvable from the
-    // workload mount namespace.
+    // workload mount namespace after chrooting into the workload root.
     nix::mount::mount(
         Some(source_mount_path),
-        target_mount_path.as_path(),
+        target.as_path(),
         None::<&str>,
         nix::mount::MsFlags::MS_BIND,
         None::<&str>,
@@ -1085,9 +1090,8 @@ fn mount_source_path_for_namespace_bind(source: &Path) -> &Path {
     source
 }
 
-fn mount_target_path_for_namespace_bind(pid: u32, target: &Path) -> PathBuf {
-    let rel = target.strip_prefix("/").unwrap_or(target);
-    PathBuf::from(format!("/proc/{pid}/root")).join(rel)
+fn workload_proc_root_path(pid: u32) -> PathBuf {
+    PathBuf::from(format!("/proc/{pid}/root"))
 }
 
 fn paths_resolve_to_same_object(a: &Path, b: &Path) -> Result<bool> {
@@ -1311,10 +1315,10 @@ mod tests {
     }
 
     #[test]
-    fn namespace_bind_targets_workload_proc_root_path() {
-        let target = mount_target_path_for_namespace_bind(42, Path::new("/data"));
+    fn namespace_bind_chroots_to_workload_proc_root() {
+        let root = workload_proc_root_path(42);
 
-        assert_eq!(target, PathBuf::from("/proc/42/root/data"));
+        assert_eq!(root, PathBuf::from("/proc/42/root"));
     }
 
     #[test]
