@@ -138,8 +138,7 @@ pub async fn create_challenge(
     Path(app_name): Path<String>,
     Json(body): Json<CreateChallengeRequest>,
 ) -> Result<Json<ChallengeResponse>, (StatusCode, Json<serde_json::Value>)> {
-    scopes::require_admin(&auth)?;
-    scopes::require_scope(&auth, "apps:write")?;
+    scopes::require_app_write(&auth)?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -204,8 +203,7 @@ pub async fn verify_challenge(
     State(state): State<AppState>,
     Path((app_name, domain)): Path<(String, String)>,
 ) -> Result<Json<VerifyResponse>, (StatusCode, Json<serde_json::Value>)> {
-    scopes::require_admin(&auth)?;
-    scopes::require_scope(&auth, "apps:write")?;
+    scopes::require_app_write(&auth)?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -514,6 +512,8 @@ pub async fn get_domain(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<Json<DomainResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_read(&auth)?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)

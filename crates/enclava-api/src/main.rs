@@ -674,6 +674,8 @@ async fn main() {
     let outbound_config = enclava_api::clients::ClientConfig::from_env();
     let http_client = enclava_api::clients::build_guarded_client(&outbound_config)
         .expect("failed to build SSRF-defended outbound HTTP client");
+    let registry_client =
+        enclava_api::clients::RegistryClient::from_env().expect("failed to build registry client");
     let trustee_http_client =
         build_trustee_http_client().expect("failed to build Trustee HTTP client");
 
@@ -687,6 +689,7 @@ async fn main() {
         platform_domain,
         tee_domain_suffix,
         http_client,
+        registry_client,
         trustee_http_client,
         tee_http_client,
         btcpay_webhook_secret,

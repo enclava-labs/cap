@@ -1234,14 +1234,14 @@ pub enum SignerCommand {
         #[arg(long, default_value = "https://token.actions.githubusercontent.com")]
         issuer: String,
     },
-    /// Rotate an existing signer identity. Requires an email confirmation
-    /// token tied to the requesting user's verified email.
+    /// Rotate an existing signer identity. If omitted, the confirmation token
+    /// is issued by the platform for this exact rotation request.
     Rotate {
         /// New cosign Fulcio identity subject.
         subject: String,
-        /// Email confirmation token issued by the platform.
+        /// Short-lived confirmation token issued by the platform.
         #[arg(long = "confirmation-token")]
-        confirmation_token: String,
+        confirmation_token: Option<String>,
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
         app: Option<String>,
@@ -1277,6 +1277,25 @@ pub async fn signer(cmd: SignerCommand) -> Result<(), Box<dyn std::error::Error>
             app,
         } => {
             let app_name = resolve_app_name(&app)?;
+            let confirmation_token = match confirmation_token {
+                Some(token) => token,
+                None => {
+                    let issued = api
+                        .issue_signer_rotation_token(
+                            &app_name,
+                            &SignerRotationTokenRequest {
+                                subject: subject.clone(),
+                                issuer: issuer.clone(),
+                            },
+                        )
+                        .await?;
+                    println!(
+                        "Signer rotation confirmation token issued; expires in {} seconds.",
+                        issued.expires_in_seconds
+                    );
+                    issued.token
+                }
+            };
             let req = SetSignerRequest {
                 subject: subject.clone(),
                 issuer: issuer.clone(),

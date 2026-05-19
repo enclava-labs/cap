@@ -3,6 +3,7 @@ name: Build API Image
 on:
   push:
     branches: ['main']
+    tags: ['v*']
     paths:
     - '.github/workflows/api-image.yml'
     - 'Cargo.toml'
@@ -50,16 +51,39 @@ jobs:
           images: ghcr.io/enclava-ai/enclava-api
           tags: |
             type=ref,event=branch
+            type=ref,event=tag
             type=sha,prefix=
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./crates/enclava-api/Dockerfile
-          push: ${{ github.ref == 'refs/heads/main' }}
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
+
+      - name: Set up Kustomize
+        if: github.event_name != 'pull_request'
+        uses: imranismail/setup-kustomize@v2
+
+      - name: Render digest-pinned deploy manifest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p dist
+          image_ref="ghcr.io/enclava-ai/enclava-api@${{ steps.build.outputs.digest }}"
+          scripts/render-api-release-manifest.sh "${image_ref}" dist/enclava-api-deploy.yaml
+          printf '%s\n' "${image_ref}" > dist/enclava-api-image.txt
+
+      - name: Upload release manifest artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: enclava-api-release-manifest
+          path: |
+            dist/enclava-api-deploy.yaml
+            dist/enclava-api-image.txt

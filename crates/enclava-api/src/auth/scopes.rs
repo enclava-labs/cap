@@ -42,6 +42,35 @@ pub fn require_scope(auth: &AuthContext, scope: &str) -> AuthzResult {
     Ok(())
 }
 
+pub fn require_requested_api_key_scopes(
+    auth: &AuthContext,
+    requested_scopes: &[String],
+) -> AuthzResult {
+    require_admin(auth)?;
+    require_scope(auth, "org:admin")?;
+    if let Some(key) = &auth.api_key {
+        for scope in requested_scopes {
+            crate::auth::api_key::require_scope(key, scope)
+                .map_err(|_| forbidden(format!("API key cannot grant scope it lacks: {scope}")))?;
+        }
+    }
+    Ok(())
+}
+
+pub fn require_app_read(auth: &AuthContext) -> AuthzResult {
+    require_scope(auth, "apps:read")
+}
+
+pub fn require_app_write(auth: &AuthContext) -> AuthzResult {
+    require_admin(auth)?;
+    require_scope(auth, "apps:write")
+}
+
+pub fn require_config_metadata_write(auth: &AuthContext) -> AuthzResult {
+    require_admin(auth)?;
+    require_scope(auth, "config:write")
+}
+
 pub fn require_admin_role(role: Role) -> AuthzResult {
     match role {
         Role::Owner | Role::Admin => Ok(()),
@@ -176,5 +205,63 @@ mod tests {
         assert!(require_scope(&auth(Role::Admin, &[]), "apps:write").is_ok());
         assert!(require_scope(&auth(Role::Admin, &["apps:write"]), "apps:write").is_ok());
         assert!(require_scope(&auth(Role::Admin, &["apps:read"]), "apps:write").is_err());
+    }
+
+    #[test]
+    fn api_key_creation_requires_admin_and_org_admin_scope() {
+        let requested = vec!["apps:read".to_string()];
+
+        assert!(require_requested_api_key_scopes(&auth(Role::Member, &[]), &requested).is_err());
+        assert!(
+            require_requested_api_key_scopes(&auth(Role::Admin, &["apps:read"]), &requested)
+                .is_err()
+        );
+        assert!(
+            require_requested_api_key_scopes(&auth(Role::Admin, &["org:admin"]), &requested)
+                .is_err()
+        );
+        assert!(
+            require_requested_api_key_scopes(
+                &auth(Role::Admin, &["org:admin", "apps:read"]),
+                &requested
+            )
+            .is_ok()
+        );
+        assert!(require_requested_api_key_scopes(&auth(Role::Admin, &[]), &requested).is_ok());
+    }
+
+    #[test]
+    fn api_key_cannot_grant_scope_it_does_not_have() {
+        let requested = vec!["apps:write".to_string()];
+        assert!(
+            require_requested_api_key_scopes(
+                &auth(Role::Admin, &["org:admin", "apps:read"]),
+                &requested
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn app_write_requires_admin_role_and_apps_write_scope() {
+        assert!(require_app_write(&auth(Role::Member, &[])).is_err());
+        assert!(require_app_write(&auth(Role::Admin, &["apps:read"])).is_err());
+        assert!(require_app_write(&auth(Role::Admin, &["apps:write"])).is_ok());
+        assert!(require_app_write(&auth(Role::Owner, &[])).is_ok());
+    }
+
+    #[test]
+    fn app_read_requires_apps_read_scope_for_api_keys() {
+        assert!(require_app_read(&auth(Role::Member, &[])).is_ok());
+        assert!(require_app_read(&auth(Role::Member, &["apps:read"])).is_ok());
+        assert!(require_app_read(&auth(Role::Member, &["config:write"])).is_err());
+    }
+
+    #[test]
+    fn config_metadata_write_requires_admin_and_config_write_scope() {
+        assert!(require_config_metadata_write(&auth(Role::Member, &[])).is_err());
+        assert!(require_config_metadata_write(&auth(Role::Admin, &["apps:write"])).is_err());
+        assert!(require_config_metadata_write(&auth(Role::Admin, &["config:write"])).is_ok());
+        assert!(require_config_metadata_write(&auth(Role::Owner, &[])).is_ok());
     }
 }

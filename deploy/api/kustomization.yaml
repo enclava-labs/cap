@@ -1,4 +1,4 @@
-apiVersion: kustomize.config.k8s.io/v1
+apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 namespace: enclava-platform
@@ -11,18 +11,5 @@ resources:
 
 images:
 - name: ghcr.io/enclava-ai/enclava-api
-  newTag: "v1.0.0"
-
-# NOTE: These are placeholder values. Override using:
-# - kustomize edit set secret api-secrets --from-literal=database-url="..."
-# - Or create a SealedSecret/ExternalSecret for production
-secretGenerator:
-- name: api-secrets
-  type: Opaque
-  literals:
-  - database-url="postgresql://user:pass@host:5432/db"
-  - btcpay-url="http://btcpay:23001"
-  - btcpay-api-key="placeholder"
-  - btcpay-webhook-secret="placeholder"
-  - cloudflare-api-token="placeholder"
-  - tenant-dns-target="203.0.113.10"
+  newName: ghcr.io/enclava-ai/enclava-api
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

@@ -7,6 +7,7 @@ use crate::auth::email;
 use crate::auth::jwt::issue_session_token;
 use crate::auth::middleware::AuthContext;
 use crate::auth::nostr;
+use crate::auth::scopes;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -280,6 +281,8 @@ pub async fn create_api_key_route(
     State(state): State<AppState>,
     Json(body): Json<CreateApiKeyRequest>,
 ) -> Result<(StatusCode, Json<ApiKeyResponse>), (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_requested_api_key_scopes(&auth, &body.scopes)?;
+
     let created = api_key::create_api_key(
         &state.db,
         auth.org_id,
@@ -313,6 +316,8 @@ pub async fn revoke_api_key_route(
     State(state): State<AppState>,
     axum::extract::Path(key_id): axum::extract::Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_requested_api_key_scopes(&auth, &[])?;
+
     let revoked = api_key::revoke_api_key(&state.db, key_id, auth.org_id)
         .await
         .map_err(|e| {
@@ -329,5 +334,46 @@ pub async fn revoke_api_key_route(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "API key not found"})),
         ))
+    }
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::*;
+    use crate::models::Role;
+    use axum::extract::State;
+
+    #[tokio::test]
+    async fn create_api_key_rejects_member_before_database_access() {
+        let err = create_api_key_route(
+            crate::test_support::auth_context(Role::Member, &[]),
+            State(crate::test_support::lazy_state()),
+            Json(CreateApiKeyRequest {
+                name: "deploy".to_string(),
+                scopes: vec!["apps:write".to_string()],
+                expires_at: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn create_api_key_rejects_scope_escalation_before_database_access() {
+        let err = create_api_key_route(
+            crate::test_support::auth_context(Role::Admin, &["org:admin", "apps:read"]),
+            State(crate::test_support::lazy_state()),
+            Json(CreateApiKeyRequest {
+                name: "deploy".to_string(),
+                scopes: vec!["apps:write".to_string()],
+                expires_at: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 }

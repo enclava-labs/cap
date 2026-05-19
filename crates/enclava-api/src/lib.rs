@@ -26,6 +26,10 @@ use crate::ratelimit::TrustedProxyKeyExtractor;
 use crate::state::AppState;
 
 pub fn build_router(state: AppState) -> Router {
+    build_router_inner(state, true)
+}
+
+fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
     let key_extractor = TrustedProxyKeyExtractor::from_env();
 
     let unlock_governor_conf = GovernorConfigBuilder::default()
@@ -97,6 +101,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/apps/{name}/signer",
             axum::routing::patch(routes::apps::rotate_signer),
+        )
+        .route(
+            "/apps/{name}/signer/rotation-token",
+            axum::routing::post(routes::apps::issue_signer_rotation_token_route),
         );
 
     // Deployment routes (authenticated)
@@ -199,8 +207,12 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/apps/{name}/unlock/mode",
             axum::routing::put(routes::unlock::update_unlock_mode),
-        )
-        .layer(GovernorLayer::new(unlock_governor_conf));
+        );
+    let unlock_routes = if enable_rate_limits {
+        unlock_routes.layer(GovernorLayer::new(unlock_governor_conf))
+    } else {
+        unlock_routes
+    };
 
     // Billing routes
     let billing_routes = Router::new()
@@ -259,8 +271,12 @@ pub fn build_router(state: AppState) -> Router {
         .merge(status_routes)
         .merge(unlock_routes)
         .merge(workload_routes)
-        .merge(billing_routes)
-        .layer(GovernorLayer::new(api_governor_conf));
+        .merge(billing_routes);
+    let api_routes = if enable_rate_limits {
+        api_routes.layer(GovernorLayer::new(api_governor_conf))
+    } else {
+        api_routes
+    };
 
     Router::new()
         .merge(health)
@@ -321,5 +337,93 @@ pub fn build_cors_layer() -> CorsLayer {
 /// Expose build_router for testing.
 #[doc(hidden)]
 pub fn test_router(state: AppState) -> Router {
-    build_router(state)
+    build_router_inner(state, false)
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::auth::api_key::ValidatedApiKey;
+    use crate::auth::middleware::AuthContext;
+    use crate::clients::{AllowList, ClientConfig, RegistryClient};
+    use crate::models::Role;
+    use crate::state::AppState;
+    use ed25519_dalek::SigningKey;
+    use enclava_common::image::ImageRef;
+    use enclava_engine::types::AttestationConfig;
+    use rand::rngs::OsRng;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    pub(crate) fn auth_context(role: Role, scopes: &[&str]) -> AuthContext {
+        AuthContext {
+            user_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            org_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            org_name: "test-org".to_string(),
+            role,
+            api_key: if scopes.is_empty() {
+                None
+            } else {
+                Some(ValidatedApiKey {
+                    id: Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+                    org_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+                    created_by: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+                    scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+                })
+            },
+        }
+    }
+
+    pub(crate) fn lazy_state() -> AppState {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://test:test@localhost:5432/test")
+            .expect("lazy postgres URL should parse");
+        AppState {
+            db: pool,
+            signing_key: Arc::new(SigningKey::generate(&mut OsRng)),
+            hmac_key: Arc::new([7u8; 32]),
+            api_url: "https://api.example.test".to_string(),
+            btcpay_url: "https://btcpay.example.test".to_string(),
+            btcpay_api_key: "test-key".to_string(),
+            platform_domain: "enclava.dev".to_string(),
+            tee_domain_suffix: "tee.enclava.dev".to_string(),
+            http_client: reqwest::Client::new(),
+            registry_client: RegistryClient::new(
+                ClientConfig::from_env(),
+                AllowList::from_env_or_default(None),
+            )
+            .unwrap(),
+            trustee_http_client: reqwest::Client::new(),
+            tee_http_client: reqwest::Client::new(),
+            btcpay_webhook_secret: "test-secret".to_string(),
+            attestation: Some(AttestationConfig {
+                proxy_image: ImageRef::parse(
+                    "ghcr.io/enclava-ai/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                )
+                .unwrap(),
+                caddy_image: ImageRef::parse(
+                    "ghcr.io/enclava-ai/caddy-ingress@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                )
+                .unwrap(),
+                acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+                caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
+                trustee_policy_read_available: true,
+                workload_artifacts_url: Some("https://api.example.test/workload/artifacts".into()),
+                tls_certificate_broker_url: None,
+                trustee_policy_url: Some("https://kbs.example.test/policy".into()),
+                local_workload_artifacts_json: None,
+                local_trustee_policy_json: None,
+                platform_trustee_policy_pubkey_hex: Some("11".repeat(32)),
+                signing_service_pubkey_hex: Some("11".repeat(32)),
+            }),
+            dns: None,
+            acme: None,
+            kbs_policy: None,
+            trustee_attestation_verify_url: None,
+            trustee_attestation_verify_bearer_token: None,
+            signing_service: None,
+            require_customer_signed_policy_artifact: true,
+            deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
 }

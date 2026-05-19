@@ -13,11 +13,15 @@ pub const TOKEN_ISSUER: &str = "enclava-cap";
 pub const SESSION_AUDIENCE: &str = "enclava:session";
 /// Audience for short-lived config tokens consumed by the TEE.
 pub const CONFIG_AUDIENCE: &str = "enclava:config";
+/// Audience for signer rotation confirmation tokens.
+pub const SIGNER_ROTATION_AUDIENCE: &str = "enclava:signer-rotation";
 
 /// `typ` claim value for session tokens.
 pub const SESSION_TYP: &str = "session";
 /// `typ` claim value for config tokens.
 pub const CONFIG_TYP: &str = "config";
+/// `typ` claim value for signer rotation confirmation tokens.
+pub const SIGNER_ROTATION_TYP: &str = "signer-rotation";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionClaims {
@@ -39,6 +43,34 @@ pub struct ConfigTokenClaims {
     pub app_id: String,
     pub instance_id: String,
     pub scopes: Vec<String>,
+    pub exp: i64,
+    pub iat: i64,
+    pub iss: String,
+    pub aud: String,
+    pub typ: String,
+    pub jti: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SignerRotationTokenInput {
+    pub user_id: Uuid,
+    pub org_id: Uuid,
+    pub app_id: Uuid,
+    pub previous_subject: String,
+    pub previous_issuer: String,
+    pub new_subject: String,
+    pub new_issuer: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SignerRotationClaims {
+    pub sub: String,
+    pub org_id: String,
+    pub app_id: String,
+    pub previous_subject: String,
+    pub previous_issuer: String,
+    pub new_subject: String,
+    pub new_issuer: String,
     pub exp: i64,
     pub iat: i64,
     pub iss: String,
@@ -83,6 +115,14 @@ fn config_validator() -> Validation {
     validation.set_required_spec_claims(&["sub", "exp", "iat", "iss", "aud"]);
     validation.set_issuer(&[TOKEN_ISSUER]);
     validation.set_audience(&[CONFIG_AUDIENCE]);
+    validation
+}
+
+fn signer_rotation_validator() -> Validation {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_required_spec_claims(&["sub", "exp", "iat", "iss", "aud"]);
+    validation.set_issuer(&[TOKEN_ISSUER]);
+    validation.set_audience(&[SIGNER_ROTATION_AUDIENCE]);
     validation
 }
 
@@ -181,6 +221,64 @@ pub fn verify_config_token(
         return Err(JwtError::Invalid);
     }
     Ok(data.claims)
+}
+
+pub fn issue_signer_rotation_token(
+    hmac_key: &[u8; 32],
+    input: &SignerRotationTokenInput,
+    ttl: Duration,
+) -> Result<String, JwtError> {
+    let now = Utc::now();
+    let claims = SignerRotationClaims {
+        sub: input.user_id.to_string(),
+        org_id: input.org_id.to_string(),
+        app_id: input.app_id.to_string(),
+        previous_subject: input.previous_subject.clone(),
+        previous_issuer: input.previous_issuer.clone(),
+        new_subject: input.new_subject.clone(),
+        new_issuer: input.new_issuer.clone(),
+        exp: (now + ttl).timestamp(),
+        iat: now.timestamp(),
+        iss: TOKEN_ISSUER.to_string(),
+        aud: SIGNER_ROTATION_AUDIENCE.to_string(),
+        typ: SIGNER_ROTATION_TYP.to_string(),
+        jti: new_jti(),
+    };
+
+    Ok(encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(hmac_key),
+    )?)
+}
+
+pub fn verify_signer_rotation_token(
+    hmac_key: &[u8; 32],
+    token: &str,
+    expected: &SignerRotationTokenInput,
+) -> Result<SignerRotationClaims, JwtError> {
+    let validation = signer_rotation_validator();
+    let data =
+        decode::<SignerRotationClaims>(token, &DecodingKey::from_secret(hmac_key), &validation)
+            .map_err(|e| match e.kind() {
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature => JwtError::Expired,
+                _ => JwtError::Invalid,
+            })?;
+    let claims = data.claims;
+
+    if claims.typ != SIGNER_ROTATION_TYP
+        || claims.sub != expected.user_id.to_string()
+        || claims.org_id != expected.org_id.to_string()
+        || claims.app_id != expected.app_id.to_string()
+        || claims.previous_subject != expected.previous_subject
+        || claims.previous_issuer != expected.previous_issuer
+        || claims.new_subject != expected.new_subject
+        || claims.new_issuer != expected.new_issuer
+    {
+        return Err(JwtError::Invalid);
+    }
+
+    Ok(claims)
 }
 
 /// Get the Ed25519 verifying (public) key as base64 for embedding in cc_init_data.
@@ -315,6 +413,59 @@ mod tests {
         .unwrap();
         assert!(matches!(
             verify_session_token(&key, &token),
+            Err(JwtError::Invalid)
+        ));
+    }
+
+    fn signer_rotation_input() -> SignerRotationTokenInput {
+        SignerRotationTokenInput {
+            user_id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            app_id: Uuid::new_v4(),
+            previous_subject: "repo:old/app:ref:refs/heads/main".to_string(),
+            previous_issuer: "https://token.actions.githubusercontent.com".to_string(),
+            new_subject: "repo:new/app:ref:refs/heads/main".to_string(),
+            new_issuer: "https://token.actions.githubusercontent.com".to_string(),
+        }
+    }
+
+    #[test]
+    fn signer_rotation_token_round_trip_is_bound_to_rotation_fields() {
+        let key = generate_hmac_key();
+        let input = signer_rotation_input();
+        let token = issue_signer_rotation_token(&key, &input, Duration::minutes(10)).unwrap();
+        let claims = verify_signer_rotation_token(&key, &token, &input).unwrap();
+
+        assert_eq!(claims.aud, SIGNER_ROTATION_AUDIENCE);
+        assert_eq!(claims.typ, SIGNER_ROTATION_TYP);
+        assert_eq!(claims.sub, input.user_id.to_string());
+        assert_eq!(claims.app_id, input.app_id.to_string());
+        assert_eq!(claims.previous_subject, input.previous_subject);
+        assert_eq!(claims.new_subject, input.new_subject);
+    }
+
+    #[test]
+    fn signer_rotation_token_rejects_session_token() {
+        let key = generate_hmac_key();
+        let input = signer_rotation_input();
+        let session = issue_session_token(&key, input.user_id).unwrap();
+
+        assert!(matches!(
+            verify_signer_rotation_token(&key, &session, &input),
+            Err(JwtError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn signer_rotation_token_rejects_changed_new_subject() {
+        let key = generate_hmac_key();
+        let input = signer_rotation_input();
+        let token = issue_signer_rotation_token(&key, &input, Duration::minutes(10)).unwrap();
+        let mut tampered_expected = input.clone();
+        tampered_expected.new_subject = "repo:attacker/app:ref:refs/heads/main".to_string();
+
+        assert!(matches!(
+            verify_signer_rotation_token(&key, &token, &tampered_expected),
             Err(JwtError::Invalid)
         ));
     }

@@ -17,6 +17,7 @@ const DEBUG_ONLY_FLAGS: &[&str] = &[
     "ALLOW_EPHEMERAL_KEYS",
     "TENANT_TEE_ACCEPT_INVALID_CERTS",
     "ENCLAVA_TEE_ACCEPT_INVALID_CERTS",
+    "LEGACY_BOOTSTRAP_SCRIPT",
 ];
 
 const ALWAYS_REQUIRED: &[&str] = &["BTCPAY_WEBHOOK_SECRET"];
@@ -60,6 +61,21 @@ fn enforce_with(
         if !api_key_pepper_present {
             return Err(EnvGateError::MissingRequired("API_KEY_HMAC_PEPPER"));
         }
+
+        match lookup("TRUSTEE_POLICY_READ_AVAILABLE") {
+            Some(value) if flag_is_truthy(&value) => {}
+            _ => {
+                return Err(EnvGateError::MissingRequired(
+                    "TRUSTEE_POLICY_READ_AVAILABLE",
+                ));
+            }
+        }
+
+        if let Some(value) = lookup("TRUSTEE_KBS_URL")
+            && value.trim().starts_with("http://")
+        {
+            return Err(EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_KBS_URL"));
+        }
     }
 
     for required in ALWAYS_REQUIRED {
@@ -81,6 +97,7 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("BTCPAY_WEBHOOK_SECRET", "secret");
         m.insert("API_KEY_HMAC_PEPPER", "01234567890123456789012345678901");
+        m.insert("TRUSTEE_POLICY_READ_AVAILABLE", "true");
         m
     }
 
@@ -161,5 +178,40 @@ mod tests {
         let mut env = ok_required();
         env.insert("SKIP_COSIGN_VERIFY", "0");
         run(env, false).expect("falsy flag should not trip the gate");
+    }
+
+    #[test]
+    fn release_requires_trustee_policy_read_available() {
+        let mut env = ok_required();
+        env.remove("TRUSTEE_POLICY_READ_AVAILABLE");
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::MissingRequired("TRUSTEE_POLICY_READ_AVAILABLE")
+        ));
+    }
+
+    #[test]
+    fn release_rejects_legacy_bootstrap_script() {
+        let mut env = ok_required();
+        env.insert("TRUSTEE_POLICY_READ_AVAILABLE", "true");
+        env.insert("LEGACY_BOOTSTRAP_SCRIPT", "true");
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::DebugOnlyFlagInRelease("LEGACY_BOOTSTRAP_SCRIPT")
+        ));
+    }
+
+    #[test]
+    fn release_rejects_http_kbs_url() {
+        let mut env = ok_required();
+        env.insert("TRUSTEE_POLICY_READ_AVAILABLE", "true");
+        env.insert("TRUSTEE_KBS_URL", "http://kbs.example.test:8080");
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_KBS_URL")
+        ));
     }
 }

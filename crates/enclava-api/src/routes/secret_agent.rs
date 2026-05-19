@@ -65,7 +65,7 @@ pub async fn create_deployment(
     Json(body): Json<SecretAgentCreateDeploymentRequest>,
 ) -> Result<(StatusCode, Json<SecretAgentDeploymentResponse>), (StatusCode, Json<serde_json::Value>)>
 {
-    scopes::require_scope(&auth, "apps:write")?;
+    scopes::require_app_write(&auth)?;
 
     let image = body
         .image

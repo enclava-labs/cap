@@ -3,7 +3,7 @@
 //! Supports Docker Hub, GHCR, and any OCI-compliant registry.
 //! Uses the distribution spec v2 manifest endpoint.
 
-use reqwest::Client;
+use crate::clients::{ClientError, RegistryClient};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
@@ -15,12 +15,14 @@ pub enum RegistryError {
     NotFound(String),
     #[error("unsupported registry: {0}")]
     UnsupportedRegistry(String),
+    #[error("registry client rejected request: {0}")]
+    Client(#[from] ClientError),
 }
 
 /// Resolve an image tag to a digest by querying the registry's manifest endpoint.
 /// Returns the full digest string (e.g., "sha256:abcd...").
 pub async fn resolve_tag_to_digest(
-    client: &Client,
+    client: &RegistryClient,
     registry: &str,
     repository: &str,
     tag: &str,
@@ -29,8 +31,10 @@ pub async fn resolve_tag_to_digest(
 
     // HEAD request for the manifest, accepting OCI and Docker media types
     let url = format!("{}/v2/{}/manifests/{}", base_url, repository, tag);
+    client.check_url(&url)?;
 
     let response = client
+        .inner()
         .head(&url)
         .header(
             "Accept",
@@ -82,7 +86,7 @@ pub fn registry_base_url(registry: &str) -> Result<String, RegistryError> {
 /// Parse a full image reference and resolve the tag to a digest.
 /// If the image already has a digest, returns it as-is.
 pub async fn resolve_image_digest(
-    client: &Client,
+    client: &RegistryClient,
     image_ref: &enclava_common::image::ImageRef,
 ) -> Result<String, RegistryError> {
     if image_ref.has_digest() {
@@ -94,4 +98,54 @@ pub async fn resolve_image_digest(
         .ok_or_else(|| RegistryError::ResolveFailed("image has no tag or digest".to_string()))?;
 
     resolve_tag_to_digest(client, image_ref.registry(), image_ref.repository(), tag).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clients::{AllowList, BlockedNetworks, ClientConfig};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn registry_client() -> RegistryClient {
+        RegistryClient::new(
+            ClientConfig {
+                blocked: Arc::new(BlockedNetworks::defaults()),
+                body_limit_bytes: 1024,
+                timeout: Duration::from_secs(2),
+            },
+            AllowList::from_env_or_default(None),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tag_resolution_rejects_non_allowlisted_registry_before_network() {
+        let image =
+            enclava_common::image::ImageRef::parse("attacker.example/org/app:latest").unwrap();
+        let err = resolve_image_digest(&registry_client(), &image)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RegistryError::Client(crate::clients::ClientError::HostNotAllowed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn digest_pinned_image_does_not_need_registry_lookup() {
+        let image = enclava_common::image::ImageRef::parse(
+            "attacker.example/org/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .unwrap();
+
+        let digest = resolve_image_digest(&registry_client(), &image)
+            .await
+            .unwrap();
+        assert_eq!(
+            digest,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
 }

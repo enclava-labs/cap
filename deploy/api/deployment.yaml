@@ -13,12 +13,29 @@ spec:
       labels:
         app: enclava-api
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: api
         image: ghcr.io/enclava-ai/enclava-api:latest
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
         ports:
         - containerPort: 3000
           name: http
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
         env:
         - name: DATABASE_URL
           valueFrom:
@@ -79,3 +96,6 @@ spec:
           periodSeconds: 10
       imagePullSecrets:
       - name: ghcr-login
+      volumes:
+      - name: tmp
+        emptyDir: {}

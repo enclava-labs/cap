@@ -173,6 +173,7 @@ fn classify_signer_identity(subject: &str, issuer: &str) -> crate::cosign::Verif
 mod classifier_tests {
     use super::*;
     use crate::cosign::VerificationPolicy;
+    use crate::models::Role;
     use enclava_common::image::ImageRef;
     use enclava_engine::types::AttestationConfig;
 
@@ -259,6 +260,49 @@ mod classifier_tests {
 
         assert_eq!(cfg.local_workload_artifacts_json.as_deref(), Some("{}"));
         assert_eq!(cfg.local_trustee_policy_json.as_deref(), Some("{}"));
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_member_before_database_access() {
+        let result = deploy(
+            crate::test_support::auth_context(Role::Member, &[]),
+            State(crate::test_support::lazy_state()),
+            Path("demo".to_string()),
+            Json(DeployRequest {
+                image: "ghcr.io/example/demo:latest".to_string(),
+                container_name: None,
+                resources: None,
+                customer_descriptor_blob: None,
+                org_keyring_blob: None,
+                signed_policy_artifact: None,
+            }),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("member deploy unexpectedly passed authorization"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn rollback_rejects_unscoped_api_key_before_database_access() {
+        let result = rollback(
+            crate::test_support::auth_context(Role::Admin, &["apps:read"]),
+            State(crate::test_support::lazy_state()),
+            Path("demo".to_string()),
+            Json(RollbackRequest {
+                deployment_id: Some(Uuid::new_v4()),
+            }),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("unscoped rollback unexpectedly passed authorization"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 }
 
@@ -391,7 +435,7 @@ pub async fn generate_agent_policy(
     Path(app_name): Path<String>,
     Json(body): Json<AgentPolicyRequest>,
 ) -> Result<Json<AgentPolicyResponse>, (StatusCode, Json<serde_json::Value>)> {
-    scopes::require_scope(&auth, "apps:write")?;
+    scopes::require_app_write(&auth)?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -456,6 +500,8 @@ pub async fn deploy(
     Path(app_name): Path<String>,
     Json(body): Json<DeployRequest>,
 ) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_write(&auth)?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -506,7 +552,7 @@ pub async fn deploy(
     let image_digest = if image_ref.has_digest() {
         image_ref.digest().to_string()
     } else {
-        crate::registry::resolve_image_digest(&state.http_client, &image_ref)
+        crate::registry::resolve_image_digest(&state.registry_client, &image_ref)
             .await
             .map_err(|e| {
                 (
@@ -957,6 +1003,8 @@ pub async fn deployment_history(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<Json<Vec<DeploymentResponse>>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_read(&auth)?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -1001,6 +1049,8 @@ pub async fn rollback(
     Path(app_name): Path<String>,
     Json(body): Json<RollbackRequest>,
 ) -> Result<(StatusCode, Json<RollbackResponse>), (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_write(&auth)?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)

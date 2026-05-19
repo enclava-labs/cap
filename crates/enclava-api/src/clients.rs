@@ -14,7 +14,13 @@ use std::time::Duration;
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
-const DEFAULT_REGISTRY_ALLOWLIST: &[&str] = &["ghcr.io", "docker.io", "quay.io", "gcr.io"];
+const DEFAULT_REGISTRY_ALLOWLIST: &[&str] = &[
+    "ghcr.io",
+    "docker.io",
+    "registry-1.docker.io",
+    "quay.io",
+    "gcr.io",
+];
 const DEFAULT_REGISTRY_WILDCARDS: &[&str] = &["pkg.dev"];
 
 const DEFAULT_BODY_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
@@ -382,7 +388,13 @@ mod tests {
     #[test]
     fn default_allowlist_accepts_known_registries() {
         let allow = AllowList::from_env_or_default(None);
-        for host in ["ghcr.io", "docker.io", "quay.io", "gcr.io"] {
+        for host in [
+            "ghcr.io",
+            "docker.io",
+            "registry-1.docker.io",
+            "quay.io",
+            "gcr.io",
+        ] {
             assert!(allow.allows(host), "{host} should be allowed");
         }
     }

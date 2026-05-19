@@ -3,12 +3,16 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
+use chrono::Duration;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::auth::jwt::{
+    SignerRotationTokenInput, issue_signer_rotation_token, verify_signer_rotation_token,
+};
 use crate::auth::middleware::AuthContext;
 use crate::auth::scopes;
 use crate::models::App;
@@ -285,6 +289,8 @@ pub async fn create_app(
     State(state): State<AppState>,
     Json(body): Json<CreateAppRequest>,
 ) -> Result<(StatusCode, Json<AppResponse>), (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_write(&auth)?;
+
     // Validate name with comprehensive checks
     validate_app_name(&body.name).map_err(|e| {
         (
@@ -467,6 +473,8 @@ pub async fn list_apps(
     auth: AuthContext,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AppResponse>>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_read(&auth)?;
+
     let apps: Vec<App> = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 ORDER BY name")
         .bind(auth.org_id)
         .fetch_all(&state.db)
@@ -487,6 +495,8 @@ pub async fn get_app(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<Json<AppResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_read(&auth)?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -683,6 +693,135 @@ pub struct RotateSignerRequest {
     pub email_confirmation_token: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SignerRotationTokenRequest {
+    pub subject: String,
+    pub issuer: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SignerRotationTokenResponse {
+    pub token: String,
+    pub expires_in_seconds: u64,
+}
+
+const SIGNER_ROTATION_TOKEN_TTL_SECONDS: u64 = 600;
+
+/// POST /apps/{name}/signer/rotation-token -- issue a short-lived token that
+/// authorizes exactly one signer rotation from the currently pinned identity
+/// to the requested identity. Session auth only; API keys cannot mint these
+/// human-confirmation tokens.
+pub async fn issue_signer_rotation_token_route(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(app_name): Path<String>,
+    Json(body): Json<SignerRotationTokenRequest>,
+) -> Result<Json<SignerRotationTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_owner(&auth)?;
+    scopes::require_scope(&auth, "apps:write")?;
+
+    if auth.api_key.is_some() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "session authentication required for signer rotation token"
+            })),
+        ));
+    }
+
+    let subject = body.subject.trim().to_string();
+    let issuer = body.issuer.trim().to_string();
+    if subject.is_empty() || issuer.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "subject and issuer are required"})),
+        ));
+    }
+
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+        .bind(auth.org_id)
+        .bind(&app_name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| internal_server_error())?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "app not found"})),
+        ))?;
+
+    let previous_subject = app
+        .signer_identity_subject
+        .clone()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let previous_issuer = app
+        .signer_identity_issuer
+        .clone()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let (previous_subject, previous_issuer) = match (previous_subject, previous_issuer) {
+        (Some(subject), Some(issuer)) => (subject, issuer),
+        (None, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "signer identity is not set; use initial signer set first"
+                })),
+            ));
+        }
+        _ => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "app signer identity is incomplete"})),
+            ));
+        }
+    };
+
+    let input = SignerRotationTokenInput {
+        user_id: auth.user_id,
+        org_id: auth.org_id,
+        app_id: app.id,
+        previous_subject,
+        previous_issuer,
+        new_subject: subject,
+        new_issuer: issuer,
+    };
+    let token = issue_signer_rotation_token(
+        state.hmac_key.as_ref(),
+        &input,
+        Duration::seconds(SIGNER_ROTATION_TOKEN_TTL_SECONDS as i64),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({"error": format!("failed to issue signer rotation token: {e}")}),
+            ),
+        )
+    })?;
+
+    let _ = sqlx::query(
+        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.signer.rotation_token.issue', $4)",
+    )
+    .bind(auth.org_id)
+    .bind(app.id)
+    .bind(auth.user_id)
+    .bind(serde_json::json!({
+        "previous_subject": input.previous_subject,
+        "previous_issuer":  input.previous_issuer,
+        "new_subject":      input.new_subject,
+        "new_issuer":       input.new_issuer,
+        "expires_in_seconds": SIGNER_ROTATION_TOKEN_TTL_SECONDS,
+    }))
+    .execute(&state.db)
+    .await;
+
+    Ok(Json(SignerRotationTokenResponse {
+        token,
+        expires_in_seconds: SIGNER_ROTATION_TOKEN_TTL_SECONDS,
+    }))
+}
+
 /// PATCH /apps/{name}/signer -- rotate the per-app cosign / Fulcio identity.
 /// Owner-only. Requires an email confirmation token tied to the requesting
 /// user's verified email address.
@@ -695,7 +834,9 @@ pub async fn rotate_signer(
     scopes::require_owner(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
 
-    if body.subject.trim().is_empty() || body.issuer.trim().is_empty() {
+    let subject = body.subject.trim().to_string();
+    let issuer = body.issuer.trim().to_string();
+    if subject.is_empty() || issuer.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "subject and issuer are required"})),
@@ -732,13 +873,28 @@ pub async fn rotate_signer(
         ));
     }
 
-    // TODO(phase-10): validate email_confirmation_token against the email
-    // verification table once the email-verification mechanism (Phase 10)
-    // ships. For now we require the field to be present on rotation so
-    // clients are already wired correctly, but cannot yet verify it
-    // server-side. Initial-set calls do not require it -- there is no
-    // previous identity to authenticate the rotation against.
-    let _ = confirmation_token;
+    if !is_initial_set {
+        let expected = SignerRotationTokenInput {
+            user_id: auth.user_id,
+            org_id: auth.org_id,
+            app_id: app.id,
+            previous_subject: previous_subject.clone().unwrap_or_default(),
+            previous_issuer: previous_issuer.clone().unwrap_or_default(),
+            new_subject: subject.clone(),
+            new_issuer: issuer.clone(),
+        };
+        verify_signer_rotation_token(
+            state.hmac_key.as_ref(),
+            confirmation_token.expect("checked above"),
+            &expected,
+        )
+        .map_err(|_| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "invalid email_confirmation_token"})),
+            )
+        })?;
+    }
 
     sqlx::query(
         "UPDATE apps
@@ -748,8 +904,8 @@ pub async fn rotate_signer(
              updated_at              = now()
          WHERE id = $3",
     )
-    .bind(&body.subject)
-    .bind(&body.issuer)
+    .bind(&subject)
+    .bind(&issuer)
     .bind(app.id)
     .execute(&state.db)
     .await
@@ -773,8 +929,8 @@ pub async fn rotate_signer(
     .bind(serde_json::json!({
         "previous_subject": previous_subject,
         "previous_issuer":  previous_issuer,
-        "new_subject":      &body.subject,
-        "new_issuer":       &body.issuer,
+        "new_subject":      &subject,
+        "new_issuer":       &issuer,
         "initial_set":      is_initial_set,
     }))
     .execute(&state.db)
@@ -791,7 +947,14 @@ pub async fn rotate_signer(
 
 #[cfg(test)]
 mod signer_request_tests {
-    use super::{CreateAppRequest, RotateSignerRequest};
+    use super::{
+        CreateAppRequest, RotateSignerRequest, SignerRotationTokenRequest, create_app,
+        issue_signer_rotation_token_route, list_apps,
+    };
+    use crate::models::Role;
+    use axum::Json;
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
 
     #[test]
     fn create_request_defaults_to_password_unlock() {
@@ -831,5 +994,62 @@ mod signer_request_tests {
         let token: Option<String> = Some("   ".to_string());
         let normalized = token.as_deref().map(str::trim).filter(|t| !t.is_empty());
         assert!(normalized.is_none());
+    }
+
+    #[tokio::test]
+    async fn create_app_rejects_member_before_database_access() {
+        let result = create_app(
+            crate::test_support::auth_context(Role::Member, &[]),
+            State(crate::test_support::lazy_state()),
+            Json(CreateAppRequest {
+                name: "demo".to_string(),
+                unlock_mode: "password".to_string(),
+                bootstrap_pubkey_hash: None,
+                signer_identity_subject: None,
+                signer_identity_issuer: None,
+            }),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("member app creation unexpectedly passed authorization"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn list_apps_rejects_unscoped_api_key_before_database_access() {
+        let result = list_apps(
+            crate::test_support::auth_context(Role::Member, &["config:write"]),
+            State(crate::test_support::lazy_state()),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("unscoped app list unexpectedly passed authorization"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn signer_rotation_token_rejects_api_key_before_database_access() {
+        let result = issue_signer_rotation_token_route(
+            crate::test_support::auth_context(Role::Owner, &["apps:write"]),
+            State(crate::test_support::lazy_state()),
+            Path("demo".to_string()),
+            Json(SignerRotationTokenRequest {
+                subject: "repo:me/app:ref:refs/heads/main".to_string(),
+                issuer: "https://token.actions.githubusercontent.com".to_string(),
+            }),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("API key minted signer rotation token"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 }

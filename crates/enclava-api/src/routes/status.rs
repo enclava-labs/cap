@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::auth::middleware::AuthContext;
+use crate::auth::{middleware::AuthContext, scopes};
 use crate::models::App;
 use crate::state::AppState;
 
@@ -29,6 +29,8 @@ pub async fn app_status(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<Json<AppStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_read(&auth)?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -108,6 +110,8 @@ pub async fn app_logs(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<Json<Vec<LogLine>>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_read(&auth)?;
+
     let _app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)

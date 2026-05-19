@@ -190,21 +190,17 @@ pub fn verify_chain(inputs: &VerifyInputs<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Returns true if the chain ran end-to-end, false if it was skipped because
-/// the Phase 3 Trustee patch is not yet deployed. False return is logged as
-/// an error so production deployments cannot quietly run without verification.
+/// Returns true if the chain ran end-to-end. Missing verification inputs are
+/// fatal because seeds must not be released without Trustee policy verification.
 pub fn verify_chain_or_skip(inputs: Option<&VerifyInputs<'_>>) -> Result<bool> {
     match inputs {
         Some(i) => {
             verify_chain(i)?;
             Ok(true)
         }
-        None => {
-            tracing::error!(
-                "Phase 3 Trustee patch not yet deployed; in-TEE policy verification SKIPPED"
-            );
-            Ok(false)
-        }
+        None => Err(InitError::TrusteePolicy(
+            "in-TEE Trustee policy verification required before seed release".to_string(),
+        )),
     }
 }
 
@@ -1203,9 +1199,9 @@ mod tests {
     }
 
     #[test]
-    fn skipped_chain_logs_and_returns_false() {
-        let result = verify_chain_or_skip(None).unwrap();
-        assert!(!result);
+    fn skipped_chain_is_fatal() {
+        let err = verify_chain_or_skip(None).unwrap_err();
+        assert!(matches!(err, InitError::TrusteePolicy(s) if s.contains("verification required")));
     }
 
     #[test]

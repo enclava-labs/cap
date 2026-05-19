@@ -326,6 +326,8 @@ pub async fn unlock_status(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<Json<UnlockStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_read(&auth)?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -378,6 +380,8 @@ pub async fn unlock_endpoint(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<Json<UnlockEndpointResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_read(&auth)?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)

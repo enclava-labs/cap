@@ -90,6 +90,8 @@ pub async fn list_config_keys(
     State(state): State<AppState>,
     Path(app_name): Path<String>,
 ) -> Result<Json<Vec<ConfigKeyResponse>>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_read(&auth)?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -140,6 +142,8 @@ pub async fn config_sync(
     Path(app_name): Path<String>,
     Json(body): Json<ConfigSyncRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_config_metadata_write(&auth)?;
+
     let app: Option<App> = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -197,6 +201,8 @@ pub async fn delete_config_meta(
     State(state): State<AppState>,
     Path((app_name, key_name)): Path<(String, String)>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_config_metadata_write(&auth)?;
+
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -230,8 +236,11 @@ pub async fn delete_config_meta(
 
 #[cfg(test)]
 mod tests {
-    use super::config_token_instance_id;
-    use crate::models::{App, AppStatus, UnlockMode};
+    use super::{ConfigSyncRequest, config_sync, config_token_instance_id};
+    use crate::models::{App, AppStatus, Role, UnlockMode};
+    use axum::Json;
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
     use uuid::Uuid;
 
     #[test]
@@ -259,5 +268,25 @@ mod tests {
         };
 
         assert_eq!(config_token_instance_id(&app), "cap-a826eb13-demo-demo");
+    }
+
+    #[tokio::test]
+    async fn config_sync_rejects_unscoped_api_key_before_database_access() {
+        let result = config_sync(
+            crate::test_support::auth_context(Role::Admin, &["apps:write"]),
+            State(crate::test_support::lazy_state()),
+            Path("demo".to_string()),
+            Json(ConfigSyncRequest {
+                key_name: "SECRET".to_string(),
+                deleted: false,
+            }),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("unscoped config sync unexpectedly passed authorization"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
     }
 }

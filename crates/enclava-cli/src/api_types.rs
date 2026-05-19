@@ -67,6 +67,18 @@ pub struct SetSignerRequest {
 }
 
 #[derive(Debug, Serialize)]
+pub struct SignerRotationTokenRequest {
+    pub subject: String,
+    pub issuer: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SignerRotationTokenResponse {
+    pub token: String,
+    pub expires_in_seconds: u64,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ServiceSpec {
     pub name: String,
     pub image: String,

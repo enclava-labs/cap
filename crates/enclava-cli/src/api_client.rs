@@ -174,6 +174,22 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn issue_signer_rotation_token(
+        &self,
+        app_name: &str,
+        req: &SignerRotationTokenRequest,
+    ) -> Result<SignerRotationTokenResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/apps/{app_name}/signer/rotation-token")))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn delete_app(&self, name: &str) -> Result<(), ApiError> {
         let resp = self
             .http

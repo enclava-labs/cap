@@ -1,12 +1,15 @@
 //! Integration tests for API routes using testcontainers.
 
+use axum::http::StatusCode;
 use ed25519_dalek::SigningKey;
 use enclava_api::{state::AppState, test_router};
 use enclava_common::image::ImageRef;
 use enclava_engine::types::AttestationConfig;
 use rand::rngs::OsRng;
+use serde_json::Value;
 use sqlx::PgPool;
 use std::sync::Arc;
+use uuid::Uuid;
 
 async fn setup_test_db() -> PgPool {
     let database_url = std::env::var("DATABASE_URL")
@@ -28,6 +31,12 @@ async fn setup_test_state() -> (AppState, PgPool) {
     let pool = setup_test_db().await;
     let signing_key = Arc::new(SigningKey::generate(&mut OsRng));
     let hmac_key = Arc::new([0u8; 32]); // Test HMAC key
+    unsafe {
+        std::env::set_var(
+            "API_KEY_HMAC_PEPPER",
+            "cap-test-api-key-hmac-pepper-with-at-least-32-bytes",
+        );
+    }
 
     let state = AppState {
         db: pool.clone(),
@@ -39,6 +48,11 @@ async fn setup_test_state() -> (AppState, PgPool) {
         platform_domain: "enclava.dev".to_string(),
         tee_domain_suffix: "tee.enclava.dev".to_string(),
         http_client: reqwest::Client::new(),
+        registry_client: enclava_api::clients::RegistryClient::new(
+            enclava_api::clients::ClientConfig::from_env(),
+            enclava_api::clients::AllowList::from_env_or_default(None),
+        )
+        .unwrap(),
         trustee_http_client: reqwest::Client::new(),
         tee_http_client: reqwest::Client::new(),
         btcpay_webhook_secret: "test-secret".to_string(),
@@ -80,7 +94,7 @@ async fn health_endpoint_returns_ok() {
     let (state, _pool) = setup_test_state().await;
     let app = test_router(state);
 
-    let server = axum_test::TestServer::new(app);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
 
     let response = server
         .get("/health")
@@ -89,4 +103,163 @@ async fn health_endpoint_returns_ok() {
 
     response.assert_status_ok();
     response.assert_text("ok");
+}
+
+#[tokio::test]
+async fn api_key_creation_cannot_escalate_scopes_end_to_end() {
+    let (state, _pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+
+    let signup = server
+        .post("/auth/signup")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({
+            "provider": "email",
+            "email": format!("api-key-owner-{suffix}@example.test"),
+            "password": "correct horse battery staple",
+            "display_name": format!("Owner {suffix}"),
+        }))
+        .await;
+    signup.assert_status(StatusCode::CREATED);
+    let auth: Value = signup.json();
+    let session_token = auth["token"].as_str().expect("session token");
+
+    let limited_key = server
+        .post("/auth/api-keys")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(session_token)
+        .json(&serde_json::json!({
+            "name": "read-admin",
+            "scopes": ["org:admin", "apps:read"],
+        }))
+        .await;
+    limited_key.assert_status(StatusCode::CREATED);
+    let limited_key_body: Value = limited_key.json();
+    let raw_limited_key = limited_key_body["raw_key"].as_str().expect("raw API key");
+
+    let escalation = server
+        .post("/auth/api-keys")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(raw_limited_key)
+        .json(&serde_json::json!({
+            "name": "write-key",
+            "scopes": ["apps:write"],
+        }))
+        .await;
+    escalation.assert_status(StatusCode::FORBIDDEN);
+
+    let same_scope = server
+        .post("/auth/api-keys")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(raw_limited_key)
+        .json(&serde_json::json!({
+            "name": "read-child",
+            "scopes": ["apps:read"],
+        }))
+        .await;
+    same_scope.assert_status(StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn signer_rotation_token_rotates_signer_end_to_end() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+
+    let signup = server
+        .post("/auth/signup")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({
+            "provider": "email",
+            "email": format!("signer-owner-{suffix}@example.test"),
+            "password": "correct horse battery staple",
+            "display_name": format!("Signer {suffix}"),
+        }))
+        .await;
+    signup.assert_status(StatusCode::CREATED);
+    let auth: Value = signup.json();
+    let session_token = auth["token"].as_str().expect("session token");
+    let org_id = Uuid::parse_str(auth["org_id"].as_str().expect("org id")).expect("uuid org id");
+
+    let app_id = Uuid::new_v4();
+    let app_name = format!("signer-{suffix}");
+    let previous_subject = format!("repo:enclava/{suffix}:ref:refs/heads/main");
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    sqlx::query(
+        "INSERT INTO apps (
+            id, org_id, name, namespace, instance_id, tenant_id, service_account,
+            bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, unlock_mode,
+            domain, tee_domain, signer_identity_subject, signer_identity_issuer, signer_identity_set_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, now())",
+    )
+    .bind(app_id)
+    .bind(org_id)
+    .bind(&app_name)
+    .bind(format!("cap-test-{suffix}"))
+    .bind(format!("tenant-{suffix}"))
+    .bind(format!("tenant-{suffix}"))
+    .bind(format!("sa-{suffix}"))
+    .bind("bootstrap-hash")
+    .bind("identity-hash")
+    .bind("password")
+    .bind(format!("{app_name}.enclava.dev"))
+    .bind(format!("{app_name}.tee.enclava.dev"))
+    .bind(&previous_subject)
+    .bind(previous_issuer)
+    .execute(&pool)
+    .await
+    .expect("insert signer app");
+
+    let new_subject = format!("repo:enclava/{suffix}:ref:refs/heads/release");
+    let issued = server
+        .post(&format!("/apps/{app_name}/signer/rotation-token"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(session_token)
+        .json(&serde_json::json!({
+            "subject": new_subject,
+            "issuer": previous_issuer,
+        }))
+        .await;
+    issued.assert_status_ok();
+    let issued_body: Value = issued.json();
+    let confirmation_token = issued_body["token"]
+        .as_str()
+        .expect("signer rotation token");
+
+    let invalid_rotation = server
+        .patch(&format!("/apps/{app_name}/signer"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(session_token)
+        .json(&serde_json::json!({
+            "subject": new_subject,
+            "issuer": previous_issuer,
+            "email_confirmation_token": "tok-123",
+        }))
+        .await;
+    invalid_rotation.assert_status(StatusCode::FORBIDDEN);
+
+    let rotation = server
+        .patch(&format!("/apps/{app_name}/signer"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(session_token)
+        .json(&serde_json::json!({
+            "subject": new_subject,
+            "issuer": previous_issuer,
+            "email_confirmation_token": confirmation_token,
+        }))
+        .await;
+    rotation.assert_status_ok();
+    let rotated: Value = rotation.json();
+    assert_eq!(
+        rotated["signer_identity_subject"].as_str(),
+        Some(new_subject.as_str())
+    );
+    assert_eq!(
+        rotated["signer_identity_issuer"].as_str(),
+        Some(previous_issuer)
+    );
 }
