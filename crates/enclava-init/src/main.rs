@@ -1051,10 +1051,11 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         .with_context(|| format!("opening mount namespace for pid {pid}"))?;
     nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNS)
         .with_context(|| format!("setns to pid {pid} mount namespace"))?;
-    std::fs::create_dir_all(&target)
-        .with_context(|| format!("creating target {}", target.display()))?;
     let source_mount_path = mount_source_path_for_namespace_bind(&source);
-    if paths_resolve_to_same_object(source_mount_path, &target).with_context(|| {
+    let target_mount_path = mount_target_path_for_namespace_bind(pid, &target);
+    std::fs::create_dir_all(&target_mount_path)
+        .with_context(|| format!("creating target {}", target.display()))?;
+    if paths_resolve_to_same_object(source_mount_path, &target_mount_path).with_context(|| {
         format!(
             "checking whether {} is already mounted at {}",
             source.display(),
@@ -1071,7 +1072,7 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     // workload mount namespace.
     nix::mount::mount(
         Some(source_mount_path),
-        target.as_path(),
+        target_mount_path.as_path(),
         None::<&str>,
         nix::mount::MsFlags::MS_BIND,
         None::<&str>,
@@ -1082,6 +1083,11 @@ fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
 
 fn mount_source_path_for_namespace_bind(source: &Path) -> &Path {
     source
+}
+
+fn mount_target_path_for_namespace_bind(pid: u32, target: &Path) -> PathBuf {
+    let rel = target.strip_prefix("/").unwrap_or(target);
+    PathBuf::from(format!("/proc/{pid}/root")).join(rel)
 }
 
 fn paths_resolve_to_same_object(a: &Path, b: &Path) -> Result<bool> {
@@ -1302,6 +1308,13 @@ mod tests {
         let mount_source = mount_source_path_for_namespace_bind(&source);
 
         assert_eq!(mount_source, source.as_path());
+    }
+
+    #[test]
+    fn namespace_bind_targets_workload_proc_root_path() {
+        let target = mount_target_path_for_namespace_bind(42, Path::new("/data"));
+
+        assert_eq!(target, PathBuf::from("/proc/42/root/data"));
     }
 
     #[test]
