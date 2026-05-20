@@ -55,6 +55,10 @@ async fn delete_tenant_namespace(namespace: &str) -> Result<(), kube::Error> {
     }
 }
 
+fn workload_teardown_instance_id(app: &App) -> String {
+    format!("{}-{}", app.namespace, app.name)
+}
+
 async fn request_workload_teardown(
     state: &AppState,
     auth: &AuthContext,
@@ -65,7 +69,7 @@ async fn request_workload_teardown(
         auth.user_id,
         auth.org_id,
         app.id,
-        &app.instance_id,
+        &workload_teardown_instance_id(app),
         vec!["teardown".to_string()],
     )
     .map_err(|e| {
@@ -949,9 +953,9 @@ pub async fn rotate_signer(
 mod signer_request_tests {
     use super::{
         CreateAppRequest, RotateSignerRequest, SignerRotationTokenRequest, create_app,
-        issue_signer_rotation_token_route, list_apps,
+        issue_signer_rotation_token_route, list_apps, workload_teardown_instance_id,
     };
-    use crate::models::Role;
+    use crate::models::{App, AppStatus, Role, UnlockMode};
     use axum::Json;
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
@@ -994,6 +998,36 @@ mod signer_request_tests {
         let token: Option<String> = Some("   ".to_string());
         let normalized = token.as_deref().map(str::trim).filter(|t| !t.is_empty());
         assert!(normalized.is_none());
+    }
+
+    #[test]
+    fn teardown_token_instance_id_matches_attestation_proxy_owner_instance_id() {
+        let app = App {
+            id: uuid::Uuid::new_v4(),
+            org_id: uuid::Uuid::new_v4(),
+            name: "demo".to_string(),
+            namespace: "cap-a826eb13-demo".to_string(),
+            instance_id: "a826eb13-12345678".to_string(),
+            tenant_id: "a826eb13".to_string(),
+            service_account: "cap-demo-sa".to_string(),
+            bootstrap_owner_pubkey_hash: "00".repeat(32),
+            tenant_instance_identity_hash: "11".repeat(32),
+            unlock_mode: UnlockMode::Password,
+            domain: "demo.a826eb13.enclava.dev".to_string(),
+            tee_domain: Some("demo.a826eb13.tee.enclava.dev".to_string()),
+            custom_domain: None,
+            status: AppStatus::Running,
+            signer_identity_subject: None,
+            signer_identity_issuer: None,
+            signer_identity_set_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(
+            workload_teardown_instance_id(&app),
+            "cap-a826eb13-demo-demo"
+        );
     }
 
     #[tokio::test]
