@@ -862,18 +862,28 @@ async fn wait_for_bootstrap_endpoint(
             return Err("deploy timed out waiting for TEE ownership claim endpoint".into());
         }
 
-        match tee.bootstrap_challenge().await {
-            Ok(_) => {
-                pb.set_message("Ownership claim endpoint ready");
-                return Ok(true);
-            }
-            Err(err) if tee.claim_state_is_successful().await.unwrap_or(false) => {
-                pb.set_message("Ownership already claimed");
-                let _ = err;
-                return Ok(false);
-            }
+        match tee.attest_receipt_key().await {
+            Ok((_attestation, attested_tee)) => match attested_tee.bootstrap_challenge().await {
+                Ok(_) => {
+                    pb.set_message("Ownership claim endpoint ready");
+                    return Ok(true);
+                }
+                Err(err)
+                    if attested_tee
+                        .claim_state_is_successful()
+                        .await
+                        .unwrap_or(false) =>
+                {
+                    pb.set_message("Ownership already claimed");
+                    let _ = err;
+                    return Ok(false);
+                }
+                Err(_) => {
+                    pb.set_message("Waiting for ownership claim endpoint...");
+                }
+            },
             Err(_) => {
-                pb.set_message("Waiting for ownership claim endpoint...");
+                pb.set_message("Waiting for attested ownership claim endpoint...");
             }
         }
 
@@ -935,6 +945,7 @@ async fn ensure_password_storage_unlocked_for_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
     let tee = TeeClient::new(&endpoint.tee_url);
+    let (_attestation, tee) = tee.attest_receipt_key().await?;
     let status = tee.status_json().await?;
     let state = tee_unlock_state(&status);
 
@@ -1556,6 +1567,57 @@ mod tests {
         assert!(!deploy_should_unlock_before_config(true, true, true));
         assert!(!deploy_should_unlock_before_config(true, false, false));
         assert!(!deploy_should_unlock_before_config(false, false, true));
+    }
+
+    #[test]
+    fn deploy_bootstrap_probe_attests_before_calling_claim_endpoint() {
+        let source = include_str!("app.rs");
+        let fn_start = source
+            .find("async fn wait_for_bootstrap_endpoint")
+            .expect("wait_for_bootstrap_endpoint exists");
+        let fn_end = source[fn_start..]
+            .find("async fn wait_for_deploy_runtime")
+            .expect("wait_for_deploy_runtime follows wait_for_bootstrap_endpoint")
+            + fn_start;
+        let body = &source[fn_start..fn_end];
+
+        let attest = body
+            .find("attest_receipt_key")
+            .expect("bootstrap readiness probe must attest the TEE TLS leaf");
+        let challenge = body
+            .find("bootstrap_challenge")
+            .expect("bootstrap readiness probe must query challenge endpoint");
+        assert!(
+            attest < challenge,
+            "deploy must verify attestation/SPKI binding before probing bootstrap challenge"
+        );
+    }
+
+    #[test]
+    fn deploy_password_unlock_attests_before_reading_or_unlocking_storage() {
+        let source = include_str!("app.rs");
+        let fn_start = source
+            .find("async fn ensure_password_storage_unlocked_for_config")
+            .expect("ensure_password_storage_unlocked_for_config exists");
+        let fn_end = source[fn_start..]
+            .find("fn tee_unlock_state")
+            .expect("tee_unlock_state follows ensure_password_storage_unlocked_for_config")
+            + fn_start;
+        let body = &source[fn_start..fn_end];
+
+        let attest = body
+            .find("attest_receipt_key")
+            .expect("password unlock helper must attest the TEE TLS leaf");
+        let status = body
+            .find("status_json")
+            .expect("password unlock helper must read TEE status");
+        let unlock = body
+            .find("tee.unlock")
+            .expect("password unlock helper must call unlock");
+        assert!(
+            attest < status && attest < unlock,
+            "deploy must use the attested/SPKI-pinned client for status and password unlock"
+        );
     }
 
     #[test]
