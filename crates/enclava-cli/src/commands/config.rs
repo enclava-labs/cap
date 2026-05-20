@@ -81,9 +81,10 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
                 .as_deref()
                 .map(TeeClient::from_config_url)
                 .unwrap_or_else(|| {
-                    let tee_domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
+                    let tee_domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
                     TeeClient::new(tee_domain)
                 });
+            let (_attestation, tee) = tee.attest_receipt_key().await?;
             for (key, value) in &pairs {
                 tee.config_set(key, value, &token_resp.token).await?;
                 api.sync_config_key(&app_name, key, false).await?;
@@ -123,12 +124,10 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
                 .as_deref()
                 .map(TeeClient::from_config_url)
                 .unwrap_or_else(|| {
-                    let tee_domain = app_info
-                        .custom_domain
-                        .as_deref()
-                        .unwrap_or(&app_info.domain);
+                    let tee_domain = app_info.tee_domain.as_deref().unwrap_or(&app_info.domain);
                     TeeClient::new(tee_domain)
                 });
+            let (_attestation, tee) = tee.attest_receipt_key().await?;
             tee.config_unset(&key, &token_resp.token).await?;
 
             // Delete metadata from API
@@ -138,4 +137,61 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key_value;
+
+    #[test]
+    fn parse_key_value_accepts_equals_in_value() {
+        assert_eq!(
+            parse_key_value("TOKEN=a=b").unwrap(),
+            ("TOKEN".to_string(), "a=b".to_string())
+        );
+    }
+
+    #[test]
+    fn config_set_attests_before_writing_values() {
+        let source = include_str!("config.rs");
+        let set_start = source
+            .find("ConfigCommand::Set { vars } =>")
+            .expect("set command branch exists");
+        let get_start = source[set_start..]
+            .find("ConfigCommand::Get")
+            .expect("get command branch follows set")
+            + set_start;
+        let body = &source[set_start..get_start];
+
+        let attest = body
+            .find("attest_receipt_key")
+            .expect("config set must attest the TEE TLS leaf");
+        let config_set = body
+            .find("config_set")
+            .expect("config set must write values");
+        assert!(
+            attest < config_set,
+            "config set must verify attestation/SPKI binding before writing config"
+        );
+    }
+
+    #[test]
+    fn config_unset_attests_before_deleting_value() {
+        let source = include_str!("config.rs");
+        let unset_start = source
+            .find("ConfigCommand::Unset { key, app } =>")
+            .expect("unset command branch exists");
+        let body = &source[unset_start..];
+
+        let attest = body
+            .find("attest_receipt_key")
+            .expect("config unset must attest the TEE TLS leaf");
+        let config_unset = body
+            .find("config_unset")
+            .expect("config unset must delete value");
+        assert!(
+            attest < config_unset,
+            "config unset must verify attestation/SPKI binding before deleting config"
+        );
+    }
 }

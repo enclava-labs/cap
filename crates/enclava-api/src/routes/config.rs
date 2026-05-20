@@ -28,6 +28,11 @@ fn config_token_instance_id(app: &App) -> String {
     format!("{}-{}", app.namespace, app.name)
 }
 
+fn config_token_tee_url(app: &App) -> Option<String> {
+    let domain = app.tee_domain.as_deref()?;
+    Some(format!("https://{domain}/.well-known/confidential/config"))
+}
+
 /// POST /apps/{name}/config-token -- issue a short-lived JWT for config writes.
 pub async fn issue_config_token_route(
     auth: AuthContext,
@@ -68,8 +73,12 @@ pub async fn issue_config_token_route(
         )
     })?;
 
-    let domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
-    let tee_url = format!("https://{}/.well-known/confidential/config", domain);
+    let tee_url = config_token_tee_url(&app).ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "tee domain not configured"})),
+        )
+    })?;
 
     Ok(Json(ConfigTokenResponse {
         token,
@@ -236,7 +245,7 @@ pub async fn delete_config_meta(
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigSyncRequest, config_sync, config_token_instance_id};
+    use super::{ConfigSyncRequest, config_sync, config_token_instance_id, config_token_tee_url};
     use crate::models::{App, AppStatus, Role, UnlockMode};
     use axum::Json;
     use axum::extract::{Path, State};
@@ -268,6 +277,65 @@ mod tests {
         };
 
         assert_eq!(config_token_instance_id(&app), "cap-a826eb13-demo-demo");
+    }
+
+    #[test]
+    fn config_token_url_targets_attested_tee_domain_not_app_or_custom_domain() {
+        let app = App {
+            id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            name: "demo".to_string(),
+            namespace: "cap-a826eb13-demo".to_string(),
+            instance_id: "demo".to_string(),
+            tenant_id: "a826eb13".to_string(),
+            service_account: "cap-demo-sa".to_string(),
+            bootstrap_owner_pubkey_hash: "00".repeat(32),
+            tenant_instance_identity_hash: "11".repeat(32),
+            unlock_mode: UnlockMode::Password,
+            domain: "demo.a826eb13.enclava.dev".to_string(),
+            tee_domain: Some("demo.a826eb13.tee.enclava.dev".to_string()),
+            custom_domain: Some("demo.example.com".to_string()),
+            status: AppStatus::Running,
+            signer_identity_subject: None,
+            signer_identity_issuer: None,
+            signer_identity_set_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(
+            config_token_tee_url(&app),
+            Some(
+                "https://demo.a826eb13.tee.enclava.dev/.well-known/confidential/config".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn config_token_url_requires_tee_domain() {
+        let app = App {
+            id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            name: "demo".to_string(),
+            namespace: "cap-a826eb13-demo".to_string(),
+            instance_id: "demo".to_string(),
+            tenant_id: "a826eb13".to_string(),
+            service_account: "cap-demo-sa".to_string(),
+            bootstrap_owner_pubkey_hash: "00".repeat(32),
+            tenant_instance_identity_hash: "11".repeat(32),
+            unlock_mode: UnlockMode::Password,
+            domain: "demo.a826eb13.enclava.dev".to_string(),
+            tee_domain: None,
+            custom_domain: Some("demo.example.com".to_string()),
+            status: AppStatus::Running,
+            signer_identity_subject: None,
+            signer_identity_issuer: None,
+            signer_identity_set_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(config_token_tee_url(&app), None);
     }
 
     #[tokio::test]

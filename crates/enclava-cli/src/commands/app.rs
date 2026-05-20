@@ -804,6 +804,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             .as_deref()
             .map(TeeClient::from_config_url)
             .unwrap_or_else(|| TeeClient::new(&resp.app_domain));
+        let (_attestation, tee) = tee.attest_receipt_key().await?;
 
         for (key, value) in &config_pairs {
             tee.config_set(key, value, &token_resp.token).await?;
@@ -1617,6 +1618,30 @@ mod tests {
         assert!(
             attest < status && attest < unlock,
             "deploy must use the attested/SPKI-pinned client for status and password unlock"
+        );
+    }
+
+    #[test]
+    fn deploy_config_push_attests_before_setting_values() {
+        let source = include_str!("app.rs");
+        let phase_start = source
+            .find("// Phase 4: Push config if --set was used")
+            .expect("config push phase exists");
+        let phase_end = source[phase_start..]
+            .find("// Phase 4: Health check")
+            .expect("health check phase follows config push")
+            + phase_start;
+        let body = &source[phase_start..phase_end];
+
+        let attest = body
+            .find("attest_receipt_key")
+            .expect("deploy config push must attest the TEE TLS leaf");
+        let set = body
+            .find("config_set")
+            .expect("deploy config push must set config values");
+        assert!(
+            attest < set,
+            "deploy config delivery must verify attestation/SPKI binding before writing config"
         );
     }
 
