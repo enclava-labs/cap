@@ -889,7 +889,7 @@ async fn wait_for_bootstrap_endpoint(
     pb: &ProgressBar,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
-    let tee = TeeClient::new_with_timeout(&endpoint.tee_url, Duration::from_secs(10));
+    let tee = TeeClient::new_for_ownership(&endpoint.tee_url);
     let start = std::time::Instant::now();
 
     loop {
@@ -1634,6 +1634,24 @@ mod tests {
         assert!(
             attest < challenge,
             "deploy must verify attestation/SPKI binding before probing bootstrap challenge"
+        );
+    }
+
+    #[test]
+    fn deploy_bootstrap_probe_uses_ownership_timeout_client() {
+        let source = include_str!("app.rs");
+        let fn_start = source
+            .find("async fn wait_for_bootstrap_endpoint")
+            .expect("wait_for_bootstrap_endpoint exists");
+        let fn_end = source[fn_start..]
+            .find("async fn wait_for_deploy_runtime")
+            .expect("wait_for_deploy_runtime follows wait_for_bootstrap_endpoint")
+            + fn_start;
+        let body = &source[fn_start..fn_end];
+
+        assert!(
+            body.contains("TeeClient::new_for_ownership(&endpoint.tee_url)"),
+            "bootstrap probe must allow ownership attestation to take longer than the short poll interval"
         );
     }
 
