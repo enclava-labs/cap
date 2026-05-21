@@ -86,9 +86,9 @@ fn parse_config_inputs(
 fn deploy_should_unlock_before_config(
     is_password_mode: bool,
     needs_initial_claim: bool,
-    has_config_pairs: bool,
+    _has_config_pairs: bool,
 ) -> bool {
-    is_password_mode && !needs_initial_claim && has_config_pairs
+    is_password_mode && !needs_initial_claim
 }
 
 fn deploy_needs_initial_claim(
@@ -1604,8 +1604,13 @@ mod tests {
     fn deploy_unlocks_existing_password_storage_before_config_push() {
         assert!(deploy_should_unlock_before_config(true, false, true));
         assert!(!deploy_should_unlock_before_config(true, true, true));
-        assert!(!deploy_should_unlock_before_config(true, false, false));
+        assert!(deploy_should_unlock_before_config(true, false, false));
         assert!(!deploy_should_unlock_before_config(false, false, true));
+    }
+
+    #[test]
+    fn deploy_unlocks_existing_password_storage_even_without_config_push() {
+        assert!(deploy_should_unlock_before_config(true, false, false));
     }
 
     #[test]
