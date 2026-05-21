@@ -967,7 +967,7 @@ async fn ensure_password_storage_unlocked_for_config(
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
-    let tee = TeeClient::new(&endpoint.tee_url);
+    let tee = TeeClient::new_for_ownership(&endpoint.tee_url);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
     let status = tee.status_json().await?;
     let state = tee_unlock_state(&status);
@@ -1044,7 +1044,7 @@ async fn claim_initial_ownership(
     app_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
-    let tee = TeeClient::new(&endpoint.tee_url);
+    let tee = TeeClient::new_for_ownership(&endpoint.tee_url);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     let challenge = tee.bootstrap_challenge().await?;

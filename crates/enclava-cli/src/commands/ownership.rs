@@ -91,7 +91,7 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_name = resolve_app_name(&args.app)?;
     let (api, paths) = build_api_client()?;
     let tee_url = resolve_tee_url(&api, &app_name).await?;
-    let tee = TeeClient::new(&tee_url);
+    let tee = TeeClient::new_for_ownership(&tee_url);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     println!("Claiming ownership of {app_name}...");
@@ -173,7 +173,7 @@ pub async fn unlock(args: UnlockArgs) -> Result<(), Box<dyn std::error::Error>> 
     let app_name = resolve_app_name(&args.app)?;
     let (api, _paths) = build_api_client()?;
     let tee_url = resolve_tee_url(&api, &app_name).await?;
-    let tee = TeeClient::new(&tee_url);
+    let tee = TeeClient::new_for_ownership(&tee_url);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     let password = Password::new().with_prompt("Unlock password").interact()?;
@@ -223,7 +223,7 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
     let app_name = resolve_app_name(&args.app)?;
     let (api, _paths) = build_api_client()?;
     let tee_url = resolve_tee_url(&api, &app_name).await?;
-    let tee = TeeClient::new(&tee_url);
+    let tee = TeeClient::new_for_ownership(&tee_url);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     let mnemonic: String = Input::new()

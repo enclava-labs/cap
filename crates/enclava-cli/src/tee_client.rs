@@ -23,6 +23,8 @@ use crate::api_types::{SignedReceiptResponse, TransitionReceiptAttestation};
 use crate::attestation::{tee_tls_transcript_hash, validate_snp_report_with_der_chain};
 
 const AMD_KDS_BASE_URL: &str = "https://kdsintf.amd.com";
+pub const DEFAULT_TEE_REQUEST_TIMEOUT_SECONDS: u64 = 180;
+pub const OWNERSHIP_TEE_REQUEST_TIMEOUT_SECONDS: u64 = 900;
 
 /// Direct HTTPS client for the attestation proxy running inside a TEE.
 /// All requests go to https://{app-domain}/.well-known/confidential/...
@@ -125,7 +127,18 @@ impl TeeClient {
     /// Create a TEE client for the given app domain.
     /// The domain is the HTTPS endpoint of the app (e.g., "myapp.enclava.dev").
     pub fn new(app_domain: &str) -> Self {
-        Self::new_with_timeout(app_domain, std::time::Duration::from_secs(180))
+        Self::new_with_timeout(
+            app_domain,
+            std::time::Duration::from_secs(DEFAULT_TEE_REQUEST_TIMEOUT_SECONDS),
+        )
+    }
+
+    /// Create a TEE client for ownership claim/unlock requests.
+    pub fn new_for_ownership(app_domain: &str) -> Self {
+        Self::new_with_timeout(
+            app_domain,
+            std::time::Duration::from_secs(OWNERSHIP_TEE_REQUEST_TIMEOUT_SECONDS),
+        )
     }
 
     /// Create a TEE client with a custom request timeout.
@@ -1101,6 +1114,7 @@ mod tests {
     use super::{TeeClient, accepts_invalid_tee_certs, normalize_unlock_mode};
     use sev::parser::ByteParser;
     use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1132,6 +1146,16 @@ mod tests {
         assert_eq!(
             tee.url("/config/MY_KEY"),
             "https://app.enclava.dev/.well-known/confidential/config/MY_KEY"
+        );
+    }
+
+    #[test]
+    fn ownership_client_timeout_covers_live_rollout_budget() {
+        let tee = TeeClient::new_for_ownership("app.enclava.dev");
+
+        assert!(
+            tee.timeout >= Duration::from_secs(600),
+            "ownership requests must cover slow Kata first boot within the CAP rollout budget"
         );
     }
 
