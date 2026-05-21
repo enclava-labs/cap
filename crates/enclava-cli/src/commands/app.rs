@@ -91,6 +91,21 @@ fn deploy_should_unlock_before_config(
     is_password_mode && !needs_initial_claim && has_config_pairs
 }
 
+fn deploy_needs_initial_claim(
+    is_password_mode: bool,
+    ownership_state: Option<&str>,
+    app_status: &str,
+) -> bool {
+    if !is_password_mode {
+        return false;
+    }
+    match ownership_state {
+        Some("unclaimed") => true,
+        Some(_) => false,
+        None => app_status == "creating",
+    }
+}
+
 fn parse_hex32(name: &str, value: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
     let bytes = hex::decode(value.trim())?;
     bytes
@@ -784,21 +799,13 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     // On first boot the app container is intentionally unhealthy until the
     // owner claims storage, so waiting for app-level readiness deadlocks.
     // Instead, wait for the TEE bootstrap endpoint and claim directly.
-    let needs_initial_claim = if is_password_mode {
-        match api
-            .get_unlock_status(&app_name)
-            .await
-            .ok()
-            .and_then(|status| status.ownership_state)
-            .as_deref()
-        {
-            Some("unclaimed") => true,
-            Some(_) => false,
-            None => app.tenant_instance_identity_hash.is_none(),
-        }
-    } else {
-        false
-    };
+    let ownership_state = api
+        .get_unlock_status(&app_name)
+        .await
+        .ok()
+        .and_then(|status| status.ownership_state);
+    let needs_initial_claim =
+        deploy_needs_initial_claim(is_password_mode, ownership_state.as_deref(), &app.status);
 
     if needs_initial_claim {
         pb.set_position(3);
@@ -806,6 +813,12 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         if wait_for_bootstrap_endpoint(&api, &app_name, max_wait, poll_interval, &pb).await? {
             claim_initial_ownership(&api, &paths, &cli_config, &app_name).await?;
             pb.set_message("Ownership claimed");
+        } else {
+            wait_for_deploy_runtime(&api, &app_name, max_wait, poll_interval, &pb).await?;
+            if deploy_should_unlock_before_config(is_password_mode, false, !config_pairs.is_empty())
+            {
+                ensure_password_storage_unlocked_for_config(&api, &app_name, &pb).await?;
+            }
         }
     } else {
         wait_for_deploy_runtime(&api, &app_name, max_wait, poll_interval, &pb).await?;
@@ -1593,6 +1606,11 @@ mod tests {
         assert!(!deploy_should_unlock_before_config(true, true, true));
         assert!(!deploy_should_unlock_before_config(true, false, false));
         assert!(!deploy_should_unlock_before_config(false, false, true));
+    }
+
+    #[test]
+    fn deploy_claims_fresh_created_password_app_when_unlock_status_is_unavailable() {
+        assert!(deploy_needs_initial_claim(true, None, "creating"));
     }
 
     #[test]
