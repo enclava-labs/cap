@@ -33,6 +33,8 @@ use enclava_engine::types::{
 use std::collections::HashMap;
 use uuid::Uuid;
 
+const DEPLOY_HEALTH_TIMEOUT_SECONDS: u64 = 900;
+
 /// Resolve app name from --app flag or enclava.toml.
 fn resolve_app_name(explicit: &Option<String>) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(name) = explicit {
@@ -852,7 +854,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     pb.set_message("Waiting for health check...");
 
     let health_start = std::time::Instant::now();
-    let health_timeout = Duration::from_secs(60);
+    let health_timeout = Duration::from_secs(DEPLOY_HEALTH_TIMEOUT_SECONDS);
 
     loop {
         if health_start.elapsed() > health_timeout {
@@ -1726,6 +1728,14 @@ mod tests {
         assert!(
             !body.contains("Deployed (health check timed out)"),
             "deploy must fail when the runtime health check times out"
+        );
+    }
+
+    #[test]
+    fn deploy_health_timeout_covers_generated_readiness_delay() {
+        assert!(
+            DEPLOY_HEALTH_TIMEOUT_SECONDS >= 240,
+            "deploy health timeout must cover the 180s generated readiness delay plus rollout jitter"
         );
     }
 
