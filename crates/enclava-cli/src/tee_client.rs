@@ -23,6 +23,7 @@ use crate::api_types::{SignedReceiptResponse, TransitionReceiptAttestation};
 use crate::attestation::{tee_tls_transcript_hash, validate_snp_report_with_der_chain};
 
 const AMD_KDS_BASE_URL: &str = "https://kdsintf.amd.com";
+const AMD_KDS_VCEK_MAX_ATTEMPTS: usize = 8;
 pub const DEFAULT_TEE_REQUEST_TIMEOUT_SECONDS: u64 = 180;
 pub const OWNERSHIP_TEE_REQUEST_TIMEOUT_SECONDS: u64 = 900;
 
@@ -679,26 +680,81 @@ async fn fetch_snp_der_chain_from_kds(snp_report_bytes: &[u8]) -> Result<SnpDerC
         .map_err(|err| TeeError::Attestation(format!("SNP report parse failed: {err}")))?;
     let (ark_der, ask_der) = builtin_snp_ca_der_chain(&report)?;
     let vcek_url = amd_kds_vcek_url(&report, AMD_KDS_BASE_URL)?;
-    let vcek_der = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .https_only(true)
         .timeout(std::time::Duration::from_secs(30))
-        .build()?
-        .get(vcek_url)
-        .send()
-        .await
-        .map_err(|err| TeeError::Attestation(format!("AMD KDS VCEK request failed: {err}")))?
-        .error_for_status()
-        .map_err(|err| TeeError::Attestation(format!("AMD KDS VCEK fetch failed: {err}")))?
-        .bytes()
-        .await
-        .map_err(|err| TeeError::Attestation(format!("AMD KDS VCEK body read failed: {err}")))?
-        .to_vec();
+        .build()?;
+    let vcek_der = fetch_amd_kds_vcek_der(&client, &vcek_url).await?;
 
     Ok(SnpDerChain {
         ark_der,
         ask_der,
         vcek_der,
     })
+}
+
+fn amd_kds_vcek_should_retry(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn amd_kds_vcek_retry_delay(attempt_index: usize) -> std::time::Duration {
+    let seconds = match attempt_index {
+        0 => 2,
+        1 => 5,
+        2 => 10,
+        3 => 20,
+        _ => 30,
+    };
+    std::time::Duration::from_secs(seconds)
+}
+
+async fn fetch_amd_kds_vcek_der(
+    client: &reqwest::Client,
+    vcek_url: &str,
+) -> Result<Vec<u8>, TeeError> {
+    let mut last_error = None;
+
+    for attempt in 0..AMD_KDS_VCEK_MAX_ATTEMPTS {
+        match client.get(vcek_url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    if amd_kds_vcek_should_retry(status) && attempt + 1 < AMD_KDS_VCEK_MAX_ATTEMPTS
+                    {
+                        tokio::time::sleep(amd_kds_vcek_retry_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(TeeError::Attestation(format!(
+                        "AMD KDS VCEK fetch failed: HTTP status {status} for url ({vcek_url})"
+                    )));
+                }
+
+                return resp
+                    .bytes()
+                    .await
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|err| {
+                        TeeError::Attestation(format!("AMD KDS VCEK body read failed: {err}"))
+                    });
+            }
+            Err(err) => {
+                let message = err.to_string();
+                if attempt + 1 < AMD_KDS_VCEK_MAX_ATTEMPTS {
+                    last_error = Some(message);
+                    tokio::time::sleep(amd_kds_vcek_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(TeeError::Attestation(format!(
+                    "AMD KDS VCEK request failed: {message}"
+                )));
+            }
+        }
+    }
+
+    Err(TeeError::Attestation(format!(
+        "AMD KDS VCEK request failed after retries: {}",
+        last_error.unwrap_or_else(|| "unknown error".to_string())
+    )))
 }
 
 fn builtin_snp_ca_der_chain(
@@ -1345,6 +1401,19 @@ mod tests {
                 "ab".repeat(64)
             )
         );
+    }
+
+    #[test]
+    fn amd_kds_vcek_retries_rate_limits_and_server_errors() {
+        assert!(super::amd_kds_vcek_should_retry(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(super::amd_kds_vcek_should_retry(
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
+        assert!(!super::amd_kds_vcek_should_retry(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
     }
 
     #[test]
