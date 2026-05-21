@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Enclava Deploy Flow: No Env Exports</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --ink: #17202a;
+      --muted: #5d6b7a;
+      --line: #d6dee8;
+      --teal: #0f766e;
+      --teal-soft: #d9f3ef;
+      --blue: #2563eb;
+      --blue-soft: #dce9ff;
+      --amber: #b45309;
+      --amber-soft: #fff0d5;
+      --green: #166534;
+      --green-soft: #dcfce7;
+      --shadow: 0 18px 60px rgba(23, 32, 42, 0.09);
+      font-family:
+        Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+        "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+    }
+
+    .page {
+      width: min(1500px, calc(100vw - 40px));
+      margin: 28px auto;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 24px;
+      align-items: end;
+      padding: 32px 36px 24px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(30px, 4vw, 54px);
+      line-height: 1.02;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      max-width: 900px;
+      margin: 0;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1.45;
+    }
+
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 44px;
+      padding: 10px 14px;
+      border: 1px solid #9ed8d0;
+      border-radius: 999px;
+      background: var(--teal-soft);
+      color: #0b4f49;
+      font-size: 15px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--teal);
+    }
+
+    .canvas {
+      padding: 30px 36px 36px;
+    }
+
+    .lanes {
+      display: grid;
+      gap: 22px;
+    }
+
+    .lane {
+      display: grid;
+      grid-template-columns: 170px 1fr;
+      gap: 18px;
+      align-items: stretch;
+    }
+
+    .lane-label {
+      display: grid;
+      align-content: center;
+      padding: 18px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #fbfcfe;
+      min-height: 150px;
+    }
+
+    .lane-label strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 18px;
+    }
+
+    .lane-label span {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+      align-items: stretch;
+      position: relative;
+    }
+
+    .step {
+      position: relative;
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 10px;
+      min-height: 150px;
+      padding: 18px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #ffffff;
+    }
+
+    .step::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      right: -18px;
+      width: 18px;
+      height: 2px;
+      background: var(--line);
+    }
+
+    .step::before {
+      content: "";
+      position: absolute;
+      top: calc(50% - 5px);
+      right: -20px;
+      width: 0;
+      height: 0;
+      border-top: 6px solid transparent;
+      border-bottom: 6px solid transparent;
+      border-left: 8px solid var(--line);
+    }
+
+    .steps .step:last-child::after,
+    .steps .step:last-child::before {
+      display: none;
+    }
+
+    .num {
+      display: inline-grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 999px;
+      color: #ffffff;
+      font-weight: 800;
+      font-size: 15px;
+    }
+
+    .teal .num,
+    .teal .tag {
+      background: var(--teal);
+    }
+
+    .blue .num,
+    .blue .tag {
+      background: var(--blue);
+    }
+
+    .amber .num,
+    .amber .tag {
+      background: var(--amber);
+    }
+
+    .green .num,
+    .green .tag {
+      background: var(--green);
+    }
+
+    .step h2 {
+      margin: 0;
+      font-size: 21px;
+      line-height: 1.18;
+      letter-spacing: 0;
+    }
+
+    .step p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.38;
+    }
+
+    code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+      color: #0f3c38;
+      background: #ecfdf5;
+      border: 1px solid #b7eadc;
+      border-radius: 5px;
+      padding: 1px 5px;
+      word-break: break-word;
+    }
+
+    .callouts {
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 22px;
+      margin-top: 28px;
+    }
+
+    .callout,
+    .runtime {
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #fbfcfe;
+      padding: 22px;
+    }
+
+    .callout h2,
+    .runtime h2 {
+      margin: 0 0 14px;
+      font-size: 22px;
+      letter-spacing: 0;
+    }
+
+    .comparison {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    .compare-box {
+      min-height: 145px;
+      padding: 18px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #ffffff;
+    }
+
+    .compare-box strong {
+      display: block;
+      margin-bottom: 10px;
+      font-size: 16px;
+    }
+
+    .compare-box ul,
+    .runtime ul {
+      margin: 0;
+      padding-left: 20px;
+      color: var(--muted);
+      line-height: 1.45;
+      font-size: 15px;
+    }
+
+    .compare-box li + li,
+    .runtime li + li {
+      margin-top: 6px;
+    }
+
+    .new {
+      border-color: #9ed8d0;
+      background: var(--teal-soft);
+    }
+
+    .old {
+      border-color: #efd08f;
+      background: var(--amber-soft);
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      margin-bottom: 12px;
+      padding: 5px 9px;
+      border-radius: 999px;
+      color: #ffffff;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+
+    .runtime-map {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .component {
+      min-height: 84px;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #ffffff;
+    }
+
+    .component strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+    }
+
+    .component span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .footer {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: space-between;
+      align-items: center;
+      padding: 18px 36px;
+      border-top: 1px solid var(--line);
+      background: #fbfcfe;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .footer strong {
+      color: var(--ink);
+    }
+
+    @media (max-width: 1180px) {
+      header {
+        grid-template-columns: 1fr;
+        align-items: start;
+      }
+
+      .lane {
+        grid-template-columns: 1fr;
+      }
+
+      .lane-label {
+        min-height: auto;
+      }
+
+      .steps {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .step::after,
+      .step::before {
+        display: none;
+      }
+
+      .callouts {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .page {
+        width: 100%;
+        margin: 0;
+        border-radius: 0;
+        border-left: 0;
+        border-right: 0;
+      }
+
+      header,
+      .canvas,
+      .footer {
+        padding-left: 18px;
+        padding-right: 18px;
+      }
+
+      .steps,
+      .comparison,
+      .runtime-map {
+        grid-template-columns: 1fr;
+      }
+
+      .status-chip {
+        white-space: normal;
+        border-radius: 8px;
+      }
+    }
+
+    @media print {
+      body {
+        background: #ffffff;
+      }
+
+      .page {
+        width: 100%;
+        margin: 0;
+        border: 0;
+        box-shadow: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page" aria-label="Enclava deploy flow infographic">
+    <header>
+      <div>
+        <h1>Enclava Deploy Flow: No Env Exports</h1>
+        <p class="subtitle">
+          The CLI discovers deployment context from the authenticated CAP API,
+          builds a signed descriptor locally, and lets the platform create a
+          tenant runtime from pinned GHCR image digests.
+        </p>
+      </div>
+      <div class="status-chip"><span class="dot"></span> Product shape implemented</div>
+    </header>
+
+    <section class="canvas">
+      <div class="lanes">
+        <section class="lane" aria-labelledby="lane-cli">
+          <div class="lane-label">
+            <strong id="lane-cli">User and CLI</strong>
+            <span>Simple deploy command. No platform internals exported into the shell.</span>
+          </div>
+          <div class="steps">
+            <article class="step teal">
+              <span class="num">1</span>
+              <h2>Run deploy</h2>
+              <p><code>enclava deploy --image ghcr.io/...</code></p>
+            </article>
+            <article class="step teal">
+              <span class="num">2</span>
+              <h2>Discover context</h2>
+              <p>CLI calls <code>/platform/deployment-context</code> with the logged-in session.</p>
+            </article>
+            <article class="step teal">
+              <span class="num">3</span>
+              <h2>Receive platform facts</h2>
+              <p>API returns the signing public key and TLS certificate broker URL.</p>
+            </article>
+            <article class="step teal">
+              <span class="num">4</span>
+              <h2>Build signed descriptor</h2>
+              <p>The CLI signs a deploy descriptor that binds image digest, policy, and context.</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="lane" aria-labelledby="lane-control">
+          <div class="lane-label">
+            <strong id="lane-control">CAP control plane</strong>
+            <span>Authenticated API validates intent and turns it into tenant resources.</span>
+          </div>
+          <div class="steps">
+            <article class="step blue">
+              <span class="num">5</span>
+              <h2>Validate descriptor</h2>
+              <p>CAP API checks the signed request against platform policy and deploy inputs.</p>
+            </article>
+            <article class="step blue">
+              <span class="num">6</span>
+              <h2>Create tenant namespace</h2>
+              <p>Kubernetes namespace is created for the app, for example <code>cap-org-app</code>.</p>
+            </article>
+            <article class="step blue">
+              <span class="num">7</span>
+              <h2>Pull GHCR digests</h2>
+              <p>Runtime containers use pinned GHCR digests instead of mutable local images.</p>
+            </article>
+            <article class="step blue">
+              <span class="num">8</span>
+              <h2>Expose app URL</h2>
+              <p>The platform publishes the tenant HTTPS endpoint for the deployed app.</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="lane" aria-labelledby="lane-runtime">
+          <div class="lane-label">
+            <strong id="lane-runtime">Claim, unlock, runtime</strong>
+            <span>TEE evidence and storage unlock gate the app before it serves traffic.</span>
+          </div>
+          <div class="steps">
+            <article class="step amber">
+              <span class="num">9</span>
+              <h2>Claim or unlock</h2>
+              <p>The user verifies TEE evidence and unlocks encrypted tenant storage.</p>
+            </article>
+            <article class="step amber">
+              <span class="num">10</span>
+              <h2>Start runtime</h2>
+              <p><code>enclava-init</code> prepares the pod, then app containers become ready.</p>
+            </article>
+            <article class="step green">
+              <span class="num">11</span>
+              <h2>Serve HTTPS</h2>
+              <p><code>tenant-ingress</code> routes public HTTPS traffic to the web app.</p>
+            </article>
+            <article class="step green">
+              <span class="num">12</span>
+              <h2>Keep attestation available</h2>
+              <p><code>attestation-proxy</code> remains available for runtime attestation flows.</p>
+            </article>
+          </div>
+        </section>
+      </div>
+
+      <section class="callouts" aria-label="Key deploy behavior">
+        <div class="callout">
+          <h2>What changed for users</h2>
+          <div class="comparison">
+            <div class="compare-box old">
+              <span class="tag">Before</span>
+              <strong>Manual config exports</strong>
+              <ul>
+                <li><code>ENCLAVA_API_SIGNING_PUBKEY</code> had to be known by the user.</li>
+                <li><code>TLS_CERTIFICATE_BROKER_URL</code> had to be set in the shell.</li>
+                <li>Deploy UX exposed internal platform wiring.</li>
+              </ul>
+            </div>
+            <div class="compare-box new">
+              <span class="tag">Now</span>
+              <strong>Authenticated context delivery</strong>
+              <ul>
+                <li>The API returns the current runtime signing key.</li>
+                <li>The API returns the correct TLS broker URL for the environment.</li>
+                <li>The CLI can deploy without extra env-var ceremony.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="runtime">
+          <h2>Runtime shape</h2>
+          <ul>
+            <li><strong>web</strong> is the customer app image.</li>
+            <li><strong>tenant-ingress</strong> terminates and routes tenant HTTP traffic.</li>
+            <li><strong>enclava-init</strong> prepares confidential runtime state before app readiness.</li>
+            <li><strong>attestation-proxy</strong> serves attestation-related runtime APIs.</li>
+          </ul>
+          <div class="runtime-map" aria-label="Runtime container map">
+            <div class="component">
+              <strong>web</strong>
+              <span>Customer workload image from GHCR digest.</span>
+            </div>
+            <div class="component">
+              <strong>tenant-ingress</strong>
+              <span>Public HTTPS entry point into the tenant pod.</span>
+            </div>
+            <div class="component">
+              <strong>enclava-init</strong>
+              <span>Init and unlock-sensitive runtime setup.</span>
+            </div>
+            <div class="component">
+              <strong>attestation-proxy</strong>
+              <span>TEE evidence and attestation service path.</span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <footer class="footer">
+      <span><strong>Security boundary:</strong> platform facts come from the authenticated CAP API, not user-managed shell exports.</span>
+      <span><strong>Release boundary:</strong> cluster workloads pull committed GHCR image digests.</span>
+    </footer>
+  </main>
+</body>
+</html>
