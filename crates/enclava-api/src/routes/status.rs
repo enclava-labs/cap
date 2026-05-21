@@ -78,12 +78,7 @@ pub async fn app_status(
         };
 
     let db_status = format!("{:?}", app.status).to_lowercase();
-    let effective_status = match live_state.as_deref() {
-        Some("unlocked") => "running".to_string(),
-        Some("locked") => "locked".to_string(),
-        Some("unclaimed") if db_status == "failed" => "creating".to_string(),
-        _ => db_status,
-    };
+    let effective_status = effective_app_status(&db_status, live_state.as_deref());
 
     Ok(Json(AppStatusResponse {
         app_name: app.name,
@@ -95,6 +90,15 @@ pub async fn app_status(
         tee_status,
         storage_status,
     }))
+}
+
+fn effective_app_status(db_status: &str, live_state: Option<&str>) -> String {
+    match live_state {
+        Some("unlocked") if db_status == "running" => "running".to_string(),
+        Some("locked") => "locked".to_string(),
+        Some("unclaimed") if db_status == "failed" => "creating".to_string(),
+        _ => db_status.to_string(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -130,4 +134,22 @@ pub async fn app_logs(
 
     // TODO: proxy via kube-rs pod log API (Plan 3 integration)
     Ok(Json(vec![]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_app_status;
+
+    #[test]
+    fn unlocked_tee_does_not_mark_creating_app_running() {
+        assert_eq!(
+            effective_app_status("creating", Some("unlocked")),
+            "creating"
+        );
+    }
+
+    #[test]
+    fn unlocked_tee_keeps_running_app_running() {
+        assert_eq!(effective_app_status("running", Some("unlocked")), "running");
+    }
 }
