@@ -64,6 +64,12 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         axum::routing::post(routes::users::register_public_key),
     );
 
+    // Platform routes (authenticated)
+    let platform_routes = Router::new().route(
+        "/platform/deployment-context",
+        axum::routing::get(routes::platform::deployment_context),
+    );
+
     // Org routes (authenticated)
     let org_routes = Router::new()
         .route("/orgs", axum::routing::post(routes::orgs::create_org))
@@ -262,6 +268,7 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
     let api_routes = Router::new()
         .merge(auth_routes)
         .merge(user_routes)
+        .merge(platform_routes)
         .merge(org_routes)
         .merge(app_routes)
         .merge(deploy_routes)

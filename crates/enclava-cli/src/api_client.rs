@@ -262,6 +262,17 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn deployment_context(&self) -> Result<DeploymentContextResponse, ApiError> {
+        let resp = self
+            .http
+            .get(self.url("/platform/deployment-context"))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     // --- Status ---
 
     pub async fn get_status(&self, app_name: &str) -> Result<AppStatus, ApiError> {

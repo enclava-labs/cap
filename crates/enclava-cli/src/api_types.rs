@@ -143,6 +143,13 @@ pub struct AgentPolicyResponse {
     pub genpolicy_version_pin: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeploymentContextResponse {
+    pub api_signing_pubkey: String,
+    #[serde(default)]
+    pub tls_certificate_broker_url: Option<String>,
+}
+
 // --- Status ---
 
 #[derive(Debug, Deserialize)]

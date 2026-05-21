@@ -166,6 +166,7 @@ struct ConfidentialAppForCcHash<'a> {
     release: &'a PlatformRelease,
     workload_artifact_binding: WorkloadArtifactBinding,
     generated_agent_policy: GeneratedAgentPolicy,
+    deployment_context: DeploymentContextResponse,
     unlock_mode: &'a str,
     tenant_id: String,
     tenant_instance_identity_hash: [u8; 32],
@@ -182,11 +183,16 @@ fn confidential_app_for_cc_hash(
         release,
         workload_artifact_binding,
         generated_agent_policy,
+        deployment_context,
         unlock_mode,
         tenant_id,
         tenant_instance_identity_hash,
         bootstrap_owner_pubkey_hash,
     } = params;
+    let api_signing_pubkey = deployment_context.api_signing_pubkey.trim().to_string();
+    if api_signing_pubkey.is_empty() {
+        return Err("platform deployment context did not include api_signing_pubkey".into());
+    }
 
     let unlock_mode = match unlock_mode {
         "password" => UnlockMode::Password,
@@ -224,7 +230,7 @@ fn confidential_app_for_cc_hash(
             tee_domain: app.tee_domain.clone().unwrap_or_else(|| app.domain.clone()),
             custom_domain: app.custom_domain.clone(),
         },
-        api_signing_pubkey: std::env::var("ENCLAVA_API_SIGNING_PUBKEY").unwrap_or_default(),
+        api_signing_pubkey,
         api_url: String::new(),
         resources: ResourceLimits {
             cpu: app_config.resources.cpu.clone(),
@@ -240,7 +246,10 @@ fn confidential_app_for_cc_hash(
                 .map_err(|err| format!("platform release tenant_caddy_tls_mode: {err}"))?,
             trustee_policy_read_available: true,
             workload_artifacts_url: None,
-            tls_certificate_broker_url: tls_certificate_broker_url_for_cc_hash(release),
+            tls_certificate_broker_url: tls_certificate_broker_url_for_cc_hash(
+                release,
+                &deployment_context,
+            )?,
             trustee_policy_url: None,
             local_workload_artifacts_json: Some("{}".to_string()),
             local_trustee_policy_json: Some("{}".to_string()),
@@ -253,18 +262,25 @@ fn confidential_app_for_cc_hash(
     })
 }
 
-fn tls_certificate_broker_url_for_cc_hash(release: &PlatformRelease) -> Option<String> {
+fn tls_certificate_broker_url_for_cc_hash(
+    release: &PlatformRelease,
+    deployment_context: &DeploymentContextResponse,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mode = release
         .tenant_caddy_tls_mode
         .parse::<enclava_engine::types::CaddyTlsMode>()
-        .ok()?;
+        .map_err(|err| format!("platform release tenant_caddy_tls_mode: {err}"))?;
     if mode != enclava_engine::types::CaddyTlsMode::Dns01Broker {
-        return None;
+        return Ok(None);
     }
-    std::env::var("TLS_CERTIFICATE_BROKER_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
+
+    let url = deployment_context
+        .tls_certificate_broker_url
+        .as_deref()
+        .map(str::trim)
         .filter(|value| !value.is_empty())
+        .ok_or("platform deployment context did not include tls_certificate_broker_url for dns01-broker release")?;
+    Ok(Some(url.to_string()))
 }
 
 async fn fetch_generated_agent_policy(
@@ -398,6 +414,11 @@ pub(crate) async fn build_signed_deploy_blobs(
     if !proxy_image.has_digest() || !caddy_image.has_digest() {
         return Err("platform release sidecar anchors must be digest-pinned".into());
     }
+    let deployment_context = api.deployment_context().await?;
+    let api_signing_pubkey = deployment_context.api_signing_pubkey.trim().to_string();
+    if api_signing_pubkey.is_empty() {
+        return Err("platform deployment context did not include api_signing_pubkey".into());
+    }
 
     let org_name = match cli_config.org.as_deref() {
         Some(org) => org,
@@ -508,7 +529,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             attestation_proxy_digest: proxy_image.digest().to_string(),
             caddy_digest: caddy_image.digest().to_string(),
         },
-        api_signing_pubkey: std::env::var("ENCLAVA_API_SIGNING_PUBKEY").unwrap_or_default(),
+        api_signing_pubkey,
         expected_firmware_measurement: release.expected_firmware_measurement_bytes()?,
         expected_runtime_class: release.expected_runtime_class.clone(),
         kbs_resource_path: format!(
@@ -540,6 +561,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             release: &release,
             workload_artifact_binding,
             generated_agent_policy: generated_agent_policy.clone(),
+            deployment_context,
             unlock_mode: deploy_unlock_mode,
             tenant_id,
             tenant_instance_identity_hash: identity_hash,
@@ -1380,9 +1402,6 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
 mod tests {
     use super::*;
     use enclava_cli::app_config::{AppSection, ResourcesSection, StorageSection, UnlockSection};
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_release() -> PlatformRelease {
         PlatformRelease {
@@ -1458,6 +1477,13 @@ mod tests {
         }
     }
 
+    fn test_deployment_context() -> DeploymentContextResponse {
+        DeploymentContextResponse {
+            api_signing_pubkey: "test-api-signing-pubkey".to_string(),
+            tls_certificate_broker_url: None,
+        }
+    }
+
     #[test]
     fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
         let app = confidential_app_for_cc_hash(
@@ -1479,6 +1505,7 @@ mod tests {
                     policy_sha256: Sha256::digest(b"package agent_policy\n").into(),
                     genpolicy_version_pin: "test-genpolicy".to_string(),
                 },
+                deployment_context: test_deployment_context(),
                 unlock_mode: "password",
                 tenant_id: "org".to_string(),
                 tenant_instance_identity_hash: [4; 32],
@@ -1486,6 +1513,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(app.api_signing_pubkey, "test-api-signing-pubkey");
 
         let cc_toml = cc_init_data::build_toml_with_options(
             &app,
@@ -1505,18 +1533,16 @@ mod tests {
     }
 
     #[test]
-    fn signed_cc_hash_app_includes_dns01_broker_url_when_release_uses_broker_mode() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: this test serializes access with ENV_LOCK because environment
-        // variables are process-global in Rust 2024.
-        unsafe {
-            std::env::set_var(
-                "TLS_CERTIFICATE_BROKER_URL",
-                "http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate",
-            );
-        }
+    fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
         let mut release = test_release();
         release.tenant_caddy_tls_mode = "dns01-broker".to_string();
+        let deployment_context = DeploymentContextResponse {
+            api_signing_pubkey: "context-api-signing-pubkey".to_string(),
+            tls_certificate_broker_url: Some(
+                "http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
+                    .to_string(),
+            ),
+        };
 
         let app = confidential_app_for_cc_hash(
             &test_app_response(),
@@ -1537,6 +1563,7 @@ mod tests {
                     policy_sha256: Sha256::digest(b"package agent_policy\n").into(),
                     genpolicy_version_pin: "test-genpolicy".to_string(),
                 },
+                deployment_context,
                 unlock_mode: "password",
                 tenant_id: "org".to_string(),
                 tenant_instance_identity_hash: [4; 32],
@@ -1544,6 +1571,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert_eq!(app.api_signing_pubkey, "context-api-signing-pubkey");
 
         let cc_toml = cc_init_data::build_toml_with_options(
             &app,
@@ -1557,9 +1585,6 @@ mod tests {
             "tls_certificate_broker_url = \"http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate\""
         ));
         assert!(cc_toml.contains("tls_certificate_hostnames = \"[\\\"demo.org.enclava.dev\\\"]\""));
-        unsafe {
-            std::env::remove_var("TLS_CERTIFICATE_BROKER_URL");
-        }
     }
 
     #[test]
