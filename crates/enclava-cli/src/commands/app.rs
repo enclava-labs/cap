@@ -856,8 +856,8 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     loop {
         if health_start.elapsed() > health_timeout {
-            pb.finish_with_message("Deployed (health check timed out)");
-            break;
+            pb.abandon_with_message("Timeout waiting for health check");
+            return Err("deploy timed out waiting for app health check".into());
         }
 
         match api.get_status(&app_name).await {
@@ -1703,6 +1703,24 @@ mod tests {
         assert!(
             attest < set,
             "deploy config delivery must verify attestation/SPKI binding before writing config"
+        );
+    }
+
+    #[test]
+    fn deploy_health_timeout_is_not_reported_as_success() {
+        let source = include_str!("app.rs");
+        let phase_start = source
+            .find("// Phase 4: Health check")
+            .expect("health check phase exists");
+        let phase_end = source[phase_start..]
+            .find("println!();")
+            .expect("health check phase is followed by deploy summary")
+            + phase_start;
+        let body = &source[phase_start..phase_end];
+
+        assert!(
+            !body.contains("Deployed (health check timed out)"),
+            "deploy must fail when the runtime health check times out"
         );
     }
 
