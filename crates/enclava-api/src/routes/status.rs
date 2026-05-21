@@ -48,7 +48,7 @@ pub async fn app_status(
         ))?;
 
     let domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
-    let tee_status_url = format!("https://{}/.well-known/confidential/status", domain);
+    let tee_status_url = confidential_status_url(domain, app.tee_domain.as_deref());
 
     let (pod_status, tee_status, storage_status, live_state) =
         match state.tee_http_client.get(&tee_status_url).send().await {
@@ -101,6 +101,11 @@ fn effective_app_status(db_status: &str, live_state: Option<&str>) -> String {
     }
 }
 
+fn confidential_status_url(domain: &str, tee_domain: Option<&str>) -> String {
+    let confidential_domain = tee_domain.unwrap_or(domain);
+    format!("https://{confidential_domain}/.well-known/confidential/status")
+}
+
 #[derive(Debug, Serialize)]
 pub struct LogLine {
     pub timestamp: String,
@@ -138,7 +143,7 @@ pub async fn app_logs(
 
 #[cfg(test)]
 mod tests {
-    use super::effective_app_status;
+    use super::{confidential_status_url, effective_app_status};
 
     #[test]
     fn unlocked_tee_does_not_mark_creating_app_running() {
@@ -151,5 +156,13 @@ mod tests {
     #[test]
     fn unlocked_tee_keeps_running_app_running() {
         assert_eq!(effective_app_status("running", Some("unlocked")), "running");
+    }
+
+    #[test]
+    fn confidential_status_probe_uses_tee_domain() {
+        assert_eq!(
+            confidential_status_url("app.example.test", Some("app.tee.example.test")),
+            "https://app.tee.example.test/.well-known/confidential/status"
+        );
     }
 }
