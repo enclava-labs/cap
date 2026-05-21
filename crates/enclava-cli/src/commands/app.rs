@@ -1733,8 +1733,11 @@ mod tests {
 
     #[test]
     fn deploy_health_timeout_covers_generated_readiness_delay() {
+        let deploy_health_timeout = Duration::from_secs(DEPLOY_HEALTH_TIMEOUT_SECONDS);
+        let generated_readiness_delay_with_jitter = Duration::from_secs(240);
+
         assert!(
-            DEPLOY_HEALTH_TIMEOUT_SECONDS >= 240,
+            deploy_health_timeout >= generated_readiness_delay_with_jitter,
             "deploy health timeout must cover the 180s generated readiness delay plus rollout jitter"
         );
     }
