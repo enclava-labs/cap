@@ -2,7 +2,7 @@ use dialoguer::Input;
 use std::path::Path;
 
 /// Detect EXPOSE port from a Dockerfile.
-fn detect_dockerfile_port(path: &Path) -> Option<u16> {
+pub(crate) fn detect_dockerfile_port(path: &Path) -> Option<u16> {
     let content = std::fs::read_to_string(path).ok()?;
     for line in content.lines() {
         let trimmed = line.trim();
@@ -20,8 +20,36 @@ fn detect_dockerfile_port(path: &Path) -> Option<u16> {
     None
 }
 
+/// Default app name derived from the current project directory.
+pub(crate) fn default_app_name(cwd: &Path) -> String {
+    let raw = cwd
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("my-app")
+        .to_lowercase();
+
+    let mut name = String::new();
+    let mut previous_was_dash = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            name.push(ch);
+            previous_was_dash = false;
+        } else if !previous_was_dash && !name.is_empty() {
+            name.push('-');
+            previous_was_dash = true;
+        }
+    }
+
+    let trimmed = name.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "my-app".to_string()
+    } else {
+        trimmed
+    }
+}
+
 /// Generate enclava.toml content.
-fn generate_enclava_toml(name: &str, port: u16) -> String {
+pub(crate) fn generate_enclava_toml(name: &str, port: u16) -> String {
     format!(
         r#"[app]
 name = "{name}"
@@ -49,7 +77,7 @@ timeout = 5
 }
 
 /// Generate GitHub Actions workflow for build + sign + deploy.
-fn generate_github_workflow(app_name: &str) -> String {
+pub(crate) fn generate_github_workflow(app_name: &str) -> String {
     format!(
         r#"name: Deploy {app_name}
 
@@ -177,16 +205,9 @@ pub async fn init() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Get app name (default to directory name)
-    let dir_name = cwd
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("my-app")
-        .to_lowercase()
-        .replace(' ', "-");
-
     let app_name: String = Input::new()
         .with_prompt("App name")
-        .default(dir_name)
+        .default(default_app_name(&cwd))
         .interact_text()?;
 
     let port: u16 = Input::new()
@@ -259,6 +280,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("Dockerfile");
         assert_eq!(detect_dockerfile_port(&missing), None);
+    }
+
+    #[test]
+    fn default_app_name_sanitizes_directory_name() {
+        let path = Path::new("/tmp/My App_repo!");
+        assert_eq!(default_app_name(path), "my-app-repo");
     }
 
     #[test]
