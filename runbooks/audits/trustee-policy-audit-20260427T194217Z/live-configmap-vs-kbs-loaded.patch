@@ -1,7 +1,0 @@
---- /tmp/trustee-policy-audit-20260427T194217Z-corrected/live-policy.rego	2026-04-27 19:43:09.702332876 +0000
-+++ /tmp/trustee-policy-audit-20260427T194217Z-corrected/kbs-loaded-policy.rego	2026-04-27 19:43:09.970340935 +0000
-@@ -1276,4 +1276,3 @@
-         data.method == "DELETE"
-         owner_resource_request_allowed(requested_path)
-     }
--

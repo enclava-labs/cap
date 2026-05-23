@@ -154,6 +154,8 @@ pub struct App {
     pub signer_identity_subject: Option<String>,
     pub signer_identity_issuer: Option<String>,
     pub signer_identity_set_at: Option<DateTime<Utc>>,
+    pub source_provider: Option<String>,
+    pub source_repository: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -183,6 +185,7 @@ pub struct AppResources {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Deployment {
     pub id: Uuid,
+    pub org_id: Option<Uuid>,
     pub app_id: Uuid,
     pub trigger: Trigger,
     pub status: DeployStatus,
@@ -195,6 +198,9 @@ pub struct Deployment {
     pub cosign_verified: bool,
     pub provenance_attestation: Option<serde_json::Value>,
     pub sbom: Option<serde_json::Value>,
+    pub external_id: Option<String>,
+    pub source_provider: Option<String>,
+    pub source_repository: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]

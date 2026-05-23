@@ -1,0 +1,167 @@
+/* ============================================================
+   Enclava CAP · Vault theme · design tokens
+   Both modes coexist; the active one is selected via
+   <html data-theme="dark|light">.
+   ============================================================ */
+
+:root[data-theme='dark'] {
+  --bg: #0a0d11;
+  --bg-2: #0e1218;
+  --panel: #131822;
+  --line: #2a3744;
+  --line-2: #3e4d5d;
+  --ink: #dde6d4;
+  --ink-2: #bcc7b2;
+  --dim: #7d8c84;
+  --dimmer: #4a5550;
+  --phos: #7dffb2;
+  --phos-dim: #34a263;
+  --phos-soft: rgba(125, 255, 178, 0.1);
+  --amber: #ffb454;
+  --amber-soft: rgba(255, 180, 84, 0.12);
+  --red: #ff6b6b;
+  --blue: #7ec8ff;
+  --magenta: #d896ff;
+  --gold: #ffd166;
+  --selection: #1f3a2a;
+
+  --on-phos: #06241a;
+  --on-amber: #1a1004;
+  --on-ink: var(--bg);
+
+  --elevation: rgba(255, 255, 255, 0.025);
+  --elevation-soft: rgba(255, 255, 255, 0.012);
+
+  --scanline-opacity: 0.012;
+  --vignette-opacity: 0.5;
+  --terminal-bg: #050709;
+  --terminal-fg: #dde6d4;
+}
+
+:root[data-theme='light'] {
+  --bg: #f4efe2;
+  --bg-2: #ece6d5;
+  --panel: #f9f5ea;
+  --line: #d6cebb;
+  --line-2: #c0b69d;
+  --ink: #14140f;
+  --ink-2: #2a2820;
+  --dim: #6e695c;
+  --dimmer: #9b9684;
+  --phos: #1f6b3a;
+  --phos-dim: #2a854a;
+  --phos-soft: #d5e9d8;
+  --amber: #a85a0a;
+  --amber-soft: #f4dcbc;
+  --red: #a32525;
+  --blue: #1f4f87;
+  --magenta: #6f2b8a;
+  --gold: #8a6a1c;
+  --selection: #f4dcbc;
+
+  --on-phos: var(--bg);
+  --on-amber: var(--bg);
+  --on-ink: var(--bg);
+
+  --elevation: var(--bg-2);
+  --elevation-soft: var(--bg-2);
+
+  --scanline-opacity: 0.018;
+  --vignette-opacity: 0;
+  --terminal-bg: #1c1c14;
+  --terminal-fg: #e7e2cf;
+}
+
+/* fallback default */
+:root {
+  color-scheme: dark light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* dark-mode scanlines + vignette overlay; both fade to invisible in light */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 100;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, var(--scanline-opacity)) 0,
+    rgba(255, 255, 255, var(--scanline-opacity)) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  mix-blend-mode: overlay;
+}
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 99;
+  background: radial-gradient(ellipse at center, transparent 55%, rgba(0, 0, 0, var(--vignette-opacity)) 100%);
+}
+
+/* light theme paper grid */
+:root[data-theme='light'] body {
+  background-image: repeating-linear-gradient(
+    to bottom,
+    rgba(20, 20, 15, 0.018) 0,
+    rgba(20, 20, 15, 0.018) 1px,
+    transparent 1px,
+    transparent 28px
+  );
+}
+:root[data-theme='light'] body::before {
+  display: none;
+}
+
+::selection {
+  background: var(--selection);
+  color: var(--phos);
+}
+:root[data-theme='light'] ::selection {
+  background: var(--phos);
+  color: var(--bg);
+}
+
+a {
+  color: var(--phos);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--phos-dim);
+}
+a:hover {
+  color: var(--ink);
+  border-bottom-color: var(--ink);
+}
+
+button {
+  font-family: inherit;
+}
+
+input,
+textarea,
+select {
+  font-family: inherit;
+  color: inherit;
+}
+
+pre {
+  font-family: inherit;
+}

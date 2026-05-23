@@ -719,10 +719,11 @@ pub async fn update_unlock_mode(
     });
 
     sqlx::query(
-        "INSERT INTO deployments (id, app_id, trigger, spec_snapshot, image_digest)
-         VALUES ($1, $2, 'api', $3, $4)",
+        "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest)
+         VALUES ($1, $2, $3, 'api', $4, $5)",
     )
     .bind(deploy_id)
+    .bind(auth.org_id)
     .bind(app.id)
     .bind(&spec_snapshot)
     .bind(&image_digest)
@@ -883,6 +884,8 @@ mod tests {
             signer_identity_subject: None,
             signer_identity_issuer: None,
             signer_identity_set_at: None,
+            source_provider: None,
+            source_repository: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

@@ -20,6 +20,7 @@ const DEFAULT_REGISTRY_ALLOWLIST: &[&str] = &[
     "registry-1.docker.io",
     "quay.io",
     "gcr.io",
+    "registry.gitlab.com",
 ];
 const DEFAULT_REGISTRY_WILDCARDS: &[&str] = &["pkg.dev"];
 
@@ -394,6 +395,7 @@ mod tests {
             "registry-1.docker.io",
             "quay.io",
             "gcr.io",
+            "registry.gitlab.com",
         ] {
             assert!(allow.allows(host), "{host} should be allowed");
         }
@@ -424,6 +426,14 @@ mod tests {
             .check_url("https://attacker.example/v2/foo/manifests/x")
             .unwrap_err();
         assert!(matches!(err, ClientError::HostNotAllowed(_)));
+    }
+
+    #[test]
+    fn registry_client_accepts_gitlab_registry() {
+        let client = RegistryClient::new(cfg(), AllowList::from_env_or_default(None)).unwrap();
+        client
+            .check_url("https://registry.gitlab.com/v2/acme/app/manifests/latest")
+            .unwrap();
     }
 
     #[test]

@@ -61,6 +61,9 @@ fn agent_policy_create_container_is_bound_to_workload_identity() {
         "input.OCI.Annotations[\"io.kubernetes.pod.service-account.name\"] == \"cap-test-app-sa\""
     ));
     assert!(
+        toml.contains("input.OCI.Annotations[\"tenant.enclava.dev/instance\"] == \"test-app\"")
+    );
+    assert!(
         toml.contains("input.OCI.Annotations[\"tenant.flowforge.sh/instance\"] == \"test-app\"")
     );
 }
@@ -212,6 +215,7 @@ fn toml_serializes_adversarial_claim_values_without_breakout() {
 fn toml_contains_policy_instance_annotation() {
     let app = sample_app();
     let toml = build_toml(&app);
+    assert!(toml.contains("\"tenant.enclava.dev/instance\":\"test-app\""));
     assert!(toml.contains("\"tenant.flowforge.sh/instance\":\"test-app\""));
 }
 

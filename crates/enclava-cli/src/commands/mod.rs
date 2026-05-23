@@ -4,6 +4,7 @@ pub mod config;
 pub mod descriptor;
 pub mod domains;
 pub mod init;
+pub mod key;
 pub mod org;
 pub mod ownership;
 pub mod prepare;
@@ -28,7 +29,11 @@ pub enum Command {
     Signup,
     /// Authenticate with the platform
     Login(auth::LoginArgs),
-    /// Generate enclava.toml and GitHub Actions workflow
+    /// Show authenticated user and active organization
+    Whoami,
+    /// Clear the saved platform session
+    Logout,
+    /// Generate enclava.toml for manual deployment
     Init,
     /// Prepare this repository for Enclava deployment
     Prepare,
@@ -70,6 +75,9 @@ pub enum Command {
     /// Manage organizations
     #[command(subcommand)]
     Org(org::OrgCommand),
+    /// Manage local recovery and deployment keys
+    #[command(subcommand)]
+    Key(key::KeyCommand),
     /// Inspect a deployment descriptor (debug; phase 7 groundwork)
     #[command(subcommand)]
     Descriptor(descriptor::DescriptorCommand),
@@ -79,6 +87,8 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Signup => auth::signup().await,
         Command::Login(args) => auth::login(args).await,
+        Command::Whoami => auth::whoami().await,
+        Command::Logout => auth::logout().await,
         Command::Init => init::init().await,
         Command::Prepare => prepare::prepare().await,
         Command::Create(args) => app::create(args).await,
@@ -97,6 +107,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Signer(cmd) => app::signer(cmd).await,
         Command::Tier(cmd) => tier::run(cmd).await,
         Command::Org(cmd) => org::run(cmd).await,
+        Command::Key(cmd) => key::run(cmd).await,
         Command::Descriptor(cmd) => descriptor::run(cmd).await,
     }
 }

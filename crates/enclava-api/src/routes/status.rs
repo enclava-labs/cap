@@ -5,6 +5,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
+use chrono::Utc;
 use serde::Serialize;
 
 use crate::auth::{middleware::AuthContext, scopes};
@@ -121,7 +122,7 @@ pub async fn app_logs(
 ) -> Result<Json<Vec<LogLine>>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_read(&auth)?;
 
-    let _app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
         .fetch_optional(&state.db)
@@ -137,8 +138,15 @@ pub async fn app_logs(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    // TODO: proxy via kube-rs pod log API (Plan 3 integration)
-    Ok(Json(vec![]))
+    Ok(Json(vec![LogLine {
+        timestamp: Utc::now().to_rfc3339(),
+        container: "cap".to_string(),
+        message: format!(
+            "Live log streaming is not connected yet for {}; current app status is {}.",
+            app.name,
+            format!("{:?}", app.status).to_lowercase()
+        ),
+    }]))
 }
 
 #[cfg(test)]

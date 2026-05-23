@@ -272,6 +272,8 @@ mod tests {
             signer_identity_subject: None,
             signer_identity_issuer: None,
             signer_identity_set_at: None,
+            source_provider: None,
+            source_repository: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -299,6 +301,8 @@ mod tests {
             signer_identity_subject: None,
             signer_identity_issuer: None,
             signer_identity_set_at: None,
+            source_provider: None,
+            source_repository: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -331,6 +335,8 @@ mod tests {
             signer_identity_subject: None,
             signer_identity_issuer: None,
             signer_identity_set_at: None,
+            source_provider: None,
+            source_repository: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

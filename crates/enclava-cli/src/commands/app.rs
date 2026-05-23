@@ -1,8 +1,7 @@
 use clap::Args;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
@@ -18,8 +17,9 @@ use enclava_cli::descriptor::{
     build_descriptor, cap_app_oci_runtime_spec,
 };
 use enclava_cli::keyring::{
-    keyring_fingerprint, load_keyring_envelope, load_trusted_owner, member_allows_deploy,
-    verify_keyring,
+    OrgKeyringEnvelope, Role, keyring_fingerprint, load_keyring_envelope, load_trusted_owner,
+    member_allows_deploy, sign_keyring, single_member_keyring, store_keyring_envelope,
+    store_trusted_owner, verify_keyring,
 };
 use enclava_cli::keys;
 use enclava_cli::platform_release::PlatformRelease;
@@ -122,16 +122,126 @@ fn env_hex32(name: &str) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>>
         .transpose()
 }
 
-fn jwt_subject(token: &str) -> Option<Uuid> {
-    #[derive(serde::Deserialize)]
-    struct Claims {
-        sub: String,
+fn parse_pubkey(hex_in: &str) -> Result<VerifyingKey, Box<dyn std::error::Error>> {
+    let bytes = hex::decode(hex_in)?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "pubkey must decode to 32 bytes")?;
+    Ok(VerifyingKey::from_bytes(&arr)?)
+}
+
+fn keyring_envelope_from_response(
+    response: OrgKeyringResponse,
+) -> Result<OrgKeyringEnvelope, Box<dyn std::error::Error>> {
+    let sig_bytes: [u8; 64] = hex::decode(response.signature)?
+        .try_into()
+        .map_err(|_| "API returned org keyring signature with invalid length")?;
+    Ok(OrgKeyringEnvelope {
+        keyring: serde_json::from_value(response.keyring_payload)?,
+        signature: ed25519_dalek::Signature::from_bytes(&sig_bytes),
+        signing_pubkey: parse_pubkey(&response.signing_pubkey)?,
+    })
+}
+
+async fn resolve_current_user_org(
+    api: &ApiClient,
+) -> Result<(Uuid, Uuid, String), Box<dyn std::error::Error>> {
+    let me = api.get_current_user().await?;
+    Ok((
+        Uuid::parse_str(&me.user_id)?,
+        Uuid::parse_str(&me.active_org.id)?,
+        me.active_org.name,
+    ))
+}
+
+async fn register_public_key(
+    api: &ApiClient,
+    public: &VerifyingKey,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = api
+        .register_public_key(&RegisterPublicKeyRequest {
+            public_key: hex::encode(public.to_bytes()),
+            label: Some("enclava-cli-owner".to_string()),
+        })
+        .await?;
+    Ok(())
+}
+
+async fn upload_keyring(
+    api: &ApiClient,
+    org_name: &str,
+    envelope: &OrgKeyringEnvelope,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = api
+        .put_org_keyring(
+            org_name,
+            &PutOrgKeyringRequest {
+                version: envelope.keyring.version,
+                keyring_payload: serde_json::to_value(&envelope.keyring)?,
+                signature: hex::encode(envelope.signature.to_bytes()),
+                signing_pubkey: hex::encode(envelope.signing_pubkey.to_bytes()),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn ensure_manual_deploy_keyring(
+    api: &ApiClient,
+    paths: &CliPaths,
+) -> Result<(Uuid, String, keys::UserSigningKey), Box<dyn std::error::Error>> {
+    let (user_id, org_id, org_name) = resolve_current_user_org(api).await?;
+    let seed = keys::load_or_create_recovery_seed(paths)?;
+    let owner_key = keys::derive_org_owner_key(user_id, org_id, &seed)?;
+    register_public_key(api, &owner_key.public).await?;
+
+    if let (Some(trusted_owner), Ok(local_envelope)) =
+        (load_trusted_owner(&org_id)?, load_keyring_envelope(&org_id))
+    {
+        let verified = verify_keyring(&local_envelope, &trusted_owner)?;
+        if member_allows_deploy(verified, &owner_key.public) {
+            return Ok((org_id, org_name, owner_key));
+        }
     }
 
-    let payload = token.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload.as_bytes()).ok()?;
-    let claims: Claims = serde_json::from_slice(&bytes).ok()?;
-    Uuid::parse_str(&claims.sub).ok()
+    match api.get_org_keyring(&org_name).await {
+        Ok(response) => {
+            let envelope = keyring_envelope_from_response(response)?;
+            if envelope.signing_pubkey.to_bytes() != owner_key.public.to_bytes() {
+                return Err(
+                    "remote org keyring is owned by a different key; restore the matching recovery seed or use org keyring commands"
+                        .into(),
+                );
+            }
+            verify_keyring(&envelope, &owner_key.public)?;
+            store_trusted_owner(&org_id, &owner_key.public)?;
+            store_keyring_envelope(&org_id, &envelope)?;
+            Ok((org_id, org_name, owner_key))
+        }
+        Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {
+            let now = Utc::now();
+            let keyring = single_member_keyring(org_id, 1, &owner_key, Role::Owner, now);
+            let envelope = sign_keyring(&owner_key, keyring);
+            store_trusted_owner(&org_id, &owner_key.public)?;
+            store_keyring_envelope(&org_id, &envelope)?;
+            upload_keyring(api, &org_name, &envelope).await?;
+            match api
+                .bootstrap_signing_service_owner(
+                    &org_name,
+                    &BootstrapSigningServiceRequest {
+                        owner_pubkey_hex: hex::encode(owner_key.public.to_bytes()),
+                    },
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
+                Err(err) => return Err(err.into()),
+            }
+            Ok((org_id, org_name, owner_key))
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn render_trustee_policy(
@@ -404,8 +514,8 @@ pub(crate) async fn build_signed_deploy_blobs(
     let SignedDeployBlobParams {
         api,
         paths,
-        cli_config,
-        creds,
+        cli_config: _cli_config,
+        creds: _creds,
         app,
         app_config,
         image,
@@ -437,29 +547,9 @@ pub(crate) async fn build_signed_deploy_blobs(
         return Err("platform deployment context did not include api_signing_pubkey".into());
     }
 
-    let org_name = match cli_config.org.as_deref() {
-        Some(org) => org,
-        None => return Err("active org is required to sign deployment descriptor".into()),
-    };
-    let org_id = if let Ok(value) = std::env::var("ENCLAVA_ORG_ID") {
-        Uuid::parse_str(&value)?
-    } else {
-        api.list_orgs()
-            .await?
-            .into_iter()
-            .find(|org| org.name == org_name)
-            .and_then(|org| org.id)
-            .ok_or_else(|| format!("active org '{org_name}' was not returned by /orgs"))?
-            .parse()?
-    };
+    let (org_id, org_name, deployer_key) = ensure_manual_deploy_keyring(api, paths).await?;
 
     let app_id = Uuid::parse_str(&app.id)?;
-    let user_id = creds
-        .session_token
-        .as_deref()
-        .and_then(jwt_subject)
-        .unwrap_or_else(Uuid::new_v4);
-    let deployer_key = keys::create_and_store(user_id)?;
     let trusted_owner = load_trusted_owner(&org_id)?
         .ok_or("org owner pubkey is not trusted; run `enclava org keyring trust` or `enclava org keyring init`")?;
     let keyring_envelope = load_keyring_envelope(&org_id).map_err(|err| {
@@ -475,13 +565,13 @@ pub(crate) async fn build_signed_deploy_blobs(
     }
     let org_keyring_fingerprint = keyring_fingerprint(verified_keyring);
 
-    let tenant_id = org_name.to_string();
+    let tenant_id = org_name.clone();
     let identity_hash = if let Some(value) = app.tenant_instance_identity_hash.as_deref() {
         parse_hex32("tenant_instance_identity_hash", value)?
     } else if let Some(value) = env_hex32("ENCLAVA_TENANT_INSTANCE_IDENTITY_HASH")? {
         value
     } else if deploy_unlock_mode == "password" {
-        match bootstrap_identity_hash(paths, org_name, &app.name, &tenant_id, &app.instance_id)? {
+        match bootstrap_identity_hash(paths, &org_name, &app.name, &tenant_id, &app.instance_id)? {
             Some(hash) => hash,
             None => {
                 return Err(
@@ -494,7 +584,7 @@ pub(crate) async fn build_signed_deploy_blobs(
     };
     let bootstrap_pubkey_hash = if let Some(value) = app.bootstrap_owner_pubkey_hash.clone() {
         value
-    } else if let Some(value) = bootstrap_public_key_hash(paths, org_name, &app.name)? {
+    } else if let Some(value) = bootstrap_public_key_hash(paths, &org_name, &app.name)? {
         value
     } else {
         std::env::var("ENCLAVA_BOOTSTRAP_OWNER_PUBKEY_HASH")
@@ -517,7 +607,7 @@ pub(crate) async fn build_signed_deploy_blobs(
 
     let mut descriptor = build_descriptor(DeploymentDescriptorBuildInput {
         org_id,
-        org_slug: org_name.to_string(),
+        org_slug: org_name.clone(),
         app_id,
         app_name: app.name.clone(),
         deploy_id: Uuid::new_v4(),
@@ -639,21 +729,16 @@ pub struct CreateArgs {
 
 pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_config = AppConfig::find_and_load()?;
-    let (api, paths, cli_config) = build_api_client()?;
+    let (api, paths, _cli_config) = build_api_client()?;
 
     let bootstrap_key = if app_config.unlock.mode == "password" {
-        let org = cli_config
-            .org
-            .as_deref()
-            .ok_or("no active org -- run `enclava login` first")?;
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let (org_id, org, _) = ensure_manual_deploy_keyring(&api, &paths).await?;
+        let seed = keys::load_or_create_recovery_seed(&paths)?;
+        let app_seed = keys::derive_app_bootstrap_seed(org_id, &app_config.app.name, &seed)?;
+        let signing_key = SigningKey::from_bytes(&app_seed);
         let public_key = signing_key.verifying_key().to_bytes();
         let public_key_hash = hex::encode(Sha256::digest(public_key));
-        Some((
-            org.to_string(),
-            hex::encode(signing_key.to_bytes()),
-            public_key_hash,
-        ))
+        Some((org, hex::encode(app_seed), public_key_hash))
     } else {
         None
     };
@@ -1187,7 +1272,19 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // Print all logs at once
         let body = resp.text().await?;
-        print!("{body}");
+        match serde_json::from_str::<Vec<LogLine>>(&body) {
+            Ok(lines) => {
+                for line in lines {
+                    println!(
+                        "{} {} {}",
+                        line.timestamp,
+                        line.container,
+                        line.message.trim_end()
+                    );
+                }
+            }
+            Err(_) => print!("{body}"),
+        }
     }
 
     Ok(())

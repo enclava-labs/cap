@@ -122,6 +122,45 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn start_device_login(
+        &self,
+        req: &DeviceLoginStartRequest,
+    ) -> Result<DeviceLoginStartResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url("/auth/device/start"))
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn poll_device_login(
+        &self,
+        req: &DeviceLoginPollRequest,
+    ) -> Result<DeviceLoginPollResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url("/auth/device/poll"))
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn get_current_user(&self) -> Result<CurrentUserResponse, ApiError> {
+        let resp = self
+            .http
+            .get(self.url("/users/me"))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     // --- Apps ---
 
     pub async fn create_app(&self, req: &CreateAppRequest) -> Result<AppResponse, ApiError> {

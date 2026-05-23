@@ -15,6 +15,7 @@ pub mod ratelimit;
 pub mod registry;
 pub mod routes;
 pub mod signing_service;
+pub mod source_provider;
 pub mod state;
 
 use axum::Router;
@@ -51,6 +52,18 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .route("/auth/signup", axum::routing::post(routes::auth::signup))
         .route("/auth/login", axum::routing::post(routes::auth::login))
         .route(
+            "/auth/device/start",
+            axum::routing::post(routes::auth::start_device_login),
+        )
+        .route(
+            "/auth/device/poll",
+            axum::routing::post(routes::auth::poll_device_login),
+        )
+        .route(
+            "/auth/device/approve",
+            axum::routing::post(routes::auth::approve_device_login),
+        )
+        .route(
             "/auth/api-keys",
             axum::routing::post(routes::auth::create_api_key_route),
         )
@@ -59,10 +72,12 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
             axum::routing::delete(routes::auth::revoke_api_key_route),
         );
 
-    let user_routes = Router::new().route(
-        "/users/me/public-keys",
-        axum::routing::post(routes::users::register_public_key),
-    );
+    let user_routes = Router::new()
+        .route("/users/me", axum::routing::get(routes::users::current_user))
+        .route(
+            "/users/me/public-keys",
+            axum::routing::post(routes::users::register_public_key),
+        );
 
     // Platform routes (authenticated)
     let platform_routes = Router::new().route(
@@ -116,6 +131,18 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
     // Deployment routes (authenticated)
     let deploy_routes = Router::new()
         .route(
+            "/deployments",
+            axum::routing::post(routes::deployments::create_generic_deployment),
+        )
+        .route(
+            "/deployments/{deployment_id}",
+            axum::routing::get(routes::deployments::get_generic_deployment),
+        )
+        .route(
+            "/deployments/{deployment_id}/config-token",
+            axum::routing::post(routes::deployments::generic_config_token),
+        )
+        .route(
             "/apps/{name}/deploy",
             axum::routing::post(routes::deployments::deploy),
         )
@@ -130,23 +157,6 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .route(
             "/apps/{name}/rollback",
             axum::routing::post(routes::deployments::rollback),
-        );
-
-    // Secret Agent hosted-Hermes compatibility routes. These wrap CAP's native
-    // org/app/deploy/config-token model behind the small provisioning API used
-    // by Secret Agent.
-    let secret_agent_routes = Router::new()
-        .route(
-            "/v1/deployments",
-            axum::routing::post(routes::secret_agent::create_deployment),
-        )
-        .route(
-            "/v1/deployments/{deployment_id}/status",
-            axum::routing::get(routes::secret_agent::deployment_status),
-        )
-        .route(
-            "/v1/deployments/{deployment_id}/config-token",
-            axum::routing::post(routes::secret_agent::config_token),
         );
 
     // Config routes (authenticated)
@@ -272,7 +282,6 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .merge(org_routes)
         .merge(app_routes)
         .merge(deploy_routes)
-        .merge(secret_agent_routes)
         .merge(config_routes)
         .merge(domain_routes)
         .merge(status_routes)

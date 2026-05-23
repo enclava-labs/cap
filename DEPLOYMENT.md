@@ -1,135 +1,153 @@
 # Deployment
 
-This guide covers three deployment paths:
+This document describes the current CAP API runtime. It is based on
+`crates/enclava-api/src/main.rs`, `env_gates.rs`, `platform_release.rs`,
+`cosign.rs`, `kbs.rs`, `dns.rs`, and the `deploy/api` overlay.
 
-1. **Local development** — Docker Compose.
-2. **Single host** — Docker + an external PostgreSQL.
-3. **Kubernetes** — the reference overlay in `deploy/api/`.
-
-CAP's API is a stateless HTTP service. It needs PostgreSQL for platform state
-and a [BTCPay Server](https://btcpayserver.org) instance for Bitcoin payments.
-To actually provision workloads into confidential enclaves you also need a
-Kubernetes cluster with AMD SEV-SNP nodes and the companion attestation-proxy,
-but the API itself runs anywhere a normal container runs.
-
-## 1. Local development (Docker Compose)
+## Local Development
 
 ```bash
 docker compose up --build
 curl http://localhost:3000/health
 ```
 
-This spins up PostgreSQL and the API with placeholder credentials (see
-`docker-compose.yml`). `ALLOW_EPHEMERAL_KEYS=1` lets the API generate signing
-and session keys on boot — fine for development, never enable in production.
+The compose file is intentionally development-only. It uses a local PostgreSQL
+container, placeholder BTCPay values, and `ALLOW_EPHEMERAL_KEYS=1`. Do not use
+that mode for any persistent environment because restarts rotate API signing and
+session keys.
 
-## 2. Single host (Docker + external PostgreSQL)
+## Production Shape
 
-```bash
-docker run --rm -d --name cap-api \
-  -p 3000:3000 \
-  -e DATABASE_URL="postgres://USER:PASS@HOST:5432/enclava" \
-  -e API_URL="https://api.example.com" \
-  -e PLATFORM_DOMAIN="example.com" \
-  -e BTCPAY_URL="https://btcpay.example.com" \
-  -e BTCPAY_API_KEY="..." \
-  -e BTCPAY_WEBHOOK_SECRET="..." \
-  -e API_SIGNING_KEY_PKCS8_BASE64="$(cat api-signing-key.b64)" \
-  -e SESSION_HMAC_KEY_BASE64="$(cat session-hmac.b64)" \
-  ghcr.io/enclava-ai/enclava-api:main
+CAP API is a stateless HTTP service backed by PostgreSQL. It performs these
+startup checks before serving traffic:
+
+- installs the rustls crypto provider;
+- rejects debug-only flags in release builds;
+- loads PostgreSQL config and runs migrations;
+- loads API signing and session HMAC keys;
+- verifies the signed platform release when policy-read mode is enabled;
+- verifies digest-pinned platform sidecar images with cosign;
+- builds DNS, Trustee/KBS, policy signing, registry, and tenant TEE clients.
+
+The `deploy/api` overlay is a minimal starting point. Production manifests must
+provide the full env set below, mount key material from a real secret manager,
+pin images by digest, and grant the API only the Kubernetes permissions needed
+for CAP-managed tenant resources.
+
+## Required Environment
+
+Required for every persistent API process:
+
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | PostgreSQL connection string. Migrations run on startup. |
+| `BTCPAY_WEBHOOK_SECRET` | Required by startup gates even if billing routes are not exercised. |
+| `API_SIGNING_KEY_PATH` or `API_SIGNING_KEY_PKCS8_BASE64` | Ed25519 PKCS#8 private key used for config JWTs and deploy metadata. |
+| `SESSION_HMAC_KEY_PATH` or `SESSION_HMAC_KEY_BASE64` | 32-byte HMAC key used for session JWTs and signer rotation tokens. |
+
+Required in release builds:
+
+| Variable | Purpose |
+| --- | --- |
+| `API_KEY_HMAC_PEPPER` or `API_KEY_HMAC_PEPPER_BASE64` | Pepper for HMAC-format API keys. Must be at least 32 bytes. |
+| `TRUSTEE_POLICY_READ_AVAILABLE=true` | Enables the supported signed-policy/in-TEE verification path. |
+| `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX` | Compile-time root public key required to verify the bundled or supplied platform release. |
+
+Required for production deploys:
+
+| Variable | Purpose |
+| --- | --- |
+| `ATTESTATION_PROXY_IMAGE` | Digest-pinned attestation-proxy image. Can come from the signed platform release. |
+| `CADDY_INGRESS_IMAGE` | Digest-pinned tenant ingress image. Can come from the signed platform release. |
+| `TRUSTEE_KBS_URL` | HTTPS Trustee KBS URL. Release builds reject `http://` values. |
+| `TRUSTEE_KBS_CA_CERT_PEM` or `TRUSTEE_KBS_CA_CERT_PATH` | Root certificate for private Trustee KBS TLS, when not using public roots. |
+| `WORKLOAD_ARTIFACTS_URL` | Workload-attested CAP artifact endpoint used by `enclava-init`. |
+| `TRUSTEE_POLICY_URL` | Workload-attested active Trustee policy endpoint used by `enclava-init`. |
+| `TRUSTEE_ATTESTATION_VERIFY_URL` | Trustee callback used by CAP workload artifact and TLS broker routes. |
+| `TRUSTEE_ATTESTATION_VERIFY_BEARER_TOKEN` | Caller auth token CAP presents to the Trustee verify endpoint. |
+| `PLATFORM_SIGNING_SERVICE_URL` | Policy signing service endpoint. Can come from the signed platform release. |
+| `SIGNING_SERVICE_PUBKEY_HEX` or `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX` | Ed25519 public key used to verify signed policy artifacts. Can come from the platform release. |
+
+Required only when the matching feature is enabled:
+
+| Variable | Purpose |
+| --- | --- |
+| `TLS_CERTIFICATE_BROKER_URL` | Required when `TENANT_CADDY_TLS_MODE=dns01-broker`. |
+| `PLATFORM_SIGNING_SERVICE_TOKEN` | Bearer token sent to the policy signing service when configured. |
+| `DNS_MANAGEMENT_REQUIRED=1` | Makes CAP fail startup unless DNS credentials are configured. |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare API token used for CAP-managed tenant records. |
+| `TENANT_DNS_TARGET` | A/AAAA target for managed tenant records. |
+
+## Defaulted Environment
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BIND_ADDR` | `0.0.0.0:3000` | API listen address. |
+| `API_URL` | `http://localhost:3000` | Public API base URL embedded in deploy metadata. |
+| `PLATFORM_DOMAIN` | `enclava.dev` | Public app hostname suffix. |
+| `TEE_DOMAIN_SUFFIX` | `tee.<PLATFORM_DOMAIN>` | TEE/attestation hostname suffix. |
+| `BTCPAY_URL` | `http://localhost:23001` | BTCPay Greenfield API base URL. |
+| `BTCPAY_API_KEY` | empty | Billing API key. Billing calls need a real value. |
+| `TENANT_CADDY_TLS_MODE` | `acme` | Tenant TLS mode: `acme`, `dns01-broker`, or `internal`. |
+| `TENANT_CADDY_ACME_CA` | Let's Encrypt production directory | ACME directory URL used by tenant Caddy. |
+| `CLOUDFLARE_ZONE_NAME` | `enclava.dev` | Managed DNS zone name. |
+| `CLOUDFLARE_ZONE_ID` | unset | Optional zone ID to skip lookup. |
+| `CAP_MAX_CONCURRENT_APPLIES` | `1` | Per-process apply concurrency limit. |
+| `CORS_ALLOWED_ORIGINS` | empty in release, localhost in debug | Comma-separated allowed browser origins. |
+| `TRUSTED_PROXY_CIDRS` | empty | CIDRs trusted for rate-limit client IP extraction. |
+| `REGISTRY_ALLOWLIST` | built-in defaults | Registry host allowlist for outbound image metadata requests. |
+| `OUTBOUND_HTTP_BODY_LIMIT_BYTES` | code default | Max outbound HTTP body size for guarded client responses. |
+| `ACME_DIRECTORY_URL` | tenant Caddy ACME CA | ACME directory for the DNS-01 broker. |
+| `ACME_ACCOUNT_CREDENTIALS_PATH` | unset | Optional persisted ACME account credentials path. |
+| `ACME_DNS_PROPAGATION_SECONDS` | `30` | DNS propagation wait used by the broker. |
+
+Debug-only flags rejected by release builds:
+
+```text
+SKIP_COSIGN_VERIFY
+COSIGN_ALLOW_HTTP_REGISTRY
+ALLOW_EPHEMERAL_KEYS
+TENANT_TEE_ACCEPT_INVALID_CERTS
+ENCLAVA_TEE_ACCEPT_INVALID_CERTS
+LEGACY_BOOTSTRAP_SCRIPT
+TENANT_TEE_TLS_MODE=staging|insecure
 ```
 
-Database migrations run automatically on boot.
+## Platform Release
 
-## 3. Kubernetes
+The API and CLI both load `crates/enclava-cli/platform-release.json` unless
+`ENCLAVA_PLATFORM_RELEASE_PATH` points at another signed release envelope.
+Release verification checks:
 
-The `deploy/api/` directory is a Kustomize overlay with the minimal resources
-(Namespace, Deployment, Service, Ingress, and a placeholder `api-secrets`
-Secret).
+- the envelope signature against `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`;
+- digest pins for `attestation_proxy_image` and `caddy_ingress_image`;
+- HTTPS Trustee KBS URL;
+- concrete genpolicy version;
+- policy template hash;
+- runtime class match between release metadata and the engine.
+
+When release metadata supplies a value, an explicit env override must match it
+exactly or startup fails.
+
+## Kubernetes
+
+The minimal overlay:
 
 ```bash
-# Edit deploy/api/ingress.yaml to match your DNS and ingress class.
-# Edit deploy/api/kustomization.yaml to set real secret values, or replace the
-# secretGenerator with a SealedSecret / ExternalSecret.
-
 kubectl apply -k deploy/api/
 kubectl -n enclava-platform rollout status deploy/enclava-api
 ```
 
-The overlay assumes cert-manager with a `letsencrypt-prod` ClusterIssuer and an
-`nginx` IngressClass. Swap those annotations if your cluster is different.
+Before using it for a real environment, replace placeholder secret references,
+pin the API image digest in `deploy/api/kustomization.yaml`, add the production
+env values above, and verify the service account/RBAC can apply only the
+tenant resources CAP owns.
 
-## Environment variables
+## Image Verification
 
-| Variable | Required | Default | Purpose |
-|----------|----------|---------|---------|
-| `DATABASE_URL` | yes | — | PostgreSQL 16+ connection string |
-| `API_URL` | yes (prod) | `http://localhost:3000` | Public base URL of the API |
-| `PLATFORM_DOMAIN` | yes (prod) | `enclava.dev` | Suffix used for per-app subdomains |
-| `BIND_ADDR` | no | `0.0.0.0:3000` | Listen address |
-| `BTCPAY_URL` | yes (billing) | `http://localhost:23001` | BTCPay Greenfield API base URL |
-| `BTCPAY_API_KEY` | yes (billing) | — | BTCPay API key |
-| `BTCPAY_WEBHOOK_SECRET` | yes (billing) | — | BTCPay webhook HMAC secret |
-| `API_SIGNING_KEY_PATH` | one of these | — | Path to PKCS#8 Ed25519 private key |
-| `API_SIGNING_KEY_PKCS8_BASE64` | one of these | — | Same key, base64-encoded |
-| `SESSION_HMAC_KEY_PATH` | one of these | — | Path to 32-byte session HMAC key |
-| `SESSION_HMAC_KEY_BASE64` | one of these | — | Same key, base64-encoded |
-| `ALLOW_EPHEMERAL_KEYS` | dev only | unset | If `1`, generate signing/HMAC keys in memory |
-| `COSIGN_PUBLIC_KEY_PATH` | one of these | — | Cosign public key file for image verification |
-| `COSIGN_PUBLIC_KEY_PEM` | one of these | — | Same key, inline PEM |
-| `SKIP_COSIGN_VERIFY` | dev only | unset | If `1`, bypass cosign signature verification |
-| `ATTESTATION_PROXY_IMAGE` | yes (deploy) | — | Digest-pinned attestation-proxy image (`name@sha256:...`) |
-| `CADDY_INGRESS_IMAGE` | yes (deploy) | — | Digest-pinned tenant ingress Caddy image (`name@sha256:...`) |
-| `TENANT_CADDY_TLS_MODE` | no | `acme` | Tenant Caddy issuer mode. Use `internal` only for staging/live-smoke loops with insecure client TLS verification; set consistently on CAP API and policy signing-service |
-| `TENANT_CADDY_ACME_CA` | no | Let's Encrypt production | ACME directory URL used when `TENANT_CADDY_TLS_MODE=acme` |
-| `CLOUDFLARE_API_TOKEN` | no | — | Cloudflare API token used by CAP to manage tenant A/AAAA records |
-| `CLOUDFLARE_ZONE_NAME` | no | `enclava.dev` | Cloudflare zone name CAP manages |
-| `CLOUDFLARE_ZONE_ID` | no | — | Optional Cloudflare zone ID; avoids zone lookup when set |
-| `TENANT_DNS_TARGET` | no | — | Public tenant ingress IP for CAP-managed A/AAAA records |
-| `DNS_MANAGEMENT_REQUIRED` | no | unset | If `1`, API startup fails unless CAP DNS env is configured |
-| `RUST_LOG` | no | `enclava_api=debug,tower_http=debug` | Log filter |
-
-CAP manages public tenant DNS records. Tenant TLS private keys and certificates
-remain workload-owned: the generated tenant ingress sidecar performs ACME
-TLS-ALPN-01 by default and stores certificate state in the tenant TLS volume.
-
-### Signing keys
-
-Generate an Ed25519 signing key (PKCS#8) and a 32-byte session HMAC key:
-
-```bash
-openssl genpkey -algorithm ed25519 -outform DER | base64 -w0 > api-signing-key.b64
-openssl rand -base64 32 > session-hmac.b64
-```
-
-Mount them via `*_PATH` or inject via `*_BASE64`. **Never** run with
-`ALLOW_EPHEMERAL_KEYS=1` in production — restarts rotate keys, invalidating
-every issued token.
-
-## BTCPay Server
-
-CAP expects a self-hosted BTCPay Server. See
-[btcpayserver.org](https://btcpayserver.org) for installation. Create a store,
-generate a Greenfield API key with `btcpay.store.cancreateinvoice` permission,
-and configure a webhook pointing at `$API_URL/v1/webhooks/btcpay` with the
-shared secret from `BTCPAY_WEBHOOK_SECRET`.
-
-## Image builds
-
-`.github/workflows/api-image.yml` builds and pushes
-`ghcr.io/enclava-ai/enclava-api:<branch>` and `:<sha>` on every push to `main`.
-For your own fork, retarget `images:` in `.github/workflows/api-image.yml` and
-`deploy/api/kustomization.yaml`.
-
-## Confidential workloads
-
-Running end-user applications inside SEV-SNP enclaves additionally requires:
-
-- A Kubernetes cluster with kata-containers + the confidential runtime class.
-- AMD SEV-SNP capable nodes.
-- The attestation-proxy sidecar image.
-- A KBS (Key Broker Service) reachable from workload pods.
-
-Those pieces are outside the scope of this repo. The API generates the
-manifests (see `crates/enclava-engine`) and applies them via server-side apply
-when the runtime is in place.
+CAP verifies platform sidecars at API startup and verifies user workload images
+on deploy. Apps must have a pinned signer identity before deploy. The CLI
+starter workflow generated by `enclava init` signs images with GitHub Actions
+keyless cosign and deploys by immutable digest. Integrations may instead submit
+provider metadata through `POST /deployments`; CAP validates GitHub/GHCR and
+GitLab/GitLab Registry identities without calling either provider API.

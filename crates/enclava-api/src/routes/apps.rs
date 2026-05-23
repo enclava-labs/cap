@@ -16,6 +16,9 @@ use crate::auth::jwt::{
 use crate::auth::middleware::AuthContext;
 use crate::auth::scopes;
 use crate::models::App;
+use crate::source_provider::{
+    SourceProvider, validate_signing_identity, validate_source_repository,
+};
 use crate::state::AppState;
 
 /// Helper function for consistent internal server error responses
@@ -191,6 +194,12 @@ pub struct CreateAppRequest {
     /// Cosign Fulcio issuer URL. Optional at create-time; Phase 9 wires it in.
     #[serde(default)]
     pub signer_identity_issuer: Option<String>,
+    /// Source provider that owns the workload repository.
+    #[serde(default)]
+    pub source_provider: Option<SourceProvider>,
+    /// Provider-local repository path, e.g. owner/repo or group/subgroup/project.
+    #[serde(default)]
+    pub source_repository: Option<String>,
 }
 
 fn default_unlock_mode() -> String {
@@ -213,6 +222,8 @@ pub struct AppResponse {
     pub status: String,
     pub signer_identity_subject: Option<String>,
     pub signer_identity_issuer: Option<String>,
+    pub source_provider: Option<String>,
+    pub source_repository: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -233,8 +244,30 @@ impl From<App> for AppResponse {
             status: format!("{:?}", a.status).to_lowercase(),
             signer_identity_subject: a.signer_identity_subject,
             signer_identity_issuer: a.signer_identity_issuer,
+            source_provider: a.source_provider,
+            source_repository: a.source_repository,
             created_at: a.created_at,
         }
+    }
+}
+
+fn validate_source_metadata(
+    provider: Option<SourceProvider>,
+    repository: Option<&str>,
+    signer_subject: Option<&str>,
+    signer_issuer: Option<&str>,
+) -> Result<(), String> {
+    match (provider, repository) {
+        (None, None) => Ok(()),
+        (Some(provider), Some(repository)) => {
+            if let (Some(subject), Some(issuer)) = (signer_subject, signer_issuer) {
+                validate_signing_identity(provider, repository, subject, issuer)
+                    .map_err(|e| e.to_string())
+            } else {
+                validate_source_repository(provider, repository).map_err(|e| e.to_string())
+            }
+        }
+        _ => Err("source_provider and source_repository must be provided together".to_string()),
     }
 }
 
@@ -297,6 +330,18 @@ pub async fn create_app(
 
     // Validate name with comprehensive checks
     validate_app_name(&body.name).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+    })?;
+    validate_source_metadata(
+        body.source_provider,
+        body.source_repository.as_deref(),
+        body.signer_identity_subject.as_deref(),
+        body.signer_identity_issuer.as_deref(),
+    )
+    .map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e})),
@@ -382,10 +427,11 @@ pub async fn create_app(
 
     let result = sqlx::query(
         "INSERT INTO apps (id, org_id, name, namespace, instance_id, tenant_id,
-         service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
+        service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
          unlock_mode, domain, tee_domain,
-         signer_identity_subject, signer_identity_issuer, signer_identity_set_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15)",
+         signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
+         source_provider, source_repository)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17)",
     )
     .bind(app_id)
     .bind(auth.org_id)
@@ -402,6 +448,8 @@ pub async fn create_app(
     .bind(body.signer_identity_subject.as_deref())
     .bind(body.signer_identity_issuer.as_deref())
     .bind(signer_set_at)
+    .bind(body.source_provider.map(SourceProvider::as_str))
+    .bind(body.source_repository.as_deref())
     .execute(&state.db)
     .await;
 
@@ -1020,6 +1068,8 @@ mod signer_request_tests {
             signer_identity_subject: None,
             signer_identity_issuer: None,
             signer_identity_set_at: None,
+            source_provider: None,
+            source_repository: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1041,6 +1091,8 @@ mod signer_request_tests {
                 bootstrap_pubkey_hash: None,
                 signer_identity_subject: None,
                 signer_identity_issuer: None,
+                source_provider: None,
+                source_repository: None,
             }),
         )
         .await;

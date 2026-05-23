@@ -308,7 +308,8 @@ fn build_agent_policy(
                     "io.kubernetes.cri.image-name": image_digest,
                     "io.kubernetes.pod.namespace": namespace,
                     "io.kubernetes.pod.service-account.name": service_account,
-                    "tenant.flowforge.sh/instance": instance
+                    crate::types::TENANT_INSTANCE_ANNOTATION: instance,
+                    crate::types::LEGACY_TENANT_INSTANCE_ANNOTATION: instance
                 }
             },
             "image_name": image_digest
@@ -365,8 +366,19 @@ fn build_agent_policy(
         "  input.OCI.Annotations[\"io.kubernetes.pod.service-account.name\"] == {}\n",
         rego_string(service_account)
     ));
+    rego.push_str("  tenant_instance_matches\n");
+    rego.push_str("}\n\n");
+    rego.push_str("tenant_instance_matches {\n");
     rego.push_str(&format!(
-        "  input.OCI.Annotations[\"tenant.flowforge.sh/instance\"] == {}\n",
+        "  input.OCI.Annotations[{}] == {}\n",
+        rego_string(crate::types::TENANT_INSTANCE_ANNOTATION),
+        rego_string(instance)
+    ));
+    rego.push_str("}\n\n");
+    rego.push_str("tenant_instance_matches {\n");
+    rego.push_str(&format!(
+        "  input.OCI.Annotations[{}] == {}\n",
+        rego_string(crate::types::LEGACY_TENANT_INSTANCE_ANNOTATION),
         rego_string(instance)
     ));
     rego.push_str("}\n\n");

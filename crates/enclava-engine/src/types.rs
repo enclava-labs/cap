@@ -3,6 +3,9 @@ use enclava_common::types::{BootstrapPolicy, Durability, ResourceLimits, UnlockM
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub const TENANT_INSTANCE_ANNOTATION: &str = "tenant.enclava.dev/instance";
+pub const LEGACY_TENANT_INSTANCE_ANNOTATION: &str = "tenant.flowforge.sh/instance";
+
 /// Complete specification for a confidential application deployment.
 /// This is the sole input to the engine's manifest generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,8 +309,8 @@ impl ConfidentialApp {
     /// Stable owner-resource instance name used by the attestation proxy.
     ///
     /// The live Trustee policy derives owner resource access from the attested
-    /// Kubernetes namespace and the `tenant.flowforge.sh/instance` annotation,
-    /// so CAP uses the namespace and app name for the KBS owner path.
+    /// Kubernetes namespace and the tenant instance annotation, so CAP uses the
+    /// namespace and app name for the KBS owner path.
     pub fn owner_instance_id(&self) -> String {
         format!("{}-{}", self.namespace, self.name)
     }

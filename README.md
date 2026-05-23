@@ -1,62 +1,85 @@
 # Enclava CAP
 
-**Heroku-like deploys for AMD SEV-SNP confidential workloads.**
+CAP is the Enclava control plane for deploying OCI images as confidential
+workloads on a Kubernetes cluster with Kata confidential containers and AMD
+SEV-SNP. The supported user path is:
 
-CAP is a PaaS for running containers inside hardware-encrypted enclaves.
-Developers push an OCI image; the platform handles TEE provisioning, encrypted
-storage, attestation, key management, and TLS. The operator cannot read user
-data, secrets, or memory — even with root on the host.
+1. `enclava signup` or `enclava login`
+2. `enclava init` or `enclava prepare`
+3. `enclava create`
+4. `enclava signer set ...`
+5. `enclava deploy --image <registry>/<image>@sha256:<digest>`
+6. `enclava claim` or `enclava unlock` for password-mode apps
 
-> Status: early. The API, engine, and CLI crates are functional; production
-> use requires an AMD SEV-SNP cluster with the companion attestation-proxy.
+The CLI signs a deployment descriptor from the local app config and the signed
+platform release. The API validates the descriptor, image signer, org keyring,
+generated agent policy, and signed policy artifact before applying Kubernetes
+resources.
 
-## Quick start
+## Repository Layout
+
+| Path | Purpose |
+| --- | --- |
+| `crates/enclava-common` | Canonical encoding, descriptors, validation, image references, shared crypto helpers |
+| `crates/enclava-cli` | `enclava` user CLI, local config, descriptor signing, TEE attestation client |
+| `crates/enclava-api` | Axum API, auth, org/app/deploy/config/domain/billing/workload routes, deploy orchestration |
+| `crates/enclava-engine` | Kubernetes manifest rendering and server-side apply/cleanup/watch logic |
+| `crates/enclava-init` | In-TEE LUKS, seed derivation, Trustee policy verification, TLS certificate broker client |
+| `crates/enclava-wait-exec` | Workload wrapper that blocks app and ingress commands until `enclava-init` is ready |
+| `deploy/api` | Minimal Kubernetes API deployment overlay |
+| `runbooks` | Current operator runbooks and visual flow artifacts |
+
+## Current Docs
+
+| Doc | Scope |
+| --- | --- |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Current deploy/runtime architecture |
+| [API.md](API.md) | Current HTTP route map and auth model |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | API runtime, production env, and deploy prerequisites |
+| [DEV.md](DEV.md) | Local development and verification commands |
+| [SECURITY_REVIEW.md](SECURITY_REVIEW.md) | Current code-grounded security posture |
+| [SECURITY_MITIGATION_PLAN.md](SECURITY_MITIGATION_PLAN.md) | Current mitigation checklist and operating baseline |
+| [crates/enclava-init/README.md](crates/enclava-init/README.md) | In-TEE init sidecar contract |
+
+## Local Development
 
 ```bash
 docker compose up --build
 curl http://localhost:3000/health
 ```
 
-That brings up the API against a local PostgreSQL. See [DEPLOYMENT.md](DEPLOYMENT.md)
-for production deployment, environment variables, and Kubernetes manifests.
+`docker-compose.yml` is development-only. It starts PostgreSQL and the API with
+placeholder billing values and ephemeral signing/session keys.
 
-## Architecture
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│    CLI      │────▶│ API Server  │────▶│  Database   │
-└─────────────┘     └─────────────┘     └─────────────┘
-                          │
-                          ▼
-                   ┌─────────────┐
-                   │   Engine    │────▶ Kubernetes (SEV-SNP nodes)
-                   └─────────────┘
-```
-
-| Crate | Purpose |
-|-------|---------|
-| `enclava-common` | Shared types, crypto utilities, image resolution |
-| `enclava-engine` | Kubernetes manifest generation and server-side apply |
-| `enclava-api` | Axum REST API: auth, billing, deployments |
-| `enclava-cli` | Developer CLI (`enclava deploy`, `enclava unlock`, …) |
-
-## Development
+Common verification commands:
 
 ```bash
-cargo test --workspace        # all tests
-cargo run -p enclava-api      # start the API locally
-cargo build -p enclava-cli --release
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-features
 ```
 
-Rust 2024 edition, MSRV 1.85. The API is built with axum + sqlx; the engine
-uses kube-rs. Crypto primitives (argon2, hkdf, x25519, aes-gcm, zeroize) are
-shared with the attestation-proxy.
+`enclava-init` links against system `libcryptsetup`. If that package is not
+installed, run the rest of the workspace with `--exclude enclava-init` or use a
+build image that includes the development headers.
 
-## Contributing
+## Runtime Requirements
 
-Issues and PRs welcome. Please run `cargo fmt` and `cargo test --workspace`
-before submitting.
+CAP can start as a normal API service, but real deploys require the platform
+runtime:
+
+- PostgreSQL for API state.
+- Digest-pinned `attestation-proxy`, `caddy-ingress`, and `enclava-init` images.
+- A signed platform release compiled or supplied with the pinned release root
+  key.
+- A Kubernetes cluster with the confidential runtime class used by
+  `enclava-engine`.
+- Trustee KBS reachable by the guest AA/CDH path over the configured HTTPS
+  endpoint.
+- Policy signing service reachable by CAP for generated agent policy and signed
+  policy artifacts.
+- Cloudflare DNS credentials when CAP-managed tenant DNS is required.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

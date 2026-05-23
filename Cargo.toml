@@ -36,6 +36,8 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 argon2 = "0.5"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
 tower = "0.5"
 chrono = { version = "0.4", features = ["serde"] }

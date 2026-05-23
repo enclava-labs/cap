@@ -203,8 +203,9 @@ mod tests {
                 .unwrap();
         assert!(workflow.contains("id-token: write"));
         assert!(workflow.contains("cosign sign --yes"));
-        assert!(workflow.contains("https://github.com/${{ github.workflow_ref }}"));
-        assert!(workflow.contains("enclava deploy"));
+        assert!(!workflow.contains("https://github.com/${{ github.workflow_ref }}"));
+        assert!(workflow.contains("enclava deploy --image"));
+        assert!(!workflow.contains("ENCLAVA_API_KEY"));
         assert!(!workflow.contains("git push"));
         assert!(!workflow.contains("git commit"));
     }
@@ -276,7 +277,7 @@ mod tests {
         assert_eq!(config.app.port, 9090);
 
         let workflow = std::fs::read_to_string(workflow_dir.join("enclava-deploy.yml")).unwrap();
-        assert!(workflow.contains("name: Deploy"));
+        assert!(workflow.contains("name: Build signed image"));
         assert!(workflow.contains("id-token: write"));
     }
 }

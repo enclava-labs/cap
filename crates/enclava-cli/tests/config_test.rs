@@ -9,6 +9,7 @@ fn cli_paths_from_explicit_root() {
     assert_eq!(paths.config, root.join("config.toml"));
     assert_eq!(paths.credentials, root.join("credentials.toml"));
     assert_eq!(paths.keys_dir, root.join("keys"));
+    assert_eq!(paths.recovery_seed, root.join("recovery.seed"));
 }
 
 #[test]
@@ -29,6 +30,7 @@ fn load_missing_config_returns_defaults() {
     let config = enclava_cli::config::load_config(&paths).unwrap();
     assert_eq!(config.api_url, "https://api.enclava.dev");
     assert!(config.org.is_none());
+    assert!(config.org_id.is_none());
 }
 
 #[test]
@@ -38,11 +40,16 @@ fn save_and_load_config_round_trip() {
     let config = enclava_cli::config::CliConfig {
         api_url: "https://custom.api.dev".to_string(),
         org: Some("my-team".to_string()),
+        org_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
     };
     enclava_cli::config::save_config(&paths, &config).unwrap();
     let loaded = enclava_cli::config::load_config(&paths).unwrap();
     assert_eq!(loaded.api_url, "https://custom.api.dev");
     assert_eq!(loaded.org.as_deref(), Some("my-team"));
+    assert_eq!(
+        loaded.org_id.as_deref(),
+        Some("11111111-1111-1111-1111-111111111111")
+    );
 }
 
 #[test]
@@ -52,11 +59,17 @@ fn save_and_load_credentials_round_trip() {
     let creds = enclava_cli::config::Credentials {
         session_token: Some("jwt-abc".to_string()),
         api_key: None,
+        user_id: Some("user-1".to_string()),
+        active_org_id: Some("org-1".to_string()),
+        active_org_name: Some("personal".to_string()),
     };
     enclava_cli::config::save_credentials(&paths, &creds).unwrap();
     let loaded = enclava_cli::config::load_credentials(&paths).unwrap();
     assert_eq!(loaded.session_token.as_deref(), Some("jwt-abc"));
     assert!(loaded.api_key.is_none());
+    assert_eq!(loaded.user_id.as_deref(), Some("user-1"));
+    assert_eq!(loaded.active_org_id.as_deref(), Some("org-1"));
+    assert_eq!(loaded.active_org_name.as_deref(), Some("personal"));
 }
 
 #[test]
@@ -64,6 +77,7 @@ fn auth_token_prefers_session_over_api_key() {
     let creds = enclava_cli::config::Credentials {
         session_token: Some("session".to_string()),
         api_key: Some("key".to_string()),
+        ..Default::default()
     };
     assert_eq!(creds.auth_token(), Some("session"));
 }
@@ -73,6 +87,7 @@ fn auth_token_falls_back_to_api_key() {
     let creds = enclava_cli::config::Credentials {
         session_token: None,
         api_key: Some("key".to_string()),
+        ..Default::default()
     };
     assert_eq!(creds.auth_token(), Some("key"));
 }
@@ -94,6 +109,7 @@ fn credentials_file_has_restricted_permissions() {
     let creds = enclava_cli::config::Credentials {
         session_token: Some("secret".to_string()),
         api_key: None,
+        ..Default::default()
     };
     enclava_cli::config::save_credentials(&paths, &creds).unwrap();
     let meta = fs::metadata(&paths.credentials).unwrap();

@@ -33,6 +33,53 @@ pub struct AuthResponse {
     pub org_name: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct DeviceLoginStartRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceLoginStartResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: String,
+    pub expires_in: i64,
+    pub interval: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeviceLoginPollRequest {
+    pub device_code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceLoginPollResponse {
+    pub status: String,
+    pub interval: i64,
+    pub expires_in: i64,
+    pub error: Option<String>,
+    pub auth: Option<AuthResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CurrentUserResponse {
+    pub user_id: String,
+    pub display_name: String,
+    pub active_org: CurrentUserOrg,
+    pub orgs: Vec<CurrentUserOrg>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CurrentUserOrg {
+    pub id: String,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub role: String,
+    pub is_personal: bool,
+}
+
 // --- Apps ---
 
 #[derive(Debug, Serialize)]

@@ -20,10 +20,12 @@ fn client_from_config() {
     let config = enclava_cli::config::CliConfig {
         api_url: "https://custom.api.dev".to_string(),
         org: None,
+        org_id: None,
     };
     let creds = enclava_cli::config::Credentials {
         session_token: Some("jwt-test".to_string()),
         api_key: None,
+        ..Default::default()
     };
     let client = ApiClient::from_config(&config, &creds);
     let _ = client;

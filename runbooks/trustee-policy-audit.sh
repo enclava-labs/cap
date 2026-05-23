@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Production Trustee policy audit wrapper for SECURITY_MITIGATION_PLAN rev14
-# Track 4. Run from an operator machine with kubectl, CAP_DB_URL, and
-# KBS_ADMIN_TOKEN available.
+# Trustee policy audit wrapper. Run from an operator machine with kubectl,
+# CAP_DB_URL, and KBS_ADMIN_TOKEN available.
 
 NS="${KBS_POLICY_NAMESPACE:-trustee-operator-system}"
 CM="${KBS_POLICY_CONFIGMAP:-resource-policy}"
@@ -92,12 +91,9 @@ Review:
 
 1. \`cap-binding-key-diff.patch\` must be empty.
 2. Classify every rule in \`non-cap.rego\` using
-   \`cap/runbooks/investigations/B4-trustee-policy-audit-playbook.md\`.
-3. If needed, diff \`live-policy.rego\` against the retired
-   \`enclava-tenant-manifests/infra/trustee-kbs-policy/resource-policy.rego\`
-   as a historical baseline only; CAP-signed artifacts are the live source of truth.
-4. Record each operator-added rule as merge, drop, or known deviation before
-   enabling \`KBS_REQUIRE_SIGNED_POLICY=true\`.
+   \`cap/runbooks/trustee-policy-audit.md\`.
+3. Confirm CAP-signed artifacts remain the deploy authority.
+4. Record any operator-owned rule as intentional baseline or remove it.
 EOF
 
 echo "audit artifacts written to $OUT_DIR"

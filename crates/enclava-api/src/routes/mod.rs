@@ -6,7 +6,6 @@ pub mod deployments;
 pub mod domains;
 pub mod orgs;
 pub mod platform;
-pub mod secret_agent;
 pub mod status;
 pub mod unlock;
 pub mod users;

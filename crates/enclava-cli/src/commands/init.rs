@@ -76,10 +76,10 @@ timeout = 5
     )
 }
 
-/// Generate GitHub Actions workflow for build + sign + deploy.
+/// Generate a GitHub Actions starter workflow for build + sign.
 pub(crate) fn generate_github_workflow(app_name: &str) -> String {
     format!(
-        r#"name: Deploy {app_name}
+        r#"name: Build signed image for {app_name}
 
 on:
   push:
@@ -151,30 +151,10 @@ jobs:
           sbom-path: sbom.spdx.json
           push-to-registry: true
 
-      - name: Install enclava CLI
+      - name: Print manual deploy image
         run: |
-          curl -sSL https://get.enclava.dev | sh
-
-      # First-time setup only: pin the cosign Fulcio signer identity to
-      # this workflow's GitHub Actions OIDC URI subject. Subsequent runs
-      # are idempotent on the platform side -- if the signer is already
-      # set this call is rejected with the rotation guard, which is the
-      # intended behavior.
-      - name: Set signer identity (first deploy only)
-        continue-on-error: true
-        run: |
-          enclava signer set \
-            "https://github.com/${{{{ github.workflow_ref }}}}" \
-            --issuer "https://token.actions.githubusercontent.com"
-        env:
-          ENCLAVA_API_KEY: ${{{{ secrets.ENCLAVA_API_KEY }}}}
-
-      - name: Deploy
-        run: |
-          enclava deploy \
-            --image ${{{{ env.REGISTRY }}}}/${{{{ env.IMAGE_NAME }}}}@${{{{ steps.build.outputs.digest }}}}
-        env:
-          ENCLAVA_API_KEY: ${{{{ secrets.ENCLAVA_API_KEY }}}}
+          echo "Deploy manually with:"
+          echo "enclava deploy --image ${{{{ env.REGISTRY }}}}/${{{{ env.IMAGE_NAME }}}}@${{{{ steps.build.outputs.digest }}}}"
 "#
     )
 }
@@ -221,7 +201,7 @@ pub async fn init() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Creating enclava.toml... done");
 
-    // Write GitHub Actions workflow
+    // Write GitHub Actions starter workflow
     let workflow_dir = cwd.join(".github").join("workflows");
     std::fs::create_dir_all(&workflow_dir)?;
     let workflow_path = workflow_dir.join("enclava-deploy.yml");
@@ -236,9 +216,10 @@ pub async fn init() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("Next steps:");
-    println!("  1. Add your API key to GitHub secrets:");
-    println!("     enclava login && gh secret set ENCLAVA_API_KEY");
-    println!("  2. Push to main to trigger your first deploy");
+    println!("  1. Run `enclava login`");
+    println!("  2. Run `enclava create --signer-subject <cosign-subject>`");
+    println!("  3. Build and sign a public digest-pinned image");
+    println!("  4. Run `enclava deploy --image <image>@sha256:<digest>`");
 
     Ok(())
 }
@@ -302,6 +283,7 @@ mod tests {
         assert!(workflow.contains("cosign"));
         assert!(workflow.contains("attest-build-provenance"));
         assert!(workflow.contains("sbom-action"));
-        assert!(workflow.contains("enclava deploy"));
+        assert!(workflow.contains("enclava deploy --image"));
+        assert!(!workflow.contains("ENCLAVA_API_KEY"));
     }
 }

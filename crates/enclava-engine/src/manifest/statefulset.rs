@@ -43,7 +43,10 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
         "storage.enclava.dev/secure-pv-init-data-sha256".to_string(),
         cc_init_data_hash,
     );
-    annotations.insert("tenant.flowforge.sh/instance".to_string(), app.name.clone());
+    annotations.insert(
+        crate::types::TENANT_INSTANCE_ANNOTATION.to_string(),
+        app.name.clone(),
+    );
 
     let legacy = legacy_bootstrap_enabled();
 

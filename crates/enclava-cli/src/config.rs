@@ -9,6 +9,9 @@ pub struct CliConfig {
     pub api_url: String,
     /// Active organization name (None = personal org)
     pub org: Option<String>,
+    /// Active organization UUID, when known from browser/device login.
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 fn default_api_url() -> String {
@@ -20,6 +23,7 @@ impl Default for CliConfig {
         Self {
             api_url: default_api_url(),
             org: None,
+            org_id: None,
         }
     }
 }
@@ -31,6 +35,15 @@ pub struct Credentials {
     pub session_token: Option<String>,
     /// Long-lived API key (for CI/programmatic use)
     pub api_key: Option<String>,
+    /// Authenticated platform user UUID, when known.
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// Active organization UUID tied to the saved session, when known.
+    #[serde(default)]
+    pub active_org_id: Option<String>,
+    /// Active organization name tied to the saved session, when known.
+    #[serde(default)]
+    pub active_org_name: Option<String>,
 }
 
 impl Credentials {
@@ -54,6 +67,8 @@ pub struct CliPaths {
     pub keys_dir: PathBuf,
     /// ~/.enclava/sessions/ (reserved for future session state)
     pub sessions_dir: PathBuf,
+    /// ~/.enclava/recovery.seed (random local seed for deterministic deploy keys)
+    pub recovery_seed: PathBuf,
 }
 
 impl CliPaths {
@@ -70,6 +85,7 @@ impl CliPaths {
             credentials: root.join("credentials.toml"),
             keys_dir: root.join("keys"),
             sessions_dir: root.join("sessions"),
+            recovery_seed: root.join("recovery.seed"),
             root,
         })
     }

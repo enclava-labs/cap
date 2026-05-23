@@ -270,30 +270,30 @@ mod tests {
         SecurityContext, Sidecars, SignerIdentity,
     };
 
-    fn nutshell_descriptor() -> DeploymentDescriptor {
+    fn customer_app_descriptor() -> DeploymentDescriptor {
         DeploymentDescriptor {
             schema_version: "v1".to_string(),
             org_id: uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
             org_slug: "8f346820".to_string(),
             app_id: uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
-            app_name: "nutshell".to_string(),
+            app_name: "customer-app".to_string(),
             deploy_id: uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
             created_at: chrono::Utc.with_ymd_and_hms(2026, 5, 8, 12, 0, 0).unwrap(),
             nonce: [1; 32],
-            app_domain: "nutshell.8f346820.enclava.dev".to_string(),
-            tee_domain: "nutshell.8f346820.tee.enclava.dev".to_string(),
+            app_domain: "customer-app.8f346820.enclava.dev".to_string(),
+            tee_domain: "customer-app.8f346820.tee.enclava.dev".to_string(),
             custom_domains: Vec::new(),
-            namespace: "cap-nutshell-first-customer-nutshell".to_string(),
-            service_account: "cap-nutshell-sa".to_string(),
+            namespace: "cap-demo-org-customer-app".to_string(),
+            service_account: "cap-customer-app-sa".to_string(),
             identity_hash: [2; 32],
             image_ref:
-                "ghcr.io/freedomcashlabs/nutshell@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "ghcr.io/acme/customer-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_string(),
             image_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_string(),
             signer_identity: SignerIdentity {
                 subject:
-                    "https://github.com/freedomcashlabs/nutshell/.github/workflows/docker.yaml@refs/heads/main"
+                    "https://github.com/acme/customer-app/.github/workflows/docker.yaml@refs/heads/main"
                         .to_string(),
                 issuer: "https://token.actions.githubusercontent.com".to_string(),
             },
@@ -336,7 +336,7 @@ mod tests {
             api_signing_pubkey: "test-api-signing-pubkey".to_string(),
             expected_firmware_measurement: [3; 32],
             expected_runtime_class: "kata-qemu-snp".to_string(),
-            kbs_resource_path: "default/cap-nutshell-first-customer-nutshell-owner".to_string(),
+            kbs_resource_path: "default/cap-demo-org-customer-app-owner".to_string(),
             unlock_mode: "password".to_string(),
             policy_template_id: "enclava-kbs-policy-v1".to_string(),
             policy_template_sha256: [4; 32],
@@ -348,8 +348,8 @@ mod tests {
     }
 
     #[test]
-    fn signed_descriptor_runtime_fields_match_nutshell_expectations() {
-        let descriptor = nutshell_descriptor();
+    fn signed_descriptor_runtime_fields_match_descriptor_expectations() {
+        let descriptor = customer_app_descriptor();
 
         assert_eq!(
             serialize_workload_command(&descriptor.oci_runtime_spec.args).unwrap(),
@@ -364,12 +364,12 @@ mod tests {
 
     #[test]
     fn descriptor_runtime_overrides_stale_primary_container_fields() {
-        let descriptor = nutshell_descriptor();
+        let descriptor = customer_app_descriptor();
         let mut app = ConfidentialApp {
             app_id: descriptor.app_id,
             name: descriptor.app_name.clone(),
             namespace: descriptor.namespace.clone(),
-            instance_id: "nutshell-test".to_string(),
+            instance_id: "customer-app-test".to_string(),
             tenant_id: descriptor.org_slug.clone(),
             bootstrap_owner_pubkey_hash: "00".repeat(32),
             tenant_instance_identity_hash: hex::encode(descriptor.identity_hash),
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn signed_descriptor_without_subpath_mounts_clears_stale_storage_paths() {
-        let mut descriptor = nutshell_descriptor();
+        let mut descriptor = customer_app_descriptor();
         descriptor
             .oci_runtime_spec
             .mounts
@@ -445,7 +445,7 @@ mod tests {
             app_id: descriptor.app_id,
             name: descriptor.app_name.clone(),
             namespace: descriptor.namespace.clone(),
-            instance_id: "nutshell-test".to_string(),
+            instance_id: "customer-app-test".to_string(),
             tenant_id: descriptor.org_slug.clone(),
             bootstrap_owner_pubkey_hash: "00".repeat(32),
             tenant_instance_identity_hash: hex::encode(descriptor.identity_hash),

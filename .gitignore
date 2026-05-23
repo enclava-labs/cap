@@ -2,6 +2,9 @@
 /target
 /docs
 /tools
+/runbooks/audits
+/runbooks/*
+/design-proposals/*
 # Agent scratch (never commit)
 .claude/
 .Codex/

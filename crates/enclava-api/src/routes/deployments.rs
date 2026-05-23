@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::auth::{middleware::AuthContext, scopes};
 use crate::models::{App, Deployment};
+use crate::source_provider::{SourceProvider, validate_source_context};
 use crate::state::AppState;
 
 fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
@@ -173,9 +174,102 @@ fn classify_signer_identity(subject: &str, issuer: &str) -> crate::cosign::Verif
 mod classifier_tests {
     use super::*;
     use crate::cosign::VerificationPolicy;
-    use crate::models::Role;
+    use crate::models::{App, AppStatus, DeployStatus, Deployment, Role, Trigger, UnlockMode};
     use enclava_common::image::ImageRef;
     use enclava_engine::types::AttestationConfig;
+
+    fn idempotency_app() -> App {
+        App {
+            id: Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),
+            org_id: Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap(),
+            name: "customer-app".to_string(),
+            namespace: "cap-test-customer-app".to_string(),
+            instance_id: "test-customer-app".to_string(),
+            tenant_id: "test".to_string(),
+            service_account: "cap-customer-app-sa".to_string(),
+            bootstrap_owner_pubkey_hash: "11".repeat(32),
+            tenant_instance_identity_hash: "22".repeat(32),
+            unlock_mode: UnlockMode::Auto,
+            domain: "customer-app.test.enclava.dev".to_string(),
+            tee_domain: Some("customer-app.test.tee.enclava.dev".to_string()),
+            custom_domain: None,
+            status: AppStatus::Creating,
+            signer_identity_subject: Some(
+                "https://github.com/acme/confidential-app/.github/workflows/build.yml@refs/heads/main"
+                    .to_string(),
+            ),
+            signer_identity_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
+            signer_identity_set_at: Some(chrono::Utc::now()),
+            source_provider: Some("github".to_string()),
+            source_repository: Some("acme/confidential-app".to_string()),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn idempotency_deployment(app: &App) -> Deployment {
+        Deployment {
+            id: Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap(),
+            org_id: Some(app.org_id),
+            app_id: app.id,
+            trigger: Trigger::Api,
+            status: DeployStatus::Pending,
+            spec_snapshot: serde_json::json!({
+                "app_name": app.name,
+                "namespace": app.namespace,
+                "instance_id": app.instance_id,
+                "image": "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "container_name": "app",
+                "resources": null,
+                "external_id": "deploy-123",
+                "source_provider": "github",
+                "source_repository": "acme/confidential-app",
+            }),
+            manifest_hash: None,
+            image_digest: Some(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            ),
+            error_message: None,
+            created_at: chrono::Utc::now(),
+            completed_at: None,
+            cosign_verified: true,
+            provenance_attestation: None,
+            sbom: None,
+            external_id: Some("deploy-123".to_string()),
+            source_provider: Some("github".to_string()),
+            source_repository: Some("acme/confidential-app".to_string()),
+        }
+    }
+
+    fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
+        GenericDeploymentRequest {
+            external_id: Some("deploy-123".to_string()),
+            app: GenericDeploymentApp {
+                name: app_name.to_string(),
+                create_if_missing: true,
+                unlock_mode: "auto".to_string(),
+                bootstrap_pubkey_hash: None,
+            },
+            source: GenericDeploymentSource {
+                provider: SourceProvider::GitHub,
+                repository: "acme/confidential-app".to_string(),
+            },
+            workload: GenericDeploymentWorkload {
+                image: "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                container_name: Some("app".to_string()),
+                resources: None,
+            },
+            signing: GenericDeploymentSigning {
+                subject: "https://github.com/acme/confidential-app/.github/workflows/build.yml@refs/heads/main"
+                    .to_string(),
+                issuer: "https://token.actions.githubusercontent.com".to_string(),
+            },
+            security: GenericDeploymentSecurity::default(),
+        }
+    }
 
     fn attestation_config() -> AttestationConfig {
         AttestationConfig {
@@ -262,6 +356,80 @@ mod classifier_tests {
         assert_eq!(cfg.local_trustee_policy_json.as_deref(), Some("{}"));
     }
 
+    #[test]
+    fn idempotent_retry_requires_same_deployment_payload() {
+        let app = idempotency_app();
+        let deployment = idempotency_deployment(&app);
+
+        ensure_idempotent_retry_matches(&deployment, &app, &idempotency_request(&app.name))
+            .unwrap();
+
+        let err = ensure_idempotent_retry_matches(
+            &deployment,
+            &app,
+            &idempotency_request("different-app"),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(
+            err.1.0["error"].as_str(),
+            Some("external_id already exists with different app.name")
+        );
+    }
+
+    #[test]
+    fn external_id_rejects_empty_or_padded_values() {
+        validate_external_id(Some("deploy-123")).unwrap();
+
+        for value in ["", " deploy-123", "deploy-123 "] {
+            let err = validate_external_id(Some(value)).unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn cap_core_source_has_no_product_specific_deployment_customizations() {
+        let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let needles = [
+            ["her", "mes"].concat(),
+            ["secret", "_", "agent"].concat(),
+            ["nut", "shell"].concat(),
+        ];
+        let mut findings = Vec::new();
+        scan_rs_files_for_needles(&source_dir, &needles, &mut findings);
+
+        assert!(
+            findings.is_empty(),
+            "CAP core source contains product-specific deployment customizations: {findings:?}"
+        );
+    }
+
+    fn scan_rs_files_for_needles(
+        dir: &std::path::Path,
+        needles: &[String],
+        findings: &mut Vec<String>,
+    ) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                scan_rs_files_for_needles(&path, needles, findings);
+                continue;
+            }
+            if path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs") {
+                continue;
+            }
+            let contents = std::fs::read_to_string(&path).unwrap();
+            let normalized = contents.to_ascii_lowercase();
+            for needle in needles {
+                if normalized.contains(needle) {
+                    findings.push(format!("{} contains {}", path.display(), needle));
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn deploy_rejects_member_before_database_access() {
         let result = deploy(
@@ -272,6 +440,9 @@ mod classifier_tests {
                 image: "ghcr.io/example/demo:latest".to_string(),
                 container_name: None,
                 resources: None,
+                external_id: None,
+                source_provider: None,
+                source_repository: None,
                 customer_descriptor_blob: None,
                 org_keyring_blob: None,
                 signed_policy_artifact: None,
@@ -299,6 +470,22 @@ mod classifier_tests {
         .await;
         let err = match result {
             Ok(_) => panic!("unscoped rollback unexpectedly passed authorization"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn generic_config_token_rejects_unscoped_api_key_before_database_access() {
+        let result = generic_config_token(
+            crate::test_support::auth_context(Role::Admin, &["apps:read"]),
+            State(crate::test_support::lazy_state()),
+            Path(Uuid::new_v4()),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("unscoped generic config token unexpectedly passed authorization"),
             Err(err) => err,
         };
 
@@ -353,6 +540,12 @@ pub struct DeployRequest {
     pub container_name: Option<String>,
     #[serde(default)]
     pub resources: Option<DeployResources>,
+    #[serde(default)]
+    pub external_id: Option<String>,
+    #[serde(default)]
+    pub source_provider: Option<SourceProvider>,
+    #[serde(default)]
+    pub source_repository: Option<String>,
     #[serde(default)]
     pub customer_descriptor_blob: Option<String>,
     #[serde(default)]
@@ -428,6 +621,132 @@ impl DeploymentResponse {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct GenericDeploymentRequest {
+    #[serde(default)]
+    pub external_id: Option<String>,
+    pub app: GenericDeploymentApp,
+    pub source: GenericDeploymentSource,
+    pub workload: GenericDeploymentWorkload,
+    pub signing: GenericDeploymentSigning,
+    #[serde(default)]
+    pub security: GenericDeploymentSecurity,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenericDeploymentApp {
+    pub name: String,
+    #[serde(default)]
+    pub create_if_missing: bool,
+    #[serde(default = "default_generic_unlock_mode")]
+    pub unlock_mode: String,
+    #[serde(default)]
+    pub bootstrap_pubkey_hash: Option<String>,
+}
+
+fn default_generic_unlock_mode() -> String {
+    "password".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenericDeploymentSource {
+    pub provider: SourceProvider,
+    pub repository: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenericDeploymentWorkload {
+    pub image: String,
+    #[serde(default)]
+    pub container_name: Option<String>,
+    #[serde(default)]
+    pub resources: Option<DeployResources>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GenericDeploymentSigning {
+    pub subject: String,
+    pub issuer: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct GenericDeploymentSecurity {
+    #[serde(default)]
+    pub customer_descriptor_blob: Option<String>,
+    #[serde(default)]
+    pub org_keyring_blob: Option<String>,
+    #[serde(default)]
+    pub signed_policy_artifact: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GenericDeploymentResponse {
+    pub deployment_id: Uuid,
+    pub app_name: String,
+    pub app_domain: String,
+    pub tee_url: Option<String>,
+    pub image: Option<String>,
+    pub image_digest: Option<String>,
+    pub source_provider: Option<String>,
+    pub source_repository: Option<String>,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GenericConfigTokenResponse {
+    pub deployment_id: Uuid,
+    pub token: String,
+    pub tee_url: String,
+    pub expires_in_seconds: u64,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl GenericDeploymentResponse {
+    fn from_deployment(deployment: Deployment, app: &App) -> Self {
+        let app_domain = app
+            .custom_domain
+            .clone()
+            .unwrap_or_else(|| app.domain.clone());
+        let tee_url = app
+            .tee_domain
+            .as_ref()
+            .map(|domain| format!("https://{domain}"));
+        let image = deployment
+            .spec_snapshot
+            .get("image")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        Self {
+            deployment_id: deployment.id,
+            app_name: app.name.clone(),
+            app_domain,
+            tee_url,
+            image,
+            image_digest: deployment.image_digest,
+            source_provider: deployment
+                .source_provider
+                .or_else(|| app.source_provider.clone()),
+            source_repository: deployment
+                .source_repository
+                .or_else(|| app.source_repository.clone()),
+            status: format!("{:?}", deployment.status).to_lowercase(),
+            error_message: deployment.error_message,
+            created_at: deployment.created_at,
+            completed_at: deployment.completed_at,
+        }
+    }
+}
+
+fn json_error(
+    status: StatusCode,
+    message: impl Into<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (status, Json(serde_json::json!({"error": message.into()})))
+}
+
 /// POST /apps/{name}/agent-policy -- authenticated genpolicy preflight broker.
 pub async fn generate_agent_policy(
     auth: AuthContext,
@@ -493,6 +812,361 @@ pub async fn generate_agent_policy(
     }))
 }
 
+/// POST /deployments -- generic provider-aware deployment entrypoint.
+pub async fn create_generic_deployment(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Json(body): Json<GenericDeploymentRequest>,
+) -> Result<(StatusCode, Json<GenericDeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_write(&auth)?;
+    validate_external_id(body.external_id.as_deref())?;
+
+    validate_source_context(
+        body.source.provider,
+        &body.source.repository,
+        &body.workload.image,
+        &body.signing.subject,
+        &body.signing.issuer,
+    )
+    .map_err(|e| json_error(StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    if let Some(external_id) = body.external_id.as_deref()
+        && let Some((deployment, app)) =
+            fetch_deployment_by_external_id(&state, auth.org_id, external_id).await?
+    {
+        ensure_idempotent_retry_matches(&deployment, &app, &body)?;
+        return Ok((
+            StatusCode::OK,
+            Json(GenericDeploymentResponse::from_deployment(deployment, &app)),
+        ));
+    }
+
+    let app = match fetch_app_by_name(&state, auth.org_id, &body.app.name).await? {
+        Some(app) => {
+            ensure_generic_app_metadata(
+                &state,
+                app,
+                body.source.provider,
+                &body.source.repository,
+                &body.signing.subject,
+                &body.signing.issuer,
+            )
+            .await?
+        }
+        None if body.app.create_if_missing => {
+            let create = crate::routes::apps::CreateAppRequest {
+                name: body.app.name.clone(),
+                unlock_mode: body.app.unlock_mode.clone(),
+                bootstrap_pubkey_hash: body.app.bootstrap_pubkey_hash.clone(),
+                signer_identity_subject: Some(body.signing.subject.clone()),
+                signer_identity_issuer: Some(body.signing.issuer.clone()),
+                source_provider: Some(body.source.provider),
+                source_repository: Some(body.source.repository.clone()),
+            };
+            let (_, Json(created)) =
+                crate::routes::apps::create_app(auth.clone(), State(state.clone()), Json(create))
+                    .await?;
+            fetch_app_by_name(&state, auth.org_id, &created.name)
+                .await?
+                .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+        }
+        None => {
+            return Err(json_error(
+                StatusCode::NOT_FOUND,
+                "app not found; set app.create_if_missing to true to create it",
+            ));
+        }
+    };
+
+    let deploy_request = DeployRequest {
+        image: body.workload.image,
+        container_name: body.workload.container_name,
+        resources: body.workload.resources,
+        external_id: body.external_id,
+        source_provider: Some(body.source.provider),
+        source_repository: Some(body.source.repository),
+        customer_descriptor_blob: body.security.customer_descriptor_blob,
+        org_keyring_blob: body.security.org_keyring_blob,
+        signed_policy_artifact: body.security.signed_policy_artifact,
+    };
+    let org_id = auth.org_id;
+    let (status, Json(deployed)) = deploy(
+        auth,
+        State(state.clone()),
+        Path(app.name.clone()),
+        Json(deploy_request),
+    )
+    .await?;
+    let (deployment, app) = fetch_deployment_with_app(&state, org_id, deployed.deployment_id)
+        .await?
+        .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+
+    Ok((
+        status,
+        Json(GenericDeploymentResponse::from_deployment(deployment, &app)),
+    ))
+}
+
+/// GET /deployments/{deployment_id} -- generic deployment status/details.
+pub async fn get_generic_deployment(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(deployment_id): Path<Uuid>,
+) -> Result<Json<GenericDeploymentResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_read(&auth)?;
+    let (deployment, app) = fetch_deployment_with_app(&state, auth.org_id, deployment_id)
+        .await?
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "deployment not found"))?;
+
+    Ok(Json(GenericDeploymentResponse::from_deployment(
+        deployment, &app,
+    )))
+}
+
+/// POST /deployments/{deployment_id}/config-token -- generic config-token bridge.
+pub async fn generic_config_token(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(deployment_id): Path<Uuid>,
+) -> Result<Json<GenericConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_admin(&auth)?;
+    scopes::require_scope(&auth, "config:write")?;
+
+    let (_deployment, app) = fetch_deployment_with_app(&state, auth.org_id, deployment_id)
+        .await?
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "deployment not found"))?;
+    let Json(token) =
+        crate::routes::config::issue_config_token_route(auth, State(state), Path(app.name.clone()))
+            .await?;
+
+    Ok(Json(GenericConfigTokenResponse {
+        deployment_id,
+        token: token.token,
+        tee_url: token.tee_url,
+        expires_in_seconds: token.expires_in_seconds,
+        expires_at: chrono::Utc::now() + chrono::Duration::seconds(token.expires_in_seconds as i64),
+    }))
+}
+
+async fn fetch_app_by_name(
+    state: &AppState,
+    org_id: Uuid,
+    app_name: &str,
+) -> Result<Option<App>, (StatusCode, Json<serde_json::Value>)> {
+    sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+        .bind(org_id)
+        .bind(app_name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))
+}
+
+async fn fetch_app_by_id(
+    state: &AppState,
+    org_id: Uuid,
+    app_id: Uuid,
+) -> Result<App, (StatusCode, Json<serde_json::Value>)> {
+    sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND id = $2")
+        .bind(org_id)
+        .bind(app_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "app not found"))
+}
+
+async fn fetch_deployment_with_app(
+    state: &AppState,
+    org_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<Option<(Deployment, App)>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(deployment) = sqlx::query_as::<_, Deployment>(
+        "SELECT d.*
+           FROM deployments d
+           JOIN apps a ON a.id = d.app_id
+          WHERE d.id = $1
+            AND a.org_id = $2",
+    )
+    .bind(deployment_id)
+    .bind(org_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+    else {
+        return Ok(None);
+    };
+    let app = fetch_app_by_id(state, org_id, deployment.app_id).await?;
+    Ok(Some((deployment, app)))
+}
+
+async fn fetch_deployment_by_external_id(
+    state: &AppState,
+    org_id: Uuid,
+    external_id: &str,
+) -> Result<Option<(Deployment, App)>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(deployment) = sqlx::query_as::<_, Deployment>(
+        "SELECT d.*
+           FROM deployments d
+           JOIN apps a ON a.id = d.app_id
+          WHERE a.org_id = $1
+            AND d.external_id = $2
+          ORDER BY d.created_at DESC
+          LIMIT 1",
+    )
+    .bind(org_id)
+    .bind(external_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+    else {
+        return Ok(None);
+    };
+    let app = fetch_app_by_id(state, org_id, deployment.app_id).await?;
+    Ok(Some((deployment, app)))
+}
+
+fn validate_external_id(
+    external_id: Option<&str>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let Some(external_id) = external_id else {
+        return Ok(());
+    };
+    if external_id.trim() != external_id || external_id.is_empty() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "external_id must not be empty or padded with whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_idempotent_retry_matches(
+    deployment: &Deployment,
+    app: &App,
+    body: &GenericDeploymentRequest,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if app.name != body.app.name {
+        return Err(idempotency_conflict("app.name"));
+    }
+    let expected_provider = body.source.provider.as_str();
+    let existing_provider = deployment
+        .source_provider
+        .as_deref()
+        .or(app.source_provider.as_deref());
+    if existing_provider != Some(expected_provider) {
+        return Err(idempotency_conflict("source.provider"));
+    }
+    let existing_repository = deployment
+        .source_repository
+        .as_deref()
+        .or(app.source_repository.as_deref());
+    if existing_repository != Some(body.source.repository.as_str()) {
+        return Err(idempotency_conflict("source.repository"));
+    }
+    if app.signer_identity_subject.as_deref() != Some(body.signing.subject.as_str()) {
+        return Err(idempotency_conflict("signing.subject"));
+    }
+    if app.signer_identity_issuer.as_deref() != Some(body.signing.issuer.as_str()) {
+        return Err(idempotency_conflict("signing.issuer"));
+    }
+    if deployment
+        .spec_snapshot
+        .get("image")
+        .and_then(serde_json::Value::as_str)
+        != Some(body.workload.image.as_str())
+    {
+        return Err(idempotency_conflict("workload.image"));
+    }
+    let requested_container = body.workload.container_name.as_deref().unwrap_or("web");
+    let existing_container = deployment
+        .spec_snapshot
+        .get("container_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("web");
+    if existing_container != requested_container {
+        return Err(idempotency_conflict("workload.container_name"));
+    }
+    let existing_resources = deployment
+        .spec_snapshot
+        .get("resources")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let requested_resources =
+        serde_json::to_value(&body.workload.resources).unwrap_or(serde_json::Value::Null);
+    if existing_resources != requested_resources {
+        return Err(idempotency_conflict("workload.resources"));
+    }
+    Ok(())
+}
+
+fn idempotency_conflict(field: &'static str) -> (StatusCode, Json<serde_json::Value>) {
+    json_error(
+        StatusCode::CONFLICT,
+        format!("external_id already exists with different {field}"),
+    )
+}
+
+async fn ensure_generic_app_metadata(
+    state: &AppState,
+    app: App,
+    provider: SourceProvider,
+    repository: &str,
+    subject: &str,
+    issuer: &str,
+) -> Result<App, (StatusCode, Json<serde_json::Value>)> {
+    let provider_str = provider.as_str();
+    if let Some(existing) = app.source_provider.as_deref()
+        && existing != provider_str
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "app source_provider does not match deployment source provider",
+        ));
+    }
+    if let Some(existing) = app.source_repository.as_deref()
+        && existing != repository
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "app source_repository does not match deployment source repository",
+        ));
+    }
+    match (
+        app.signer_identity_subject.as_deref(),
+        app.signer_identity_issuer.as_deref(),
+    ) {
+        (Some(existing_subject), Some(existing_issuer))
+            if existing_subject == subject && existing_issuer == issuer => {}
+        (None, None) => {}
+        _ => {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "app pinned signer identity does not match deployment signing identity",
+            ));
+        }
+    }
+
+    sqlx::query_as(
+        "UPDATE apps
+            SET source_provider = $1,
+                source_repository = $2,
+                signer_identity_subject = $3,
+                signer_identity_issuer = $4,
+                signer_identity_set_at = COALESCE(signer_identity_set_at, now()),
+                updated_at = now()
+          WHERE id = $5
+          RETURNING *",
+    )
+    .bind(provider_str)
+    .bind(repository)
+    .bind(subject)
+    .bind(issuer)
+    .bind(app.id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))
+}
+
 /// POST /apps/{name}/deploy -- deploy or update an app.
 pub async fn deploy(
     auth: AuthContext,
@@ -517,6 +1191,30 @@ pub async fn deploy(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
+
+    if let (Some(provider), Some(repository)) =
+        (body.source_provider, body.source_repository.as_deref())
+    {
+        let subject = app.signer_identity_subject.as_deref().ok_or_else(|| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "app has no pinned signer identity; set one before deploying",
+            )
+        })?;
+        let issuer = app.signer_identity_issuer.as_deref().ok_or_else(|| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "app has no pinned signer identity; set one before deploying",
+            )
+        })?;
+        validate_source_context(provider, repository, &body.image, subject, issuer)
+            .map_err(|e| json_error(StatusCode::BAD_REQUEST, e.to_string()))?;
+    } else if body.source_provider.is_some() || body.source_repository.is_some() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "source_provider and source_repository must be provided together",
+        ));
+    }
 
     let signing_artifacts = crate::signing_service::decode_optional_blobs(
         body.customer_descriptor_blob.clone(),
@@ -816,13 +1514,18 @@ pub async fn deploy(
         .as_ref()
         .map(|artifacts| artifacts.descriptor.deploy_id)
         .unwrap_or_else(Uuid::new_v4);
+    let source_provider = body.source_provider.map(SourceProvider::as_str);
     let spec_snapshot = serde_json::json!({
         "app_name": app.name,
         "namespace": app.namespace,
         "instance_id": app.instance_id,
         "image": body.image,
         "image_digest": &image_digest,
+        "container_name": container_name,
         "resources": body.resources,
+        "external_id": &body.external_id,
+        "source_provider": source_provider,
+        "source_repository": &body.source_repository,
         "signed_descriptor_core_hash": signing_artifacts
             .as_ref()
             .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
@@ -832,23 +1535,31 @@ pub async fn deploy(
     // verification result, not hardcoded.
     let cosign_verified = true;
     sqlx::query(
-        "INSERT INTO deployments (id, app_id, trigger, spec_snapshot, image_digest, cosign_verified, provenance_attestation, sbom)
-         VALUES ($1, $2, 'api', $3, $4, $5, $6, $7)",
+        "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest, cosign_verified, provenance_attestation, sbom, external_id, source_provider, source_repository)
+         VALUES ($1, $2, $3, 'api', $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(deploy_id)
+    .bind(auth.org_id)
     .bind(app.id)
     .bind(&spec_snapshot)
     .bind(Some(&image_digest))
     .bind(cosign_verified)
     .bind(&provenance)
     .bind(&sbom)
+    .bind(body.external_id.as_deref())
+    .bind(source_provider)
+    .bind(body.source_repository.as_deref())
     .execute(&state.db)
     .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
+    .map_err(|e| {
+        if e.to_string().contains("idx_deployments_org_external_id") {
+            json_error(
+                StatusCode::CONFLICT,
+                "deployment with external_id already exists in this org",
+            )
+        } else {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+        }
     })?;
 
     if let (Some(artifacts), Some(signed)) =
@@ -1205,13 +1916,16 @@ pub async fn rollback(
 
     let deploy_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO deployments (id, app_id, trigger, spec_snapshot, image_digest)
-         VALUES ($1, $2, 'rollback', $3, $4)",
+        "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest, source_provider, source_repository)
+         VALUES ($1, $2, $3, 'rollback', $4, $5, $6, $7)",
     )
     .bind(deploy_id)
+    .bind(auth.org_id)
     .bind(app.id)
     .bind(&prev.spec_snapshot)
     .bind(&prev.image_digest)
+    .bind(prev.source_provider.as_deref())
+    .bind(prev.source_repository.as_deref())
     .execute(&state.db)
     .await
     .map_err(|_| {

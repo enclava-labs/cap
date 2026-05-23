@@ -1502,7 +1502,9 @@ name = "enclava-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "base64 0.22.1",
+ "chacha20poly1305",
  "chrono",
  "clap",
  "colored",
@@ -1513,6 +1515,7 @@ dependencies = [
  "enclava-engine",
  "futures",
  "hex",
+ "hkdf",
  "indicatif",
  "nostr",
  "rand 0.8.6",

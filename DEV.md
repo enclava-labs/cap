@@ -1,58 +1,86 @@
-# CAP Development Notes
+# Development
 
-## Build Tooling
+## Toolchain
 
-- Trustee/KBS and CoCo verifier builds on Fedora/RHEL hosts need the DNF
-  packages `protobuf-compiler`, `clang20`, and `clang20-devel` installed.
-- When building Trustee-side validation tools for release, include the
-  all-verifier feature set rather than only AMD SEV-SNP so the platform can add
-  other TEE backends without rebuilding the toolchain shape.
+CAP is a Rust 2024 workspace with MSRV 1.85. Use the workspace root for normal
+commands:
 
-## Stateful Kata SEV-SNP Pods
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-features
+```
 
-- Stateful confidential workloads must use normal long-running containers only.
-  Do not put `attestation-proxy` or helper installation into `initContainers`
-  for the raw Block PVC/LUKS path.
-- `attestation-proxy` runs as a regular sidecar. App, tenant-ingress, and
-  `enclava-init` also start as regular containers.
-- Decrypted state is exposed at `/state`. Workloads must use paths under
-  `/state` directly, for example `/state/data`; do not rely on arbitrary
-  per-app bind mounts such as `/data`. The current Kata runtime rejects
-  Kubernetes `subPath` mounts and the guest-side namespace bind path failed
-  live with `EINVAL`.
-- The worker runtime must use `shared_fs = "virtio-9p"` plus
-  `disable_block_device_use = false`: `virtio-fs` fails on the current
-  QEMU/IOMMU path, while `shared_fs = "none"` makes ordinary ConfigMap/EmptyDir
-  mounts hit Kata direct-volume filename limits.
-- CAP uses `shareProcessNamespace: true`: wait-exec writes each workload PID,
-  `enclava-init` opens the encrypted state, and the `/state` EmptyDir is mounted
-  with propagation so app containers can see the decrypted filesystem. The app
-  container uses `HostToContainer` on `/state`; `enclava-init` uses
-  `Bidirectional` on `/state` and `/state/tls-state`.
-- Customer workload images must include an executable at
-  `/usr/local/bin/enclava-wait-exec`. CAP sets the app command to that path; the
-  helper writes the started sentinel with its PID, waits for
-  `/run/enclava/init-ready`, then execs the workload command.
-- The helper must make `/run/enclava/containers` a shared writable sticky
-  directory (`chmod 1777`) before writing its sentinel. App and tenant-ingress
-  run under different non-root UIDs, so the first helper to create the
-  directory cannot leave it at the default `0755` mode.
-- Platform sidecar images that CAP wraps, currently `caddy-ingress`, must also
-  include `/usr/local/bin/enclava-wait-exec`.
+`enclava-init` links to `libcryptsetup`. On hosts without the development
+package, use:
 
-## Fast Nutshell Contract Gate
+```bash
+cargo test --workspace --exclude enclava-init
+cargo clippy --workspace --all-targets --exclude enclava-init -- -D warnings
+```
 
-- Run `scripts/nutshell-fast-contract.sh` before building/pushing API,
-  signing-service, or Nutshell images for live testing. It validates the
-  Nutshell `enclava.toml` and Dockerfile state contract, then runs the focused
-  CAP and signing-service tests that catch descriptor/runtime/policy drift.
-- For fast live smoke tests, set CAP API `TENANT_CADDY_TLS_MODE=internal`.
-  Set the same env var on policy signing-service. This renders tenant Caddy
-  with `tls internal` on high port `10443`, maps Service port `443` to that
-  high port, and avoids external ACME latency while the CLI/client is already
-  using staging or insecure TLS verification. Production must leave this unset
-  or set it to `acme`.
-- Only use the live cluster after this local gate passes. Keep the customer
-  StatefulSet scaled to zero between live attempts and inspect the rendered pod
-  spec before unlocking so simple command/port/mount mistakes do not boot a TEE
-  VM.
+Local API integration tests need a reachable PostgreSQL test database. When the
+database is not configured, prefer targeted unit tests such as:
+
+```bash
+cargo test -p enclava-api --lib
+cargo test -p enclava-cli
+cargo test -p enclava-engine
+python3 -m pytest tests/test_cap_hermes_proof.py
+```
+
+## Local API
+
+```bash
+docker compose up --build
+curl http://localhost:3000/health
+```
+
+The compose stack is development-only and uses ephemeral signing/session keys.
+It is useful for route and client work, not for persistent deploy validation.
+
+## Deploy Flow Development
+
+The current user-facing CLI path should stay free of platform-owned env
+exports. `enclava deploy --image ...@sha256:...` obtains API signing, platform
+release, TLS broker, and policy-signing context through authenticated API calls.
+
+When changing deploy behavior, check both sides of the contract:
+
+- CLI descriptor construction in `crates/enclava-cli/src/commands/app.rs`,
+  `descriptor.rs`, `keyring.rs`, and `policy_artifact.rs`.
+- API validation and apply orchestration in
+  `crates/enclava-api/src/routes/deployments.rs`,
+  `signing_service.rs`, `deploy.rs`, `kbs.rs`, and `cosign.rs`.
+- Engine manifest output in `crates/enclava-engine/src/manifest`.
+- In-TEE verification in `crates/enclava-init/src/trustee_verify.rs`.
+
+If a production bug is being fixed, add the failing test before changing the
+implementation.
+
+## Runtime Contract Notes
+
+- Workload images and platform sidecar images that CAP wraps must include
+  `/usr/local/bin/enclava-wait-exec`.
+- `enclava-init` is the mount propagation source and writes
+  `/run/enclava/init-ready` after LUKS open, verification, seed derivation, TLS
+  certificate setup, and bind mounts complete.
+- App data and TLS state are separate LUKS volumes. App data is owner-seed
+  backed; TLS state is used by tenant Caddy for certificate continuity.
+- Password-mode first deploy waits for the TEE bootstrap claim endpoint instead
+  of app readiness because the workload is intentionally blocked until
+  ownership is claimed.
+- Direct owner operations must use the TEE hostname and the ownership TEE
+  client path, not the public app hostname.
+
+## Fast Contract Gate
+
+Run this before building or pushing API, signing-service, or Nutshell images for
+live smoke testing:
+
+```bash
+scripts/nutshell-fast-contract.sh
+```
+
+It validates the Nutshell app contract and then runs the focused CAP and
+signing-service checks that catch descriptor, runtime, and policy drift.

@@ -164,9 +164,10 @@ fn statefulset_has_policy_instance_annotation() {
         .as_ref()
         .unwrap();
     assert_eq!(
-        annotations.get("tenant.flowforge.sh/instance"),
+        annotations.get(enclava_engine::types::TENANT_INSTANCE_ANNOTATION),
         Some(&"test-app".to_string())
     );
+    assert!(!annotations.contains_key(enclava_engine::types::LEGACY_TENANT_INSTANCE_ANNOTATION));
 }
 
 #[test]
