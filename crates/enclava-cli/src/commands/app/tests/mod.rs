@@ -276,6 +276,60 @@ fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
 }
 
 #[test]
+fn password_redeploy_wait_does_not_accept_stale_unlocked_runtime() {
+    let source = include_str!("../../app.rs");
+    let fn_start = source
+        .find("async fn wait_for_deploy_runtime")
+        .expect("wait_for_deploy_runtime exists");
+    let fn_end = source[fn_start..]
+        .find("async fn ensure_password_storage_unlocked_for_config")
+        .expect("ensure_password_storage_unlocked_for_config follows wait_for_deploy_runtime")
+        + fn_start;
+    let body = &source[fn_start..fn_end];
+
+    assert!(
+        source.contains("DeployRuntimeTarget::PasswordLocked"),
+        "runtime wait must have a password-redeploy mode"
+    );
+    assert!(
+        body.contains("target.accepts_direct_unlocked()"),
+        "password redeploy wait must gate direct unlocked status so old pods cannot satisfy the new rollout"
+    );
+}
+
+#[test]
+fn deploy_waits_on_returned_deployment_record() {
+    let source = include_str!("../../app.rs");
+    let deploy_start = source
+        .find("pub async fn deploy")
+        .expect("deploy function exists");
+    let deploy_end = source[deploy_start..]
+        .find("async fn wait_for_bootstrap_endpoint")
+        .expect("wait_for_bootstrap_endpoint follows deploy")
+        + deploy_start;
+    let body = &source[deploy_start..deploy_end];
+
+    let deploy_call = body.find("api.deploy").expect("deploy calls API");
+    let apply_wait = body
+        .find("wait_for_deployment_apply_start")
+        .expect("deploy must wait for the returned deployment to start applying");
+    let runtime_wait = body
+        .find("wait_for_deploy_runtime")
+        .expect("deploy waits for TEE runtime");
+    let completion_wait = body
+        .find("wait_for_deployment_completion")
+        .expect("deploy must wait for the returned deployment to complete");
+    assert!(
+        deploy_call < apply_wait && apply_wait < runtime_wait && runtime_wait < completion_wait,
+        "deploy must not let stale app status from the previous pod satisfy the new deployment"
+    );
+    assert!(
+        body.contains("resp.deployment_id"),
+        "deployment waits must be tied to the deployment returned by POST /deploy"
+    );
+}
+
+#[test]
 fn deploy_password_unlock_attests_before_reading_or_unlocking_storage() {
     let source = include_str!("../../app.rs");
     let fn_start = source

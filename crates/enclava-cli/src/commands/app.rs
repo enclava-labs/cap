@@ -93,6 +93,29 @@ fn deploy_should_unlock_before_config(
     is_password_mode && !needs_initial_claim
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeployRuntimeTarget {
+    AnyReady,
+    PasswordLocked,
+}
+
+impl DeployRuntimeTarget {
+    fn accepts_api_status(self, status: &str) -> bool {
+        match self {
+            Self::AnyReady => matches!(status, "running" | "locked"),
+            Self::PasswordLocked => status == "locked",
+        }
+    }
+
+    fn accepts_running_pod_phase(self) -> bool {
+        matches!(self, Self::AnyReady)
+    }
+
+    fn accepts_direct_unlocked(self) -> bool {
+        matches!(self, Self::AnyReady)
+    }
+}
+
 fn deploy_needs_initial_claim(
     is_password_mode: bool,
     ownership_state: Option<&str>,
@@ -284,6 +307,15 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let max_wait = Duration::from_secs(900);
     let poll_interval = Duration::from_secs(3);
+    wait_for_deployment_apply_start(
+        &api,
+        &app_name,
+        &resp.deployment_id,
+        max_wait,
+        poll_interval,
+        &pb,
+    )
+    .await?;
 
     // Phase 3: First ownership claim for password-mode apps.
     //
@@ -305,14 +337,48 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             claim_initial_ownership(&api, &paths, &cli_config, &app_name).await?;
             pb.set_message("Ownership claimed");
         } else {
-            wait_for_deploy_runtime(&api, &app_name, max_wait, poll_interval, &pb).await?;
+            let runtime_target = if deploy_should_unlock_before_config(
+                is_password_mode,
+                false,
+                !config_pairs.is_empty(),
+            ) {
+                DeployRuntimeTarget::PasswordLocked
+            } else {
+                DeployRuntimeTarget::AnyReady
+            };
+            wait_for_deploy_runtime(
+                &api,
+                &app_name,
+                max_wait,
+                poll_interval,
+                &pb,
+                runtime_target,
+            )
+            .await?;
             if deploy_should_unlock_before_config(is_password_mode, false, !config_pairs.is_empty())
             {
                 ensure_password_storage_unlocked_for_config(&api, &app_name, &pb).await?;
             }
         }
     } else {
-        wait_for_deploy_runtime(&api, &app_name, max_wait, poll_interval, &pb).await?;
+        let runtime_target = if deploy_should_unlock_before_config(
+            is_password_mode,
+            false,
+            !config_pairs.is_empty(),
+        ) {
+            DeployRuntimeTarget::PasswordLocked
+        } else {
+            DeployRuntimeTarget::AnyReady
+        };
+        wait_for_deploy_runtime(
+            &api,
+            &app_name,
+            max_wait,
+            poll_interval,
+            &pb,
+            runtime_target,
+        )
+        .await?;
         if deploy_should_unlock_before_config(is_password_mode, false, !config_pairs.is_empty()) {
             ensure_password_storage_unlocked_for_config(&api, &app_name, &pb).await?;
         }
@@ -342,24 +408,17 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     pb.set_position(5);
     pb.set_message("Waiting for health check...");
 
-    let health_start = std::time::Instant::now();
     let health_timeout = Duration::from_secs(DEPLOY_HEALTH_TIMEOUT_SECONDS);
-
-    loop {
-        if health_start.elapsed() > health_timeout {
-            pb.abandon_with_message("Timeout waiting for health check");
-            return Err("deploy timed out waiting for app health check".into());
-        }
-
-        match api.get_status(&app_name).await {
-            Ok(status) if status.status == "running" => {
-                pb.finish_with_message("Deployed and healthy");
-                break;
-            }
-            _ => {}
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    wait_for_deployment_completion(
+        &api,
+        &app_name,
+        &resp.deployment_id,
+        health_timeout,
+        Duration::from_secs(2),
+        &pb,
+    )
+    .await?;
+    pb.finish_with_message("Deployed and healthy");
 
     println!();
     println!("  App:    {app_name}");
@@ -424,6 +483,7 @@ async fn wait_for_deploy_runtime(
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
+    target: DeployRuntimeTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     let direct_tee = api
@@ -440,7 +500,7 @@ async fn wait_for_deploy_runtime(
 
         match api.get_status(app_name).await {
             Ok(status) => {
-                if matches!(status.status.as_str(), "running" | "locked") {
+                if target.accepts_api_status(status.status.as_str()) {
                     pb.set_position(3);
                     pb.set_message(match status.status.as_str() {
                         "locked" => "TEE running, storage locked",
@@ -450,7 +510,7 @@ async fn wait_for_deploy_runtime(
                 }
 
                 match status.pod_phase.as_deref() {
-                    Some("Running") => {
+                    Some("Running") if target.accepts_running_pod_phase() => {
                         pb.set_position(3);
                         pb.set_message("TEE running, attestation complete");
                         return Ok(());
@@ -476,13 +536,103 @@ async fn wait_for_deploy_runtime(
                     pb.set_message("TEE running, storage locked");
                     return Ok(());
                 }
-                "unlocked" => {
+                "unlocked" if target.accepts_direct_unlocked() => {
                     pb.set_position(3);
                     pb.set_message("TEE running, attestation complete");
                     return Ok(());
                 }
+                "unlocked" => {
+                    pb.set_message("Waiting for replacement TEE lock...");
+                }
                 _ => {}
             }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn find_deployment_entry(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+) -> Result<Option<DeploymentEntry>, ApiError> {
+    Ok(api
+        .list_deployments(app_name)
+        .await?
+        .into_iter()
+        .find(|deployment| deployment.id == deployment_id))
+}
+
+async fn wait_for_deployment_apply_start(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+    max_wait: Duration,
+    poll_interval: Duration,
+    pb: &ProgressBar,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > max_wait {
+            pb.abandon_with_message("Timeout waiting for deployment apply");
+            return Err(format!("deployment {deployment_id} did not start applying").into());
+        }
+
+        match find_deployment_entry(api, app_name, deployment_id).await {
+            Ok(Some(deployment)) => match deployment.status.as_str() {
+                "pending" => pb.set_message("Waiting for deployment apply..."),
+                "failed" => {
+                    let detail = deployment
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("deployment failed before apply");
+                    return Err(format!("deployment {deployment_id} failed: {detail}").into());
+                }
+                _ => return Ok(()),
+            },
+            Ok(None) => pb.set_message("Waiting for deployment record..."),
+            Err(_) => pb.set_message("Waiting for deployment status..."),
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn wait_for_deployment_completion(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+    max_wait: Duration,
+    poll_interval: Duration,
+    pb: &ProgressBar,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > max_wait {
+            pb.abandon_with_message("Timeout waiting for deployment health");
+            return Err(format!("deployment {deployment_id} timed out waiting for health").into());
+        }
+
+        match find_deployment_entry(api, app_name, deployment_id).await {
+            Ok(Some(deployment)) => match deployment.status.as_str() {
+                "healthy" => return Ok(()),
+                "failed" => {
+                    let detail = deployment
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("deployment failed");
+                    return Err(format!("deployment {deployment_id} failed: {detail}").into());
+                }
+                "pending" | "applying" | "watching" => {
+                    pb.set_message(format!("Deployment: {}", deployment.status));
+                }
+                other => {
+                    pb.set_message(format!("Deployment: {other}"));
+                }
+            },
+            Ok(None) => pb.set_message("Waiting for deployment record..."),
+            Err(_) => pb.set_message("Waiting for deployment status..."),
         }
 
         tokio::time::sleep(poll_interval).await;

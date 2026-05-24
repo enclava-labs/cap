@@ -391,6 +391,8 @@ pub struct DeploymentEntry {
     pub id: String,
     pub status: String,
     pub image_digest: Option<String>,
+    #[serde(default)]
+    pub error_message: Option<String>,
     pub created_at: String,
     pub completed_at: Option<String>,
 }
