@@ -1,10 +1,13 @@
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, ListParams};
+use k8s_openapi::jiff::Timestamp;
+use kube::api::{Api, DeleteParams, ListParams};
 use tokio::time::Instant;
 
 use super::engine::{ApplyEngine, ApplyError};
 use super::types::{DeployPhase, DeployStatus};
+
+const STALE_TERMINATING_POD_FORCE_DELETE_BUFFER_SECONDS: i64 = 10;
 
 pub fn pod_label_selector(statefulset_name: &str) -> String {
     format!("app={statefulset_name}")
@@ -95,6 +98,34 @@ pub fn classify_pod_phase(snap: &PodSnapshot) -> DeployPhase {
     }
 }
 
+pub fn stale_terminating_pod_needs_force_delete(pod: &Pod, now: Timestamp) -> bool {
+    let Some(deleted_at) = pod.metadata.deletion_timestamp.as_ref() else {
+        return false;
+    };
+
+    if pod
+        .metadata
+        .finalizers
+        .as_ref()
+        .is_some_and(|finalizers| !finalizers.is_empty())
+    {
+        return false;
+    }
+
+    let grace = pod
+        .metadata
+        .deletion_grace_period_seconds
+        .or_else(|| {
+            pod.spec
+                .as_ref()
+                .and_then(|spec| spec.termination_grace_period_seconds)
+        })
+        .unwrap_or(30)
+        .max(0);
+    let stale_after = grace + STALE_TERMINATING_POD_FORCE_DELETE_BUFFER_SECONDS;
+    now.duration_since(deleted_at.0).as_secs() >= stale_after
+}
+
 /// Watch a StatefulSet rollout until it reaches a terminal state or times out.
 ///
 /// Polls the StatefulSet and its pods at `config.poll_interval`. Returns
@@ -162,6 +193,40 @@ pub async fn watch_rollout(
         let pods = pod_api
             .list(&ListParams::default().labels(&pod_label_selector(statefulset_name)))
             .await?;
+        let now = Timestamp::now();
+
+        for pod in &pods.items {
+            if !stale_terminating_pod_needs_force_delete(pod, now) {
+                continue;
+            }
+
+            let Some(pod_name) = pod.metadata.name.as_deref() else {
+                continue;
+            };
+
+            tracing::warn!(
+                namespace = %namespace,
+                statefulset = %statefulset_name,
+                pod = %pod_name,
+                "force deleting stale terminating pod after grace period"
+            );
+            match pod_api
+                .delete(pod_name, &DeleteParams::default().grace_period(0))
+                .await
+            {
+                Ok(_) => {}
+                Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+                Err(err) => {
+                    tracing::warn!(
+                        namespace = %namespace,
+                        statefulset = %statefulset_name,
+                        pod = %pod_name,
+                        error = %err,
+                        "failed to force delete stale terminating pod"
+                    );
+                }
+            }
+        }
 
         let mut worst_phase = DeployPhase::Running;
 

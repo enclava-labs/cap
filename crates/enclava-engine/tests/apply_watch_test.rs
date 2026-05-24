@@ -1,5 +1,10 @@
 use enclava_engine::apply::types::DeployPhase;
-use enclava_engine::apply::watch::{PodSnapshot, classify_pod_phase, pod_label_selector};
+use enclava_engine::apply::watch::{
+    PodSnapshot, classify_pod_phase, pod_label_selector, stale_terminating_pod_needs_force_delete,
+};
+use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
+use k8s_openapi::jiff::Timestamp;
 
 #[test]
 fn pending_pod_maps_to_pods_scheduled_or_tee_booting() {
@@ -78,6 +83,68 @@ fn unknown_phase_maps_to_tee_booting() {
 #[test]
 fn pod_label_selector_matches_generated_statefulset_labels() {
     assert_eq!(pod_label_selector("my-app"), "app=my-app");
+}
+
+#[test]
+fn stale_terminating_pod_after_grace_needs_force_delete() {
+    let deleted_at = Time(
+        "2026-05-24T19:26:06Z"
+            .parse::<Timestamp>()
+            .expect("timestamp parses"),
+    );
+    let now = "2026-05-24T19:27:00Z"
+        .parse::<Timestamp>()
+        .expect("timestamp parses");
+    let pod = Pod {
+        metadata: ObjectMeta {
+            deletion_timestamp: Some(deleted_at),
+            deletion_grace_period_seconds: Some(30),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    assert!(stale_terminating_pod_needs_force_delete(&pod, now));
+}
+
+#[test]
+fn fresh_or_finalized_terminating_pod_is_not_force_deleted() {
+    let deleted_at = Time(
+        "2026-05-24T19:26:06Z"
+            .parse::<Timestamp>()
+            .expect("timestamp parses"),
+    );
+    let fresh_now = "2026-05-24T19:26:20Z"
+        .parse::<Timestamp>()
+        .expect("timestamp parses");
+    let stale_now = "2026-05-24T19:27:00Z"
+        .parse::<Timestamp>()
+        .expect("timestamp parses");
+    let fresh_pod = Pod {
+        metadata: ObjectMeta {
+            deletion_timestamp: Some(deleted_at.clone()),
+            deletion_grace_period_seconds: Some(30),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let finalized_pod = Pod {
+        metadata: ObjectMeta {
+            deletion_timestamp: Some(deleted_at),
+            deletion_grace_period_seconds: Some(30),
+            finalizers: Some(vec!["example.com/finalizer".to_string()]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    assert!(!stale_terminating_pod_needs_force_delete(
+        &fresh_pod, fresh_now
+    ));
+    assert!(!stale_terminating_pod_needs_force_delete(
+        &finalized_pod,
+        stale_now
+    ));
 }
 
 /// Integration test: requires a running cluster.
