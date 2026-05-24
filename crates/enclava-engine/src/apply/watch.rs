@@ -119,7 +119,6 @@ pub async fn watch_rollout(
     let mut last_phase = DeployPhase::Applying;
 
     loop {
-        // Check timeout
         if start.elapsed() >= deadline {
             return Ok(DeployStatus::timed_out(&format!(
                 "rollout did not complete within {:?}",
@@ -127,7 +126,6 @@ pub async fn watch_rollout(
             )));
         }
 
-        // Fetch StatefulSet status
         let sts = match sts_api.get(statefulset_name).await {
             Ok(sts) => sts,
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
@@ -138,7 +136,6 @@ pub async fn watch_rollout(
             Err(e) => return Err(e.into()),
         };
 
-        // Check if StatefulSet reports all replicas ready
         let sts_status = sts.status.as_ref();
         let generation = sts.metadata.generation.unwrap_or(0);
         let observed_generation = sts_status.and_then(|s| s.observed_generation).unwrap_or(0);
@@ -172,7 +169,6 @@ pub async fn watch_rollout(
             let snap = PodSnapshot::from_pod(pod);
             let phase = classify_pod_phase(&snap);
 
-            // Check for crash loops
             if let Some(statuses) = pod
                 .status
                 .as_ref()

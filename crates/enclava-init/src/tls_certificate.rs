@@ -163,7 +163,7 @@ mod tests {
         let second_pem = std::fs::read_to_string(&key_path).unwrap();
         let second_csr = build_csr_der(&hosts, &second_key).unwrap();
 
-        assert!(first_pem.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(KeyPair::from_pem(&first_pem).is_ok());
         assert_eq!(first_pem, second_pem);
         assert!(!first_csr.is_empty());
         assert!(!second_csr.is_empty());

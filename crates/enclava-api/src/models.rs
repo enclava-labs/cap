@@ -2,8 +2,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-// --- Enums ---
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "tier_enum", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
@@ -91,8 +89,6 @@ pub enum PaymentStatus {
     Confirmed,
     Expired,
 }
-
-// --- Row structs ---
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Organization {

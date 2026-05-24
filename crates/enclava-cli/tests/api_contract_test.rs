@@ -46,6 +46,33 @@ fn auth_response_matches_server_shape() {
 }
 
 #[test]
+fn current_user_accepts_deploy_eligibility_fields() {
+    let body = serde_json::json!({
+        "user_id": "c5277e9d-c1bc-4daa-bbb4-43a625952eec",
+        "display_name": "CLI User",
+        "active_org": {
+            "id": "d28131d5-f605-46e9-9b5a-6ee26a2d31dd",
+            "name": "personal-cli",
+            "display_name": null,
+            "role": "owner",
+            "is_personal": true,
+            "tier": "free",
+            "deploy_allowed": true,
+            "deploy_block_reason": null,
+            "dashboard_url": "https://app.enclava.dev/billing"
+        },
+        "orgs": []
+    });
+    let resp: CurrentUserResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(resp.active_org.tier.as_deref(), Some("free"));
+    assert_eq!(resp.active_org.deploy_allowed, Some(true));
+    assert_eq!(
+        resp.active_org.dashboard_url.as_deref(),
+        Some("https://app.enclava.dev/billing")
+    );
+}
+
+#[test]
 fn list_orgs_deserializes_bare_array() {
     let body = serde_json::json!([
         { "id": "3bd1e7b1", "name": "testco", "display_name": null, "tier": "free", "is_personal": false }

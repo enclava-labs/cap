@@ -167,13 +167,14 @@ fn verify_transition_receipt(
     if receipt.payload.to_mode.as_deref() != Some(requested.api_value()) {
         return Err("transition_receipt.payload.to_mode".to_string());
     }
+    let attestation_quote_sha256_text = receipt
+        .payload
+        .attestation_quote_sha256
+        .as_deref()
+        .ok_or_else(|| "transition_receipt.payload.attestation_quote_sha256".to_string())?;
     let attestation_quote_sha256 = parse_hex32(
         "transition_receipt.payload.attestation_quote_sha256",
-        receipt
-            .payload
-            .attestation_quote_sha256
-            .as_deref()
-            .ok_or_else(|| "transition_receipt.payload.attestation_quote_sha256".to_string())?,
+        attestation_quote_sha256_text,
     )?;
     if receipt.payload.new_value_sha256.is_some() {
         return Err("transition_receipt.payload.new_value_sha256".to_string());
@@ -189,12 +190,7 @@ fn verify_transition_receipt(
         ("to_mode", requested.api_value().as_bytes()),
         (
             "attestation_quote_sha256",
-            receipt
-                .payload
-                .attestation_quote_sha256
-                .as_deref()
-                .unwrap()
-                .as_bytes(),
+            attestation_quote_sha256_text.as_bytes(),
         ),
         ("timestamp", receipt.payload.timestamp.as_bytes()),
     ]);

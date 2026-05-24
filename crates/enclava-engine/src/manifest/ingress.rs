@@ -113,10 +113,6 @@ fn validate_https_url(url: &str) -> Result<(), IngressRenderError> {
 }
 
 fn validate_email(s: &str) -> Result<(), IngressRenderError> {
-    // Conservative — we only ever emit our own constant infra@enclava.dev,
-    // but defense in depth: ASCII, no whitespace, no control chars, exactly
-    // one '@', non-empty local and domain parts. The domain part must pass
-    // validate_fqdn.
     if !s.is_ascii() {
         return Err(IngressRenderError::InvalidEmail("must be ASCII".into()));
     }

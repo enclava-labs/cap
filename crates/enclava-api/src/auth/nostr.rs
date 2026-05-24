@@ -155,7 +155,6 @@ pub async fn signup_or_login(
     pool: &PgPool,
     identity: &VerifiedIdentity,
 ) -> Result<(Uuid, Uuid, bool), NostrAuthError> {
-    // Check if npub already registered
     let existing: Option<(Uuid,)> = sqlx::query_as(
         "SELECT user_id FROM user_identities WHERE provider = 'nostr' AND identifier = $1",
     )

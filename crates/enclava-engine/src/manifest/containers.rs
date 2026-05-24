@@ -396,9 +396,6 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             run_as_group: Some(0),
             run_as_non_root: Some(false),
             read_only_root_filesystem: Some(true),
-            // cryptsetup luksOpen and in-guest namespace bind mounts need
-            // SYS_ADMIN. The workload containers keep an unprivileged context
-            // and never receive the raw block devices.
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".to_string()]),
                 add: Some(vec!["SYS_ADMIN".to_string()]),

@@ -8,7 +8,9 @@ use enclava_cli::api_client::ApiClient;
 use enclava_cli::api_types::UpdateUnlockModeRequest;
 use enclava_cli::app_config::AppConfig;
 use enclava_cli::config::{self, CliPaths};
+use enclava_cli::keys;
 use enclava_cli::tee_client::TeeClient;
+use uuid::Uuid;
 
 #[derive(Args)]
 pub struct ClaimArgs {
@@ -87,6 +89,29 @@ fn build_api_client() -> Result<(ApiClient, CliPaths), Box<dyn std::error::Error
     Ok((api, paths))
 }
 
+fn load_or_derive_bootstrap_private_key(
+    paths: &CliPaths,
+    org_name: &str,
+    org_id: Uuid,
+    app_name: &str,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let key_path = paths.bootstrap_key_path(org_name, app_name);
+    if key_path.exists() {
+        let private_key_hex = std::fs::read_to_string(&key_path)?;
+        return hex::decode(private_key_hex.trim())
+            .map_err(|e| format!("invalid bootstrap key format: {e}"))?
+            .try_into()
+            .map_err(|_| "bootstrap key must be 32 bytes (64 hex chars)".into());
+    }
+
+    let seed = keys::load_recovery_seed(paths)?.ok_or(
+        "bootstrap key is missing and no recovery seed is available; run `enclava key restore <backup>`",
+    )?;
+    let app_seed = keys::derive_app_bootstrap_seed(org_id, app_name, &seed)?;
+    config::save_bootstrap_key(paths, org_name, app_name, &hex::encode(app_seed))?;
+    Ok(app_seed)
+}
+
 pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_name = resolve_app_name(&args.app)?;
     let (api, paths) = build_api_client()?;
@@ -100,26 +125,13 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     let challenge = tee.bootstrap_challenge().await?;
     println!("Challenge received (expires in {}s)", challenge.ttl_seconds);
 
-    // Step 2: Load bootstrap keypair
-    let cli_config = config::load_config(&paths)?;
-    let org = cli_config
-        .org
-        .as_deref()
-        .ok_or("no active org -- run `enclava login` first")?;
-    let key_path = paths.bootstrap_key_path(org, &app_name);
+    // Step 2: Load or re-derive the deterministic bootstrap keypair.
+    let me = api.get_current_user().await?;
+    let org_id = Uuid::parse_str(&me.active_org.id)?;
+    let private_key_bytes =
+        load_or_derive_bootstrap_private_key(&paths, &me.active_org.name, org_id, &app_name)?;
 
     // Step 3: Sign challenge with Ed25519 bootstrap keypair
-    let private_key_hex = std::fs::read_to_string(&key_path).map_err(|e| {
-        format!(
-            "bootstrap key not found at {}: {e}. Was this app created with `enclava create`?",
-            key_path.display()
-        )
-    })?;
-    let private_key_bytes: [u8; 32] = hex::decode(private_key_hex.trim())
-        .map_err(|e| format!("invalid bootstrap key format: {e}"))?
-        .try_into()
-        .map_err(|_| "bootstrap key must be 32 bytes (64 hex chars)")?;
-
     let signing_key = SigningKey::from_bytes(&private_key_bytes);
     let verifying_key = signing_key.verifying_key();
 

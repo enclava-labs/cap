@@ -56,7 +56,6 @@ pub async fn signup(
         return Err(EmailAuthError::PasswordRequired);
     }
 
-    // Check if email already exists
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM user_identities WHERE provider = 'email' AND identifier = $1)",
     )

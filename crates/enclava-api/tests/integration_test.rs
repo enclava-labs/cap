@@ -243,7 +243,53 @@ async fn device_login_approval_issues_cli_session_and_users_me_works() {
     me.assert_status_ok();
     let me_body: Value = me.json();
     assert_eq!(me_body["active_org"]["id"], org_id.to_string());
+    assert_eq!(me_body["active_org"]["tier"], "free");
+    assert_eq!(me_body["active_org"]["deploy_allowed"], true);
+    assert_eq!(me_body["active_org"]["deploy_block_reason"], Value::Null);
+    assert_eq!(
+        me_body["active_org"]["dashboard_url"],
+        "https://app.enclava.dev/billing"
+    );
     assert_eq!(me_body["orgs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn app_logs_returns_explicit_unavailable_until_log_proxy_exists() {
+    let (state, _pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("logs-{}", &suffix[..12]);
+    let (session_token, _org_id) = signup_owner(&server, "logs-unavailable").await;
+
+    let create = server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+            "signer_identity_subject": "repo:enclava/logs:ref:refs/heads/main",
+            "signer_identity_issuer": "https://token.actions.githubusercontent.com"
+        }))
+        .await;
+    create.assert_status(StatusCode::CREATED);
+
+    let logs = server
+        .get(&format!("/apps/{app_name}/logs"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    logs.assert_status(StatusCode::NOT_IMPLEMENTED);
+    let body: Value = logs.json();
+    assert_eq!(body["error"], "logs_unavailable");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Live log streaming is not connected yet")
+    );
+    assert_eq!(body["status"], "creating");
 }
 
 #[tokio::test]

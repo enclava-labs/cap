@@ -36,6 +36,13 @@ pub struct AuthResponse {
 
 const DEVICE_LOGIN_TTL_MINUTES: i64 = 10;
 const DEVICE_LOGIN_POLL_INTERVAL_SECONDS: i64 = 5;
+type DeviceLoginPollRow = (
+    String,
+    DateTime<Utc>,
+    Option<DateTime<Utc>>,
+    Option<Uuid>,
+    Option<Uuid>,
+);
 
 async fn fetch_org_name(
     db: &sqlx::PgPool,
@@ -294,13 +301,7 @@ pub async fn poll_device_login(
     Json(body): Json<DeviceLoginPollRequest>,
 ) -> Result<Json<DeviceLoginPollResponse>, (StatusCode, Json<serde_json::Value>)> {
     let hash = code_hash(&body.device_code);
-    let row: Option<(
-        String,
-        DateTime<Utc>,
-        Option<DateTime<Utc>>,
-        Option<Uuid>,
-        Option<Uuid>,
-    )> = sqlx::query_as(
+    let row: Option<DeviceLoginPollRow> = sqlx::query_as(
         "SELECT status, expires_at, last_polled_at, approved_user_id, approved_org_id
          FROM device_login_sessions
          WHERE device_code_hash = $1",
@@ -631,7 +632,6 @@ pub async fn login(
                     )
                 })?;
 
-            // Get user_id from identity
             let user_id: Uuid = sqlx::query_scalar(
                 "SELECT user_id FROM user_identities WHERE provider = 'email' AND identifier = $1",
             )

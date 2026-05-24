@@ -5,7 +5,6 @@
   let email = $state('');
 
   function continueWith(provider: string) {
-    // mock: pretend we authenticated and jump to dashboard
     console.log('Mock auth via', provider);
     goto('/dashboard');
   }
@@ -13,227 +12,290 @@
 
 <ScreenChrome
   tabNum="01"
-  tabLabel="AUTH / LOGIN"
+  tabLabel="AUTH"
   breadcrumb="app.enclava.dev/cli/login"
-  statusText="SESSION · GUEST"
+  statusText="session · guest"
 >
-  <div class="login-wrap">
-    <div class="login-l">
-      <pre class="glyph">  ╔══════════════════════════════════╗
-  ║   E N C L A V A   ·   C A P      ║
-  ║   confidential application       ║
-  ║   platform                       ║
-  ╚══════════════════════════════════╝</pre>
-      <h1>Sign in to your enclave.</h1>
-      <p>Your keys derive every deploy. Use any identity provider — none of them sign your code.</p>
-      <div class="lede">
-        <div>›  TEE attestation <b>AMD SEV-SNP</b></div>
-        <div>›  Customer-signed descriptors</div>
-        <div>›  Encrypted-by-default persistence</div>
-      </div>
-      <div class="footer-ascii">
-        <span class="blink">▮</span> &nbsp; awaiting input · cap-web @ v0.7.3-rc4
+  <div class="auth">
+    <div class="auth-l">
+      <div class="inner">
+        <div class="eyebrow">SIGN IN</div>
+        <h1>The PaaS for <span class="accent">confidential apps.</span></h1>
+        <p>
+          Sign in to deploy containers into attested TEEs. Bring any identity — only your key signs
+          your code.
+        </p>
+        <div class="pillars">
+          <div class="pillar">
+            <div class="ico">&lt;/&gt;</div>
+            <div class="h">Declarative deploys</div>
+            <div class="b">One file describes the app — image, resources, domain.</div>
+          </div>
+          <div class="pillar">
+            <div class="ico">⌂</div>
+            <div class="h">Sealed secrets</div>
+            <div class="b">Encrypted on your machine, unsealed only inside the TEE.</div>
+          </div>
+          <div class="pillar">
+            <div class="ico">≣</div>
+            <div class="h">Encrypted volumes</div>
+            <div class="b">Persistent data sealed with TEE-derived keys.</div>
+          </div>
+        </div>
       </div>
     </div>
-    <div class="login-r">
-      <div class="label">CONTINUE WITH</div>
-      <button class="auth-btn" onclick={() => continueWith('nostr')}>
-        <span class="ico">⌁</span>
-        <span>
+
+    <div class="auth-r">
+      <div class="eyebrow muted">CONTINUE WITH</div>
+      <h3>Choose an identity for this session</h3>
+      <button class="prov" type="button" onclick={() => continueWith('nostr')}>
+        <span class="ico primary">⌁</span>
+        <span class="text">
           <div class="lab">Nostr</div>
-          <div class="sub">sign-in with npub via NIP-98</div>
+          <div class="sub">sign with npub · NIP-98 challenge</div>
         </span>
-        <span class="key">⌘ N</span>
+        <span class="arr">→</span>
       </button>
-      <button class="auth-btn" onclick={() => continueWith('github')}>
-        <span class="ico">◆</span>
-        <span>
+      <button class="prov" type="button" onclick={() => continueWith('github')}>
+        <span class="ico">G</span>
+        <span class="text">
           <div class="lab">GitHub</div>
-          <div class="sub">OAuth 2.0 · org membership inherited</div>
+          <div class="sub">OAuth 2.0 · inherits org membership</div>
         </span>
-        <span class="key">⌘ G</span>
+        <span class="arr">→</span>
       </button>
-      <button class="auth-btn" onclick={() => continueWith('google')}>
-        <span class="ico">✉</span>
-        <span>
+      <button class="prov" type="button" onclick={() => continueWith('google')}>
+        <span class="ico secondary">M</span>
+        <span class="text">
           <div class="lab">Google</div>
           <div class="sub">OAuth 2.0 · email identity only</div>
         </span>
-        <span class="key">⌘ M</span>
+        <span class="arr">→</span>
       </button>
-      <div class="divider-x">OR LINK BY EMAIL</div>
-      <form class="email-row" onsubmit={(e) => { e.preventDefault(); continueWith('email'); }}>
+      <div class="or">or magic link</div>
+      <form
+        class="email-row"
+        onsubmit={(e) => {
+          e.preventDefault();
+          continueWith('email');
+        }}
+      >
         <input placeholder="you@enclave.dev" bind:value={email} />
-        <button type="submit">SEND ›</button>
+        <button type="submit">Send →</button>
       </form>
       <div class="fine">
-        By continuing you accept the <a href="#">acceptable-use policy</a>
-        and pledge not to deploy unsigned containers.
+        By continuing you accept the <a href="#">acceptable-use policy</a>. Unsigned containers will
+        not deploy.
       </div>
     </div>
   </div>
 </ScreenChrome>
 
 <style>
-  .login-wrap {
+  .auth {
     display: grid;
-    grid-template-columns: 1.05fr 1fr;
-    min-height: 540px;
+    grid-template-columns: 1.1fr 1fr;
+    min-height: 640px;
   }
-  .login-l {
-    padding: 56px 48px;
-    border-right: 1px dashed var(--line);
+  .auth-l {
+    padding: 64px 56px;
+    border-right: 1px solid var(--hair);
+    position: relative;
+    overflow: hidden;
+  }
+  .auth-l::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(circle at 20% 90%, hsla(190, 90%, 45%, 0.12), transparent 50%),
+      radial-gradient(circle at 90% 20%, hsla(160, 84%, 39%, 0.08), transparent 50%);
+  }
+  .auth-l .inner {
     position: relative;
   }
-  .login-r {
-    padding: 56px 48px;
+  .auth-l h1 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 52px;
+    line-height: 1.05;
+    letter-spacing: -0.03em;
+    margin: 16px 0 18px;
+    max-width: 16ch;
   }
-  :root[data-theme='light'] .login-r {
-    background: var(--bg);
+  .auth-l h1 .accent {
+    color: var(--primary);
   }
-  .glyph {
-    font-size: 12px;
-    color: var(--phos);
-    line-height: 1.15;
-    margin: 0 0 28px;
+  .auth-l p {
+    color: var(--muted-fg);
+    max-width: 42ch;
+    font-size: 16px;
+    line-height: 1.55;
+    margin-bottom: 56px;
   }
-  h1 {
-    font-weight: 500;
-    font-size: 24px;
-    color: var(--ink);
-    margin: 0 0 10px;
-    letter-spacing: 0.02em;
-  }
-  p {
-    color: var(--dim);
-    max-width: 32ch;
-    margin: 0 0 30px;
-  }
-  .lede {
+  .pillars {
     display: grid;
-    gap: 4px;
-    font-size: 12px;
-    color: var(--dim);
-    letter-spacing: 0.08em;
-  }
-  .lede b {
-    color: var(--phos);
-    font-weight: 500;
-  }
-  .footer-ascii {
-    position: absolute;
-    bottom: 30px;
-    left: 48px;
-    right: 48px;
-    color: var(--dimmer);
-    font-size: 12px;
-  }
-  .blink {
-    animation: blink 1.1s steps(2, end) infinite;
-    color: var(--phos);
-  }
-  @keyframes blink {
-    50% {
-      opacity: 0;
-    }
-  }
-  .label {
-    color: var(--dim);
-    font-size: 12px;
-    letter-spacing: 0.12em;
-    margin-bottom: 16px;
-  }
-  .auth-btn {
-    display: grid;
-    grid-template-columns: 28px 1fr auto;
-    align-items: center;
+    grid-template-columns: 1fr 1fr 1fr;
     gap: 14px;
+  }
+  .pillar {
+    padding: 14px 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--card);
+  }
+  .pillar .ico {
+    color: var(--primary);
+    margin-bottom: 8px;
+    font-family: var(--font-mono);
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .pillar .h {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 4px;
+  }
+  .pillar .b {
+    color: var(--muted-fg);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  .auth-r {
+    padding: 64px 56px;
+    background: var(--bg-2);
+  }
+  .auth-r h3 {
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 22px;
+    margin: 12px 0 24px;
+    letter-spacing: -0.01em;
+  }
+  .prov {
+    display: grid;
+    grid-template-columns: 40px 1fr auto;
+    gap: 14px;
+    align-items: center;
     width: 100%;
     padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--card);
     margin-bottom: 10px;
-    background: transparent;
-    border: 1px solid var(--line);
-    color: var(--ink);
     cursor: pointer;
     transition: 0.15s;
     text-align: left;
+    color: var(--fg);
+    font: inherit;
   }
-  :root[data-theme='light'] .auth-btn {
-    background: var(--panel);
-    border-color: var(--line-2);
+  .prov:hover {
+    border-color: var(--primary);
+    background: var(--card-2);
+    transform: translateY(-1px);
+    box-shadow: 0 6px 20px -10px var(--primary-glow);
   }
-  .auth-btn:hover {
-    border-color: var(--phos);
-    background: var(--phos-soft);
-  }
-  .lab {
-    font-size: 14px;
-  }
-  .sub {
-    color: var(--dim);
-    font-size: 12px;
-  }
-  .key {
-    color: var(--dimmer);
-    font-size: 11px;
-  }
-  .ico {
-    width: 22px;
-    height: 22px;
+  .prov .ico {
+    width: 36px;
+    height: 36px;
+    border-radius: var(--radius);
+    background: hsla(0, 0%, 100%, 0.04);
     display: grid;
     place-items: center;
-    color: var(--phos);
+    color: var(--fg);
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 14px;
   }
-  .divider-x {
+  .prov .ico.primary {
+    background: var(--primary-soft);
+    color: var(--primary);
+  }
+  .prov .ico.secondary {
+    background: var(--secondary-soft);
+    color: var(--secondary);
+  }
+  .prov .lab {
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1.2;
+  }
+  .prov .sub {
+    font-size: 12px;
+    color: var(--muted-fg);
+    margin-top: 2px;
+  }
+  .prov .arr {
+    color: var(--dim);
+    transition: 0.15s;
+  }
+  .prov:hover .arr {
+    color: var(--primary);
+    transform: translateX(4px);
+  }
+  .or {
     display: flex;
     align-items: center;
     gap: 12px;
-    color: var(--dimmer);
-    margin: 22px 0;
+    color: var(--dim);
+    font-family: var(--font-mono);
     font-size: 11px;
-    letter-spacing: 0.12em;
+    letter-spacing: 0.1em;
+    margin: 22px 0;
+    text-transform: uppercase;
   }
-  .divider-x::before,
-  .divider-x::after {
+  .or::before,
+  .or::after {
     content: '';
     flex: 1;
-    border-top: 1px dashed var(--line);
+    border-top: 1px solid var(--hair);
   }
   .email-row {
     display: flex;
-    border: 1px solid var(--line);
-  }
-  :root[data-theme='light'] .email-row {
-    background: var(--panel);
-    border-color: var(--line-2);
+    gap: 8px;
   }
   .email-row input {
     flex: 1;
-    background: transparent;
-    border: 0;
-    padding: 13px 14px;
-    color: var(--ink);
+    padding: 12px 14px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: 14px;
     outline: none;
   }
   .email-row input::placeholder {
-    color: var(--dimmer);
+    color: var(--dim);
+  }
+  .email-row input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--primary-soft);
   }
   .email-row button {
-    background: var(--phos);
-    color: var(--on-phos);
+    background: var(--primary);
+    color: var(--primary-fg);
     border: 0;
-    padding: 0 16px;
-    font-weight: 500;
+    padding: 0 18px;
+    border-radius: var(--radius);
+    font-family: var(--font-sans);
+    font-weight: 600;
+    font-size: 14px;
     cursor: pointer;
-    letter-spacing: 0.08em;
-  }
-  .email-row button:hover {
-    background: var(--ink);
-    color: var(--on-ink);
   }
   .fine {
-    color: var(--dimmer);
     font-size: 12px;
-    margin-top: 14px;
+    color: var(--dim);
+    margin-top: 22px;
+    line-height: 1.6;
+  }
+  .fine a {
+    color: var(--muted-fg);
+    text-decoration: underline;
+    text-decoration-color: var(--border-2);
+    text-underline-offset: 3px;
   }
 </style>

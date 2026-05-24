@@ -230,7 +230,7 @@ pub async fn verify_image(
         })?;
 
     let auth = Auth::Anonymous;
-    let (cosign_signature_image, source_image_digest) = cosign_client
+    let (_, source_image_digest) = cosign_client
         .triangulate(&image, &auth)
         .await
         .map_err(|e| {
@@ -245,7 +245,7 @@ pub async fn verify_image(
     }
 
     let trusted_layers = cosign_client
-        .trusted_signature_layers(&auth, &source_image_digest, &cosign_signature_image)
+        .trusted_signature_layers(&auth, &image)
         .await
         .map_err(|e| {
             let msg = e.to_string();
@@ -310,7 +310,14 @@ fn extract_signer_metadata(
     if let Some(layer) = layers.iter().find(|l| l.bundle.is_some())
         && let Some(bundle) = &layer.bundle
     {
-        rekor_index = Some(bundle.payload.log_index);
+        rekor_index = match bundle {
+            sigstore::cosign::bundle_content::BundleContent::RekorBundle(bundle) => {
+                Some(bundle.payload.log_index)
+            }
+            sigstore::cosign::bundle_content::BundleContent::SigstoreBundle(entry) => {
+                Some(entry.log_index)
+            }
+        };
     }
 
     if subject.is_none() {

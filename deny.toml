@@ -2,7 +2,7 @@
 yanked = "deny"
 unmaintained = "none"
 ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "Transitive via jsonwebtoken/sigstore; CAP does not perform RSA private-key operations, and upstream has no fixed rsa release yet. Revisit when jsonwebtoken/sigstore move off rsa 0.9.x." },
+    { id = "RUSTSEC-2023-0071", reason = "Transitive via sigstore/openidconnect; CAP does not perform RSA private-key operations, and upstream has no fixed rsa release yet. Revisit when sigstore moves off openidconnect/rsa 0.9.x." },
 ]
 
 [sources]

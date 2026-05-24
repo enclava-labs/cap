@@ -1,57 +1,62 @@
 <script lang="ts">
   interface Props {
-    variant: 'healthy' | 'applying' | 'pending' | 'failed' | 'rolled' | 'stopped';
+    variant: 'healthy' | 'applying' | 'pending' | 'failed' | 'rolled' | 'stopped' | 'bitcoin';
     children: import('svelte').Snippet;
     small?: boolean;
   }
   let { variant, children, small = false }: Props = $props();
 </script>
 
-<span class="badge b-{variant}" class:small>
+<span class="chip c-{variant}" class:small>
   {@render children()}
 </span>
 
 <style>
-  .badge {
+  .chip {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: 2px 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 500;
+    padding: 3px 10px;
+    border-radius: 999px;
     border: 1px solid currentColor;
-    font-size: 11px;
-    letter-spacing: 0.12em;
-    background: var(--phos-soft);
+    background: color-mix(in srgb, currentColor 10%, transparent);
+    letter-spacing: 0.02em;
+    text-transform: lowercase;
   }
-  .badge.small {
-    font-size: 11px;
-    padding: 1px 6px;
+  .chip.small {
+    font-size: 10px;
+    padding: 2px 8px;
   }
-  .badge::before {
+  .chip::before {
     content: '';
-    width: 5px;
-    height: 5px;
-    background: currentColor;
+    width: 6px;
+    height: 6px;
     border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 8px currentColor;
   }
-  :root[data-theme='dark'] .badge::before {
-    box-shadow: 0 0 6px currentColor;
+  .c-healthy {
+    color: var(--secondary);
   }
-  .b-healthy {
-    color: var(--phos);
+  .c-applying {
+    color: var(--primary);
   }
-  .b-applying {
-    color: var(--blue);
-  }
-  .b-pending {
+  .c-pending {
     color: var(--amber);
   }
-  .b-failed {
+  .c-failed {
     color: var(--red);
   }
-  .b-rolled {
-    color: var(--magenta);
+  .c-rolled {
+    color: var(--violet);
   }
-  .b-stopped {
-    color: var(--dim);
+  .c-stopped {
+    color: var(--muted-fg);
+  }
+  .c-bitcoin {
+    color: var(--amber);
   }
 </style>

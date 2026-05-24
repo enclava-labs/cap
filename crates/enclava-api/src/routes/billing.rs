@@ -60,9 +60,9 @@ pub fn tier_limits(tier: &str) -> Option<TierInfo> {
 /// GET /billing/tiers -- available tiers + pricing.
 pub async fn list_tiers() -> Json<Vec<TierInfo>> {
     Json(vec![
-        tier_limits("free").unwrap(),
-        tier_limits("pro").unwrap(),
-        tier_limits("enterprise").unwrap(),
+        tier_limits("free").expect("built-in free tier must exist"),
+        tier_limits("pro").expect("built-in pro tier must exist"),
+        tier_limits("enterprise").expect("built-in enterprise tier must exist"),
     ])
 }
 
@@ -96,7 +96,6 @@ pub async fn upgrade_tier(
         ));
     }
 
-    // Create BTCPay invoice
     let btcpay = crate::billing::btcpay::BtcPayClient::new(
         &state.btcpay_url,
         &state.btcpay_api_key,
@@ -345,7 +344,6 @@ pub async fn btcpay_webhook(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // Parse the verified payload
     let payload: crate::billing::btcpay::WebhookPayload =
         serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
 
@@ -431,7 +429,6 @@ pub async fn btcpay_webhook(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            // Update org tier
             sqlx::query(
                 "UPDATE organizations SET tier = $1::tier_enum, updated_at = now() WHERE id = $2",
             )
@@ -441,7 +438,6 @@ pub async fn btcpay_webhook(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            // Create or update subscription
             let sub_id = Uuid::new_v4();
             sqlx::query(
                 "INSERT INTO subscriptions (id, org_id, tier, status, current_period_end)
@@ -454,7 +450,6 @@ pub async fn btcpay_webhook(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-            // Update payment with subscription_id
             let _ = sqlx::query(
                 "UPDATE payments SET subscription_id = $1 WHERE btcpay_invoice_id = $2",
             )

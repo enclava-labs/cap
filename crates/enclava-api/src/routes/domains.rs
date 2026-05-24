@@ -295,10 +295,6 @@ pub async fn verify_challenge(
 
     let previous_custom = app.custom_domain.clone();
 
-    // Custom domains are user-owned -- the user already published the TXT
-    // we just verified and will publish their A/AAAA at the platform edge IP.
-    // We do not touch the platform Cloudflare zone here. The DB row is for
-    // tracking and cleanup only.
     crate::dns::record_custom_domain(&state.db, app.id, &domain)
         .await
         .map_err(dns_error_response)?;

@@ -79,8 +79,8 @@ jobs:
           tool: cargo-audit,cargo-deny
 
       - name: Run cargo audit
-        # RUSTSEC-2023-0071 is transitive through jsonwebtoken/sigstore and has
-        # no fixed upstream release. cargo-deny records the same exception with
+        # RUSTSEC-2023-0071 is transitive through sigstore/openidconnect and has
+        # no fixed upstream path. cargo-deny records the same exception with
         # rationale in deny.toml.
         run: cargo audit --ignore RUSTSEC-2023-0071
 

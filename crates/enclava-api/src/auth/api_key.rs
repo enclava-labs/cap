@@ -160,7 +160,6 @@ pub async fn validate_api_key(
         .into_iter()
         .filter_map(
             |(id, org_id, created_by, key_hash, hash_format, scopes, expires_at)| {
-                // Check expiry
                 if let Some(exp) = expires_at
                     && exp < Utc::now()
                 {
@@ -183,7 +182,6 @@ pub async fn validate_api_key(
         };
 
         if valid {
-            // Update last_used_at
             let _ = sqlx::query("UPDATE api_keys SET last_used_at = now() WHERE id = $1")
                 .bind(id)
                 .execute(pool)
@@ -417,15 +415,15 @@ mod tests {
 
     #[test]
     fn invalid_hmac_key_lengths_are_rejected() {
-        let short_secret = "enclava_AAAAAAAAAAAAAAAAAAAAAAAAAA_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short_material = format!("{}{}_{}", HMAC_KEY_PREFIX, "A".repeat(26), "A".repeat(51));
         assert!(matches!(
-            parse_hmac_key(short_secret),
+            parse_hmac_key(&short_material),
             Err(ApiKeyError::InvalidFormat)
         ));
 
-        let short_prefix = "enclava_AAAAAAAAAAAAAAAAAAAAAAAAA_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short_prefix = format!("{}{}_{}", HMAC_KEY_PREFIX, "A".repeat(25), "A".repeat(52));
         assert!(matches!(
-            parse_hmac_key(short_prefix),
+            parse_hmac_key(&short_prefix),
             Err(ApiKeyError::InvalidFormat)
         ));
     }

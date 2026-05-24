@@ -6,7 +6,6 @@ Production releases must pass ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX as a
 development artifact verified by enclava-cli's fallback fixture root.
 """
 
-from __future__ import annotations
 
 import argparse
 import copy

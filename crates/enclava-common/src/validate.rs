@@ -156,10 +156,6 @@ pub fn validate_image_digest(s: &str) -> Result<(), ValidateError> {
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------
-    // validate_dns_label
-    // -----------------------------------------------------------------
-
     #[test]
     fn dns_label_accepts_valid() {
         assert!(validate_dns_label("a").is_ok());
@@ -238,10 +234,6 @@ mod tests {
         assert!(validate_dns_label("a@@b").is_err());
     }
 
-    // -----------------------------------------------------------------
-    // validate_org_slug
-    // -----------------------------------------------------------------
-
     #[test]
     fn org_slug_accepts_8_lowercase_hex() {
         assert!(validate_org_slug("abcd1234").is_ok());
@@ -263,10 +255,6 @@ mod tests {
         assert!(validate_org_slug("abcd-123").is_err());
         assert!(validate_org_slug("abcd 123").is_err());
     }
-
-    // -----------------------------------------------------------------
-    // validate_app_name
-    // -----------------------------------------------------------------
 
     #[test]
     fn app_name_accepts_valid() {
@@ -307,10 +295,6 @@ mod tests {
         assert!(validate_fqdn("app.12345678.enclava.dev").is_ok());
         assert!(validate_fqdn("app.00000000.enclava.dev").is_ok());
     }
-
-    // -----------------------------------------------------------------
-    // validate_fqdn
-    // -----------------------------------------------------------------
 
     #[test]
     fn fqdn_accepts_valid() {
@@ -365,10 +349,6 @@ mod tests {
         assert!(validate_fqdn("a\nb.dev").is_err());
         assert!(validate_fqdn("a b.dev").is_err());
     }
-
-    // -----------------------------------------------------------------
-    // validate_image_digest
-    // -----------------------------------------------------------------
 
     #[test]
     fn image_digest_accepts_valid() {

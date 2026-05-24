@@ -357,21 +357,22 @@ mod tests {
     use std::io::{Seek, SeekFrom, Write};
     use tempfile::tempdir;
 
-    fn make_backing_file(size_mb: u64) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempdir().unwrap();
+    fn make_backing_file(size_mb: u64) -> Result<(tempfile::TempDir, PathBuf)> {
+        let dir = tempdir()?;
         let path = dir.path().join("disk.img");
-        let mut f = File::create(&path).unwrap();
-        f.seek(SeekFrom::Start(size_mb * 1024 * 1024 - 1)).unwrap();
-        f.write_all(&[0u8]).unwrap();
-        (dir, path)
+        let mut f = File::create(&path)?;
+        f.seek(SeekFrom::Start(size_mb * 1024 * 1024 - 1))?;
+        f.write_all(&[0u8])?;
+        Ok((dir, path))
     }
 
     #[test]
-    fn format_then_open_round_trip() {
-        let (_dir, img) = make_backing_file(32);
+    fn format_then_open_round_trip() -> Result<()> {
+        let (_dir, img) = make_backing_file(32)?;
         let key = DerivedSeed([0x11u8; 32]);
         format(&img, &key).expect("format");
         let opened = open(&img, "enclava-init-test", &key).expect("open");
         assert!(opened.mapper_path.starts_with("/dev/mapper/"));
+        Ok(())
     }
 }

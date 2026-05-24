@@ -13,10 +13,6 @@ use crate::types::ConfidentialApp;
 pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
     let mut hard = BTreeMap::new();
 
-    // CPU. ResourceQuota admission accounts the sum of regular containers and
-    // RuntimeClass overhead. Keep these constants aligned with
-    // manifest/containers.rs and the kata-qemu-snp RuntimeClass used by the
-    // StatefulSet.
     hard.insert(
         "requests.cpu".to_string(),
         Quantity(sum_cpu_quantities(&[
@@ -83,7 +79,6 @@ pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
     );
     hard.insert("services.nodeports".to_string(), Quantity("0".to_string()));
 
-    // Secrets and ConfigMaps
     hard.insert("secrets".to_string(), Quantity("50".to_string()));
     hard.insert("configmaps".to_string(), Quantity("50".to_string()));
 
@@ -171,8 +166,5 @@ fn sum_storage_quantities(a: &str, b: &str) -> String {
         return format!("{total}{a_suffix}");
     }
 
-    // The UI/API defaults use matching units. If a future caller mixes units,
-    // keep the old conservative app-data value instead of inventing a lossy
-    // quantity conversion here.
     a.to_string()
 }

@@ -23,10 +23,6 @@ use sqlx::PgPool;
 pub const HAPROXY_LOCK_ID: i64 = haproxy_lock_id();
 
 const fn haproxy_lock_id() -> i64 {
-    // First 8 bytes (big-endian) of SHA-256("cap-haproxy-config"), interpreted
-    // as i64. Pre-computed at the time this constant was defined so we don't
-    // need a const-eval hash crate. The associated test in this module
-    // verifies the constant matches the live SHA-256 of the label.
     0xe9_d6_37_8a_9d_46_b5_88u64 as i64
 }
 

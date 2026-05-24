@@ -238,10 +238,6 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     toml.push_str(&identity_toml);
     toml.push_str("'''\n");
 
-    // Phase 11: bind sidecar digests so the customer-signed descriptor can
-    // chain `expected_cc_init_data_hash` to the exact runtime identity. Kata's
-    // initdata parser expects every [data] value to be a string, so keep the
-    // structured claim as a JSON string instead of a nested TOML table.
     let sidecar_digests = serde_json::json!({
         "attestation_proxy": app.attestation.proxy_image.digest(),
         "caddy_ingress": app.attestation.caddy_image.digest(),

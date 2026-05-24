@@ -78,6 +78,14 @@ pub struct CurrentUserOrg {
     pub display_name: Option<String>,
     pub role: String,
     pub is_personal: bool,
+    #[serde(default)]
+    pub tier: Option<String>,
+    #[serde(default)]
+    pub deploy_allowed: Option<bool>,
+    #[serde(default)]
+    pub deploy_block_reason: Option<String>,
+    #[serde(default)]
+    pub dashboard_url: Option<String>,
 }
 
 // --- Apps ---
@@ -502,7 +510,10 @@ pub struct UnlockEndpointResponse {
 #[derive(Debug, Deserialize)]
 pub struct ApiErrorBody {
     pub error: String,
+    pub message: Option<String>,
     pub detail: Option<String>,
+    pub reason: Option<String>,
+    pub dashboard_url: Option<String>,
 }
 
 #[cfg(test)]

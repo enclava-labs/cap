@@ -83,10 +83,20 @@ impl ApiClient {
             let status_code = status.as_u16();
             let message = match resp.json::<ApiErrorBody>().await {
                 Ok(body) => {
-                    if let Some(detail) = body.detail {
-                        format!("{}: {}", body.error, detail)
+                    let mut message = body
+                        .message
+                        .or(body.detail)
+                        .unwrap_or_else(|| body.error.clone());
+                    if let Some(reason) = body.reason {
+                        message = format!("{message} ({reason})");
+                    }
+                    if let Some(url) = body.dashboard_url {
+                        message = format!("{message}\nDashboard: {url}");
+                    }
+                    if message == body.error {
+                        message
                     } else {
-                        body.error
+                        format!("{}: {message}", body.error)
                     }
                 }
                 Err(_) => format!("HTTP {status_code}"),

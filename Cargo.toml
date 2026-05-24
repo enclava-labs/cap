@@ -33,7 +33,7 @@ data-encoding = "2"
 flate2 = "1.0"
 axum = { version = "0.8", features = ["macros"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "derive", "migrate", "macros"] }
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
@@ -54,7 +54,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 hmac = "0.12"
 subtle = "2"
 tower_governor = "0.8"
-sigstore = { version = "0.13", default-features = false, features = ["cosign", "sigstore-trust-root", "rustls-tls"] }
+sigstore = { version = "0.14", default-features = false, features = ["cosign", "sigstore-trust-root", "rustls-tls"] }
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio", "system-config"] }
 zeroize = { version = "1", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }

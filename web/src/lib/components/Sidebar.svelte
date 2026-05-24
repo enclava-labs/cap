@@ -2,19 +2,20 @@
   import { page } from '$app/stores';
   import { activeOrg } from '$lib/mocks';
 
-  type Item = { href: string; label: string; kbd: string; icon?: string };
+  type Item = { href: string; label: string; kbd: string; icon: string };
 
   const workspace: Item[] = [
-    { href: '/dashboard', label: 'Overview', kbd: 'G O', icon: '▸' },
-    { href: '/apps', label: 'Apps', kbd: 'G A', icon: '▸' },
-    { href: '/deployments', label: 'Deployments', kbd: 'G D', icon: '▸' },
-    { href: `/orgs/${activeOrg.name}/keyring`, label: 'Keyring', kbd: 'G K', icon: '▸' },
-    { href: `/orgs/${activeOrg.name}/members`, label: 'Members', kbd: 'G M', icon: '▸' }
+    { href: '/dashboard', label: 'Overview', kbd: 'G O', icon: '◐' },
+    { href: '/apps', label: 'Apps', kbd: 'G A', icon: '▢' },
+    { href: '/deployments', label: 'Deployments', kbd: 'G D', icon: '⤺' },
+    { href: `/orgs/${activeOrg.name}/keyring`, label: 'Keyring', kbd: 'G K', icon: '⎈' },
+    { href: `/orgs/${activeOrg.name}/members`, label: 'Members', kbd: 'G M', icon: '⌥' }
   ];
   const account: Item[] = [
-    { href: `/orgs/${activeOrg.name}/billing`, label: 'Billing', kbd: 'G B', icon: '▸' },
-    { href: '/recovery', label: 'Recovery', kbd: 'G R', icon: '▸' },
-    { href: '/audit', label: 'Audit log', kbd: 'G L', icon: '▸' }
+    { href: `/orgs/${activeOrg.name}/billing`, label: 'Billing', kbd: 'G B', icon: '₿' },
+    { href: '/recovery', label: 'Recovery seed', kbd: 'G R', icon: '⤓' },
+    { href: '/audit', label: 'Audit log', kbd: 'G L', icon: '⊟' },
+    { href: '/settings', label: 'Settings', kbd: '', icon: '⚙' }
   ];
 
   function isActive(href: string): boolean {
@@ -22,126 +23,139 @@
   }
 </script>
 
-<aside class="side">
-  <div class="brand">
-    <div class="bglyph">▣ ENCLAVA</div>
-    <div class="bsub">CAP</div>
-  </div>
-  <div class="group">
-    <div class="gh">WORKSPACE</div>
-    <nav class="nav">
-      {#each workspace as item}
-        <a href={item.href} class:active={isActive(item.href)}>
-          <span>{item.icon}</span>
-          <span>{item.label}</span>
-          <span class="kbd">{item.kbd}</span>
-        </a>
-      {/each}
-    </nav>
-  </div>
-  <div class="group">
-    <div class="gh">ACCOUNT</div>
-    <nav class="nav">
-      {#each account as item}
-        <a href={item.href} class:active={isActive(item.href)}>
-          <span>{item.icon}</span>
-          <span>{item.label}</span>
-          <span class="kbd">{item.kbd}</span>
-        </a>
-      {/each}
-    </nav>
-  </div>
-  <div class="org-pill">
-    <div class="top">
-      <span>ACTIVE ORG</span><span class="tier">{activeOrg.tier.toUpperCase()}</span>
+<aside class="nav-col">
+  <div class="org-switcher">
+    <div class="av">{activeOrg.name[0].toUpperCase()}</div>
+    <div>
+      <div class="nm">{activeOrg.name}</div>
+      <div class="sb">
+        {activeOrg.is_personal ? 'personal' : 'team'} · {activeOrg.tier.toLowerCase()}
+      </div>
     </div>
-    <div class="name">{activeOrg.name}</div>
-    <div class="top">
-      <span>{activeOrg.is_personal ? 'PERSONAL' : 'TEAM'} · {activeOrg.role.toUpperCase()}</span>
-    </div>
+    <div class="ch">⇅</div>
+  </div>
+
+  <div class="nav-grp">
+    <div class="gh">Workspace</div>
+    {#each workspace as item}
+      <a class="nav-link" class:act={isActive(item.href)} href={item.href}>
+        <span class="ico">{item.icon}</span>
+        <span>{item.label}</span>
+        {#if item.kbd}<span class="kbd">{item.kbd}</span>{/if}
+      </a>
+    {/each}
+  </div>
+
+  <div class="nav-grp">
+    <div class="gh">Account</div>
+    {#each account as item}
+      <a class="nav-link" class:act={isActive(item.href)} href={item.href}>
+        <span class="ico">{item.icon}</span>
+        <span>{item.label}</span>
+        {#if item.kbd}<span class="kbd">{item.kbd}</span>{/if}
+      </a>
+    {/each}
   </div>
 </aside>
 
 <style>
-  .side {
-    border-right: 1px solid var(--line);
+  .nav-col {
     padding: 18px 14px;
-    min-height: 720px;
-    background: var(--elevation);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--card);
+    position: sticky;
+    top: 24px;
+    align-self: start;
+    max-height: calc(100vh - 48px);
+    overflow-y: auto;
   }
-  .brand {
-    display: flex;
-    align-items: center;
+
+  .org-switcher {
+    margin: 0 0 18px;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--card);
+    display: grid;
+    grid-template-columns: 30px 1fr auto;
     gap: 10px;
-    margin-bottom: 28px;
-    padding: 4px 6px;
+    align-items: center;
+    cursor: pointer;
   }
-  .bglyph {
-    color: var(--phos);
+  .org-switcher:hover {
+    border-color: var(--border-2);
+  }
+  .av {
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius);
+    background: linear-gradient(135deg, var(--primary), var(--secondary));
+    color: var(--primary-fg);
     font-weight: 700;
-    letter-spacing: 0.05em;
+    font-size: 12px;
+    display: grid;
+    place-items: center;
   }
-  .bsub {
+  .nm {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .sb {
     font-size: 11px;
-    color: var(--dim);
-    letter-spacing: 0.14em;
+    color: var(--muted-fg);
+    font-family: var(--font-mono);
   }
-  .group {
-    margin-bottom: 18px;
+  .ch {
+    color: var(--dim);
+    font-size: 14px;
+  }
+
+  .nav-grp {
+    padding: 4px 4px 14px;
   }
   .gh {
-    font-size: 11px;
-    color: var(--dimmer);
+    font-family: var(--font-mono);
+    font-size: 10px;
     letter-spacing: 0.14em;
-    padding: 6px;
-  }
-  .nav {
-    display: grid;
-  }
-  .nav a {
-    display: grid;
-    grid-template-columns: 16px 1fr auto;
-    gap: 8px;
-    align-items: center;
-    padding: 7px 8px;
-    border: 0;
-    color: var(--ink-2);
-    font-size: 13px;
-  }
-  .nav a:hover {
-    background: var(--phos-soft);
-    color: var(--phos);
-  }
-  .nav a.active {
-    background: var(--phos-soft);
-    color: var(--phos);
-  }
-  .nav a .kbd {
-    font-size: 11px;
-    color: var(--dimmer);
-    border: 1px solid var(--line-2);
-    padding: 0 4px;
-    background: var(--panel);
-  }
-  .org-pill {
-    margin: 16px 6px 0;
-    padding: 10px 12px;
-    border: 1px solid var(--line-2);
-    background: var(--panel);
-    display: grid;
-    gap: 4px;
-  }
-  .org-pill .top {
-    display: flex;
-    justify-content: space-between;
-    font-size: 11px;
     color: var(--dim);
-    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 8px 10px;
   }
-  .org-pill .name {
-    color: var(--ink);
+  .nav-link {
+    display: grid;
+    grid-template-columns: 18px 1fr auto;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 10px;
+    border-radius: var(--radius);
+    font-size: 13.5px;
+    color: var(--fg-2);
+    cursor: pointer;
   }
-  .org-pill .tier {
-    color: var(--amber);
+  .nav-link:hover {
+    background: hsla(0, 0%, 100%, 0.04);
+    color: var(--fg);
+  }
+  .nav-link.act {
+    background: var(--primary-soft);
+    color: var(--primary);
+  }
+  .nav-link .ico {
+    color: var(--dim);
+    font-family: var(--font-mono);
+  }
+  .nav-link.act .ico {
+    color: var(--primary);
+  }
+  .nav-link .kbd {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--dim);
+    padding: 1px 5px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--card);
   }
 </style>

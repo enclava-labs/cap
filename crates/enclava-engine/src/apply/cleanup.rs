@@ -161,7 +161,6 @@ pub async fn delete_pvcs_and_wait(
         return Ok(());
     }
 
-    // Delete each PVC
     for pvc in &pvcs.items {
         let pvc_name = pvc.metadata.name.as_deref().unwrap_or("<unnamed>");
         match api.delete(pvc_name, &DeleteParams::default()).await {
@@ -230,7 +229,6 @@ pub async fn delete_namespace_and_wait(
 ) -> Result<(), ApplyError> {
     let api: Api<Namespace> = Api::all(engine.client().clone());
 
-    // Request deletion
     match api.delete(namespace, &DeleteParams::default()).await {
         Ok(_) => {
             tracing::info!(namespace = %namespace, "namespace delete requested");
@@ -306,7 +304,6 @@ pub async fn cleanup_app(
 ) -> CleanupReport {
     let mut report = CleanupReport::new();
 
-    // Step 1: Notify teardown proxy (best-effort)
     if let Some(token) = api_token {
         let domain = app.primary_domain();
         match notify_teardown_proxy(domain, token, engine.config().teardown_proxy_timeout).await {
@@ -328,7 +325,6 @@ pub async fn cleanup_app(
         report.record_success("notify_teardown_proxy_skipped");
     }
 
-    // Step 2: Scale StatefulSet to 0
     match scale_statefulset_to_zero(
         engine,
         &app.namespace,
@@ -353,7 +349,6 @@ pub async fn cleanup_app(
         }
     }
 
-    // Step 3: Delete StatefulSet
     match delete_statefulset(engine, &app.namespace, &app.name).await {
         Ok(()) => report.record_success("delete_statefulset"),
         Err(e) => {
@@ -362,7 +357,6 @@ pub async fn cleanup_app(
         }
     }
 
-    // Step 4: Delete PVCs and wait
     match delete_pvcs_and_wait(engine, &app.namespace, engine.config().pvc_delete_timeout).await {
         Ok(()) => report.record_success("delete_pvcs"),
         Err(e) => {
@@ -371,11 +365,6 @@ pub async fn cleanup_app(
         }
     }
 
-    // Step 5: KBS policy update is NOT done here. The caller (API layer)
-    // regenerates the full KBS policy from its database after removing
-    // this app's bindings. The engine does not own the aggregate policy.
-
-    // Step 6: Delete namespace
     match delete_namespace_and_wait(
         engine,
         &app.namespace,

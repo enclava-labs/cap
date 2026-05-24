@@ -711,9 +711,6 @@ pub async fn apply_deployment_manifests(
         )
         .await?;
     } else {
-        // Backward-compatible path for unsigned deployments only. Signed
-        // deployments must use the signing-service envelope as Trustee's
-        // authoritative policy body.
         crate::kbs::ensure_owner_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
         crate::kbs::ensure_tls_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
         crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref()).await?;

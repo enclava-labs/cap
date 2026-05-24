@@ -4,18 +4,18 @@
     lines: LogLine[];
     maxHeight?: string;
   }
-  let { lines, maxHeight = '240px' }: Props = $props();
+  let { lines, maxHeight = '280px' }: Props = $props();
 
   function levelClass(l: LogLine['level']): string {
     switch (l) {
       case 'I':
-        return 'lvl-i';
+        return 'i';
       case 'W':
-        return 'lvl-w';
+        return 'w';
       case 'E':
-        return 'lvl-e';
+        return 'e';
       case 'O':
-        return 'lvl-o';
+        return 'o';
     }
   }
   function levelLabel(l: LogLine['level']): string {
@@ -23,43 +23,39 @@
   }
 </script>
 
-<div class="terminal" style="max-height: {maxHeight}">
+<div class="term" style="max-height: {maxHeight}">
   {#each lines as line}
     <div>
-      <span class="ts">{line.ts}</span>
-      <span class={levelClass(line.level)}>{levelLabel(line.level)}</span>
+      <span class="ts">{line.ts}</span><span class={levelClass(line.level)}>{levelLabel(line.level)}</span>
       {line.message}
     </div>
   {/each}
 </div>
 
 <style>
-  .terminal {
-    background: var(--terminal-bg);
-    border: 1px solid var(--line);
-    padding: 14px 16px;
-    font-size: 12px;
-    color: var(--terminal-fg);
-    line-height: 1.7;
+  .term {
+    padding: 20px 22px;
     overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.75;
+    color: var(--fg-2);
+    background: var(--inset);
   }
   .ts {
-    color: #7a7560;
-    margin-right: 8px;
+    color: var(--dim);
+    margin-right: 10px;
   }
-  :root[data-theme='dark'] .ts {
-    color: var(--dimmer);
+  .i {
+    color: var(--primary);
   }
-  .lvl-i {
-    color: #79b8ff;
+  .w {
+    color: var(--amber);
   }
-  .lvl-w {
-    color: #f0c674;
+  .e {
+    color: var(--red);
   }
-  .lvl-e {
-    color: #ff7a7a;
-  }
-  .lvl-o {
-    color: #7dffb2;
+  .o {
+    color: var(--secondary);
   }
 </style>

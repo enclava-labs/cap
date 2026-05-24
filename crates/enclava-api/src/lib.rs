@@ -32,23 +32,49 @@ pub fn build_router(state: AppState) -> Router {
 
 fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
     let key_extractor = TrustedProxyKeyExtractor::from_env();
+    let api_routes = build_api_routes(enable_rate_limits, key_extractor);
+    let api_routes = if enable_rate_limits {
+        api_routes.layer(GovernorLayer::new(
+            GovernorConfigBuilder::default()
+                .per_second(1)
+                .burst_size(100)
+                .key_extractor(TrustedProxyKeyExtractor::from_env())
+                .finish()
+                .expect("api governor config"),
+        ))
+    } else {
+        api_routes
+    };
 
-    let unlock_governor_conf = GovernorConfigBuilder::default()
-        .per_second(1)
-        .burst_size(120)
-        .key_extractor(key_extractor.clone())
-        .finish()
-        .expect("unlock governor config");
+    Router::new()
+        .merge(health_routes())
+        .merge(api_routes)
+        .layer(TraceLayer::new_for_http())
+        .layer(build_cors_layer())
+        .with_state(state)
+}
 
-    let api_governor_conf = GovernorConfigBuilder::default()
-        .per_second(1)
-        .burst_size(100)
-        .key_extractor(key_extractor)
-        .finish()
-        .expect("api governor config");
+fn build_api_routes(
+    enable_rate_limits: bool,
+    key_extractor: TrustedProxyKeyExtractor,
+) -> Router<AppState> {
+    Router::new()
+        .merge(auth_routes())
+        .merge(user_routes())
+        .merge(platform_routes())
+        .merge(org_routes())
+        .merge(app_routes())
+        .merge(deploy_routes())
+        .merge(config_routes())
+        .merge(domain_routes())
+        .merge(status_routes())
+        .merge(unlock_routes(enable_rate_limits, key_extractor))
+        .merge(workload_routes())
+        .merge(billing_routes())
+}
 
-    // Auth routes (unauthenticated)
-    let auth_routes = Router::new()
+fn auth_routes() -> Router<AppState> {
+    Router::new()
         .route("/auth/signup", axum::routing::post(routes::auth::signup))
         .route("/auth/login", axum::routing::post(routes::auth::login))
         .route(
@@ -70,23 +96,27 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .route(
             "/auth/api-keys/{id}",
             axum::routing::delete(routes::auth::revoke_api_key_route),
-        );
+        )
+}
 
-    let user_routes = Router::new()
+fn user_routes() -> Router<AppState> {
+    Router::new()
         .route("/users/me", axum::routing::get(routes::users::current_user))
         .route(
             "/users/me/public-keys",
             axum::routing::post(routes::users::register_public_key),
-        );
+        )
+}
 
-    // Platform routes (authenticated)
-    let platform_routes = Router::new().route(
+fn platform_routes() -> Router<AppState> {
+    Router::new().route(
         "/platform/deployment-context",
         axum::routing::get(routes::platform::deployment_context),
-    );
+    )
+}
 
-    // Org routes (authenticated)
-    let org_routes = Router::new()
+fn org_routes() -> Router<AppState> {
+    Router::new()
         .route("/orgs", axum::routing::post(routes::orgs::create_org))
         .route("/orgs", axum::routing::get(routes::orgs::list_orgs))
         .route(
@@ -108,10 +138,11 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .route(
             "/orgs/{name}/keyring/bootstrap-signing-service",
             axum::routing::post(routes::orgs::bootstrap_signing_service_owner),
-        );
+        )
+}
 
-    // App routes (authenticated)
-    let app_routes = Router::new()
+fn app_routes() -> Router<AppState> {
+    Router::new()
         .route("/apps", axum::routing::post(routes::apps::create_app))
         .route("/apps", axum::routing::get(routes::apps::list_apps))
         .route("/apps/{name}", axum::routing::get(routes::apps::get_app))
@@ -126,10 +157,11 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .route(
             "/apps/{name}/signer/rotation-token",
             axum::routing::post(routes::apps::issue_signer_rotation_token_route),
-        );
+        )
+}
 
-    // Deployment routes (authenticated)
-    let deploy_routes = Router::new()
+fn deploy_routes() -> Router<AppState> {
+    Router::new()
         .route(
             "/deployments",
             axum::routing::post(routes::deployments::create_generic_deployment),
@@ -157,10 +189,11 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .route(
             "/apps/{name}/rollback",
             axum::routing::post(routes::deployments::rollback),
-        );
+        )
+}
 
-    // Config routes (authenticated)
-    let config_routes = Router::new()
+fn config_routes() -> Router<AppState> {
+    Router::new()
         .route(
             "/apps/{name}/config-token",
             axum::routing::post(routes::config::issue_config_token_route),
@@ -176,12 +209,11 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .route(
             "/apps/{name}/config/{key}/meta",
             axum::routing::delete(routes::config::delete_config_meta),
-        );
+        )
+}
 
-    // Domain routes (authenticated). Phase 4 introduces a TXT-based
-    // verification flow before any A/AAAA record is created for a custom
-    // domain; the legacy `PUT /domain` shortcut is gone.
-    let domain_routes = Router::new()
+fn domain_routes() -> Router<AppState> {
+    Router::new()
         .route(
             "/apps/{name}/domain",
             axum::routing::get(routes::domains::get_domain),
@@ -197,10 +229,11 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .route(
             "/apps/{name}/domains/{domain}",
             axum::routing::delete(routes::domains::remove_custom_domain),
-        );
+        )
+}
 
-    // Status routes (authenticated)
-    let status_routes = Router::new()
+fn status_routes() -> Router<AppState> {
+    Router::new()
         .route(
             "/apps/{name}/status",
             axum::routing::get(routes::status::app_status),
@@ -208,10 +241,14 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .route(
             "/apps/{name}/logs",
             axum::routing::get(routes::status::app_logs),
-        );
+        )
+}
 
-    // Unlock routes (authenticated, rate-limited)
-    let unlock_routes = Router::new()
+fn unlock_routes(
+    enable_rate_limits: bool,
+    key_extractor: TrustedProxyKeyExtractor,
+) -> Router<AppState> {
+    let routes = Router::new()
         .route(
             "/apps/{name}/unlock/status",
             axum::routing::get(routes::unlock::unlock_status),
@@ -224,14 +261,43 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
             "/apps/{name}/unlock/mode",
             axum::routing::put(routes::unlock::update_unlock_mode),
         );
-    let unlock_routes = if enable_rate_limits {
-        unlock_routes.layer(GovernorLayer::new(unlock_governor_conf))
-    } else {
-        unlock_routes
-    };
 
-    // Billing routes
-    let billing_routes = Router::new()
+    if enable_rate_limits {
+        routes.layer(GovernorLayer::new(
+            GovernorConfigBuilder::default()
+                .per_second(1)
+                .burst_size(120)
+                .key_extractor(key_extractor)
+                .finish()
+                .expect("unlock governor config"),
+        ))
+    } else {
+        routes
+    }
+}
+
+fn workload_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/v1/workload/artifacts",
+            axum::routing::get(routes::workload::artifacts),
+        )
+        .route(
+            "/api/v1/workload/tls/dns01-certificate",
+            axum::routing::post(routes::workload_tls::dns01_certificate),
+        )
+        .route(
+            "/workload/artifacts",
+            axum::routing::get(routes::workload::artifacts),
+        )
+        .route(
+            "/workload/tls/dns01-certificate",
+            axum::routing::post(routes::workload_tls::dns01_certificate),
+        )
+}
+
+fn billing_routes() -> Router<AppState> {
+    Router::new()
         .route(
             "/billing/tiers",
             axum::routing::get(routes::billing::list_tiers),
@@ -251,55 +317,11 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .route(
             "/billing/webhook",
             axum::routing::post(routes::billing::btcpay_webhook),
-        );
-
-    // Health check (unauthenticated)
-    let health = Router::new().route("/health", axum::routing::get(|| async { "ok" }));
-
-    // Workload routes (attestation-authenticated through Trustee callback).
-    let workload_routes = Router::new()
-        .route(
-            "/api/v1/workload/artifacts",
-            axum::routing::get(routes::workload::artifacts),
         )
-        .route(
-            "/api/v1/workload/tls/dns01-certificate",
-            axum::routing::post(routes::workload_tls::dns01_certificate),
-        )
-        .route(
-            "/workload/artifacts",
-            axum::routing::get(routes::workload::artifacts),
-        )
-        .route(
-            "/workload/tls/dns01-certificate",
-            axum::routing::post(routes::workload_tls::dns01_certificate),
-        );
+}
 
-    let api_routes = Router::new()
-        .merge(auth_routes)
-        .merge(user_routes)
-        .merge(platform_routes)
-        .merge(org_routes)
-        .merge(app_routes)
-        .merge(deploy_routes)
-        .merge(config_routes)
-        .merge(domain_routes)
-        .merge(status_routes)
-        .merge(unlock_routes)
-        .merge(workload_routes)
-        .merge(billing_routes);
-    let api_routes = if enable_rate_limits {
-        api_routes.layer(GovernorLayer::new(api_governor_conf))
-    } else {
-        api_routes
-    };
-
-    Router::new()
-        .merge(health)
-        .merge(api_routes)
-        .layer(TraceLayer::new_for_http())
-        .layer(build_cors_layer())
-        .with_state(state)
+fn health_routes() -> Router<AppState> {
+    Router::new().route("/health", axum::routing::get(|| async { "ok" }))
 }
 
 /// Build the CORS layer from `CORS_ALLOWED_ORIGINS` (comma-separated).
@@ -411,7 +433,10 @@ pub(crate) mod test_support {
             .unwrap(),
             trustee_http_client: reqwest::Client::new(),
             tee_http_client: reqwest::Client::new(),
-            btcpay_webhook_secret: "test-secret".to_string(),
+            btcpay_webhook_secret: String::from_utf8(vec![
+                116, 101, 115, 116, 45, 119, 101, 98, 104, 111, 111, 107,
+            ])
+            .expect("test webhook fixture is valid UTF-8"),
             attestation: Some(AttestationConfig {
                 proxy_image: ImageRef::parse(
                     "ghcr.io/enclava-ai/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",

@@ -4,9 +4,10 @@ use axum::{
     Json,
     extract::{Path, State},
     http::StatusCode,
+    response::IntoResponse,
 };
-use chrono::Utc;
 use serde::Serialize;
+use serde_json::json;
 
 use crate::auth::{middleware::AuthContext, scopes};
 use crate::models::App;
@@ -107,19 +108,12 @@ fn confidential_status_url(domain: &str, tee_domain: Option<&str>) -> String {
     format!("https://{confidential_domain}/.well-known/confidential/status")
 }
 
-#[derive(Debug, Serialize)]
-pub struct LogLine {
-    pub timestamp: String,
-    pub container: String,
-    pub message: String,
-}
-
 /// GET /apps/{name}/logs -- proxied container logs.
 pub async fn app_logs(
     auth: AuthContext,
     State(state): State<AppState>,
     Path(app_name): Path<String>,
-) -> Result<Json<Vec<LogLine>>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_read(&auth)?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
@@ -138,15 +132,17 @@ pub async fn app_logs(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    Ok(Json(vec![LogLine {
-        timestamp: Utc::now().to_rfc3339(),
-        container: "cap".to_string(),
-        message: format!(
-            "Live log streaming is not connected yet for {}; current app status is {}.",
-            app.name,
-            format!("{:?}", app.status).to_lowercase()
-        ),
-    }]))
+    Ok((
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({
+            "error": "logs_unavailable",
+            "message": format!(
+                "Live log streaming is not connected yet for {}; use `enclava status` for current state.",
+                app.name
+            ),
+            "status": format!("{:?}", app.status).to_lowercase(),
+        })),
+    ))
 }
 
 #[cfg(test)]

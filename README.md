@@ -2,19 +2,40 @@
 
 CAP is the Enclava control plane for deploying OCI images as confidential
 workloads on a Kubernetes cluster with Kata confidential containers and AMD
-SEV-SNP. The supported user path is:
+SEV-SNP. The first supported self-serve path is manual CLI deploy after web
+registration and billing:
 
-1. `enclava signup` or `enclava login`
+1. Register and add billing/credits in the web UI.
+2. `enclava login`
+3. `enclava init` or `enclava prepare`
+4. `enclava create`
+5. `enclava signer set ...` or pass `--signer-subject` during create.
+6. Build, sign, and publish a public digest-pinned image.
+7. `enclava deploy --image <registry>/<image>@sha256:<digest>`
+8. Save recovery state with `enclava key backup --out enclava-recovery.json`.
+
+Legacy CLI signup/login commands remain available for development, but
+registration, billing, and credit purchases are platform-web responsibilities.
+
+The deploy path does not require a workflow API key. The CLI authenticates with
+a platform session, derives customer-owned deploy keys from a local random
+recovery seed, initializes the personal-org keyring when needed, and signs the
+deployment descriptor before calling the API.
+
+For app projects, the usual local command sequence is:
+
+1. `enclava login`
 2. `enclava init` or `enclava prepare`
 3. `enclava create`
-4. `enclava signer set ...`
-5. `enclava deploy --image <registry>/<image>@sha256:<digest>`
-6. `enclava claim` or `enclava unlock` for password-mode apps
+4. `enclava deploy --image <registry>/<image>@sha256:<digest>`
+5. `enclava status`
+6. `enclava logs`
 
 The CLI signs a deployment descriptor from the local app config and the signed
 platform release. The API validates the descriptor, image signer, org keyring,
 generated agent policy, and signed policy artifact before applying Kubernetes
-resources.
+resources. `enclava logs` currently returns an explicit unavailable response
+until the Kubernetes log proxy is wired.
 
 ## Repository Layout
 

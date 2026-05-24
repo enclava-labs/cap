@@ -39,11 +39,18 @@ curl http://localhost:3000/health
 The compose stack is development-only and uses ephemeral signing/session keys.
 It is useful for route and client work, not for persistent deploy validation.
 
+Device-login route work can be tested locally with the API integration suite.
+The CLI starts `/auth/device/start`, polls `/auth/device/poll`, and stores the
+approved session before calling `/users/me`. After login/signup, the CLI also
+ensures the personal-org keyring is ready so manual deploy does not require
+manual `enclava org keyring ...` commands.
+
 ## Deploy Flow Development
 
 The current user-facing CLI path should stay free of platform-owned env
 exports. `enclava deploy --image ...@sha256:...` obtains API signing, platform
 release, TLS broker, and policy-signing context through authenticated API calls.
+Users should not need `ENCLAVA_API_KEY` for the first manual deploy path.
 
 When changing deploy behavior, check both sides of the contract:
 
@@ -70,6 +77,9 @@ implementation.
 - Password-mode first deploy waits for the TEE bootstrap claim endpoint instead
   of app readiness because the workload is intentionally blocked until
   ownership is claimed.
+- App bootstrap keys are deterministic from the recovery seed. If the cached
+  key file is missing, `enclava deploy` and `enclava claim` can re-derive it
+  after `enclava key restore <backup>`.
 - Direct owner operations must use the TEE hostname and the ownership TEE
   client path, not the public app hostname.
 

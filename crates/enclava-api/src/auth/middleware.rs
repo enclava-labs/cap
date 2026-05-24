@@ -85,7 +85,6 @@ fn extract_api_key_header(parts: &Parts) -> Option<String> {
 
 /// Extract org name from X-Enclava-Org header or ?org= query param.
 fn extract_org_hint(parts: &Parts) -> Option<String> {
-    // Header first
     if let Some(org) = parts
         .headers
         .get("X-Enclava-Org")
@@ -95,7 +94,6 @@ fn extract_org_hint(parts: &Parts) -> Option<String> {
         return Some(org);
     }
 
-    // Query param fallback
     #[derive(Deserialize)]
     struct OrgQuery {
         org: Option<String>,

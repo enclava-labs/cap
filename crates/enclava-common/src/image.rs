@@ -104,14 +104,12 @@ impl ImageRef {
 }
 
 fn split_name(name: &str) -> Result<(String, String), ImageRefError> {
-    // Validate overall length
     if name.len() > 255 {
         return Err(ImageRefError::Invalid(
             "image reference too long".to_string(),
         ));
     }
 
-    // Validate characters - only allow OCI-compliant characters
     if !name.chars().all(|c| {
         c.is_ascii_alphanumeric() || c == '/' || c == ':' || c == '.' || c == '-' || c == '_'
     }) {
@@ -124,7 +122,6 @@ fn split_name(name: &str) -> Result<(String, String), ImageRefError> {
         let registry = &name[..pos];
         let repository = &name[pos + 1..];
 
-        // Validate registry
         if registry.is_empty() {
             return Err(ImageRefError::Invalid("empty registry".to_string()));
         }
@@ -132,7 +129,6 @@ fn split_name(name: &str) -> Result<(String, String), ImageRefError> {
         if !registry.contains('.') && !registry.contains(':') {
             Ok(("docker.io".to_string(), name.to_string()))
         } else {
-            // Validate registry format
             if !registry
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == ':' || c == '-')

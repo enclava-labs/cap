@@ -540,10 +540,6 @@ async fn main() {
         }
     }
 
-    // Phase 11: cosign-verify the platform-controlled sidecars before serving
-    // any deploy/unlock requests. Refusing to start prevents an operator who
-    // has swapped a sidecar image from booting CAP and minting cc_init_data
-    // that anchors the swapped digest.
     let startup_proxy_image = match release_env_value(
         "ATTESTATION_PROXY_IMAGE",
         platform_release

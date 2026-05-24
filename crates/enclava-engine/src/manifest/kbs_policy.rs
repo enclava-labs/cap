@@ -61,7 +61,6 @@ pub fn generate_kbs_policy_rego(
 ) -> String {
     let mut rego = String::new();
 
-    // Header
     rego.push_str("package policy\n\nimport rego.v1\n\ndefault allow := false\n\n");
 
     // Legacy resource_bindings (frozen per OID-5) plus CAP TLS seed bindings.

@@ -600,7 +600,6 @@ pub async fn ensure_dns_pair(
     let mut created: Vec<String> = Vec::new();
 
     // Track whether each hostname existed already so that rollback only
-    // removes records that this call created.
     let app_existed = dns_record_exists(pool, app_id, app_host).await?;
     ensure_dns_record(pool, client, config, app_id, app_host, false).await?;
     if !app_existed {

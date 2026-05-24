@@ -8,7 +8,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
@@ -24,6 +25,10 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::config::CliPaths;
+
+const BACKUP_KDF_MEMORY_KIB: u32 = 19_456;
+const BACKUP_KDF_ITERATIONS: u32 = 2;
+const BACKUP_KDF_PARALLELISM: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum KeysError {
@@ -92,15 +97,52 @@ impl UserSigningKey {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RecoveryBackupMetadata {
+    pub org_id: Option<String>,
+    pub org_name: Option<String>,
+    pub owner_fingerprint: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryBackup {
     pub version: u8,
-    pub kdf: String,
-    pub cipher: String,
-    pub salt: String,
-    pub nonce: String,
-    pub ciphertext: String,
+    pub kind: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_fingerprint: Option<String>,
     pub seed_fingerprint: String,
+    pub kdf: RecoveryBackupKdf,
+    pub cipher: RecoveryBackupCipher,
+    pub ciphertext: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryBackupKdf {
+    pub name: String,
+    pub salt: String,
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryBackupCipher {
+    pub name: String,
+    pub nonce: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecoveryBackupPayload {
+    version: u8,
+    recovery_seed: String,
+    created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
 }
 
 impl Drop for UserSigningKey {
@@ -252,10 +294,22 @@ pub fn derive_app_bootstrap_seed(
     derive_ed25519_seed(recovery_seed, &format!("app-bootstrap/{org_id}/{app_name}"))
 }
 
-fn backup_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], KeysError> {
+fn backup_key(passphrase: &str, kdf: &RecoveryBackupKdf) -> Result<[u8; 32], KeysError> {
+    if kdf.name != "argon2id" {
+        return Err(KeysError::InvalidBackup(format!(
+            "unsupported kdf {}",
+            kdf.name
+        )));
+    }
+    let salt = STANDARD
+        .decode(&kdf.salt)
+        .map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
+    let params = Params::new(kdf.memory_kib, kdf.iterations, kdf.parallelism, Some(32))
+        .map_err(|e| KeysError::Crypto(e.to_string()))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = [0u8; 32];
-    Argon2::default()
-        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+    argon2
+        .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
         .map_err(|e| KeysError::Crypto(e.to_string()))?;
     Ok(key)
 }
@@ -263,6 +317,14 @@ fn backup_key(passphrase: &str, salt: &[u8]) -> Result<[u8; 32], KeysError> {
 pub fn encrypt_recovery_backup(
     seed: &[u8; 32],
     passphrase: &str,
+) -> Result<RecoveryBackup, KeysError> {
+    encrypt_recovery_backup_with_metadata(seed, passphrase, RecoveryBackupMetadata::default())
+}
+
+pub fn encrypt_recovery_backup_with_metadata(
+    seed: &[u8; 32],
+    passphrase: &str,
+    metadata: RecoveryBackupMetadata,
 ) -> Result<RecoveryBackup, KeysError> {
     if passphrase.is_empty() {
         return Err(KeysError::InvalidBackup(
@@ -273,20 +335,43 @@ pub fn encrypt_recovery_backup(
     let mut nonce = [0u8; 24];
     OsRng.fill_bytes(&mut salt);
     OsRng.fill_bytes(&mut nonce);
-    let key = backup_key(passphrase, &salt)?;
+    let kdf = RecoveryBackupKdf {
+        name: "argon2id".to_string(),
+        salt: STANDARD.encode(salt),
+        memory_kib: BACKUP_KDF_MEMORY_KIB,
+        iterations: BACKUP_KDF_ITERATIONS,
+        parallelism: BACKUP_KDF_PARALLELISM,
+    };
+    let cipher_params = RecoveryBackupCipher {
+        name: "xchacha20-poly1305".to_string(),
+        nonce: STANDARD.encode(nonce),
+    };
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let payload = RecoveryBackupPayload {
+        version: 1,
+        recovery_seed: STANDARD.encode(seed),
+        created_at: created_at.clone(),
+        notes: None,
+    };
+    let payload_bytes =
+        serde_json::to_vec(&payload).map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
+    let key = backup_key(passphrase, &kdf)?;
     let cipher =
         XChaCha20Poly1305::new_from_slice(&key).map_err(|e| KeysError::Crypto(e.to_string()))?;
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), seed.as_slice())
+        .encrypt(XNonce::from_slice(&nonce), payload_bytes.as_slice())
         .map_err(|e| KeysError::Crypto(e.to_string()))?;
     Ok(RecoveryBackup {
         version: 1,
-        kdf: "argon2id".to_string(),
-        cipher: "xchacha20poly1305".to_string(),
-        salt: hex::encode(salt),
-        nonce: hex::encode(nonce),
-        ciphertext: hex::encode(ciphertext),
+        kind: "enclava-recovery-backup".to_string(),
+        created_at,
+        org_id: metadata.org_id,
+        org_name: metadata.org_name,
+        owner_fingerprint: metadata.owner_fingerprint,
         seed_fingerprint: seed_fingerprint(seed),
+        kdf,
+        cipher: cipher_params,
+        ciphertext: STANDARD.encode(ciphertext),
     })
 }
 
@@ -300,34 +385,53 @@ pub fn decrypt_recovery_backup(
             backup.version
         )));
     }
-    if backup.kdf != "argon2id" || backup.cipher != "xchacha20poly1305" {
+    if backup.kind != "enclava-recovery-backup" {
+        return Err(KeysError::InvalidBackup(format!(
+            "unsupported kind {}",
+            backup.kind
+        )));
+    }
+    if backup.cipher.name != "xchacha20-poly1305" {
         return Err(KeysError::InvalidBackup(
             "unsupported backup crypto parameters".to_string(),
         ));
     }
-    let salt = hex::decode(&backup.salt).map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
-    let nonce = hex::decode(&backup.nonce).map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
+    let nonce = STANDARD
+        .decode(&backup.cipher.nonce)
+        .map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
     if nonce.len() != 24 {
         return Err(KeysError::InvalidBackup(
             "nonce must be 24 bytes".to_string(),
         ));
     }
-    let ciphertext =
-        hex::decode(&backup.ciphertext).map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
-    let key = backup_key(passphrase, &salt)?;
+    let ciphertext = STANDARD
+        .decode(&backup.ciphertext)
+        .map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
+    let key = backup_key(passphrase, &backup.kdf)?;
     let cipher =
         XChaCha20Poly1305::new_from_slice(&key).map_err(|e| KeysError::Crypto(e.to_string()))?;
     let plaintext = cipher
         .decrypt(XNonce::from_slice(&nonce), ciphertext.as_slice())
         .map_err(|_| KeysError::InvalidBackup("wrong passphrase or corrupted backup".into()))?;
-    if plaintext.len() != 32 {
+    let payload: RecoveryBackupPayload =
+        serde_json::from_slice(&plaintext).map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
+    if payload.version != 1 {
+        return Err(KeysError::InvalidBackup(format!(
+            "unsupported payload version {}",
+            payload.version
+        )));
+    }
+    let seed_bytes = STANDARD
+        .decode(payload.recovery_seed)
+        .map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
+    if seed_bytes.len() != 32 {
         return Err(KeysError::InvalidBackup(format!(
             "seed must decrypt to 32 bytes, got {}",
-            plaintext.len()
+            seed_bytes.len()
         )));
     }
     let mut seed = [0u8; 32];
-    seed.copy_from_slice(&plaintext);
+    seed.copy_from_slice(&seed_bytes);
     if seed_fingerprint(&seed) != backup.seed_fingerprint {
         return Err(KeysError::InvalidBackup(
             "seed fingerprint mismatch".to_string(),
@@ -425,6 +529,32 @@ mod tests {
 
         assert_eq!(restored, seed);
         assert!(decrypt_recovery_backup(&backup, "wrong passphrase").is_err());
+    }
+
+    #[test]
+    fn encrypted_recovery_backup_carries_only_non_secret_metadata_outside_ciphertext() {
+        let seed = [9u8; 32];
+        let backup = encrypt_recovery_backup_with_metadata(
+            &seed,
+            "correct horse battery staple",
+            RecoveryBackupMetadata {
+                org_id: Some("22222222-2222-2222-2222-222222222222".to_string()),
+                org_name: Some("demo".to_string()),
+                owner_fingerprint: Some("owner-fp".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(backup.kind, "enclava-recovery-backup");
+        assert_eq!(backup.org_name.as_deref(), Some("demo"));
+        assert_eq!(backup.owner_fingerprint.as_deref(), Some("owner-fp"));
+        assert_eq!(backup.kdf.name, "argon2id");
+        assert_eq!(backup.cipher.name, "xchacha20-poly1305");
+        assert_ne!(backup.ciphertext, hex::encode(seed));
+        assert_eq!(
+            decrypt_recovery_backup(&backup, "correct horse battery staple").unwrap(),
+            seed
+        );
     }
 
     #[cfg(unix)]

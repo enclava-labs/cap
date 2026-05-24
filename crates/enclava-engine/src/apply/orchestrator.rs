@@ -74,19 +74,15 @@ pub async fn apply_all(
         .as_deref()
         .ok_or_else(|| ApplyError::NamespaceNotReady("namespace has no name".to_string()))?;
 
-    // Step 1: Namespace
     apply_namespace(engine, &manifests.namespace).await?;
     tracing::info!(namespace = %ns_name, "step 1/5: namespace ready");
 
-    // Step 2: Standard namespaced resources
     apply_standard_resources(engine, manifests).await?;
     tracing::info!(namespace = %ns_name, "step 2/5: standard resources applied");
 
-    // Step 3: CiliumNetworkPolicy
     apply_network_policy(engine, ns_name, &manifests.network_policy).await?;
     tracing::info!(namespace = %ns_name, "step 3/5: CiliumNetworkPolicy applied");
 
-    // Step 4: Gateway API routing resources
     apply_gateway_resources(
         engine,
         ns_name,
@@ -97,7 +93,6 @@ pub async fn apply_all(
     .await?;
     tracing::info!(namespace = %ns_name, "step 4/5: Gateway API resources applied");
 
-    // Step 5: StatefulSet (with manifest hash annotation for drift detection)
     let mut sts = manifests.statefulset.clone();
     let hash = manifest_hash(manifests);
 
@@ -134,8 +129,6 @@ pub async fn apply_and_watch(
     // Generate manifests
     let manifests = generate_all_manifests(app);
 
-    // Phase 11: cc_init_data binds runtime_class. Refuse to deploy if the
-    // rendered Pod's runtimeClassName diverges from what cc_init_data committed.
     crate::manifest::cc_init_data::verify_runtime_class_binding(&manifests.statefulset)
         .map_err(ApplyError::ManifestGeneration)?;
 
