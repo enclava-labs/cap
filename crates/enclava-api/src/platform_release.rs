@@ -258,13 +258,19 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: "scheme must be https".to_string(),
         });
     }
-    release
+    let tls_mode = release
         .tenant_caddy_tls_mode
         .parse::<enclava_engine::types::CaddyTlsMode>()
         .map_err(|err| PlatformReleaseError::InvalidField {
             field: "tenant_caddy_tls_mode",
             message: err,
         })?;
+    if tls_mode == enclava_engine::types::CaddyTlsMode::Internal {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_tls_mode",
+            message: "internal mode is only allowed for dev fixtures/local tests".to_string(),
+        });
+    }
     reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
         PlatformReleaseError::InvalidField {
             field: "tenant_caddy_acme_ca",
@@ -329,6 +335,18 @@ mod tests {
         let err = validate_release_payload(&payload).unwrap_err();
         assert!(
             matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "trustee_kbs_url")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_internal_caddy_tls_mode() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.tenant_caddy_tls_mode = "internal".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_tls_mode")
         );
     }
 }

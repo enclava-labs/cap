@@ -12,7 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from cap_hermes_proof_args import parse_args
-from cap_hermes_proof_attestation import validate_attestation_response
+from cap_hermes_proof_attestation import (
+    ce_v1_bytes,
+    ce_v1_hash,
+    extract_report_data,
+    tee_report_data,
+    validate_attestation_response,
+)
 from cap_hermes_proof_support import (
     FAIL,
     PASS,
@@ -22,6 +28,8 @@ from cap_hermes_proof_support import (
     ProofError,
     add_http_check,
     bearer_headers,
+    cosign_verify_blob_args,
+    detached_manifest_signature_exists,
     detached_manifest_signature_path,
     extract_manifest_digest,
     fetch_leaf_spki_sha256,
@@ -34,8 +42,23 @@ from cap_hermes_proof_support import (
     manifest_has_signature,
     normalize_digest,
     render_results,
+    sigstore_bundle_looks_valid,
     verify_cosign_blob,
 )
+
+
+def same_api_origin(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return True
+    left_url = urllib.parse.urlparse(left)
+    right_url = urllib.parse.urlparse(right)
+    left_port = left_url.port or (443 if left_url.scheme == "https" else 80)
+    right_port = right_url.port or (443 if right_url.scheme == "https" else 80)
+    return (
+        left_url.scheme.lower() == right_url.scheme.lower()
+        and (left_url.hostname or "").lower() == (right_url.hostname or "").lower()
+        and left_port == right_port
+    )
 
 
 def validate_inputs(args: argparse.Namespace, results: list[CheckResult]) -> bool:
@@ -45,6 +68,17 @@ def validate_inputs(args: argparse.Namespace, results: list[CheckResult]) -> boo
         results.append(CheckResult(FAIL, "inputs", "CAP app name missing; pass --app or set CAP_APP_NAME."))
     if not args.api_token:
         detail = "CAP API token missing; pass --api-token or log in with enclava CLI."
+        results.append(CheckResult(FAIL, "inputs", detail))
+    if (
+        args.api_token
+        and getattr(args, "_api_token_source", None) == "cli"
+        and getattr(args, "_cli_api_url", None)
+        and not same_api_origin(args.api_url, args._cli_api_url)
+    ):
+        detail = (
+            "refusing to use the enclava CLI token for a different CAP API origin; "
+            "pass --api-token or set CAP_API_TOKEN for this --api-url"
+        )
         results.append(CheckResult(FAIL, "inputs", detail))
     return not any(result.status == FAIL for result in results)
 
@@ -103,7 +137,9 @@ def signed_manifest_status(
     if detached_signature and cosign_verified:
         return PASS, "detached signature bundle cosign verified"
     if detached_signature and not inline_signature:
-        return PASS, "detached signature bundle present"
+        if sigstore_bundle_looks_valid(detached_signature):
+            return WARN, "detached Sigstore bundle present but not cosign verified"
+        return WARN, "detached signature sidecar present but not verified as Sigstore bundle"
     if inline_signature:
         return PASS, "signature present"
     return WARN, "signature not found"
@@ -133,6 +169,7 @@ def check_app_status(args: argparse.Namespace, results: list[CheckResult], auth:
             headers=auth,
             timeout=args.timeout,
             insecure_tls=args.insecure_tls,
+            allow_redirects=False,
         ),
     )
     if not app_status_resp:
@@ -170,6 +207,7 @@ def check_deployment_digest(
             headers=auth,
             timeout=args.timeout,
             insecure_tls=args.insecure_tls,
+            allow_redirects=False,
         ),
     )
     if not deployments_resp:
@@ -356,6 +394,7 @@ def check_hermes(args: argparse.Namespace, results: list[CheckResult], app_domai
             body=body,
             timeout=args.timeout,
             insecure_tls=args.insecure_tls,
+            allow_redirects=False,
         ),
     )
     if hermes_resp:

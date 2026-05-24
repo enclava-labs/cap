@@ -179,6 +179,21 @@ fn unlock_mode_transition_response_deserializes() {
 }
 
 #[test]
+fn deployment_entry_accepts_legacy_deployment_id_field() {
+    let body = serde_json::json!({
+        "deployment_id": "90dc3149-02e2-4d44-8398-67637abbcbbe",
+        "status": "running",
+        "image_digest": "sha256:abc",
+        "created_at": "2026-05-24T10:00:00Z",
+        "completed_at": null
+    });
+
+    let entry: DeploymentEntry = serde_json::from_value(body).unwrap();
+
+    assert_eq!(entry.id, "90dc3149-02e2-4d44-8398-67637abbcbbe");
+}
+
+#[test]
 fn billing_status_uses_period_end() {
     // Real server response: {"tier":"free","status":"active","period_end":null,"grace_period_ends":null}
     let body = serde_json::json!({

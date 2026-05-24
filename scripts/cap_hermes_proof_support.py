@@ -123,6 +123,25 @@ def detached_manifest_signature_path(manifest_path: Path) -> Path | None:
     return None
 
 
+def detached_manifest_signature_exists(manifest_path: Path) -> bool:
+    return detached_manifest_signature_path(manifest_path) is not None
+
+
+def sigstore_bundle_looks_valid(bundle_path: Path) -> bool:
+    try:
+        bundle = load_json_file(bundle_path)
+    except Exception:
+        return False
+    if not isinstance(bundle, dict):
+        return False
+    has_media_type = isinstance(bundle.get("mediaType"), str) and bundle["mediaType"].strip()
+    has_verification_material = isinstance(bundle.get("verificationMaterial"), dict)
+    has_signed_content = any(
+        key in bundle for key in ("messageSignature", "dsseEnvelope")
+    )
+    return bool(has_media_type and has_verification_material and has_signed_content)
+
+
 def cosign_verify_blob_args(
     manifest_path: Path,
     bundle_path: Path,
@@ -240,11 +259,18 @@ def http_request(
     body: bytes | None = None,
     timeout: float = 20.0,
     insecure_tls: bool = False,
+    allow_redirects: bool = True,
 ) -> HttpResult:
     request = urllib.request.Request(url, method=method.upper(), headers=headers or {}, data=body)
     context = ssl._create_unverified_context() if insecure_tls else None
+    handlers = []
+    if context is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=context))
+    if not allow_redirects:
+        handlers.append(NoRedirectHandler())
+    opener = urllib.request.build_opener(*handlers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        with opener.open(request, timeout=timeout) as response:
             return HttpResult(
                 url=url,
                 status_code=response.status,
@@ -252,12 +278,22 @@ def http_request(
                 body=response.read(),
             )
     except urllib.error.HTTPError as err:
+        if not allow_redirects and 300 <= err.code < 400:
+            location = err.headers.get("Location", "").strip() or "missing Location"
+            raise ProofError(
+                f"refused authenticated redirect from {url}: HTTP {err.code} -> {location}"
+            ) from err
         return HttpResult(
             url=url,
             status_code=err.code,
             headers=dict(err.headers.items()),
             body=err.read(),
         )
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802
+        return None
 
 
 def join_url(base: str, path: str) -> str:

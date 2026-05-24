@@ -311,3 +311,96 @@ fn workload_pid_fallback_rejects_missing_mount_namespace() {
 
     assert!(err.to_string().contains("mount namespace"));
 }
+
+#[test]
+fn sentinel_record_validates_name_identity_env_and_start_time() {
+    let dir = tempdir().unwrap();
+    write_fake_proc(dir.path(), 789, "web", 10001, 10001, 555);
+    let record = SentinelRecord {
+        container: Some("web".to_string()),
+        pid: 789,
+        uid: Some(10001),
+        gid: Some(10001),
+        start_time_ticks: Some(555),
+    };
+
+    validate_sentinel_record(
+        dir.path(),
+        "web",
+        ExpectedIdentity {
+            uid: 10001,
+            gid: 10001,
+        },
+        &record,
+    )
+    .unwrap();
+}
+
+#[test]
+fn sentinel_record_rejects_pid_reuse_start_time_mismatch() {
+    let dir = tempdir().unwrap();
+    write_fake_proc(dir.path(), 789, "web", 10001, 10001, 556);
+    let record = SentinelRecord {
+        container: Some("web".to_string()),
+        pid: 789,
+        uid: Some(10001),
+        gid: Some(10001),
+        start_time_ticks: Some(555),
+    };
+
+    let err = validate_sentinel_record(
+        dir.path(),
+        "web",
+        ExpectedIdentity {
+            uid: 10001,
+            gid: 10001,
+        },
+        &record,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("start_time_ticks"));
+}
+
+#[test]
+fn parses_structured_and_legacy_sentinel_records() {
+    let structured = parse_sentinel_record(
+        "version=1\ncontainer=tenant-ingress\npid=123\nuid=10002\ngid=10002\nstart_time_ticks=77\n",
+    )
+    .unwrap();
+    assert_eq!(structured.pid, 123);
+    assert_eq!(structured.container.as_deref(), Some("tenant-ingress"));
+    assert_eq!(structured.uid, Some(10002));
+    assert_eq!(structured.start_time_ticks, Some(77));
+
+    let legacy = parse_sentinel_record("456\n").unwrap();
+    assert_eq!(legacy.pid, 456);
+    assert!(legacy.container.is_none());
+}
+
+fn write_fake_proc(root: &Path, pid: u32, name: &str, uid: u32, gid: u32, start_time: u64) {
+    let proc_dir = root.join(pid.to_string());
+    std::fs::create_dir_all(proc_dir.join("ns")).unwrap();
+    std::fs::write(proc_dir.join("ns/mnt"), b"").unwrap();
+    std::fs::write(
+        proc_dir.join("environ"),
+        format!("PATH=/usr/bin\0ENCLAVA_CONTAINER_NAME={name}\0").as_bytes(),
+    )
+    .unwrap();
+    std::fs::write(
+        proc_dir.join("status"),
+        format!(
+            "Name:\twait-exec\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(proc_dir.join("stat"), fake_stat(pid, start_time)).unwrap();
+}
+
+fn fake_stat(pid: u32, start_time: u64) -> String {
+    let mut fields = vec!["S".to_string()];
+    fields.extend((4..=21).map(|_| "0".to_string()));
+    fields.push(start_time.to_string());
+    let fields = fields.join(" ");
+    format!("{pid} (enclava-wait-exec) {fields}")
+}

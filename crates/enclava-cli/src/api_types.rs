@@ -387,6 +387,7 @@ pub struct RollbackResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct DeploymentEntry {
+    #[serde(alias = "deployment_id")]
     pub id: String,
     pub status: String,
     pub image_digest: Option<String>,

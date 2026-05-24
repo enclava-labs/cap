@@ -113,7 +113,7 @@ fn run() -> Result<()> {
 
     if stay_alive {
         record_stage("waiting for workload containers").ok();
-        let workload_namespaces = wait_for_container_start_sentinels()
+        let workload_namespaces = wait_for_container_start_sentinels(&cfg)
             .context("waiting for workload containers before bind-mounting decrypted volumes")?;
         record_stage("binding workload mount namespaces").ok();
         bind_mounts_into_workload_namespaces(&cfg, &workload_namespaces)
@@ -171,8 +171,9 @@ fn started_dir_path() -> PathBuf {
 mod namespace_bind;
 #[cfg(test)]
 use namespace_bind::{
-    WorkloadNamespace, bind_mount_plan_for_workload, find_workload_pid_by_env,
-    mount_source_path_after_workload_chroot, paths_resolve_to_same_object, validate_sentinel_name,
+    ExpectedIdentity, SentinelRecord, WorkloadNamespace, bind_mount_plan_for_workload,
+    find_workload_pid_by_env, mount_source_path_after_workload_chroot, parse_sentinel_record,
+    paths_resolve_to_same_object, validate_sentinel_name, validate_sentinel_record,
     workload_proc_root_path,
 };
 use namespace_bind::{

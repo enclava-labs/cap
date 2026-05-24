@@ -55,6 +55,14 @@ fn enforce_with(
             return Err(EnvGateError::DebugOnlyFlagInRelease("TENANT_TEE_TLS_MODE"));
         }
 
+        if let Some(mode) = lookup("TENANT_CADDY_TLS_MODE")
+            && mode.trim().eq_ignore_ascii_case("internal")
+        {
+            return Err(EnvGateError::DebugOnlyFlagInRelease(
+                "TENANT_CADDY_TLS_MODE",
+            ));
+        }
+
         let api_key_pepper_present = lookup("API_KEY_HMAC_PEPPER")
             .is_some_and(|v| !v.trim().is_empty())
             || lookup("API_KEY_HMAC_PEPPER_BASE64").is_some_and(|v| !v.trim().is_empty());
@@ -133,6 +141,17 @@ mod tests {
         let mut env = ok_required();
         env.insert("TENANT_TEE_TLS_MODE", "insecure");
         assert!(run(env, false).is_err());
+    }
+
+    #[test]
+    fn release_rejects_internal_caddy_tls_mode() {
+        let mut env = ok_required();
+        env.insert("TENANT_CADDY_TLS_MODE", "internal");
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::DebugOnlyFlagInRelease("TENANT_CADDY_TLS_MODE")
+        ));
     }
 
     #[test]

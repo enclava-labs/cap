@@ -1,15 +1,22 @@
 import base64
 import hashlib
+import http.server
 import importlib.util
 import json
+import argparse
 import struct
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 
-SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "cap_hermes_proof.py"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+SCRIPT_PATH = SCRIPTS_DIR / "cap_hermes_proof.py"
 SPEC = importlib.util.spec_from_file_location("cap_hermes_proof", SCRIPT_PATH)
 proof = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -77,6 +84,30 @@ class CapHermesProofTests(unittest.TestCase):
 
             self.assertTrue(proof.detached_manifest_signature_exists(manifest_path))
             self.assertEqual(proof.detached_manifest_signature_path(manifest_path), bundle_path)
+
+    def test_detached_manifest_signature_sidecar_is_not_pass_without_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest_path = Path(tmp) / "hermes-policy.json"
+            manifest_path.write_text("{}", encoding="utf-8")
+            bundle_path = Path(f"{manifest_path}.sigstore.json")
+            bundle_path.write_text('{"bundle": true}', encoding="utf-8")
+            args = argparse.Namespace(
+                require_cosign_verify=False,
+                require_signed_manifest=True,
+                cosign_certificate_identity=None,
+                cosign_certificate_oidc_issuer=None,
+                timeout=1,
+            )
+
+            status, detail = proof.signed_manifest_status(
+                args,
+                manifest_path,
+                inline_signature=False,
+                detached_signature=bundle_path,
+            )
+
+        self.assertEqual(status, proof.WARN)
+        self.assertIn("not verified", detail)
 
     def test_cosign_verify_blob_args_include_identity_and_bundle(self):
         args = proof.cosign_verify_blob_args(
@@ -194,6 +225,70 @@ class CapHermesProofTests(unittest.TestCase):
             loaded = proof.load_json_file(path)
 
         self.assertEqual(proof.extract_manifest_digest(loaded), "sha256:" + ("a" * 64))
+
+    def test_validate_inputs_rejects_cli_token_for_different_api_origin(self):
+        args = argparse.Namespace(
+            api_url="https://other.example.test",
+            app="demo",
+            api_token="token-from-cli",
+            _api_token_source="cli",
+            _cli_api_url="https://cap.example.test",
+        )
+        results = []
+
+        self.assertFalse(proof.validate_inputs(args, results))
+        self.assertEqual(results[0].status, proof.FAIL)
+        self.assertIn("different CAP API origin", results[0].detail)
+
+    def test_authenticated_http_request_refuses_redirect(self):
+        with run_redirect_server() as base_url:
+            with self.assertRaisesRegex(proof.ProofError, "refused authenticated redirect"):
+                proof.http_request(
+                    f"{base_url}/redirect",
+                    headers={"Authorization": "Bearer token"},
+                    allow_redirects=False,
+                    timeout=2,
+                )
+
+    def test_public_http_request_can_follow_redirect(self):
+        with run_redirect_server() as base_url:
+            response = proof.http_request(f"{base_url}/redirect", timeout=2)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.text, "ok")
+
+
+class RedirectHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", "/ok")
+            self.end_headers()
+            return
+        if self.path == "/ok":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
+class run_redirect_server:
+    def __enter__(self):
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+    def __exit__(self, exc_type, exc, tb):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
 
 
 if __name__ == "__main__":

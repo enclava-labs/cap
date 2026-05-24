@@ -58,12 +58,21 @@ fn challenge_response_accepts_live_proxy_shape() {
 }
 
 #[test]
-fn locked_status_means_ownership_is_already_claimed() {
+fn only_claimed_ownership_state_means_owner_claim_succeeded() {
     assert!(super::claim_state_json_is_successful(
-        &serde_json::json!({"state": "locked"})
+        &serde_json::json!({"ownership_state": "claimed", "unlock_state": "locked"})
     ));
     assert!(super::claim_state_json_is_successful(
+        &serde_json::json!({"state": "claimed"})
+    ));
+    assert!(!super::claim_state_json_is_successful(
+        &serde_json::json!({"state": "locked"})
+    ));
+    assert!(!super::claim_state_json_is_successful(
         &serde_json::json!({"ownership_state": "locked"})
+    ));
+    assert!(!super::claim_state_json_is_successful(
+        &serde_json::json!({"unlock_state": "unlocked"})
     ));
     assert!(!super::claim_state_json_is_successful(
         &serde_json::json!({"state": "unclaimed"})

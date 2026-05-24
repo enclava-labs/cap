@@ -428,14 +428,22 @@ pub fn build_enclava_tools_init_container() -> Container {
         image: Some(enclava_init_image()),
         command: Some(vec![
             "/bin/sh".to_string(),
+            "-eu".to_string(),
             "-c".to_string(),
-            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec".to_string(),
+            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers".to_string(),
         ]),
-        volume_mounts: Some(vec![VolumeMount {
-            name: "enclava-tools".to_string(),
-            mount_path: "/work".to_string(),
-            ..Default::default()
-        }]),
+        volume_mounts: Some(vec![
+            VolumeMount {
+                name: "enclava-tools".to_string(),
+                mount_path: "/work".to_string(),
+                ..Default::default()
+            },
+            VolumeMount {
+                name: "unlock-socket".to_string(),
+                mount_path: "/run/enclava".to_string(),
+                ..Default::default()
+            },
+        ]),
         security_context: Some(SecurityContext {
             allow_privilege_escalation: Some(false),
             read_only_root_filesystem: Some(true),

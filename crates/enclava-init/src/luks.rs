@@ -110,10 +110,10 @@ fn format_with_libcryptsetup(device: &Path, key: &DerivedSeed) -> Result<()> {
 ///
 /// The header must already exist (call [`format`] first on a fresh device).
 pub fn open(device: &Path, mapping_name: &str, key: &DerivedSeed) -> Result<LuksOpened> {
-    if Path::new(&format!("/dev/mapper/{mapping_name}")).exists() {
-        return Ok(LuksOpened {
-            mapper_path: PathBuf::from(format!("/dev/mapper/{mapping_name}")),
-        });
+    let mapper_path = PathBuf::from(format!("/dev/mapper/{mapping_name}"));
+    if mapper_path.exists() {
+        validate_existing_mapper(device, mapping_name, key)?;
+        return Ok(LuksOpened { mapper_path });
     }
 
     if let Err(cli_err) = open_with_cryptsetup_cli(device, mapping_name, key) {
@@ -130,9 +130,21 @@ pub fn open(device: &Path, mapping_name: &str, key: &DerivedSeed) -> Result<Luks
         })?;
     }
 
-    Ok(LuksOpened {
-        mapper_path: PathBuf::from(format!("/dev/mapper/{mapping_name}")),
-    })
+    Ok(LuksOpened { mapper_path })
+}
+
+fn validate_existing_mapper(device: &Path, mapping_name: &str, key: &DerivedSeed) -> Result<()> {
+    let status_device = cryptsetup_status_device(mapping_name)?;
+    if let Some(status_device) = status_device
+        && !paths_equivalent(&status_device, device)
+    {
+        return Err(InitError::Luks(format!(
+            "existing mapper {mapping_name} is backed by {}, expected {}",
+            status_device.display(),
+            device.display()
+        )));
+    }
+    test_passphrase_with_cryptsetup_cli(device, key)
 }
 
 fn open_with_libcryptsetup(device: &Path, mapping_name: &str, key: &DerivedSeed) -> Result<()> {
@@ -229,6 +241,60 @@ fn open_with_cryptsetup_cli(device: &Path, mapping_name: &str, key: &DerivedSeed
         ];
         run_command("cryptsetup", &args)
     })
+}
+
+fn test_passphrase_with_cryptsetup_cli(device: &Path, key: &DerivedSeed) -> Result<()> {
+    with_key_file(key, |key_file| {
+        let args = vec![
+            "--debug".to_string(),
+            "--disable-locks".to_string(),
+            "open".to_string(),
+            "--test-passphrase".to_string(),
+            path_arg(device)?,
+            "--key-file".to_string(),
+            path_arg(key_file)?,
+        ];
+        run_command("cryptsetup", &args)
+    })
+}
+
+fn cryptsetup_status_device(mapping_name: &str) -> Result<Option<PathBuf>> {
+    let output = std::process::Command::new("cryptsetup")
+        .args(["status", mapping_name])
+        .output()
+        .map_err(|e| InitError::Luks(format!("cryptsetup status {mapping_name}: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(InitError::Luks(format!(
+            "cryptsetup status {mapping_name} exited with {}: stdout={} stderr={}",
+            output.status,
+            truncate_output(stdout.trim()),
+            truncate_output(stderr.trim())
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_cryptsetup_status_device(&stdout))
+}
+
+fn parse_cryptsetup_status_device(output: &str) -> Option<PathBuf> {
+    output.lines().find_map(|line| {
+        line.trim_start()
+            .strip_prefix("device:")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn has_luks_keyslots(device: &Path) -> Result<Option<bool>> {
@@ -348,6 +414,30 @@ pub fn mount(mapper_path: &Path, mount_point: &Path) -> Result<()> {
         ))
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn parses_cryptsetup_status_device_line() {
+        let output = r#"
+/dev/mapper/cap-state is active.
+  type:    LUKS2
+  device:  /dev/vdb
+"#;
+
+        assert_eq!(
+            parse_cryptsetup_status_device(output),
+            Some(PathBuf::from("/dev/vdb"))
+        );
+    }
+
+    #[test]
+    fn cryptsetup_status_device_parser_allows_missing_device_line() {
+        assert_eq!(parse_cryptsetup_status_device("inactive\n"), None);
+    }
 }
 
 #[cfg(all(test, feature = "luks-integration"))]

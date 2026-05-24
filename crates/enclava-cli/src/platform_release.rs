@@ -224,19 +224,25 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: err.to_string(),
         }
     })?;
-    if !matches!(kbs_url.scheme(), "http" | "https") {
+    if kbs_url.scheme() != "https" {
         return Err(PlatformReleaseError::InvalidField {
             field: "trustee_kbs_url",
-            message: "scheme must be http or https".to_string(),
+            message: "scheme must be https".to_string(),
         });
     }
-    release
+    let tls_mode = release
         .tenant_caddy_tls_mode
         .parse::<enclava_engine::types::CaddyTlsMode>()
         .map_err(|err| PlatformReleaseError::InvalidField {
             field: "tenant_caddy_tls_mode",
             message: err,
         })?;
+    if tls_mode == enclava_engine::types::CaddyTlsMode::Internal {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_tls_mode",
+            message: "internal mode is only allowed for dev fixtures/local tests".to_string(),
+        });
+    }
     reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
         PlatformReleaseError::InvalidField {
             field: "tenant_caddy_acme_ca",
@@ -290,5 +296,29 @@ mod tests {
             .push_str("-tampered");
         let err = verify_envelope(tampered).unwrap_err();
         assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
+    }
+
+    #[test]
+    fn release_payload_rejects_http_kbs_url() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.trustee_kbs_url = "http://kbs.example.test:8080".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "trustee_kbs_url")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_internal_caddy_tls_mode() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.tenant_caddy_tls_mode = "internal".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_tls_mode")
+        );
     }
 }

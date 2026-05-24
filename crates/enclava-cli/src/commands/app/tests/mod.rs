@@ -205,7 +205,7 @@ fn deploy_claims_fresh_created_password_app_when_unlock_status_is_unavailable() 
 
 #[test]
 fn deploy_bootstrap_probe_attests_before_calling_claim_endpoint() {
-    let source = include_str!("app.rs");
+    let source = include_str!("../../app.rs");
     let fn_start = source
         .find("async fn wait_for_bootstrap_endpoint")
         .expect("wait_for_bootstrap_endpoint exists");
@@ -229,7 +229,7 @@ fn deploy_bootstrap_probe_attests_before_calling_claim_endpoint() {
 
 #[test]
 fn deploy_bootstrap_probe_uses_ownership_timeout_client() {
-    let source = include_str!("app.rs");
+    let source = include_str!("../../app.rs");
     let fn_start = source
         .find("async fn wait_for_bootstrap_endpoint")
         .expect("wait_for_bootstrap_endpoint exists");
@@ -247,7 +247,7 @@ fn deploy_bootstrap_probe_uses_ownership_timeout_client() {
 
 #[test]
 fn deploy_password_unlock_attests_before_reading_or_unlocking_storage() {
-    let source = include_str!("app.rs");
+    let source = include_str!("../../app.rs");
     let fn_start = source
         .find("async fn ensure_password_storage_unlocked_for_config")
         .expect("ensure_password_storage_unlocked_for_config exists");
@@ -274,7 +274,7 @@ fn deploy_password_unlock_attests_before_reading_or_unlocking_storage() {
 
 #[test]
 fn deploy_config_push_attests_before_setting_values() {
-    let source = include_str!("app.rs");
+    let source = include_str!("../../app.rs");
     let phase_start = source
         .find("// Phase 4: Push config if --set was used")
         .expect("config push phase exists");
@@ -298,7 +298,7 @@ fn deploy_config_push_attests_before_setting_values() {
 
 #[test]
 fn deploy_health_timeout_is_not_reported_as_success() {
-    let source = include_str!("app.rs");
+    let source = include_str!("../../app.rs");
     let phase_start = source
         .find("// Phase 4: Health check")
         .expect("health check phase exists");

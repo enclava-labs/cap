@@ -126,16 +126,20 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
     return out
 
 
-def validate_payload(payload: dict[str, str]) -> None:
+def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = False) -> None:
     if payload["schema_version"] != "v1":
         raise ValueError("schema_version must be v1")
     for field in ["attestation_proxy_image", "caddy_ingress_image"]:
         if not GHCR_DIGEST_RE.fullmatch(payload[field]):
             raise ValueError(f"{field} must be a ghcr.io/enclava-ai digest-pinned ref")
-    if not payload["trustee_kbs_url"].startswith(("http://", "https://")):
-        raise ValueError("trustee_kbs_url must be http or https")
+    if not payload["trustee_kbs_url"].startswith("https://"):
+        raise ValueError("trustee_kbs_url must be https")
     if payload["tenant_caddy_tls_mode"] not in ("acme", "dns01-broker", "internal"):
         raise ValueError("tenant_caddy_tls_mode must be acme, dns01-broker, or internal")
+    if payload["tenant_caddy_tls_mode"] == "internal" and not allow_dev_internal_tls:
+        raise ValueError(
+            "tenant_caddy_tls_mode=internal is only allowed with --dev-fixture-key"
+        )
     if not payload["tenant_caddy_acme_ca"].startswith(("http://", "https://")):
         raise ValueError("tenant_caddy_acme_ca must be http or https")
     hex32_bytes("signing_service_pubkey_hex", payload["signing_service_pubkey_hex"])
@@ -162,7 +166,7 @@ def signing_seed(args: argparse.Namespace) -> str:
 def generate(args: argparse.Namespace) -> str:
     base = json.loads(args.input.read_text())
     payload = env_overlay(base["payload"])
-    validate_payload(payload)
+    validate_payload(payload, allow_dev_internal_tls=args.dev_fixture_key)
 
     seed = hex32_bytes("ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX", signing_seed(args))
     private_key = Ed25519PrivateKey.from_private_bytes(seed)
@@ -187,7 +191,10 @@ def main() -> int:
     parser.add_argument(
         "--dev-fixture-key",
         action="store_true",
-        help="sign with the checked-in non-production fixture key",
+        help=(
+            "sign with the checked-in non-production fixture key; also permits "
+            "dev-only internal tenant Caddy TLS"
+        ),
     )
     args = parser.parse_args()
 

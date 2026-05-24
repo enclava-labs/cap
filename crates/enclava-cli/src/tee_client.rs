@@ -469,14 +469,11 @@ impl TeeClient {
 }
 
 fn claim_state_json_is_successful(body: &serde_json::Value) -> bool {
-    let state = body
-        .get("ownership_state")
-        .or_else(|| body.get("state"))
-        .and_then(|value| value.as_str());
-    let unlock_state = body.get("unlock_state").and_then(|value| value.as_str());
+    let ownership_state = body.get("ownership_state").and_then(|value| value.as_str());
+    let legacy_state = body.get("state").and_then(|value| value.as_str());
 
-    matches!(state, Some("claimed" | "locked" | "unlocking" | "unlocked"))
-        || matches!(unlock_state, Some("locked" | "unlocking" | "unlocked"))
+    matches!(ownership_state, Some("claimed"))
+        || (ownership_state.is_none() && matches!(legacy_state, Some("claimed")))
 }
 
 fn change_password_body(current_password: &str, new_password: &str) -> serde_json::Value {

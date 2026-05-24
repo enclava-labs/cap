@@ -273,7 +273,8 @@ fn render_route_into(config: &str, route: &SniRoute) -> String {
         backend_name,
         target,
     } = route;
-    let cleaned = remove_route_from(config, backend_name, host);
+    let cleaned =
+        remove_backend_block(&remove_route_from(config, backend_name, host), backend_name);
     let use_backend = format!("  use_backend {backend_name} if {{ req.ssl_sni -i {host} }}");
     let server = format!("  server tenant {target} check");
     let backend = format!(
@@ -347,6 +348,31 @@ fn remove_route_from(config: &str, backend_name: &str, domain: &str) -> String {
     };
 
     let mut rendered = final_lines.join("\n");
+    if config.ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered
+}
+
+fn remove_backend_block(config: &str, backend_name: &str) -> String {
+    let mut out = Vec::new();
+    let mut skipping_backend = false;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed == format!("backend {backend_name}") {
+            skipping_backend = true;
+            continue;
+        }
+        if skipping_backend {
+            if trimmed.starts_with("backend ") {
+                skipping_backend = false;
+            } else {
+                continue;
+            }
+        }
+        out.push(line);
+    }
+    let mut rendered = out.join("\n");
     if config.ends_with('\n') {
         rendered.push('\n');
     }
@@ -530,5 +556,21 @@ mod tests {
         assert!(after_first.contains("backend be_cap_x_app"));
         let after_second = remove_route_from(&after_first, "be_cap_x_app", "b.host");
         assert!(!after_second.contains("be_cap_x_app"));
+    }
+
+    #[test]
+    fn render_refreshes_shared_backend_target() {
+        let cfg = "frontend fe_443\n  bind :443\n\
+            \x20\x20use_backend be_cap_x_app if { req.ssl_sni -i app.abcd1234.enclava.dev }\n\
+            \x20\x20use_backend be_cap_x_app if { req.ssl_sni -i custom.example.com }\n\
+            \x20\x20default_backend be_reject\n\nbackend be_cap_x_app\n  server tenant 1.2.3.4:443 check\n\nbackend be_reject\n";
+        let route = SniRoute::new("custom.example.com", "be_cap_x_app", "5.6.7.8:443").unwrap();
+
+        let rendered = render_route_into(cfg, &route);
+
+        assert!(rendered.contains("app.abcd1234.enclava.dev"));
+        assert!(rendered.contains("custom.example.com"));
+        assert!(rendered.contains("server tenant 5.6.7.8:443 check"));
+        assert!(!rendered.contains("server tenant 1.2.3.4:443 check"));
     }
 }

@@ -573,6 +573,19 @@ fn enclava_tools_init_container_has_resources_for_tenant_quota() {
 }
 
 #[test]
+fn enclava_tools_init_container_prepares_group_restricted_wait_handoff() {
+    let c = build_enclava_tools_init_container();
+    let command = c.command.as_ref().unwrap().join(" ");
+    assert!(command.contains("install -d -m 02770 -o 0 -g 10001 /run/enclava/containers"));
+    let mounts = c.volume_mounts.as_ref().unwrap();
+    assert!(
+        mounts
+            .iter()
+            .any(|m| m.name == "unlock-socket" && m.mount_path == "/run/enclava")
+    );
+}
+
+#[test]
 fn enclava_init_container_mounts_both_luks_devices_and_unlock_socket() {
     let c = build_enclava_init_container(&sample_app());
     let vd = c.volume_devices.as_ref().unwrap();
