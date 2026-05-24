@@ -526,33 +526,18 @@ fn proxy_volume_mounts(legacy: bool) -> Vec<VolumeMount> {
     v
 }
 
-fn proxy_security_context(legacy: bool) -> SecurityContext {
-    if legacy {
-        SecurityContext {
-            allow_privilege_escalation: Some(false),
-            read_only_root_filesystem: Some(true),
-            run_as_non_root: Some(false),
-            run_as_user: Some(0),
-            run_as_group: Some(0),
-            capabilities: Some(Capabilities {
-                add: Some(vec!["MKNOD".to_string()]),
-                drop: Some(vec!["ALL".to_string()]),
-            }),
-            ..Default::default()
-        }
-    } else {
-        SecurityContext {
-            allow_privilege_escalation: Some(false),
-            read_only_root_filesystem: Some(true),
-            run_as_non_root: Some(true),
-            run_as_user: Some(10001),
-            run_as_group: Some(10001),
-            capabilities: Some(Capabilities {
-                add: None,
-                drop: Some(vec!["ALL".to_string()]),
-            }),
-            ..Default::default()
-        }
+fn proxy_security_context(_legacy: bool) -> SecurityContext {
+    SecurityContext {
+        allow_privilege_escalation: Some(false),
+        read_only_root_filesystem: Some(true),
+        run_as_non_root: Some(false),
+        run_as_user: Some(0),
+        run_as_group: Some(0),
+        capabilities: Some(Capabilities {
+            add: Some(vec!["MKNOD".to_string()]),
+            drop: Some(vec!["ALL".to_string()]),
+        }),
+        ..Default::default()
     }
 }
 

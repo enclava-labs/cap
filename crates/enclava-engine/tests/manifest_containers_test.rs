@@ -232,13 +232,16 @@ fn proxy_container_name_and_port() {
 }
 
 #[test]
-fn proxy_container_is_non_root() {
+fn proxy_container_can_create_sev_guest_device_for_auto_unlock() {
     let c = build_attestation_proxy_container(&sample_app());
     let sc = c.security_context.as_ref().unwrap();
-    assert_eq!(sc.run_as_non_root, Some(true));
-    assert_eq!(sc.run_as_user, Some(10001));
-    assert_eq!(sc.run_as_group, Some(10001));
+    assert_eq!(sc.run_as_non_root, Some(false));
+    assert_eq!(sc.run_as_user, Some(0));
+    assert_eq!(sc.run_as_group, Some(0));
     assert_eq!(sc.read_only_root_filesystem, Some(true));
+    let caps = sc.capabilities.as_ref().unwrap();
+    assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
+    assert_eq!(caps.add.as_deref(), Some(&["MKNOD".to_string()][..]));
 }
 
 #[test]
