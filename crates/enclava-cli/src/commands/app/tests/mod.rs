@@ -246,6 +246,36 @@ fn deploy_bootstrap_probe_uses_ownership_timeout_client() {
 }
 
 #[test]
+fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
+    let source = include_str!("../../app.rs");
+    let fn_start = source
+        .find("async fn wait_for_deploy_runtime")
+        .expect("wait_for_deploy_runtime exists");
+    let fn_end = source[fn_start..]
+        .find("async fn ensure_password_storage_unlocked_for_config")
+        .expect("ensure_password_storage_unlocked_for_config follows wait_for_deploy_runtime")
+        + fn_start;
+    let body = &source[fn_start..fn_end];
+
+    let endpoint = body
+        .find("get_unlock_endpoint")
+        .expect("runtime wait must resolve the direct TEE endpoint");
+    let tee = body
+        .find("TeeClient::new_for_ownership")
+        .expect("runtime wait must use the ownership timeout TEE client");
+    let attest = body
+        .find("attest_receipt_key")
+        .expect("runtime wait must attest the direct TEE status endpoint");
+    let status = body
+        .find("status_json")
+        .expect("runtime wait must read direct TEE status");
+    assert!(
+        endpoint < tee && tee < attest && attest < status && body.contains("tee_unlock_state"),
+        "deploy runtime wait must not depend only on API status when the direct TEE status is available"
+    );
+}
+
+#[test]
 fn deploy_password_unlock_attests_before_reading_or_unlocking_storage() {
     let source = include_str!("../../app.rs");
     let fn_start = source

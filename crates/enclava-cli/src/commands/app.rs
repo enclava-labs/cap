@@ -426,6 +426,11 @@ async fn wait_for_deploy_runtime(
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
+    let direct_tee = api
+        .get_unlock_endpoint(app_name)
+        .await
+        .ok()
+        .map(|endpoint| TeeClient::new_for_ownership(&endpoint.tee_url));
 
     loop {
         if start.elapsed() > max_wait {
@@ -458,6 +463,25 @@ async fn wait_for_deploy_runtime(
             }
             Err(_) => {
                 // Status endpoint may not be ready yet.
+            }
+        }
+
+        if let Some(tee) = direct_tee.as_ref()
+            && let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
+            && let Ok(status) = attested_tee.status_json().await
+        {
+            match tee_unlock_state(&status) {
+                "locked" => {
+                    pb.set_position(3);
+                    pb.set_message("TEE running, storage locked");
+                    return Ok(());
+                }
+                "unlocked" => {
+                    pb.set_position(3);
+                    pb.set_message("TEE running, attestation complete");
+                    return Ok(());
+                }
+                _ => {}
             }
         }
 
