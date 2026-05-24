@@ -1,11 +1,11 @@
 //! Deploy orchestrator: builds ConfidentialApp from DB state, calls engine, records result.
 
 use enclava_common::image::ImageRef;
-use enclava_common::types::{ResourceLimits, UnlockMode};
+use enclava_common::types::{ResourceLimits, UnlockMode as CommonUnlockMode};
 use enclava_engine::apply::{
     engine::ApplyEngine,
     orchestrator::{apply_all, manifest_hash},
-    types::DeployPhase,
+    types::{DeployPhase, DeployStatus as EngineDeployStatus},
     watch::watch_rollout,
 };
 use enclava_engine::manifest::generate_all_manifests;
@@ -16,7 +16,51 @@ use enclava_engine::types::{
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::{App, AppContainer, AppResources};
+use crate::models::{App, AppContainer, AppResources, AppStatus};
+
+#[derive(Debug, PartialEq, Eq)]
+struct DeploymentOutcome {
+    deploy_status: &'static str,
+    app_status: &'static str,
+    error_message: Option<String>,
+}
+
+fn classify_rollout_result(
+    result: Result<EngineDeployStatus, String>,
+    previous_app_status: AppStatus,
+    unlock_mode: crate::models::UnlockMode,
+) -> DeploymentOutcome {
+    match result {
+        Ok(status) if status.phase == DeployPhase::Running => DeploymentOutcome {
+            deploy_status: "healthy",
+            app_status: "running",
+            error_message: None,
+        },
+        Ok(status)
+            if status.phase == DeployPhase::TimedOut
+                && previous_app_status == AppStatus::Running
+                && unlock_mode == crate::models::UnlockMode::Password =>
+        {
+            DeploymentOutcome {
+                deploy_status: "healthy",
+                app_status: "running",
+                error_message: None,
+            }
+        }
+        Ok(status) => DeploymentOutcome {
+            deploy_status: "failed",
+            app_status: "failed",
+            error_message: status
+                .message
+                .or_else(|| Some(format!("{:?}", status.phase))),
+        },
+        Err(err) => DeploymentOutcome {
+            deploy_status: "failed",
+            app_status: "failed",
+            error_message: Some(err),
+        },
+    }
+}
 
 pub struct ApplyDeploymentManifestsRequest {
     pub pool: PgPool,
@@ -182,8 +226,8 @@ pub async fn build_confidential_app(
     }
 
     let unlock_mode = match app.unlock_mode {
-        crate::models::UnlockMode::Auto => UnlockMode::Auto,
-        crate::models::UnlockMode::Password => UnlockMode::Password,
+        crate::models::UnlockMode::Auto => CommonUnlockMode::Auto,
+        crate::models::UnlockMode::Password => CommonUnlockMode::Password,
     };
 
     let mut storage = StorageSpec::new(&resources.app_data_size, &resources.tls_data_size);
@@ -269,6 +313,62 @@ mod tests {
         Capabilities, DeploymentDescriptor, EnvVar, Mount, OciRuntimeSpec, Port, Resources,
         SecurityContext, Sidecars, SignerIdentity,
     };
+
+    #[test]
+    fn password_redeploy_timeout_stays_healthy_for_manual_unlock() {
+        let outcome = classify_rollout_result(
+            Ok(EngineDeployStatus::timed_out(
+                "rollout did not complete within 600s",
+            )),
+            AppStatus::Running,
+            crate::models::UnlockMode::Password,
+        );
+
+        assert_eq!(
+            outcome,
+            DeploymentOutcome {
+                deploy_status: "healthy",
+                app_status: "running",
+                error_message: None,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_redeploy_timeout_still_fails() {
+        let outcome = classify_rollout_result(
+            Ok(EngineDeployStatus::timed_out(
+                "rollout did not complete within 600s",
+            )),
+            AppStatus::Running,
+            crate::models::UnlockMode::Auto,
+        );
+
+        assert_eq!(outcome.deploy_status, "failed");
+        assert_eq!(outcome.app_status, "failed");
+        assert_eq!(
+            outcome.error_message.as_deref(),
+            Some("rollout did not complete within 600s")
+        );
+    }
+
+    #[test]
+    fn password_create_timeout_still_fails() {
+        let outcome = classify_rollout_result(
+            Ok(EngineDeployStatus::timed_out(
+                "rollout did not complete within 600s",
+            )),
+            AppStatus::Creating,
+            crate::models::UnlockMode::Password,
+        );
+
+        assert_eq!(outcome.deploy_status, "failed");
+        assert_eq!(outcome.app_status, "failed");
+        assert_eq!(
+            outcome.error_message.as_deref(),
+            Some("rollout did not complete within 600s")
+        );
+    }
 
     fn customer_app_descriptor() -> DeploymentDescriptor {
         DeploymentDescriptor {
@@ -386,7 +486,7 @@ mod tests {
                 is_primary: true,
             }],
             storage: StorageSpec::new("5Gi", "2Gi"),
-            unlock_mode: UnlockMode::Password,
+            unlock_mode: CommonUnlockMode::Password,
             domain: DomainSpec {
                 platform_domain: descriptor.app_domain.clone(),
                 tee_domain: descriptor.tee_domain.clone(),
@@ -462,7 +562,7 @@ mod tests {
                 is_primary: true,
             }],
             storage: StorageSpec::new("5Gi", "2Gi"),
-            unlock_mode: UnlockMode::Password,
+            unlock_mode: CommonUnlockMode::Password,
             domain: DomainSpec {
                 platform_domain: descriptor.app_domain.clone(),
                 tee_domain: descriptor.tee_domain.clone(),
@@ -748,32 +848,26 @@ pub async fn apply_deployment_manifests(
     set_deployment_status(&pool, deployment_id, "watching", Some(&hash), None, false).await?;
 
     tokio::spawn(async move {
-        let result = watch_rollout(&engine, &app_spec.namespace, &app_spec.name).await;
-        let (deploy_status, app_status, error_message) = match result {
-            Ok(status) if status.phase == DeployPhase::Running => ("healthy", "running", None),
-            Ok(status) => (
-                "failed",
-                "failed",
-                status
-                    .message
-                    .or_else(|| Some(format!("{:?}", status.phase))),
-            ),
-            Err(e) => ("failed", "failed", Some(e.to_string())),
-        };
+        let previous_app_status = app.status;
+        let unlock_mode = app.unlock_mode;
+        let result = watch_rollout(&engine, &app_spec.namespace, &app_spec.name)
+            .await
+            .map_err(|e| e.to_string());
+        let outcome = classify_rollout_result(result, previous_app_status, unlock_mode);
 
         if let Err(e) = record_deployment_result(
             &pool,
             deployment_id,
-            deploy_status,
+            outcome.deploy_status,
             Some(&hash),
-            error_message.as_deref(),
+            outcome.error_message.as_deref(),
         )
         .await
         {
             tracing::error!(deployment_id = %deployment_id, error = %e, "failed to record deployment result");
         }
 
-        if let Err(e) = set_app_status(&pool, app.id, app_status).await {
+        if let Err(e) = set_app_status(&pool, app.id, outcome.app_status).await {
             tracing::error!(app_id = %app.id, error = %e, "failed to update app status");
         }
     });
