@@ -598,6 +598,9 @@ pub async fn update_unlock_mode(
                 .generated_agent_policy(&signed)
                 .map_err(crate::routes::deployments::signing_error_response)?,
         );
+        crate::routes::deployments::select_local_signed_artifact_delivery(
+            &mut app_spec.attestation,
+        );
         let (_encoded, cc_init_data_hash) =
             enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
         artifacts
@@ -980,6 +983,30 @@ mod tests {
             RequestedUnlockMode::Password,
             RequestedUnlockMode::Password
         ));
+    }
+
+    #[test]
+    fn unlock_mode_hash_validation_uses_local_artifact_delivery_mode() {
+        let source = include_str!("unlock.rs");
+        let fn_start = source
+            .find("pub async fn update_unlock_mode")
+            .expect("update_unlock_mode exists");
+        let fn_end = source[fn_start..]
+            .find("let receipt_json")
+            .expect("receipt persistence follows signing validation")
+            + fn_start;
+        let body = &source[fn_start..fn_end];
+
+        let select = body
+            .find("select_local_signed_artifact_delivery")
+            .expect("unlock-mode signing validation must use local artifact delivery mode");
+        let compute = body
+            .find("compute_cc_init_data")
+            .expect("unlock-mode signing validation computes cc_init_data hash");
+        assert!(
+            select < compute,
+            "unlock-mode redeploy hash validation must match normal deploy's signed-artifact delivery mode"
+        );
     }
 
     #[test]
