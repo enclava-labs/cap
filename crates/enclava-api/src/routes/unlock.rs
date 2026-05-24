@@ -190,7 +190,7 @@ fn verify_transition_receipt(
         ("to_mode", requested.api_value().as_bytes()),
         (
             "attestation_quote_sha256",
-            attestation_quote_sha256_text.as_bytes(),
+            attestation_quote_sha256.as_slice(),
         ),
         ("timestamp", receipt.payload.timestamp.as_bytes()),
     ]);
@@ -904,6 +904,7 @@ mod tests {
             new_value_sha256: None,
             timestamp: timestamp.to_string(),
         };
+        let quote_hash_bytes = hex::decode(attestation_quote_sha256).unwrap();
         let payload_canonical_bytes = enclava_common::canonical::ce_v1_bytes(&[
             ("purpose", payload.purpose.as_bytes()),
             (
@@ -912,10 +913,7 @@ mod tests {
             ),
             ("from_mode", from_mode.as_bytes()),
             ("to_mode", to_mode.as_bytes()),
-            (
-                "attestation_quote_sha256",
-                attestation_quote_sha256.as_bytes(),
-            ),
+            ("attestation_quote_sha256", quote_hash_bytes.as_slice()),
             ("timestamp", payload.timestamp.as_bytes()),
         ]);
         let pubkey = signing_key.verifying_key().to_bytes();
