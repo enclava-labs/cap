@@ -12,7 +12,7 @@ use crate::types::ConfidentialApp;
 use enclava_common::canonical::ce_v1_hash;
 use enclava_common::types::UnlockMode;
 
-pub(crate) const LOCAL_OWNER_SEED_RESOURCE_URL: &str = "http://127.0.0.1:8006/internal/owner-seed";
+pub(crate) const LOCAL_OWNER_SEED_RESOURCE_URL: &str = "http://127.0.0.1:8081/internal/owner-seed";
 pub(crate) const LOCAL_KBS_ATTESTATION_TOKEN_URL: &str =
     "http://127.0.0.1:8006/aa/token?token_type=kbs";
 const LOCAL_WORKLOAD_ARTIFACTS_PATH: &str = "/etc/enclava-init/workload-artifacts.json";

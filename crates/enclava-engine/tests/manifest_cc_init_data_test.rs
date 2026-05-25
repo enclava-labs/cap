@@ -149,7 +149,7 @@ fn data_claims_include_required_rego_descriptor_anchors() {
     );
     assert_eq!(
         data["kbs_url"].as_str().unwrap(),
-        "http://127.0.0.1:8006/internal/owner-seed"
+        "http://127.0.0.1:8081/internal/owner-seed"
     );
     assert_eq!(
         data["kbs_attestation_token_url"].as_str().unwrap(),
