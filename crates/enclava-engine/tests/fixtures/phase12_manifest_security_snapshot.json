@@ -23,7 +23,7 @@
         "ghcr.io/test/app@sha256:abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234"
       ],
       "allowedInitDataHashes": [
-        "a243ba2bdfcfd5fa96ec9239e456db404606a508c6231ea1f754a5b8cab9cc33"
+        "078dbc897ca5d564f0bee3f7519e3a7672cea2a6ed7c49f76ba4a8d8458399bc"
       ],
       "key": "cap-test-org-test-app-test-app-tls"
     }
