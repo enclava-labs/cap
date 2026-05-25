@@ -276,6 +276,39 @@ fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
 }
 
 #[test]
+fn status_command_falls_back_to_attested_tee_status() {
+    let source = include_str!("../../app.rs");
+    let fn_start = source
+        .find("pub async fn status")
+        .expect("status function exists");
+    let fn_end = source[fn_start..]
+        .find("#[derive(Args)]\npub struct LogsArgs")
+        .expect("logs args follow status function")
+        + fn_start;
+    let body = &source[fn_start..fn_end];
+
+    let api_status = body
+        .find("api.get_status")
+        .expect("status command must read API status");
+    let endpoint = body
+        .find("get_unlock_endpoint")
+        .expect("status command must resolve the direct TEE endpoint");
+    let tee = body
+        .find("TeeClient::new_for_ownership")
+        .expect("status command must use the ownership timeout TEE client");
+    let attest = body
+        .find("attest_receipt_key")
+        .expect("status command must attest the direct TEE status endpoint");
+    let state = body
+        .find("tee_unlock_state")
+        .expect("status command must interpret the direct TEE state");
+    assert!(
+        api_status < endpoint && endpoint < tee && tee < attest && attest < state,
+        "status must fall back to attested direct TEE state when API live status lacks TEE fields"
+    );
+}
+
+#[test]
 fn password_redeploy_wait_does_not_accept_stale_unlocked_runtime() {
     let source = include_str!("../../app.rs");
     let fn_start = source

@@ -781,7 +781,33 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     let app_name = resolve_app_name(&args.app)?;
     let (api, _paths, _cli_config) = build_api_client()?;
 
-    let status = api.get_status(&app_name).await?;
+    let mut status = api.get_status(&app_name).await?;
+    if let Ok(endpoint) = api.get_unlock_endpoint(&app_name).await {
+        let tee = TeeClient::new_for_ownership(&endpoint.tee_url);
+        if let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
+            && let Ok(tee_status_json) = attested_tee.status_json().await
+        {
+            let state = tee_unlock_state(&tee_status_json);
+            match state {
+                "locked" => status.status = "locked".to_string(),
+                "unlocked" if status.status == "running" => {}
+                "unclaimed" if status.status == "failed" => status.status = "creating".to_string(),
+                _ => {}
+            }
+            if status.tee_status.is_none() {
+                status.tee_status = Some(state.to_string());
+            }
+            if status.unlock_status.is_none() {
+                status.unlock_status = Some(state.to_string());
+            }
+            if status.pod_phase.is_none() {
+                status.pod_phase = tee_status_json
+                    .get("pod_status")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+            }
+        }
+    }
 
     let status_colored = match status.status.as_str() {
         "running" => status.status.green().to_string(),
