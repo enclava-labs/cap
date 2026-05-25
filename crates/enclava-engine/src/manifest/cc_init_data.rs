@@ -114,7 +114,7 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     push_toml_string(
         &mut toml,
         "kbs_url",
-        crate::manifest::enclava_init_config::LOCAL_KATA_CDH_RESOURCE_URL,
+        crate::manifest::enclava_init_config::LOCAL_OWNER_SEED_RESOURCE_URL,
     );
     push_toml_string(&mut toml, "kbs_resource_path", &app.owner_resource_path());
     push_toml_string(

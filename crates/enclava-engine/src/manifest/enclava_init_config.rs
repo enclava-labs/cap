@@ -12,7 +12,7 @@ use crate::types::ConfidentialApp;
 use enclava_common::canonical::ce_v1_hash;
 use enclava_common::types::UnlockMode;
 
-pub(crate) const LOCAL_KATA_CDH_RESOURCE_URL: &str = "http://127.0.0.1:8006/cdh/resource";
+pub(crate) const LOCAL_OWNER_SEED_RESOURCE_URL: &str = "http://127.0.0.1:8006/internal/owner-seed";
 pub(crate) const LOCAL_KBS_ATTESTATION_TOKEN_URL: &str =
     "http://127.0.0.1:8006/aa/token?token_type=kbs";
 const LOCAL_WORKLOAD_ARTIFACTS_PATH: &str = "/etc/enclava-init/workload-artifacts.json";
@@ -78,7 +78,7 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     out.push_str(&format!("argon2-salt-hex = \"{}\"\n", argon2_salt_hex(app)));
 
     if app.unlock_mode == UnlockMode::Auto {
-        out.push_str(&format!("kbs-url = \"{LOCAL_KATA_CDH_RESOURCE_URL}\"\n"));
+        out.push_str(&format!("kbs-url = \"{LOCAL_OWNER_SEED_RESOURCE_URL}\"\n"));
         out.push_str(&format!(
             "kbs-resource-path = \"{}\"\n",
             app.owner_resource_path()
