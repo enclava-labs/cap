@@ -26,3 +26,5 @@ private-age-key*
 .vscode/
 __pycache__/
 *.py[cod]
+.aislop/
+to-delete
