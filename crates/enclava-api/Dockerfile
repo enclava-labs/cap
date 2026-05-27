@@ -54,7 +54,6 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 # Set default environment (override in deployment)
 ENV DATABASE_URL="postgresql://host:5432/db" \
     API_URL="http://localhost:3000" \
-    BTCPAY_URL="http://btcpay:23001" \
     PLATFORM_DOMAIN="enclava.dev"
 
 ENTRYPOINT ["/usr/local/bin/enclava-api"]

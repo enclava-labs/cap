@@ -3,10 +3,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::middleware::AuthContext;
-use crate::models::Tier;
+use crate::models::EntitlementClass;
 use crate::state::AppState;
-
-const BILLING_DASHBOARD_URL: &str = "https://app.enclava.dev/billing";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CurrentUserOrg {
@@ -15,10 +13,9 @@ pub struct CurrentUserOrg {
     pub display_name: Option<String>,
     pub role: String,
     pub is_personal: bool,
-    pub tier: String,
+    pub entitlement_class: String,
     pub deploy_allowed: bool,
     pub deploy_block_reason: Option<String>,
-    pub dashboard_url: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,8 +42,15 @@ pub async fn current_user(
         ))?;
 
     let api_key_org = auth.api_key.as_ref().map(|_| auth.org_id);
-    let rows: Vec<(Uuid, String, Option<String>, crate::models::Role, bool, Tier)> = sqlx::query_as(
-        "SELECT o.id, o.name, o.display_name, m.role as \"role: _\", o.is_personal, o.tier as \"tier: _\"
+    let rows: Vec<(
+        Uuid,
+        String,
+        Option<String>,
+        crate::models::Role,
+        bool,
+        EntitlementClass,
+    )> = sqlx::query_as(
+        "SELECT o.id, o.name, o.display_name, m.role as \"role: _\", o.is_personal, o.entitlement_class as \"entitlement_class: _\"
          FROM organizations o
          JOIN memberships m ON m.org_id = o.id
          WHERE m.user_id = $1
@@ -62,21 +66,18 @@ pub async fn current_user(
 
     let orgs: Vec<CurrentUserOrg> = rows
         .into_iter()
-        .map(|(id, name, display_name, role, is_personal, tier)| {
-            let (deploy_allowed, deploy_block_reason, dashboard_url) =
-                deploy_eligibility_for_tier(tier);
-            CurrentUserOrg {
+        .map(
+            |(id, name, display_name, role, is_personal, entitlement_class)| CurrentUserOrg {
                 id,
                 name,
                 display_name,
                 role: format!("{role:?}").to_lowercase(),
                 is_personal,
-                tier: format!("{tier:?}").to_lowercase(),
-                deploy_allowed,
-                deploy_block_reason,
-                dashboard_url,
-            }
-        })
+                entitlement_class: format!("{entitlement_class:?}").to_lowercase(),
+                deploy_allowed: true,
+                deploy_block_reason: None,
+            },
+        )
         .collect();
 
     let active_org = orgs
@@ -89,10 +90,9 @@ pub async fn current_user(
             display_name: None,
             role: format!("{:?}", auth.role).to_lowercase(),
             is_personal: false,
-            tier: "unknown".to_string(),
+            entitlement_class: "unknown".to_string(),
             deploy_allowed: false,
             deploy_block_reason: Some("org_membership_not_found".to_string()),
-            dashboard_url: Some(BILLING_DASHBOARD_URL.to_string()),
         });
 
     Ok(Json(CurrentUserResponse {
@@ -101,10 +101,6 @@ pub async fn current_user(
         active_org,
         orgs,
     }))
-}
-
-fn deploy_eligibility_for_tier(_tier: Tier) -> (bool, Option<String>, Option<String>) {
-    (true, None, Some(BILLING_DASHBOARD_URL.to_string()))
 }
 
 #[derive(Debug, Deserialize)]

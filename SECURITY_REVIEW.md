@@ -34,7 +34,6 @@ Production CAP must run with:
   `TRUSTEE_ATTESTATION_VERIFY_BEARER_TOKEN`
 - policy signing service URL and verification public key
 - API signing key, session HMAC key, and API-key HMAC pepper
-- non-empty `BTCPAY_WEBHOOK_SECRET`
 
 Release builds refuse the supported production path if these gates are not met
 or if debug bypass flags are enabled.
@@ -45,7 +44,6 @@ or if debug bypass flags are enabled.
 | --- | --- |
 | Static `deploy/api` overlay is minimal | The checked-in overlay is a starting point and does not encode the full production env/RBAC/secrets shape. Production overlays must extend it. |
 | KBS and signing-service availability are hard dependencies | Deploy and runtime verification depend on these services being reachable and pinned to the signed release. Operational monitoring must cover them. |
-| Billing routes are present but not the security boundary | BTCPay config must be real for billing correctness, but deploy security does not rely on successful billing calls. |
 | Development compose can start with ephemeral keys | This is intentional for local work only. Persistent environments must use durable key material. |
 
 ## Verification Commands

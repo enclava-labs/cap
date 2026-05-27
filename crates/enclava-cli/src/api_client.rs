@@ -90,9 +90,6 @@ impl ApiClient {
                     if let Some(reason) = body.reason {
                         message = format!("{message} ({reason})");
                     }
-                    if let Some(url) = body.dashboard_url {
-                        message = format!("{message}\nDashboard: {url}");
-                    }
                     if message == body.error {
                         message
                     } else {
@@ -504,53 +501,6 @@ impl ApiClient {
             .put(self.url(&format!("/apps/{app_name}/unlock/mode")))
             .headers(self.auth_headers()?)
             .json(req)
-            .send()
-            .await?;
-        let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
-    }
-
-    // --- Billing ---
-
-    pub async fn get_tiers(&self) -> Result<Vec<TierInfo>, ApiError> {
-        let resp = self
-            .http
-            .get(self.url("/billing/tiers"))
-            .headers(self.auth_headers()?)
-            .send()
-            .await?;
-        let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
-    }
-
-    pub async fn upgrade_tier(&self, tier: &str) -> Result<InvoiceResponse, ApiError> {
-        let resp = self
-            .http
-            .post(self.url("/billing/upgrade"))
-            .headers(self.auth_headers()?)
-            .json(&serde_json::json!({ "tier": tier }))
-            .send()
-            .await?;
-        let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
-    }
-
-    pub async fn get_billing_status(&self) -> Result<BillingStatus, ApiError> {
-        let resp = self
-            .http
-            .get(self.url("/billing/status"))
-            .headers(self.auth_headers()?)
-            .send()
-            .await?;
-        let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
-    }
-
-    pub async fn renew(&self) -> Result<InvoiceResponse, ApiError> {
-        let resp = self
-            .http
-            .post(self.url("/billing/renew"))
-            .headers(self.auth_headers()?)
             .send()
             .await?;
         let resp = self.check_response(resp).await?;

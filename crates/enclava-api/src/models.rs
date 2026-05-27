@@ -3,12 +3,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "tier_enum", rename_all = "lowercase")]
+#[sqlx(type_name = "entitlement_class_enum", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
-pub enum Tier {
-    Free,
-    Pro,
-    Enterprise,
+pub enum EntitlementClass {
+    Core,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -70,32 +68,12 @@ pub enum DeployStatus {
     RolledBack,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "sub_status_enum", rename_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
-pub enum SubStatus {
-    Active,
-    Expired,
-    #[serde(rename = "grace_period")]
-    #[sqlx(rename = "grace_period")]
-    GracePeriod,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "payment_status_enum", rename_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
-pub enum PaymentStatus {
-    Pending,
-    Confirmed,
-    Expired,
-}
-
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Organization {
     pub id: Uuid,
     pub name: String,
     pub display_name: Option<String>,
-    pub tier: Tier,
+    pub entitlement_class: EntitlementClass,
     pub is_personal: bool,
     pub cust_slug: String,
     pub created_at: DateTime<Utc>,
@@ -211,29 +189,6 @@ pub struct ApiKey {
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub expires_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-pub struct Subscription {
-    pub id: Uuid,
-    pub org_id: Uuid,
-    pub tier: Tier,
-    pub status: SubStatus,
-    pub current_period_start: DateTime<Utc>,
-    pub current_period_end: DateTime<Utc>,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-pub struct Payment {
-    pub id: Uuid,
-    pub org_id: Uuid,
-    pub subscription_id: Option<Uuid>,
-    pub amount_sats: i64,
-    pub btcpay_invoice_id: String,
-    pub status: PaymentStatus,
-    pub created_at: DateTime<Utc>,
-    pub confirmed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

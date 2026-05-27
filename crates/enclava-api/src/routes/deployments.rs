@@ -11,8 +11,6 @@ use crate::models::{App, Deployment};
 use crate::source_provider::{SourceProvider, validate_source_context};
 use crate::state::AppState;
 
-const BILLING_DASHBOARD_URL: &str = "https://app.enclava.dev/billing";
-
 fn deploy_blocked_response(
     status: StatusCode,
     reason: &str,
@@ -24,7 +22,6 @@ fn deploy_blocked_response(
             "error": "deploy_blocked",
             "reason": reason,
             "message": message,
-            "dashboard_url": BILLING_DASHBOARD_URL,
         })),
     )
 }
@@ -448,7 +445,7 @@ pub async fn deploy(
             )
         })?;
 
-    // Enforce tier resource limits (API-18)
+    // Enforce core entitlement resource limits.
     if let Some(ref resources) = body.resources {
         let org: crate::models::Organization =
             sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
@@ -462,11 +459,12 @@ pub async fn deploy(
                     )
                 })?;
 
-        let tier_str = format!("{:?}", org.tier).to_lowercase();
-        let limits = crate::routes::billing::tier_limits(&tier_str).ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "unknown tier"})),
-        ))?;
+        let entitlement_class = format!("{:?}", org.entitlement_class).to_lowercase();
+        let limits =
+            crate::entitlements::limits_for_entitlement_class(&entitlement_class).ok_or((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "unknown entitlement class"})),
+            ))?;
 
         if let Some(ref cpu) = resources.cpu {
             let requested: f64 = cpu.parse().unwrap_or(0.0);
@@ -474,9 +472,9 @@ pub async fn deploy(
             if requested > allowed {
                 return Err(deploy_blocked_response(
                     StatusCode::FORBIDDEN,
-                    "tier_cpu_limit",
+                    "entitlement_cpu_limit",
                     format!(
-                        "Your {tier_str} tier allows max {} CPU, requested {cpu}. Upgrade in the Enclava dashboard or lower the requested CPU.",
+                        "Org entitlement class {entitlement_class} allows max {} CPU, requested {cpu}. Increase the entitlement class or lower the requested CPU.",
                         limits.max_cpu
                     ),
                 ));
@@ -493,15 +491,15 @@ pub async fn deploy(
             let allowed = parse_memory_gi(&limits.max_memory).map_err(|_| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "invalid tier memory limit"})),
+                    Json(serde_json::json!({"error": "invalid entitlement memory limit"})),
                 )
             })?;
             if requested > allowed {
                 return Err(deploy_blocked_response(
                     StatusCode::FORBIDDEN,
-                    "tier_memory_limit",
+                    "entitlement_memory_limit",
                     format!(
-                        "Your {tier_str} tier allows max {} memory, requested {memory}. Upgrade in the Enclava dashboard or lower the requested memory.",
+                        "Org entitlement class {entitlement_class} allows max {} memory, requested {memory}. Increase the entitlement class or lower the requested memory.",
                         limits.max_memory
                     ),
                 ));

@@ -300,43 +300,43 @@ pub async fn verify_challenge(
         )
     })?;
 
+    if Utc::now() > expires_at {
+        let e = DomainError::Expired;
+        return Err((
+            e.status(),
+            Json(serde_json::json!({"error": e.to_string()})),
+        ));
+    }
+
+    let txt_name = format!("{}{}", CHALLENGE_PREFIX, domain);
+    let expected = format!("enclava-domain-verification={token}");
+
+    let live = lookup_txt(&txt_name).await.map_err(|e| {
+        let de = DomainError::Lookup(e.to_string());
+        (
+            de.status(),
+            Json(serde_json::json!({"error": de.to_string()})),
+        )
+    })?;
+
+    let mut matched = false;
+    for value in &live {
+        if value.as_bytes().ct_eq(expected.as_bytes()).into() {
+            matched = true;
+            break;
+        }
+    }
+    if !matched {
+        let e = DomainError::MismatchedToken(txt_name);
+        return Err((
+            e.status(),
+            Json(serde_json::json!({"error": e.to_string()})),
+        ));
+    }
+
     let verified_at = if let Some(verified_at) = verified_at {
         verified_at
     } else {
-        if Utc::now() > expires_at {
-            let e = DomainError::Expired;
-            return Err((
-                e.status(),
-                Json(serde_json::json!({"error": e.to_string()})),
-            ));
-        }
-
-        let txt_name = format!("{}{}", CHALLENGE_PREFIX, domain);
-        let expected = format!("enclava-domain-verification={token}");
-
-        let live = lookup_txt(&txt_name).await.map_err(|e| {
-            let de = DomainError::Lookup(e.to_string());
-            (
-                de.status(),
-                Json(serde_json::json!({"error": de.to_string()})),
-            )
-        })?;
-
-        let mut matched = false;
-        for value in &live {
-            if value.as_bytes().ct_eq(expected.as_bytes()).into() {
-                matched = true;
-                break;
-            }
-        }
-        if !matched {
-            let e = DomainError::MismatchedToken(txt_name);
-            return Err((
-                e.status(),
-                Json(serde_json::json!({"error": e.to_string()})),
-            ));
-        }
-
         let verified_at = Utc::now();
         sqlx::query("UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2")
             .bind(verified_at)

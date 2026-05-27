@@ -20,8 +20,6 @@ const DEBUG_ONLY_FLAGS: &[&str] = &[
     "LEGACY_BOOTSTRAP_SCRIPT",
 ];
 
-const ALWAYS_REQUIRED: &[&str] = &["BTCPAY_WEBHOOK_SECRET"];
-
 fn flag_is_truthy(value: &str) -> bool {
     matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES")
 }
@@ -86,13 +84,6 @@ fn enforce_with(
         }
     }
 
-    for required in ALWAYS_REQUIRED {
-        match lookup(required) {
-            Some(value) if !value.trim().is_empty() => {}
-            _ => return Err(EnvGateError::MissingRequired(required)),
-        }
-    }
-
     Ok(())
 }
 
@@ -103,7 +94,6 @@ mod tests {
 
     fn ok_required() -> HashMap<&'static str, &'static str> {
         let mut m = HashMap::new();
-        m.insert("BTCPAY_WEBHOOK_SECRET", "secret");
         m.insert("API_KEY_HMAC_PEPPER", "01234567890123456789012345678901");
         m.insert("TRUSTEE_POLICY_READ_AVAILABLE", "true");
         m
@@ -163,12 +153,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_btcpay_secret_rejected_in_debug() {
+    fn debug_core_allows_no_hosted_secret() {
         let env = HashMap::new();
-        assert!(matches!(
-            run(env, true).unwrap_err(),
-            EnvGateError::MissingRequired("BTCPAY_WEBHOOK_SECRET")
-        ));
+        run(env, true).expect("core debug mode should not require hosted-service secrets");
     }
 
     #[test]

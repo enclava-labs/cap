@@ -8,7 +8,6 @@ pub mod key;
 pub mod org;
 pub mod ownership;
 pub mod prepare;
-pub mod tier;
 
 use clap::{Parser, Subcommand};
 
@@ -69,9 +68,6 @@ pub enum Command {
     /// Manage the per-app cosign Fulcio signer identity
     #[command(subcommand)]
     Signer(app::SignerCommand),
-    /// Manage subscription tier and payments
-    #[command(subcommand)]
-    Tier(tier::TierCommand),
     /// Manage organizations
     #[command(subcommand)]
     Org(org::OrgCommand),
@@ -105,7 +101,6 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Rollback(args) => app::rollback(args).await,
         Command::Destroy(args) => app::destroy(args).await,
         Command::Signer(cmd) => app::signer(cmd).await,
-        Command::Tier(cmd) => tier::run(cmd).await,
         Command::Org(cmd) => org::run(cmd).await,
         Command::Key(cmd) => key::run(cmd).await,
         Command::Descriptor(cmd) => descriptor::run(cmd).await,

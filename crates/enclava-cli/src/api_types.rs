@@ -79,13 +79,11 @@ pub struct CurrentUserOrg {
     pub role: String,
     pub is_personal: bool,
     #[serde(default)]
-    pub tier: Option<String>,
+    pub entitlement_class: Option<String>,
     #[serde(default)]
     pub deploy_allowed: Option<bool>,
     #[serde(default)]
     pub deploy_block_reason: Option<String>,
-    #[serde(default)]
-    pub dashboard_url: Option<String>,
 }
 
 // --- Apps ---
@@ -397,36 +395,6 @@ pub struct DeploymentEntry {
     pub completed_at: Option<String>,
 }
 
-// --- Billing ---
-
-#[derive(Debug, Deserialize)]
-pub struct TierInfo {
-    pub name: String,
-    pub max_apps: u32,
-    pub max_cpu: String,
-    pub max_memory: String,
-    pub max_storage: String,
-    pub price_sats: u64,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct InvoiceResponse {
-    pub invoice_id: String,
-    pub payment_url: String,
-    pub amount_sats: u64,
-    pub lightning_invoice: Option<String>,
-    pub expires_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BillingStatus {
-    pub tier: String,
-    pub status: String,
-    pub period_end: Option<String>,
-    #[serde(default)]
-    pub grace_period_ends: Option<String>,
-}
-
 // --- Orgs ---
 
 #[derive(Debug, Serialize)]
@@ -440,7 +408,7 @@ pub struct OrgResponse {
     pub id: Option<String>,
     pub name: String,
     pub display_name: Option<String>,
-    pub tier: String,
+    pub entitlement_class: String,
     pub is_personal: bool,
 }
 
@@ -516,7 +484,6 @@ pub struct ApiErrorBody {
     pub message: Option<String>,
     pub detail: Option<String>,
     pub reason: Option<String>,
-    pub dashboard_url: Option<String>,
 }
 
 #[cfg(test)]

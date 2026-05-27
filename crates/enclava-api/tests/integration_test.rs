@@ -1,12 +1,14 @@
 //! Integration tests for API routes using testcontainers.
 
 use axum::http::StatusCode;
+use chrono::{Duration, Utc};
 use ed25519_dalek::SigningKey;
 use enclava_api::{state::AppState, test_router};
 use enclava_common::image::ImageRef;
 use enclava_engine::types::AttestationConfig;
 use rand::rngs::OsRng;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -43,8 +45,7 @@ async fn setup_test_state() -> (AppState, PgPool) {
         signing_key,
         hmac_key,
         api_url: "http://localhost:3000".to_string(),
-        btcpay_url: "http://localhost:23001".to_string(),
-        btcpay_api_key: "test-key".to_string(),
+        dashboard_url: Some("https://console.example.test".to_string()),
         platform_domain: "enclava.dev".to_string(),
         tee_domain_suffix: "tee.enclava.dev".to_string(),
         http_client: reqwest::Client::new(),
@@ -55,7 +56,6 @@ async fn setup_test_state() -> (AppState, PgPool) {
         .unwrap(),
         trustee_http_client: reqwest::Client::new(),
         tee_http_client: reqwest::Client::new(),
-        btcpay_webhook_secret: "test-secret".to_string(),
         attestation: Some(AttestationConfig {
             proxy_image: ImageRef::parse(
                 "ghcr.io/enclava-ai/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
@@ -152,6 +152,10 @@ async fn persisted_app_source(pool: &PgPool, org_id: Uuid, app_name: &str) -> (S
     .expect("persisted app source")
 }
 
+fn device_code_hash(code: &str) -> Vec<u8> {
+    Sha256::digest(code.as_bytes()).to_vec()
+}
+
 #[tokio::test]
 async fn health_endpoint_returns_ok() {
     let (state, _pool) = setup_test_state().await;
@@ -243,14 +247,101 @@ async fn device_login_approval_issues_cli_session_and_users_me_works() {
     me.assert_status_ok();
     let me_body: Value = me.json();
     assert_eq!(me_body["active_org"]["id"], org_id.to_string());
-    assert_eq!(me_body["active_org"]["tier"], "free");
+    assert_eq!(me_body["active_org"]["entitlement_class"], "core");
     assert_eq!(me_body["active_org"]["deploy_allowed"], true);
     assert_eq!(me_body["active_org"]["deploy_block_reason"], Value::Null);
-    assert_eq!(
-        me_body["active_org"]["dashboard_url"],
-        "https://app.enclava.dev/billing"
-    );
     assert_eq!(me_body["orgs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn device_login_approved_code_is_single_use_and_still_expires() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let (session_token, org_id) = signup_owner(&server, "device-login-reuse").await;
+
+    let start = server
+        .post("/auth/device/start")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({}))
+        .await;
+    start.assert_status_ok();
+    let start_body: Value = start.json();
+    let device_code = start_body["device_code"].as_str().expect("device_code");
+    let user_code = start_body["user_code"].as_str().expect("user_code");
+
+    let approve = server
+        .post("/auth/device/approve")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "user_code": user_code,
+            "org_id": org_id,
+        }))
+        .await;
+    approve.assert_status_ok();
+
+    let first_poll = server
+        .post("/auth/device/poll")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({ "device_code": device_code }))
+        .await;
+    first_poll.assert_status_ok();
+    let first_body: Value = first_poll.json();
+    assert_eq!(first_body["status"], "approved");
+    assert!(first_body["auth"]["token"].is_string());
+
+    let second_poll = server
+        .post("/auth/device/poll")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({ "device_code": device_code }))
+        .await;
+    second_poll.assert_status_ok();
+    let second_body: Value = second_poll.json();
+    assert_eq!(second_body["status"], "expired");
+    assert_eq!(second_body["auth"], Value::Null);
+
+    let expired_start = server
+        .post("/auth/device/start")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({}))
+        .await;
+    expired_start.assert_status_ok();
+    let expired_start_body: Value = expired_start.json();
+    let expired_device_code = expired_start_body["device_code"]
+        .as_str()
+        .expect("expired device_code");
+    let expired_user_code = expired_start_body["user_code"]
+        .as_str()
+        .expect("expired user_code");
+
+    let approve_expired = server
+        .post("/auth/device/approve")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "user_code": expired_user_code,
+            "org_id": org_id,
+        }))
+        .await;
+    approve_expired.assert_status_ok();
+
+    sqlx::query("UPDATE device_login_sessions SET expires_at = $1 WHERE device_code_hash = $2")
+        .bind(Utc::now() - Duration::minutes(1))
+        .bind(device_code_hash(expired_device_code))
+        .execute(&pool)
+        .await
+        .expect("expire approved device code");
+
+    let expired_poll = server
+        .post("/auth/device/poll")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({ "device_code": expired_device_code }))
+        .await;
+    expired_poll.assert_status_ok();
+    let expired_body: Value = expired_poll.json();
+    assert_eq!(expired_body["status"], "expired");
+    assert_eq!(expired_body["auth"], Value::Null);
 }
 
 #[tokio::test]
@@ -290,6 +381,72 @@ async fn app_logs_returns_explicit_unavailable_until_log_proxy_exists() {
             .contains("Live log streaming is not connected yet")
     );
     assert_eq!(body["status"], "creating");
+}
+
+#[tokio::test]
+async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("domain-{}", &suffix[..12]);
+    let domain = format!("stale-{}.example.com", &suffix[..12]);
+    let (session_token, _org_id) = signup_owner(&server, "domain-replay").await;
+
+    let create = server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await;
+    create.assert_status(StatusCode::CREATED);
+    let create_body: Value = create.json();
+    let app_id = Uuid::parse_str(create_body["id"].as_str().expect("app id")).unwrap();
+
+    sqlx::query(
+        "INSERT INTO custom_domain_challenges (
+             id, app_id, domain, challenge_token, expires_at, verified_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(app_id)
+    .bind(&domain)
+    .bind("historically-valid-token")
+    .bind(Utc::now() - Duration::hours(1))
+    .bind(Utc::now() - Duration::hours(2))
+    .execute(&pool)
+    .await
+    .expect("insert stale verified domain challenge");
+
+    let verify = server
+        .post(&format!("/apps/{app_name}/domains/{domain}/verify"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    verify.assert_status(StatusCode::CONFLICT);
+    let body: Value = verify.json();
+    assert_eq!(body["error"], "challenge has expired");
+
+    let custom_domain: Option<String> =
+        sqlx::query_scalar("SELECT custom_domain FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app custom domain");
+    assert_eq!(custom_domain, None);
+
+    let tracked_dns: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM dns_records WHERE app_id = $1 AND hostname = $2")
+            .bind(app_id)
+            .bind(&domain)
+            .fetch_optional(&pool)
+            .await
+            .expect("load tracked custom DNS row");
+    assert_eq!(tracked_dns, None);
 }
 
 #[tokio::test]

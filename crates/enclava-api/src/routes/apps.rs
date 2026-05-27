@@ -21,8 +21,6 @@ use crate::source_provider::{
 };
 use crate::state::AppState;
 
-const BILLING_DASHBOARD_URL: &str = "https://app.enclava.dev/billing";
-
 /// Helper function for consistent internal server error responses
 fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
     (
@@ -38,7 +36,6 @@ fn deploy_blocked_response(reason: &str, message: String) -> (StatusCode, Json<s
             "error": "deploy_blocked",
             "reason": reason,
             "message": message,
-            "dashboard_url": BILLING_DASHBOARD_URL,
         })),
     )
 }
@@ -359,7 +356,7 @@ pub async fn create_app(
         )
     })?;
 
-    // Enforce tier app limit (API-18)
+    // Enforce core entitlement app limit.
     let org: crate::models::Organization =
         sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
             .bind(auth.org_id)
@@ -367,10 +364,10 @@ pub async fn create_app(
             .await
             .map_err(|_| internal_server_error())?;
 
-    let tier_str = format!("{:?}", org.tier).to_lowercase();
-    let limits = crate::routes::billing::tier_limits(&tier_str).ok_or((
+    let entitlement_class = format!("{:?}", org.entitlement_class).to_lowercase();
+    let limits = crate::entitlements::limits_for_entitlement_class(&entitlement_class).ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"error": "unknown tier"})),
+        Json(serde_json::json!({"error": "unknown entitlement class"})),
     ))?;
 
     let app_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps WHERE org_id = $1")
@@ -386,9 +383,9 @@ pub async fn create_app(
 
     if app_count >= limits.max_apps as i64 {
         return Err(deploy_blocked_response(
-            "tier_app_limit",
+            "entitlement_app_limit",
             format!(
-                "Your {tier_str} tier allows max {} apps, you have {app_count}. Upgrade in the Enclava dashboard or delete an app.",
+                "Org entitlement class {entitlement_class} allows max {} apps, you have {app_count}. Increase the entitlement class or delete an app.",
                 limits.max_apps
             ),
         ));

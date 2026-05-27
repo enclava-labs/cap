@@ -23,9 +23,6 @@ services:
       DATABASE_URL: postgresql://enclava:enclava@postgres:5432/enclava
       API_URL: http://localhost:3000
       PLATFORM_DOMAIN: enclava.local
-      BTCPAY_URL: http://localhost:23001
-      BTCPAY_API_KEY: test-key
-      BTCPAY_WEBHOOK_SECRET: test-secret
       ALLOW_EPHEMERAL_KEYS: "1"
     ports:
       - "3000:3000"

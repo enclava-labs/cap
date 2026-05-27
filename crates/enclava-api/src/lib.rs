@@ -1,12 +1,12 @@
 pub mod acme;
 pub mod auth;
-pub mod billing;
 pub mod clients;
 pub mod cosign;
 pub mod db;
 pub mod deploy;
 pub mod dns;
 pub mod edge;
+pub mod entitlements;
 pub mod env_gates;
 pub mod kbs;
 pub mod models;
@@ -70,7 +70,6 @@ fn build_api_routes(
         .merge(status_routes())
         .merge(unlock_routes(enable_rate_limits, key_extractor))
         .merge(workload_routes())
-        .merge(billing_routes())
 }
 
 fn auth_routes() -> Router<AppState> {
@@ -296,30 +295,6 @@ fn workload_routes() -> Router<AppState> {
         )
 }
 
-fn billing_routes() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/billing/tiers",
-            axum::routing::get(routes::billing::list_tiers),
-        )
-        .route(
-            "/billing/upgrade",
-            axum::routing::post(routes::billing::upgrade_tier),
-        )
-        .route(
-            "/billing/status",
-            axum::routing::get(routes::billing::subscription_status),
-        )
-        .route(
-            "/billing/renew",
-            axum::routing::post(routes::billing::renew_subscription),
-        )
-        .route(
-            "/billing/webhook",
-            axum::routing::post(routes::billing::btcpay_webhook),
-        )
-}
-
 fn health_routes() -> Router<AppState> {
     Router::new().route("/health", axum::routing::get(|| async { "ok" }))
 }
@@ -421,8 +396,7 @@ pub(crate) mod test_support {
             signing_key: Arc::new(SigningKey::generate(&mut OsRng)),
             hmac_key: Arc::new([7u8; 32]),
             api_url: "https://api.example.test".to_string(),
-            btcpay_url: "https://btcpay.example.test".to_string(),
-            btcpay_api_key: "test-key".to_string(),
+            dashboard_url: Some("https://app.example.test".to_string()),
             platform_domain: "enclava.dev".to_string(),
             tee_domain_suffix: "tee.enclava.dev".to_string(),
             http_client: reqwest::Client::new(),
@@ -433,10 +407,6 @@ pub(crate) mod test_support {
             .unwrap(),
             trustee_http_client: reqwest::Client::new(),
             tee_http_client: reqwest::Client::new(),
-            btcpay_webhook_secret: String::from_utf8(vec![
-                116, 101, 115, 116, 45, 119, 101, 98, 104, 111, 111, 107,
-            ])
-            .expect("test webhook fixture is valid UTF-8"),
             attestation: Some(AttestationConfig {
                 proxy_image: ImageRef::parse(
                     "ghcr.io/enclava-ai/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",

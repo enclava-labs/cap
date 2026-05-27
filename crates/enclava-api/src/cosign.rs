@@ -244,8 +244,9 @@ pub async fn verify_image(
         )));
     }
 
+    let signature_lookup_image = signature_lookup_source_image(&image, image_digest);
     let trusted_layers = cosign_client
-        .trusted_signature_layers(&auth, &image)
+        .trusted_signature_layers(&auth, &signature_lookup_image)
         .await
         .map_err(|e| {
             let msg = e.to_string();
@@ -284,6 +285,14 @@ pub async fn verify_image(
         verified_at: Utc::now(),
         rekor_log_index,
     })
+}
+
+fn signature_lookup_source_image(image: &OciReference, image_digest: &str) -> OciReference {
+    OciReference::with_digest(
+        image.registry().to_string(),
+        image.repository().to_string(),
+        image_digest.to_string(),
+    )
 }
 
 fn extract_signer_metadata(
@@ -612,6 +621,21 @@ mod tests {
                     .to_string(),
             fulcio_issuer: "https://token.actions.githubusercontent.com".to_string(),
         }
+    }
+
+    #[test]
+    fn signature_lookup_source_is_digest_pinned_for_mutable_tags() {
+        let image: OciReference = "registry.example.test/team/app:latest".parse().unwrap();
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let lookup = signature_lookup_source_image(&image, digest);
+
+        assert_eq!(
+            lookup.whole(),
+            format!("registry.example.test/team/app@{digest}")
+        );
+        assert_eq!(lookup.digest(), Some(digest));
+        assert_eq!(lookup.tag(), None);
     }
 
     #[test]

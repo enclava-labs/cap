@@ -60,21 +60,6 @@ spec:
             secretKeyRef:
               name: api-secrets
               key: tenant-dns-target
-        - name: BTCPAY_URL
-          valueFrom:
-            secretKeyRef:
-              name: api-secrets
-              key: btcpay-url
-        - name: BTCPAY_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: api-secrets
-              key: btcpay-api-key
-        - name: BTCPAY_WEBHOOK_SECRET
-          valueFrom:
-            secretKeyRef:
-              name: api-secrets
-              key: btcpay-webhook-secret
         resources:
           requests:
             cpu: 100m

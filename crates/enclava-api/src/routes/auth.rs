@@ -257,7 +257,10 @@ pub async fn start_device_login(
     let device_code = random_device_code();
     let user_code = random_user_code();
     let normalized_user_code = normalize_user_code(&user_code);
-    let verification_uri = format!("{}/cli/login", state.api_url.trim_end_matches('/'));
+    let verification_uri = format!(
+        "{}/cli/login",
+        state.device_login_base_url().trim_end_matches('/')
+    );
     let verification_uri_complete = format!("{verification_uri}?user_code={user_code}");
     let expires_at = Utc::now() + Duration::minutes(DEVICE_LOGIN_TTL_MINUTES);
     let id = Uuid::new_v4();
@@ -323,11 +326,11 @@ pub async fn poll_device_login(
         ));
     };
 
-    if Utc::now() >= expires_at && status == "pending" {
+    if Utc::now() >= expires_at && (status == "pending" || status == "approved") {
         let _ = sqlx::query(
             "UPDATE device_login_sessions
              SET status = 'expired'
-             WHERE device_code_hash = $1 AND status = 'pending'",
+             WHERE device_code_hash = $1 AND status IN ('pending', 'approved')",
         )
         .bind(&hash)
         .execute(&state.db)
@@ -373,6 +376,33 @@ pub async fn poll_device_login(
     }
 
     if status == "approved" {
+        let redeemed = sqlx::query(
+            "UPDATE device_login_sessions
+             SET status = 'expired',
+                 last_polled_at = now()
+             WHERE device_code_hash = $1
+               AND status = 'approved'
+               AND expires_at > now()",
+        )
+        .bind(&hash)
+        .execute(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
+        if redeemed.rows_affected() == 0 {
+            return Ok(Json(DeviceLoginPollResponse {
+                status: "expired".to_string(),
+                interval: DEVICE_LOGIN_POLL_INTERVAL_SECONDS,
+                expires_in: 0,
+                error: Some("device login expired".to_string()),
+                auth: None,
+            }));
+        }
+
         let user_id = approved_user_id.ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "approved device login is missing user"})),

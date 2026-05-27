@@ -593,10 +593,7 @@ async fn main() {
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
-    let btcpay_url =
-        std::env::var("BTCPAY_URL").unwrap_or_else(|_| "http://localhost:23001".to_string());
-    let btcpay_api_key = std::env::var("BTCPAY_API_KEY").unwrap_or_default();
-    let btcpay_webhook_secret = std::env::var("BTCPAY_WEBHOOK_SECRET").unwrap_or_default();
+    let dashboard_url = env_nonempty("ENCLAVA_DASHBOARD_URL");
     let platform_domain =
         std::env::var("PLATFORM_DOMAIN").unwrap_or_else(|_| "enclava.dev".to_string());
     let tee_domain_suffix =
@@ -680,15 +677,13 @@ async fn main() {
         signing_key: Arc::new(signing_key),
         hmac_key: Arc::new(hmac_key),
         api_url,
-        btcpay_url,
-        btcpay_api_key,
+        dashboard_url,
         platform_domain,
         tee_domain_suffix,
         http_client,
         registry_client,
         trustee_http_client,
         tee_http_client,
-        btcpay_webhook_secret,
         attestation,
         dns,
         acme,

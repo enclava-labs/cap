@@ -26,7 +26,7 @@ pub struct OrgResponse {
     pub id: Uuid,
     pub name: String,
     pub display_name: Option<String>,
-    pub tier: String,
+    pub entitlement_class: String,
     pub is_personal: bool,
 }
 
@@ -36,7 +36,7 @@ impl From<Organization> for OrgResponse {
             id: o.id,
             name: o.name,
             display_name: o.display_name,
-            tier: format!("{:?}", o.tier).to_lowercase(),
+            entitlement_class: format!("{:?}", o.entitlement_class).to_lowercase(),
             is_personal: o.is_personal,
         }
     }

@@ -94,7 +94,7 @@ pub async fn run(cmd: OrgCommand) -> Result<(), Box<dyn std::error::Error>> {
             let resp = api.create_org(&req).await?;
 
             println!("Organization '{}' created.", resp.name);
-            println!("Tier: {}", resp.tier);
+            println!("Entitlement: {}", resp.entitlement_class);
 
             // Switch to the new org
             cli_config.org = Some(resp.name.clone());

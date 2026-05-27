@@ -12,9 +12,8 @@ curl http://localhost:3000/health
 ```
 
 The compose file is intentionally development-only. It uses a local PostgreSQL
-container, placeholder BTCPay values, and `ALLOW_EPHEMERAL_KEYS=1`. Do not use
-that mode for any persistent environment because restarts rotate API signing and
-session keys.
+container and `ALLOW_EPHEMERAL_KEYS=1`. Do not use that mode for any persistent
+environment because restarts rotate API signing and session keys.
 
 ## Production Shape
 
@@ -41,7 +40,6 @@ Required for every persistent API process:
 | Variable | Purpose |
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string. Migrations run on startup. |
-| `BTCPAY_WEBHOOK_SECRET` | Required by startup gates even if billing routes are not exercised. |
 | `API_SIGNING_KEY_PATH` or `API_SIGNING_KEY_PKCS8_BASE64` | Ed25519 PKCS#8 private key used for config JWTs and deploy metadata. |
 | `SESSION_HMAC_KEY_PATH` or `SESSION_HMAC_KEY_BASE64` | 32-byte HMAC key used for session JWTs and signer rotation tokens. |
 
@@ -84,10 +82,9 @@ Required only when the matching feature is enabled:
 | --- | --- | --- |
 | `BIND_ADDR` | `0.0.0.0:3000` | API listen address. |
 | `API_URL` | `http://localhost:3000` | Public API base URL embedded in deploy metadata. |
+| `ENCLAVA_DASHBOARD_URL` | unset | Optional hosted console base URL used for CLI device-login approval. |
 | `PLATFORM_DOMAIN` | `enclava.dev` | Public app hostname suffix. |
 | `TEE_DOMAIN_SUFFIX` | `tee.<PLATFORM_DOMAIN>` | TEE/attestation hostname suffix. |
-| `BTCPAY_URL` | `http://localhost:23001` | BTCPay Greenfield API base URL. |
-| `BTCPAY_API_KEY` | empty | Billing API key. Billing calls need a real value. |
 | `TENANT_CADDY_TLS_MODE` | `acme` | Tenant TLS mode: `acme`, `dns01-broker`, or `internal`. |
 | `TENANT_CADDY_ACME_CA` | Let's Encrypt production directory | ACME directory URL used by tenant Caddy. |
 | `CLOUDFLARE_ZONE_NAME` | `enclava.dev` | Managed DNS zone name. |

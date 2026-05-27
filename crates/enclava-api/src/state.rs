@@ -19,10 +19,9 @@ pub struct AppState {
     pub hmac_key: Arc<[u8; 32]>,
     /// Base URL of this API server (for config metadata sync callbacks).
     pub api_url: String,
-    /// BTCPay Server base URL.
-    pub btcpay_url: String,
-    /// BTCPay Server API key.
-    pub btcpay_api_key: String,
+    /// Optional hosted console base URL used for browser approval.
+    /// Self-hosted core deployments can leave this unset.
+    pub dashboard_url: Option<String>,
     /// Platform domain suffix (e.g., "enclava.dev").
     pub platform_domain: String,
     /// TEE domain suffix (e.g., "tee.enclava.dev"). Per D1 the TEE-facing
@@ -37,8 +36,6 @@ pub struct AppState {
     /// HTTP client for tenant TEE endpoints. Test environments may use staging
     /// ACME certificates that are not trusted by the public WebPKI roots.
     pub tee_http_client: reqwest::Client,
-    /// BTCPay webhook HMAC secret for signature verification.
-    pub btcpay_webhook_secret: String,
     /// Sidecar/runtime settings used when generating Kubernetes manifests.
     pub attestation: Option<AttestationConfig>,
     /// Cloudflare DNS settings for CAP-managed tenant host records.
@@ -65,4 +62,14 @@ pub struct AppState {
     /// deployment starts a Kata VM and attaches Longhorn volumes; bursts can
     /// overwhelm a single worker node before Kubernetes has useful feedback.
     pub deployment_apply_permits: Arc<Semaphore>,
+}
+
+impl AppState {
+    pub fn dashboard_url(&self) -> Option<&str> {
+        self.dashboard_url.as_deref()
+    }
+
+    pub fn device_login_base_url(&self) -> &str {
+        self.dashboard_url().unwrap_or(&self.api_url)
+    }
 }

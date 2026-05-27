@@ -56,26 +56,21 @@ fn current_user_accepts_deploy_eligibility_fields() {
             "display_name": null,
             "role": "owner",
             "is_personal": true,
-            "tier": "free",
+            "entitlement_class": "core",
             "deploy_allowed": true,
-            "deploy_block_reason": null,
-            "dashboard_url": "https://app.enclava.dev/billing"
+            "deploy_block_reason": null
         },
         "orgs": []
     });
     let resp: CurrentUserResponse = serde_json::from_value(body).unwrap();
-    assert_eq!(resp.active_org.tier.as_deref(), Some("free"));
+    assert_eq!(resp.active_org.entitlement_class.as_deref(), Some("core"));
     assert_eq!(resp.active_org.deploy_allowed, Some(true));
-    assert_eq!(
-        resp.active_org.dashboard_url.as_deref(),
-        Some("https://app.enclava.dev/billing")
-    );
 }
 
 #[test]
 fn list_orgs_deserializes_bare_array() {
     let body = serde_json::json!([
-        { "id": "3bd1e7b1", "name": "testco", "display_name": null, "tier": "free", "is_personal": false }
+        { "id": "3bd1e7b1", "name": "testco", "display_name": null, "entitlement_class": "core", "is_personal": false }
     ]);
     let orgs: Vec<OrgResponse> = serde_json::from_value(body).unwrap();
     assert_eq!(orgs.len(), 1);
@@ -191,18 +186,4 @@ fn deployment_entry_accepts_legacy_deployment_id_field() {
     let entry: DeploymentEntry = serde_json::from_value(body).unwrap();
 
     assert_eq!(entry.id, "90dc3149-02e2-4d44-8398-67637abbcbbe");
-}
-
-#[test]
-fn billing_status_uses_period_end() {
-    // Real server response: {"tier":"free","status":"active","period_end":null,"grace_period_ends":null}
-    let body = serde_json::json!({
-        "tier": "free",
-        "status": "active",
-        "period_end": null,
-        "grace_period_ends": null
-    });
-    let status: BillingStatus = serde_json::from_value(body).unwrap();
-    assert_eq!(status.tier, "free");
-    assert!(status.period_end.is_none());
 }

@@ -1,14 +1,14 @@
 -- Custom enum types
-CREATE TYPE tier_enum AS ENUM ('free', 'pro', 'enterprise');
+CREATE TYPE entitlement_class_enum AS ENUM ('core');
 CREATE TYPE provider_enum AS ENUM ('email', 'nostr');
 CREATE TYPE role_enum AS ENUM ('owner', 'admin', 'member');
 
--- Organizations (billing/tenant entity)
+-- Organizations (tenant entity)
 CREATE TABLE organizations (
     id          uuid PRIMARY KEY,
     name        text NOT NULL UNIQUE,
     display_name text,
-    tier        tier_enum NOT NULL DEFAULT 'free',
+    entitlement_class entitlement_class_enum NOT NULL DEFAULT 'core',
     is_personal boolean NOT NULL DEFAULT false,
     created_at  timestamptz NOT NULL DEFAULT now(),
     updated_at  timestamptz NOT NULL DEFAULT now()
