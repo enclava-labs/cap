@@ -48,7 +48,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/enclava-ai/enclava-api
+          images: ghcr.io/enclava-labs/enclava-api
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -75,7 +75,7 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           mkdir -p dist
-          image_ref="ghcr.io/enclava-ai/enclava-api@${{ steps.build.outputs.digest }}"
+          image_ref="ghcr.io/enclava-labs/enclava-api@${{ steps.build.outputs.digest }}"
           scripts/render-api-release-manifest.sh "${image_ref}" dist/enclava-api-deploy.yaml
           printf '%s\n' "${image_ref}" > dist/enclava-api-image.txt
 
