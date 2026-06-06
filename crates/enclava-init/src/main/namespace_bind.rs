@@ -1,4 +1,7 @@
 use super::*;
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Component;
 use std::thread;
@@ -30,6 +33,12 @@ pub(super) struct SentinelRecord {
 pub(super) struct NamespaceBindMount {
     pub(super) source: PathBuf,
     pub(super) target: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MountSourceStrategy {
+    Path,
+    DetachedTreeFd,
 }
 
 pub(super) fn wait_for_container_start_sentinels(cfg: &Config) -> Result<Vec<WorkloadNamespace>> {
@@ -465,6 +474,13 @@ pub(super) fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     let _source_dir = std::fs::File::open(&source)
         .with_context(|| format!("open source {}", source.display()))?;
     std::fs::metadata(&source).with_context(|| format!("stat source {}", source.display()))?;
+    let detached_source = match mount_source_strategy(&source) {
+        MountSourceStrategy::Path => None,
+        MountSourceStrategy::DetachedTreeFd => Some(
+            open_detached_mount_tree(&source)
+                .with_context(|| format!("open detached mount tree {}", source.display()))?,
+        ),
+    };
     let ns = std::fs::File::open(format!("/proc/{pid}/ns/mnt"))
         .with_context(|| format!("opening mount namespace for pid {pid}"))?;
     nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNS)
@@ -488,21 +504,100 @@ pub(super) fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     })? {
         return Ok(());
     }
-    nix::mount::mount(
-        Some(source_mount_path.as_path()),
-        target_mount_path.as_path(),
-        None::<&str>,
-        nix::mount::MsFlags::MS_BIND,
-        None::<&str>,
-    )
-    .with_context(|| {
-        format!(
-            "bind mounting {} to {}",
-            source.display(),
-            target_mount_path.display()
+    if let Some(detached_source) = detached_source {
+        move_detached_mount_tree(&detached_source, &target_mount_path).with_context(|| {
+            format!(
+                "move mounting detached {} to {}",
+                source.display(),
+                target_mount_path.display()
+            )
+        })?;
+    } else {
+        nix::mount::mount(
+            Some(source_mount_path.as_path()),
+            target_mount_path.as_path(),
+            None::<&str>,
+            nix::mount::MsFlags::MS_BIND,
+            None::<&str>,
         )
-    })?;
+        .with_context(|| {
+            format!(
+                "bind mounting {} to {}",
+                source.display(),
+                target_mount_path.display()
+            )
+        })?;
+    }
     Ok(())
+}
+
+pub(super) fn mount_source_strategy(source: &Path) -> MountSourceStrategy {
+    if is_proc_root_source(source) {
+        MountSourceStrategy::DetachedTreeFd
+    } else {
+        MountSourceStrategy::Path
+    }
+}
+
+fn is_proc_root_source(source: &Path) -> bool {
+    let mut components = source.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return false;
+    }
+    if !matches!(components.next(), Some(Component::Normal(part)) if part == "proc") {
+        return false;
+    }
+    let Some(Component::Normal(pid)) = components.next() else {
+        return false;
+    };
+    if !pid.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    matches!(components.next(), Some(Component::Normal(part)) if part == "root")
+}
+
+fn open_detached_mount_tree(source: &Path) -> Result<OwnedFd> {
+    let c_source = path_to_cstring(source)?;
+    let flags = nix::libc::OPEN_TREE_CLONE | (nix::libc::O_CLOEXEC as u32);
+    let fd = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_open_tree,
+            nix::libc::AT_FDCWD,
+            c_source.as_ptr(),
+            flags,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open_tree");
+    }
+    // SAFETY: open_tree returned a fresh owned file descriptor on success.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+fn move_detached_mount_tree(source: &OwnedFd, target: &Path) -> Result<()> {
+    const MOVE_MOUNT_F_EMPTY_PATH: u32 = 0x00000004;
+
+    let empty = CString::new("").expect("empty CString");
+    let c_target = path_to_cstring(target)?;
+    let rc = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_move_mount,
+            source.as_raw_fd(),
+            empty.as_ptr(),
+            nix::libc::AT_FDCWD,
+            c_target.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error()).context("move_mount");
+    }
+    Ok(())
+}
+
+fn path_to_cstring(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("path contains NUL byte: {}", path.display()))
 }
 
 pub(super) fn workload_target_path(_pid: u32, target: &Path) -> Result<PathBuf> {

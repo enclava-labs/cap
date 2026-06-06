@@ -80,6 +80,18 @@ fn namespace_bind_uses_init_proc_source_and_chrooted_workload_target() {
 }
 
 #[test]
+fn namespace_bind_detaches_proc_source_before_setns() {
+    assert_eq!(
+        mount_source_strategy(&namespace_source(11, "/state/app-logs")),
+        MountSourceStrategy::DetachedTreeFd
+    );
+    assert_eq!(
+        mount_source_strategy(Path::new("/state/app-logs")),
+        MountSourceStrategy::Path
+    );
+}
+
+#[test]
 fn caddy_tls_bind_source_is_below_tls_state_root() {
     assert_eq!(
         caddy_tls_bind_dir(Path::new("/state/tls-state")),
