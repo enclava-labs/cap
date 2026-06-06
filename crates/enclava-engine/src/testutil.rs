@@ -56,12 +56,12 @@ pub fn sample_app() -> ConfidentialApp {
         resources: ResourceLimits::default(),
         attestation: AttestationConfig {
             proxy_image: ImageRef::parse(
-                "ghcr.io/enclava-ai/attestation-proxy@sha256:\
+                "ghcr.io/enclava-labs/attestation-proxy@sha256:\
                  1111111111111111111111111111111111111111111111111111111111111111",
             )
             .unwrap(),
             caddy_image: ImageRef::parse(
-                "ghcr.io/enclava-ai/caddy-ingress@sha256:\
+                "ghcr.io/enclava-labs/caddy-ingress@sha256:\
                  2222222222222222222222222222222222222222222222222222222222222222",
             )
             .unwrap(),

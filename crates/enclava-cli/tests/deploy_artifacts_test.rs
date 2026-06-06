@@ -198,7 +198,7 @@ fn deploy_descriptor_and_keyring_envelopes_serialize_for_deploy_request() {
         service_account: "cap-demo-sa".to_string(),
         identity_hash: [1; 32],
         image_ref:
-            "ghcr.io/enclava-ai/demo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "ghcr.io/enclava-labs/demo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_string(),
         image_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             .to_string(),
@@ -248,7 +248,7 @@ fn deploy_descriptor_and_keyring_envelopes_serialize_for_deploy_request() {
     assert_eq!(descriptor_value["signing_key_id"], "cli-key");
     assert_eq!(
         descriptor_value["descriptor"]["image_ref"],
-        "ghcr.io/enclava-ai/demo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "ghcr.io/enclava-labs/demo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     );
     assert_eq!(
         descriptor_value["signing_pubkey"].as_str().unwrap().len(),

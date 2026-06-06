@@ -23,7 +23,7 @@ spec:
           type: RuntimeDefault
       containers:
       - name: api
-        image: ghcr.io/enclava-ai/enclava-api:latest
+        image: ghcr.io/enclava-labs/enclava-api:latest
         securityContext:
           allowPrivilegeEscalation: false
           readOnlyRootFilesystem: true

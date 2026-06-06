@@ -280,7 +280,7 @@ mod tests {
     fn bundled_release_uses_ghcr_digest_pinned_sidecars() {
         let release = PlatformRelease::load_verified().unwrap();
         for image in [release.attestation_proxy_image, release.caddy_ingress_image] {
-            assert!(image.starts_with("ghcr.io/enclava-ai/"));
+            assert!(image.starts_with("ghcr.io/enclava-labs/"));
             assert!(image.contains("@sha256:"));
             assert!(!image.contains("ttl.sh/"));
         }

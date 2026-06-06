@@ -11,10 +11,10 @@ fn test_release() -> PlatformRelease {
             policy_template_sha256: "22".repeat(32),
             policy_template_text: "package policy\n".to_string(),
             attestation_proxy_image:
-                "ghcr.io/enclava-ai/attestation-proxy@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "ghcr.io/enclava-labs/attestation-proxy@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_string(),
             caddy_ingress_image:
-                "ghcr.io/enclava-ai/caddy-ingress@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                "ghcr.io/enclava-labs/caddy-ingress@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                     .to_string(),
             trustee_kbs_url: "https://kbs.example.test:8080".to_string(),
             trustee_kbs_ca_cert_pem: String::new(),

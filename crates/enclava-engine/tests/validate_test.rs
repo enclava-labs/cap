@@ -91,7 +91,7 @@ fn name_must_be_dns_safe() {
 fn rejects_attestation_proxy_without_digest() {
     let mut app = sample_app();
     app.attestation.proxy_image =
-        enclava_common::image::ImageRef::parse("ghcr.io/enclava-ai/proxy:latest").unwrap();
+        enclava_common::image::ImageRef::parse("ghcr.io/enclava-labs/proxy:latest").unwrap();
     let err = validate_app(&app).unwrap_err();
     assert!(err.to_string().contains("attestation-proxy"));
 }
@@ -100,7 +100,7 @@ fn rejects_attestation_proxy_without_digest() {
 fn rejects_caddy_without_digest() {
     let mut app = sample_app();
     app.attestation.caddy_image =
-        enclava_common::image::ImageRef::parse("ghcr.io/enclava-ai/caddy:v1").unwrap();
+        enclava_common::image::ImageRef::parse("ghcr.io/enclava-labs/caddy:v1").unwrap();
     let err = validate_app(&app).unwrap_err();
     assert!(err.to_string().contains("caddy"));
 }

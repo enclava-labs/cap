@@ -291,7 +291,7 @@ mod tests {
             namespace: "cap-abcd1234-demo".to_string(),
             service_account: "cap-demo-sa".to_string(),
             identity_hash: [9; 32],
-            image_ref: "ghcr.io/enclava-ai/demo@sha256:aaaa".to_string(),
+            image_ref: "ghcr.io/enclava-labs/demo@sha256:aaaa".to_string(),
             image_digest: "sha256:aaaa".to_string(),
             signer_identity: SignerIdentity {
                 subject: "https://github.com/x/y/.github/workflows/build.yml".to_string(),
@@ -359,7 +359,7 @@ mod tests {
     fn canonical_bytes_include_image_ref() {
         let mut d_a = fixed_descriptor();
         let mut d_b = d_a.clone();
-        d_b.image_ref = "ghcr.io/enclava-ai/other@sha256:aaaa".to_string();
+        d_b.image_ref = "ghcr.io/enclava-labs/other@sha256:aaaa".to_string();
 
         assert_ne!(
             descriptor_core_canonical_bytes(&d_a),

@@ -10,6 +10,6 @@ resources:
 - ingress.yaml
 
 images:
-- name: ghcr.io/enclava-ai/enclava-api
-  newName: ghcr.io/enclava-ai/enclava-api
+- name: ghcr.io/enclava-labs/enclava-api
+  newName: ghcr.io/enclava-labs/enclava-api
   digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

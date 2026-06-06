@@ -23,7 +23,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 DEV_FIXTURE_SIGNING_KEY_HEX = "c0" * 32
 DEFAULT_RELEASE_PATH = Path(__file__).resolve().parents[1] / "platform-release.json"
 GHCR_DIGEST_RE = re.compile(
-    r"^ghcr\.io/enclava-ai/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
+    r"^ghcr\.io/enclava-labs/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
 )
 HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -131,7 +131,7 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
         raise ValueError("schema_version must be v1")
     for field in ["attestation_proxy_image", "caddy_ingress_image"]:
         if not GHCR_DIGEST_RE.fullmatch(payload[field]):
-            raise ValueError(f"{field} must be a ghcr.io/enclava-ai digest-pinned ref")
+            raise ValueError(f"{field} must be a ghcr.io/enclava-labs digest-pinned ref")
     if not payload["trustee_kbs_url"].startswith("https://"):
         raise ValueError("trustee_kbs_url must be https")
     if payload["tenant_caddy_tls_mode"] not in ("acme", "dns01-broker", "internal"):

@@ -64,7 +64,7 @@ class CapHermesProofTests(unittest.TestCase):
         manifest = {
             "expected": {
                 "workload_image": (
-                    "ghcr.io/enclava-ai/hermes-agent-enclava@"
+                    "ghcr.io/enclava-labs/hermes-agent-enclava@"
                     "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 )
             }
