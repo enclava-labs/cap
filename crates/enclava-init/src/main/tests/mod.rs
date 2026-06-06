@@ -67,8 +67,11 @@ fn namespace_bind_chroots_to_workload_proc_root() {
 }
 
 #[test]
-fn namespace_bind_uses_fd_source_and_workload_proc_target() {
-    assert_eq!(proc_self_fd_path(17), PathBuf::from("/proc/self/fd/17"));
+fn namespace_bind_uses_init_proc_source_and_workload_proc_target() {
+    assert_eq!(
+        namespace_source(11, "/state/app-logs"),
+        PathBuf::from("/proc/11/root/state/app-logs")
+    );
     assert_eq!(
         workload_target_path(42, Path::new("/app/logs")).unwrap(),
         PathBuf::from("/proc/42/root/app/logs")

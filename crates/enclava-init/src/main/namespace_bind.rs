@@ -1,5 +1,4 @@
 use super::*;
-use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Component;
 use std::thread;
@@ -419,7 +418,7 @@ pub(super) fn bind_mount_plan_for_workload(
     Ok(mounts)
 }
 
-fn namespace_source(pid: u32, mount_path: &str) -> PathBuf {
+pub(super) fn namespace_source(pid: u32, mount_path: &str) -> PathBuf {
     let rel = mount_path.trim_start_matches('/');
     PathBuf::from(format!("/proc/{pid}/root/{rel}"))
 }
@@ -463,14 +462,14 @@ pub(super) fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         .map_err(|_| anyhow!("invalid pid {}", args[0]))?;
     let source = PathBuf::from(&args[1]);
     let target = PathBuf::from(&args[2]);
-    let source_dir = std::fs::File::open(&source)
+    let _source_dir = std::fs::File::open(&source)
         .with_context(|| format!("open source {}", source.display()))?;
     std::fs::metadata(&source).with_context(|| format!("stat source {}", source.display()))?;
     let ns = std::fs::File::open(format!("/proc/{pid}/ns/mnt"))
         .with_context(|| format!("opening mount namespace for pid {pid}"))?;
     nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNS)
         .with_context(|| format!("setns to pid {pid} mount namespace"))?;
-    let source_mount_path = proc_self_fd_path(source_dir.as_raw_fd());
+    let source_mount_path = source.clone();
     let target_mount_path = workload_target_path(pid, &target)?;
     std::fs::create_dir_all(&target_mount_path)
         .with_context(|| format!("creating target {}", target_mount_path.display()))?;
@@ -498,10 +497,6 @@ pub(super) fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         )
     })?;
     Ok(())
-}
-
-pub(super) fn proc_self_fd_path(fd: RawFd) -> PathBuf {
-    PathBuf::from(format!("/proc/self/fd/{fd}"))
 }
 
 pub(super) fn workload_target_path(pid: u32, target: &Path) -> Result<PathBuf> {
