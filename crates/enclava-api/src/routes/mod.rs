@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod deployments;
 pub mod domains;
+pub mod internal;
 pub mod orgs;
 pub mod platform;
 pub mod status;

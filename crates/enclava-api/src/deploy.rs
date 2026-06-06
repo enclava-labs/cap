@@ -500,11 +500,11 @@ mod tests {
             },
             attestation: AttestationConfig {
                 proxy_image: ImageRef::parse(
-                    "ghcr.io/enclava-ai/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "ghcr.io/enclava-labs/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 )
                 .unwrap(),
                 caddy_image: ImageRef::parse(
-                    "ghcr.io/enclava-ai/caddy-ingress@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "ghcr.io/enclava-labs/caddy-ingress@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 )
                 .unwrap(),
                 acme_ca_url: enclava_engine::types::default_acme_ca_url(),
@@ -576,11 +576,11 @@ mod tests {
             },
             attestation: AttestationConfig {
                 proxy_image: ImageRef::parse(
-                    "ghcr.io/enclava-ai/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "ghcr.io/enclava-labs/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 )
                 .unwrap(),
                 caddy_image: ImageRef::parse(
-                    "ghcr.io/enclava-ai/caddy-ingress@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "ghcr.io/enclava-labs/caddy-ingress@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 )
                 .unwrap(),
                 acme_ca_url: enclava_engine::types::default_acme_ca_url(),

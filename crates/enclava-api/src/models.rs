@@ -3,13 +3,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
-#[sqlx(type_name = "entitlement_class_enum", rename_all = "lowercase")]
-#[serde(rename_all = "lowercase")]
-pub enum EntitlementClass {
-    Core,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "provider_enum", rename_all = "lowercase")]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
@@ -73,7 +66,7 @@ pub struct Organization {
     pub id: Uuid,
     pub name: String,
     pub display_name: Option<String>,
-    pub entitlement_class: EntitlementClass,
+    pub entitlement_class: String,
     pub is_personal: bool,
     pub cust_slug: String,
     pub created_at: DateTime<Utc>,

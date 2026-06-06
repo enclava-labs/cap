@@ -13,13 +13,13 @@ use uuid::Uuid;
 use crate::auth::jwt::{
     SignerRotationTokenInput, issue_signer_rotation_token, verify_signer_rotation_token,
 };
-use crate::auth::middleware::AuthContext;
+use crate::auth::middleware::{AuthContext, ManagementOrigin};
 use crate::auth::scopes;
 use crate::models::App;
 use crate::source_provider::{
     SourceProvider, validate_signing_identity, validate_source_repository,
 };
-use crate::state::AppState;
+use crate::state::{AppState, CapManagementMode};
 
 /// Helper function for consistent internal server error responses
 fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
@@ -54,6 +54,30 @@ fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_js
         status,
         Json(serde_json::json!({"error": error.to_string()})),
     )
+}
+
+pub(crate) async fn ensure_management_write_allowed(
+    state: &AppState,
+    auth: &AuthContext,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match (state.management_mode, auth.management_origin) {
+        (CapManagementMode::Standalone, ManagementOrigin::Public)
+        | (CapManagementMode::PaasManaged, ManagementOrigin::PaasInternal) => Ok(()),
+        (CapManagementMode::Standalone, ManagementOrigin::PaasInternal) => Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "standalone_instance",
+                "message": "Standalone CAP instances do not accept PaaS internal management writes"
+            })),
+        )),
+        (CapManagementMode::PaasManaged, ManagementOrigin::Public) => Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "paas_managed_instance",
+                "message": "This CAP instance is managed by PaaS; management writes must use PaaS internal routes"
+            })),
+        )),
+    }
 }
 
 async fn delete_tenant_namespace(namespace: &str) -> Result<(), kube::Error> {
@@ -136,7 +160,7 @@ async fn request_workload_teardown(
 }
 
 /// Comprehensive app name validation
-fn validate_app_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_app_name(name: &str) -> Result<(), String> {
     if name.is_empty() || name.len() > 63 {
         return Err("app name must be between 1 and 63 characters".to_string());
     }
@@ -281,7 +305,7 @@ fn validate_source_metadata(
 }
 
 /// Derive identity fields per OID-1 and OID-6.
-fn derive_identity(
+pub(crate) fn derive_identity(
     org_name: &str,
     app_id: Uuid,
     app_name: &str,
@@ -336,6 +360,7 @@ pub async fn create_app(
     Json(body): Json<CreateAppRequest>,
 ) -> Result<(StatusCode, Json<AppResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
+    ensure_management_write_allowed(&state, &auth).await?;
 
     validate_app_name(&body.name).map_err(|e| {
         (
@@ -364,8 +389,24 @@ pub async fn create_app(
             .await
             .map_err(|_| internal_server_error())?;
 
-    let entitlement_class = format!("{:?}", org.entitlement_class).to_lowercase();
-    let limits = crate::entitlements::limits_for_entitlement_class(&entitlement_class).ok_or((
+    let entitlement_class = org.entitlement_class.clone();
+    let decision = crate::entitlements::entitlement_decision_for_org(
+        &state.db,
+        auth.org_id,
+        &entitlement_class,
+    )
+    .await
+    .map_err(|_| internal_server_error())?;
+    if !decision.deploy_allowed {
+        return Err(deploy_blocked_response(
+            decision
+                .deploy_block_reason
+                .as_deref()
+                .unwrap_or("entitlement_blocked"),
+            format!("Org entitlement class {entitlement_class} does not allow app creation"),
+        ));
+    }
+    let limits = decision.limits.ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({"error": "unknown entitlement class"})),
     ))?;
@@ -585,6 +626,7 @@ pub async fn delete_app(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
+    ensure_management_write_allowed(&state, &auth).await?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -781,6 +823,7 @@ pub async fn issue_signer_rotation_token_route(
             })),
         ));
     }
+    ensure_management_write_allowed(&state, &auth).await?;
 
     let subject = body.subject.trim().to_string();
     let issuer = body.issuer.trim().to_string();
@@ -886,6 +929,7 @@ pub async fn rotate_signer(
 ) -> Result<Json<AppResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_owner(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
+    ensure_management_write_allowed(&state, &auth).await?;
 
     let subject = body.subject.trim().to_string();
     let issuer = body.issuer.trim().to_string();

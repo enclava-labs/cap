@@ -98,9 +98,9 @@ fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
 
 fn attestation_config() -> AttestationConfig {
     AttestationConfig {
-            proxy_image: ImageRef::parse("ghcr.io/enclava-ai/attestation-proxy@sha256:996c32b0726a90d82c08ae095b4bfbe01e47617cf929dc1eed3bd981f4e8155d")
+            proxy_image: ImageRef::parse("ghcr.io/enclava-labs/attestation-proxy@sha256:996c32b0726a90d82c08ae095b4bfbe01e47617cf929dc1eed3bd981f4e8155d")
                 .unwrap(),
-            caddy_image: ImageRef::parse("ghcr.io/enclava-ai/caddy-ingress@sha256:31a43cbfce0399cc83d22aabcb25346badcddfb46f4984eccd410c22e691ca6f")
+            caddy_image: ImageRef::parse("ghcr.io/enclava-labs/caddy-ingress@sha256:31a43cbfce0399cc83d22aabcb25346badcddfb46f4984eccd410c22e691ca6f")
                 .unwrap(),
             acme_ca_url: enclava_engine::types::default_acme_ca_url(),
             caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
@@ -179,6 +179,20 @@ fn signed_deploy_hash_validation_uses_local_artifact_delivery_mode() {
 
     assert_eq!(cfg.local_workload_artifacts_json.as_deref(), Some("{}"));
     assert_eq!(cfg.local_trustee_policy_json.as_deref(), Some("{}"));
+}
+
+#[test]
+fn signed_deploy_path_ensures_app_and_tee_dns_pair() {
+    let source = include_str!("../../deployments.rs");
+    let deploy_body = source
+        .split("pub async fn deploy")
+        .nth(1)
+        .expect("deploy route exists");
+
+    assert!(
+        deploy_body.contains("crate::dns::ensure_dns_pair"),
+        "signed deploy must ensure both app and TEE DNS hostnames"
+    );
 }
 
 #[test]

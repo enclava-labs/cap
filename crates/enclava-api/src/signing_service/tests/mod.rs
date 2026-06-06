@@ -51,7 +51,7 @@ fn descriptor() -> DeploymentDescriptor {
             service_account: "cap-demo-sa".to_string(),
             identity_hash: [2; 32],
             image_ref:
-                "ghcr.io/enclava-ai/demo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                "ghcr.io/enclava-labs/demo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                     .to_string(),
             image_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_string(),
@@ -491,7 +491,7 @@ fn signed_artifact_agent_policy_drives_cc_init_data_hash() {
 }
 
 fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> ConfidentialApp {
-    let image = format!("ghcr.io/enclava-ai/demo@{}", descriptor.image_digest);
+    let image = format!("ghcr.io/enclava-labs/demo@{}", descriptor.image_digest);
     ConfidentialApp {
         app_id: descriptor.app_id,
         name: descriptor.app_name.clone(),
@@ -547,12 +547,12 @@ fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> Confide
         },
         attestation: AttestationConfig {
             proxy_image: ImageRef::parse(&format!(
-                "ghcr.io/enclava-ai/attestation-proxy@{}",
+                "ghcr.io/enclava-labs/attestation-proxy@{}",
                 descriptor.sidecars.attestation_proxy_digest
             ))
             .unwrap(),
             caddy_image: ImageRef::parse(&format!(
-                "ghcr.io/enclava-ai/caddy-ingress@{}",
+                "ghcr.io/enclava-labs/caddy-ingress@{}",
                 descriptor.sidecars.caddy_digest
             ))
             .unwrap(),

@@ -92,6 +92,35 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn registry_auth_from_env(registry: &str) -> Auth {
+    if let Some(token) = env_nonempty("COSIGN_REGISTRY_BEARER_TOKEN") {
+        return Auth::Bearer(token);
+    }
+
+    if let (Some(username), Some(password)) = (
+        env_nonempty("COSIGN_REGISTRY_USERNAME"),
+        env_nonempty("COSIGN_REGISTRY_PASSWORD"),
+    ) {
+        return Auth::Basic(username, password);
+    }
+
+    if registry == "ghcr.io"
+        && let Some(token) = env_nonempty("GHCR_TOKEN")
+    {
+        let username = env_nonempty("GHCR_USERNAME").unwrap_or_else(|| "oauth2".to_string());
+        return Auth::Basic(username, token);
+    }
+
+    Auth::Anonymous
+}
+
 fn looks_like_not_signed_error(err: &str) -> bool {
     let lower = err.to_ascii_lowercase();
     lower.contains("manifest unknown")
@@ -214,6 +243,7 @@ pub async fn verify_image(
     let image: OciReference = image_ref
         .parse()
         .map_err(|e| CosignError::VerificationFailed(format!("invalid image reference: {}", e)))?;
+    let (registry, _) = parse_image_parts(image_ref)?;
 
     let mut oci_client_config = ClientConfig::default();
     if env_flag("COSIGN_ALLOW_HTTP_REGISTRY") {
@@ -229,7 +259,7 @@ pub async fn verify_image(
             CosignError::VerificationFailed(format!("failed to initialize sigstore client: {}", e))
         })?;
 
-    let auth = Auth::Anonymous;
+    let auth = registry_auth_from_env(&registry);
     let (_, source_image_digest) = cosign_client
         .triangulate(&image, &auth)
         .await
@@ -791,5 +821,23 @@ mod tests {
             parse_image_parts("user/repo:tag").unwrap(),
             ("docker.io".to_string(), "user/repo".to_string())
         );
+    }
+
+    #[test]
+    fn registry_auth_from_env_uses_basic_credentials() {
+        unsafe {
+            std::env::set_var("COSIGN_REGISTRY_USERNAME", "cap-bot");
+            std::env::set_var("COSIGN_REGISTRY_PASSWORD", "ghp_example");
+            std::env::remove_var("COSIGN_REGISTRY_BEARER_TOKEN");
+            std::env::remove_var("GHCR_USERNAME");
+            std::env::remove_var("GHCR_TOKEN");
+        }
+
+        let auth = registry_auth_from_env("ghcr.io");
+
+        assert!(matches!(
+            auth,
+            Auth::Basic(username, password) if username == "cap-bot" && password == "ghp_example"
+        ));
     }
 }

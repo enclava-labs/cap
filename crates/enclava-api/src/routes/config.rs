@@ -144,18 +144,15 @@ pub struct ConfigSyncRequest {
     pub deleted: bool,
 }
 
-/// POST /apps/{name}/config/sync -- authenticated metadata sync callback.
-pub async fn config_sync(
-    auth: AuthContext,
-    State(state): State<AppState>,
-    Path(app_name): Path<String>,
-    Json(body): Json<ConfigSyncRequest>,
+pub(crate) async fn sync_config_metadata_for_org(
+    state: &AppState,
+    org_id: Uuid,
+    app_name: &str,
+    body: &ConfigSyncRequest,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    scopes::require_config_metadata_write(&auth)?;
-
     let app: Option<App> = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
-        .bind(auth.org_id)
-        .bind(&app_name)
+        .bind(org_id)
+        .bind(app_name)
         .fetch_optional(&state.db)
         .await
         .map_err(|_| {
@@ -173,7 +170,7 @@ pub async fn config_sync(
     if body.deleted {
         sqlx::query("DELETE FROM config_metadata WHERE app_id = $1 AND key_name = $2")
             .bind(app.id)
-            .bind(&body.key_name)
+            .bind(body.key_name.as_str())
             .execute(&state.db)
             .await
             .map_err(|_| {
@@ -190,7 +187,7 @@ pub async fn config_sync(
         )
         .bind(Uuid::new_v4())
         .bind(app.id)
-        .bind(&body.key_name)
+        .bind(body.key_name.as_str())
         .execute(&state.db)
         .await
         .map_err(|_| {
@@ -204,17 +201,15 @@ pub async fn config_sync(
     Ok(StatusCode::OK)
 }
 
-/// DELETE /apps/{name}/config/{key}/meta -- remove key metadata.
-pub async fn delete_config_meta(
-    auth: AuthContext,
-    State(state): State<AppState>,
-    Path((app_name, key_name)): Path<(String, String)>,
+pub(crate) async fn delete_config_metadata_for_org(
+    state: &AppState,
+    org_id: Uuid,
+    app_name: &str,
+    key_name: &str,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    scopes::require_config_metadata_write(&auth)?;
-
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
-        .bind(auth.org_id)
-        .bind(&app_name)
+        .bind(org_id)
+        .bind(app_name)
         .fetch_optional(&state.db)
         .await
         .map_err(|_| {
@@ -230,7 +225,7 @@ pub async fn delete_config_meta(
 
     sqlx::query("DELETE FROM config_metadata WHERE app_id = $1 AND key_name = $2")
         .bind(app.id)
-        .bind(&key_name)
+        .bind(key_name)
         .execute(&state.db)
         .await
         .map_err(|_| {
@@ -241,6 +236,29 @@ pub async fn delete_config_meta(
         })?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /apps/{name}/config/sync -- authenticated metadata sync callback.
+pub async fn config_sync(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(app_name): Path<String>,
+    Json(body): Json<ConfigSyncRequest>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_config_metadata_write(&auth)?;
+    crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    sync_config_metadata_for_org(&state, auth.org_id, &app_name, &body).await
+}
+
+/// DELETE /apps/{name}/config/{key}/meta -- remove key metadata.
+pub async fn delete_config_meta(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path((app_name, key_name)): Path<(String, String)>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_config_metadata_write(&auth)?;
+    crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    delete_config_metadata_for_org(&state, auth.org_id, &app_name, &key_name).await
 }
 
 #[cfg(test)]

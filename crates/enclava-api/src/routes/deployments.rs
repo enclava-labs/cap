@@ -330,6 +330,7 @@ pub async fn deploy(
     Json(body): Json<DeployRequest>,
 ) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
+    crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -459,12 +460,33 @@ pub async fn deploy(
                     )
                 })?;
 
-        let entitlement_class = format!("{:?}", org.entitlement_class).to_lowercase();
-        let limits =
-            crate::entitlements::limits_for_entitlement_class(&entitlement_class).ok_or((
+        let entitlement_class = org.entitlement_class.clone();
+        let decision = crate::entitlements::entitlement_decision_for_org(
+            &state.db,
+            auth.org_id,
+            &entitlement_class,
+        )
+        .await
+        .map_err(|_| {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "unknown entitlement class"})),
-            ))?;
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
+        if !decision.deploy_allowed {
+            return Err(deploy_blocked_response(
+                StatusCode::FORBIDDEN,
+                decision
+                    .deploy_block_reason
+                    .as_deref()
+                    .unwrap_or("entitlement_blocked"),
+                format!("Org entitlement class {entitlement_class} does not allow deploys"),
+            ));
+        }
+        let limits = decision.limits.ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "unknown entitlement class"})),
+        ))?;
 
         if let Some(ref cpu) = resources.cpu {
             let requested: f64 = cpu.parse().unwrap_or(0.0);
@@ -751,13 +773,14 @@ pub async fn deploy(
     .execute(&state.db)
     .await;
 
-    crate::dns::ensure_dns_record(
+    let tee_domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
+    crate::dns::ensure_dns_pair(
         &state.db,
         &state.http_client,
         state.dns.as_ref(),
         app.id,
         &app.domain,
-        false,
+        tee_domain,
     )
     .await
     .map_err(dns_error_response)?;

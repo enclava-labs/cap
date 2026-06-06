@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::middleware::AuthContext;
-use crate::models::EntitlementClass;
 use crate::state::AppState;
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,9 +47,9 @@ pub async fn current_user(
         Option<String>,
         crate::models::Role,
         bool,
-        EntitlementClass,
+        String,
     )> = sqlx::query_as(
-        "SELECT o.id, o.name, o.display_name, m.role as \"role: _\", o.is_personal, o.entitlement_class as \"entitlement_class: _\"
+        "SELECT o.id, o.name, o.display_name, m.role as \"role: _\", o.is_personal, o.entitlement_class
          FROM organizations o
          JOIN memberships m ON m.org_id = o.id
          WHERE m.user_id = $1
@@ -64,21 +63,23 @@ pub async fn current_user(
     .await
     .map_err(|_| db_error())?;
 
-    let orgs: Vec<CurrentUserOrg> = rows
-        .into_iter()
-        .map(
-            |(id, name, display_name, role, is_personal, entitlement_class)| CurrentUserOrg {
-                id,
-                name,
-                display_name,
-                role: format!("{role:?}").to_lowercase(),
-                is_personal,
-                entitlement_class: format!("{entitlement_class:?}").to_lowercase(),
-                deploy_allowed: true,
-                deploy_block_reason: None,
-            },
-        )
-        .collect();
+    let mut orgs: Vec<CurrentUserOrg> = Vec::with_capacity(rows.len());
+    for (id, name, display_name, role, is_personal, entitlement_class) in rows {
+        let decision =
+            crate::entitlements::entitlement_decision_for_org(&state.db, id, &entitlement_class)
+                .await
+                .map_err(|_| db_error())?;
+        orgs.push(CurrentUserOrg {
+            id,
+            name,
+            display_name,
+            role: format!("{role:?}").to_lowercase(),
+            is_personal,
+            entitlement_class,
+            deploy_allowed: decision.deploy_allowed,
+            deploy_block_reason: decision.deploy_block_reason,
+        });
+    }
 
     let active_org = orgs
         .iter()

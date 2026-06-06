@@ -46,12 +46,135 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         api_routes
     };
 
-    Router::new()
-        .merge(health_routes())
+    let mut router = Router::new().merge(health_routes());
+    if state.management_mode.internal_paas_routes_enabled() {
+        router = router.merge(internal_routes());
+    }
+
+    router
         .merge(api_routes)
         .layer(TraceLayer::new_for_http())
         .layer(build_cors_layer())
         .with_state(state)
+}
+
+fn internal_routes() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/internal/paas/orgs/{paas_org_id}",
+            axum::routing::put(routes::internal::upsert_paas_org),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}",
+            axum::routing::put(routes::internal::sync_paas_member),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/entitlements",
+            axum::routing::put(routes::internal::sync_paas_entitlement),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps",
+            axum::routing::get(routes::internal::list_paas_apps)
+                .post(routes::internal::create_paas_app),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/members",
+            axum::routing::get(routes::internal::list_paas_members),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/deployments",
+            axum::routing::get(routes::internal::list_paas_deployments)
+                .post(routes::internal::create_paas_generic_deployment),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/status",
+            axum::routing::get(routes::internal::list_paas_status),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/deploy",
+            axum::routing::post(routes::internal::deploy_paas_app),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/agent-policy",
+            axum::routing::post(routes::internal::generate_paas_agent_policy),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/users/me/public-keys",
+            axum::routing::post(routes::internal::register_paas_public_key),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/keyring",
+            axum::routing::get(routes::internal::get_paas_keyring)
+                .put(routes::internal::put_paas_keyring),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/keyring/bootstrap-signing-service",
+            axum::routing::post(routes::internal::bootstrap_paas_keyring_signing_service),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/signer/rotation-token",
+            axum::routing::post(routes::internal::issue_paas_signer_rotation_token),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/signer",
+            axum::routing::patch(routes::internal::rotate_paas_signer),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domain",
+            axum::routing::get(routes::internal::get_paas_app_domain),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domains",
+            axum::routing::post(routes::internal::create_paas_domain_challenge),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domains/{domain}/verify",
+            axum::routing::post(routes::internal::verify_paas_domain_challenge),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domains/{domain}",
+            axum::routing::delete(routes::internal::remove_paas_custom_domain),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config",
+            axum::routing::get(routes::internal::list_paas_config_keys),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config-token",
+            axum::routing::post(routes::internal::issue_paas_config_token),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config/sync",
+            axum::routing::post(routes::internal::sync_paas_config_metadata),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config/{key_name}/meta",
+            axum::routing::delete(routes::internal::delete_paas_config_metadata),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/rollback",
+            axum::routing::post(routes::internal::rollback_paas_app),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}",
+            axum::routing::get(routes::internal::get_paas_generic_deployment),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/config-token",
+            axum::routing::post(routes::internal::issue_paas_generic_config_token),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/status",
+            axum::routing::get(routes::internal::get_paas_unlock_status),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/endpoint",
+            axum::routing::get(routes::internal::get_paas_unlock_endpoint),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/mode",
+            axum::routing::put(routes::internal::update_paas_unlock_mode),
+        )
 }
 
 fn build_api_routes(
@@ -356,7 +479,7 @@ pub fn test_router(state: AppState) -> Router {
 #[cfg(test)]
 pub(crate) mod test_support {
     use crate::auth::api_key::ValidatedApiKey;
-    use crate::auth::middleware::AuthContext;
+    use crate::auth::middleware::{AuthContext, ManagementOrigin};
     use crate::clients::{AllowList, ClientConfig, RegistryClient};
     use crate::models::Role;
     use crate::state::AppState;
@@ -384,6 +507,7 @@ pub(crate) mod test_support {
                     scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
                 })
             },
+            management_origin: ManagementOrigin::Public,
         }
     }
 
@@ -393,6 +517,7 @@ pub(crate) mod test_support {
             .expect("lazy postgres URL should parse");
         AppState {
             db: pool,
+            management_mode: crate::state::CapManagementMode::Standalone,
             signing_key: Arc::new(SigningKey::generate(&mut OsRng)),
             hmac_key: Arc::new([7u8; 32]),
             api_url: "https://api.example.test".to_string(),
@@ -409,11 +534,11 @@ pub(crate) mod test_support {
             tee_http_client: reqwest::Client::new(),
             attestation: Some(AttestationConfig {
                 proxy_image: ImageRef::parse(
-                    "ghcr.io/enclava-ai/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                    "ghcr.io/enclava-labs/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
                 )
                 .unwrap(),
                 caddy_image: ImageRef::parse(
-                    "ghcr.io/enclava-ai/caddy-ingress@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                    "ghcr.io/enclava-labs/caddy-ingress@sha256:2222222222222222222222222222222222222222222222222222222222222222",
                 )
                 .unwrap(),
                 acme_ca_url: enclava_engine::types::default_acme_ca_url(),
@@ -435,6 +560,7 @@ pub(crate) mod test_support {
             signing_service: None,
             require_customer_signed_policy_artifact: true,
             deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            internal_auth: None,
         }
     }
 }

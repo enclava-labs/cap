@@ -7,8 +7,12 @@ use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use enclava_api::{
-    acme::AcmeConfig, auth::jwt, build_router, dns::DnsConfig, platform_release::PlatformRelease,
-    state::AppState,
+    acme::AcmeConfig,
+    auth::jwt,
+    build_router,
+    dns::DnsConfig,
+    platform_release::PlatformRelease,
+    state::{AppState, CapManagementMode, InternalAuthConfig},
 };
 
 fn env_flag(name: &str) -> bool {
@@ -22,6 +26,47 @@ fn env_nonempty(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn env_list(name: &str) -> Vec<String> {
+    env_nonempty(name)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn load_internal_auth_config() -> Option<InternalAuthConfig> {
+    let mut tokens = Vec::new();
+    if let Some(token) = env_nonempty("CAP_INTERNAL_SERVICE_TOKEN") {
+        tokens.push(token);
+    }
+    if let Some(token) = env_nonempty("CAP_INTERNAL_SERVICE_TOKEN_NEXT") {
+        tokens.push(token);
+    }
+    let allowed_client_sans = env_list("CAP_INTERNAL_ALLOWED_CLIENT_SANS");
+    let trusted_proxy_secret = env_nonempty("CAP_INTERNAL_TRUSTED_PROXY_SECRET");
+    if tokens.is_empty() && allowed_client_sans.is_empty() {
+        return None;
+    }
+    Some(InternalAuthConfig::from_plaintext_token_strings(
+        tokens,
+        allowed_client_sans,
+        trusted_proxy_secret,
+    ))
+}
+
+fn load_management_mode() -> CapManagementMode {
+    env_nonempty("CAP_MANAGEMENT_MODE")
+        .as_deref()
+        .unwrap_or("standalone")
+        .parse()
+        .expect("invalid CAP_MANAGEMENT_MODE")
 }
 
 fn load_caddy_tls_mode() -> anyhow::Result<CaddyTlsMode> {
@@ -671,6 +716,25 @@ async fn main() {
         max_concurrent_applies,
         "configured deployment apply concurrency"
     );
+    let management_mode = load_management_mode();
+    let internal_auth = load_internal_auth_config();
+    if management_mode == CapManagementMode::PaasManaged
+        && !internal_auth
+            .as_ref()
+            .is_some_and(|config| config.is_usable())
+    {
+        panic!(
+            "CAP_MANAGEMENT_MODE=paas_managed requires usable CAP_INTERNAL_SERVICE_TOKEN and CAP_INTERNAL_ALLOWED_CLIENT_SANS"
+        );
+    }
+    if management_mode == CapManagementMode::Standalone && internal_auth.is_some() {
+        tracing::warn!(
+            "CAP internal PaaS auth is configured but CAP_MANAGEMENT_MODE=standalone; /internal/paas routes are disabled"
+        );
+    }
+    if management_mode == CapManagementMode::PaasManaged {
+        tracing::info!("CAP internal PaaS routes configured");
+    }
     let tee_http_client =
         build_tenant_tee_http_client().expect("failed to build tenant TEE HTTP client");
 
@@ -684,6 +748,7 @@ async fn main() {
 
     let state = AppState {
         db: pool,
+        management_mode,
         signing_key: Arc::new(signing_key),
         hmac_key: Arc::new(hmac_key),
         api_url,
@@ -703,6 +768,7 @@ async fn main() {
         signing_service,
         require_customer_signed_policy_artifact,
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_applies)),
+        internal_auth,
     };
 
     let app = build_router(state);

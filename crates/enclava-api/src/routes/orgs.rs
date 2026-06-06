@@ -36,7 +36,7 @@ impl From<Organization> for OrgResponse {
             id: o.id,
             name: o.name,
             display_name: o.display_name,
-            entitlement_class: format!("{:?}", o.entitlement_class).to_lowercase(),
+            entitlement_class: o.entitlement_class,
             is_personal: o.is_personal,
         }
     }
@@ -348,6 +348,7 @@ pub async fn put_keyring(
     scopes::require_scope(&auth, "org:admin")?;
     let (org_id, caller_role) = active_membership(&state, &auth, &org_name).await?;
     scopes::require_owner_role(caller_role)?;
+    crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
 
     if body.version < 1 {
         return Err(bad_request("version must be positive"));
@@ -545,6 +546,7 @@ pub async fn bootstrap_signing_service_owner(
     scopes::require_scope(&auth, "org:admin")?;
     let (org_id, caller_role) = active_membership(&state, &auth, &org_name).await?;
     scopes::require_admin_role(caller_role)?;
+    crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
 
     let owner_pubkey = decode_hex_len("owner_pubkey_hex", &body.owner_pubkey_hex, 32)?;
     let latest_signing_pubkey: Option<Vec<u8>> = sqlx::query_scalar(
@@ -613,6 +615,7 @@ pub async fn invite_member(
         Json(serde_json::json!({"error": "organization not found"})),
     ))?;
     require_api_key_org(&auth, org_id)?;
+    crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
 
     scopes::require_admin_role(caller_role)?;
 
@@ -750,6 +753,7 @@ pub async fn remove_member(
         Json(serde_json::json!({"error": "organization not found"})),
     ))?;
     require_api_key_org(&auth, org_id)?;
+    crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
 
     scopes::require_admin_role(caller_role)?;
 
@@ -814,6 +818,7 @@ mod tests {
             org_name: "personal".to_string(),
             role: Role::Owner,
             api_key,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
         }
     }
 

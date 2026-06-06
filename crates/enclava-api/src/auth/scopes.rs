@@ -170,6 +170,7 @@ mod tests {
                     scopes: scopes.iter().map(|s| s.to_string()).collect(),
                 })
             },
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
         }
     }
 

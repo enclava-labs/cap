@@ -3,8 +3,18 @@
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
 use ed25519_dalek::SigningKey;
-use enclava_api::{state::AppState, test_router};
-use enclava_common::image::ImageRef;
+use enclava_api::{
+    auth::jwt::issue_session_token,
+    state::{AppState, CapManagementMode, InternalAuthConfig},
+    test_router,
+};
+use enclava_common::{
+    descriptor::{
+        Capabilities, DeploymentDescriptor, EnvVar, OciRuntimeSpec, Port, Resources,
+        SecurityContext, Sidecars, SignerIdentity,
+    },
+    image::ImageRef,
+};
 use enclava_engine::types::AttestationConfig;
 use rand::rngs::OsRng;
 use serde_json::Value;
@@ -29,7 +39,7 @@ async fn setup_test_db() -> PgPool {
     pool
 }
 
-async fn setup_test_state() -> (AppState, PgPool) {
+async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppState, PgPool) {
     let pool = setup_test_db().await;
     let signing_key = Arc::new(SigningKey::generate(&mut OsRng));
     let hmac_key = Arc::new([0u8; 32]); // Test HMAC key
@@ -42,6 +52,7 @@ async fn setup_test_state() -> (AppState, PgPool) {
 
     let state = AppState {
         db: pool.clone(),
+        management_mode,
         signing_key,
         hmac_key,
         api_url: "http://localhost:3000".to_string(),
@@ -58,11 +69,11 @@ async fn setup_test_state() -> (AppState, PgPool) {
         tee_http_client: reqwest::Client::new(),
         attestation: Some(AttestationConfig {
             proxy_image: ImageRef::parse(
-                "ghcr.io/enclava-ai/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "ghcr.io/enclava-labs/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
             )
             .unwrap(),
             caddy_image: ImageRef::parse(
-                "ghcr.io/enclava-ai/caddy-ingress@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "ghcr.io/enclava-labs/caddy-ingress@sha256:2222222222222222222222222222222222222222222222222222222222222222",
             )
             .unwrap(),
             acme_ca_url: enclava_engine::types::default_acme_ca_url(),
@@ -84,9 +95,43 @@ async fn setup_test_state() -> (AppState, PgPool) {
         signing_service: None,
         require_customer_signed_policy_artifact: false,
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        internal_auth: Some(InternalAuthConfig::from_plaintext_tokens(
+            &["cap-internal-current", "cap-internal-next"],
+            &["spiffe://paas.example.test/enclava-paas"],
+        )),
     };
 
     (state, pool)
+}
+
+async fn setup_test_state() -> (AppState, PgPool) {
+    setup_test_state_with_mode(CapManagementMode::Standalone).await
+}
+
+async fn setup_paas_managed_test_state() -> (AppState, PgPool) {
+    setup_test_state_with_mode(CapManagementMode::PaasManaged).await
+}
+
+fn add_internal_headers(
+    request: axum_test::TestRequest,
+    idempotency_key: &str,
+) -> axum_test::TestRequest {
+    request
+        .add_header("authorization", "Bearer cap-internal-current")
+        .add_header(
+            "x-enclava-internal-client-san",
+            "spiffe://paas.example.test/enclava-paas",
+        )
+        .add_header("idempotency-key", idempotency_key)
+}
+
+fn add_internal_actor_headers(
+    request: axum_test::TestRequest,
+    idempotency_key: &str,
+    paas_user_id: &str,
+) -> axum_test::TestRequest {
+    add_internal_headers(request, idempotency_key)
+        .add_header("x-enclava-paas-user-id", paas_user_id)
 }
 
 async fn signup_owner(server: &axum_test::TestServer, prefix: &str) -> (String, Uuid) {
@@ -150,6 +195,68 @@ async fn persisted_app_source(pool: &PgPool, org_id: Uuid, app_name: &str) -> (S
     .fetch_one(pool)
     .await
     .expect("persisted app source")
+}
+
+async fn bootstrap_paas_internal_org(
+    server: &axum_test::TestServer,
+    suffix: &str,
+    paas_org_id: &str,
+    paas_user_id: &str,
+    org_name: &str,
+) {
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}")),
+        &format!("hosted-org-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": org_name,
+        "display_name": "Hosted Deploy Org",
+        "status": "active",
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    add_internal_headers(
+        server.put(&format!(
+            "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}"
+        )),
+        &format!("hosted-member-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "display_name": "Hosted Deploy User",
+        "role": "owner",
+        "active": true,
+        "version": 1,
+    }))
+    .await
+    .assert_status_ok();
+
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}/entitlements")),
+        &format!("hosted-entitlement-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "version": 1,
+        "deploy_allowed": true,
+        "block_reason": null,
+        "limits": {
+            "name": "starter",
+            "max_apps": 2,
+            "max_cpu": "2",
+            "max_memory": "4Gi",
+            "max_storage": "20Gi"
+        }
+    }))
+    .await
+    .assert_status_ok();
+}
+
+fn github_signer_subject() -> &'static str {
+    "https://github.com/acme/confidential-app/.github/workflows/build.yml@refs/heads/main"
+}
+
+fn github_signer_issuer() -> &'static str {
+    "https://token.actions.githubusercontent.com"
 }
 
 fn device_code_hash(code: &str) -> Vec<u8> {
@@ -342,6 +449,834 @@ async fn device_login_approved_code_is_single_use_and_still_expires() {
     let expired_body: Value = expired_poll.json();
     assert_eq!(expired_body["status"], "expired");
     assert_eq!(expired_body["auth"], Value::Null);
+}
+
+#[tokio::test]
+async fn paas_internal_org_member_and_entitlement_sync_are_idempotent() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("paas-{}", &suffix[..16]);
+
+    let missing_san = server
+        .put(&format!("/internal/paas/orgs/{paas_org_id}"))
+        .add_header("authorization", "Bearer cap-internal-current")
+        .add_header("idempotency-key", format!("org-missing-san-{suffix}"))
+        .json(&serde_json::json!({
+            "name": org_name,
+            "display_name": "PaaS Managed",
+            "status": "active",
+        }))
+        .await;
+    missing_san.assert_status(StatusCode::UNAUTHORIZED);
+
+    let create_org = add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}")),
+        &format!("org-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": org_name,
+        "display_name": "PaaS Managed",
+        "status": "active",
+    }))
+    .await;
+    create_org.assert_status(StatusCode::CREATED);
+    let created_body: Value = create_org.json();
+    let cap_org_id =
+        Uuid::parse_str(created_body["cap_org_id"].as_str().expect("cap org id")).unwrap();
+    assert_eq!(created_body["paas_org_id"], paas_org_id);
+
+    let replay = add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}")),
+        &format!("org-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": org_name,
+        "display_name": "PaaS Managed",
+        "status": "active",
+    }))
+    .await;
+    replay.assert_status(StatusCode::CREATED);
+    let replay_body: Value = replay.json();
+    assert_eq!(replay_body["cap_org_id"], cap_org_id.to_string());
+
+    let mismatch = add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}")),
+        &format!("org-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": format!("paas-different-{}", &suffix[..8]),
+        "display_name": "PaaS Managed",
+        "status": "active",
+    }))
+    .await;
+    mismatch.assert_status(StatusCode::CONFLICT);
+    let mismatch_body: Value = mismatch.json();
+    assert_eq!(mismatch_body["error"], "idempotency_key_reused");
+
+    let sync_member = add_internal_headers(
+        server.put(&format!(
+            "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}"
+        )),
+        &format!("member-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "display_name": "PaaS User",
+        "role": "owner",
+        "active": true,
+        "version": 7,
+    }))
+    .await;
+    sync_member.assert_status_ok();
+    let member_body: Value = sync_member.json();
+    let cap_user_id =
+        Uuid::parse_str(member_body["cap_user_id"].as_str().expect("cap user id")).unwrap();
+    assert_eq!(member_body["role"], "owner");
+
+    let sync_entitlement = add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}/entitlements")),
+        &format!("entitlement-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "version": 3,
+        "deploy_allowed": true,
+        "block_reason": null,
+        "limits": {
+            "name": "starter",
+            "max_apps": 2,
+            "max_cpu": "2",
+            "max_memory": "4Gi",
+            "max_storage": "20Gi"
+        }
+    }))
+    .await;
+    sync_entitlement.assert_status_ok();
+
+    let management: (String, String) =
+        sqlx::query_as("SELECT mode, status FROM organization_management WHERE org_id = $1")
+            .bind(cap_org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("organization management row");
+    assert_eq!(
+        management,
+        ("paas_managed".to_string(), "active".to_string())
+    );
+
+    let member: (String, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+        "SELECT role::text, removed_at FROM memberships WHERE org_id = $1 AND user_id = $2",
+    )
+    .bind(cap_org_id)
+    .bind(cap_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("synced membership");
+    assert_eq!(member.0, "owner");
+    assert_eq!(member.1, None);
+
+    let entitlement: (i64, bool, Value) = sqlx::query_as(
+        "SELECT version, deploy_allowed, limits FROM organization_entitlements WHERE org_id = $1",
+    )
+    .bind(cap_org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("synced entitlement");
+    assert_eq!(entitlement.0, 3);
+    assert_eq!(entitlement.1, true);
+    assert_eq!(entitlement.2["max_apps"], 2);
+}
+
+#[tokio::test]
+async fn standalone_cap_does_not_mount_paas_internal_routes() {
+    let (state, _pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    let response = add_internal_headers(
+        server.put("/internal/paas/orgs/standalone-route-check"),
+        "standalone-route-check",
+    )
+    .json(&serde_json::json!({
+        "name": "standalone-route-check",
+        "display_name": "Standalone Route Check",
+        "status": "active",
+    }))
+    .await;
+
+    response.assert_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn paas_managed_orgs_fail_closed_and_block_public_writes() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let hmac_key = state.hmac_key.clone();
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("guard-{}", &suffix[..16]);
+
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}")),
+        &format!("guard-org-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": org_name,
+        "display_name": "Guarded Org",
+        "status": "active",
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    add_internal_headers(
+        server.put(&format!(
+            "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}"
+        )),
+        &format!("guard-member-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "display_name": "Guarded User",
+        "role": "owner",
+        "active": true,
+        "version": 1,
+    }))
+    .await
+    .assert_status_ok();
+
+    let cap_user_id: Uuid = sqlx::query_scalar(
+        "SELECT cap_id FROM paas_external_mappings WHERE resource_type = 'user' AND paas_external_id = $1",
+    )
+    .bind(&paas_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("cap user mapping");
+    let session_token = issue_session_token(&hmac_key, cap_user_id).expect("session token");
+
+    let missing_entitlement = server
+        .get("/users/me")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .add_header("x-enclava-org", &org_name)
+        .authorization_bearer(&session_token)
+        .await;
+    missing_entitlement.assert_status_ok();
+    let missing_body: Value = missing_entitlement.json();
+    assert_eq!(missing_body["active_org"]["deploy_allowed"], false);
+    assert_eq!(
+        missing_body["active_org"]["deploy_block_reason"],
+        "paas_managed_entitlement_missing"
+    );
+
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}/entitlements")),
+        &format!("guard-entitlement-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "version": 1,
+        "deploy_allowed": true,
+        "block_reason": null,
+        "limits": {
+            "name": "starter",
+            "max_apps": 2,
+            "max_cpu": "2",
+            "max_memory": "4Gi",
+            "max_storage": "20Gi"
+        }
+    }))
+    .await
+    .assert_status_ok();
+
+    let entitled = server
+        .get("/users/me")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .add_header("x-enclava-org", &org_name)
+        .authorization_bearer(&session_token)
+        .await;
+    entitled.assert_status_ok();
+    let entitled_body: Value = entitled.json();
+    assert_eq!(entitled_body["active_org"]["deploy_allowed"], true);
+    assert_eq!(
+        entitled_body["active_org"]["deploy_block_reason"],
+        Value::Null
+    );
+
+    let public_create = server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .add_header("x-enclava-org", &org_name)
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": format!("blocked-{}", &suffix[..8]),
+            "unlock_mode": "auto",
+        }))
+        .await;
+    public_create.assert_status(StatusCode::FORBIDDEN);
+    let public_body: Value = public_create.json();
+    assert_eq!(public_body["error"], "paas_managed_instance");
+}
+
+#[tokio::test]
+async fn paas_internal_domain_challenge_does_not_reenter_public_write_guard() {
+    let (state, _pool) = setup_paas_managed_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("domain-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+    let domain = format!("dashboard-{}.example.com", &suffix[..12]);
+
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}")),
+        &format!("domain-org-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": org_name,
+        "display_name": "Domain Bridge Org",
+        "status": "active",
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    add_internal_headers(
+        server.put(&format!(
+            "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}"
+        )),
+        &format!("domain-member-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "display_name": "Domain Bridge User",
+        "role": "owner",
+        "active": true,
+        "version": 1,
+    }))
+    .await
+    .assert_status_ok();
+
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}/entitlements")),
+        &format!("domain-entitlement-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "version": 1,
+        "deploy_allowed": true,
+        "block_reason": null,
+        "limits": {
+            "name": "starter",
+            "max_apps": 2,
+            "max_cpu": "2",
+            "max_memory": "4Gi",
+            "max_storage": "20Gi"
+        }
+    }))
+    .await
+    .assert_status_ok();
+
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("domain-app-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "auto",
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let challenge = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domains"
+        )),
+        &format!("domain-challenge-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&serde_json::json!({ "domain": domain }))
+    .await;
+    challenge.assert_status_ok();
+    let challenge_body: Value = challenge.json();
+    assert_eq!(challenge_body["domain"], domain);
+    assert!(
+        challenge_body["txt_record_value"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("enclava-domain-verification="))
+    );
+}
+
+#[tokio::test]
+async fn paas_internal_config_sync_bypasses_public_paas_managed_write_guard() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("cfg-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}")),
+        &format!("config-org-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": org_name,
+        "display_name": "Config Sync Org",
+        "status": "active",
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    add_internal_headers(
+        server.put(&format!(
+            "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}"
+        )),
+        &format!("config-member-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "display_name": "Config Sync User",
+        "role": "owner",
+        "active": true,
+        "version": 1,
+    }))
+    .await
+    .assert_status_ok();
+
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}/entitlements")),
+        &format!("config-entitlement-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "version": 1,
+        "deploy_allowed": true,
+        "block_reason": null,
+        "limits": {
+            "name": "starter",
+            "max_apps": 2,
+            "max_cpu": "2",
+            "max_memory": "4Gi",
+            "max_storage": "20Gi"
+        }
+    }))
+    .await
+    .assert_status_ok();
+
+    let create_app = add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("config-app-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "auto",
+    }))
+    .await;
+    create_app.assert_status(StatusCode::CREATED);
+    let create_app_body: Value = create_app.json();
+    let cap_app_id =
+        Uuid::parse_str(create_app_body["cap_app_id"].as_str().expect("cap app id")).unwrap();
+
+    let sync = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config/sync"
+        )),
+        &format!("config-sync-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&serde_json::json!({
+        "key_name": "SMOKE_SECRET",
+    }))
+    .await;
+    sync.assert_status_ok();
+    let sync_body: Value = sync.json();
+    assert_eq!(sync_body["status"], "synced");
+
+    let key: String = sqlx::query_scalar("SELECT key_name FROM config_metadata WHERE app_id = $1")
+        .bind(cap_app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("config metadata row");
+    assert_eq!(key, "SMOKE_SECRET");
+
+    let delete = add_internal_actor_headers(
+        server.delete(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config/SMOKE_SECRET/meta"
+        )),
+        &format!("config-delete-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&serde_json::json!({}))
+    .await;
+    delete.assert_status(StatusCode::NO_CONTENT);
+
+    let remaining: Option<String> =
+        sqlx::query_scalar("SELECT key_name FROM config_metadata WHERE app_id = $1")
+            .bind(cap_app_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("config metadata lookup after delete");
+    assert_eq!(remaining, None);
+}
+
+#[tokio::test]
+async fn paas_internal_create_app_persists_cli_signer_identity() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("pins-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+
+    let create = add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("hosted-app-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "signer_identity_subject": github_signer_subject(),
+        "signer_identity_issuer": github_signer_issuer(),
+    }))
+    .await;
+    create.assert_status(StatusCode::CREATED);
+    let create_body: Value = create.json();
+
+    let pinned: (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT namespace,
+                  instance_id,
+                  service_account,
+                  bootstrap_owner_pubkey_hash,
+                  tenant_instance_identity_hash,
+                  signer_identity_subject,
+                  signer_identity_issuer
+           FROM apps
+          WHERE name = $1",
+    )
+    .bind(&app_name)
+    .fetch_one(&pool)
+    .await
+    .expect("app signer pins");
+    assert_eq!(pinned.5.as_deref(), Some(github_signer_subject()));
+    assert_eq!(pinned.6.as_deref(), Some(github_signer_issuer()));
+    assert_eq!(create_body["namespace"], pinned.0);
+    assert_eq!(create_body["instance_id"], pinned.1);
+    assert_eq!(create_body["service_account"], pinned.2);
+    assert_eq!(create_body["bootstrap_owner_pubkey_hash"], pinned.3);
+    assert_eq!(create_body["tenant_instance_identity_hash"], pinned.4);
+}
+
+#[tokio::test]
+async fn paas_internal_deploy_reuses_signed_deploy_gate() {
+    let (mut state, pool) = setup_paas_managed_test_state().await;
+    state.require_customer_signed_policy_artifact = true;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("deploy-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("hosted-deploy-app-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    sqlx::query(
+        "UPDATE apps
+            SET signer_identity_subject = $1,
+                signer_identity_issuer = $2,
+                signer_identity_set_at = now()
+          WHERE name = $3",
+    )
+    .bind(github_signer_subject())
+    .bind(github_signer_issuer())
+    .bind(&app_name)
+    .execute(&pool)
+    .await
+    .expect("set signer pins");
+
+    let response = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/deploy"
+        )),
+        &format!("hosted-deploy-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&serde_json::json!({
+        "image": "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }))
+    .await;
+
+    response.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = response.json();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("signed policy deployments require"),
+        "unexpected response body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn paas_internal_agent_policy_route_reaches_cap_policy_broker() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("policy-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("hosted-policy-app-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "password",
+        "bootstrap_pubkey_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "signer_identity_subject": github_signer_subject(),
+        "signer_identity_issuer": github_signer_issuer(),
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let (
+        cap_org_id,
+        org_slug,
+        cap_app_id,
+        domain,
+        tee_domain,
+        namespace,
+        service_account,
+        identity_hash_hex,
+    ): (
+        Uuid,
+        String,
+        Uuid,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT o.id,
+                o.cust_slug,
+                a.id,
+                a.domain,
+                a.tee_domain,
+                a.namespace,
+                a.service_account,
+                a.tenant_instance_identity_hash
+           FROM apps a
+           JOIN organizations o ON o.id = a.org_id
+          WHERE a.name = $1",
+    )
+    .bind(&app_name)
+    .fetch_one(&pool)
+    .await
+    .expect("app descriptor inputs");
+    let identity_hash: [u8; 32] = hex::decode(identity_hash_hex)
+        .expect("decode identity hash")
+        .try_into()
+        .expect("identity hash length");
+    let descriptor = DeploymentDescriptor {
+        schema_version: "v1".to_string(),
+        org_id: cap_org_id,
+        org_slug,
+        app_id: cap_app_id,
+        app_name: app_name.clone(),
+        deploy_id: Uuid::new_v4(),
+        created_at: Utc::now(),
+        nonce: [7; 32],
+        app_domain: domain,
+        tee_domain: tee_domain.expect("tee domain"),
+        custom_domains: vec![],
+        namespace,
+        service_account,
+        identity_hash,
+        image_ref: "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        image_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        signer_identity: SignerIdentity {
+            subject: github_signer_subject().to_string(),
+            issuer: github_signer_issuer().to_string(),
+        },
+        oci_runtime_spec: OciRuntimeSpec {
+            command: vec![],
+            args: vec!["/usr/local/bin/app".to_string()],
+            env: vec![EnvVar {
+                name: "RUST_LOG".to_string(),
+                value: "info".to_string(),
+            }],
+            ports: vec![Port {
+                container_port: 8000,
+                protocol: "TCP".to_string(),
+            }],
+            mounts: vec![],
+            capabilities: Capabilities::default(),
+            security_context: SecurityContext::default(),
+            resources: Resources::default(),
+        },
+        sidecars: Sidecars {
+            attestation_proxy_digest:
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            caddy_digest:
+                "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+        },
+        api_signing_pubkey: "test-api-signing-pubkey".to_string(),
+        expected_firmware_measurement: [3; 32],
+        expected_runtime_class: "kata-qemu-snp".to_string(),
+        kbs_resource_path: format!("default/{app_name}-owner"),
+        unlock_mode: "password".to_string(),
+        policy_template_id: "enclava-kbs-policy-v1".to_string(),
+        policy_template_sha256: [4; 32],
+        platform_release_version: "cap-test".to_string(),
+        expected_agent_policy_hash: [5; 32],
+        expected_cc_init_data_hash: [6; 32],
+        expected_kbs_policy_hash: [7; 32],
+    };
+
+    let response = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/agent-policy"
+        )),
+        &format!("hosted-agent-policy-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&serde_json::json!({ "descriptor": descriptor }))
+    .await;
+
+    response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = response.json();
+    assert_eq!(body["error"], "platform signing service is not configured");
+}
+
+#[tokio::test]
+async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_preconditions() {
+    let (mut state, pool) = setup_paas_managed_test_state().await;
+    state.require_customer_signed_policy_artifact = true;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("generic-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+    let external_id = format!("deploy-{suffix}");
+
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}")),
+        &format!("generic-org-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": org_name,
+        "display_name": "Generic Deploy Org",
+        "status": "active",
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    add_internal_headers(
+        server.put(&format!(
+            "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}"
+        )),
+        &format!("generic-member-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "display_name": "Generic Deploy User",
+        "role": "owner",
+        "active": true,
+        "version": 1,
+    }))
+    .await
+    .assert_status_ok();
+
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}/entitlements")),
+        &format!("generic-entitlement-sync-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "version": 1,
+        "deploy_allowed": true,
+        "block_reason": null,
+        "limits": {
+            "name": "starter",
+            "max_apps": 2,
+            "max_cpu": "2",
+            "max_memory": "4Gi",
+            "max_storage": "20Gi"
+        }
+    }))
+    .await
+    .assert_status_ok();
+
+    let response = add_internal_actor_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/deployments")),
+        &format!("generic-deploy-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&generic_deployment_body(
+        &external_id,
+        &app_name,
+        "github",
+        "acme/confidential-app",
+        "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "https://github.com/acme/confidential-app/.github/workflows/build.yml@refs/heads/main",
+        "https://token.actions.githubusercontent.com",
+    ))
+    .await;
+
+    response.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = response.json();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("signed policy deployments require"),
+        "unexpected response body: {body}"
+    );
+
+    let cap_org_id: Uuid = sqlx::query_scalar(
+        "SELECT cap_id FROM paas_external_mappings WHERE resource_type = 'organization' AND paas_external_id = $1",
+    )
+    .bind(&paas_org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("cap org mapping");
+    assert_eq!(
+        persisted_app_source(&pool, cap_org_id, &app_name).await,
+        ("github".to_string(), "acme/confidential-app".to_string())
+    );
 }
 
 #[tokio::test]

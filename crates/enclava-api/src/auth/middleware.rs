@@ -31,6 +31,15 @@ pub struct AuthContext {
     pub role: crate::models::Role,
     /// If authenticated via API key, contains the key metadata.
     pub api_key: Option<ValidatedApiKey>,
+    /// Whether this context came from public CAP auth or the PaaS internal
+    /// bridge. External callers cannot set this field through request input.
+    pub management_origin: ManagementOrigin,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ManagementOrigin {
+    Public,
+    PaasInternal,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -218,6 +227,7 @@ impl FromRequestParts<AppState> for AuthContext {
             org_name,
             role,
             api_key,
+            management_origin: ManagementOrigin::Public,
         })
     }
 }
