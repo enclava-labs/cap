@@ -173,8 +173,8 @@ mod namespace_bind;
 use namespace_bind::{
     ExpectedIdentity, SentinelRecord, WorkloadNamespace, bind_mount_plan_for_workload,
     find_workload_pid_by_env, mount_source_path_after_workload_chroot, parse_sentinel_record,
-    paths_resolve_to_same_object, validate_sentinel_name, validate_sentinel_record,
-    workload_proc_root_path,
+    paths_resolve_to_same_object, proc_self_fd_path, validate_sentinel_name,
+    validate_sentinel_record, workload_proc_root_path, workload_target_path,
 };
 use namespace_bind::{
     app_bind_mount_dir, bind_mounts_into_workload_namespaces, run_bind_mount_into_ns,

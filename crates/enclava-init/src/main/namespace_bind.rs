@@ -1,4 +1,5 @@
 use super::*;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Component;
 use std::thread;
@@ -462,40 +463,58 @@ pub(super) fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         .map_err(|_| anyhow!("invalid pid {}", args[0]))?;
     let source = PathBuf::from(&args[1]);
     let target = PathBuf::from(&args[2]);
-    let _source_dir = std::fs::File::open(&source)
+    let source_dir = std::fs::File::open(&source)
         .with_context(|| format!("open source {}", source.display()))?;
     std::fs::metadata(&source).with_context(|| format!("stat source {}", source.display()))?;
     let ns = std::fs::File::open(format!("/proc/{pid}/ns/mnt"))
         .with_context(|| format!("opening mount namespace for pid {pid}"))?;
     nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNS)
         .with_context(|| format!("setns to pid {pid} mount namespace"))?;
-    let workload_root = workload_proc_root_path(pid);
-    std::env::set_current_dir(&workload_root)
-        .with_context(|| format!("entering workload root {}", workload_root.display()))?;
-    nix::unistd::chroot(&workload_root)
-        .with_context(|| format!("chroot to workload root {}", workload_root.display()))?;
-    std::env::set_current_dir("/").context("entering chroot /")?;
-    let source_mount_path = mount_source_path_after_workload_chroot(&source);
-    std::fs::create_dir_all(&target)
-        .with_context(|| format!("creating target {}", target.display()))?;
-    if paths_resolve_to_same_object(&source_mount_path, &target).with_context(|| {
+    let source_mount_path = proc_self_fd_path(source_dir.as_raw_fd());
+    let target_mount_path = workload_target_path(pid, &target)?;
+    std::fs::create_dir_all(&target_mount_path)
+        .with_context(|| format!("creating target {}", target_mount_path.display()))?;
+    if paths_resolve_to_same_object(&source_mount_path, &target_mount_path).with_context(|| {
         format!(
             "checking whether {} is already mounted at {}",
             source.display(),
-            target.display()
+            target_mount_path.display()
         )
     })? {
         return Ok(());
     }
     nix::mount::mount(
         Some(source_mount_path.as_path()),
-        target.as_path(),
+        target_mount_path.as_path(),
         None::<&str>,
         nix::mount::MsFlags::MS_BIND,
         None::<&str>,
     )
-    .with_context(|| format!("bind mounting {} to {}", source.display(), target.display()))?;
+    .with_context(|| {
+        format!(
+            "bind mounting {} to {}",
+            source.display(),
+            target_mount_path.display()
+        )
+    })?;
     Ok(())
+}
+
+pub(super) fn proc_self_fd_path(fd: RawFd) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{fd}"))
+}
+
+pub(super) fn workload_target_path(pid: u32, target: &Path) -> Result<PathBuf> {
+    if !target.is_absolute() {
+        return Err(anyhow!(
+            "workload bind target must be absolute: {}",
+            target.display()
+        ));
+    }
+    let rel = target
+        .strip_prefix("/")
+        .with_context(|| format!("normalizing target {}", target.display()))?;
+    Ok(workload_proc_root_path(pid).join(rel))
 }
 
 pub(super) fn mount_source_path_after_workload_chroot(source: &Path) -> PathBuf {

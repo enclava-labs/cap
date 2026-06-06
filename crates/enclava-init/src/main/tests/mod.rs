@@ -76,6 +76,16 @@ fn namespace_bind_chroot_source_strips_init_proc_root() {
 }
 
 #[test]
+fn namespace_bind_uses_fd_source_and_workload_proc_target() {
+    assert_eq!(proc_self_fd_path(17), PathBuf::from("/proc/self/fd/17"));
+    assert_eq!(
+        workload_target_path(42, Path::new("/app/logs")).unwrap(),
+        PathBuf::from("/proc/42/root/app/logs")
+    );
+    assert!(workload_target_path(42, Path::new("relative/path")).is_err());
+}
+
+#[test]
 fn caddy_tls_bind_source_is_below_tls_state_root() {
     assert_eq!(
         caddy_tls_bind_dir(Path::new("/state/tls-state")),
