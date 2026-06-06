@@ -21,6 +21,8 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+const CAP_ALLOW_INTERNAL_TENANT_TLS: &str = "CAP_ALLOW_INTERNAL_TENANT_TLS";
+
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -83,10 +85,29 @@ fn require_env_matches_release(
     expected: &str,
     redact_values: bool,
 ) -> anyhow::Result<()> {
-    let Some(actual) = env_nonempty(name) else {
+    require_env_value_matches_release(
+        name,
+        env_nonempty(name),
+        expected,
+        redact_values,
+        env_flag(CAP_ALLOW_INTERNAL_TENANT_TLS),
+    )
+}
+
+fn require_env_value_matches_release(
+    name: &str,
+    actual: Option<String>,
+    expected: &str,
+    redact_values: bool,
+    allow_internal_tenant_tls: bool,
+) -> anyhow::Result<()> {
+    let Some(actual) = actual else {
         anyhow::bail!("{name} is required by signed platform release");
     };
     if actual.trim() != expected.trim() {
+        if release_conflict_allowed(name, &actual, expected, allow_internal_tenant_tls) {
+            return Ok(());
+        }
         if redact_values {
             anyhow::bail!("{name} conflicts with signed platform release");
         }
@@ -96,6 +117,17 @@ fn require_env_matches_release(
         );
     }
     Ok(())
+}
+
+fn release_conflict_allowed(
+    name: &str,
+    actual: &str,
+    _expected: &str,
+    allow_internal_tenant_tls: bool,
+) -> bool {
+    name == "TENANT_CADDY_TLS_MODE"
+        && allow_internal_tenant_tls
+        && actual.trim().eq_ignore_ascii_case("internal")
 }
 
 fn build_tenant_tee_http_client() -> anyhow::Result<reqwest::Client> {
@@ -341,9 +373,28 @@ fn release_env_value(
     release_value: Option<&str>,
     required: bool,
 ) -> anyhow::Result<Option<String>> {
-    match (env_nonempty(env_name), release_value) {
+    release_env_value_from(
+        env_name,
+        env_nonempty(env_name),
+        release_value,
+        required,
+        env_flag(CAP_ALLOW_INTERNAL_TENANT_TLS),
+    )
+}
+
+fn release_env_value_from(
+    env_name: &str,
+    env_value: Option<String>,
+    release_value: Option<&str>,
+    required: bool,
+    allow_internal_tenant_tls: bool,
+) -> anyhow::Result<Option<String>> {
+    match (env_value, release_value) {
         (Some(value), Some(expected)) => {
             if value != expected {
+                if release_conflict_allowed(env_name, &value, expected, allow_internal_tenant_tls) {
+                    return Ok(Some(value));
+                }
                 anyhow::bail!(
                     "{env_name} conflicts with signed platform release: env `{value}` != release `{expected}`"
                 );
@@ -411,7 +462,8 @@ fn load_attestation_config(
     let tls_certificate_broker_url = load_url_env(
         "TLS_CERTIFICATE_BROKER_URL",
         trustee_policy_read_available && caddy_tls_mode == CaddyTlsMode::Dns01Broker,
-    )?;
+    )?
+    .filter(|_| caddy_tls_mode == CaddyTlsMode::Dns01Broker);
     let trustee_policy_url = load_url_env("TRUSTEE_POLICY_URL", trustee_policy_read_available)?;
     let release_pubkey =
         platform_release.map(|release| release.signing_service_pubkey_hex.as_str());
@@ -483,8 +535,7 @@ fn load_dns_config() -> anyhow::Result<Option<DnsConfig>> {
 fn load_acme_config(attestation: Option<&AttestationConfig>) -> anyhow::Result<Option<AcmeConfig>> {
     let broker_enabled = attestation
         .and_then(|cfg| cfg.tls_certificate_broker_url.as_ref())
-        .is_some()
-        || env_nonempty("TLS_CERTIFICATE_BROKER_URL").is_some();
+        .is_some();
     if !broker_enabled {
         return Ok(None);
     }
@@ -818,5 +869,56 @@ mod tests {
             err.to_string().contains("TENANT_TEE_CA_CERT_PEM"),
             "error should name the invalid tenant TEE CA env var: {err}"
         );
+    }
+
+    #[test]
+    fn release_env_value_rejects_unapproved_platform_release_conflict() {
+        let err = release_env_value_from(
+            "TENANT_CADDY_TLS_MODE",
+            Some("internal".to_string()),
+            Some("dns01-broker"),
+            false,
+            false,
+        )
+        .expect_err("internal TLS must not override a signed release without explicit gate");
+
+        assert!(
+            err.to_string()
+                .contains("conflicts with signed platform release"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn release_env_value_allows_explicit_internal_tenant_tls_override() {
+        let value = release_env_value_from(
+            "TENANT_CADDY_TLS_MODE",
+            Some("internal".to_string()),
+            Some("dns01-broker"),
+            false,
+            true,
+        )
+        .expect("explicit internal TLS override should be allowed");
+
+        assert_eq!(value.as_deref(), Some("internal"));
+    }
+
+    #[test]
+    fn startup_release_match_allows_explicit_internal_tenant_tls_override() {
+        require_env_value_matches_release(
+            "TENANT_CADDY_TLS_MODE",
+            Some("internal".to_string()),
+            "dns01-broker",
+            false,
+            true,
+        )
+        .expect("explicit internal TLS override should pass release match gate");
+    }
+
+    #[test]
+    fn acme_config_is_disabled_without_attestation_broker() {
+        let acme = load_acme_config(None).expect("missing broker should be valid");
+
+        assert!(acme.is_none());
     }
 }

@@ -16,6 +16,7 @@ pub enum EnvGateError {
 }
 
 const CAP_ALLOW_PRODUCTION_ACME: &str = "CAP_ALLOW_PRODUCTION_ACME";
+const CAP_ALLOW_INTERNAL_TENANT_TLS: &str = "CAP_ALLOW_INTERNAL_TENANT_TLS";
 const LETS_ENCRYPT_PRODUCTION_DIRECTORY_URL: &str =
     "https://acme-v02.api.letsencrypt.org/directory";
 
@@ -93,6 +94,7 @@ fn enforce_with(
 
         if let Some(mode) = lookup("TENANT_CADDY_TLS_MODE")
             && mode.trim().eq_ignore_ascii_case("internal")
+            && !lookup(CAP_ALLOW_INTERNAL_TENANT_TLS).is_some_and(|value| flag_is_truthy(&value))
         {
             return Err(EnvGateError::DebugOnlyFlagInRelease(
                 "TENANT_CADDY_TLS_MODE",
@@ -188,6 +190,15 @@ mod tests {
             err,
             EnvGateError::DebugOnlyFlagInRelease("TENANT_CADDY_TLS_MODE")
         ));
+    }
+
+    #[test]
+    fn release_allows_internal_caddy_tls_mode_with_explicit_preprod_override() {
+        let mut env = ok_required();
+        env.insert("TENANT_CADDY_TLS_MODE", "internal");
+        env.insert("CAP_ALLOW_INTERNAL_TENANT_TLS", "true");
+
+        run(env, false).expect("explicit preprod internal TLS override should be allowed");
     }
 
     #[test]
