@@ -238,10 +238,14 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: err,
         })?;
     if tls_mode == enclava_engine::types::CaddyTlsMode::Internal {
-        return Err(PlatformReleaseError::InvalidField {
-            field: "tenant_caddy_tls_mode",
-            message: "internal mode is only allowed for dev fixtures/local tests".to_string(),
-        });
+        if !internal_tenant_tls_override_enabled() {
+            return Err(PlatformReleaseError::InvalidField {
+                field: "tenant_caddy_tls_mode",
+                message:
+                    "internal mode requires CAP_ALLOW_INTERNAL_TENANT_TLS=true for preprod use"
+                        .to_string(),
+            });
+        }
     }
     reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
         PlatformReleaseError::InvalidField {
@@ -261,9 +265,27 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
     Ok(())
 }
 
+fn internal_tenant_tls_override_enabled() -> bool {
+    [
+        "CAP_ALLOW_INTERNAL_TENANT_TLS",
+        "ENCLAVA_ALLOW_INTERNAL_TENANT_TLS",
+    ]
+    .iter()
+    .filter_map(|name| std::env::var(name).ok())
+    .any(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn bundled_release_verifies_and_hashes_template() {
@@ -316,9 +338,33 @@ mod tests {
         let mut payload = raw.payload;
         payload.tenant_caddy_tls_mode = "internal".to_string();
 
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("CAP_ALLOW_INTERNAL_TENANT_TLS");
+            std::env::remove_var("ENCLAVA_ALLOW_INTERNAL_TENANT_TLS");
+        }
         let err = validate_release_payload(&payload).unwrap_err();
         assert!(
             matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_tls_mode")
         );
+    }
+
+    #[test]
+    fn release_payload_allows_internal_caddy_tls_with_explicit_preprod_override() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.tenant_caddy_tls_mode = "internal".to_string();
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("CAP_ALLOW_INTERNAL_TENANT_TLS", "true");
+            std::env::remove_var("ENCLAVA_ALLOW_INTERNAL_TENANT_TLS");
+        }
+        let result = validate_release_payload(&payload);
+        unsafe {
+            std::env::remove_var("CAP_ALLOW_INTERNAL_TENANT_TLS");
+        }
+
+        result.unwrap();
     }
 }
