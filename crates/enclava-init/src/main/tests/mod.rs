@@ -67,14 +67,14 @@ fn namespace_bind_chroots_to_workload_proc_root() {
 }
 
 #[test]
-fn namespace_bind_uses_init_proc_source_and_workload_proc_target() {
+fn namespace_bind_uses_init_proc_source_and_chrooted_workload_target() {
     assert_eq!(
         namespace_source(11, "/state/app-logs"),
         PathBuf::from("/proc/11/root/state/app-logs")
     );
     assert_eq!(
         workload_target_path(42, Path::new("/app/logs")).unwrap(),
-        PathBuf::from("/proc/42/root/app/logs")
+        PathBuf::from("/app/logs")
     );
     assert!(workload_target_path(42, Path::new("relative/path")).is_err());
 }

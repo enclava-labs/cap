@@ -469,6 +469,12 @@ pub(super) fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
         .with_context(|| format!("opening mount namespace for pid {pid}"))?;
     nix::sched::setns(&ns, nix::sched::CloneFlags::CLONE_NEWNS)
         .with_context(|| format!("setns to pid {pid} mount namespace"))?;
+    let workload_root = workload_proc_root_path(pid);
+    std::env::set_current_dir(&workload_root)
+        .with_context(|| format!("entering workload root {}", workload_root.display()))?;
+    nix::unistd::chroot(&workload_root)
+        .with_context(|| format!("chroot to workload root {}", workload_root.display()))?;
+    std::env::set_current_dir("/").context("entering chroot /")?;
     let source_mount_path = source.clone();
     let target_mount_path = workload_target_path(pid, &target)?;
     std::fs::create_dir_all(&target_mount_path)
@@ -499,17 +505,14 @@ pub(super) fn run_bind_mount_into_ns(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn workload_target_path(pid: u32, target: &Path) -> Result<PathBuf> {
+pub(super) fn workload_target_path(_pid: u32, target: &Path) -> Result<PathBuf> {
     if !target.is_absolute() {
         return Err(anyhow!(
             "workload bind target must be absolute: {}",
             target.display()
         ));
     }
-    let rel = target
-        .strip_prefix("/")
-        .with_context(|| format!("normalizing target {}", target.display()))?;
-    Ok(workload_proc_root_path(pid).join(rel))
+    Ok(target.to_path_buf())
 }
 
 pub(super) fn workload_proc_root_path(pid: u32) -> PathBuf {
