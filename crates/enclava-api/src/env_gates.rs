@@ -9,7 +9,15 @@ pub enum EnvGateError {
     DebugOnlyFlagInRelease(&'static str),
     #[error("env var `{0}` must be set and non-empty")]
     MissingRequired(&'static str),
+    #[error(
+        "ACME directory `{0}` points at production Let's Encrypt; set CAP_ALLOW_PRODUCTION_ACME=true only for production CAP"
+    )]
+    ProductionAcmeWithoutExplicitAllow(&'static str),
 }
+
+const CAP_ALLOW_PRODUCTION_ACME: &str = "CAP_ALLOW_PRODUCTION_ACME";
+const LETS_ENCRYPT_PRODUCTION_DIRECTORY_URL: &str =
+    "https://acme-v02.api.letsencrypt.org/directory";
 
 const DEBUG_ONLY_FLAGS: &[&str] = &[
     "SKIP_COSIGN_VERIFY",
@@ -26,6 +34,36 @@ fn flag_is_truthy(value: &str) -> bool {
 
 fn debug_assertions_on() -> bool {
     cfg!(debug_assertions)
+}
+
+fn is_letsencrypt_production_acme_url(value: &str) -> bool {
+    value
+        .trim()
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(LETS_ENCRYPT_PRODUCTION_DIRECTORY_URL)
+}
+
+fn validate_acme_directory_url(
+    source_name: &'static str,
+    value: &str,
+    production_acme_allowed: bool,
+) -> Result<(), EnvGateError> {
+    if is_letsencrypt_production_acme_url(value) && !production_acme_allowed {
+        return Err(EnvGateError::ProductionAcmeWithoutExplicitAllow(
+            source_name,
+        ));
+    }
+    Ok(())
+}
+
+pub fn ensure_acme_directory_allowed(
+    source_name: &'static str,
+    value: &str,
+) -> Result<(), EnvGateError> {
+    let production_acme_allowed = std::env::var(CAP_ALLOW_PRODUCTION_ACME)
+        .ok()
+        .is_some_and(|value| flag_is_truthy(&value));
+    validate_acme_directory_url(source_name, value, production_acme_allowed)
 }
 
 /// Apply Phase-0 production gates. Should be called early in `main`, before
@@ -59,6 +97,14 @@ fn enforce_with(
             return Err(EnvGateError::DebugOnlyFlagInRelease(
                 "TENANT_CADDY_TLS_MODE",
             ));
+        }
+
+        let production_acme_allowed =
+            lookup(CAP_ALLOW_PRODUCTION_ACME).is_some_and(|value| flag_is_truthy(&value));
+        for acme_source_name in ["ACME_DIRECTORY_URL", "TENANT_CADDY_ACME_CA"] {
+            if let Some(value) = lookup(acme_source_name) {
+                validate_acme_directory_url(acme_source_name, &value, production_acme_allowed)?;
+            }
         }
 
         let api_key_pepper_present = lookup("API_KEY_HMAC_PEPPER")
@@ -219,5 +265,62 @@ mod tests {
             err,
             EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_KBS_URL")
         ));
+    }
+
+    #[test]
+    fn release_rejects_production_acme_without_explicit_allow() {
+        let mut env = ok_required();
+        env.insert(
+            "ACME_DIRECTORY_URL",
+            "https://acme-v02.api.letsencrypt.org/directory",
+        );
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::ProductionAcmeWithoutExplicitAllow("ACME_DIRECTORY_URL")
+        ));
+    }
+
+    #[test]
+    fn release_rejects_production_tenant_caddy_acme_without_explicit_allow() {
+        let mut env = ok_required();
+        env.insert(
+            "TENANT_CADDY_ACME_CA",
+            "https://acme-v02.api.letsencrypt.org/directory",
+        );
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::ProductionAcmeWithoutExplicitAllow("TENANT_CADDY_ACME_CA")
+        ));
+    }
+
+    #[test]
+    fn release_allows_staging_acme() {
+        let mut env = ok_required();
+        env.insert(
+            "ACME_DIRECTORY_URL",
+            "https://acme-staging-v02.api.letsencrypt.org/directory",
+        );
+        env.insert(
+            "TENANT_CADDY_ACME_CA",
+            "https://acme-staging-v02.api.letsencrypt.org/directory",
+        );
+        run(env, false).expect("staging ACME should be allowed by default");
+    }
+
+    #[test]
+    fn release_allows_production_acme_with_explicit_allow() {
+        let mut env = ok_required();
+        env.insert("CAP_ALLOW_PRODUCTION_ACME", "true");
+        env.insert(
+            "ACME_DIRECTORY_URL",
+            "https://acme-v02.api.letsencrypt.org/directory",
+        );
+        env.insert(
+            "TENANT_CADDY_ACME_CA",
+            "https://acme-v02.api.letsencrypt.org/directory",
+        );
+        run(env, false).expect("explicit production ACME override should be allowed");
     }
 }

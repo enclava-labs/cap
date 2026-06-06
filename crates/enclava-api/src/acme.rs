@@ -134,16 +134,13 @@ async fn wait_for_txt_record(
 }
 
 async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
-    let resolver = match TokioResolver::builder_tokio().and_then(|builder| builder.build()) {
-        Ok(r) => r,
-        Err(_) => TokioResolver::builder_with_config(
-            ResolverConfig::udp_and_tcp(&CLOUDFLARE),
-            TokioRuntimeProvider::default(),
-        )
-        .with_options(ResolverOpts::default())
-        .build()
-        .map_err(|e| e.to_string())?,
-    };
+    let resolver = TokioResolver::builder_with_config(
+        ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+        TokioRuntimeProvider::default(),
+    )
+    .with_options(ResolverOpts::default())
+    .build()
+    .map_err(|e| e.to_string())?;
     let response = resolver.txt_lookup(name).await.map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for record in response.answers() {
@@ -220,6 +217,24 @@ mod tests {
         assert!(
             wait_pos < ready_pos,
             "ACME DNS-01 must verify TXT propagation before challenge.set_ready()"
+        );
+    }
+
+    #[test]
+    fn dns01_txt_lookup_does_not_use_cluster_resolver() {
+        let source = include_str!("acme.rs");
+        let lookup = source
+            .split("async fn lookup_txt")
+            .nth(1)
+            .expect("lookup_txt function");
+
+        assert!(
+            !lookup.contains("builder_tokio()"),
+            "ACME DNS-01 TXT self-check must not use the pod's cluster resolver; negative DNS caching can hide newly-created challenge records"
+        );
+        assert!(
+            lookup.contains("ResolverConfig::udp_and_tcp(&CLOUDFLARE)"),
+            "ACME DNS-01 TXT self-check should use an external recursive resolver"
         );
     }
 }

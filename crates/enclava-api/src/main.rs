@@ -443,9 +443,19 @@ fn load_acme_config(attestation: Option<&AttestationConfig>) -> anyhow::Result<O
     if !broker_enabled {
         return Ok(None);
     }
-    let directory_url = env_nonempty("ACME_DIRECTORY_URL")
-        .or_else(|| attestation.map(|cfg| cfg.acme_ca_url.clone()))
-        .unwrap_or_else(enclava_engine::types::default_acme_ca_url);
+    let (directory_url_source, directory_url) =
+        if let Some(directory_url) = env_nonempty("ACME_DIRECTORY_URL") {
+            ("ACME_DIRECTORY_URL", directory_url)
+        } else if let Some(cfg) = attestation {
+            ("TENANT_CADDY_ACME_CA", cfg.acme_ca_url.clone())
+        } else {
+            (
+                "ACME_DIRECTORY_URL default",
+                enclava_engine::types::default_acme_ca_url(),
+            )
+        };
+    enclava_api::env_gates::ensure_acme_directory_allowed(directory_url_source, &directory_url)
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
     reqwest::Url::parse(&directory_url)
         .map_err(|err| anyhow::anyhow!("invalid ACME_DIRECTORY_URL: {err}"))?;
     let account_credentials_path =
