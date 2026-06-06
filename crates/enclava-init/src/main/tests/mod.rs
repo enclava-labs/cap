@@ -67,15 +67,6 @@ fn namespace_bind_chroots_to_workload_proc_root() {
 }
 
 #[test]
-fn namespace_bind_chroot_source_strips_init_proc_root() {
-    let source = Path::new("/proc/10/root/state/data");
-
-    let stripped = mount_source_path_after_workload_chroot(source);
-
-    assert_eq!(stripped, PathBuf::from("/state/data"));
-}
-
-#[test]
 fn namespace_bind_uses_fd_source_and_workload_proc_target() {
     assert_eq!(proc_self_fd_path(17), PathBuf::from("/proc/self/fd/17"));
     assert_eq!(

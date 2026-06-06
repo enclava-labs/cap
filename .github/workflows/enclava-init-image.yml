@@ -42,7 +42,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/enclava-ai/enclava-init
+          images: ghcr.io/enclava-labs/enclava-init
           tags: |
             type=ref,event=branch
             type=sha,prefix=

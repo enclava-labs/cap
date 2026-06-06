@@ -517,20 +517,6 @@ pub(super) fn workload_target_path(pid: u32, target: &Path) -> Result<PathBuf> {
     Ok(workload_proc_root_path(pid).join(rel))
 }
 
-pub(super) fn mount_source_path_after_workload_chroot(source: &Path) -> PathBuf {
-    let source = source.to_string_lossy();
-    let Some(rest) = source.strip_prefix("/proc/") else {
-        return PathBuf::from(source.as_ref());
-    };
-    let Some((pid, path)) = rest.split_once("/root/") else {
-        return PathBuf::from(source.as_ref());
-    };
-    if !pid.bytes().all(|b| b.is_ascii_digit()) {
-        return PathBuf::from(source.as_ref());
-    }
-    PathBuf::from("/").join(path)
-}
-
 pub(super) fn workload_proc_root_path(pid: u32) -> PathBuf {
     PathBuf::from(format!("/proc/{pid}/root"))
 }
