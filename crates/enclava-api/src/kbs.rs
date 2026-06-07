@@ -75,6 +75,8 @@ struct SignedPolicyArtifactRow {
     signed_policy_artifact: serde_json::Value,
 }
 
+const KBS_POLICY_CONFIGMAP_VALUE_SOFT_LIMIT: usize = 850_000;
+
 pub async fn ensure_owner_binding(
     db: &PgPool,
     config: Option<&KbsPolicyConfig>,
@@ -274,6 +276,7 @@ pub async fn reconcile_signed_policy_artifacts(
         r#"
         WITH ranked AS (
             SELECT wa.signed_policy_artifact,
+                   d.created_at,
                    row_number() OVER (
                        PARTITION BY wa.app_id
                        ORDER BY d.created_at DESC
@@ -285,7 +288,7 @@ pub async fn reconcile_signed_policy_artifacts(
         SELECT signed_policy_artifact
         FROM ranked
         WHERE rn <= $1
-        ORDER BY rn
+        ORDER BY created_at DESC
         "#,
     )
     .bind(config.signed_policy_retention)
@@ -301,12 +304,11 @@ pub async fn reconcile_signed_policy_artifacts(
         .map(|row| serde_json::from_value(row.signed_policy_artifact))
         .collect::<Result<_, _>>()?;
 
-    if let Some(extra_artifact) = extra_artifact
-        && !artifacts.iter().any(|artifact| {
-            artifact.metadata.descriptor_core_hash == extra_artifact.metadata.descriptor_core_hash
-        })
-    {
-        artifacts.push(extra_artifact.clone());
+    if let Some(extra_artifact) = extra_artifact {
+        artifacts.retain(|artifact| {
+            artifact.metadata.descriptor_core_hash != extra_artifact.metadata.descriptor_core_hash
+        });
+        artifacts.insert(0, extra_artifact.clone());
     }
 
     let client = kube::Client::try_default().await?;
@@ -337,6 +339,32 @@ pub async fn reconcile_signed_policy_artifacts(
 }
 
 fn signed_policy_artifact_policy_body(
+    artifacts: &[crate::signing_service::SignedPolicyArtifact],
+) -> Result<String, KbsPolicyError> {
+    if artifacts.len() <= 1 {
+        return serialize_signed_policy_artifacts(artifacts);
+    }
+
+    for count in (1..=artifacts.len()).rev() {
+        let body = serialize_signed_policy_artifacts(&artifacts[..count])?;
+        if body.len() <= KBS_POLICY_CONFIGMAP_VALUE_SOFT_LIMIT || count == 1 {
+            if count < artifacts.len() {
+                tracing::warn!(
+                    artifact_count = artifacts.len(),
+                    retained_artifact_count = count,
+                    policy_body_bytes = body.len(),
+                    limit_bytes = KBS_POLICY_CONFIGMAP_VALUE_SOFT_LIMIT,
+                    "trimmed signed KBS policy artifact set to fit ConfigMap payload budget"
+                );
+            }
+            return Ok(body);
+        }
+    }
+
+    serialize_signed_policy_artifacts(artifacts)
+}
+
+fn serialize_signed_policy_artifacts(
     artifacts: &[crate::signing_service::SignedPolicyArtifact],
 ) -> Result<String, KbsPolicyError> {
     if let [artifact] = artifacts {
@@ -832,5 +860,47 @@ owner_resource_bindings := {}
         assert_eq!(parsed["schema_version"], "enclava-signed-policy-set-v1");
         assert_eq!(parsed["artifacts"].as_array().unwrap().len(), 2);
         assert!(is_signed_policy_artifact_body(&body));
+    }
+
+    #[test]
+    fn signed_policy_artifact_body_stays_below_configmap_payload_budget() {
+        let mut artifact = crate::signing_service::SignedPolicyArtifact {
+            metadata: crate::signing_service::PolicyMetadata {
+                app_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                deploy_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                descriptor_core_hash: "aa".repeat(32),
+                descriptor_signing_pubkey: "bb".repeat(32),
+                platform_release_version: "platform-2026.04".to_string(),
+                policy_template_id: "trustee-resource-policy-v1".to_string(),
+                policy_template_sha256: "cc".repeat(32),
+                agent_policy_sha256: "11".repeat(32),
+                genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+                signed_at: "2026-04-01T12:30:00+00:00".to_string(),
+                key_id: "policy-test-key-v1".to_string(),
+            },
+            rego_text: "package policy\n\ndefault allow := false\n".to_string(),
+            rego_sha256: "dd".repeat(32),
+            agent_policy_text: "package agent_policy\n".to_string()
+                + &"allow := true\n".repeat(12_000),
+            agent_policy_sha256: "11".repeat(32),
+            signature: "ee".repeat(64),
+            verify_pubkey_b64: "ZmFrZS1wdWJrZXk=".to_string(),
+            org_keyring: None,
+        };
+        let artifacts = (0..8)
+            .map(|idx| {
+                artifact.metadata.deploy_id = format!("33333333-3333-3333-3333-33333333333{idx}");
+                artifact.clone()
+            })
+            .collect::<Vec<_>>();
+
+        let body = signed_policy_artifact_policy_body(&artifacts).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert!(body.len() <= 850_000, "policy body length: {}", body.len());
+        assert!(
+            parsed["artifacts"].as_array().unwrap().len() < artifacts.len(),
+            "oversized artifact sets should be trimmed before patching KBS"
+        );
     }
 }

@@ -1,5 +1,7 @@
 use super::*;
-use enclava_cli::app_config::{AppSection, ResourcesSection, StorageSection, UnlockSection};
+use enclava_cli::app_config::{
+    AppSection, EgressRuleConfig, EgressSection, ResourcesSection, StorageSection, UnlockSection,
+};
 
 fn test_release() -> PlatformRelease {
     PlatformRelease {
@@ -65,6 +67,12 @@ fn test_app_config() -> AppConfig {
         unlock: UnlockSection {
             mode: "password".to_string(),
         },
+        egress: EgressSection {
+            allow: vec![EgressRuleConfig {
+                host: "inference.tinfoil.sh".to_string(),
+                ports: vec![443],
+            }],
+        },
         services: HashMap::new(),
         resources: ResourcesSection {
             cpu: "1".to_string(),
@@ -111,6 +119,8 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
         )
         .unwrap();
     assert_eq!(app.api_signing_pubkey, "test-api-signing-pubkey");
+    assert_eq!(app.egress_allowlist.len(), 1);
+    assert_eq!(app.egress_allowlist[0].host, "inference.tinfoil.sh");
 
     let cc_toml = cc_init_data::build_toml_with_options(
         &app,

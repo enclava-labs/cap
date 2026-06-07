@@ -2,15 +2,6 @@ use serde_json::{Value, json};
 
 use crate::types::{ConfidentialApp, EgressRule};
 
-/// Platform-default FQDN egress allowlist.
-///
-/// Hardcoded so the operator cannot quietly drop these. Caddy needs ACME
-/// reachability to issue and renew TLS certs for tenant ingress.
-const PLATFORM_DEFAULT_FQDNS: &[&str] = &[
-    "acme-v02.api.letsencrypt.org",
-    "acme-staging-v02.api.letsencrypt.org",
-];
-
 /// Generate a CiliumNetworkPolicy (cilium.io/v2 CRD).
 ///
 /// Default: no egress to `world`. The previous policy allowed unrestricted
@@ -37,7 +28,10 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
                     "ports": [
                         { "port": "53", "protocol": "UDP" },
                         { "port": "53", "protocol": "TCP" }
-                    ]
+                    ],
+                    "rules": {
+                        "dns": [{ "matchPattern": "*" }]
+                    }
                 }
             ]
         }),
@@ -88,11 +82,8 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
         }),
     ];
 
-    for fqdn in PLATFORM_DEFAULT_FQDNS {
-        egress.push(json!({
-            "toFQDNs": [{ "matchName": fqdn }],
-            "toPorts": [{ "ports": [{ "port": "443", "protocol": "TCP" }] }],
-        }));
+    if let Some(rule) = acme_egress_rule(app) {
+        egress.push(rule);
     }
 
     for rule in tls_certificate_broker_egress_rules(app) {
@@ -150,24 +141,30 @@ fn egress_rule_value(rule: &EgressRule) -> Value {
     })
 }
 
+fn acme_egress_rule(app: &ConfidentialApp) -> Option<Value> {
+    let host = url_host(&app.attestation.acme_ca_url)?;
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    Some(json!({
+        "toFQDNs": [{ "matchName": host }],
+        "toPorts": [{ "ports": [{ "port": "443", "protocol": "TCP" }] }],
+    }))
+}
+
 fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
     let Some(url) = app.attestation.tls_certificate_broker_url.as_deref() else {
         return Vec::new();
     };
-    let Some((scheme, rest)) = url.trim().split_once("://") else {
+    let Some((scheme, _)) = url.trim().split_once("://") else {
         return Vec::new();
     };
-    let Some(authority) = rest.split('/').next().map(str::trim) else {
+    let Some(authority) = url_authority(url) else {
         return Vec::new();
     };
-    if authority.is_empty() {
+    let Some(host) = host_from_authority(authority) else {
         return Vec::new();
-    }
-    let host = authority
-        .strip_prefix('[')
-        .and_then(|value| value.split_once(']').map(|(host, _)| host))
-        .unwrap_or_else(|| authority.split(':').next().unwrap_or(authority))
-        .trim();
+    };
     if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
         return Vec::new();
     }
@@ -209,6 +206,29 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
         "toFQDNs": [{ "matchName": host }],
         "toPorts": [{ "ports": [{ "port": port.to_string(), "protocol": "TCP" }] }],
     })]
+}
+
+fn url_host(url: &str) -> Option<&str> {
+    let authority = url_authority(url)?;
+    host_from_authority(authority)
+}
+
+fn url_authority(url: &str) -> Option<&str> {
+    let (_, rest) = url.trim().split_once("://")?;
+    let authority = rest.split('/').next()?.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    Some(authority)
+}
+
+fn host_from_authority(authority: &str) -> Option<&str> {
+    let host = authority
+        .strip_prefix('[')
+        .and_then(|value| value.split_once(']').map(|(host, _)| host))
+        .unwrap_or_else(|| authority.split(':').next().unwrap_or(authority))
+        .trim();
+    if host.is_empty() { None } else { Some(host) }
 }
 
 fn explicit_url_port(authority: &str) -> Option<u16> {

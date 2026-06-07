@@ -105,6 +105,7 @@ pub struct CreateAppRequest {
     pub health_path: Option<String>,
     pub health_interval: Option<u32>,
     pub health_timeout: Option<u32>,
+    pub egress_allowlist: Vec<crate::app_config::EgressRuleConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signer_identity_subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -99,16 +99,25 @@ fn env_nonempty(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn registry_auth_from_env(registry: &str) -> Auth {
-    if let Some(token) = env_nonempty("COSIGN_REGISTRY_BEARER_TOKEN") {
-        return Auth::Bearer(token);
-    }
+fn env_registry_scope_matches(registry: &str) -> bool {
+    let registry = registry.trim_end_matches('.');
+    env_nonempty("COSIGN_REGISTRY_HOST")
+        .map(|host| host.trim_end_matches('.').eq_ignore_ascii_case(registry))
+        .unwrap_or(false)
+}
 
-    if let (Some(username), Some(password)) = (
-        env_nonempty("COSIGN_REGISTRY_USERNAME"),
-        env_nonempty("COSIGN_REGISTRY_PASSWORD"),
-    ) {
-        return Auth::Basic(username, password);
+fn registry_auth_from_env(registry: &str) -> Auth {
+    if env_registry_scope_matches(registry) {
+        if let Some(token) = env_nonempty("COSIGN_REGISTRY_BEARER_TOKEN") {
+            return Auth::Bearer(token);
+        }
+
+        if let (Some(username), Some(password)) = (
+            env_nonempty("COSIGN_REGISTRY_USERNAME"),
+            env_nonempty("COSIGN_REGISTRY_PASSWORD"),
+        ) {
+            return Auth::Basic(username, password);
+        }
     }
 
     if registry == "ghcr.io"
@@ -643,6 +652,38 @@ fn read_public_key_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard<'a> {
+        _lock: MutexGuard<'a, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl<'a> EnvGuard<'a> {
+        fn new(names: &[&'static str]) -> Self {
+            let lock = ENV_LOCK.lock().expect("env test lock");
+            let saved = names
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect();
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard<'_> {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.iter() {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
 
     fn url_policy() -> VerificationPolicy {
         VerificationPolicy::FulcioUrlIdentity {
@@ -825,7 +866,16 @@ mod tests {
 
     #[test]
     fn registry_auth_from_env_uses_basic_credentials() {
+        let _env = EnvGuard::new(&[
+            "COSIGN_REGISTRY_HOST",
+            "COSIGN_REGISTRY_USERNAME",
+            "COSIGN_REGISTRY_PASSWORD",
+            "COSIGN_REGISTRY_BEARER_TOKEN",
+            "GHCR_USERNAME",
+            "GHCR_TOKEN",
+        ]);
         unsafe {
+            std::env::set_var("COSIGN_REGISTRY_HOST", "ghcr.io");
             std::env::set_var("COSIGN_REGISTRY_USERNAME", "cap-bot");
             std::env::set_var("COSIGN_REGISTRY_PASSWORD", "ghp_example");
             std::env::remove_var("COSIGN_REGISTRY_BEARER_TOKEN");
@@ -839,5 +889,29 @@ mod tests {
             auth,
             Auth::Basic(username, password) if username == "cap-bot" && password == "ghp_example"
         ));
+    }
+
+    #[test]
+    fn registry_auth_from_env_does_not_send_generic_credentials_to_unscoped_registry() {
+        let _env = EnvGuard::new(&[
+            "COSIGN_REGISTRY_HOST",
+            "COSIGN_REGISTRY_USERNAME",
+            "COSIGN_REGISTRY_PASSWORD",
+            "COSIGN_REGISTRY_BEARER_TOKEN",
+            "GHCR_USERNAME",
+            "GHCR_TOKEN",
+        ]);
+        unsafe {
+            std::env::set_var("COSIGN_REGISTRY_HOST", "ghcr.io");
+            std::env::set_var("COSIGN_REGISTRY_USERNAME", "cap-bot");
+            std::env::set_var("COSIGN_REGISTRY_PASSWORD", "private-token");
+            std::env::remove_var("COSIGN_REGISTRY_BEARER_TOKEN");
+            std::env::remove_var("GHCR_USERNAME");
+            std::env::remove_var("GHCR_TOKEN");
+        }
+
+        let auth = registry_auth_from_env("attacker.example");
+
+        assert!(matches!(auth, Auth::Anonymous));
     }
 }

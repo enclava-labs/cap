@@ -246,6 +246,10 @@ pub async fn build_confidential_app(
             .collect();
     }
 
+    let egress_allowlist =
+        crate::routes::apps::engine_egress_allowlist_from_json(&app.egress_allowlist)
+            .map_err(DeployError::Validation)?;
+
     Ok(ConfidentialApp {
         app_id: app.id,
         name: app.name.clone(),
@@ -272,7 +276,7 @@ pub async fn build_confidential_app(
             memory: resources.memory_limit,
         },
         attestation: attestation_config.clone(),
-        egress_allowlist: Vec::new(),
+        egress_allowlist,
         workload_artifact_binding: None,
         generated_agent_policy: None,
     })

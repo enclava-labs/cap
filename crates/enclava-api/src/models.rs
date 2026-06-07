@@ -123,6 +123,7 @@ pub struct App {
     pub signer_identity_set_at: Option<DateTime<Utc>>,
     pub source_provider: Option<String>,
     pub source_repository: Option<String>,
+    pub egress_allowlist: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

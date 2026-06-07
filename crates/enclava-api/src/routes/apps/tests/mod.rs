@@ -69,6 +69,7 @@ fn teardown_token_instance_id_matches_attestation_proxy_owner_instance_id() {
         signer_identity_set_at: None,
         source_provider: None,
         source_repository: None,
+        egress_allowlist: serde_json::json!([]),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -92,6 +93,7 @@ async fn create_app_rejects_member_before_database_access() {
             signer_identity_issuer: None,
             source_provider: None,
             source_repository: None,
+            egress_allowlist: Vec::new(),
         }),
     )
     .await;

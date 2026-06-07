@@ -89,6 +89,9 @@ pub async fn resolve_image_digest(
     client: &RegistryClient,
     image_ref: &enclava_common::image::ImageRef,
 ) -> Result<String, RegistryError> {
+    let base_url = registry_base_url(image_ref.registry())?;
+    client.check_url(&format!("{base_url}/v2/"))?;
+
     if image_ref.has_digest() {
         return Ok(image_ref.digest().to_string());
     }
@@ -134,18 +137,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn digest_pinned_image_does_not_need_registry_lookup() {
+    async fn digest_pinned_image_still_enforces_registry_allowlist() {
         let image = enclava_common::image::ImageRef::parse(
             "attacker.example/org/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
         .unwrap();
 
-        let digest = resolve_image_digest(&registry_client(), &image)
+        let err = resolve_image_digest(&registry_client(), &image)
             .await
-            .unwrap();
-        assert_eq!(
-            digest,
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RegistryError::Client(crate::clients::ClientError::HostNotAllowed(_))
+        ));
     }
 }

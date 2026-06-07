@@ -292,7 +292,7 @@ pub(crate) fn confidential_app_for_cc_hash(
             platform_trustee_policy_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
             signing_service_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
         },
-        egress_allowlist: Vec::new(),
+        egress_allowlist: app_config.egress.to_engine_rules(),
         workload_artifact_binding: Some(workload_artifact_binding),
         generated_agent_policy: Some(generated_agent_policy),
     })
@@ -324,13 +324,14 @@ async fn fetch_generated_agent_policy(
     release: &PlatformRelease,
     descriptor: &enclava_cli::descriptor::DeploymentDescriptor,
 ) -> Result<GeneratedAgentPolicy, Box<dyn std::error::Error>> {
+    let request = AgentPolicyRequest {
+        descriptor: descriptor.clone(),
+    };
+    if let Ok(path) = std::env::var("ENCLAVA_DEBUG_AGENT_POLICY_REQUEST_PATH") {
+        std::fs::write(path, serde_json::to_vec_pretty(&request)?)?;
+    }
     let response = api
-        .generate_agent_policy(
-            &descriptor.app_name,
-            &AgentPolicyRequest {
-                descriptor: descriptor.clone(),
-            },
-        )
+        .generate_agent_policy(&descriptor.app_name, &request)
         .await?;
     if response.genpolicy_version_pin != release.genpolicy_version {
         return Err(format!(
@@ -614,14 +615,19 @@ pub(crate) async fn build_signed_deploy_blobs(
             bootstrap_owner_pubkey_hash: bootstrap_pubkey_hash,
         },
     )?;
+    if let Ok(path) = std::env::var("ENCLAVA_DEBUG_CC_APP_PATH") {
+        std::fs::write(path, serde_json::to_vec_pretty(&cc_app)?)?;
+    }
     let cc_init_options = cc_init_data::CcInitDataOptions {
         kbs_url: release.trustee_kbs_url.clone(),
         kbs_ca_cert_pem: (!release.trustee_kbs_ca_cert_pem.trim().is_empty())
             .then(|| release.trustee_kbs_ca_cert_pem.clone()),
     };
-    let cc_init_data_hash: [u8; 32] =
-        Sha256::digest(cc_init_data::build_toml_with_options(&cc_app, &cc_init_options).as_bytes())
-            .into();
+    let cc_init_toml = cc_init_data::build_toml_with_options(&cc_app, &cc_init_options);
+    if let Ok(path) = std::env::var("ENCLAVA_DEBUG_CC_INIT_TOML_PATH") {
+        std::fs::write(path, cc_init_toml.as_bytes())?;
+    }
+    let cc_init_data_hash: [u8; 32] = Sha256::digest(cc_init_toml.as_bytes()).into();
     descriptor.expected_cc_init_data_hash = cc_init_data_hash;
     let rendered_policy = render_trustee_policy(&release.policy_template_text, &descriptor)?;
     descriptor.expected_kbs_policy_hash = Sha256::digest(rendered_policy.as_bytes()).into();

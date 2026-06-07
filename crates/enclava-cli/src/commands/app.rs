@@ -208,6 +208,7 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
         health_path: app_config.health.as_ref().map(|h| h.path.clone()),
         health_interval: app_config.health.as_ref().map(|h| h.interval),
         health_timeout: app_config.health.as_ref().map(|h| h.timeout),
+        egress_allowlist: app_config.egress.allow.clone(),
         signer_identity_subject,
         signer_identity_issuer,
     };
@@ -247,6 +248,9 @@ pub struct DeployArgs {
     /// Digest-pinned container image to deploy and bind into the customer-signed descriptor.
     #[arg(long)]
     pub image: String,
+    /// Return after the API accepts the deployment instead of waiting for runtime health.
+    #[arg(long)]
+    pub no_wait: bool,
     /// Set config key=value pairs delivered to TEE after boot
     #[arg(long = "set", value_name = "KEY=VALUE")]
     pub config_vars: Vec<String>,
@@ -287,6 +291,9 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         org_keyring_blob: Some(signed_blobs.org_keyring_blob),
         signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
     };
+    if let Ok(path) = std::env::var("ENCLAVA_DEBUG_DEPLOY_REQUEST_PATH") {
+        std::fs::write(path, serde_json::to_vec_pretty(&req)?)?;
+    }
 
     // Phase 1: Deploy
     let pb = ProgressBar::new(5);
@@ -300,6 +307,16 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     let resp = api.deploy(&app_name, &req).await?;
     pb.set_position(1);
     pb.set_message("Manifests applied");
+
+    if args.no_wait {
+        pb.finish_with_message("Deployment accepted");
+        println!();
+        println!("  App:    {app_name}");
+        println!("  URL:    https://{}", resp.app_domain);
+        println!("  Deploy: {}", resp.deployment_id);
+        println!("  Status: {}", resp.status);
+        return Ok(());
+    }
 
     // Phase 2: Wait for TEE boot (poll status)
     pb.set_position(2);

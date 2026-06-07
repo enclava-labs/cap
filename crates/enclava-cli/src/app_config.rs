@@ -11,6 +11,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub unlock: UnlockSection,
     #[serde(default)]
+    pub egress: EgressSection,
+    #[serde(default)]
     pub services: HashMap<String, ServiceSection>,
     #[serde(default)]
     pub resources: ResourcesSection,
@@ -73,6 +75,35 @@ impl Default for UnlockSection {
             mode: default_unlock_mode(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EgressSection {
+    #[serde(default)]
+    pub allow: Vec<EgressRuleConfig>,
+}
+
+impl EgressSection {
+    pub fn to_engine_rules(&self) -> Vec<enclava_engine::types::EgressRule> {
+        self.allow
+            .iter()
+            .map(|rule| enclava_engine::types::EgressRule {
+                host: rule.host.clone(),
+                ports: rule.ports.clone(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressRuleConfig {
+    pub host: String,
+    #[serde(default = "default_egress_ports")]
+    pub ports: Vec<u16>,
+}
+
+fn default_egress_ports() -> Vec<u16> {
+    vec![443]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +233,137 @@ impl AppConfig {
             ));
         }
 
+        for rule in &self.egress.allow {
+            validate_egress_rule(rule)?;
+        }
+
         Ok(())
+    }
+}
+
+fn validate_egress_rule(rule: &EgressRuleConfig) -> Result<(), AppConfigError> {
+    let host = rule.host.trim();
+    if host.is_empty() {
+        return Err(AppConfigError::Validation(
+            "egress host cannot be empty".to_string(),
+        ));
+    }
+    if host != rule.host {
+        return Err(AppConfigError::Validation(format!(
+            "egress host '{}' cannot contain surrounding whitespace",
+            rule.host
+        )));
+    }
+    if host.contains("://") || host.contains('/') || host.contains(':') || host.contains('*') {
+        return Err(AppConfigError::Validation(format!(
+            "egress host '{host}' must be a hostname, not a URL, wildcard, or host:port"
+        )));
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Err(AppConfigError::Validation(format!(
+            "egress host '{host}' must be a DNS hostname"
+        )));
+    }
+    if !host.contains('.') || !host.split('.').all(valid_dns_label) {
+        return Err(AppConfigError::Validation(format!(
+            "egress host '{host}' must be a valid DNS hostname"
+        )));
+    }
+    if rule.ports.is_empty() {
+        return Err(AppConfigError::Validation(format!(
+            "egress ports cannot be empty for host '{host}'"
+        )));
+    }
+    if rule.ports.contains(&0) {
+        return Err(AppConfigError::Validation(format!(
+            "egress ports must be between 1 and 65535 for host '{host}'"
+        )));
+    }
+    Ok(())
+}
+
+fn valid_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && label
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+        && label
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+        && label
+            .chars()
+            .last()
+            .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_egress_allowlist_rules() {
+        let config = AppConfig::parse(
+            r#"
+[app]
+name = "tee-router"
+port = 8000
+command = ["/usr/local/bin/app"]
+
+[egress]
+allow = [
+  { host = "inference.tinfoil.sh", ports = [443] },
+  { host = "rekor.sigstore.dev" }
+]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.egress.allow.len(), 2);
+        assert_eq!(config.egress.allow[0].host, "inference.tinfoil.sh");
+        assert_eq!(config.egress.allow[0].ports, vec![443]);
+        assert_eq!(config.egress.allow[1].host, "rekor.sigstore.dev");
+        assert_eq!(config.egress.allow[1].ports, vec![443]);
+    }
+
+    #[test]
+    fn rejects_empty_egress_host() {
+        let err = AppConfig::parse(
+            r#"
+[app]
+name = "tee-router"
+port = 8000
+
+[egress]
+allow = [{ host = "", ports = [443] }]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("egress host cannot be empty"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_egress_ports() {
+        let err = AppConfig::parse(
+            r#"
+[app]
+name = "tee-router"
+port = 8000
+
+[egress]
+allow = [{ host = "inference.tinfoil.sh", ports = [] }]
+"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("egress ports cannot be empty"),
+            "{err}"
+        );
     }
 }

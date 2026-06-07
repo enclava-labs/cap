@@ -886,6 +886,7 @@ mod tests {
             signer_identity_set_at: None,
             source_provider: None,
             source_repository: None,
+            egress_allowlist: serde_json::json!([]),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

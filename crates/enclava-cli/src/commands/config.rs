@@ -10,8 +10,11 @@ pub enum ConfigCommand {
     /// Set one or more config secrets (delivered direct to TEE)
     Set {
         /// KEY=VALUE pairs
-        #[arg(required = true)]
+        #[arg(value_name = "KEY=VALUE")]
         vars: Vec<String>,
+        /// Set config key from a local file without exposing the value in process arguments.
+        #[arg(long = "set-file", value_name = "KEY=PATH")]
+        file_vars: Vec<String>,
     },
     /// List config key names (values never leave the TEE)
     Get {
@@ -56,13 +59,42 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
     Ok((key.to_string(), value.to_string()))
 }
 
+fn parse_file_key_value(s: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let (key, path) = s
+        .split_once('=')
+        .ok_or_else(|| format!("invalid file config format '{s}': expected KEY=PATH"))?;
+    if key.is_empty() {
+        return Err("key cannot be empty".into());
+    }
+    let value = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read config file for {key} at {path}: {err}"))?;
+    Ok((
+        key.to_string(),
+        value.trim_end_matches(['\r', '\n']).to_string(),
+    ))
+}
+
+fn parse_config_inputs(
+    vars: &[String],
+    file_vars: &[String],
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    let mut pairs = vars
+        .iter()
+        .map(|v| parse_key_value(v))
+        .collect::<Result<Vec<_>, _>>()?;
+    for entry in file_vars {
+        pairs.push(parse_file_key_value(entry)?);
+    }
+    if pairs.is_empty() {
+        return Err("expected at least one KEY=VALUE or --set-file KEY=PATH".into());
+    }
+    Ok(pairs)
+}
+
 pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        ConfigCommand::Set { vars } => {
-            let pairs: Vec<(String, String)> = vars
-                .iter()
-                .map(|v| parse_key_value(v))
-                .collect::<Result<Vec<_>, _>>()?;
+        ConfigCommand::Set { vars, file_vars } => {
+            let pairs = parse_config_inputs(&vars, &file_vars)?;
 
             let app_name = {
                 let config = AppConfig::find_and_load()?;
@@ -141,7 +173,8 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_key_value;
+    use super::{parse_config_inputs, parse_key_value};
+    use std::fs;
 
     #[test]
     fn parse_key_value_accepts_equals_in_value() {
@@ -152,10 +185,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_inputs_accepts_set_file_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        fs::write(&path, "from-file\n").unwrap();
+
+        let pairs = parse_config_inputs(
+            &["INLINE=a=b".to_string()],
+            &[format!("FROM_FILE={}", path.display())],
+        )
+        .unwrap();
+
+        assert_eq!(
+            pairs,
+            vec![
+                ("INLINE".to_string(), "a=b".to_string()),
+                ("FROM_FILE".to_string(), "from-file".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_config_inputs_requires_at_least_one_value() {
+        let err = parse_config_inputs(&[], &[]).unwrap_err().to_string();
+        assert!(err.contains("expected at least one"));
+    }
+
+    #[test]
     fn config_set_attests_before_writing_values() {
         let source = include_str!("config.rs");
         let set_start = source
-            .find("ConfigCommand::Set { vars } =>")
+            .find("ConfigCommand::Set { vars, file_vars } => {\n            let pairs")
             .expect("set command branch exists");
         let get_start = source[set_start..]
             .find("ConfigCommand::Get")
