@@ -22,6 +22,11 @@ on:
     - 'crates/enclava-common/**'
     - 'crates/enclava-engine/**'
   workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Optional additional image tag to publish, for example v1.2.3"
+        required: false
+        type: string
 
 jobs:
   build-and-push:
@@ -29,6 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
       packages: write
 
     steps:
@@ -50,6 +56,7 @@ jobs:
         with:
           images: ghcr.io/enclava-labs/enclava-api
           tags: |
+            type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
             type=ref,event=branch
             type=ref,event=tag
             type=sha,prefix=
@@ -66,6 +73,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true
+
+      - name: Install cosign
+        if: github.event_name != 'pull_request'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign pushed digest
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ghcr.io/enclava-labs/enclava-api
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
       - name: Set up Kustomize
         if: github.event_name != 'pull_request'
