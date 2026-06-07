@@ -43,7 +43,7 @@ pub(super) enum MountSourceStrategy {
 
 pub(super) fn wait_for_container_start_sentinels(cfg: &Config) -> Result<Vec<WorkloadNamespace>> {
     let names = std::env::var("ENCLAVA_INIT_WAIT_FOR_CONTAINERS").unwrap_or_default();
-    let containers = names
+    let mut containers = names
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -51,6 +51,9 @@ pub(super) fn wait_for_container_start_sentinels(cfg: &Config) -> Result<Vec<Wor
         .collect::<Result<Vec<_>>>()?;
     if containers.is_empty() {
         return Ok(Vec::new());
+    }
+    if !containers.iter().any(|name| name == "attestation-proxy") {
+        containers.push("attestation-proxy".to_string());
     }
 
     let dir = started_dir_path();
@@ -98,7 +101,7 @@ fn collect_workload_namespaces_once(
         let sentinel = dir.join(name);
         let expected = expected_identity(cfg, name);
         match read_sentinel_pid(&sentinel, proc_root, name, expected).or_else(|sentinel_err| {
-            find_workload_pid_by_env_checked(proc_root, name, Some(expected)).with_context(|| {
+            find_workload_pid_checked(proc_root, name, Some(expected)).with_context(|| {
                 format!(
                     "sentinel {} unavailable ({sentinel_err}) and /proc fallback failed",
                     sentinel.display()
@@ -121,17 +124,17 @@ fn collect_workload_namespaces_once(
     Ok(namespaces)
 }
 
-fn expected_identity(cfg: &Config, name: &str) -> ExpectedIdentity {
-    if name == "tenant-ingress" {
-        ExpectedIdentity {
+pub(super) fn expected_identity(cfg: &Config, name: &str) -> ExpectedIdentity {
+    match name {
+        "attestation-proxy" => ExpectedIdentity { uid: 0, gid: 0 },
+        "tenant-ingress" => ExpectedIdentity {
             uid: cfg.caddy_uid,
             gid: cfg.caddy_gid,
-        }
-    } else {
-        ExpectedIdentity {
+        },
+        _ => ExpectedIdentity {
             uid: cfg.app_uid,
             gid: cfg.app_gid,
-        }
+        },
     }
 }
 
@@ -254,7 +257,22 @@ pub(super) fn validate_sentinel_record(
 
 #[cfg(test)]
 pub(super) fn find_workload_pid_by_env(proc_root: &Path, name: &str) -> Result<u32> {
-    find_workload_pid_by_env_checked(proc_root, name, None)
+    find_workload_pid_checked(proc_root, name, None)
+}
+
+fn find_workload_pid_checked(
+    proc_root: &Path,
+    name: &str,
+    expected: Option<ExpectedIdentity>,
+) -> Result<u32> {
+    find_workload_pid_by_env_checked(proc_root, name, expected).or_else(|env_err| {
+        if name == "attestation-proxy" {
+            find_attestation_proxy_pid_by_cmdline(proc_root, expected)
+                .with_context(|| format!("env fallback failed ({env_err})"))
+        } else {
+            Err(env_err)
+        }
+    })
 }
 
 fn find_workload_pid_by_env_checked(
@@ -287,6 +305,34 @@ fn find_workload_pid_by_env_checked(
         }
     }
     Err(anyhow!("no running workload helper found for {name}"))
+}
+
+fn find_attestation_proxy_pid_by_cmdline(
+    proc_root: &Path,
+    expected: Option<ExpectedIdentity>,
+) -> Result<u32> {
+    for entry in std::fs::read_dir(proc_root)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let cmdline = match std::fs::read(entry.path().join("cmdline")) {
+            Ok(cmdline) => cmdline,
+            Err(_) => continue,
+        };
+        let first_arg = cmdline.split(|byte| *byte == 0).find(|arg| !arg.is_empty());
+        if first_arg == Some(b"/attestation-proxy".as_slice()) {
+            validate_pid_mount_namespace(proc_root, pid)?;
+            if let Some(expected) = expected {
+                validate_proc_pid_identity(proc_root, pid, expected)?;
+            }
+            return Ok(pid);
+        }
+    }
+    Err(anyhow!("no running attestation-proxy process found"))
 }
 
 fn validate_pid_env(proc_root: &Path, pid: u32, name: &str) -> Result<()> {
@@ -414,14 +460,20 @@ pub(super) fn bind_mount_plan_for_workload(
     let mut mounts = Vec::new();
     if workload.name != "tenant-ingress" {
         for bind in &cfg.app_bind_mounts {
-            mounts.push(NamespaceBindMount {
-                source: namespace_source(
-                    self_pid,
-                    &app_bind_mount_dir(Path::new(&cfg.state.mount_path), &bind.subdir)?
-                        .to_string_lossy(),
-                ),
-                target: PathBuf::from(&bind.mount_path),
-            });
+            let state_target = app_bind_mount_dir(Path::new(&cfg.state.mount_path), &bind.subdir)?;
+            let source = namespace_source(self_pid, &state_target.to_string_lossy());
+            let mut targets = if workload.name == "attestation-proxy" {
+                vec![state_target]
+            } else {
+                vec![PathBuf::from(&bind.mount_path), state_target]
+            };
+            targets.dedup();
+            for target in targets {
+                mounts.push(NamespaceBindMount {
+                    source: source.clone(),
+                    target,
+                });
+            }
         }
     }
     Ok(mounts)

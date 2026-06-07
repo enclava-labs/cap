@@ -560,7 +560,11 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("ATTESTATION_TLS_PORT", "8443"),
         env("TEE_DOMAIN", &app.domain.tee_domain),
         env("CAP_API_SIGNING_PUBKEY", &app.api_signing_pubkey),
-        env("CAP_CONFIG_DIR", "/state/.enclava/config"),
+        env("CAP_CONFIG_DIR", "/state/app-data/.enclava/config"),
+        env(
+            "CAP_CONFIG_READY_MARKER",
+            "/state/app-data/.enclava/luks-ready",
+        ),
         env("STORAGE_OWNERSHIP_MODE", mode),
         env("INSTANCE_ID", &app.owner_instance_id()),
         env("OWNER_CIPHERTEXT_BACKEND", "kbs-resource"),

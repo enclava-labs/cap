@@ -1,4 +1,5 @@
 use super::*;
+use enclava_init::config::AppBindMountConfig;
 use tempfile::tempdir;
 
 #[test]
@@ -97,6 +98,76 @@ fn caddy_tls_bind_source_is_below_tls_state_root() {
         caddy_tls_bind_dir(Path::new("/state/tls-state")),
         PathBuf::from("/state/tls-state/tenant-ingress")
     );
+}
+
+#[test]
+fn cap_config_dir_is_prepared_for_proxy_writer() {
+    let dir = tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let mut chowned = Vec::new();
+
+    prepare_cap_config_dir_with(&state, |path, identity| {
+        chowned.push((path.to_path_buf(), identity));
+        Ok(())
+    })
+    .unwrap();
+
+    let config_root = state.join(".enclava");
+    let config_dir = state.join(".enclava/config");
+    let ready_marker = state.join(".enclava/luks-ready");
+    assert!(config_root.is_dir());
+    assert!(config_dir.is_dir());
+    assert!(
+        ready_marker.is_file(),
+        "CAP config writes must be able to prove they see the decrypted LUKS volume"
+    );
+    assert_eq!(chowned, vec![(config_root, numeric_identity(0, 0))]);
+}
+
+#[test]
+fn app_data_cap_config_dir_is_prepared_for_proxy_and_app_group() {
+    let dir = tempdir().unwrap();
+    let app_data = dir.path().join("state/app-data");
+    std::fs::create_dir_all(&app_data).unwrap();
+    let mut chowned = Vec::new();
+
+    prepare_app_data_cap_config_dir_with(&app_data, 10001, |path, identity| {
+        chowned.push((path.to_path_buf(), identity));
+        Ok(())
+    })
+    .unwrap();
+
+    let config_root = app_data.join(".enclava");
+    let config_dir = app_data.join(".enclava/config");
+    let ready_marker = app_data.join(".enclava/luks-ready");
+    assert!(config_root.is_dir());
+    assert!(config_dir.is_dir());
+    assert!(
+        ready_marker.is_file(),
+        "CAP config writes must be able to prove they see the decrypted LUKS app-data volume"
+    );
+    assert_eq!(
+        chowned,
+        vec![(config_root.clone(), numeric_identity(0, 10001))]
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&config_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o750
+        );
+        assert_eq!(
+            std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o7777,
+            0o2750
+        );
+    }
 }
 
 #[test]
@@ -314,6 +385,88 @@ fn workload_pid_fallback_finds_wait_exec_process_by_container_name() {
     let pid = find_workload_pid_by_env(dir.path(), "tenant-ingress").unwrap();
 
     assert_eq!(pid, 123);
+}
+
+#[test]
+fn attestation_proxy_identity_is_root_for_namespace_binding() {
+    let dir = tempdir().unwrap();
+    let cfg = config_with_signed_cc(dir.path(), "");
+
+    assert_eq!(
+        expected_identity(&cfg, "attestation-proxy"),
+        ExpectedIdentity { uid: 0, gid: 0 }
+    );
+}
+
+#[test]
+fn attestation_proxy_pid_fallback_uses_command_line_without_env_marker() {
+    let dir = tempdir().unwrap();
+    let proc_dir = dir.path().join("321");
+    std::fs::create_dir_all(proc_dir.join("ns")).unwrap();
+    std::fs::write(proc_dir.join("environ"), b"PATH=/usr/bin\0").unwrap();
+    std::fs::write(proc_dir.join("cmdline"), b"/attestation-proxy\0").unwrap();
+    std::fs::write(proc_dir.join("ns/mnt"), b"").unwrap();
+
+    let pid = find_workload_pid_by_env(dir.path(), "attestation-proxy").unwrap();
+
+    assert_eq!(pid, 321);
+}
+
+#[test]
+fn attestation_proxy_binds_app_data_below_state_for_config_writes() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config_with_signed_cc(dir.path(), "");
+    cfg.app_bind_mounts = vec![AppBindMountConfig {
+        subdir: "app-data".to_string(),
+        mount_path: "/app/data".to_string(),
+    }];
+    let workload = WorkloadNamespace {
+        name: "attestation-proxy".to_string(),
+        pid: 123,
+    };
+
+    let mounts = bind_mount_plan_for_workload(&cfg, 999, &workload).unwrap();
+
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].target, PathBuf::from("/state/app-data"));
+    assert_eq!(
+        mounts[0].source,
+        PathBuf::from("/proc/999/root/state/app-data")
+    );
+}
+
+#[test]
+fn app_workload_binds_app_data_below_state_for_direct_config_reads() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config_with_signed_cc(dir.path(), "");
+    cfg.app_bind_mounts = vec![AppBindMountConfig {
+        subdir: "app-data".to_string(),
+        mount_path: "/app/data".to_string(),
+    }];
+    let workload = WorkloadNamespace {
+        name: "web".to_string(),
+        pid: 123,
+    };
+
+    let mounts = bind_mount_plan_for_workload(&cfg, 999, &workload).unwrap();
+
+    let pairs = mounts
+        .iter()
+        .map(|mount| (mount.source.as_path(), mount.target.as_path()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pairs,
+        vec![
+            (
+                Path::new("/proc/999/root/state/app-data"),
+                Path::new("/app/data")
+            ),
+            (
+                Path::new("/proc/999/root/state/app-data"),
+                Path::new("/state/app-data")
+            ),
+        ]
+    );
 }
 
 #[test]

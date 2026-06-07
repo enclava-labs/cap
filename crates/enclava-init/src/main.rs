@@ -21,6 +21,8 @@ const DEFAULT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS: u64 = 10;
 const CADDY_RUNTIME_HANDOFF_PATH: &str = "/run/enclava/caddy-runtime";
 const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
+const CAP_CONFIG_RELATIVE_DIR: &str = ".enclava/config";
+const CAP_CONFIG_READY_MARKER_RELATIVE_PATH: &str = ".enclava/luks-ready";
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -172,9 +174,10 @@ mod namespace_bind;
 #[cfg(test)]
 use namespace_bind::{
     ExpectedIdentity, MountSourceStrategy, SentinelRecord, WorkloadNamespace,
-    bind_mount_plan_for_workload, find_workload_pid_by_env, mount_source_strategy,
-    namespace_source, parse_sentinel_record, paths_resolve_to_same_object, validate_sentinel_name,
-    validate_sentinel_record, workload_proc_root_path, workload_target_path,
+    bind_mount_plan_for_workload, expected_identity, find_workload_pid_by_env,
+    mount_source_strategy, namespace_source, parse_sentinel_record, paths_resolve_to_same_object,
+    validate_sentinel_name, validate_sentinel_record, workload_proc_root_path,
+    workload_target_path,
 };
 use namespace_bind::{
     app_bind_mount_dir, bind_mounts_into_workload_namespaces, run_bind_mount_into_ns,
@@ -721,6 +724,10 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
 
     chown::chown(state_root, app_identity)
         .with_context(|| format!("chown {}", state_root.display()))?;
+    prepare_cap_config_dir_with(state_root, |path, identity| {
+        chown::chown_recursive(path, identity)?;
+        Ok(())
+    })?;
     chown::chown_recursive(tls_state_root, caddy_identity)
         .with_context(|| format!("chown {}", tls_state_root.display()))?;
 
@@ -758,6 +765,12 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
         })?;
         chown::chown_recursive(&dir, app_identity)
             .with_context(|| format!("chown {}", dir.display()))?;
+        if bind.subdir == "app-data" {
+            prepare_app_data_cap_config_dir_with(&dir, cfg.app_gid, |path, identity| {
+                chown::chown_recursive(path, identity)?;
+                Ok(())
+            })?;
+        }
     }
 
     Ok(())
@@ -844,6 +857,81 @@ fn sync_dir_contents(src: &Path, dst: &Path) -> Result<()> {
 
 fn caddy_tls_bind_dir(tls_state_root: &Path) -> PathBuf {
     tls_state_root.join("tenant-ingress")
+}
+
+fn cap_config_root_dir(state_root: &Path) -> PathBuf {
+    state_root.join(".enclava")
+}
+
+fn cap_config_dir(state_root: &Path) -> PathBuf {
+    state_root.join(CAP_CONFIG_RELATIVE_DIR)
+}
+
+fn cap_config_ready_marker(state_root: &Path) -> PathBuf {
+    state_root.join(CAP_CONFIG_READY_MARKER_RELATIVE_PATH)
+}
+
+fn prepare_cap_config_dir_with<F>(state_root: &Path, mut chown_recursive: F) -> Result<()>
+where
+    F: FnMut(&Path, ExecIdentity) -> Result<()>,
+{
+    prepare_cap_config_dir_owned_with(
+        state_root,
+        numeric_identity(0, 0),
+        0o755,
+        0o755,
+        &mut chown_recursive,
+    )
+}
+
+fn prepare_app_data_cap_config_dir_with<F>(
+    app_data_root: &Path,
+    app_gid: u32,
+    mut chown_recursive: F,
+) -> Result<()>
+where
+    F: FnMut(&Path, ExecIdentity) -> Result<()>,
+{
+    prepare_cap_config_dir_owned_with(
+        app_data_root,
+        numeric_identity(0, app_gid),
+        0o750,
+        0o2750,
+        &mut chown_recursive,
+    )
+}
+
+fn prepare_cap_config_dir_owned_with<F>(
+    state_root: &Path,
+    identity: ExecIdentity,
+    root_mode: u32,
+    dir_mode: u32,
+    chown_recursive: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&Path, ExecIdentity) -> Result<()>,
+{
+    let config_root = cap_config_root_dir(state_root);
+    let config_dir = cap_config_dir(state_root);
+    let ready_marker = cap_config_ready_marker(state_root);
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("creating CAP config dir {}", config_dir.display()))?;
+    writes::atomic_write(&ready_marker, b"luks-ready\n", 0o644)
+        .with_context(|| format!("writing CAP config ready marker {}", ready_marker.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&config_root, std::fs::Permissions::from_mode(root_mode))
+            .with_context(|| format!("chmod {}", config_root.display()))?;
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(dir_mode))
+            .with_context(|| format!("chmod {}", config_dir.display()))?;
+    }
+
+    chown_recursive(&config_root, identity)
+        .with_context(|| format!("chown {}", config_root.display()))?;
+    Ok(())
 }
 
 fn numeric_identity(uid: u32, gid: u32) -> ExecIdentity {

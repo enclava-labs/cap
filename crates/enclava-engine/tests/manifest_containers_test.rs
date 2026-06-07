@@ -297,7 +297,15 @@ fn proxy_container_mounts_state_filesystem_for_config_storage() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/.enclava/config")
+        Some("/state/app-data/.enclava/config")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "CAP_CONFIG_READY_MARKER")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/state/app-data/.enclava/luks-ready")
     );
 }
 
