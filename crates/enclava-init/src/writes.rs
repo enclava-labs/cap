@@ -47,6 +47,13 @@ pub fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     })?;
 
     fs::rename(&tmp, path)?;
+    sync_parent_dir(parent)?;
+    Ok(())
+}
+
+fn sync_parent_dir(parent: &Path) -> Result<()> {
+    let dir = OpenOptions::new().read(true).open(parent)?;
+    dir.sync_all()?;
     Ok(())
 }
 
@@ -73,6 +80,20 @@ mod tests {
         atomic_write(&path, b"v1", 0o600).unwrap();
         atomic_write(&path, b"v2", 0o600).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"v2");
+    }
+
+    #[test]
+    fn atomic_write_syncs_parent_after_rename() {
+        let source = include_str!("writes.rs");
+        let rename_pos = source.find("fs::rename(&tmp, path)?").expect("rename call");
+        let sync_pos = source
+            .find("sync_parent_dir(parent)?")
+            .expect("parent sync call");
+
+        assert!(
+            rename_pos < sync_pos,
+            "atomic writes must fsync the containing directory after rename"
+        );
     }
 
     #[test]

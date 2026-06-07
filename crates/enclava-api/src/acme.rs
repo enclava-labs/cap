@@ -92,10 +92,44 @@ pub async fn issue_dns01_certificate(
         return Err(AcmeError::OrderStatus(status));
     }
 
-    order.finalize_csr(csr_der).await?;
-    let cert_chain = order.poll_certificate(&RetryPolicy::default()).await?;
+    if let Err(err) = finalize_csr_after_ready(&mut order, csr_der).await {
+        cleanup_challenges(http_client, dns_config, &challenge_records).await;
+        return Err(err);
+    }
+    let cert_chain = match order.poll_certificate(&RetryPolicy::default()).await {
+        Ok(cert_chain) => cert_chain,
+        Err(err) => {
+            cleanup_challenges(http_client, dns_config, &challenge_records).await;
+            return Err(AcmeError::Acme(err));
+        }
+    };
     cleanup_challenges(http_client, dns_config, &challenge_records).await;
     Ok(cert_chain)
+}
+
+async fn finalize_csr_after_ready(
+    order: &mut instant_acme::Order,
+    csr_der: &[u8],
+) -> Result<(), AcmeError> {
+    for attempt in 0..5 {
+        match order.finalize_csr(csr_der).await {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < 4 && is_order_not_ready_finalize_error(&err.to_string()) => {
+                let status = order.poll_ready(&RetryPolicy::default()).await?;
+                if status != OrderStatus::Ready {
+                    return Err(AcmeError::OrderStatus(status));
+                }
+                tokio::time::sleep(Duration::from_secs(1 + attempt)).await;
+            }
+            Err(err) => return Err(AcmeError::Acme(err)),
+        }
+    }
+    unreachable!("bounded finalize retry loop always returns")
+}
+
+fn is_order_not_ready_finalize_error(message: &str) -> bool {
+    message.contains("orderNotReady")
+        || (message.contains("not acceptable for finalization") && message.contains("pending"))
 }
 
 async fn wait_for_txt_record(
@@ -277,6 +311,31 @@ mod tests {
         assert!(
             lookup.contains("external DNS lookup failed; falling back to system resolver"),
             "ACME DNS-01 TXT fallback should log external resolver failures for live diagnosis"
+        );
+    }
+
+    #[test]
+    fn dns01_finalize_retries_pending_order_not_ready_errors() {
+        assert!(super::is_order_not_ready_finalize_error(
+            "ACME failed: API error: Order's status (\"pending\") is not acceptable for finalization (urn:ietf:params:acme:error:orderNotReady)"
+        ));
+        assert!(!super::is_order_not_ready_finalize_error(
+            "ACME failed: API error: account is rate limited"
+        ));
+
+        let source = include_str!("acme.rs");
+        let finalize = source
+            .split("async fn finalize_csr_after_ready")
+            .nth(1)
+            .expect("finalize retry helper");
+
+        assert!(
+            finalize.contains("order.finalize_csr(csr_der).await"),
+            "ACME DNS-01 must finalize the CSR in the helper"
+        );
+        assert!(
+            finalize.contains("order.poll_ready(&RetryPolicy::default()).await"),
+            "ACME DNS-01 must re-poll order readiness before retrying a pending finalization"
         );
     }
 }
