@@ -336,7 +336,10 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
 /// The sidecar needs device-mapper and mount namespace rights. App and caddy
 /// remain unprivileged and only consume the decrypted mountpoints.
 pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
-    let wait_containers = format!("{},tenant-ingress", app.primary_container().unwrap().name);
+    let wait_containers = format!(
+        "{},tenant-ingress,attestation-proxy",
+        app.primary_container().unwrap().name
+    );
     Container {
         name: "enclava-init".to_string(),
         image: Some(enclava_init_image()),
@@ -514,7 +517,6 @@ fn proxy_volume_mounts(legacy: bool) -> Vec<VolumeMount> {
         v.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),
-            read_only: Some(true),
             ..Default::default()
         });
         v.push(VolumeMount {
@@ -582,6 +584,8 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
     ];
     if !legacy {
+        env_vars.push(env("ENCLAVA_CONTAINER_NAME", "attestation-proxy"));
+        env_vars.push(env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"));
         env_vars.push(env("ENCLAVA_INIT_UNLOCK_SOCKET", UNLOCK_SOCKET_PATH));
     }
     if let Some(cert) = cc_init_data::trustee_kbs_ca_cert_pem() {

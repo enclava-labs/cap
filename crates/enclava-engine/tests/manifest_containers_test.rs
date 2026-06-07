@@ -254,7 +254,11 @@ fn proxy_container_mounts_unlock_socket() {
         .iter()
         .find(|m| m.name == "unlock-socket" && m.mount_path == "/run/enclava")
         .unwrap();
-    assert_eq!(ready_m.read_only, Some(true));
+    assert_ne!(
+        ready_m.read_only,
+        Some(true),
+        "proxy must write its startup sentinel before init-ready"
+    );
     let env = c.env.as_ref().unwrap();
     assert_eq!(
         env.iter()
@@ -264,6 +268,39 @@ fn proxy_container_mounts_unlock_socket() {
             .as_deref(),
         Some("/run/enclava-unlock/unlock.sock")
     );
+}
+
+#[test]
+fn proxy_container_registers_startup_sentinel_without_waiting_for_init_ready() {
+    let c = build_attestation_proxy_container(&sample_app());
+    let env = c.env.as_ref().unwrap();
+
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ENCLAVA_CONTAINER_NAME")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("attestation-proxy")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ENCLAVA_STARTED_DIR")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/run/enclava/containers")
+    );
+    assert!(
+        env.iter().all(|e| e.name != "ENCLAVA_INIT_READY_FILE"),
+        "proxy must not wait for init-ready before serving unlock"
+    );
+
+    assert_eq!(
+        c.command.as_ref().unwrap(),
+        &vec!["/attestation-proxy".to_string()]
+    );
+    assert!(c.args.as_ref().is_none_or(|args| args.is_empty()));
 }
 
 #[test]
@@ -519,7 +556,7 @@ fn enclava_init_container_waits_for_workloads_and_marks_ready_file() {
             .unwrap()
             .value
             .as_deref(),
-        Some("web,tenant-ingress")
+        Some("web,tenant-ingress,attestation-proxy")
     );
     assert_eq!(
         env.iter()
@@ -555,7 +592,7 @@ fn enclava_init_container_waits_for_tenant_ingress_sentinel() {
             .unwrap()
             .value
             .as_deref(),
-        Some("web,tenant-ingress")
+        Some("web,tenant-ingress,attestation-proxy")
     );
 }
 
