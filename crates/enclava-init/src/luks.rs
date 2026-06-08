@@ -15,7 +15,7 @@
 //! runtime image must include `mkfs.ext4`.
 
 use std::fs::{OpenOptions, remove_file};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,14 +37,25 @@ pub struct LuksOpened {
     pub mapper_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormatDecision {
+    FormatFreshDevice,
+    OpenExisting,
+}
+
 /// True iff the device already carries a LUKS2 header that loads cleanly.
 pub fn is_formatted(device: &Path) -> Result<bool> {
     let mut dev = CryptInit::init(device)
         .map_err(|e| InitError::Luks(format!("init {}: {e}", device.display())))?;
-    Ok(dev
+    if dev
         .context_handle()
         .load::<()>(Some(EncryptionFormat::Luks2), None)
-        .is_ok())
+        .is_ok()
+    {
+        return Ok(true);
+    }
+
+    cryptsetup_is_luks(device).map(|value| value.unwrap_or(false))
 }
 
 /// Format `device` as LUKS2 and add `key` as keyslot 0.
@@ -172,14 +183,19 @@ pub fn format_if_unformatted_then_open(
     mapping_name: &str,
     key: &DerivedSeed,
 ) -> Result<LuksOpened> {
-    let mut needs_mkfs = !is_formatted(device)?;
-    if !needs_mkfs && !has_luks_keyslots(device)?.unwrap_or(true) {
-        tracing::warn!(
-            device = %device.display(),
-            "LUKS header has no keyslots; treating as incomplete first-boot format"
-        );
-        needs_mkfs = true;
-    }
+    let formatted = is_formatted(device)?;
+    let has_keyslots = if formatted {
+        has_luks_keyslots(device)?
+    } else {
+        None
+    };
+    let blank = if formatted {
+        false
+    } else {
+        device_appears_blank(device)?
+    };
+    let decision = format_decision(formatted, has_keyslots, blank)?;
+    let needs_mkfs = matches!(decision, FormatDecision::FormatFreshDevice);
     if needs_mkfs {
         format(device, key)?;
     }
@@ -188,6 +204,31 @@ pub fn format_if_unformatted_then_open(
         mkfs_ext4(&opened.mapper_path)?;
     }
     Ok(opened)
+}
+
+fn format_decision(
+    formatted: bool,
+    has_keyslots: Option<bool>,
+    blank: bool,
+) -> Result<FormatDecision> {
+    if formatted {
+        if has_keyslots == Some(false) {
+            return Err(InitError::Luks(
+                "existing LUKS header has no keyslots; refusing to reformat persistent volume"
+                    .to_string(),
+            ));
+        }
+        return Ok(FormatDecision::OpenExisting);
+    }
+
+    if blank {
+        Ok(FormatDecision::FormatFreshDevice)
+    } else {
+        Err(InitError::Luks(
+            "device is not LUKS2 and is not blank; refusing to format persistent volume"
+                .to_string(),
+        ))
+    }
 }
 
 fn mkfs_ext4(mapper_path: &Path) -> Result<()> {
@@ -318,6 +359,41 @@ fn has_luks_keyslots(device: &Path) -> Result<Option<bool>> {
         .map(|keyslots| !keyslots.is_empty()))
 }
 
+fn cryptsetup_is_luks(device: &Path) -> Result<Option<bool>> {
+    let status = match std::process::Command::new("cryptsetup")
+        .args(["isLuks", "--type", "luks2"])
+        .arg(device)
+        .status()
+    {
+        Ok(status) => status,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(InitError::Luks(format!("cryptsetup isLuks: {err}"))),
+    };
+    if status.success() {
+        return Ok(Some(true));
+    }
+    if status.code() == Some(1) {
+        return Ok(Some(false));
+    }
+    Err(InitError::Luks(format!(
+        "cryptsetup isLuks {} exited with {status}",
+        device.display()
+    )))
+}
+
+fn device_appears_blank(device: &Path) -> Result<bool> {
+    const PROBE_BYTES: usize = 4096;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(device)
+        .map_err(|e| InitError::Luks(format!("open {} for blank probe: {e}", device.display())))?;
+    let mut buf = [0u8; PROBE_BYTES];
+    let read = file
+        .read(&mut buf)
+        .map_err(|e| InitError::Luks(format!("read {} blank probe: {e}", device.display())))?;
+    Ok(buf[..read].iter().all(|byte| *byte == 0))
+}
+
 fn with_key_file<F>(key: &DerivedSeed, f: F) -> Result<()>
 where
     F: FnOnce(&Path) -> Result<()>,
@@ -419,6 +495,24 @@ pub fn mount(mapper_path: &Path, mount_point: &Path) -> Result<()> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+
+    #[test]
+    fn format_decision_only_formats_blank_unformatted_devices() {
+        assert_eq!(
+            format_decision(false, None, true).expect("blank device is first boot"),
+            FormatDecision::FormatFreshDevice
+        );
+        assert_eq!(
+            format_decision(true, Some(true), false).expect("formatted device opens"),
+            FormatDecision::OpenExisting
+        );
+    }
+
+    #[test]
+    fn format_decision_refuses_ambiguous_or_damaged_devices() {
+        assert!(format_decision(false, None, false).is_err());
+        assert!(format_decision(true, Some(false), false).is_err());
+    }
 
     #[test]
     fn parses_cryptsetup_status_device_line() {
