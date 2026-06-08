@@ -536,7 +536,11 @@ fn proxy_security_context(_legacy: bool) -> SecurityContext {
         run_as_user: Some(0),
         run_as_group: Some(0),
         capabilities: Some(Capabilities {
-            add: Some(vec!["MKNOD".to_string(), "SYS_PTRACE".to_string()]),
+            add: Some(vec![
+                "CHOWN".to_string(),
+                "MKNOD".to_string(),
+                "SYS_PTRACE".to_string(),
+            ]),
             drop: Some(vec!["ALL".to_string()]),
         }),
         ..Default::default()
@@ -562,11 +566,9 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("ATTESTATION_TLS_PORT", "8443"),
         env("TEE_DOMAIN", &app.domain.tee_domain),
         env("CAP_API_SIGNING_PUBKEY", &app.api_signing_pubkey),
-        env("CAP_CONFIG_DIR", "/state/app-data/.enclava/config"),
-        env(
-            "CAP_CONFIG_READY_MARKER",
-            "/state/app-data/.enclava/luks-ready",
-        ),
+        env("CAP_CONFIG_DIR", "/state/.enclava/config"),
+        env("CAP_CONFIG_READY_MARKER", "/state/.enclava/luks-ready"),
+        env("CAP_CONFIG_FILE_GID", "10001"),
         env("STORAGE_OWNERSHIP_MODE", mode),
         env("INSTANCE_ID", &app.owner_instance_id()),
         env("OWNER_CIPHERTEXT_BACKEND", "kbs-resource"),

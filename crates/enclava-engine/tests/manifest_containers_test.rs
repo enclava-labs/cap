@@ -243,7 +243,13 @@ fn proxy_container_can_create_sev_guest_device_for_auto_unlock() {
     assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
     assert_eq!(
         caps.add.as_deref(),
-        Some(&["MKNOD".to_string(), "SYS_PTRACE".to_string()][..])
+        Some(
+            &[
+                "CHOWN".to_string(),
+                "MKNOD".to_string(),
+                "SYS_PTRACE".to_string()
+            ][..]
+        )
     );
 }
 
@@ -337,7 +343,7 @@ fn proxy_container_mounts_state_filesystem_for_config_storage() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/app-data/.enclava/config")
+        Some("/state/.enclava/config")
     );
     assert_eq!(
         env.iter()
@@ -345,7 +351,15 @@ fn proxy_container_mounts_state_filesystem_for_config_storage() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/app-data/.enclava/luks-ready")
+        Some("/state/.enclava/luks-ready")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "CAP_CONFIG_FILE_GID")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("10001")
     );
 }
 
