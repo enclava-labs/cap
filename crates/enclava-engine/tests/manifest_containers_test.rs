@@ -343,7 +343,7 @@ fn proxy_container_uses_luks_state_root_for_config_storage() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/.enclava/config")
+        Some("/state/app-data/.enclava/config")
     );
     assert_eq!(
         env.iter()
@@ -351,7 +351,7 @@ fn proxy_container_uses_luks_state_root_for_config_storage() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/.enclava/luks-ready")
+        Some("/state/app-data/.enclava/luks-ready")
     );
     assert_eq!(
         env.iter()
