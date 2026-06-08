@@ -45,17 +45,30 @@ enum FormatDecision {
 
 /// True iff the device already carries a LUKS2 header that loads cleanly.
 pub fn is_formatted(device: &Path) -> Result<bool> {
-    let mut dev = CryptInit::init(device)
-        .map_err(|e| InitError::Luks(format!("init {}: {e}", device.display())))?;
-    if dev
-        .context_handle()
-        .load::<()>(Some(EncryptionFormat::Luks2), None)
-        .is_ok()
-    {
-        return Ok(true);
+    match CryptInit::init(device) {
+        Ok(mut dev) => {
+            if dev
+                .context_handle()
+                .load::<()>(Some(EncryptionFormat::Luks2), None)
+                .is_ok()
+            {
+                return Ok(true);
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                device = %device.display(),
+                error = %err,
+                "libcryptsetup init failed while probing LUKS header; falling back to CLI/header probe"
+            );
+        }
     }
 
-    cryptsetup_is_luks(device).map(|value| value.unwrap_or(false))
+    if let Some(value) = cryptsetup_is_luks(device)? {
+        return Ok(value);
+    }
+
+    device_has_luks2_header_magic(device)
 }
 
 /// Format `device` as LUKS2 and add `key` as keyslot 0.
@@ -375,10 +388,33 @@ fn cryptsetup_is_luks(device: &Path) -> Result<Option<bool>> {
     if status.code() == Some(1) {
         return Ok(Some(false));
     }
-    Err(InitError::Luks(format!(
-        "cryptsetup isLuks {} exited with {status}",
-        device.display()
-    )))
+    tracing::warn!(
+        device = %device.display(),
+        status = %status,
+        "cryptsetup isLuks returned an inconclusive status; falling back to header probe"
+    );
+    Ok(None)
+}
+
+fn device_has_luks2_header_magic(device: &Path) -> Result<bool> {
+    const LUKS_HEADER_BYTES: usize = 8;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(device)
+        .map_err(|e| InitError::Luks(format!("open {} for LUKS probe: {e}", device.display())))?;
+    let mut buf = [0u8; LUKS_HEADER_BYTES];
+    let read = file
+        .read(&mut buf)
+        .map_err(|e| InitError::Luks(format!("read {} LUKS probe: {e}", device.display())))?;
+    Ok(buffer_has_luks2_header_magic(&buf[..read]))
+}
+
+fn buffer_has_luks2_header_magic(buf: &[u8]) -> bool {
+    const LUKS_MAGIC: &[u8; 6] = b"LUKS\xba\xbe";
+    if buf.len() < 8 || &buf[..6] != LUKS_MAGIC {
+        return false;
+    }
+    u16::from_be_bytes([buf[6], buf[7]]) == 2
 }
 
 fn device_appears_blank(device: &Path) -> Result<bool> {
@@ -512,6 +548,16 @@ mod unit_tests {
     fn format_decision_refuses_ambiguous_or_damaged_devices() {
         assert!(format_decision(false, None, false).is_err());
         assert!(format_decision(true, Some(false), false).is_err());
+    }
+
+    #[test]
+    fn luks2_header_magic_detects_existing_luks2_header() {
+        let mut header = [0u8; 16];
+        header[..6].copy_from_slice(b"LUKS\xba\xbe");
+        header[6..8].copy_from_slice(&2u16.to_be_bytes());
+
+        assert!(buffer_has_luks2_header_magic(&header));
+        assert!(!buffer_has_luks2_header_magic(&[0u8; 16]));
     }
 
     #[test]
