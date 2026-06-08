@@ -427,11 +427,31 @@ fn attestation_proxy_binds_app_data_below_state_for_config_writes() {
 
     let mounts = bind_mount_plan_for_workload(&cfg, 999, &workload).unwrap();
 
-    assert_eq!(mounts.len(), 1);
-    assert_eq!(mounts[0].target, PathBuf::from("/state/app-data"));
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[1].target, PathBuf::from("/state/app-data"));
     assert_eq!(
-        mounts[0].source,
+        mounts[1].source,
         PathBuf::from("/proc/999/root/state/app-data")
+    );
+}
+
+#[test]
+fn attestation_proxy_binds_cap_config_root_below_state() {
+    let dir = tempdir().unwrap();
+    let cfg = config_with_signed_cc(dir.path(), "");
+    let workload = WorkloadNamespace {
+        name: "attestation-proxy".to_string(),
+        pid: 123,
+    };
+
+    let mounts = bind_mount_plan_for_workload(&cfg, 999, &workload).unwrap();
+
+    assert!(
+        mounts.iter().any(|mount| {
+            mount.source == PathBuf::from("/proc/999/root/state/.enclava")
+                && mount.target == PathBuf::from("/state/.enclava")
+        }),
+        "CAP config root must be bound from the decrypted LUKS namespace"
     );
 }
 
@@ -457,6 +477,10 @@ fn app_workload_binds_app_data_below_state_for_direct_config_reads() {
     assert_eq!(
         pairs,
         vec![
+            (
+                Path::new("/proc/999/root/state/.enclava"),
+                Path::new("/state/.enclava")
+            ),
             (
                 Path::new("/proc/999/root/state/app-data"),
                 Path::new("/app/data")

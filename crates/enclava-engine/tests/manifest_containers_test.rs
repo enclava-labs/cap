@@ -313,7 +313,7 @@ fn proxy_container_registers_startup_sentinel_without_waiting_for_init_ready() {
 }
 
 #[test]
-fn proxy_container_uses_luks_app_data_for_config_storage() {
+fn proxy_container_uses_luks_state_root_for_config_storage() {
     let c = build_attestation_proxy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
     let legacy_m = vm
@@ -343,7 +343,7 @@ fn proxy_container_uses_luks_app_data_for_config_storage() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/app-data/.enclava/config")
+        Some("/state/.enclava/config")
     );
     assert_eq!(
         env.iter()
@@ -351,7 +351,7 @@ fn proxy_container_uses_luks_app_data_for_config_storage() {
             .unwrap()
             .value
             .as_deref(),
-        Some("/state/app-data/.enclava/luks-ready")
+        Some("/state/.enclava/luks-ready")
     );
     assert_eq!(
         env.iter()

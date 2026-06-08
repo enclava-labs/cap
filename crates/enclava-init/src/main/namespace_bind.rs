@@ -459,6 +459,12 @@ pub(super) fn bind_mount_plan_for_workload(
 ) -> Result<Vec<NamespaceBindMount>> {
     let mut mounts = Vec::new();
     if workload.name != "tenant-ingress" {
+        let config_root = cap_config_bind_dir(Path::new(&cfg.state.mount_path));
+        mounts.push(NamespaceBindMount {
+            source: namespace_source(self_pid, &config_root.to_string_lossy()),
+            target: config_root,
+        });
+
         for bind in &cfg.app_bind_mounts {
             let state_target = app_bind_mount_dir(Path::new(&cfg.state.mount_path), &bind.subdir)?;
             let source = namespace_source(self_pid, &state_target.to_string_lossy());
@@ -477,6 +483,10 @@ pub(super) fn bind_mount_plan_for_workload(
         }
     }
     Ok(mounts)
+}
+
+fn cap_config_bind_dir(state_root: &Path) -> PathBuf {
+    state_root.join(".enclava")
 }
 
 pub(super) fn namespace_source(pid: u32, mount_path: &str) -> PathBuf {
