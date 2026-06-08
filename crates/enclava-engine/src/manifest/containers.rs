@@ -536,7 +536,7 @@ fn proxy_security_context(_legacy: bool) -> SecurityContext {
         run_as_user: Some(0),
         run_as_group: Some(0),
         capabilities: Some(Capabilities {
-            add: Some(vec!["MKNOD".to_string()]),
+            add: Some(vec!["MKNOD".to_string(), "SYS_PTRACE".to_string()]),
             drop: Some(vec!["ALL".to_string()]),
         }),
         ..Default::default()

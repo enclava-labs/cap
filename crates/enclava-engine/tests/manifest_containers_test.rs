@@ -241,7 +241,10 @@ fn proxy_container_can_create_sev_guest_device_for_auto_unlock() {
     assert_eq!(sc.read_only_root_filesystem, Some(true));
     let caps = sc.capabilities.as_ref().unwrap();
     assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
-    assert_eq!(caps.add.as_deref(), Some(&["MKNOD".to_string()][..]));
+    assert_eq!(
+        caps.add.as_deref(),
+        Some(&["MKNOD".to_string(), "SYS_PTRACE".to_string()][..])
+    );
 }
 
 #[test]
