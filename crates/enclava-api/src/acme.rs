@@ -96,11 +96,11 @@ pub async fn issue_dns01_certificate(
         cleanup_challenges(http_client, dns_config, &challenge_records).await;
         return Err(err);
     }
-    let cert_chain = match order.poll_certificate(&RetryPolicy::default()).await {
+    let cert_chain = match poll_certificate_after_finalize(&mut order).await {
         Ok(cert_chain) => cert_chain,
         Err(err) => {
             cleanup_challenges(http_client, dns_config, &challenge_records).await;
-            return Err(AcmeError::Acme(err));
+            return Err(err);
         }
     };
     cleanup_challenges(http_client, dns_config, &challenge_records).await;
@@ -130,6 +130,26 @@ async fn finalize_csr_after_ready(
 fn is_order_not_ready_finalize_error(message: &str) -> bool {
     message.contains("orderNotReady")
         || (message.contains("not acceptable for finalization") && message.contains("pending"))
+}
+
+async fn poll_certificate_after_finalize(
+    order: &mut instant_acme::Order,
+) -> Result<String, AcmeError> {
+    for attempt in 0..5 {
+        match order.poll_certificate(&RetryPolicy::default()).await {
+            Ok(cert_chain) => return Ok(cert_chain),
+            Err(err) if attempt < 4 && is_certificate_not_found_poll_error(&err.to_string()) => {
+                tokio::time::sleep(Duration::from_secs(1 + attempt)).await;
+            }
+            Err(err) => return Err(AcmeError::Acme(err)),
+        }
+    }
+    unreachable!("bounded certificate polling retry loop always returns")
+}
+
+fn is_certificate_not_found_poll_error(message: &str) -> bool {
+    message.contains("Certificate not found")
+        && message.contains("urn:ietf:params:acme:error:malformed")
 }
 
 async fn wait_for_txt_record(
@@ -336,6 +356,31 @@ mod tests {
         assert!(
             finalize.contains("order.poll_ready(&RetryPolicy::default()).await"),
             "ACME DNS-01 must re-poll order readiness before retrying a pending finalization"
+        );
+    }
+
+    #[test]
+    fn dns01_certificate_poll_retries_staging_certificate_not_found() {
+        assert!(super::is_certificate_not_found_poll_error(
+            "ACME failed: API error: Certificate not found (urn:ietf:params:acme:error:malformed)"
+        ));
+        assert!(!super::is_certificate_not_found_poll_error(
+            "ACME failed: API error: account is rate limited"
+        ));
+
+        let source = include_str!("acme.rs");
+        let poll = source
+            .split("async fn poll_certificate_after_finalize")
+            .nth(1)
+            .expect("certificate polling retry helper");
+
+        assert!(
+            poll.contains("order.poll_certificate(&RetryPolicy::default()).await"),
+            "ACME DNS-01 must poll the finalized certificate in the helper"
+        );
+        assert!(
+            poll.contains("is_certificate_not_found_poll_error"),
+            "ACME DNS-01 must retry transient staging certificate-not-found polling errors"
         );
     }
 }
