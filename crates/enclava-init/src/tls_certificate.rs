@@ -173,7 +173,7 @@ fn certificate_state_matches_request(
             return false;
         }
     };
-    if actual == *expected {
+    if actual == *expected && certificate_material_is_usable(persistent_root) {
         return true;
     }
     tracing::warn!(
@@ -187,13 +187,62 @@ fn certificate_state_matches_request(
     false
 }
 
+fn certificate_material_is_usable(persistent_root: &Path) -> bool {
+    let cert_path = cert_path(persistent_root);
+    let cert = match std::fs::read_to_string(&cert_path) {
+        Ok(cert) => cert,
+        Err(err) => {
+            tracing::warn!(
+                cert = %cert_path.display(),
+                error = %err,
+                "static TLS certificate is not readable"
+            );
+            return false;
+        }
+    };
+    if !cert.contains("-----BEGIN CERTIFICATE-----") || !cert.contains("-----END CERTIFICATE-----")
+    {
+        tracing::warn!(
+            cert = %cert_path.display(),
+            "static TLS certificate PEM framing is invalid"
+        );
+        return false;
+    }
+    let key_path = key_path(persistent_root);
+    if let Err(err) = load_existing_key(&key_path) {
+        tracing::warn!(
+            key = %key_path.display(),
+            error = ?err,
+            "static TLS private key is not reusable"
+        );
+        return false;
+    }
+    true
+}
+
 fn load_or_generate_key(path: &Path) -> Result<KeyPair> {
     if path.is_file() {
-        let pem = std::fs::read_to_string(path)
-            .with_context(|| format!("reading TLS private key {}", path.display()))?;
-        return KeyPair::from_pem(&pem)
-            .with_context(|| format!("parsing TLS private key {}", path.display()));
+        match load_existing_key(path) {
+            Ok(key_pair) => return Ok(key_pair),
+            Err(err) => {
+                tracing::warn!(
+                    key = %path.display(),
+                    error = ?err,
+                    "replacing malformed TLS private key"
+                );
+            }
+        }
     }
+    generate_and_write_key(path)
+}
+
+fn load_existing_key(path: &Path) -> Result<KeyPair> {
+    let pem = std::fs::read_to_string(path)
+        .with_context(|| format!("reading TLS private key {}", path.display()))?;
+    KeyPair::from_pem(&pem).with_context(|| format!("parsing TLS private key {}", path.display()))
+}
+
+fn generate_and_write_key(path: &Path) -> Result<KeyPair> {
     let key_pair = KeyPair::generate().context("generating TLS private key")?;
     writes::atomic_write(path, key_pair.serialize_pem().as_bytes(), 0o600)
         .with_context(|| format!("writing TLS private key {}", path.display()))?;
@@ -290,6 +339,23 @@ hkdf-info = "tls-state-luks-key"
     }
 
     #[test]
+    fn malformed_existing_key_is_replaced_for_new_certificate_requests() {
+        let dir = tempdir().unwrap();
+        let key_path = key_path(dir.path());
+        writes::atomic_write(&key_path, b"not a tls private key", 0o600).unwrap();
+
+        let key_pair = load_or_generate_key(&key_path).unwrap();
+        let pem = std::fs::read_to_string(&key_path).unwrap();
+
+        assert!(KeyPair::from_pem(&pem).is_ok());
+        assert!(
+            !build_csr_der(&["app.example.test".to_string()], &key_pair)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn existing_certificate_without_metadata_is_not_silently_reused() {
         let dir = tempdir().unwrap();
         writes::atomic_write(
@@ -301,13 +367,12 @@ hkdf-info = "tls-state-luks-key"
         writes::atomic_write(&key_path(dir.path()), b"not a tls private key", 0o600).unwrap();
         let cfg = tls_broker_config("http://broker.example.test/cert", &["app.example.test"]);
 
-        let err = provision_static_tls_certificate(&cfg, dir.path())
-            .expect_err("untracked certificate state must not skip broker issuance");
-
-        assert!(
-            err.to_string().contains("parsing TLS private key"),
-            "unexpected error: {err:#}"
+        let metadata = expected_metadata(
+            cfg.tls_certificate_broker_url.as_deref().unwrap(),
+            &cfg.tls_certificate_hostnames,
         );
+
+        assert!(!certificate_state_matches_request(dir.path(), &metadata));
     }
 
     #[test]
@@ -319,9 +384,10 @@ hkdf-info = "tls-state-luks-key"
             0o644,
         )
         .unwrap();
+        let key_pair = KeyPair::generate().unwrap();
         writes::atomic_write(
             &key_path(dir.path()),
-            b"not parsed when metadata matches",
+            key_pair.serialize_pem().as_bytes(),
             0o600,
         )
         .unwrap();
@@ -341,6 +407,30 @@ hkdf-info = "tls-state-luks-key"
         .unwrap();
 
         provision_static_tls_certificate(&cfg, dir.path()).unwrap();
+    }
+
+    #[test]
+    fn matching_metadata_does_not_reuse_malformed_key() {
+        let dir = tempdir().unwrap();
+        writes::atomic_write(
+            &cert_path(dir.path()),
+            b"-----BEGIN CERTIFICATE-----\nstill-valid\n-----END CERTIFICATE-----\n",
+            0o644,
+        )
+        .unwrap();
+        writes::atomic_write(&key_path(dir.path()), b"not a tls private key", 0o600).unwrap();
+        let metadata = expected_metadata(
+            "http://broker.example.test/cert",
+            &["app.example.test".to_string()],
+        );
+        writes::atomic_write(
+            &metadata_path(dir.path()),
+            &serde_json::to_vec_pretty(&metadata).unwrap(),
+            0o644,
+        )
+        .unwrap();
+
+        assert!(!certificate_state_matches_request(dir.path(), &metadata));
     }
 
     #[test]
