@@ -245,11 +245,79 @@ pub struct DeployRequest {
     pub signed_policy_artifact: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DeployResources {
     pub cpu: Option<String>,
     pub memory: Option<String>,
     pub storage: Option<String>,
+}
+
+fn resource_value(resources: &[enclava_common::descriptor::EnvVar], name: &str) -> Option<String> {
+    resources
+        .iter()
+        .find(|resource| resource.name == name)
+        .map(|resource| resource.value.clone())
+}
+
+fn descriptor_deploy_resources(
+    descriptor: &enclava_common::descriptor::DeploymentDescriptor,
+) -> Option<DeployResources> {
+    descriptor_deploy_resources_from_limits(&descriptor.oci_runtime_spec.resources.limits)
+}
+
+fn descriptor_deploy_resources_from_limits(
+    limits: &[enclava_common::descriptor::EnvVar],
+) -> Option<DeployResources> {
+    let cpu = resource_value(limits, "cpu");
+    let memory = resource_value(limits, "memory");
+    if cpu.is_none() && memory.is_none() {
+        return None;
+    }
+    Some(DeployResources {
+        cpu,
+        memory,
+        storage: None,
+    })
+}
+
+fn merge_signed_descriptor_resources(
+    requested: Option<DeployResources>,
+    signing_artifacts: Option<&crate::signing_service::DeploymentSigningArtifacts>,
+) -> Result<Option<DeployResources>, String> {
+    let Some(descriptor_resources) =
+        signing_artifacts.and_then(|artifacts| descriptor_deploy_resources(&artifacts.descriptor))
+    else {
+        return Ok(requested);
+    };
+
+    let Some(requested) = requested else {
+        return Ok(Some(descriptor_resources));
+    };
+
+    if let (Some(requested_cpu), Some(descriptor_cpu)) = (
+        requested.cpu.as_deref(),
+        descriptor_resources.cpu.as_deref(),
+    ) && requested_cpu != descriptor_cpu
+    {
+        return Err(format!(
+            "requested cpu {requested_cpu} conflicts with signed descriptor cpu {descriptor_cpu}"
+        ));
+    }
+    if let (Some(requested_memory), Some(descriptor_memory)) = (
+        requested.memory.as_deref(),
+        descriptor_resources.memory.as_deref(),
+    ) && requested_memory != descriptor_memory
+    {
+        return Err(format!(
+            "requested memory {requested_memory} conflicts with signed descriptor memory {descriptor_memory}"
+        ));
+    }
+
+    Ok(Some(DeployResources {
+        cpu: descriptor_resources.cpu.or(requested.cpu),
+        memory: descriptor_resources.memory.or(requested.memory),
+        storage: requested.storage,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,6 +445,9 @@ pub async fn deploy(
         body.org_keyring_blob.clone(),
     )
     .map_err(signing_error_response)?;
+    let effective_resources =
+        merge_signed_descriptor_resources(body.resources.clone(), signing_artifacts.as_ref())
+            .map_err(|message| json_error(StatusCode::BAD_REQUEST, message))?;
     if body.signed_policy_artifact.is_some() && signing_artifacts.is_none() {
         return Err(signing_error_response(
             crate::signing_service::SigningServiceError::ArtifactWithoutBlobs,
@@ -447,7 +518,7 @@ pub async fn deploy(
         })?;
 
     // Enforce core entitlement resource limits.
-    if let Some(ref resources) = body.resources {
+    if let Some(ref resources) = effective_resources {
         let org: crate::models::Organization =
             sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
                 .bind(auth.org_id)
@@ -722,7 +793,7 @@ pub async fn deploy(
         "image": body.image,
         "image_digest": &image_digest,
         "container_name": container_name,
-        "resources": body.resources,
+        "resources": effective_resources,
         "external_id": &body.external_id,
         "source_provider": source_provider,
         "source_repository": &body.source_repository,

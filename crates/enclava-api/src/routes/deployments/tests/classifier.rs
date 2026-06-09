@@ -223,6 +223,50 @@ fn deploy_persists_requested_resources_before_rendering_manifest() {
 }
 
 #[test]
+fn signed_deploy_derives_missing_resources_from_descriptor_before_rendering_manifest() {
+    let source = include_str!("../../deployments.rs");
+    let deploy_body = source
+        .split("pub async fn deploy")
+        .nth(1)
+        .expect("deploy route exists");
+    let merge_resources = deploy_body
+        .find("merge_signed_descriptor_resources")
+        .expect("signed deploy must merge descriptor resources into deploy resources");
+    let render_manifest = deploy_body
+        .find("build_confidential_app")
+        .expect("deploy route renders app manifest");
+
+    assert!(
+        merge_resources < render_manifest,
+        "signed descriptor resources must be applied before manifest rendering reads app_resources"
+    );
+}
+
+#[test]
+fn descriptor_deploy_resources_extracts_cpu_and_memory_limits() {
+    let resources = descriptor_deploy_resources_from_limits(&[
+        enclava_common::descriptor::EnvVar {
+            name: "memory".to_string(),
+            value: "8Gi".to_string(),
+        },
+        enclava_common::descriptor::EnvVar {
+            name: "cpu".to_string(),
+            value: "4".to_string(),
+        },
+    ])
+    .expect("descriptor resources should be present");
+
+    assert_eq!(
+        resources,
+        DeployResources {
+            cpu: Some("4".to_string()),
+            memory: Some("8Gi".to_string()),
+            storage: None,
+        }
+    );
+}
+
+#[test]
 fn idempotent_retry_requires_same_deployment_payload() {
     let app = idempotency_app();
     let deployment = idempotency_deployment(&app);
