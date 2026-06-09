@@ -12,6 +12,8 @@ use crate::{trustee_verify, writes};
 
 pub const CERT_RELATIVE_PATH: &str = "certificates/tls.crt";
 pub const KEY_RELATIVE_PATH: &str = "certificates/tls.key";
+const METADATA_RELATIVE_PATH: &str = "certificates/tls.metadata.json";
+const METADATA_VERSION: u8 = 1;
 
 #[derive(Debug, Serialize)]
 struct CertificateRequest<'a> {
@@ -23,6 +25,13 @@ struct CertificateRequest<'a> {
 #[derive(Debug, Deserialize)]
 struct CertificateResponse {
     certificate_chain_pem: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct CertificateMetadata {
+    version: u8,
+    broker_url: String,
+    hostnames: Vec<String>,
 }
 
 pub fn provision_static_tls_certificate(cfg: &Config, persistent_root: &Path) -> Result<()> {
@@ -37,13 +46,23 @@ pub fn provision_static_tls_certificate(cfg: &Config, persistent_root: &Path) ->
 
     let cert_path = cert_path(persistent_root);
     let key_path = key_path(persistent_root);
-    if cert_path.is_file() && key_path.is_file() {
+    let metadata = expected_metadata(broker_url, &cfg.tls_certificate_hostnames);
+    if certificate_state_matches_request(persistent_root, &metadata) {
         tracing::info!(
             cert = %cert_path.display(),
             key = %key_path.display(),
+            metadata = %metadata_path(persistent_root).display(),
             "static TLS certificate already present; skipping issuance"
         );
         return Ok(());
+    }
+    if cert_path.is_file() || key_path.is_file() {
+        tracing::warn!(
+            cert = %cert_path.display(),
+            key = %key_path.display(),
+            metadata = %metadata_path(persistent_root).display(),
+            "static TLS certificate state is present but not reusable; requesting fresh certificate"
+        );
     }
 
     let key_pair = load_or_generate_key(&key_path)?;
@@ -90,6 +109,10 @@ pub fn provision_static_tls_certificate(cfg: &Config, persistent_root: &Path) ->
     }
     writes::atomic_write(&cert_path, body.certificate_chain_pem.as_bytes(), 0o644)
         .with_context(|| format!("writing {}", cert_path.display()))?;
+    let metadata_json =
+        serde_json::to_vec_pretty(&metadata).context("serializing TLS certificate metadata")?;
+    writes::atomic_write(&metadata_path(persistent_root), &metadata_json, 0o644)
+        .with_context(|| format!("writing {}", metadata_path(persistent_root).display()))?;
     Ok(())
 }
 
@@ -99,6 +122,69 @@ pub fn cert_path(persistent_root: &Path) -> PathBuf {
 
 pub fn key_path(persistent_root: &Path) -> PathBuf {
     persistent_root.join(KEY_RELATIVE_PATH)
+}
+
+fn metadata_path(persistent_root: &Path) -> PathBuf {
+    persistent_root.join(METADATA_RELATIVE_PATH)
+}
+
+fn expected_metadata(broker_url: &str, hostnames: &[String]) -> CertificateMetadata {
+    CertificateMetadata {
+        version: METADATA_VERSION,
+        broker_url: broker_url.to_string(),
+        hostnames: normalized_hostnames(hostnames),
+    }
+}
+
+fn normalized_hostnames(hostnames: &[String]) -> Vec<String> {
+    let mut normalized = hostnames.to_vec();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn certificate_state_matches_request(
+    persistent_root: &Path,
+    expected: &CertificateMetadata,
+) -> bool {
+    if !cert_path(persistent_root).is_file() || !key_path(persistent_root).is_file() {
+        return false;
+    }
+    let metadata_path = metadata_path(persistent_root);
+    let bytes = match std::fs::read(&metadata_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                path = %metadata_path.display(),
+                error = %err,
+                "static TLS certificate metadata is not readable"
+            );
+            return false;
+        }
+    };
+    let actual = match serde_json::from_slice::<CertificateMetadata>(&bytes) {
+        Ok(actual) => actual,
+        Err(err) => {
+            tracing::warn!(
+                path = %metadata_path.display(),
+                error = %err,
+                "static TLS certificate metadata is invalid"
+            );
+            return false;
+        }
+    };
+    if actual == *expected {
+        return true;
+    }
+    tracing::warn!(
+        path = %metadata_path.display(),
+        expected_hostnames = ?expected.hostnames,
+        actual_hostnames = ?actual.hostnames,
+        expected_broker_url = %expected.broker_url,
+        actual_broker_url = %actual.broker_url,
+        "static TLS certificate metadata does not match current request"
+    );
+    false
 }
 
 fn load_or_generate_key(path: &Path) -> Result<KeyPair> {
@@ -137,6 +223,40 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn tls_broker_config(broker_url: &str, hostnames: &[&str]) -> Config {
+        let dir = tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let hostname_list = hostnames
+            .iter()
+            .map(|hostname| format!("{hostname:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+mode = "autounlock"
+tls-certificate-broker-url = "{broker_url}"
+tls-certificate-hostnames = [{hostname_list}]
+
+[state]
+device = "/dev/csi0"
+mapping-name = "cap-state"
+mount-path = "/state/app-data"
+hkdf-info = "state-luks-key"
+
+[tls-state]
+device = "/dev/csi1"
+mapping-name = "cap-tls-state"
+mount-path = "/state/tls-state"
+hkdf-info = "tls-state-luks-key"
+"#
+            ),
+        )
+        .unwrap();
+        Config::load(&cfg_path).unwrap()
+    }
+
     #[test]
     fn certificate_paths_match_caddyfile_static_tls_paths() {
         let root = Path::new("/state/tls-state/tenant-ingress");
@@ -167,6 +287,77 @@ mod tests {
         assert_eq!(first_pem, second_pem);
         assert!(!first_csr.is_empty());
         assert!(!second_csr.is_empty());
+    }
+
+    #[test]
+    fn existing_certificate_without_metadata_is_not_silently_reused() {
+        let dir = tempdir().unwrap();
+        writes::atomic_write(
+            &cert_path(dir.path()),
+            b"-----BEGIN CERTIFICATE-----\nstale\n-----END CERTIFICATE-----\n",
+            0o644,
+        )
+        .unwrap();
+        writes::atomic_write(&key_path(dir.path()), b"not a tls private key", 0o600).unwrap();
+        let cfg = tls_broker_config("http://broker.example.test/cert", &["app.example.test"]);
+
+        let err = provision_static_tls_certificate(&cfg, dir.path())
+            .expect_err("untracked certificate state must not skip broker issuance");
+
+        assert!(
+            err.to_string().contains("parsing TLS private key"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn existing_certificate_with_matching_metadata_is_reused() {
+        let dir = tempdir().unwrap();
+        writes::atomic_write(
+            &cert_path(dir.path()),
+            b"-----BEGIN CERTIFICATE-----\nstill-valid\n-----END CERTIFICATE-----\n",
+            0o644,
+        )
+        .unwrap();
+        writes::atomic_write(
+            &key_path(dir.path()),
+            b"not parsed when metadata matches",
+            0o600,
+        )
+        .unwrap();
+        let cfg = tls_broker_config(
+            "http://broker.example.test/cert",
+            &["b.example.test", "a.example.test", "a.example.test"],
+        );
+        let metadata = expected_metadata(
+            cfg.tls_certificate_broker_url.as_deref().unwrap(),
+            &cfg.tls_certificate_hostnames,
+        );
+        writes::atomic_write(
+            &metadata_path(dir.path()),
+            &serde_json::to_vec_pretty(&metadata).unwrap(),
+            0o644,
+        )
+        .unwrap();
+
+        provision_static_tls_certificate(&cfg, dir.path()).unwrap();
+    }
+
+    #[test]
+    fn certificate_metadata_normalizes_hostname_order_and_duplicates() {
+        let metadata = expected_metadata(
+            "http://broker.example.test/cert",
+            &[
+                "b.example.test".to_string(),
+                "a.example.test".to_string(),
+                "b.example.test".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            metadata.hostnames,
+            vec!["a.example.test".to_string(), "b.example.test".to_string()]
+        );
     }
 
     #[test]
