@@ -164,6 +164,9 @@ fn api_app_for_descriptor(
         source_provider: None,
         source_repository: None,
         egress_allowlist: serde_json::json!([]),
+        health_path: "/health".to_string(),
+        health_interval_seconds: 30,
+        health_timeout_seconds: 5,
         created_at: "2026-04-01T00:00:00Z".parse().unwrap(),
         updated_at: "2026-04-01T00:00:00Z".parse().unwrap(),
     }
@@ -546,6 +549,7 @@ fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> Confide
             cpu: "1".to_string(),
             memory: "512Mi".to_string(),
         },
+        health: enclava_engine::types::HealthCheck::default(),
         attestation: AttestationConfig {
             proxy_image: ImageRef::parse(&format!(
                 "ghcr.io/enclava-labs/attestation-proxy@{}",

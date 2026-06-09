@@ -10,14 +10,16 @@
 //! without disruption; new deploys default to the enclava-init shape.
 
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, EnvVar, ExecAction, Probe, SecurityContext,
-    VolumeDevice, VolumeMount,
+    Capabilities, Container, ContainerPort, EnvVar, ExecAction, HTTPGetAction, HTTPHeader, Probe,
+    SecurityContext, VolumeDevice, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 
 use crate::manifest::cc_init_data;
 use crate::types::{CaddyTlsMode, ConfidentialApp};
 use enclava_common::types::UnlockMode;
+use enclava_common::validate::validate_http_path;
 
 /// True when the operator has opted back into the legacy bootstrap_script.sh
 /// flow. Defaults to false — Phase 5 ships enclava-init as the default.
@@ -131,6 +133,34 @@ fn env_field_ref(name: &str, field_path: &str) -> EnvVar {
             }),
             ..Default::default()
         }),
+        ..Default::default()
+    }
+}
+
+fn validated_health_path(app: &ConfidentialApp) -> &str {
+    validate_http_path(&app.health.path)
+        .expect("health path must validate before manifest generation");
+    &app.health.path
+}
+
+fn app_http_probe(app: &ConfidentialApp, app_port: i32) -> HTTPGetAction {
+    HTTPGetAction {
+        path: Some(validated_health_path(app).to_string()),
+        port: IntOrString::Int(app_port),
+        scheme: Some("HTTP".to_string()),
+        ..Default::default()
+    }
+}
+
+fn tenant_ingress_http_probe(app: &ConfidentialApp, tls_port: i32) -> HTTPGetAction {
+    HTTPGetAction {
+        path: Some("/health".to_string()),
+        port: IntOrString::Int(tls_port),
+        scheme: Some("HTTPS".to_string()),
+        http_headers: Some(vec![HTTPHeader {
+            name: "Host".to_string(),
+            value: app.domain.platform_domain.clone(),
+        }]),
         ..Default::default()
     }
 }
@@ -330,13 +360,9 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
         }),
         liveness_probe: None,
         startup_probe: Some(k8s_openapi::api::core::v1::Probe {
-            tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
-                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                    app_port as i32,
-                ),
-                ..Default::default()
-            }),
+            http_get: Some(app_http_probe(app, app_port as i32)),
             period_seconds: Some(10),
+            timeout_seconds: Some(app.health.timeout_seconds as i32),
             // Password-mode workloads start under enclava-wait-exec and may
             // spend several minutes waiting for unlock/config before the app
             // can bind its port. Keep the startup budget long enough to avoid
@@ -345,14 +371,10 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             ..Default::default()
         }),
         readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
-            tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
-                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                    app_port as i32,
-                ),
-                ..Default::default()
-            }),
+            http_get: Some(app_http_probe(app, app_port as i32)),
             initial_delay_seconds: Some(180),
-            period_seconds: Some(10),
+            period_seconds: Some(app.health.interval_seconds as i32),
+            timeout_seconds: Some(app.health.timeout_seconds as i32),
             ..Default::default()
         }),
         ..Default::default()
@@ -869,12 +891,10 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             ..Default::default()
         }),
         readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
-            tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
-                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(tls_port),
-                ..Default::default()
-            }),
+            http_get: Some(tenant_ingress_http_probe(app, tls_port)),
             initial_delay_seconds: Some(180),
             period_seconds: Some(15),
+            timeout_seconds: Some(app.health.timeout_seconds as i32),
             ..Default::default()
         }),
         ..Default::default()

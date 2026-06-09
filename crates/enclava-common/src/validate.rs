@@ -18,6 +18,8 @@ pub enum ValidateError {
     InvalidFqdn(&'static str),
     #[error("invalid image digest: {0}")]
     InvalidImageDigest(&'static str),
+    #[error("invalid HTTP path: {0}")]
+    InvalidHttpPath(&'static str),
 }
 
 const MAX_DNS_LABEL_LEN: usize = 63;
@@ -26,6 +28,7 @@ const MAX_APP_NAME_LEN: usize = 32;
 const ORG_SLUG_LEN: usize = 8;
 const IMAGE_DIGEST_HEX_LEN: usize = 64;
 const IMAGE_DIGEST_PREFIX: &str = "sha256:";
+const MAX_HTTP_PATH_LEN: usize = 256;
 
 /// RFC 1123 DNS label (1–63 chars, `[a-z0-9-]`, no leading/trailing hyphen).
 ///
@@ -147,6 +150,38 @@ pub fn validate_image_digest(s: &str) -> Result<(), ValidateError> {
     {
         return Err(ValidateError::InvalidImageDigest(
             "hex section must be lowercase hex [0-9a-f]",
+        ));
+    }
+    Ok(())
+}
+
+/// Absolute HTTP path safe for Kubernetes probes and generated Caddyfile rewrites.
+pub fn validate_http_path(s: &str) -> Result<(), ValidateError> {
+    if s.is_empty() {
+        return Err(ValidateError::InvalidHttpPath("empty"));
+    }
+    if s.len() > MAX_HTTP_PATH_LEN {
+        return Err(ValidateError::InvalidHttpPath("exceeds 256 characters"));
+    }
+    if !s.starts_with('/') {
+        return Err(ValidateError::InvalidHttpPath("must start with '/'"));
+    }
+    if s.starts_with("//") {
+        return Err(ValidateError::InvalidHttpPath("must not start with '//'"));
+    }
+    if !s.is_ascii() {
+        return Err(ValidateError::InvalidHttpPath("must be ASCII"));
+    }
+    if s.bytes().any(|b| {
+        b.is_ascii_control()
+            || b.is_ascii_whitespace()
+            || matches!(
+                b,
+                b'\\' | b'`' | b'\'' | b'"' | b'{' | b'}' | b';' | b'?' | b'#'
+            )
+    }) {
+        return Err(ValidateError::InvalidHttpPath(
+            "contains forbidden character",
         ));
     }
     Ok(())
@@ -382,5 +417,33 @@ mod tests {
         assert!(validate_image_digest(&d).is_err());
         let d = format!("sha256:{}", "g".repeat(64));
         assert!(validate_image_digest(&d).is_err());
+    }
+
+    #[test]
+    fn http_path_accepts_absolute_paths() {
+        assert!(validate_http_path("/health").is_ok());
+        assert!(validate_http_path("/v1/info").is_ok());
+        assert!(validate_http_path("/ready-1_ok").is_ok());
+    }
+
+    #[test]
+    fn http_path_rejects_unsafe_paths() {
+        for bad in [
+            "",
+            "health",
+            "//health",
+            "/health?debug=true",
+            "/health#frag",
+            "/bad path",
+            "/bad\npath",
+            "/bad{path}",
+            "/bad;path",
+            "/bad\\path",
+        ] {
+            assert!(
+                validate_http_path(bad).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
     }
 }

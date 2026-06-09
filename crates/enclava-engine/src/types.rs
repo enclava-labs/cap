@@ -48,6 +48,9 @@ pub struct ConfidentialApp {
     pub api_url: String,
     /// CPU and memory limits.
     pub resources: ResourceLimits,
+    /// Application HTTP health check used by Kubernetes probes and tenant ingress.
+    #[serde(default)]
+    pub health: HealthCheck,
     /// Attestation proxy and ingress sidecar configuration.
     pub attestation: AttestationConfig,
     /// Per-app world-egress allowlist (Phase 11). Default: empty -> no
@@ -65,6 +68,38 @@ pub struct ConfidentialApp {
     /// unsigned/dev paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_agent_policy: Option<GeneratedAgentPolicy>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthCheck {
+    #[serde(default = "default_health_path")]
+    pub path: String,
+    #[serde(default = "default_health_interval_seconds")]
+    pub interval_seconds: u32,
+    #[serde(default = "default_health_timeout_seconds")]
+    pub timeout_seconds: u32,
+}
+
+impl Default for HealthCheck {
+    fn default() -> Self {
+        Self {
+            path: default_health_path(),
+            interval_seconds: default_health_interval_seconds(),
+            timeout_seconds: default_health_timeout_seconds(),
+        }
+    }
+}
+
+pub fn default_health_path() -> String {
+    "/health".to_string()
+}
+
+pub fn default_health_interval_seconds() -> u32 {
+    30
+}
+
+pub fn default_health_timeout_seconds() -> u32 {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

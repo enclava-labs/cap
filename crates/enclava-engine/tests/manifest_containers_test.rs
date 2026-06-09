@@ -133,25 +133,62 @@ fn app_container_has_no_kubernetes_subpath_mounts() {
 }
 
 #[test]
-fn app_container_uses_tcp_readiness_without_liveness() {
+fn app_container_uses_http_health_probes_without_liveness() {
     let c = build_app_container(&sample_app());
     assert!(c.liveness_probe.is_none());
 
     let startup = c.startup_probe.as_ref().unwrap();
+    let startup_http = startup.http_get.as_ref().unwrap();
+    assert_eq!(startup_http.path.as_deref(), Some("/health"));
     assert_eq!(
-        startup.tcp_socket.as_ref().unwrap().port,
+        startup_http.port,
         k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
     );
-    assert!(startup.http_get.is_none());
+    assert_eq!(startup_http.scheme.as_deref(), Some("HTTP"));
+    assert!(startup.tcp_socket.is_none());
     assert_eq!(startup.period_seconds, Some(10));
     assert_eq!(startup.failure_threshold, Some(180));
 
     let readiness = c.readiness_probe.as_ref().unwrap();
+    let readiness_http = readiness.http_get.as_ref().unwrap();
+    assert_eq!(readiness_http.path.as_deref(), Some("/health"));
     assert_eq!(
-        readiness.tcp_socket.as_ref().unwrap().port,
+        readiness_http.port,
         k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
     );
-    assert!(readiness.http_get.is_none());
+    assert_eq!(readiness_http.scheme.as_deref(), Some("HTTP"));
+    assert!(readiness.tcp_socket.is_none());
+}
+
+#[test]
+fn app_container_uses_configured_health_path() {
+    let mut app = sample_app();
+    app.health.path = "/v1/info".to_string();
+
+    let c = build_app_container(&app);
+
+    assert_eq!(
+        c.startup_probe
+            .as_ref()
+            .unwrap()
+            .http_get
+            .as_ref()
+            .unwrap()
+            .path
+            .as_deref(),
+        Some("/v1/info")
+    );
+    assert_eq!(
+        c.readiness_probe
+            .as_ref()
+            .unwrap()
+            .http_get
+            .as_ref()
+            .unwrap()
+            .path
+            .as_deref(),
+        Some("/v1/info")
+    );
 }
 
 // === Attestation proxy ===
@@ -381,11 +418,22 @@ fn caddy_container_internal_tls_uses_high_port() {
     let ports = c.ports.as_ref().unwrap();
     assert!(ports.iter().any(|p| p.container_port == 10443));
     let probe = c.readiness_probe.as_ref().unwrap();
-    let tcp = probe.tcp_socket.as_ref().unwrap();
+    let http_get = probe.http_get.as_ref().unwrap();
     assert_eq!(
-        tcp.port,
+        http_get.port,
         k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(10443)
     );
+    assert_eq!(http_get.path.as_deref(), Some("/health"));
+    assert_eq!(http_get.scheme.as_deref(), Some("HTTPS"));
+    assert!(
+        http_get
+            .http_headers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|h| h.name == "Host" && h.value == "test-app.abcd1234.enclava.dev")
+    );
+    assert!(probe.tcp_socket.is_none());
 }
 
 #[test]

@@ -272,6 +272,15 @@ pub(crate) fn confidential_app_for_cc_hash(
             cpu: app_config.resources.cpu.clone(),
             memory: app_config.resources.memory.clone(),
         },
+        health: app_config
+            .health
+            .as_ref()
+            .map(|health| enclava_engine::types::HealthCheck {
+                path: health.path.clone(),
+                interval_seconds: health.interval,
+                timeout_seconds: health.timeout,
+            })
+            .unwrap_or_default(),
         attestation: AttestationConfig {
             proxy_image: enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?,
             caddy_image: enclava_common::image::ImageRef::parse(&release.caddy_ingress_image)?,

@@ -244,6 +244,9 @@ pub async fn create_generic_deployment(
                 source_provider: Some(body.source.provider),
                 source_repository: Some(body.source.repository.clone()),
                 egress_allowlist: body.app.egress_allowlist.clone(),
+                health_path: None,
+                health_interval: None,
+                health_timeout: None,
             };
             let (_, Json(created)) =
                 crate::routes::apps::create_app(auth.clone(), State(state.clone()), Json(create))

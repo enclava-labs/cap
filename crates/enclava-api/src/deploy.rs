@@ -10,7 +10,7 @@ use enclava_engine::apply::{
 };
 use enclava_engine::manifest::generate_all_manifests;
 use enclava_engine::types::{
-    AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec,
+    AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, HealthCheck, StorageSpec,
     WorkloadArtifactBinding,
 };
 use sqlx::PgPool;
@@ -275,6 +275,11 @@ pub async fn build_confidential_app(
             cpu: resources.cpu_limit,
             memory: resources.memory_limit,
         },
+        health: HealthCheck {
+            path: app.health_path.clone(),
+            interval_seconds: app.health_interval_seconds.max(1) as u32,
+            timeout_seconds: app.health_timeout_seconds.max(1) as u32,
+        },
         attestation: attestation_config.clone(),
         egress_allowlist,
         workload_artifact_binding: None,
@@ -502,6 +507,7 @@ mod tests {
                 cpu: "1".to_string(),
                 memory: "1Gi".to_string(),
             },
+            health: HealthCheck::default(),
             attestation: AttestationConfig {
                 proxy_image: ImageRef::parse(
                     "ghcr.io/enclava-labs/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -578,6 +584,7 @@ mod tests {
                 cpu: "1".to_string(),
                 memory: "1Gi".to_string(),
             },
+            health: HealthCheck::default(),
             attestation: AttestationConfig {
                 proxy_image: ImageRef::parse(
                     "ghcr.io/enclava-labs/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",

@@ -12,7 +12,7 @@
 //! `format!("{user_input}")` of caller-supplied strings; that closes the
 //! Caddyfile-injection vector flagged in the security review.
 
-use enclava_common::validate::{ValidateError, validate_fqdn};
+use enclava_common::validate::{ValidateError, validate_fqdn, validate_http_path};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
@@ -31,6 +31,8 @@ pub enum IngressRenderError {
     InvalidAcmeUrl(String),
     #[error("invalid ACME contact email: {0}")]
     InvalidEmail(String),
+    #[error("invalid health path for Caddyfile: {0}")]
+    InvalidHealthPath(String),
 }
 
 /// Validated inputs ready to be rendered into a Caddyfile.
@@ -40,6 +42,7 @@ struct CaddyfileSpec {
     acme_ca: String,
     tls_mode: CaddyTlsMode,
     contact_email: String,
+    health_path: String,
 }
 
 impl CaddyfileSpec {
@@ -71,12 +74,16 @@ impl CaddyfileSpec {
         }
         let contact_email = "infra@enclava.dev".to_string();
         validate_email(&contact_email)?;
+        let health_path = app.health.path.clone();
+        validate_http_path(&health_path)
+            .map_err(|e| IngressRenderError::InvalidHealthPath(e.to_string()))?;
         Ok(Self {
             hosts,
             app_port,
             acme_ca,
             tls_mode: app.attestation.caddy_tls_mode,
             contact_email,
+            health_path,
         })
     }
 }
@@ -255,6 +262,11 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     out.push_str("    reverse_proxy 127.0.0.1:8081\n");
     out.push_str("  }\n");
     out.push_str("  handle /health {\n");
+    if spec.health_path != "/health" {
+        out.push_str("    rewrite * ");
+        out.push_str(&spec.health_path);
+        out.push('\n');
+    }
     out.push_str("    reverse_proxy 127.0.0.1:");
     out.push_str(&spec.app_port.to_string());
     out.push('\n');

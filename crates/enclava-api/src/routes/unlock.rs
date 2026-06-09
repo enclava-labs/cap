@@ -887,6 +887,9 @@ mod tests {
             source_provider: None,
             source_repository: None,
             egress_allowlist: serde_json::json!([]),
+            health_path: "/health".to_string(),
+            health_interval_seconds: 30,
+            health_timeout_seconds: 5,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

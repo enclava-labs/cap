@@ -20,6 +20,11 @@ use crate::source_provider::{
     SourceProvider, validate_signing_identity, validate_source_repository,
 };
 use crate::state::{AppState, CapManagementMode};
+use enclava_common::validate::validate_http_path;
+
+const DEFAULT_HEALTH_PATH: &str = "/health";
+const DEFAULT_HEALTH_INTERVAL_SECONDS: u32 = 30;
+const DEFAULT_HEALTH_TIMEOUT_SECONDS: u32 = 5;
 
 /// Helper function for consistent internal server error responses
 fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
@@ -236,6 +241,15 @@ pub struct CreateAppRequest {
     /// Exact external DNS hosts this app may reach directly from inside the TEE.
     #[serde(default)]
     pub egress_allowlist: Vec<EgressAllowRule>,
+    /// HTTP path Kubernetes probes should use for the primary container.
+    #[serde(default)]
+    pub health_path: Option<String>,
+    /// Probe period in seconds.
+    #[serde(default)]
+    pub health_interval: Option<u32>,
+    /// Probe timeout in seconds.
+    #[serde(default)]
+    pub health_timeout: Option<u32>,
 }
 
 fn default_unlock_mode() -> String {
@@ -258,6 +272,30 @@ pub(crate) fn validate_egress_allowlist(rules: &[EgressAllowRule]) -> Result<(),
         validate_egress_rule(rule)?;
     }
     Ok(())
+}
+
+pub(crate) fn normalize_health_config(
+    path: Option<&str>,
+    interval: Option<u32>,
+    timeout: Option<u32>,
+) -> Result<(String, u32, u32), String> {
+    let path = path.unwrap_or(DEFAULT_HEALTH_PATH).to_string();
+    validate_http_path(&path).map_err(|e| e.to_string())?;
+
+    let interval = interval.unwrap_or(DEFAULT_HEALTH_INTERVAL_SECONDS);
+    if !(1..=300).contains(&interval) {
+        return Err("health_interval must be between 1 and 300 seconds".to_string());
+    }
+
+    let timeout = timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECONDS);
+    if !(1..=60).contains(&timeout) {
+        return Err("health_timeout must be between 1 and 60 seconds".to_string());
+    }
+    if timeout > interval {
+        return Err("health_timeout must be less than or equal to health_interval".to_string());
+    }
+
+    Ok((path, interval, timeout))
 }
 
 pub(crate) fn egress_allowlist_to_json(rules: &[EgressAllowRule]) -> serde_json::Value {
@@ -347,6 +385,9 @@ pub struct AppResponse {
     pub source_provider: Option<String>,
     pub source_repository: Option<String>,
     pub egress_allowlist: Vec<EgressAllowRule>,
+    pub health_path: String,
+    pub health_interval: u32,
+    pub health_timeout: u32,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -377,6 +418,9 @@ impl From<App> for AppResponse {
                     ports: rule.ports,
                 })
                 .collect(),
+            health_path: a.health_path,
+            health_interval: a.health_interval_seconds.max(1) as u32,
+            health_timeout: a.health_timeout_seconds.max(1) as u32,
             created_at: a.created_at,
         }
     }
@@ -484,6 +528,17 @@ pub async fn create_app(
             Json(serde_json::json!({"error": e})),
         )
     })?;
+    let (health_path, health_interval, health_timeout) = normalize_health_config(
+        body.health_path.as_deref(),
+        body.health_interval,
+        body.health_timeout,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+    })?;
 
     // Enforce core entitlement app limit.
     let org: crate::models::Organization =
@@ -585,8 +640,9 @@ pub async fn create_app(
         service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
          unlock_mode, domain, tee_domain,
          signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
-         source_provider, source_repository, egress_allowlist)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18)",
+         source_provider, source_repository, egress_allowlist,
+         health_path, health_interval_seconds, health_timeout_seconds)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
     )
     .bind(app_id)
     .bind(auth.org_id)
@@ -606,6 +662,9 @@ pub async fn create_app(
     .bind(body.source_provider.map(SourceProvider::as_str))
     .bind(body.source_repository.as_deref())
     .bind(&egress_allowlist)
+    .bind(&health_path)
+    .bind(health_interval as i32)
+    .bind(health_timeout as i32)
     .execute(&state.db)
     .await;
 
@@ -662,6 +721,9 @@ pub async fn create_app(
         "name": &body.name,
         "unlock_mode": &body.unlock_mode,
         "egress_allowlist": egress_allowlist,
+        "health_path": health_path,
+        "health_interval_seconds": health_interval,
+        "health_timeout_seconds": health_timeout,
     }))
     .execute(&state.db)
     .await;

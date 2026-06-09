@@ -1,6 +1,7 @@
 use super::{
     CreateAppRequest, RotateSignerRequest, SignerRotationTokenRequest, create_app,
-    issue_signer_rotation_token_route, list_apps, workload_teardown_instance_id,
+    issue_signer_rotation_token_route, list_apps, normalize_health_config,
+    workload_teardown_instance_id,
 };
 use crate::models::{App, AppStatus, Role, UnlockMode};
 use axum::Json;
@@ -15,6 +16,34 @@ fn create_request_defaults_to_password_unlock() {
     .unwrap();
 
     assert_eq!(body.unlock_mode, "password");
+}
+
+#[test]
+fn create_request_accepts_cli_health_fields() {
+    let body: CreateAppRequest = serde_json::from_value(serde_json::json!({
+        "name": "demo",
+        "health_path": "/v1/info",
+        "health_interval": 30,
+        "health_timeout": 5
+    }))
+    .unwrap();
+
+    let (path, interval, timeout) = normalize_health_config(
+        body.health_path.as_deref(),
+        body.health_interval,
+        body.health_timeout,
+    )
+    .unwrap();
+
+    assert_eq!(path, "/v1/info");
+    assert_eq!(interval, 30);
+    assert_eq!(timeout, 5);
+}
+
+#[test]
+fn create_request_rejects_unsafe_health_path() {
+    let err = normalize_health_config(Some("/v1/info;bad"), Some(30), Some(5)).unwrap_err();
+    assert!(err.contains("invalid HTTP path"));
 }
 
 #[test]
@@ -70,6 +99,9 @@ fn teardown_token_instance_id_matches_attestation_proxy_owner_instance_id() {
         source_provider: None,
         source_repository: None,
         egress_allowlist: serde_json::json!([]),
+        health_path: "/health".to_string(),
+        health_interval_seconds: 30,
+        health_timeout_seconds: 5,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -94,6 +126,9 @@ async fn create_app_rejects_member_before_database_access() {
             source_provider: None,
             source_repository: None,
             egress_allowlist: Vec::new(),
+            health_path: None,
+            health_interval: None,
+            health_timeout: None,
         }),
     )
     .await;

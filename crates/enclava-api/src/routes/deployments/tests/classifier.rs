@@ -29,6 +29,9 @@ fn idempotency_app() -> App {
         source_provider: Some("github".to_string()),
         source_repository: Some("acme/confidential-app".to_string()),
         egress_allowlist: serde_json::json!([]),
+        health_path: "/health".to_string(),
+        health_interval_seconds: 30,
+        health_timeout_seconds: 5,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

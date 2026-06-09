@@ -124,6 +124,9 @@ pub struct App {
     pub source_provider: Option<String>,
     pub source_repository: Option<String>,
     pub egress_allowlist: serde_json::Value,
+    pub health_path: String,
+    pub health_interval_seconds: i32,
+    pub health_timeout_seconds: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

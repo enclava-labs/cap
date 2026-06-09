@@ -1,3 +1,4 @@
+use enclava_common::validate::validate_http_path;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -235,6 +236,25 @@ impl AppConfig {
 
         for rule in &self.egress.allow {
             validate_egress_rule(rule)?;
+        }
+        if let Some(health) = &self.health {
+            validate_http_path(&health.path)
+                .map_err(|e| AppConfigError::Validation(e.to_string()))?;
+            if !(1..=300).contains(&health.interval) {
+                return Err(AppConfigError::Validation(
+                    "health interval must be between 1 and 300 seconds".to_string(),
+                ));
+            }
+            if !(1..=60).contains(&health.timeout) {
+                return Err(AppConfigError::Validation(
+                    "health timeout must be between 1 and 60 seconds".to_string(),
+                ));
+            }
+            if health.timeout > health.interval {
+                return Err(AppConfigError::Validation(
+                    "health timeout must be less than or equal to health interval".to_string(),
+                ));
+            }
         }
 
         Ok(())

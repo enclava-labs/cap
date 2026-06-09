@@ -166,6 +166,19 @@ fn caddyfile_has_health_route() {
 }
 
 #[test]
+fn caddyfile_health_route_rewrites_to_configured_app_health_path() {
+    let mut app = sample_app();
+    app.health.path = "/v1/info".to_string();
+
+    let cm = generate_ingress_configmap(&app);
+    let caddyfile = cm.data.as_ref().unwrap().get("Caddyfile").unwrap();
+
+    assert!(caddyfile.contains(
+        "  handle /health {\n    rewrite * /v1/info\n    reverse_proxy 127.0.0.1:3000\n  }"
+    ));
+}
+
+#[test]
 fn custom_domain_app_uses_custom_domain() {
     let mut app = sample_app();
     app.domain.custom_domain = Some("app.example.com".to_string());
