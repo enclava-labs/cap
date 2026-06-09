@@ -10,8 +10,8 @@
 //! without disruption; new deploys default to the enclava-init shape.
 
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, ContainerPort, EnvVar, ExecAction, HTTPGetAction, HTTPHeader, Probe,
-    SecurityContext, VolumeDevice, VolumeMount,
+    Capabilities, Container, ContainerPort, EnvVar, ExecAction, HTTPGetAction, Probe,
+    SecurityContext, TCPSocketAction, VolumeDevice, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -148,19 +148,6 @@ fn app_http_probe(app: &ConfidentialApp, app_port: i32) -> HTTPGetAction {
         path: Some(validated_health_path(app).to_string()),
         port: IntOrString::Int(app_port),
         scheme: Some("HTTP".to_string()),
-        ..Default::default()
-    }
-}
-
-fn tenant_ingress_http_probe(app: &ConfidentialApp, tls_port: i32) -> HTTPGetAction {
-    HTTPGetAction {
-        path: Some("/health".to_string()),
-        port: IntOrString::Int(tls_port),
-        scheme: Some("HTTPS".to_string()),
-        http_headers: Some(vec![HTTPHeader {
-            name: "Host".to_string(),
-            value: app.domain.platform_domain.clone(),
-        }]),
         ..Default::default()
     }
 }
@@ -891,7 +878,10 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
             ..Default::default()
         }),
         readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
-            http_get: Some(tenant_ingress_http_probe(app, tls_port)),
+            tcp_socket: Some(TCPSocketAction {
+                port: IntOrString::Int(tls_port),
+                ..Default::default()
+            }),
             initial_delay_seconds: Some(180),
             period_seconds: Some(15),
             timeout_seconds: Some(app.health.timeout_seconds as i32),

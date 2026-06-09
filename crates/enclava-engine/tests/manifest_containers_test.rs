@@ -418,22 +418,15 @@ fn caddy_container_internal_tls_uses_high_port() {
     let ports = c.ports.as_ref().unwrap();
     assert!(ports.iter().any(|p| p.container_port == 10443));
     let probe = c.readiness_probe.as_ref().unwrap();
-    let http_get = probe.http_get.as_ref().unwrap();
+    assert!(
+        probe.http_get.is_none(),
+        "kubelet HTTPS probes do not set TLS SNI for the tenant domain"
+    );
+    let tcp_socket = probe.tcp_socket.as_ref().unwrap();
     assert_eq!(
-        http_get.port,
+        tcp_socket.port,
         k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(10443)
     );
-    assert_eq!(http_get.path.as_deref(), Some("/health"));
-    assert_eq!(http_get.scheme.as_deref(), Some("HTTPS"));
-    assert!(
-        http_get
-            .http_headers
-            .as_ref()
-            .unwrap()
-            .iter()
-            .any(|h| h.name == "Host" && h.value == "test-app.abcd1234.enclava.dev")
-    );
-    assert!(probe.tcp_socket.is_none());
 }
 
 #[test]
