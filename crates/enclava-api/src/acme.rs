@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::dns::{self, DnsConfig};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{CLOUDFLARE, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
@@ -16,6 +19,55 @@ pub struct AcmeConfig {
     pub directory_url: String,
     pub account_credentials_path: Option<PathBuf>,
     pub dns_propagation_wait: Duration,
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+pub struct AcmeRateLimitKey {
+    directory_url: String,
+    hostnames: Vec<String>,
+}
+
+impl AcmeRateLimitKey {
+    pub fn new(directory_url: &str, hostnames: &[String]) -> Self {
+        let mut hostnames = hostnames.to_vec();
+        hostnames.sort();
+        hostnames.dedup();
+        Self {
+            directory_url: directory_url.to_string(),
+            hostnames,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct AcmeRateLimitCache {
+    inner: Arc<RwLock<HashMap<AcmeRateLimitKey, DateTime<Utc>>>>,
+}
+
+impl AcmeRateLimitCache {
+    pub fn record(&self, key: AcmeRateLimitKey, retry_after: DateTime<Utc>) {
+        self.write().insert(key, retry_after);
+    }
+
+    pub fn active_retry_after(
+        &self,
+        key: &AcmeRateLimitKey,
+        now: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        let mut inner = self.write();
+        match inner.get(key).copied() {
+            Some(retry_after) if retry_after > now => Some(retry_after),
+            Some(_) => {
+                inner.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<AcmeRateLimitKey, DateTime<Utc>>> {
+        self.inner.write().unwrap_or_else(|err| err.into_inner())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -105,6 +157,16 @@ pub async fn issue_dns01_certificate(
     };
     cleanup_challenges(http_client, dns_config, &challenge_records).await;
     Ok(cert_chain)
+}
+
+pub fn rate_limit_retry_after(message: &str) -> Option<DateTime<Utc>> {
+    let marker = "retry after ";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find(" UTC")?;
+    let raw = &rest[..end];
+    let naive = NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").ok()?;
+    Some(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
 }
 
 async fn finalize_csr_after_ready(
@@ -382,5 +444,41 @@ mod tests {
             poll.contains("is_certificate_not_found_poll_error"),
             "ACME DNS-01 must retry transient staging certificate-not-found polling errors"
         );
+    }
+
+    #[test]
+    fn acme_rate_limit_retry_after_is_extracted_from_letsencrypt_error() {
+        let detail = "ACME failed: API error: too many certificates (5) already issued for this exact set of identifiers in the last 168h0m0s, retry after 2026-06-10 19:38:28 UTC: see https://letsencrypt.org/docs/rate-limits/#new-certificates-per-exact-set-of-identifiers (urn:ietf:params:acme:error:rateLimited)";
+
+        let retry_after = super::rate_limit_retry_after(detail).expect("retry-after timestamp");
+
+        assert_eq!(retry_after.to_rfc3339(), "2026-06-10T19:38:28+00:00");
+    }
+
+    #[test]
+    fn acme_rate_limit_cache_normalizes_identifier_order_and_expires() {
+        let cache = super::AcmeRateLimitCache::default();
+        let key = super::AcmeRateLimitKey::new(
+            "https://acme-v02.api.letsencrypt.org/directory",
+            &["b.example.test".into(), "a.example.test".into()],
+        );
+        let equivalent = super::AcmeRateLimitKey::new(
+            "https://acme-v02.api.letsencrypt.org/directory",
+            &["a.example.test".into(), "b.example.test".into()],
+        );
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-09T19:38:28Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let retry_after = chrono::DateTime::parse_from_rfc3339("2026-06-10T19:38:28Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        cache.record(key, retry_after);
+
+        assert_eq!(
+            cache.active_retry_after(&equivalent, now),
+            Some(retry_after)
+        );
+        assert_eq!(cache.active_retry_after(&equivalent, retry_after), None);
     }
 }

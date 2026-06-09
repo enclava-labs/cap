@@ -554,6 +554,7 @@ pub(crate) mod test_support {
             }),
             dns: None,
             acme: None,
+            acme_rate_limits: crate::acme::AcmeRateLimitCache::default(),
             kbs_policy: None,
             trustee_attestation_verify_url: None,
             trustee_attestation_verify_bearer_token: None,

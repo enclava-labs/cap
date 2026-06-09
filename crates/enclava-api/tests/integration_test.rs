@@ -89,6 +89,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
         }),
         dns: None,
         acme: None,
+        acme_rate_limits: enclava_api::acme::AcmeRateLimitCache::default(),
         kbs_policy: None,
         trustee_attestation_verify_url: None,
         trustee_attestation_verify_bearer_token: None,

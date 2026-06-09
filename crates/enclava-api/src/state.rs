@@ -1,4 +1,4 @@
-use crate::acme::AcmeConfig;
+use crate::acme::{AcmeConfig, AcmeRateLimitCache};
 use crate::clients::RegistryClient;
 use crate::dns::DnsConfig;
 use crate::kbs::KbsPolicyConfig;
@@ -183,6 +183,8 @@ pub struct AppState {
     pub dns: Option<DnsConfig>,
     /// ACME settings for the workload-attested DNS-01 certificate broker.
     pub acme: Option<AcmeConfig>,
+    /// Recent ACME rate-limit windows keyed by ACME directory and identifiers.
+    pub acme_rate_limits: AcmeRateLimitCache,
     /// Trustee KBS policy settings for CAP-managed owner-resource bindings.
     pub kbs_policy: Option<KbsPolicyConfig>,
     /// Trustee callback used to validate workload attestation tokens before

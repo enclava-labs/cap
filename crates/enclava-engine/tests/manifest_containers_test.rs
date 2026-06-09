@@ -133,9 +133,10 @@ fn app_container_has_no_kubernetes_subpath_mounts() {
 }
 
 #[test]
-fn app_container_uses_http_health_probes_without_liveness() {
-    let c = build_app_container(&sample_app());
-    assert!(c.liveness_probe.is_none());
+fn app_container_uses_http_health_probes_with_liveness() {
+    let app = sample_app();
+    let expected_timeout = app.health.timeout_seconds as i32;
+    let c = build_app_container(&app);
 
     let startup = c.startup_probe.as_ref().unwrap();
     let startup_http = startup.http_get.as_ref().unwrap();
@@ -158,6 +159,19 @@ fn app_container_uses_http_health_probes_without_liveness() {
     );
     assert_eq!(readiness_http.scheme.as_deref(), Some("HTTP"));
     assert!(readiness.tcp_socket.is_none());
+
+    let liveness = c.liveness_probe.as_ref().unwrap();
+    let liveness_http = liveness.http_get.as_ref().unwrap();
+    assert_eq!(liveness_http.path.as_deref(), Some("/health"));
+    assert_eq!(
+        liveness_http.port,
+        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
+    );
+    assert_eq!(liveness_http.scheme.as_deref(), Some("HTTP"));
+    assert!(liveness.tcp_socket.is_none());
+    assert_eq!(liveness.period_seconds, Some(30));
+    assert_eq!(liveness.timeout_seconds, Some(expected_timeout));
+    assert_eq!(liveness.failure_threshold, Some(3));
 }
 
 #[test]

@@ -813,6 +813,7 @@ async fn main() {
         attestation,
         dns,
         acme,
+        acme_rate_limits: enclava_api::acme::AcmeRateLimitCache::default(),
         kbs_policy,
         trustee_attestation_verify_url,
         trustee_attestation_verify_bearer_token,

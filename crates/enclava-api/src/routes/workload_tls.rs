@@ -129,6 +129,21 @@ pub async fn dns01_certificate(
                 .into_response();
         }
     };
+    let rate_limit_key =
+        crate::acme::AcmeRateLimitKey::new(&acme_config.directory_url, &body.hostnames);
+    if let Some(retry_after) = state
+        .acme_rate_limits
+        .active_retry_after(&rate_limit_key, chrono::Utc::now())
+    {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "acme_rate_limited",
+                "retry_after": retry_after.to_rfc3339(),
+            })),
+        )
+            .into_response();
+    }
 
     match crate::acme::issue_dns01_certificate(
         &state.http_client,
@@ -146,11 +161,26 @@ pub async fn dns01_certificate(
             }),
         )
             .into_response(),
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "acme_certificate_issuance_failed", "detail": err.to_string()})),
-        )
-            .into_response(),
+        Err(err) => {
+            let detail = err.to_string();
+            if let Some(retry_after) = crate::acme::rate_limit_retry_after(&detail) {
+                state.acme_rate_limits.record(rate_limit_key, retry_after);
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "error": "acme_rate_limited",
+                        "detail": detail,
+                        "retry_after": retry_after.to_rfc3339(),
+                    })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": "acme_certificate_issuance_failed", "detail": detail})),
+            )
+                .into_response()
+        }
     }
 }
 

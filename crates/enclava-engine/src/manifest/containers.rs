@@ -345,7 +345,13 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             }),
             ..Default::default()
         }),
-        liveness_probe: None,
+        liveness_probe: Some(k8s_openapi::api::core::v1::Probe {
+            http_get: Some(app_http_probe(app, app_port as i32)),
+            period_seconds: Some(30),
+            timeout_seconds: Some(app.health.timeout_seconds as i32),
+            failure_threshold: Some(3),
+            ..Default::default()
+        }),
         startup_probe: Some(k8s_openapi::api::core::v1::Probe {
             http_get: Some(app_http_probe(app, app_port as i32)),
             period_seconds: Some(10),
