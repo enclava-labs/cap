@@ -212,16 +212,16 @@ fn parse_memory_gi(s: &str) -> Result<f64, String> {
     if value <= 0.0 {
         return Err("memory value must be positive".to_string());
     }
-    if value > 1024.0 {
-        return Err("memory value too large (max 1024Gi)".to_string());
-    }
 
-    // Convert to GiB
-    match unit {
+    let value_gi = match unit {
         "Gi" | "GiB" => Ok(value),
         "Mi" | "MiB" => Ok(value / 1024.0),
         _ => Err(format!("unsupported memory unit: {}", unit)),
+    }?;
+    if value_gi > 1024.0 {
+        return Err("memory value too large (max 1024Gi)".to_string());
     }
+    Ok(value_gi)
 }
 
 #[derive(Debug, Deserialize)]
@@ -527,6 +527,26 @@ pub async fn deploy(
                 ));
             }
         }
+
+        sqlx::query(
+            "UPDATE app_resources
+                SET cpu_limit = COALESCE($1, cpu_limit),
+                    memory_limit = COALESCE($2, memory_limit),
+                    app_data_size = COALESCE($3, app_data_size)
+              WHERE app_id = $4",
+        )
+        .bind(resources.cpu.as_deref())
+        .bind(resources.memory.as_deref())
+        .bind(resources.storage.as_deref())
+        .bind(app.id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
     }
 
     // Fetch provenance attestation and SBOM if available (non-fatal if missing)

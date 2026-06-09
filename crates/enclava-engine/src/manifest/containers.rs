@@ -50,6 +50,8 @@ pub const CADDY_SEED_PATH: &str = "/state/caddy/seed";
 pub const CADDY_ACME_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
+pub const CADDY_BROKER_CERT_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.crt";
+pub const CADDY_BROKER_KEY_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.key";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
 
 fn shell_escape_arg(arg: &str) -> String {
@@ -65,6 +67,42 @@ fn shell_escape_argv(args: &[String]) -> String {
         .map(|arg| shell_escape_arg(arg))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn caddy_supervisor_script(tls_mode: CaddyTlsMode) -> String {
+    let mut script = String::new();
+    script.push_str("trap 'exit 0' TERM INT\n");
+    if tls_mode == CaddyTlsMode::Dns01Broker {
+        script.push_str("i=0\n");
+        script.push_str("while [ \"$i\" -lt 300 ]; do\n");
+        script.push_str(&format!(
+            "  if [ -r {} ] && [ -r {} ]; then break; fi\n",
+            shell_escape_arg(CADDY_BROKER_CERT_PATH),
+            shell_escape_arg(CADDY_BROKER_KEY_PATH)
+        ));
+        script.push_str(
+            "  if [ \"$i\" = 0 ] || [ $((i % 10)) -eq 0 ]; then echo 'tenant-ingress waiting for TLS certificate handoff' >&2; fi\n",
+        );
+        script.push_str("  i=$((i + 1))\n");
+        script.push_str("  sleep 1\n");
+        script.push_str("done\n");
+        script.push_str(&format!(
+            "if [ ! -r {} ] || [ ! -r {} ]; then echo 'tenant-ingress TLS certificate handoff missing or unreadable' >&2; exit 1; fi\n",
+            shell_escape_arg(CADDY_BROKER_CERT_PATH),
+            shell_escape_arg(CADDY_BROKER_KEY_PATH)
+        ));
+    }
+    script.push_str("while true; do\n");
+    script.push_str("  rc=0\n");
+    script.push_str("  if /usr/bin/caddy validate --config /etc/caddy/Caddyfile; then\n");
+    script.push_str("    /usr/bin/caddy run --config /etc/caddy/Caddyfile || rc=$?\n");
+    script.push_str("  else\n");
+    script.push_str("    rc=$?\n");
+    script.push_str("  fi\n");
+    script.push_str("  echo \"tenant-ingress caddy exited rc=$rc; restarting in 5s\" >&2\n");
+    script.push_str("  sleep 5\n");
+    script.push_str("done");
+    script
 }
 
 fn ownership_mode_str(mode: UnlockMode) -> &'static str {
@@ -718,10 +756,9 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         (
             Some(vec![ENCLAVA_WAIT_EXEC_PATH.to_string()]),
             Some(vec![
-                "/usr/bin/caddy".to_string(),
-                "run".to_string(),
-                "--config".to_string(),
-                "/etc/caddy/Caddyfile".to_string(),
+                "/bin/sh".to_string(),
+                "-ec".to_string(),
+                caddy_supervisor_script(app.attestation.caddy_tls_mode),
             ]),
         )
     };

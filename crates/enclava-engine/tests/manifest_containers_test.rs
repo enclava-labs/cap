@@ -410,14 +410,36 @@ fn caddy_container_waits_for_init_ready_before_starting_caddy() {
         c.command.as_ref().unwrap(),
         &vec!["/enclava-tools/enclava-wait-exec".to_string()]
     );
-    assert_eq!(
-        c.args.as_ref().unwrap(),
-        &vec![
-            "/usr/bin/caddy".to_string(),
-            "run".to_string(),
-            "--config".to_string(),
-            "/etc/caddy/Caddyfile".to_string(),
-        ]
+    let args = c.args.as_ref().unwrap();
+    assert_eq!(args[0], "/bin/sh");
+    assert_eq!(args[1], "-ec");
+    assert!(args[2].contains("/usr/bin/caddy run --config /etc/caddy/Caddyfile"));
+}
+
+#[test]
+fn caddy_container_supervises_caddy_inside_existing_kata_container() {
+    let mut app = sample_app();
+    app.attestation.caddy_tls_mode = CaddyTlsMode::Dns01Broker;
+    let c = build_caddy_container(&app);
+    let args = c.args.as_ref().unwrap();
+
+    assert_eq!(args[0], "/bin/sh");
+    assert_eq!(args[1], "-ec");
+    assert!(
+        args[2].contains("/run/enclava/caddy-runtime/certificates/tls.crt"),
+        "broker TLS mode must wait for the runtime certificate handoff"
+    );
+    assert!(
+        args[2].contains("/run/enclava/caddy-runtime/certificates/tls.key"),
+        "broker TLS mode must wait for the runtime private key handoff"
+    );
+    assert!(
+        args[2].contains("/usr/bin/caddy validate --config /etc/caddy/Caddyfile"),
+        "ingress must validate before serving so failures are visible"
+    );
+    assert!(
+        args[2].contains("tenant-ingress caddy exited"),
+        "ingress must retry inside the existing Kata container instead of relying on container restarts"
     );
 }
 

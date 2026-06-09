@@ -198,6 +198,31 @@ fn signed_deploy_path_ensures_app_and_tee_dns_pair() {
 }
 
 #[test]
+fn parse_memory_gi_accepts_large_mi_limits_after_conversion() {
+    assert_eq!(parse_memory_gi("16384Mi").unwrap(), 16.0);
+}
+
+#[test]
+fn deploy_persists_requested_resources_before_rendering_manifest() {
+    let source = include_str!("../../deployments.rs");
+    let deploy_body = source
+        .split("pub async fn deploy")
+        .nth(1)
+        .expect("deploy route exists");
+    let update_resources = deploy_body
+        .find("UPDATE app_resources")
+        .expect("deploy route must persist requested resources");
+    let render_manifest = deploy_body
+        .find("build_confidential_app")
+        .expect("deploy route renders app manifest");
+
+    assert!(
+        update_resources < render_manifest,
+        "requested resources must be persisted before manifest rendering reads app_resources"
+    );
+}
+
+#[test]
 fn idempotent_retry_requires_same_deployment_payload() {
     let app = idempotency_app();
     let deployment = idempotency_deployment(&app);

@@ -9,10 +9,9 @@
     "containsToEntities": false,
     "containsWorld": false,
     "fqdnRules": [
-      "acme-v02.api.letsencrypt.org",
-      "acme-staging-v02.api.letsencrypt.org"
+      "acme-v02.api.letsencrypt.org"
     ],
-    "ruleCount": 6,
+    "ruleCount": 5,
     "userFqdnRules": []
   },
   "kbs": {

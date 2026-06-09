@@ -18,12 +18,10 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
 use super::containers::{
-    CADDY_ACME_TLS_PORT, CADDY_INTERNAL_RUNTIME_PATH, CADDY_INTERNAL_TLS_PORT,
+    CADDY_ACME_TLS_PORT, CADDY_BROKER_CERT_PATH, CADDY_BROKER_KEY_PATH,
+    CADDY_INTERNAL_RUNTIME_PATH, CADDY_INTERNAL_TLS_PORT,
 };
 use crate::types::{CaddyTlsMode, ConfidentialApp};
-
-const BROKER_CERT_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.crt";
-const BROKER_KEY_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.key";
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngressRenderError {
@@ -239,9 +237,9 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
         }
         CaddyTlsMode::Dns01Broker => {
             out.push_str("  tls ");
-            out.push_str(BROKER_CERT_PATH);
+            out.push_str(CADDY_BROKER_CERT_PATH);
             out.push(' ');
-            out.push_str(BROKER_KEY_PATH);
+            out.push_str(CADDY_BROKER_KEY_PATH);
             out.push('\n');
         }
         CaddyTlsMode::Internal => {
