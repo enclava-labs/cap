@@ -14,7 +14,7 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
-use crate::manifest::containers::legacy_bootstrap_enabled;
+use crate::manifest::containers::{app_needs_startup_fallback, legacy_bootstrap_enabled};
 use crate::manifest::enclava_init_config;
 use crate::types::ConfidentialApp;
 
@@ -75,15 +75,17 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             empty_dir: Some(EmptyDirVolumeSource::default()),
             ..Default::default()
         });
-        v.push(Volume {
-            name: "startup".to_string(),
-            config_map: Some(ConfigMapVolumeSource {
-                name: format!("{}-startup", app.name),
-                default_mode: Some(0o555),
+        if app_needs_startup_fallback(app) {
+            v.push(Volume {
+                name: "startup".to_string(),
+                config_map: Some(ConfigMapVolumeSource {
+                    name: format!("{}-startup", app.name),
+                    default_mode: Some(0o555),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        });
+            });
+        }
         v.push(Volume {
             name: "unlock-socket".to_string(),
             empty_dir: Some(EmptyDirVolumeSource {

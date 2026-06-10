@@ -63,6 +63,33 @@ fn app_container_starts_under_wait_wrapper() {
 }
 
 #[test]
+fn app_container_with_explicit_command_omits_startup_fallback_mount() {
+    let mut app = sample_app();
+    app.containers[0].command = Some(vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "exec /usr/local/bin/app".to_string(),
+    ]);
+
+    let c = build_app_container(&app);
+
+    assert_eq!(
+        c.command.as_ref().unwrap(),
+        &vec![ENCLAVA_WAIT_EXEC_PATH.to_string()]
+    );
+    assert_eq!(
+        c.args.as_ref().unwrap(),
+        &vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exec /usr/local/bin/app".to_string()
+        ]
+    );
+    let vm = c.volume_mounts.as_ref().unwrap();
+    assert!(vm.iter().all(|m| m.name != "startup"));
+}
+
+#[test]
 fn app_container_reads_seed_from_state_app() {
     let c = build_app_container(&sample_app());
     let env = c.env.as_ref().unwrap();

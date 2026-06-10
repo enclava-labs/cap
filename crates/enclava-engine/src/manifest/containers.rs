@@ -152,6 +152,18 @@ fn app_http_probe(app: &ConfidentialApp, app_port: i32) -> HTTPGetAction {
     }
 }
 
+pub(crate) fn app_needs_startup_fallback(app: &ConfidentialApp) -> bool {
+    app.primary_container()
+        .map(|primary| {
+            primary
+                .command
+                .as_ref()
+                .map(|command| command.is_empty())
+                .unwrap_or(true)
+        })
+        .unwrap_or(true)
+}
+
 /// Build the app container.
 ///
 /// Phase 5 default: unprivileged, drops ALL caps, reads its seed from
@@ -260,12 +272,14 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             read_only: Some(true),
             ..Default::default()
         });
-        volume_mounts.push(VolumeMount {
-            name: "startup".to_string(),
-            mount_path: "/startup".to_string(),
-            read_only: Some(true),
-            ..Default::default()
-        });
+        if app_needs_startup_fallback(app) {
+            volume_mounts.push(VolumeMount {
+                name: "startup".to_string(),
+                mount_path: "/startup".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
         volume_mounts.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),
