@@ -55,9 +55,6 @@ pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 pub const CADDY_BROKER_CERT_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.crt";
 pub const CADDY_BROKER_KEY_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.key";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
-const APP_STARTUP_PROBE_PERIOD_SECONDS: i32 = 10;
-const APP_STARTUP_PROBE_FAILURE_THRESHOLD: i32 = 720;
-const APP_LIVENESS_PROBE_FAILURE_THRESHOLD: i32 = 3;
 
 fn shell_escape_arg(arg: &str) -> String {
     if arg.is_empty() {
@@ -367,20 +364,6 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             initial_delay_seconds: Some(180),
             period_seconds: Some(app.health.interval_seconds as i32),
             timeout_seconds: Some(app.health.timeout_seconds as i32),
-            ..Default::default()
-        }),
-        startup_probe: Some(k8s_openapi::api::core::v1::Probe {
-            http_get: Some(app_http_probe(app, app_port as i32)),
-            period_seconds: Some(APP_STARTUP_PROBE_PERIOD_SECONDS),
-            timeout_seconds: Some(app.health.timeout_seconds as i32),
-            failure_threshold: Some(APP_STARTUP_PROBE_FAILURE_THRESHOLD),
-            ..Default::default()
-        }),
-        liveness_probe: Some(k8s_openapi::api::core::v1::Probe {
-            http_get: Some(app_http_probe(app, app_port as i32)),
-            period_seconds: Some(app.health.interval_seconds as i32),
-            timeout_seconds: Some(app.health.timeout_seconds as i32),
-            failure_threshold: Some(APP_LIVENESS_PROBE_FAILURE_THRESHOLD),
             ..Default::default()
         }),
         ..Default::default()
