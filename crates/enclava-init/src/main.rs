@@ -109,7 +109,7 @@ fn run() -> Result<()> {
     }
 
     record_stage("provisioning static tls certificate").ok();
-    provision_static_tls_certificate(&cfg).context("provisioning static TLS certificate")?;
+    provision_static_tls_certificate(&cfg, &owner).context("provisioning static TLS certificate")?;
     record_stage("writing component seeds").ok();
     write_per_component_seeds(&cfg, &owner)?;
 
@@ -799,9 +799,9 @@ where
     chown_runtime(runtime, caddy_identity).with_context(|| format!("chown {}", runtime.display()))
 }
 
-fn provision_static_tls_certificate(cfg: &Config) -> Result<()> {
+fn provision_static_tls_certificate(cfg: &Config, owner: &OwnerSeed) -> Result<()> {
     let persistent = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
-    tls_certificate::provision_static_tls_certificate(cfg, &persistent)?;
+    tls_certificate::provision_static_tls_certificate(cfg, &persistent, Some(owner))?;
     let caddy_identity = numeric_identity(cfg.caddy_uid, cfg.caddy_gid);
     for path in [
         tls_certificate::cert_path(&persistent),

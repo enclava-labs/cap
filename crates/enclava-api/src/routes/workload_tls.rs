@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use x509_cert::der::{Decode, Encode};
+use x509_cert::request::CertReq;
 
 use crate::state::AppState;
 
@@ -145,7 +147,16 @@ pub async fn dns01_certificate(
         }
     };
     let certificate_cache_key =
-        certificate_cache_key(&acme_config.directory_url, &body.hostnames, &csr_der);
+        match certificate_cache_key(&acme_config.directory_url, &body.hostnames, &csr_der) {
+            Ok(key) => key,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "csr_invalid", "detail": err})),
+                )
+                    .into_response();
+            }
+        };
     match find_cached_certificate(&state.db, &certificate_cache_key).await {
         Ok(Some(certificate_chain_pem)) => {
             tracing::info!(
@@ -287,12 +298,19 @@ fn certificate_cache_key(
     directory_url: &str,
     hostnames: &[String],
     csr_der: &[u8],
-) -> CertificateCacheKey {
-    CertificateCacheKey {
+) -> Result<CertificateCacheKey, String> {
+    let csr_public_key_sha256 = csr_public_key_sha256(csr_der)?;
+    Ok(CertificateCacheKey {
         directory_url: directory_url.to_string(),
         hostnames_key: normalized_hostnames_key(hostnames),
-        csr_sha256: Sha256::digest(csr_der).to_vec(),
-    }
+        csr_sha256: csr_public_key_sha256,
+    })
+}
+
+fn csr_public_key_sha256(csr_der: &[u8]) -> Result<Vec<u8>, String> {
+    let csr = CertReq::from_der(csr_der).map_err(|err| err.to_string())?;
+    let public_key_der = csr.info.public_key.to_der().map_err(|err| err.to_string())?;
+    Ok(Sha256::digest(public_key_der).to_vec())
 }
 
 fn normalized_hostnames_key(hostnames: &[String]) -> String {
@@ -514,7 +532,17 @@ mod tests {
     }
 
     #[test]
-    fn certificate_cache_key_normalizes_hostnames_and_binds_csr() {
+    fn certificate_cache_key_normalizes_hostnames_and_binds_public_key() {
+        let hosts = vec!["a.example.test".to_string(), "b.example.test".to_string()];
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let first_csr = test_csr_der(&hosts, &key_pair);
+        let second_csr = test_csr_der(&hosts, &key_pair);
+        let different_key_csr = test_csr_der(&hosts, &rcgen::KeyPair::generate().unwrap());
+        assert_ne!(
+            first_csr, second_csr,
+            "ECDSA CSR signatures should differ even when the key is stable"
+        );
+
         let first = certificate_cache_key(
             "https://acme-v02.api.letsencrypt.org/directory",
             &[
@@ -522,22 +550,36 @@ mod tests {
                 "a.example.test".to_string(),
                 "a.example.test".to_string(),
             ],
-            b"csr-one",
-        );
+            &first_csr,
+        )
+        .unwrap();
         let reordered = certificate_cache_key(
             "https://acme-v02.api.letsencrypt.org/directory",
             &["a.example.test".to_string(), "b.example.test".to_string()],
-            b"csr-one",
-        );
-        let different_csr = certificate_cache_key(
+            &second_csr,
+        )
+        .unwrap();
+        let different_public_key = certificate_cache_key(
             "https://acme-v02.api.letsencrypt.org/directory",
             &["a.example.test".to_string(), "b.example.test".to_string()],
-            b"csr-two",
-        );
+            &different_key_csr,
+        )
+        .unwrap();
 
         assert_eq!(first.hostnames_key, "a.example.test\nb.example.test");
         assert_eq!(first, reordered);
-        assert_ne!(first, different_csr);
+        assert_ne!(first, different_public_key);
+    }
+
+    fn test_csr_der(hosts: &[String], key_pair: &rcgen::KeyPair) -> Vec<u8> {
+        let mut params = rcgen::CertificateParams::new(hosts.to_vec()).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .serialize_request(key_pair)
+            .unwrap()
+            .der()
+            .as_ref()
+            .to_vec()
     }
 
     #[test]

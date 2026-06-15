@@ -3,17 +3,22 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use hkdf::Hkdf;
+use p256::SecretKey as P256SecretKey;
+use p256::pkcs8::EncodePrivateKey;
 use rcgen::{CertificateParams, DistinguishedName, KeyPair};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::Config;
+use crate::secrets::OwnerSeed;
 use crate::{trustee_verify, writes};
 
 pub const CERT_RELATIVE_PATH: &str = "certificates/tls.crt";
 pub const KEY_RELATIVE_PATH: &str = "certificates/tls.key";
 const METADATA_RELATIVE_PATH: &str = "certificates/tls.metadata.json";
 const METADATA_VERSION: u8 = 1;
+const TLS_KEY_DERIVATION_INFO_PREFIX: &[u8] = b"enclava-tenant-tls-p256-key-v1";
 
 #[derive(Debug, Serialize)]
 struct CertificateRequest<'a> {
@@ -34,7 +39,11 @@ struct CertificateMetadata {
     hostnames: Vec<String>,
 }
 
-pub fn provision_static_tls_certificate(cfg: &Config, persistent_root: &Path) -> Result<()> {
+pub fn provision_static_tls_certificate(
+    cfg: &Config,
+    persistent_root: &Path,
+    owner_seed: Option<&OwnerSeed>,
+) -> Result<()> {
     let Some(broker_url) = cfg.tls_certificate_broker_url.as_deref() else {
         return Ok(());
     };
@@ -65,7 +74,11 @@ pub fn provision_static_tls_certificate(cfg: &Config, persistent_root: &Path) ->
         );
     }
 
-    let key_pair = load_or_generate_key(&key_path)?;
+    let key_pair = load_or_generate_key_with_owner(
+        &key_path,
+        owner_seed,
+        &cfg.tls_certificate_hostnames,
+    )?;
     let csr_der = build_csr_der(&cfg.tls_certificate_hostnames, &key_pair)?;
     let token = trustee_verify::resolve_kbs_attestation_token(
         std::env::var("KBS_ATTESTATION_TOKEN").ok().as_deref(),
@@ -220,7 +233,11 @@ fn certificate_material_is_usable(persistent_root: &Path) -> bool {
     true
 }
 
-fn load_or_generate_key(path: &Path) -> Result<KeyPair> {
+fn load_or_generate_key_with_owner(
+    path: &Path,
+    owner_seed: Option<&OwnerSeed>,
+    hostnames: &[String],
+) -> Result<KeyPair> {
     if path.is_file() {
         match load_existing_key(path) {
             Ok(key_pair) => return Ok(key_pair),
@@ -232,6 +249,9 @@ fn load_or_generate_key(path: &Path) -> Result<KeyPair> {
                 );
             }
         }
+    }
+    if let Some(owner_seed) = owner_seed {
+        return derive_and_write_key(path, owner_seed, hostnames);
     }
     generate_and_write_key(path)
 }
@@ -247,6 +267,50 @@ fn generate_and_write_key(path: &Path) -> Result<KeyPair> {
     writes::atomic_write(path, key_pair.serialize_pem().as_bytes(), 0o600)
         .with_context(|| format!("writing TLS private key {}", path.display()))?;
     Ok(key_pair)
+}
+
+fn derive_and_write_key(
+    path: &Path,
+    owner_seed: &OwnerSeed,
+    hostnames: &[String],
+) -> Result<KeyPair> {
+    let secret = derive_p256_secret_key(owner_seed, hostnames)?;
+    let pkcs8 = secret
+        .to_pkcs8_der()
+        .context("encoding derived TLS private key as PKCS#8")?;
+    let key_pair = KeyPair::try_from(pkcs8.as_bytes())
+        .context("parsing derived TLS private key for CSR signing")?;
+    writes::atomic_write(path, key_pair.serialize_pem().as_bytes(), 0o600)
+        .with_context(|| format!("writing TLS private key {}", path.display()))?;
+    Ok(key_pair)
+}
+
+fn derive_p256_secret_key(owner_seed: &OwnerSeed, hostnames: &[String]) -> Result<P256SecretKey> {
+    let info = tls_key_derivation_info(hostnames);
+    let hk = Hkdf::<Sha256>::new(None, owner_seed.as_bytes());
+    for counter in 0u8..=u8::MAX {
+        let mut candidate = [0u8; 32];
+        let mut counter_info = info.clone();
+        counter_info.push(counter);
+        hk.expand(&counter_info, &mut candidate)
+            .map_err(|err| anyhow!("deriving TLS private key material: {err}"))?;
+        if let Ok(secret) = P256SecretKey::from_slice(&candidate) {
+            return Ok(secret);
+        }
+    }
+    Err(anyhow!(
+        "failed to derive a valid P-256 TLS private key after 256 attempts"
+    ))
+}
+
+fn tls_key_derivation_info(hostnames: &[String]) -> Vec<u8> {
+    let mut info = TLS_KEY_DERIVATION_INFO_PREFIX.to_vec();
+    for hostname in normalized_hostnames(hostnames) {
+        let bytes = hostname.as_bytes();
+        info.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        info.extend_from_slice(bytes);
+    }
+    info
 }
 
 fn build_csr_der(hostnames: &[String], key_pair: &KeyPair) -> Result<Vec<u8>> {
@@ -325,10 +389,10 @@ hkdf-info = "tls-state-luks-key"
         let key_path = key_path(dir.path());
         let hosts = vec!["app.example.test".to_string()];
 
-        let first_key = load_or_generate_key(&key_path).unwrap();
+        let first_key = load_or_generate_key_with_owner(&key_path, None, &hosts).unwrap();
         let first_pem = std::fs::read_to_string(&key_path).unwrap();
         let first_csr = build_csr_der(&hosts, &first_key).unwrap();
-        let second_key = load_or_generate_key(&key_path).unwrap();
+        let second_key = load_or_generate_key_with_owner(&key_path, None, &hosts).unwrap();
         let second_pem = std::fs::read_to_string(&key_path).unwrap();
         let second_csr = build_csr_der(&hosts, &second_key).unwrap();
 
@@ -339,12 +403,30 @@ hkdf-info = "tls-state-luks-key"
     }
 
     #[test]
+    fn missing_key_file_uses_stable_owner_seed_derived_p256_key() {
+        let first_dir = tempdir().unwrap();
+        let second_dir = tempdir().unwrap();
+        let hosts = vec!["app.example.test".to_string()];
+        let owner = crate::secrets::OwnerSeed([0x42; 32]);
+
+        load_or_generate_key_with_owner(&key_path(first_dir.path()), Some(&owner), &hosts)
+            .unwrap();
+        load_or_generate_key_with_owner(&key_path(second_dir.path()), Some(&owner), &hosts)
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(key_path(first_dir.path())).unwrap(),
+            std::fs::read_to_string(key_path(second_dir.path())).unwrap()
+        );
+    }
+
+    #[test]
     fn malformed_existing_key_is_replaced_for_new_certificate_requests() {
         let dir = tempdir().unwrap();
         let key_path = key_path(dir.path());
         writes::atomic_write(&key_path, b"not a tls private key", 0o600).unwrap();
 
-        let key_pair = load_or_generate_key(&key_path).unwrap();
+        let key_pair = load_or_generate_key_with_owner(&key_path, None, &[]).unwrap();
         let pem = std::fs::read_to_string(&key_path).unwrap();
 
         assert!(KeyPair::from_pem(&pem).is_ok());
@@ -406,7 +488,7 @@ hkdf-info = "tls-state-luks-key"
         )
         .unwrap();
 
-        provision_static_tls_certificate(&cfg, dir.path()).unwrap();
+        provision_static_tls_certificate(&cfg, dir.path(), None).unwrap();
     }
 
     #[test]

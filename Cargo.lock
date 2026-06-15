@@ -1535,6 +1535,7 @@ dependencies = [
  "kube",
  "nostr",
  "rand 0.8.6",
+ "rcgen",
  "reqwest 0.13.2",
  "rustls",
  "serde",
@@ -1551,6 +1552,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-cert",
 ]
 
 [[package]]
@@ -1645,6 +1647,7 @@ dependencies = [
  "hkdf",
  "libcryptsetup-rs",
  "nix",
+ "p256",
  "rand 0.8.6",
  "rcgen",
  "reqwest 0.12.28",

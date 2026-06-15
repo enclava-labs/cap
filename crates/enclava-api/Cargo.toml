@@ -51,6 +51,7 @@ k8s-openapi = { workspace = true }
 kube = { workspace = true }
 instant-acme = "0.8"
 rustls = { workspace = true }
+x509-cert = { workspace = true }
 
 [features]
 prod-strict = ["enclava-engine/prod-strict"]
@@ -59,3 +60,4 @@ prod-strict = ["enclava-engine/prod-strict"]
 axum-test = "20"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+rcgen = "0.14"
