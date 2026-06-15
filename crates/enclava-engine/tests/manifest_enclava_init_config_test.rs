@@ -39,6 +39,20 @@ fn config_toml_has_runtime_ownership_and_app_bind_mounts() {
 }
 
 #[test]
+fn state_app_data_storage_path_uses_app_data_bind_source() {
+    let mut app = sample_app();
+    app.containers[0].storage_paths = vec!["/state/app-data".to_string()];
+
+    let cm = generate_enclava_init_configmap(&app);
+    let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
+
+    assert!(toml_text.contains("[[app-bind-mounts]]"));
+    assert!(toml_text.contains("subdir = \"app-data\""));
+    assert!(!toml_text.contains("subdir = \"state-app-data\""));
+    assert!(toml_text.contains("mount-path = \"/state/app-data\""));
+}
+
+#[test]
 fn config_toml_has_required_unlock_inputs() {
     let cm = generate_enclava_init_configmap(&sample_app());
     let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();

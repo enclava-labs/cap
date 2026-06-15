@@ -181,7 +181,8 @@ pub(crate) fn argon2_salt_hex(app: &ConfidentialApp) -> String {
 }
 
 fn storage_subdir(path: &str) -> String {
-    path.trim_start_matches('/').replace('/', "-")
+    let rel = path.trim_start_matches('/');
+    rel.strip_prefix("state/").unwrap_or(rel).replace('/', "-")
 }
 
 fn toml_string(s: &str) -> String {
