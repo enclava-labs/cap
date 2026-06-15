@@ -160,7 +160,7 @@ fn app_container_has_no_kubernetes_subpath_mounts() {
 }
 
 #[test]
-fn app_container_uses_http_readiness_without_killing_probes() {
+fn app_container_uses_http_readiness_startup_and_liveness_probes() {
     let app = sample_app();
     let expected_timeout = app.health.timeout_seconds as i32;
     let c = build_app_container(&app);
@@ -175,8 +175,32 @@ fn app_container_uses_http_readiness_without_killing_probes() {
     assert_eq!(readiness_http.scheme.as_deref(), Some("HTTP"));
     assert!(readiness.tcp_socket.is_none());
     assert_eq!(readiness.timeout_seconds, Some(expected_timeout));
-    assert!(c.startup_probe.is_none());
-    assert!(c.liveness_probe.is_none());
+
+    let startup = c.startup_probe.as_ref().unwrap();
+    let startup_http = startup.http_get.as_ref().unwrap();
+    assert_eq!(startup_http.path.as_deref(), Some("/health"));
+    assert_eq!(
+        startup_http.port,
+        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
+    );
+    assert_eq!(startup.period_seconds, Some(5));
+    assert_eq!(startup.timeout_seconds, Some(expected_timeout));
+    assert_eq!(
+        startup.failure_threshold,
+        Some(17_280),
+        "manual password unlocks must not be killed while waiting for the owner"
+    );
+
+    let liveness = c.liveness_probe.as_ref().unwrap();
+    let liveness_http = liveness.http_get.as_ref().unwrap();
+    assert_eq!(liveness_http.path.as_deref(), Some("/health"));
+    assert_eq!(
+        liveness_http.port,
+        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
+    );
+    assert_eq!(liveness.period_seconds, Some(app.health.interval_seconds as i32));
+    assert_eq!(liveness.timeout_seconds, Some(expected_timeout));
+    assert_eq!(liveness.failure_threshold, Some(3));
 }
 
 #[test]
@@ -186,10 +210,30 @@ fn app_container_uses_configured_health_path() {
 
     let c = build_app_container(&app);
 
-    assert!(c.startup_probe.is_none());
-    assert!(c.liveness_probe.is_none());
     assert_eq!(
         c.readiness_probe
+            .as_ref()
+            .unwrap()
+            .http_get
+            .as_ref()
+            .unwrap()
+            .path
+            .as_deref(),
+        Some("/v1/info")
+    );
+    assert_eq!(
+        c.startup_probe
+            .as_ref()
+            .unwrap()
+            .http_get
+            .as_ref()
+            .unwrap()
+            .path
+            .as_deref(),
+        Some("/v1/info")
+    );
+    assert_eq!(
+        c.liveness_probe
             .as_ref()
             .unwrap()
             .http_get
