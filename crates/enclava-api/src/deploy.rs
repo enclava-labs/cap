@@ -708,11 +708,9 @@ mod tests {
     }
 
     #[test]
-    fn local_signed_policy_delivery_skips_external_kbs_reconciliation() {
-        assert!(!should_reconcile_external_signed_policy(true, true, true));
-        assert!(should_reconcile_external_signed_policy(true, true, false));
-        assert!(should_reconcile_external_signed_policy(true, false, true));
-        assert!(!should_reconcile_external_signed_policy(false, true, true));
+    fn signed_policy_artifact_always_reconciles_with_kbs() {
+        assert!(should_reconcile_signed_policy_artifacts(true));
+        assert!(!should_reconcile_signed_policy_artifacts(false));
     }
 }
 
@@ -915,11 +913,7 @@ pub async fn apply_deployment_manifests(
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
     set_app_status(&pool, app.id, "creating").await?;
 
-    if should_reconcile_external_signed_policy(
-        signed_policy_artifact.is_some(),
-        app_spec.attestation.local_workload_artifacts_json.is_some(),
-        app_spec.attestation.local_trustee_policy_json.is_some(),
-    ) {
+    if should_reconcile_signed_policy_artifacts(signed_policy_artifact.is_some()) {
         crate::kbs::reconcile_signed_policy_artifacts(
             &pool,
             kbs_policy_config.as_ref(),
@@ -991,10 +985,6 @@ pub async fn apply_deployment_manifests(
     Ok(())
 }
 
-fn should_reconcile_external_signed_policy(
-    has_signed_policy_artifact: bool,
-    has_local_workload_artifacts: bool,
-    has_local_trustee_policy: bool,
-) -> bool {
-    has_signed_policy_artifact && !(has_local_workload_artifacts && has_local_trustee_policy)
+fn should_reconcile_signed_policy_artifacts(has_signed_policy_artifact: bool) -> bool {
+    has_signed_policy_artifact
 }
