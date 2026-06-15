@@ -193,6 +193,24 @@ pub fn plan_kata_start_error_pod_recreates(pods: &[Pod]) -> Vec<KataPodRecreateP
         .collect()
 }
 
+pub fn plan_stale_terminating_pod_force_deletes(
+    pods: &[Pod],
+    now: Timestamp,
+) -> Vec<KataPodRecreatePlan> {
+    pods.iter()
+        .filter_map(|pod| {
+            if !stale_terminating_pod_needs_force_delete(pod, now) {
+                return None;
+            }
+            let pod_name = pod.metadata.name.clone()?;
+            Some(KataPodRecreatePlan {
+                pod_name,
+                reason: "stale terminating pod exceeded deletion grace period".to_string(),
+            })
+        })
+        .collect()
+}
+
 pub async fn recreate_kata_start_error_pods(
     client: kube::Client,
     namespace: &str,
@@ -223,6 +241,38 @@ pub async fn recreate_kata_start_error_pods(
     }
 
     Ok(recreate_plan)
+}
+
+pub async fn force_delete_stale_terminating_pods(
+    client: kube::Client,
+    namespace: &str,
+    statefulset_name: &str,
+) -> Result<Vec<KataPodRecreatePlan>, ApplyError> {
+    let pod_api: Api<Pod> = Api::namespaced(client, namespace);
+    let pods = pod_api
+        .list(&ListParams::default().labels(&pod_label_selector(statefulset_name)))
+        .await?;
+    let force_delete_plan = plan_stale_terminating_pod_force_deletes(&pods.items, Timestamp::now());
+
+    for action in &force_delete_plan {
+        tracing::warn!(
+            namespace = %namespace,
+            statefulset = %statefulset_name,
+            pod = %action.pod_name,
+            reason = %action.reason,
+            "force deleting stale terminating pod after grace period"
+        );
+        match pod_api
+            .delete(&action.pod_name, &DeleteParams::default().grace_period(0))
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(force_delete_plan)
 }
 
 /// Watch a StatefulSet rollout until it reaches a terminal state or times out.
@@ -294,23 +344,16 @@ pub async fn watch_rollout(
             .await?;
         let now = Timestamp::now();
 
-        for pod in &pods.items {
-            if !stale_terminating_pod_needs_force_delete(pod, now) {
-                continue;
-            }
-
-            let Some(pod_name) = pod.metadata.name.as_deref() else {
-                continue;
-            };
-
+        for action in plan_stale_terminating_pod_force_deletes(&pods.items, now) {
             tracing::warn!(
                 namespace = %namespace,
                 statefulset = %statefulset_name,
-                pod = %pod_name,
+                pod = %action.pod_name,
+                reason = %action.reason,
                 "force deleting stale terminating pod after grace period"
             );
             match pod_api
-                .delete(pod_name, &DeleteParams::default().grace_period(0))
+                .delete(&action.pod_name, &DeleteParams::default().grace_period(0))
                 .await
             {
                 Ok(_) => {}
@@ -319,7 +362,7 @@ pub async fn watch_rollout(
                     tracing::warn!(
                         namespace = %namespace,
                         statefulset = %statefulset_name,
-                        pod = %pod_name,
+                        pod = %action.pod_name,
                         error = %err,
                         "failed to force delete stale terminating pod"
                     );

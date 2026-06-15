@@ -1,8 +1,8 @@
 use enclava_engine::apply::types::DeployPhase;
 use enclava_engine::apply::watch::{
     PodSnapshot, classify_pod_phase, kata_start_error_needs_pod_recreate,
-    plan_kata_start_error_pod_recreates, pod_label_selector,
-    stale_terminating_pod_needs_force_delete,
+    plan_kata_start_error_pod_recreates, plan_stale_terminating_pod_force_deletes,
+    pod_label_selector, stale_terminating_pod_needs_force_delete,
 };
 use k8s_openapi::api::core::v1::{
     ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus, Pod,
@@ -150,6 +150,53 @@ fn fresh_or_finalized_terminating_pod_is_not_force_deleted() {
         &finalized_pod,
         stale_now
     ));
+}
+
+#[test]
+fn stale_terminating_repair_plan_selects_only_stale_unfinalized_pods() {
+    let deleted_at = Time(
+        "2026-06-15T08:00:00Z"
+            .parse::<Timestamp>()
+            .expect("timestamp parses"),
+    );
+    let stale_now = "2026-06-15T08:01:00Z"
+        .parse::<Timestamp>()
+        .expect("timestamp parses");
+    let stale_pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("routstr-core-prod-0".to_string()),
+            deletion_timestamp: Some(deleted_at.clone()),
+            deletion_grace_period_seconds: Some(30),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let finalized_pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("routstr-core-prod-1".to_string()),
+            deletion_timestamp: Some(deleted_at),
+            deletion_grace_period_seconds: Some(30),
+            finalizers: Some(vec!["example.com/finalizer".to_string()]),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let normal_pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("routstr-core-prod-2".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let plan = plan_stale_terminating_pod_force_deletes(
+        &[stale_pod, finalized_pod, normal_pod],
+        stale_now,
+    );
+
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].pod_name, "routstr-core-prod-0");
+    assert!(plan[0].reason.contains("stale terminating"));
 }
 
 #[test]

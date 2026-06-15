@@ -7,6 +7,7 @@ use axum::{
     response::IntoResponse,
 };
 use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::jiff::Timestamp;
 use kube::Api;
 use kube::api::ListParams;
 use serde::Serialize;
@@ -16,7 +17,8 @@ use crate::auth::{middleware::AuthContext, scopes};
 use crate::models::{App, UnlockMode};
 use crate::state::AppState;
 use enclava_engine::apply::watch::{
-    kata_start_error_needs_pod_recreate, pod_label_selector, recreate_kata_start_error_pods,
+    force_delete_stale_terminating_pods, kata_start_error_needs_pod_recreate,
+    plan_stale_terminating_pod_force_deletes, pod_label_selector, recreate_kata_start_error_pods,
 };
 
 #[derive(Debug, Serialize)]
@@ -129,14 +131,21 @@ async fn live_runtime_recovery_reason(namespace: &str, app_name: &str) -> Option
         .await
         .ok()?;
 
-    for pod in list.items {
+    runtime_recovery_reason_from_pods(&list.items, Timestamp::now())
+}
+
+fn runtime_recovery_reason_from_pods(pods: &[Pod], now: Timestamp) -> Option<String> {
+    for pod in pods {
         if let Some(reason) = kata_start_error_needs_pod_recreate(&pod) {
             let pod_name = pod.metadata.name.as_deref().unwrap_or("<unknown>");
             return Some(format!("{pod_name}: {reason}"));
         }
     }
 
-    None
+    plan_stale_terminating_pod_force_deletes(pods, now)
+        .into_iter()
+        .next()
+        .map(|action| format!("{}: {}", action.pod_name, action.reason))
 }
 
 /// POST /apps/{name}/runtime/recover -- repair known runtime-level pod failures.
@@ -169,7 +178,7 @@ pub async fn recover_runtime(
             Json(serde_json::json!({"error": "kubernetes client unavailable"})),
         )
     })?;
-    let recovered = recreate_kata_start_error_pods(client, &app.namespace, &app.name)
+    let mut recovered = recreate_kata_start_error_pods(client.clone(), &app.namespace, &app.name)
         .await
         .map_err(|err| {
             (
@@ -180,6 +189,19 @@ pub async fn recover_runtime(
                 })),
             )
         })?;
+    let stale_terminating_recovered =
+        force_delete_stale_terminating_pods(client, &app.namespace, &app.name)
+            .await
+            .map_err(|err| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "runtime recovery failed",
+                        "message": err.to_string(),
+                    })),
+                )
+            })?;
+    recovered.extend(stale_terminating_recovered);
     let status = if recovered.is_empty() {
         "not_needed"
     } else {
@@ -261,7 +283,10 @@ pub async fn app_logs(
 
 #[cfg(test)]
 mod tests {
-    use super::{confidential_status_url, effective_app_status};
+    use super::{confidential_status_url, effective_app_status, runtime_recovery_reason_from_pods};
+    use k8s_openapi::api::core::v1::Pod;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
+    use k8s_openapi::jiff::Timestamp;
 
     #[test]
     fn unlocked_tee_does_not_mark_creating_app_running() {
@@ -285,6 +310,33 @@ mod tests {
             effective_app_status("running", Some("unlocked"), Some("runtime StartError")),
             "runtime_restart_required"
         );
+    }
+
+    #[test]
+    fn stale_terminating_pod_requires_runtime_recovery() {
+        let deleted_at = Time(
+            "2026-06-15T08:00:00Z"
+                .parse::<Timestamp>()
+                .expect("timestamp parses"),
+        );
+        let now = "2026-06-15T08:01:00Z"
+            .parse::<Timestamp>()
+            .expect("timestamp parses");
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("routstr-core-prod-0".to_string()),
+                deletion_timestamp: Some(deleted_at),
+                deletion_grace_period_seconds: Some(30),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let reason = runtime_recovery_reason_from_pods(&[pod], now)
+            .expect("stale terminating pod should require recovery");
+
+        assert!(reason.contains("routstr-core-prod-0"));
+        assert!(reason.contains("stale terminating"));
     }
 
     #[test]
