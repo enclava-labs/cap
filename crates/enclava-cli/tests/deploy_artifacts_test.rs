@@ -161,6 +161,29 @@ fn cap_oci_runtime_spec_matches_rendered_app_container_fields() {
 }
 
 #[test]
+fn cap_oci_runtime_spec_uses_app_data_source_for_state_app_data_path() {
+    let mut app = sample_app();
+    app.containers[0].storage_paths = vec!["/state/app-data".to_string()];
+    let primary = app.primary_container().unwrap();
+
+    let descriptor_oci = cap_app_oci_runtime_spec(CapAppOciRuntimeSpecInput {
+        container_name: primary.name.clone(),
+        port: primary.port.unwrap(),
+        workload_command: primary.command.clone().unwrap_or_default(),
+        storage_paths: primary.storage_paths.clone(),
+        cpu_limit: app.resources.cpu.clone(),
+        memory_limit: app.resources.memory.clone(),
+    });
+
+    let app_data_mount = descriptor_oci
+        .mounts
+        .iter()
+        .find(|mount| mount.destination == "/state/app-data")
+        .expect("state app-data mount must be present");
+    assert_eq!(app_data_mount.source, "state-mount:app-data");
+}
+
+#[test]
 fn cap_oci_runtime_spec_preserves_workload_command_as_wait_exec_args() {
     let mut app = sample_app();
     app.containers[0].command = Some(vec!["/app/server".to_string(), "--serve".to_string()]);

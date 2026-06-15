@@ -67,7 +67,8 @@ pub const CAP_APP_CPU_REQUEST: &str = "250m";
 pub const CAP_APP_MEMORY_REQUEST: &str = "512Mi";
 
 fn storage_subdir(path: &str) -> String {
-    path.trim_start_matches('/').replace('/', "-")
+    let rel = path.trim_start_matches('/');
+    rel.strip_prefix("state/").unwrap_or(rel).replace('/', "-")
 }
 
 fn named_value(name: &str, value: &str) -> EnvVar {
