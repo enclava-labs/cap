@@ -1,5 +1,6 @@
 //! Deploy orchestrator: builds ConfidentialApp from DB state, calls engine, records result.
 
+use enclava_common::descriptor::DeploymentDescriptor;
 use enclava_common::image::ImageRef;
 use enclava_common::types::{ResourceLimits, UnlockMode as CommonUnlockMode};
 use enclava_engine::apply::{
@@ -72,6 +73,7 @@ pub struct ApplyDeploymentManifestsRequest {
     pub api_url: String,
     pub workload_artifact_binding: Option<WorkloadArtifactBinding>,
     pub signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
+    pub signed_descriptor: Option<DeploymentDescriptor>,
     pub local_workload_artifacts_json: Option<String>,
     pub local_trustee_policy_json: Option<String>,
 }
@@ -154,7 +156,7 @@ fn deserialize_workload_command(command: Option<&str>) -> Option<Vec<String>> {
 
 pub(crate) fn set_primary_descriptor_runtime(
     app: &mut ConfidentialApp,
-    descriptor: &enclava_common::descriptor::DeploymentDescriptor,
+    descriptor: &DeploymentDescriptor,
 ) {
     let command = &descriptor.oci_runtime_spec.args;
     let port = descriptor_primary_port(descriptor).and_then(|port| u16::try_from(port).ok());
@@ -168,6 +170,15 @@ pub(crate) fn set_primary_descriptor_runtime(
             container.port = Some(port);
         }
         container.storage_paths = storage_paths.clone();
+    }
+}
+
+fn apply_signed_descriptor_runtime(
+    app: &mut ConfidentialApp,
+    descriptor: Option<&DeploymentDescriptor>,
+) {
+    if let Some(descriptor) = descriptor {
+        set_primary_descriptor_runtime(app, descriptor);
     }
 }
 
@@ -615,6 +626,94 @@ mod tests {
         assert!(descriptor_storage_paths(&descriptor).is_empty());
         assert!(app.primary_container().unwrap().storage_paths.is_empty());
     }
+
+    #[test]
+    fn signed_apply_runtime_overrides_stale_db_command_before_render() {
+        let mut descriptor = customer_app_descriptor();
+        descriptor.oci_runtime_spec.args = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "set -eu; DATA_DIR=/state/app-data; CONFIG_DIR=/state/app-data/.enclava/config; exec /usr/local/bin/app".to_string(),
+        ];
+
+        let mut app = ConfidentialApp {
+            app_id: descriptor.app_id,
+            name: descriptor.app_name.clone(),
+            namespace: descriptor.namespace.clone(),
+            instance_id: "customer-app-test".to_string(),
+            tenant_id: descriptor.org_slug.clone(),
+            bootstrap_owner_pubkey_hash: "00".repeat(32),
+            tenant_instance_identity_hash: hex::encode(descriptor.identity_hash),
+            service_account: descriptor.service_account.clone(),
+            signer_identity_subject: Some(descriptor.signer_identity.subject.clone()),
+            signer_identity_issuer: Some(descriptor.signer_identity.issuer.clone()),
+            containers: vec![Container {
+                name: "web".to_string(),
+                image: ImageRef::parse(&descriptor.image_ref).unwrap(),
+                port: Some(8080),
+                command: Some(vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "set -eu; DATA_DIR=/state/app-data; CONFIG_DIR=$DATA_DIR/.enclava/config; exec /usr/local/bin/app".to_string(),
+                ]),
+                env: std::collections::HashMap::new(),
+                storage_paths: Vec::new(),
+                is_primary: true,
+            }],
+            storage: StorageSpec::new("5Gi", "2Gi"),
+            unlock_mode: CommonUnlockMode::Password,
+            domain: DomainSpec {
+                platform_domain: descriptor.app_domain.clone(),
+                tee_domain: descriptor.tee_domain.clone(),
+                custom_domain: None,
+            },
+            api_signing_pubkey: String::new(),
+            api_url: String::new(),
+            resources: ResourceLimits {
+                cpu: "1".to_string(),
+                memory: "1Gi".to_string(),
+            },
+            health: HealthCheck::default(),
+            attestation: AttestationConfig {
+                proxy_image: ImageRef::parse(
+                    "ghcr.io/enclava-labs/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )
+                .unwrap(),
+                caddy_image: ImageRef::parse(
+                    "ghcr.io/enclava-labs/caddy-ingress@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                )
+                .unwrap(),
+                acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+                caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
+                trustee_policy_read_available: true,
+                workload_artifacts_url: None,
+                tls_certificate_broker_url: None,
+                trustee_policy_url: None,
+                local_workload_artifacts_json: None,
+                local_trustee_policy_json: None,
+                platform_trustee_policy_pubkey_hex: None,
+                signing_service_pubkey_hex: None,
+            },
+            egress_allowlist: Vec::new(),
+            workload_artifact_binding: None,
+            generated_agent_policy: None,
+        };
+
+        apply_signed_descriptor_runtime(&mut app, Some(&descriptor));
+
+        assert_eq!(
+            app.primary_container().unwrap().command.as_ref().unwrap(),
+            &descriptor.oci_runtime_spec.args
+        );
+    }
+
+    #[test]
+    fn local_signed_policy_delivery_skips_external_kbs_reconciliation() {
+        assert!(!should_reconcile_external_signed_policy(true, true, true));
+        assert!(should_reconcile_external_signed_policy(true, true, false));
+        assert!(should_reconcile_external_signed_policy(true, false, true));
+        assert!(!should_reconcile_external_signed_policy(false, true, true));
+    }
 }
 
 pub async fn set_deployment_status(
@@ -767,6 +866,7 @@ pub async fn apply_deployment_manifests(
         api_url,
         workload_artifact_binding,
         signed_policy_artifact,
+        signed_descriptor,
         local_workload_artifacts_json,
         local_trustee_policy_json,
     } = request;
@@ -779,6 +879,7 @@ pub async fn apply_deployment_manifests(
         &api_url,
     )
     .await?;
+    apply_signed_descriptor_runtime(&mut app_spec, signed_descriptor.as_ref());
     app_spec.workload_artifact_binding = workload_artifact_binding;
     if let (Some(workload_artifacts), Some(trustee_policy)) =
         (local_workload_artifacts_json, local_trustee_policy_json)
@@ -814,7 +915,11 @@ pub async fn apply_deployment_manifests(
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
     set_app_status(&pool, app.id, "creating").await?;
 
-    if signed_policy_artifact.is_some() {
+    if should_reconcile_external_signed_policy(
+        signed_policy_artifact.is_some(),
+        app_spec.attestation.local_workload_artifacts_json.is_some(),
+        app_spec.attestation.local_trustee_policy_json.is_some(),
+    ) {
         crate::kbs::reconcile_signed_policy_artifacts(
             &pool,
             kbs_policy_config.as_ref(),
@@ -884,4 +989,12 @@ pub async fn apply_deployment_manifests(
     });
 
     Ok(())
+}
+
+fn should_reconcile_external_signed_policy(
+    has_signed_policy_artifact: bool,
+    has_local_workload_artifacts: bool,
+    has_local_trustee_policy: bool,
+) -> bool {
+    has_signed_policy_artifact && !(has_local_workload_artifacts && has_local_trustee_policy)
 }

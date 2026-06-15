@@ -780,6 +780,9 @@ pub async fn update_unlock_mode(
     let apply_permits = state.deployment_apply_permits.clone();
     let (local_workload_artifacts_json, local_trustee_policy_json) =
         local_verification_artifacts.unzip();
+    let signed_descriptor = signing_artifacts
+        .as_ref()
+        .map(|artifacts| artifacts.descriptor.clone());
     tokio::spawn(async move {
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
@@ -816,6 +819,7 @@ pub async fn update_unlock_mode(
                 api_url,
                 workload_artifact_binding,
                 signed_policy_artifact,
+                signed_descriptor,
                 local_workload_artifacts_json,
                 local_trustee_policy_json,
             },

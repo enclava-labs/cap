@@ -208,6 +208,7 @@ pub async fn rollback(
     let (workload_artifact_binding, signed_policy_artifact) = rollback_artifact.unzip();
     let (local_workload_artifacts_json, local_trustee_policy_json) =
         local_verification_artifacts.unzip();
+    let signed_descriptor = rollback_descriptor.clone();
     tokio::spawn(async move {
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
@@ -244,6 +245,7 @@ pub async fn rollback(
                 api_url,
                 workload_artifact_binding,
                 signed_policy_artifact,
+                signed_descriptor,
                 local_workload_artifacts_json,
                 local_trustee_policy_json,
             },

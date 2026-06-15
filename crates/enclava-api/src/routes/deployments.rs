@@ -85,6 +85,7 @@ pub(crate) fn customer_signed_deploy_required(
 pub(crate) fn select_local_signed_artifact_delivery(
     attestation: &mut enclava_engine::types::AttestationConfig,
 ) {
+    attestation.trustee_policy_read_available = true;
     attestation.local_workload_artifacts_json = Some("{}".to_string());
     attestation.local_trustee_policy_json = Some("{}".to_string());
 }
@@ -756,6 +757,16 @@ pub async fn deploy(
         let expected_cc_init_data_hash =
             hex::encode(artifacts.descriptor.expected_cc_init_data_hash);
         if expected_cc_init_data_hash != cc_init_data_hash {
+            if let Ok(path) = std::env::var("ENCLAVA_DEBUG_CC_INIT_MISMATCH_TOML_PATH") {
+                let actual_toml = enclava_engine::manifest::cc_init_data::build_toml(&app_spec);
+                if let Err(error) = std::fs::write(&path, actual_toml) {
+                    tracing::warn!(
+                        path = %path,
+                        error = %error,
+                        "failed to write debug cc_init_data mismatch TOML"
+                    );
+                }
+            }
             tracing::warn!(
                 expected_cc_init_data_hash = %expected_cc_init_data_hash,
                 actual_cc_init_data_hash = %cc_init_data_hash,
@@ -901,6 +912,9 @@ pub async fn deploy(
     let apply_permits = state.deployment_apply_permits.clone();
     let (local_workload_artifacts_json, local_trustee_policy_json) =
         local_verification_artifacts.unzip();
+    let signed_descriptor = signing_artifacts
+        .as_ref()
+        .map(|artifacts| artifacts.descriptor.clone());
     tokio::spawn(async move {
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
@@ -937,6 +951,7 @@ pub async fn deploy(
                 api_url,
                 workload_artifact_binding,
                 signed_policy_artifact,
+                signed_descriptor,
                 local_workload_artifacts_json,
                 local_trustee_policy_json,
             },
