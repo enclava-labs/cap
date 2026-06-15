@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -13,6 +14,8 @@ use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
     NewOrder, OrderStatus, RetryPolicy,
 };
+
+const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct AcmeConfig {
@@ -122,7 +125,15 @@ pub async fn issue_dns01_certificate(
             let hostname = challenge.identifier().to_string();
             let record_name = format!("_acme-challenge.{hostname}");
             let record_value = challenge.key_authorization().dns_value();
+            tracing::info!(
+                record = %record_name,
+                "ensuring ACME DNS-01 TXT record"
+            );
             dns::ensure_txt_record(http_client, dns_config, &record_name, &record_value).await?;
+            tracing::info!(
+                record = %record_name,
+                "ensured ACME DNS-01 TXT record"
+            );
             challenge_records.push((record_name.clone(), record_value.clone()));
             if let Err(err) = wait_for_txt_record(
                 &record_name,
@@ -271,14 +282,48 @@ async fn lookup_txt_external(name: &str) -> Result<Vec<String>, String> {
     .with_options(ResolverOpts::default())
     .build()
     .map_err(|e| e.to_string())?;
-    collect_txt_values(resolver.txt_lookup(name).await.map_err(|e| e.to_string())?)
+    let response = dns_lookup_with_timeout(
+        "external",
+        name,
+        DNS_LOOKUP_TIMEOUT,
+        resolver.txt_lookup(name),
+    )
+    .await?;
+    collect_txt_values(response)
 }
 
 async fn lookup_txt_system(name: &str) -> Result<Vec<String>, String> {
     let resolver = TokioResolver::builder_tokio()
         .and_then(|builder| builder.build())
         .map_err(|e| e.to_string())?;
-    collect_txt_values(resolver.txt_lookup(name).await.map_err(|e| e.to_string())?)
+    let response = dns_lookup_with_timeout(
+        "system",
+        name,
+        DNS_LOOKUP_TIMEOUT,
+        resolver.txt_lookup(name),
+    )
+    .await?;
+    collect_txt_values(response)
+}
+
+async fn dns_lookup_with_timeout<T, E, F>(
+    source: &str,
+    name: &str,
+    timeout: Duration,
+    lookup: F,
+) -> Result<T, String>
+where
+    E: std::fmt::Display,
+    F: Future<Output = Result<T, E>>,
+{
+    match tokio::time::timeout(timeout, lookup).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err(format!(
+            "{source} DNS TXT lookup for {name} timed out after {}s",
+            timeout.as_secs()
+        )),
+    }
 }
 
 fn collect_txt_values(response: hickory_resolver::lookup::Lookup) -> Result<Vec<String>, String> {
@@ -346,6 +391,8 @@ async fn load_or_create_account(config: &AcmeConfig) -> Result<Account, AcmeErro
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     #[test]
     fn dns01_challenge_is_marked_ready_after_propagation_wait() {
         let source = include_str!("acme.rs");
@@ -394,6 +441,24 @@ mod tests {
             lookup.contains("external DNS lookup failed; falling back to system resolver"),
             "ACME DNS-01 TXT fallback should log external resolver failures for live diagnosis"
         );
+    }
+
+    #[tokio::test]
+    async fn dns_txt_lookup_timeout_returns_error_instead_of_hanging() {
+        let pending = std::future::pending::<Result<(), std::io::Error>>();
+
+        let err = super::dns_lookup_with_timeout(
+            "system",
+            "_acme-challenge.example.test",
+            Duration::from_millis(1),
+            pending,
+        )
+        .await
+        .expect_err("pending DNS lookup should time out");
+
+        assert!(err.contains("system DNS TXT lookup"));
+        assert!(err.contains("_acme-challenge.example.test"));
+        assert!(err.contains("timed out"));
     }
 
     #[test]
