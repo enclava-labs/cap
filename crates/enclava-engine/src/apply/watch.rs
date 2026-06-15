@@ -13,6 +13,12 @@ pub fn pod_label_selector(statefulset_name: &str) -> String {
     format!("app={statefulset_name}")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KataPodRecreatePlan {
+    pub pod_name: String,
+    pub reason: String,
+}
+
 /// Lightweight snapshot of a pod's state for phase classification.
 /// Extracted from a k8s Pod object to keep classification logic pure and testable.
 #[derive(Debug, Clone)]
@@ -126,6 +132,99 @@ pub fn stale_terminating_pod_needs_force_delete(pod: &Pod, now: Timestamp) -> bo
     now.duration_since(deleted_at.0).as_secs() >= stale_after
 }
 
+pub fn kata_start_error_needs_pod_recreate(pod: &Pod) -> Option<String> {
+    let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
+
+    for cs in statuses {
+        let waiting_reason = cs
+            .state
+            .as_ref()
+            .and_then(|state| state.waiting.as_ref())
+            .and_then(|waiting| waiting.reason.as_deref());
+        let waiting_message = cs
+            .state
+            .as_ref()
+            .and_then(|state| state.waiting.as_ref())
+            .and_then(|waiting| waiting.message.as_deref())
+            .unwrap_or("");
+        let terminated = cs
+            .last_state
+            .as_ref()
+            .and_then(|state| state.terminated.as_ref());
+        let terminated_reason = terminated.and_then(|terminated| terminated.reason.as_deref());
+        let terminated_message = terminated
+            .and_then(|terminated| terminated.message.as_deref())
+            .unwrap_or("");
+
+        let start_error = matches!(waiting_reason, Some("StartError"))
+            || matches!(terminated_reason, Some("StartError"));
+        if !start_error {
+            continue;
+        }
+
+        let detail = format!("{waiting_message}\n{terminated_message}");
+        let detail_lower = detail.to_ascii_lowercase();
+        let looks_like_runtime_start_error = detail_lower.contains("failed to create shim task")
+            || detail_lower.contains("failed to create containerd task")
+            || detail_lower.contains("einval");
+        if looks_like_runtime_start_error {
+            return Some(format!(
+                "container '{}' hit runtime StartError: {}",
+                cs.name,
+                terminated_message
+                    .split('\n')
+                    .next()
+                    .filter(|line| !line.is_empty())
+                    .unwrap_or(waiting_message)
+            ));
+        }
+    }
+
+    None
+}
+
+pub fn plan_kata_start_error_pod_recreates(pods: &[Pod]) -> Vec<KataPodRecreatePlan> {
+    pods.iter()
+        .filter_map(|pod| {
+            let reason = kata_start_error_needs_pod_recreate(pod)?;
+            let pod_name = pod.metadata.name.clone()?;
+            Some(KataPodRecreatePlan { pod_name, reason })
+        })
+        .collect()
+}
+
+pub async fn recreate_kata_start_error_pods(
+    client: kube::Client,
+    namespace: &str,
+    statefulset_name: &str,
+) -> Result<Vec<KataPodRecreatePlan>, ApplyError> {
+    let pod_api: Api<Pod> = Api::namespaced(client, namespace);
+    let pods = pod_api
+        .list(&ListParams::default().labels(&pod_label_selector(statefulset_name)))
+        .await?;
+    let recreate_plan = plan_kata_start_error_pod_recreates(&pods.items);
+
+    for action in &recreate_plan {
+        tracing::warn!(
+            namespace = %namespace,
+            statefulset = %statefulset_name,
+            pod = %action.pod_name,
+            reason = %action.reason,
+            "deleting pod to recreate Kata sandbox after runtime StartError"
+        );
+        match pod_api
+            .delete(&action.pod_name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(recreate_plan)
+}
+
 /// Watch a StatefulSet rollout until it reaches a terminal state or times out.
 ///
 /// Polls the StatefulSet and its pods at `config.poll_interval`. Returns
@@ -149,7 +248,7 @@ pub async fn watch_rollout(
 
     let mut last_phase = DeployPhase::Applying;
 
-    loop {
+    'watch: loop {
         if start.elapsed() >= deadline {
             return Ok(DeployStatus::timed_out(&format!(
                 "rollout did not complete within {:?}",
@@ -229,6 +328,25 @@ pub async fn watch_rollout(
         }
 
         let mut worst_phase = DeployPhase::Running;
+
+        for action in plan_kata_start_error_pod_recreates(&pods.items) {
+            tracing::warn!(
+                namespace = %namespace,
+                statefulset = %statefulset_name,
+                pod = %action.pod_name,
+                reason = %action.reason,
+                "deleting pod to recreate Kata sandbox after runtime StartError"
+            );
+            match pod_api
+                .delete(&action.pod_name, &DeleteParams::default())
+                .await
+            {
+                Ok(_) => {}
+                Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+                Err(err) => return Err(err.into()),
+            }
+            continue 'watch;
+        }
 
         for pod in &pods.items {
             let snap = PodSnapshot::from_pod(pod);

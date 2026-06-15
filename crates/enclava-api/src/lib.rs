@@ -95,6 +95,10 @@ fn internal_routes() -> Router<AppState> {
             axum::routing::post(routes::internal::deploy_paas_app),
         )
         .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/runtime/recover",
+            axum::routing::post(routes::internal::recover_paas_app_runtime),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/agent-policy",
             axum::routing::post(routes::internal::generate_paas_agent_policy),
         )
@@ -359,6 +363,10 @@ fn status_routes() -> Router<AppState> {
         .route(
             "/apps/{name}/status",
             axum::routing::get(routes::status::app_status),
+        )
+        .route(
+            "/apps/{name}/runtime/recover",
+            axum::routing::post(routes::status::recover_runtime),
         )
         .route(
             "/apps/{name}/logs",

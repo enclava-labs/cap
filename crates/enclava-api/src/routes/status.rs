@@ -6,12 +6,18 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use k8s_openapi::api::core::v1::Pod;
+use kube::Api;
+use kube::api::ListParams;
 use serde::Serialize;
 use serde_json::json;
 
 use crate::auth::{middleware::AuthContext, scopes};
-use crate::models::App;
+use crate::models::{App, UnlockMode};
 use crate::state::AppState;
+use enclava_engine::apply::watch::{
+    kata_start_error_needs_pod_recreate, pod_label_selector, recreate_kata_start_error_pods,
+};
 
 #[derive(Debug, Serialize)]
 pub struct AppStatusResponse {
@@ -23,6 +29,21 @@ pub struct AppStatusResponse {
     pub pod_status: Option<String>,
     pub tee_status: Option<String>,
     pub storage_status: Option<String>,
+    pub runtime_recovery: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeRecoveryPodResponse {
+    pub pod_name: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RuntimeRecoveryResponse {
+    pub app_name: String,
+    pub status: String,
+    pub recovered_pods: Vec<RuntimeRecoveryPodResponse>,
+    pub unlock_may_be_required: bool,
 }
 
 /// GET /apps/{name}/status -- live status (pod, TEE, unlock).
@@ -80,7 +101,12 @@ pub async fn app_status(
         };
 
     let db_status = format!("{:?}", app.status).to_lowercase();
-    let effective_status = effective_app_status(&db_status, live_state.as_deref());
+    let runtime_recovery = live_runtime_recovery_reason(&app.namespace, &app.name).await;
+    let effective_status = effective_app_status(
+        &db_status,
+        live_state.as_deref(),
+        runtime_recovery.as_deref(),
+    );
 
     Ok(Json(AppStatusResponse {
         app_name: app.name,
@@ -91,10 +117,98 @@ pub async fn app_status(
         pod_status,
         tee_status,
         storage_status,
+        runtime_recovery,
     }))
 }
 
-fn effective_app_status(db_status: &str, live_state: Option<&str>) -> String {
+async fn live_runtime_recovery_reason(namespace: &str, app_name: &str) -> Option<String> {
+    let client = kube::Client::try_default().await.ok()?;
+    let pods: Api<Pod> = Api::namespaced(client, namespace);
+    let list = pods
+        .list(&ListParams::default().labels(&pod_label_selector(app_name)))
+        .await
+        .ok()?;
+
+    for pod in list.items {
+        if let Some(reason) = kata_start_error_needs_pod_recreate(&pod) {
+            let pod_name = pod.metadata.name.as_deref().unwrap_or("<unknown>");
+            return Some(format!("{pod_name}: {reason}"));
+        }
+    }
+
+    None
+}
+
+/// POST /apps/{name}/runtime/recover -- repair known runtime-level pod failures.
+pub async fn recover_runtime(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(app_name): Path<String>,
+) -> Result<Json<RuntimeRecoveryResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_write(&auth)?;
+
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+        .bind(auth.org_id)
+        .bind(&app_name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "app not found"})),
+        ))?;
+
+    let client = kube::Client::try_default().await.map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "kubernetes client unavailable"})),
+        )
+    })?;
+    let recovered = recreate_kata_start_error_pods(client, &app.namespace, &app.name)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "runtime recovery failed",
+                    "message": err.to_string(),
+                })),
+            )
+        })?;
+    let status = if recovered.is_empty() {
+        "not_needed"
+    } else {
+        "restarted"
+    };
+
+    Ok(Json(RuntimeRecoveryResponse {
+        app_name: app.name,
+        status: status.to_string(),
+        recovered_pods: recovered
+            .into_iter()
+            .map(|pod| RuntimeRecoveryPodResponse {
+                pod_name: pod.pod_name,
+                reason: pod.reason,
+            })
+            .collect(),
+        unlock_may_be_required: app.unlock_mode == UnlockMode::Password,
+    }))
+}
+
+fn effective_app_status(
+    db_status: &str,
+    live_state: Option<&str>,
+    runtime_recovery: Option<&str>,
+) -> String {
+    if runtime_recovery.is_some() {
+        return "runtime_restart_required".to_string();
+    }
+
     match live_state {
         Some("unlocked") if db_status == "running" => "running".to_string(),
         Some("locked") => "locked".to_string(),
@@ -152,14 +266,25 @@ mod tests {
     #[test]
     fn unlocked_tee_does_not_mark_creating_app_running() {
         assert_eq!(
-            effective_app_status("creating", Some("unlocked")),
+            effective_app_status("creating", Some("unlocked"), None),
             "creating"
         );
     }
 
     #[test]
     fn unlocked_tee_keeps_running_app_running() {
-        assert_eq!(effective_app_status("running", Some("unlocked")), "running");
+        assert_eq!(
+            effective_app_status("running", Some("unlocked"), None),
+            "running"
+        );
+    }
+
+    #[test]
+    fn runtime_recovery_overrides_unlocked_tee_status() {
+        assert_eq!(
+            effective_app_status("running", Some("unlocked"), Some("runtime StartError")),
+            "runtime_restart_required"
+        );
     }
 
     #[test]

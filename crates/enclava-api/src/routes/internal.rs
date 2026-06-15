@@ -1208,6 +1208,19 @@ pub async fn deploy_paas_app(
     Ok((status, Json(response)))
 }
 
+pub async fn recover_paas_app_runtime(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Path((paas_org_id, app_name)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_external_id(&paas_org_id, "paas_org_id")?;
+    let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
+    let Json(response) =
+        crate::routes::status::recover_runtime(auth, State(state), Path(app_name)).await?;
+    Ok(Json(to_value(response)?))
+}
+
 pub async fn generate_paas_agent_policy(
     _auth: InternalAuth,
     State(state): State<AppState>,

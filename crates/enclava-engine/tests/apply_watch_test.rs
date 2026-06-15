@@ -1,8 +1,13 @@
 use enclava_engine::apply::types::DeployPhase;
 use enclava_engine::apply::watch::{
-    PodSnapshot, classify_pod_phase, pod_label_selector, stale_terminating_pod_needs_force_delete,
+    PodSnapshot, classify_pod_phase, kata_start_error_needs_pod_recreate,
+    plan_kata_start_error_pod_recreates, pod_label_selector,
+    stale_terminating_pod_needs_force_delete,
 };
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{
+    ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus, Pod,
+    PodStatus,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use k8s_openapi::jiff::Timestamp;
 
@@ -145,6 +150,119 @@ fn fresh_or_finalized_terminating_pod_is_not_force_deleted() {
         &finalized_pod,
         stale_now
     ));
+}
+
+#[test]
+fn kata_start_error_needs_whole_pod_recreate() {
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("routstr-core-prod-0".to_string()),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                ready: false,
+                restart_count: 6,
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("CrashLoopBackOff".to_string()),
+                        message: Some(
+                            "back-off restarting failed container=web pod=routstr-core-prod-0"
+                                .to_string(),
+                        ),
+                    }),
+                    ..Default::default()
+                }),
+                last_state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 128,
+                        reason: Some("StartError".to_string()),
+                        message: Some(
+                            "failed to create containerd task: failed to create shim task: EINVAL: Invalid argument"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let recreate = kata_start_error_needs_pod_recreate(&pod)
+        .expect("Kata StartError should trigger whole-pod recreation");
+
+    assert!(recreate.contains("web"));
+    assert!(recreate.contains("StartError"));
+    assert!(recreate.contains("failed to create shim task"));
+}
+
+#[test]
+fn kata_start_error_repair_plan_selects_only_runtime_start_errors() {
+    let runtime_failed_pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("routstr-core-prod-0".to_string()),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                ready: false,
+                restart_count: 6,
+                last_state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        exit_code: 128,
+                        reason: Some("StartError".to_string()),
+                        message: Some(
+                            "failed to create containerd task: failed to create shim task: EINVAL: Invalid argument"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let app_crash_pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("app-crash-0".to_string()),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                ready: false,
+                restart_count: 4,
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("CrashLoopBackOff".to_string()),
+                        message: Some("application exited with code 1".to_string()),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let plan = plan_kata_start_error_pod_recreates(&[runtime_failed_pod, app_crash_pod]);
+
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].pod_name, "routstr-core-prod-0");
+    assert!(plan[0].reason.contains("failed to create shim task"));
 }
 
 /// Integration test: requires a running cluster.
