@@ -81,6 +81,9 @@ fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
                 unlock_mode: "auto".to_string(),
                 bootstrap_pubkey_hash: None,
                 egress_allowlist: Vec::new(),
+                health_path: None,
+                health_interval: None,
+                health_timeout: None,
             },
             source: GenericDeploymentSource {
                 provider: SourceProvider::GitHub,
@@ -99,6 +102,35 @@ fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
             },
             security: GenericDeploymentSecurity::default(),
         }
+}
+
+#[test]
+fn generic_deployment_app_accepts_health_fields_for_created_app() {
+    let body: GenericDeploymentRequest = serde_json::from_value(serde_json::json!({
+        "app": {
+            "name": "routstr",
+            "create_if_missing": true,
+            "health_path": "/v1/info",
+            "health_interval": 60,
+            "health_timeout": 60
+        },
+        "source": {
+            "provider": "github",
+            "repository": "enclava-labs/routstr-core-confidential"
+        },
+        "workload": {
+            "image": "ghcr.io/enclava-labs/routstr-core-confidential@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "signing": {
+            "subject": "https://github.com/enclava-labs/routstr-core-confidential/.github/workflows/container.yml@refs/heads/main",
+            "issuer": "https://token.actions.githubusercontent.com"
+        }
+    }))
+    .unwrap();
+
+    assert_eq!(body.app.health_path.as_deref(), Some("/v1/info"));
+    assert_eq!(body.app.health_interval, Some(60));
+    assert_eq!(body.app.health_timeout, Some(60));
 }
 
 fn attestation_config() -> AttestationConfig {

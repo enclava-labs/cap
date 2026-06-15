@@ -23,6 +23,12 @@ pub struct GenericDeploymentApp {
     pub bootstrap_pubkey_hash: Option<String>,
     #[serde(default)]
     pub egress_allowlist: Vec<crate::routes::apps::EgressAllowRule>,
+    #[serde(default)]
+    pub health_path: Option<String>,
+    #[serde(default)]
+    pub health_interval: Option<u32>,
+    #[serde(default)]
+    pub health_timeout: Option<u32>,
 }
 
 fn default_generic_unlock_mode() -> String {
@@ -244,9 +250,9 @@ pub async fn create_generic_deployment(
                 source_provider: Some(body.source.provider),
                 source_repository: Some(body.source.repository.clone()),
                 egress_allowlist: body.app.egress_allowlist.clone(),
-                health_path: None,
-                health_interval: None,
-                health_timeout: None,
+                health_path: body.app.health_path.clone(),
+                health_interval: body.app.health_interval,
+                health_timeout: body.app.health_timeout,
             };
             let (_, Json(created)) =
                 crate::routes::apps::create_app(auth.clone(), State(state.clone()), Json(create))
