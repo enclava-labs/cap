@@ -11,6 +11,9 @@ use sqlx::PgPool;
 use crate::state::AppState;
 
 const CERTIFICATE_CACHE_MAX_AGE_DAYS: i64 = 60;
+const CERTIFICATE_ISSUANCE_WINDOW_DAYS: i64 = 7;
+const MAX_DISTINCT_CSRS_PER_HOSTNAME_WINDOW: i64 = 3;
+const LETS_ENCRYPT_PRODUCTION_DIRECTORY: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
 #[derive(Debug, Deserialize)]
 pub struct CertificateRequest {
@@ -170,6 +173,44 @@ pub async fn dns01_certificate(
                 .into_response();
         }
     }
+    match count_recent_distinct_csrs(&state.db, &certificate_cache_key).await {
+        Ok(distinct_csrs)
+            if production_acme_budget_exhausted(
+                &certificate_cache_key.directory_url,
+                distinct_csrs,
+            ) =>
+        {
+            tracing::warn!(
+                hostnames = %certificate_cache_key.hostnames_key,
+                distinct_csrs,
+                limit = MAX_DISTINCT_CSRS_PER_HOSTNAME_WINDOW,
+                window_days = CERTIFICATE_ISSUANCE_WINDOW_DAYS,
+                "blocking production ACME issuance before external rate limit is exhausted"
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "acme_internal_issuance_limit",
+                    "detail": "too many distinct TLS CSRs for this hostname set; cached certificates still work, but new private keys are blocked to protect production ACME quota",
+                    "distinct_csrs": distinct_csrs,
+                    "limit": MAX_DISTINCT_CSRS_PER_HOSTNAME_WINDOW,
+                    "window_days": CERTIFICATE_ISSUANCE_WINDOW_DAYS,
+                })),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "certificate_issuance_budget_query_failed",
+                    "detail": err.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    }
     let rate_limit_key =
         crate::acme::AcmeRateLimitKey::new(&acme_config.directory_url, &body.hostnames);
     if let Some(retry_after) = state
@@ -312,6 +353,30 @@ async fn remember_cached_certificate(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+async fn count_recent_distinct_csrs(
+    pool: &PgPool,
+    key: &CertificateCacheKey,
+) -> Result<i64, sqlx::Error> {
+    let cutoff = Utc::now() - Duration::days(CERTIFICATE_ISSUANCE_WINDOW_DAYS);
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(DISTINCT csr_sha256)::bigint
+           FROM workload_tls_certificate_cache
+          WHERE acme_directory_url = $1
+            AND hostnames_key = $2
+            AND created_at > $3",
+    )
+    .bind(&key.directory_url)
+    .bind(&key.hostnames_key)
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await
+}
+
+fn production_acme_budget_exhausted(directory_url: &str, distinct_csrs: i64) -> bool {
+    directory_url == LETS_ENCRYPT_PRODUCTION_DIRECTORY
+        && distinct_csrs >= MAX_DISTINCT_CSRS_PER_HOSTNAME_WINDOW
 }
 
 fn attested_or_declared_init_data_hash(
@@ -489,5 +554,21 @@ mod tests {
             cache_lookup < rate_limit_gate,
             "cached public certificate chains must be reusable even while a production ACME exact-set rate limit is active"
         );
+    }
+
+    #[test]
+    fn production_acme_budget_blocks_new_csrs_before_external_rate_limit() {
+        assert!(!production_acme_budget_exhausted(
+            "https://acme-staging-v02.api.letsencrypt.org/directory",
+            100,
+        ));
+        assert!(!production_acme_budget_exhausted(
+            "https://acme-v02.api.letsencrypt.org/directory",
+            MAX_DISTINCT_CSRS_PER_HOSTNAME_WINDOW - 1,
+        ));
+        assert!(production_acme_budget_exhausted(
+            "https://acme-v02.api.letsencrypt.org/directory",
+            MAX_DISTINCT_CSRS_PER_HOSTNAME_WINDOW,
+        ));
     }
 }
