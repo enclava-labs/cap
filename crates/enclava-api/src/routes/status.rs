@@ -217,29 +217,18 @@ pub async fn recover_runtime(
                 )
             })?;
     recovered.extend(stale_terminating_recovered);
-    let domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
-    let tee_status_url = confidential_status_url(domain, app.tee_domain.as_deref());
-    let live_state = fetch_confidential_status(&state, &tee_status_url)
+    let unready_recovered = recreate_unready_running_pods(client, &app.namespace, &app.name)
         .await
-        .and_then(|body| {
-            body.get("state")
-                .and_then(|value| value.as_str())
-                .map(String::from)
-        });
-    if live_state.as_deref() == Some("unlocked") {
-        let unready_recovered = recreate_unready_running_pods(client, &app.namespace, &app.name)
-            .await
-            .map_err(|err| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": "runtime recovery failed",
-                        "message": err.to_string(),
-                    })),
-                )
-            })?;
-        recovered.extend(unready_recovered);
-    }
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "runtime recovery failed",
+                    "message": err.to_string(),
+                })),
+            )
+        })?;
+    recovered.extend(unready_recovered);
     let status = if recovered.is_empty() {
         "not_needed"
     } else {

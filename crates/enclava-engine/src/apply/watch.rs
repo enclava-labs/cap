@@ -260,6 +260,10 @@ pub fn plan_unready_running_pod_recreates(
         .collect()
 }
 
+fn unready_running_pod_delete_params() -> DeleteParams {
+    DeleteParams::default().grace_period(0)
+}
+
 pub async fn recreate_kata_start_error_pods(
     client: kube::Client,
     namespace: &str,
@@ -290,6 +294,19 @@ pub async fn recreate_kata_start_error_pods(
     }
 
     Ok(recreate_plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unready_running_pod_delete_uses_zero_grace() {
+        assert_eq!(
+            unready_running_pod_delete_params().grace_period_seconds,
+            Some(0)
+        );
+    }
 }
 
 pub async fn force_delete_stale_terminating_pods(
@@ -341,10 +358,10 @@ pub async fn recreate_unready_running_pods(
             statefulset = %statefulset_name,
             pod = %action.pod_name,
             reason = %action.reason,
-            "deleting pod to recreate Kata sandbox after app container stayed unready"
+            "force deleting pod to recreate Kata sandbox after app container stayed unready"
         );
         match pod_api
-            .delete(&action.pod_name, &DeleteParams::default())
+            .delete(&action.pod_name, &unready_running_pod_delete_params())
             .await
         {
             Ok(_) => {}
