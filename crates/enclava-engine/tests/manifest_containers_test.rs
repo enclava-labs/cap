@@ -160,7 +160,7 @@ fn app_container_has_no_kubernetes_subpath_mounts() {
 }
 
 #[test]
-fn app_container_uses_http_readiness_startup_and_liveness_probes() {
+fn app_container_uses_http_readiness_and_startup_but_no_liveness_probe() {
     let app = sample_app();
     let expected_timeout = app.health.timeout_seconds as i32;
     let c = build_app_container(&app);
@@ -191,16 +191,10 @@ fn app_container_uses_http_readiness_startup_and_liveness_probes() {
         "manual password unlocks must not be killed while waiting for the owner"
     );
 
-    let liveness = c.liveness_probe.as_ref().unwrap();
-    let liveness_http = liveness.http_get.as_ref().unwrap();
-    assert_eq!(liveness_http.path.as_deref(), Some("/health"));
-    assert_eq!(
-        liveness_http.port,
-        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
+    assert!(
+        c.liveness_probe.is_none(),
+        "policy-enforced Kata sandboxes do not reliably permit recreating only the app container; CAP recovery must recreate the pod instead"
     );
-    assert_eq!(liveness.period_seconds, Some(15));
-    assert_eq!(liveness.timeout_seconds, Some(expected_timeout));
-    assert_eq!(liveness.failure_threshold, Some(3));
 }
 
 #[test]
@@ -222,21 +216,14 @@ fn app_container_uses_configured_health_path() {
         Some("/v1/info")
     );
     assert!(c.startup_probe.as_ref().unwrap().http_get.is_none());
-    assert_eq!(
-        c.liveness_probe
-            .as_ref()
-            .unwrap()
-            .http_get
-            .as_ref()
-            .unwrap()
-            .path
-            .as_deref(),
-        Some("/v1/info")
+    assert!(
+        c.liveness_probe.is_none(),
+        "configured health paths must not create app liveness probes in policy-enforced Kata sandboxes"
     );
 }
 
 #[test]
-fn app_http_liveness_and_readiness_are_capped_even_when_health_interval_is_slow() {
+fn app_http_readiness_is_capped_even_when_health_interval_is_slow() {
     let mut app = sample_app();
     app.health.path = "/v1/info".to_string();
     app.health.interval_seconds = 60;
@@ -244,13 +231,11 @@ fn app_http_liveness_and_readiness_are_capped_even_when_health_interval_is_slow(
 
     let c = build_app_container(&app);
     let readiness = c.readiness_probe.as_ref().unwrap();
-    let liveness = c.liveness_probe.as_ref().unwrap();
     let startup = c.startup_probe.as_ref().unwrap();
 
     assert_eq!(readiness.period_seconds, Some(15));
     assert_eq!(readiness.timeout_seconds, Some(5));
-    assert_eq!(liveness.period_seconds, Some(15));
-    assert_eq!(liveness.timeout_seconds, Some(5));
+    assert!(c.liveness_probe.is_none());
     assert_eq!(startup.period_seconds, Some(5));
     assert_eq!(
         startup.failure_threshold,

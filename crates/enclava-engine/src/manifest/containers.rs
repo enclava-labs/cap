@@ -59,7 +59,6 @@ const APP_STARTUP_PROBE_PERIOD_SECONDS: i32 = 5;
 const APP_STARTUP_PROBE_FAILURE_THRESHOLD: i32 = 17_280;
 const APP_HTTP_PROBE_MAX_PERIOD_SECONDS: i32 = 15;
 const APP_HTTP_PROBE_MAX_TIMEOUT_SECONDS: i32 = 5;
-const APP_LIVENESS_PROBE_FAILURE_THRESHOLD: i32 = 3;
 
 fn shell_escape_arg(arg: &str) -> String {
     if arg.is_empty() {
@@ -397,13 +396,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             failure_threshold: Some(APP_STARTUP_PROBE_FAILURE_THRESHOLD),
             ..Default::default()
         }),
-        liveness_probe: Some(k8s_openapi::api::core::v1::Probe {
-            http_get: Some(app_http_probe(app, app_port as i32)),
-            period_seconds: Some(capped_http_probe_period(app)),
-            timeout_seconds: Some(capped_http_probe_timeout(app)),
-            failure_threshold: Some(APP_LIVENESS_PROBE_FAILURE_THRESHOLD),
-            ..Default::default()
-        }),
+        liveness_probe: None,
         ..Default::default()
     }
 }
