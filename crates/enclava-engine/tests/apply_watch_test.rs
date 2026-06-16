@@ -2,11 +2,12 @@ use enclava_engine::apply::types::DeployPhase;
 use enclava_engine::apply::watch::{
     PodSnapshot, classify_pod_phase, kata_start_error_needs_pod_recreate,
     plan_kata_start_error_pod_recreates, plan_stale_terminating_pod_force_deletes,
-    pod_label_selector, stale_terminating_pod_needs_force_delete,
+    plan_unready_running_pod_recreates, pod_label_selector,
+    stale_terminating_pod_needs_force_delete, unready_running_pod_needs_recreate,
 };
 use k8s_openapi::api::core::v1::{
-    ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus, Pod,
-    PodStatus,
+    ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
+    ContainerStatus, Pod, PodStatus,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use k8s_openapi::jiff::Timestamp;
@@ -310,6 +311,148 @@ fn kata_start_error_repair_plan_selects_only_runtime_start_errors() {
     assert_eq!(plan.len(), 1);
     assert_eq!(plan[0].pod_name, "routstr-core-prod-0");
     assert!(plan[0].reason.contains("failed to create shim task"));
+}
+
+#[test]
+fn long_running_unready_web_container_needs_whole_pod_recreate() {
+    let started_at = Time(
+        "2026-06-16T12:23:29Z"
+            .parse::<Timestamp>()
+            .expect("timestamp parses"),
+    );
+    let now = "2026-06-16T12:40:00Z"
+        .parse::<Timestamp>()
+        .expect("timestamp parses");
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("routstr-core-prod-0".to_string()),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                ready: false,
+                restart_count: 0,
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning {
+                        started_at: Some(started_at.clone()),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let reason = unready_running_pod_needs_recreate(&pod, now)
+        .expect("long-running unready web container should need pod recreation");
+
+    assert!(reason.contains("web"));
+    assert!(reason.contains("unready"));
+}
+
+#[test]
+fn recent_unready_web_container_is_not_recreated_during_unlock_startup() {
+    let started_at = Time(
+        "2026-06-16T12:23:29Z"
+            .parse::<Timestamp>()
+            .expect("timestamp parses"),
+    );
+    let now = "2026-06-16T12:25:00Z"
+        .parse::<Timestamp>()
+        .expect("timestamp parses");
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("routstr-core-prod-0".to_string()),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                ready: false,
+                restart_count: 0,
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning {
+                        started_at: Some(started_at.clone()),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert!(unready_running_pod_needs_recreate(&pod, now).is_none());
+}
+
+#[test]
+fn unready_running_repair_plan_selects_only_stale_web_container() {
+    let started_at = Time(
+        "2026-06-16T12:23:29Z"
+            .parse::<Timestamp>()
+            .expect("timestamp parses"),
+    );
+    let now = "2026-06-16T12:40:00Z"
+        .parse::<Timestamp>()
+        .expect("timestamp parses");
+    let stale_unready_pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("routstr-core-prod-0".to_string()),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                ready: false,
+                restart_count: 0,
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning {
+                        started_at: Some(started_at.clone()),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let ready_pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("healthy-0".to_string()),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                ready: true,
+                restart_count: 0,
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning {
+                        started_at: Some(started_at),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let plan = plan_unready_running_pod_recreates(&[stale_unready_pod, ready_pod], now);
+
+    assert_eq!(plan.len(), 1);
+    assert_eq!(plan[0].pod_name, "routstr-core-prod-0");
+    assert!(plan[0].reason.contains("unready"));
 }
 
 /// Integration test: requires a running cluster.

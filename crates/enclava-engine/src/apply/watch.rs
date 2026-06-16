@@ -8,6 +8,7 @@ use super::engine::{ApplyEngine, ApplyError};
 use super::types::{DeployPhase, DeployStatus};
 
 const STALE_TERMINATING_POD_FORCE_DELETE_BUFFER_SECONDS: i64 = 10;
+const UNREADY_RUNNING_POD_RECREATE_AFTER_SECONDS: i64 = 600;
 
 pub fn pod_label_selector(statefulset_name: &str) -> String {
     format!("app={statefulset_name}")
@@ -211,6 +212,54 @@ pub fn plan_stale_terminating_pod_force_deletes(
         .collect()
 }
 
+pub fn unready_running_pod_needs_recreate(pod: &Pod, now: Timestamp) -> Option<String> {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return None;
+    }
+
+    let status = pod.status.as_ref()?;
+    if status.phase.as_deref() != Some("Running") {
+        return None;
+    }
+
+    let web = status
+        .container_statuses
+        .as_ref()?
+        .iter()
+        .find(|container| container.name == "web")?;
+    if web.ready {
+        return None;
+    }
+
+    let started_at = web
+        .state
+        .as_ref()
+        .and_then(|state| state.running.as_ref())
+        .and_then(|running| running.started_at.as_ref())?;
+    let unready_seconds = now.duration_since(started_at.0).as_secs();
+    if unready_seconds < UNREADY_RUNNING_POD_RECREATE_AFTER_SECONDS {
+        return None;
+    }
+
+    Some(format!(
+        "container '{}' has been running unready for {unready_seconds}s; recreate pod to recover hung app inside Kata sandbox",
+        web.name
+    ))
+}
+
+pub fn plan_unready_running_pod_recreates(
+    pods: &[Pod],
+    now: Timestamp,
+) -> Vec<KataPodRecreatePlan> {
+    pods.iter()
+        .filter_map(|pod| {
+            let reason = unready_running_pod_needs_recreate(pod, now)?;
+            let pod_name = pod.metadata.name.clone()?;
+            Some(KataPodRecreatePlan { pod_name, reason })
+        })
+        .collect()
+}
+
 pub async fn recreate_kata_start_error_pods(
     client: kube::Client,
     namespace: &str,
@@ -273,6 +322,38 @@ pub async fn force_delete_stale_terminating_pods(
     }
 
     Ok(force_delete_plan)
+}
+
+pub async fn recreate_unready_running_pods(
+    client: kube::Client,
+    namespace: &str,
+    statefulset_name: &str,
+) -> Result<Vec<KataPodRecreatePlan>, ApplyError> {
+    let pod_api: Api<Pod> = Api::namespaced(client, namespace);
+    let pods = pod_api
+        .list(&ListParams::default().labels(&pod_label_selector(statefulset_name)))
+        .await?;
+    let recreate_plan = plan_unready_running_pod_recreates(&pods.items, Timestamp::now());
+
+    for action in &recreate_plan {
+        tracing::warn!(
+            namespace = %namespace,
+            statefulset = %statefulset_name,
+            pod = %action.pod_name,
+            reason = %action.reason,
+            "deleting pod to recreate Kata sandbox after app container stayed unready"
+        );
+        match pod_api
+            .delete(&action.pod_name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(recreate_plan)
 }
 
 /// Watch a StatefulSet rollout until it reaches a terminal state or times out.
