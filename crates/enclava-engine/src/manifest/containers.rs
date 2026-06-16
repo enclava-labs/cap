@@ -633,6 +633,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         .expect("app must have a primary container");
     let mode = ownership_mode_str(app.unlock_mode);
     let legacy = legacy_bootstrap_enabled();
+    let (_, expected_init_data_hash) = cc_init_data::compute_cc_init_data(app);
 
     let mut env_vars = vec![
         env("ATTESTATION_WORKLOAD_CONTAINER", &primary.name),
@@ -641,6 +642,10 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("ATTESTATION_PROFILE", "coco-sev-snp"),
         env("ATTESTATION_RUNTIME_CLASS", "kata-qemu-snp"),
         env("ATTESTATION_WORKLOAD_IMAGE", &primary.image.digest_ref()),
+        env(
+            "ATTESTATION_EXPECTED_INIT_DATA_HASH",
+            &expected_init_data_hash,
+        ),
         env("ATTESTATION_BIND", "127.0.0.1"),
         env("ATTESTATION_TLS_BIND", "0.0.0.0"),
         env("ATTESTATION_TLS_PORT", "8443"),

@@ -1,4 +1,4 @@
-use enclava_engine::manifest::statefulset::generate_statefulset;
+use enclava_engine::manifest::{cc_init_data, statefulset::generate_statefulset};
 use enclava_engine::testutil::sample_app;
 
 #[test]
@@ -146,6 +146,27 @@ fn statefulset_has_init_data_sha256_annotation() {
         .get("storage.enclava.dev/secure-pv-init-data-sha256")
         .unwrap();
     assert_eq!(hash.len(), 64);
+}
+
+#[test]
+fn statefulset_passes_expected_init_data_hash_to_attestation_proxy() {
+    let app = sample_app();
+    let (_, expected_hash) = cc_init_data::compute_cc_init_data(&app);
+    let sts = generate_statefulset(&app);
+    let pod_spec = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+    let proxy = pod_spec
+        .containers
+        .iter()
+        .find(|container| container.name == "attestation-proxy")
+        .unwrap();
+    let env = proxy.env.as_ref().unwrap();
+
+    assert_eq!(
+        env.iter()
+            .find(|entry| entry.name == "ATTESTATION_EXPECTED_INIT_DATA_HASH")
+            .and_then(|entry| entry.value.as_deref()),
+        Some(expected_hash.as_str())
+    );
 }
 
 #[test]

@@ -3,6 +3,7 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -83,6 +84,93 @@ fn parse_config_inputs(
         ));
     }
     Ok(pairs)
+}
+
+fn string_field<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn image_ref_from_artifact(content: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("image artifact is empty".into());
+    }
+    if !trimmed.starts_with('{') {
+        return Ok(trimmed.to_string());
+    }
+
+    let value: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|err| format!("failed to parse image artifact JSON: {err}"))?;
+    if let Some(image_ref) = string_field(
+        &value,
+        &[
+            "image_ref",
+            "imageRef",
+            "digest_pinned_image",
+            "digest_pinned_ref",
+            "ref",
+        ],
+    ) {
+        return Ok(image_ref.to_string());
+    }
+
+    let image = string_field(
+        &value,
+        &[
+            "image",
+            "image_name",
+            "imageName",
+            "repository",
+            "subject-name",
+            "subject_name",
+            "name",
+        ],
+    );
+    let digest = string_field(
+        &value,
+        &[
+            "digest",
+            "image_digest",
+            "imageDigest",
+            "subject-digest",
+            "subject_digest",
+        ],
+    );
+    match (image, digest) {
+        (Some(image), Some(digest)) => Ok(format!("{}@{}", image.trim_end_matches('@'), digest)),
+        _ => Err(
+            "image artifact must contain image_ref, digest_pinned_image, or image plus digest"
+                .into(),
+        ),
+    }
+}
+
+fn resolve_deploy_image_input(
+    image: Option<&str>,
+    image_file: Option<&Path>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match (image, image_file) {
+        (Some(value), None) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Err("--image cannot be empty".into())
+            } else {
+                Ok(trimmed.to_string())
+            }
+        }
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(path).map_err(|err| {
+                format!("failed to read image artifact at {}: {err}", path.display())
+            })?;
+            image_ref_from_artifact(&content)
+        }
+        (None, None) => Err("deployment requires --image or --image-file".into()),
+        (Some(_), Some(_)) => Err("use only one of --image or --image-file".into()),
+    }
 }
 
 fn deploy_should_unlock_before_config(
@@ -246,8 +334,20 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
 #[derive(Args)]
 pub struct DeployArgs {
     /// Digest-pinned container image to deploy and bind into the customer-signed descriptor.
-    #[arg(long)]
-    pub image: String,
+    #[arg(
+        long,
+        required_unless_present = "image_file",
+        conflicts_with = "image_file"
+    )]
+    pub image: Option<String>,
+    /// File containing a digest-pinned image ref, or JSON with image_ref or image plus digest.
+    #[arg(
+        long = "image-file",
+        value_name = "PATH",
+        required_unless_present = "image",
+        conflicts_with = "image"
+    )]
+    pub image_file: Option<PathBuf>,
     /// Return after the API accepts the deployment instead of waiting for runtime health.
     #[arg(long)]
     pub no_wait: bool,
@@ -268,6 +368,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     };
     let app_name = app_config.app.name.clone();
 
+    let image = resolve_deploy_image_input(args.image.as_deref(), args.image_file.as_deref())?;
     let config_pairs = parse_config_inputs(&args.config_vars, &args.config_file_vars)?;
     let (api, paths, cli_config) = build_api_client()?;
     let creds = config::load_credentials(&paths)?;
@@ -280,13 +381,13 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         creds: &creds,
         app: &app,
         app_config: &app_config,
-        image: &args.image,
+        image: &image,
         target_unlock_mode: None,
     })
     .await?;
 
     let req = DeployRequest {
-        image: Some(args.image.clone()),
+        image: Some(image),
         customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
         org_keyring_blob: Some(signed_blobs.org_keyring_blob),
         signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),

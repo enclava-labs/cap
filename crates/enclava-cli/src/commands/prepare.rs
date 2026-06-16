@@ -204,7 +204,10 @@ mod tests {
         assert!(workflow.contains("id-token: write"));
         assert!(workflow.contains("cosign sign --yes"));
         assert!(!workflow.contains("https://github.com/${{ github.workflow_ref }}"));
-        assert!(workflow.contains("enclava deploy --image"));
+        assert!(workflow.contains("enclava-image.json"));
+        assert!(workflow.contains("actions/upload-artifact@v4"));
+        assert!(workflow.contains("enclava deploy --image-file enclava-image.json"));
+        assert!(!workflow.contains("enclava deploy --image "));
         assert!(!workflow.contains("ENCLAVA_API_KEY"));
         assert!(!workflow.contains("git push"));
         assert!(!workflow.contains("git commit"));

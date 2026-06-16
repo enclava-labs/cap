@@ -25,6 +25,9 @@ DEFAULT_RELEASE_PATH = Path(__file__).resolve().parents[1] / "platform-release.j
 GHCR_DIGEST_RE = re.compile(
     r"^ghcr\.io/enclava-labs/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
 )
+DIGEST_PINNED_RE = re.compile(
+    r"^[a-z0-9.-]+(?::[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
+)
 HEX32_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -130,7 +133,10 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
     if payload["schema_version"] != "v1":
         raise ValueError("schema_version must be v1")
     for field in ["attestation_proxy_image", "caddy_ingress_image"]:
-        if not GHCR_DIGEST_RE.fullmatch(payload[field]):
+        if allow_dev_internal_tls:
+            if not DIGEST_PINNED_RE.fullmatch(payload[field]):
+                raise ValueError(f"{field} must be a digest-pinned ref")
+        elif not GHCR_DIGEST_RE.fullmatch(payload[field]):
             raise ValueError(f"{field} must be a ghcr.io/enclava-labs digest-pinned ref")
     if not payload["trustee_kbs_url"].startswith("https://"):
         raise ValueError("trustee_kbs_url must be https")

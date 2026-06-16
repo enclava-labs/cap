@@ -309,7 +309,11 @@ fn certificate_cache_key(
 
 fn csr_public_key_sha256(csr_der: &[u8]) -> Result<Vec<u8>, String> {
     let csr = CertReq::from_der(csr_der).map_err(|err| err.to_string())?;
-    let public_key_der = csr.info.public_key.to_der().map_err(|err| err.to_string())?;
+    let public_key_der = csr
+        .info
+        .public_key
+        .to_der()
+        .map_err(|err| err.to_string())?;
     Ok(Sha256::digest(public_key_der).to_vec())
 }
 

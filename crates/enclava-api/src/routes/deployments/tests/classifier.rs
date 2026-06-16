@@ -208,12 +208,13 @@ fn signed_deploy_required_when_policy_signing_boundary_is_configured() {
 #[test]
 fn signed_deploy_hash_validation_uses_local_artifact_delivery_mode() {
     let mut cfg = attestation_config();
-    cfg.trustee_policy_read_available = true;
+    cfg.trustee_policy_read_available = false;
     cfg.workload_artifacts_url = Some("https://api.example.test/workload-artifacts".into());
     cfg.trustee_policy_url = Some("https://kbs.example.test/resource-policy/body".into());
 
     select_local_signed_artifact_delivery(&mut cfg);
 
+    assert!(cfg.trustee_policy_read_available);
     assert_eq!(cfg.local_workload_artifacts_json.as_deref(), Some("{}"));
     assert_eq!(cfg.local_trustee_policy_json.as_deref(), Some("{}"));
 }

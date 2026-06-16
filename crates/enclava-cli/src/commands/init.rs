@@ -151,10 +151,25 @@ jobs:
           sbom-path: sbom.spdx.json
           push-to-registry: true
 
-      - name: Print manual deploy image
+      - name: Write Enclava image artifact
         run: |
+          image_ref="${{{{ env.REGISTRY }}}}/${{{{ env.IMAGE_NAME }}}}@${{{{ steps.build.outputs.digest }}}}"
+          jq -n \
+            --arg image_ref "$image_ref" \
+            --arg image "${{{{ env.REGISTRY }}}}/${{{{ env.IMAGE_NAME }}}}" \
+            --arg digest "${{{{ steps.build.outputs.digest }}}}" \
+            --arg signer_subject "${{{{ github.server_url }}}}/${{{{ github.workflow_ref }}}}" \
+            --arg signer_issuer "https://token.actions.githubusercontent.com" \
+            '{{image_ref:$image_ref,image:$image,digest:$digest,signer_subject:$signer_subject,signer_issuer:$signer_issuer}}' \
+            > enclava-image.json
           echo "Deploy manually with:"
-          echo "enclava deploy --image ${{{{ env.REGISTRY }}}}/${{{{ env.IMAGE_NAME }}}}@${{{{ steps.build.outputs.digest }}}}"
+          echo "enclava deploy --image-file enclava-image.json"
+
+      - name: Upload Enclava image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enclava-image
+          path: enclava-image.json
 "#
     )
 }
@@ -283,7 +298,10 @@ mod tests {
         assert!(workflow.contains("cosign"));
         assert!(workflow.contains("attest-build-provenance"));
         assert!(workflow.contains("sbom-action"));
-        assert!(workflow.contains("enclava deploy --image"));
+        assert!(workflow.contains("enclava-image.json"));
+        assert!(workflow.contains("actions/upload-artifact@v4"));
+        assert!(workflow.contains("enclava deploy --image-file enclava-image.json"));
+        assert!(!workflow.contains("enclava deploy --image "));
         assert!(!workflow.contains("ENCLAVA_API_KEY"));
     }
 }

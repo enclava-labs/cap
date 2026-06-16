@@ -247,6 +247,22 @@ pub async fn verify_image(
     image_digest: &str,
     policy: &VerificationPolicy,
 ) -> Result<VerifiedSignature, CosignError> {
+    if env_flag("SKIP_COSIGN_VERIFY") {
+        tracing::warn!(
+            image_ref = %image_ref,
+            image_digest = %image_digest,
+            "SKIP_COSIGN_VERIFY: workload image verification bypassed (debug only)"
+        );
+        let (signer_subject, signer_issuer, _) = extract_signer_metadata(&[], policy);
+        return Ok(VerifiedSignature {
+            digest: image_digest.to_string(),
+            signer_subject,
+            signer_issuer,
+            verified_at: Utc::now(),
+            rekor_log_index: None,
+        });
+    }
+
     let trust_root = load_trust_root().await?;
 
     let image: OciReference = image_ref
@@ -846,6 +862,34 @@ mod tests {
             build_constraints(&policy),
             Err(CosignError::InvalidPolicy(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn verify_image_respects_debug_skip_cosign_verify() {
+        let _env = EnvGuard::new(&["SKIP_COSIGN_VERIFY"]);
+        unsafe {
+            std::env::set_var("SKIP_COSIGN_VERIFY", "1");
+        }
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let verified = verify_image(
+            "ghcr.io/example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            digest,
+            &url_policy(),
+        )
+        .await
+        .expect("debug cosign skip should not query registry");
+
+        assert_eq!(verified.digest, digest);
+        assert_eq!(
+            verified.signer_subject.as_deref(),
+            Some("https://github.com/example/repo/.github/workflows/build.yml@refs/heads/main")
+        );
+        assert_eq!(
+            verified.signer_issuer.as_deref(),
+            Some("https://token.actions.githubusercontent.com")
+        );
+        assert_eq!(verified.rekor_log_index, None);
     }
 
     #[test]

@@ -475,3 +475,54 @@ fn parse_config_inputs_reads_values_from_files() {
         ]
     );
 }
+
+#[test]
+fn deploy_image_input_reads_ci_artifact_image_ref() {
+    let temp = tempfile::tempdir().unwrap();
+    let artifact = temp.path().join("enclava-image.json");
+    std::fs::write(
+        &artifact,
+        r#"{
+          "image_ref": "ghcr.io/acme/api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "digest": "sha256:ignored"
+        }"#,
+    )
+    .unwrap();
+
+    let image = resolve_deploy_image_input(None, Some(&artifact)).unwrap();
+
+    assert_eq!(
+        image,
+        "ghcr.io/acme/api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+}
+
+#[test]
+fn deploy_image_input_combines_ci_artifact_image_and_digest() {
+    let temp = tempfile::tempdir().unwrap();
+    let artifact = temp.path().join("enclava-image.json");
+    std::fs::write(
+        &artifact,
+        r#"{
+          "image": "ghcr.io/acme/api",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }"#,
+    )
+    .unwrap();
+
+    let image = resolve_deploy_image_input(None, Some(&artifact)).unwrap();
+
+    assert_eq!(
+        image,
+        "ghcr.io/acme/api@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+}
+
+#[test]
+fn deploy_image_input_rejects_missing_image_source() {
+    let err = resolve_deploy_image_input(None, None)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("--image or --image-file"));
+}

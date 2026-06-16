@@ -74,11 +74,8 @@ pub fn provision_static_tls_certificate(
         );
     }
 
-    let key_pair = load_or_generate_key_with_owner(
-        &key_path,
-        owner_seed,
-        &cfg.tls_certificate_hostnames,
-    )?;
+    let key_pair =
+        load_or_generate_key_with_owner(&key_path, owner_seed, &cfg.tls_certificate_hostnames)?;
     let csr_der = build_csr_der(&cfg.tls_certificate_hostnames, &key_pair)?;
     let token = trustee_verify::resolve_kbs_attestation_token(
         std::env::var("KBS_ATTESTATION_TOKEN").ok().as_deref(),
@@ -409,8 +406,7 @@ hkdf-info = "tls-state-luks-key"
         let hosts = vec!["app.example.test".to_string()];
         let owner = crate::secrets::OwnerSeed([0x42; 32]);
 
-        load_or_generate_key_with_owner(&key_path(first_dir.path()), Some(&owner), &hosts)
-            .unwrap();
+        load_or_generate_key_with_owner(&key_path(first_dir.path()), Some(&owner), &hosts).unwrap();
         load_or_generate_key_with_owner(&key_path(second_dir.path()), Some(&owner), &hosts)
             .unwrap();
 
