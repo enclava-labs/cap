@@ -2,7 +2,7 @@ use enclava_engine::apply::types::DeployPhase;
 use enclava_engine::apply::watch::{
     PodSnapshot, classify_pod_phase, kata_start_error_needs_pod_recreate,
     plan_kata_start_error_pod_recreates, plan_stale_terminating_pod_force_deletes,
-    plan_unready_running_pod_recreates, pod_label_selector,
+    plan_unready_running_pod_recreates, pod_is_stale_rollout_revision, pod_label_selector,
     stale_terminating_pod_needs_force_delete, unready_running_pod_needs_recreate,
 };
 use k8s_openapi::api::core::v1::{
@@ -11,6 +11,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use k8s_openapi::jiff::Timestamp;
+use std::collections::BTreeMap;
 
 #[test]
 fn pending_pod_maps_to_pods_scheduled_or_tee_booting() {
@@ -89,6 +90,39 @@ fn unknown_phase_maps_to_tee_booting() {
 #[test]
 fn pod_label_selector_matches_generated_statefulset_labels() {
     assert_eq!(pod_label_selector("my-app"), "app=my-app");
+}
+
+#[test]
+fn old_revision_pods_are_stale_during_statefulset_rollout() {
+    let old_pod = Pod {
+        metadata: ObjectMeta {
+            labels: Some(BTreeMap::from([(
+                "controller-revision-hash".to_string(),
+                "enclava-go-prod-260616a-5f9fd9468".to_string(),
+            )])),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let new_pod = Pod {
+        metadata: ObjectMeta {
+            labels: Some(BTreeMap::from([(
+                "controller-revision-hash".to_string(),
+                "enclava-go-prod-260616a-8698979588".to_string(),
+            )])),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    assert!(pod_is_stale_rollout_revision(
+        &old_pod,
+        Some("enclava-go-prod-260616a-8698979588")
+    ));
+    assert!(!pod_is_stale_rollout_revision(
+        &new_pod,
+        Some("enclava-go-prod-260616a-8698979588")
+    ));
 }
 
 #[test]

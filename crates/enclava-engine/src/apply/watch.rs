@@ -14,6 +14,18 @@ pub fn pod_label_selector(statefulset_name: &str) -> String {
     format!("app={statefulset_name}")
 }
 
+pub fn pod_is_stale_rollout_revision(pod: &Pod, update_revision: Option<&str>) -> bool {
+    let Some(update_revision) = update_revision.filter(|revision| !revision.is_empty()) else {
+        return false;
+    };
+    let Some(labels) = pod.metadata.labels.as_ref() else {
+        return false;
+    };
+    labels
+        .get("controller-revision-hash")
+        .is_some_and(|pod_revision| pod_revision != update_revision)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KataPodRecreatePlan {
     pub pod_name: String,
@@ -421,6 +433,7 @@ pub async fn watch_rollout(
         let ready = sts_status.and_then(|s| s.ready_replicas).unwrap_or(0);
         let current = sts_status.and_then(|s| s.current_replicas).unwrap_or(0);
         let updated = sts_status.and_then(|s| s.updated_replicas).unwrap_or(0);
+        let update_revision = sts_status.and_then(|s| s.update_revision.as_deref());
 
         if observed_generation >= generation
             && ready >= desired
@@ -490,6 +503,17 @@ pub async fn watch_rollout(
         }
 
         for pod in &pods.items {
+            if pod_is_stale_rollout_revision(pod, update_revision) {
+                tracing::info!(
+                    namespace = %namespace,
+                    statefulset = %statefulset_name,
+                    pod = %pod.metadata.name.as_deref().unwrap_or("<unknown>"),
+                    update_revision = ?update_revision,
+                    "ignoring pod from previous StatefulSet revision during rollout"
+                );
+                continue;
+            }
+
             let snap = PodSnapshot::from_pod(pod);
             let phase = classify_pod_phase(&snap);
 
