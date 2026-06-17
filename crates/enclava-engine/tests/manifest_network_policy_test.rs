@@ -41,6 +41,30 @@ fn network_policy_ingress_allows_envoy_gateway() {
 }
 
 #[test]
+fn network_policy_ingress_allows_cap_api_attestation_claims() {
+    let mut app = sample_app();
+    app.attestation.tls_certificate_broker_url = Some(
+        "http://cap-api.enclava-preprod.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
+            .to_string(),
+    );
+    let val = generate_network_policy(&app);
+    let ingress = val["spec"]["ingress"].as_array().unwrap();
+
+    let cap_api_rule = ingress
+        .iter()
+        .find(|rule| {
+            rule["fromEndpoints"][0]["matchLabels"]["io.kubernetes.pod.namespace"].as_str()
+                == Some("enclava-preprod")
+                && rule["fromEndpoints"][0]["matchLabels"]["app.kubernetes.io/name"].as_str()
+                    == Some("cap-api")
+        })
+        .expect("CAP API attestation ingress rule");
+
+    assert_eq!(cap_api_rule["toPorts"][0]["ports"][0]["port"], "8443");
+    assert_eq!(cap_api_rule["toPorts"][0]["ports"][0]["protocol"], "TCP");
+}
+
+#[test]
 fn network_policy_egress_has_dns() {
     let app = sample_app();
     let val = generate_network_policy(&app);

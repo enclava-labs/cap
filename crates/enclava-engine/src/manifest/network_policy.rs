@@ -12,6 +12,25 @@ use crate::types::{ConfidentialApp, EgressRule};
 /// The platform-default allowlist (DNS, KBS, ACME) is always present; per-app
 /// `egress_allowlist` adds on top.
 pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
+    let mut ingress = vec![json!({
+        "fromEndpoints": [
+            {
+                "matchLabels": {
+                    "io.kubernetes.pod.namespace": &app.namespace
+                }
+            },
+            {
+                "matchLabels": {
+                    "io.kubernetes.pod.namespace": "tenant-envoy",
+                    "app.kubernetes.io/name": "envoy"
+                }
+            }
+        ]
+    })];
+    if let Some(rule) = cap_api_attestation_ingress_rule(app) {
+        ingress.push(rule);
+    }
+
     let mut egress = vec![
         // Rule: DNS to kube-dns
         json!({
@@ -107,23 +126,7 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
         "spec": {
             "description": "Strict network isolation for confidential workload",
             "endpointSelector": {},
-            "ingress": [
-                {
-                    "fromEndpoints": [
-                        {
-                            "matchLabels": {
-                                "io.kubernetes.pod.namespace": &app.namespace
-                            }
-                        },
-                        {
-                            "matchLabels": {
-                                "io.kubernetes.pod.namespace": "tenant-envoy",
-                                "app.kubernetes.io/name": "envoy"
-                            }
-                        }
-                    ]
-                }
-            ],
+            "ingress": ingress,
             "egress": egress,
         }
     })
@@ -206,6 +209,34 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
         "toFQDNs": [{ "matchName": host }],
         "toPorts": [{ "ports": [{ "port": port.to_string(), "protocol": "TCP" }] }],
     })]
+}
+
+fn cap_api_attestation_ingress_rule(app: &ConfidentialApp) -> Option<Value> {
+    let url = app.attestation.tls_certificate_broker_url.as_deref()?;
+    let authority = url_authority(url)?;
+    let host = host_from_authority(authority)?;
+    let (service_name, namespace) = kubernetes_service_name(host)?;
+    if service_name != "cap-api" {
+        return None;
+    }
+
+    Some(json!({
+        "fromEndpoints": [
+            {
+                "matchLabels": {
+                    "io.kubernetes.pod.namespace": namespace,
+                    "app.kubernetes.io/name": "cap-api"
+                }
+            }
+        ],
+        "toPorts": [
+            {
+                "ports": [
+                    { "port": "8443", "protocol": "TCP" }
+                ]
+            }
+        ]
+    }))
 }
 
 fn url_host(url: &str) -> Option<&str> {
