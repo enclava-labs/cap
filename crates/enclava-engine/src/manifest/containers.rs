@@ -118,6 +118,53 @@ fn ownership_mode_str(mode: UnlockMode) -> &'static str {
     }
 }
 
+fn required_config_keys_from_primary(app: &ConfidentialApp) -> Option<String> {
+    let primary = app.primary_container()?;
+    if let Some(value) = primary.env.get("ENCLAVA_REQUIRED_CONFIG_KEYS") {
+        if let Some(keys) = normalize_required_config_keys(value) {
+            return Some(keys);
+        }
+    }
+    primary
+        .command
+        .as_ref()?
+        .iter()
+        .find_map(|arg| required_config_keys_from_arg(arg))
+}
+
+fn required_config_keys_from_arg(arg: &str) -> Option<String> {
+    const PREFIX: &str = "ENCLAVA_REQUIRED_CONFIG_KEYS=";
+    let value = arg.split_once(PREFIX)?.1;
+    let value = value
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('"')
+        .trim_matches('\'');
+    normalize_required_config_keys(value)
+}
+
+fn normalize_required_config_keys(value: &str) -> Option<String> {
+    let keys = value
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    if keys.is_empty() || keys.iter().any(|key| !is_valid_config_key(key)) {
+        return None;
+    }
+    Some(keys.join(","))
+}
+
+fn is_valid_config_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 fn env(name: &str, value: &str) -> EnvVar {
     EnvVar {
         name: name.to_string(),
@@ -673,6 +720,9 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("KBS_FETCH_MAX_SLEEP_SECONDS", "10"),
         env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
     ];
+    if let Some(keys) = required_config_keys_from_primary(app) {
+        env_vars.push(env("CAP_CONFIG_REQUIRED_KEYS", &keys));
+    }
     if !legacy {
         env_vars.push(env("ENCLAVA_CONTAINER_NAME", "attestation-proxy"));
         env_vars.push(env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"));

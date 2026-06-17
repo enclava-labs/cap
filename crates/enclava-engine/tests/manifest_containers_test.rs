@@ -455,6 +455,29 @@ fn proxy_container_uses_luks_state_root_for_config_storage() {
     );
 }
 
+#[test]
+fn proxy_container_receives_workload_required_config_keys() {
+    let mut app = sample_app();
+    app.containers[0].command = Some(vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "ENCLAVA_REQUIRED_CONFIG_KEYS=ADMIN_EMAIL,ADMIN_PASSWORD exec /usr/local/bin/app"
+            .to_string(),
+    ]);
+
+    let c = build_attestation_proxy_container(&app);
+    let env = c.env.as_ref().unwrap();
+
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "CAP_CONFIG_REQUIRED_KEYS")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("ADMIN_EMAIL,ADMIN_PASSWORD")
+    );
+}
+
 // === Caddy ===
 
 #[test]
