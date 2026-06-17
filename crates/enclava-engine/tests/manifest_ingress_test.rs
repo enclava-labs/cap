@@ -66,6 +66,22 @@ fn caddyfile_has_well_known_confidential_routes() {
 }
 
 #[test]
+fn caddyfile_handles_confidential_cors_preflight() {
+    let app = sample_app();
+    let cm = generate_ingress_configmap(&app);
+    let data = cm.data.as_ref().unwrap();
+    let caddyfile = data.get("Caddyfile").unwrap();
+
+    assert!(caddyfile.contains("@confidential_preflight"));
+    assert!(caddyfile.contains("method OPTIONS"));
+    assert!(caddyfile.contains("Access-Control-Allow-Origin \"*\""));
+    assert!(
+        caddyfile.contains("Access-Control-Allow-Headers \"Authorization, Content-Type, Accept\"")
+    );
+    assert!(caddyfile.contains("respond \"\" 204"));
+}
+
+#[test]
 fn caddyfile_has_unlock_route() {
     let app = sample_app();
     let cm = generate_ingress_configmap(&app);

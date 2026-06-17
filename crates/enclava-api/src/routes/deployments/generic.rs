@@ -215,6 +215,29 @@ pub async fn create_generic_deployment(
 ) -> Result<(StatusCode, Json<GenericDeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     validate_external_id(body.external_id.as_deref())?;
+    let managed_template_signing = body.security.managed_template_signing;
+    if managed_template_signing
+        && auth.management_origin != crate::auth::middleware::ManagementOrigin::PaasInternal
+    {
+        return Err(json_error(
+            StatusCode::FORBIDDEN,
+            "managed_template_signing is only available through PaaS internal deployments",
+        ));
+    }
+    let org_id = auth.org_id;
+    let user_id = auth.user_id;
+    let managed_bootstrap_pubkey_hash = if managed_template_signing {
+        Some(
+            crate::managed_template_signing::managed_template_bootstrap_pubkey_hash(
+                &state.signing_key,
+                user_id,
+                org_id,
+                &body.app.name,
+            ),
+        )
+    } else {
+        None
+    };
 
     validate_source_context(
         body.source.provider,
@@ -238,7 +261,7 @@ pub async fn create_generic_deployment(
 
     let app = match fetch_app_by_name(&state, auth.org_id, &body.app.name).await? {
         Some(app) => {
-            ensure_generic_app_metadata(
+            let app = ensure_generic_app_metadata(
                 &state,
                 app,
                 body.source.provider,
@@ -246,13 +269,24 @@ pub async fn create_generic_deployment(
                 &body.signing.subject,
                 &body.signing.issuer,
             )
-            .await?
+            .await?;
+            if let Some(expected) = managed_bootstrap_pubkey_hash.as_deref()
+                && app.bootstrap_owner_pubkey_hash != expected
+            {
+                return Err(json_error(
+                    StatusCode::CONFLICT,
+                    "existing app was not created with the managed template bootstrap identity",
+                ));
+            }
+            app
         }
         None if body.app.create_if_missing => {
             let create = crate::routes::apps::CreateAppRequest {
                 name: body.app.name.clone(),
                 unlock_mode: body.app.unlock_mode.clone(),
-                bootstrap_pubkey_hash: body.app.bootstrap_pubkey_hash.clone(),
+                bootstrap_pubkey_hash: managed_bootstrap_pubkey_hash
+                    .clone()
+                    .or_else(|| body.app.bootstrap_pubkey_hash.clone()),
                 signer_identity_subject: Some(body.signing.subject.clone()),
                 signer_identity_issuer: Some(body.signing.issuer.clone()),
                 source_provider: Some(body.source.provider),
@@ -279,12 +313,6 @@ pub async fn create_generic_deployment(
 
     let mut security = body.security;
     if security.managed_template_signing {
-        if auth.management_origin != crate::auth::middleware::ManagementOrigin::PaasInternal {
-            return Err(json_error(
-                StatusCode::FORBIDDEN,
-                "managed_template_signing is only available through PaaS internal deployments",
-            ));
-        }
         if security.customer_descriptor_blob.is_some()
             || security.org_keyring_blob.is_some()
             || security.signed_policy_artifact.is_some()
@@ -355,7 +383,6 @@ pub async fn create_generic_deployment(
         org_keyring_blob: security.org_keyring_blob,
         signed_policy_artifact: security.signed_policy_artifact,
     };
-    let org_id = auth.org_id;
     let (status, Json(deployed)) = deploy(
         auth,
         State(state.clone()),
@@ -367,6 +394,11 @@ pub async fn create_generic_deployment(
     let (deployment, app) = fetch_deployment_with_app(&state, org_id, deployed.deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    if managed_template_signing {
+        crate::managed_template_signing::claim_managed_template_ownership(&state, &app, user_id)
+            .await
+            .map_err(managed_template_signing_error_response)?;
+    }
 
     Ok((
         status,
@@ -387,7 +419,8 @@ fn managed_template_signing_error_response(
         ManagedTemplateSigningError::Db(_)
         | ManagedTemplateSigningError::Serde(_)
         | ManagedTemplateSigningError::PlatformRelease(_)
-        | ManagedTemplateSigningError::Deploy(_) => {
+        | ManagedTemplateSigningError::Deploy(_)
+        | ManagedTemplateSigningError::Tee(_) => {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
         }
     }

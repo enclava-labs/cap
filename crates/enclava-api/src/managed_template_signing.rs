@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use enclava_cli::{
     descriptor::{
@@ -15,9 +16,12 @@ use enclava_engine::{
         WorkloadArtifactBinding,
     },
 };
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::time::Duration;
+use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 use crate::{
@@ -38,6 +42,8 @@ pub enum ManagedTemplateSigningError {
     SigningService(#[from] crate::signing_service::SigningServiceError),
     #[error("deploy spec error: {0}")]
     Deploy(#[from] crate::deploy::DeployError),
+    #[error("TEE ownership claim error: {0}")]
+    Tee(String),
 }
 
 pub struct ManagedTemplateSigningInput {
@@ -55,6 +61,50 @@ pub struct ManagedTemplateSigningInput {
 pub struct ManagedTemplateSigningArtifacts {
     pub customer_descriptor_blob: String,
     pub org_keyring_blob: String,
+}
+
+pub fn managed_template_bootstrap_pubkey_hash(
+    api_signing_key: &ed25519_dalek::SigningKey,
+    user_id: Uuid,
+    org_id: Uuid,
+    app_name: &str,
+) -> String {
+    let key = managed_template_bootstrap_key(api_signing_key, user_id, org_id, app_name);
+    hex::encode(Sha256::digest(key.public.to_bytes()))
+}
+
+pub async fn claim_managed_template_ownership(
+    state: &AppState,
+    app: &App,
+    user_id: Uuid,
+) -> Result<(), ManagedTemplateSigningError> {
+    let tee_domain = app.tee_domain.as_deref().ok_or_else(|| {
+        ManagedTemplateSigningError::Validation(
+            "managed template ownership claim requires a TEE domain".into(),
+        )
+    })?;
+    let tee_url = format!("https://{tee_domain}/.well-known/confidential");
+    let bootstrap_key =
+        managed_template_bootstrap_key(&state.signing_key, user_id, app.org_id, &app.name);
+    let password = random_managed_template_claim_password();
+    let deadline = Instant::now() + Duration::from_secs(600);
+    let mut last_error = None;
+
+    loop {
+        match claim_managed_template_ownership_once(&tee_url, &bootstrap_key, &password).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    return Err(ManagedTemplateSigningError::Tee(match last_error {
+                        Some(previous) => format!("{previous}; latest: {err}"),
+                        None => err,
+                    }));
+                }
+                last_error = Some(err);
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
 }
 
 pub async fn build_managed_template_signing_artifacts(
@@ -240,6 +290,69 @@ fn managed_owner_key(
     hasher.update(org_id.as_bytes());
     let seed: [u8; 32] = hasher.finalize().into();
     UserSigningKey::from_seed(user_id, seed)
+}
+
+fn managed_template_bootstrap_key(
+    api_signing_key: &ed25519_dalek::SigningKey,
+    user_id: Uuid,
+    org_id: Uuid,
+    app_name: &str,
+) -> UserSigningKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"enclava-paas-managed-template-bootstrap-v1");
+    hasher.update(api_signing_key.to_bytes());
+    hasher.update(org_id.as_bytes());
+    hasher.update(app_name.as_bytes());
+    let seed: [u8; 32] = hasher.finalize().into();
+    UserSigningKey::from_seed(user_id, seed)
+}
+
+fn random_managed_template_claim_password() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    format!("ecg_{}Aa1", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+async fn claim_managed_template_ownership_once(
+    tee_url: &str,
+    bootstrap_key: &UserSigningKey,
+    password: &str,
+) -> Result<(), String> {
+    let tee = enclava_cli::tee_client::TeeClient::new_for_ownership(tee_url);
+    let (_attestation, tee) = tee
+        .attest_receipt_key()
+        .await
+        .map_err(|err| format!("attestation failed: {err}"))?;
+    if tee
+        .claim_state_is_successful()
+        .await
+        .map_err(|err| format!("status check failed: {err}"))?
+    {
+        return Ok(());
+    }
+    let challenge = tee
+        .bootstrap_challenge()
+        .await
+        .map_err(|err| format!("bootstrap challenge failed: {err}"))?;
+    let challenge_bytes = URL_SAFE_NO_PAD
+        .decode(challenge.nonce.as_bytes())
+        .map_err(|err| format!("invalid bootstrap challenge encoding: {err}"))?;
+    let signature = bootstrap_key.sign(&challenge_bytes);
+    let bootstrap_pubkey = URL_SAFE_NO_PAD.encode(bootstrap_key.public.to_bytes());
+    let signature = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    match tee
+        .bootstrap_claim(&challenge.nonce, &bootstrap_pubkey, &signature, password)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if tee.claim_state_is_successful().await.unwrap_or(false) {
+                Ok(())
+            } else {
+                Err(format!("bootstrap claim failed: {err}"))
+            }
+        }
+    }
 }
 
 fn confidential_app_for_template_hash(
@@ -484,5 +597,21 @@ mod tests {
 
         assert_eq!(first.public.to_bytes(), second.public.to_bytes());
         assert_ne!(first.public.to_bytes(), other.public.to_bytes());
+    }
+
+    #[test]
+    fn managed_template_bootstrap_hash_is_stable_per_org_app() {
+        let api_key = SigningKey::from_bytes(&[7; 32]);
+        let user_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let org_id = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+
+        let first = managed_template_bootstrap_pubkey_hash(&api_key, user_id, org_id, "mini-prod");
+        let second = managed_template_bootstrap_pubkey_hash(&api_key, user_id, org_id, "mini-prod");
+        let other = managed_template_bootstrap_pubkey_hash(&api_key, user_id, org_id, "mini-dev");
+
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 }

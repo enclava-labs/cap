@@ -1,5 +1,5 @@
 use super::{
-    CreateAppRequest, RotateSignerRequest, SignerRotationTokenRequest, create_app,
+    CreateAppRequest, RotateSignerRequest, SignerRotationTokenRequest, create_app, derive_identity,
     issue_signer_rotation_token_route, list_apps, normalize_health_config,
     workload_teardown_instance_id,
 };
@@ -44,6 +44,21 @@ fn create_request_accepts_cli_health_fields() {
 fn create_request_rejects_unsafe_health_path() {
     let err = normalize_health_config(Some("/v1/info;bad"), Some(30), Some(5)).unwrap_err();
     assert!(err.contains("invalid HTTP path"));
+}
+
+#[test]
+fn auto_unlock_identity_uses_supplied_bootstrap_hash_when_present() {
+    let app_id = uuid::Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+    let bootstrap_hash = "ab".repeat(32);
+
+    let (_tenant_id, _instance_id, _namespace, _service_account, pubkey_hash, identity_hash) =
+        derive_identity("tenant", app_id, "mini-prod", "auto", Some(&bootstrap_hash)).unwrap();
+
+    assert_eq!(pubkey_hash, bootstrap_hash);
+    assert_eq!(
+        identity_hash,
+        enclava_common::crypto::compute_identity_hash("tenant", "tenant-aaaaaaaa", &bootstrap_hash,)
+    );
 }
 
 #[test]

@@ -258,7 +258,21 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     out.push_str("    reverse_proxy 127.0.0.1:8081\n");
     out.push_str("  }\n");
     out.push_str("  @confidential path /.well-known/confidential/*\n");
+    out.push_str("  @confidential_preflight {\n");
+    out.push_str("    method OPTIONS\n");
+    out.push_str("    path /.well-known/confidential/*\n");
+    out.push_str("  }\n");
+    out.push_str("  handle @confidential_preflight {\n");
+    out.push_str("    header Access-Control-Allow-Origin \"*\"\n");
+    out.push_str("    header Access-Control-Allow-Methods \"GET, POST, PUT, DELETE, OPTIONS\"\n");
+    out.push_str(
+        "    header Access-Control-Allow-Headers \"Authorization, Content-Type, Accept\"\n",
+    );
+    out.push_str("    header Access-Control-Max-Age \"600\"\n");
+    out.push_str("    respond \"\" 204\n");
+    out.push_str("  }\n");
     out.push_str("  handle @confidential {\n");
+    out.push_str("    header Access-Control-Allow-Origin \"*\"\n");
     out.push_str("    reverse_proxy 127.0.0.1:8081\n");
     out.push_str("  }\n");
     out.push_str("  handle /health {\n");

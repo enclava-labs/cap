@@ -470,11 +470,18 @@ pub(crate) fn derive_identity(
             hash.to_lowercase()
         }
         "auto" => {
-            // Platform generates Ed25519 keypair for auto-unlock apps
-            let keypair = SigningKey::generate(&mut OsRng);
-            let pubkey_bytes = keypair.verifying_key().to_bytes();
-            let hash = Sha256::digest(pubkey_bytes);
-            hex::encode(hash)
+            if let Some(hash) = user_pubkey_hash {
+                if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err("bootstrap_pubkey_hash must be 64 hex characters".to_string());
+                }
+                hash.to_lowercase()
+            } else {
+                // Platform generates Ed25519 keypair for auto-unlock apps.
+                let keypair = SigningKey::generate(&mut OsRng);
+                let pubkey_bytes = keypair.verifying_key().to_bytes();
+                let hash = Sha256::digest(pubkey_bytes);
+                hex::encode(hash)
+            }
         }
         _ => return Err(format!("invalid unlock_mode: {}", unlock_mode)),
     };
