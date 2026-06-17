@@ -395,9 +395,26 @@ pub async fn create_generic_deployment(
         .await?
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     if managed_template_signing {
-        crate::managed_template_signing::claim_managed_template_ownership(&state, &app, user_id)
+        let claim_state = state.clone();
+        let claim_app = app.clone();
+        tokio::spawn(async move {
+            if let Err(error) = crate::managed_template_signing::claim_managed_template_ownership(
+                &claim_state,
+                &claim_app,
+                user_id,
+            )
             .await
-            .map_err(managed_template_signing_error_response)?;
+            {
+                tracing::warn!(
+                    %error,
+                    org_id = %claim_app.org_id,
+                    app_id = %claim_app.id,
+                    app_name = %claim_app.name,
+                    user_id = %user_id,
+                    "managed template ownership claim failed"
+                );
+            }
+        });
     }
 
     Ok((
