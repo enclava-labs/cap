@@ -76,6 +76,8 @@ struct SignedPolicyArtifactRow {
 }
 
 const KBS_POLICY_CONFIGMAP_VALUE_SOFT_LIMIT: usize = 850_000;
+const SIGNED_POLICY_RECONCILE_DEPLOY_STATUSES: &[&str] =
+    &["pending", "applying", "watching", "healthy", "failed"];
 
 pub async fn ensure_owner_binding(
     db: &PgPool,
@@ -283,7 +285,7 @@ pub async fn reconcile_signed_policy_artifacts(
                    ) AS rn
             FROM workload_artifacts wa
             JOIN deployments d ON d.id = wa.deploy_id AND d.app_id = wa.app_id
-            WHERE d.status::text IN ('pending', 'applying', 'watching', 'healthy')
+            WHERE d.status::text = ANY($2)
         )
         SELECT signed_policy_artifact
         FROM ranked
@@ -292,6 +294,7 @@ pub async fn reconcile_signed_policy_artifacts(
         "#,
     )
     .bind(config.signed_policy_retention)
+    .bind(SIGNED_POLICY_RECONCILE_DEPLOY_STATUSES)
     .fetch_all(db)
     .await?;
 
@@ -902,5 +905,14 @@ owner_resource_bindings := {}
             parsed["artifacts"].as_array().unwrap().len() < artifacts.len(),
             "oversized artifact sets should be trimmed before patching KBS"
         );
+    }
+
+    #[test]
+    fn signed_policy_reconciliation_keeps_failed_deployments_for_recovery() {
+        assert!(
+            SIGNED_POLICY_RECONCILE_DEPLOY_STATUSES.contains(&"failed"),
+            "failed deployments can still have live pods/PVCs that need their signed policy artifact to restart and unlock"
+        );
+        assert!(!SIGNED_POLICY_RECONCILE_DEPLOY_STATUSES.contains(&"rolled_back"));
     }
 }
