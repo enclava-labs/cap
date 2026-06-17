@@ -66,6 +66,22 @@ fn caddyfile_has_well_known_confidential_routes() {
 }
 
 #[test]
+fn caddyfile_routes_confidential_config_to_attested_tls_listener() {
+    let app = sample_app();
+    let cm = generate_ingress_configmap(&app);
+    let data = cm.data.as_ref().unwrap();
+    let caddyfile = data.get("Caddyfile").unwrap();
+
+    assert!(caddyfile.contains("@confidential_config"));
+    assert!(
+        caddyfile
+            .contains("path /.well-known/confidential/config /.well-known/confidential/config/*")
+    );
+    assert!(caddyfile.contains("reverse_proxy https://127.0.0.1:8443"));
+    assert!(caddyfile.contains("tls_insecure_skip_verify"));
+}
+
+#[test]
 fn caddyfile_handles_confidential_cors_preflight() {
     let app = sample_app();
     let cm = generate_ingress_configmap(&app);

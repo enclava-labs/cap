@@ -271,6 +271,17 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     out.push_str("    header Access-Control-Max-Age \"600\"\n");
     out.push_str("    respond \"\" 204\n");
     out.push_str("  }\n");
+    out.push_str(
+        "  @confidential_config path /.well-known/confidential/config /.well-known/confidential/config/*\n",
+    );
+    out.push_str("  handle @confidential_config {\n");
+    out.push_str("    header Access-Control-Allow-Origin \"*\"\n");
+    out.push_str("    reverse_proxy https://127.0.0.1:8443 {\n");
+    out.push_str("      transport http {\n");
+    out.push_str("        tls_insecure_skip_verify\n");
+    out.push_str("      }\n");
+    out.push_str("    }\n");
+    out.push_str("  }\n");
     out.push_str("  handle @confidential {\n");
     out.push_str("    header Access-Control-Allow-Origin \"*\"\n");
     out.push_str("    reverse_proxy 127.0.0.1:8081\n");
