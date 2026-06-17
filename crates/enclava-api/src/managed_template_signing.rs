@@ -99,7 +99,7 @@ pub async fn build_managed_template_signing_artifacts(
     let api_signing_pubkey = public_key_base64(&state.signing_key);
     let org_slug = org_slug(&state.db, input.app.org_id).await?;
 
-    let deployer_key = UserSigningKey::generate(input.user_id);
+    let deployer_key = managed_owner_key(&state.signing_key, input.user_id, input.app.org_id);
     let keyring_version = next_keyring_version(&state.db, input.app.org_id).await?;
     let now = Utc::now();
     let keyring = single_member_keyring(
@@ -114,6 +114,13 @@ pub async fn build_managed_template_signing_artifacts(
         enclava_cli::keyring::canonical_keyring_bytes(&keyring_envelope.keyring),
     )
     .into();
+    persist_managed_keyring(&state.db, input.user_id, &deployer_key, &keyring_envelope).await?;
+    signing_service
+        .bootstrap_org(&crate::signing_service::BootstrapOrgRequest {
+            org_id: input.app.org_id,
+            owner_pubkey_hex: hex::encode(deployer_key.public.to_bytes()),
+        })
+        .await?;
 
     let identity_hash = parse_hex32(
         "tenant_instance_identity_hash",
@@ -210,7 +217,6 @@ pub async fn build_managed_template_signing_artifacts(
     let rendered_policy = render_trustee_policy(&release.policy_template_text, &descriptor)?;
     descriptor.expected_kbs_policy_hash = Sha256::digest(rendered_policy.as_bytes()).into();
 
-    persist_managed_keyring(&state.db, input.user_id, &deployer_key, &keyring_envelope).await?;
     let descriptor_envelope = enclava_cli::descriptor::sign(
         &deployer_key,
         descriptor,
@@ -221,6 +227,19 @@ pub async fn build_managed_template_signing_artifacts(
         customer_descriptor_blob: serde_json::to_string(&descriptor_envelope)?,
         org_keyring_blob: serde_json::to_string(&keyring_envelope)?,
     })
+}
+
+fn managed_owner_key(
+    api_signing_key: &ed25519_dalek::SigningKey,
+    user_id: Uuid,
+    org_id: Uuid,
+) -> UserSigningKey {
+    let mut hasher = Sha256::new();
+    hasher.update(b"enclava-paas-managed-template-owner-v1");
+    hasher.update(api_signing_key.to_bytes());
+    hasher.update(org_id.as_bytes());
+    let seed: [u8; 32] = hasher.finalize().into();
+    UserSigningKey::from_seed(user_id, seed)
 }
 
 fn confidential_app_for_template_hash(
@@ -445,4 +464,25 @@ fn render_trustee_policy(
         ));
     }
     Ok(rendered)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn managed_owner_key_is_stable_per_org() {
+        let api_key = SigningKey::from_bytes(&[7; 32]);
+        let user_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
+        let org_id = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap();
+        let other_org_id = Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap();
+
+        let first = managed_owner_key(&api_key, user_id, org_id);
+        let second = managed_owner_key(&api_key, user_id, org_id);
+        let other = managed_owner_key(&api_key, user_id, other_org_id);
+
+        assert_eq!(first.public.to_bytes(), second.public.to_bytes());
+        assert_ne!(first.public.to_bytes(), other.public.to_bytes());
+    }
 }
