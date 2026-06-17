@@ -323,17 +323,25 @@ async fn claim_managed_template_ownership_once(
         .attest_receipt_key()
         .await
         .map_err(|err| format!("attestation failed: {err}"))?;
-    if tee
-        .claim_state_is_successful()
+
+    let status = tee
+        .status_json()
         .await
-        .map_err(|err| format!("status check failed: {err}"))?
-    {
+        .map_err(|err| format!("status check failed: {err}"))?;
+    if managed_template_runtime_ready(&status) {
         return Ok(());
     }
-    let challenge = tee
-        .bootstrap_challenge()
-        .await
-        .map_err(|err| format!("bootstrap challenge failed: {err}"))?;
+    if managed_template_storage_is_claimed(&status) {
+        return complete_managed_template_unlock(&tee, password).await;
+    }
+
+    let challenge = match tee.bootstrap_challenge().await {
+        Ok(challenge) => challenge,
+        Err(err) if tee_error_is_already_claimed(&err) => {
+            return complete_managed_template_unlock(&tee, password).await;
+        }
+        Err(err) => return Err(format!("bootstrap challenge failed: {err}")),
+    };
     let challenge_bytes = URL_SAFE_NO_PAD
         .decode(challenge.nonce.as_bytes())
         .map_err(|err| format!("invalid bootstrap challenge encoding: {err}"))?;
@@ -344,15 +352,111 @@ async fn claim_managed_template_ownership_once(
         .bootstrap_claim(&challenge.nonce, &bootstrap_pubkey, &signature, password)
         .await
     {
-        Ok(_) => Ok(()),
+        Ok(_) => complete_managed_template_unlock(&tee, password).await,
         Err(err) => {
-            if tee.claim_state_is_successful().await.unwrap_or(false) {
-                Ok(())
+            let claimed = tee
+                .status_json()
+                .await
+                .map(|status| managed_template_storage_is_claimed(&status))
+                .unwrap_or(false)
+                || tee.claim_state_is_successful().await.unwrap_or(false);
+            if claimed {
+                complete_managed_template_unlock(&tee, password).await
             } else {
                 Err(format!("bootstrap claim failed: {err}"))
             }
         }
     }
+}
+
+async fn complete_managed_template_unlock(
+    tee: &enclava_cli::tee_client::TeeClient,
+    password: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let mut unlock_requested = false;
+    let mut auto_unlock_requested = false;
+
+    loop {
+        let status = tee
+            .status_json()
+            .await
+            .map_err(|err| format!("status check failed: {err}"))?;
+        if managed_template_runtime_ready(&status) {
+            return Ok(());
+        }
+
+        match managed_template_unlock_state(&status) {
+            "unlocked" => {
+                if !auto_unlock_requested {
+                    tee.enable_auto_unlock(password)
+                        .await
+                        .map_err(|err| format!("enable auto-unlock failed: {err}"))?;
+                    auto_unlock_requested = true;
+                }
+            }
+            "locked" => {
+                if !unlock_requested {
+                    tee.unlock(password)
+                        .await
+                        .map_err(|err| format!("unlock failed: {err}"))?;
+                    unlock_requested = true;
+                }
+            }
+            "error" => {
+                let detail = status
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("TEE ownership unlock failed");
+                return Err(detail.to_string());
+            }
+            "unclaimed" => return Err("TEE ownership remains unclaimed".to_string()),
+            _ => {}
+        }
+
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for managed template auto-unlock; latest status: {status}"
+            ));
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn managed_template_runtime_ready(status: &serde_json::Value) -> bool {
+    managed_template_unlock_state(status) == "unlocked"
+        && status
+            .get("auto_unlock_enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+}
+
+fn managed_template_storage_is_claimed(status: &serde_json::Value) -> bool {
+    matches!(
+        status
+            .get("ownership_state")
+            .and_then(|value| value.as_str()),
+        Some("claimed")
+    ) || matches!(managed_template_unlock_state(status), "locked" | "unlocked")
+}
+
+fn managed_template_unlock_state(status: &serde_json::Value) -> &str {
+    status
+        .get("unlock_state")
+        .or_else(|| status.get("state"))
+        .or_else(|| status.get("ownership_state"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+}
+
+fn tee_error_is_already_claimed(err: &enclava_cli::tee_client::TeeError) -> bool {
+    matches!(
+        err,
+        enclava_cli::tee_client::TeeError::Tee {
+            status: 409,
+            message
+        } if message.contains("already_claimed")
+    )
 }
 
 fn confidential_app_for_template_hash(
@@ -613,5 +717,28 @@ mod tests {
         assert_ne!(first, other);
         assert_eq!(first.len(), 64);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn managed_template_legacy_locked_state_is_claimed_but_not_ready() {
+        let status = serde_json::json!({
+            "state": "locked",
+            "auto_unlock_enabled": false
+        });
+
+        assert!(managed_template_storage_is_claimed(&status));
+        assert!(!managed_template_runtime_ready(&status));
+    }
+
+    #[test]
+    fn managed_template_runtime_requires_unlocked_auto_unlock() {
+        assert!(!managed_template_runtime_ready(&serde_json::json!({
+            "state": "unlocked",
+            "auto_unlock_enabled": false
+        })));
+        assert!(managed_template_runtime_ready(&serde_json::json!({
+            "state": "unlocked",
+            "auto_unlock_enabled": true
+        })));
     }
 }
