@@ -28,6 +28,8 @@ use crate::{
     auth::jwt::public_key_base64, models::App, platform_release::PlatformRelease, state::AppState,
 };
 
+const MANAGED_TEMPLATE_TEE_SERVICE_PORT: u16 = 8081;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ManagedTemplateSigningError {
     #[error("{0}")]
@@ -84,6 +86,7 @@ pub async fn claim_managed_template_ownership(
         )
     })?;
     let tee_url = format!("https://{tee_domain}/.well-known/confidential");
+    let tee_connect_override = managed_template_tee_connect_override(app);
     let bootstrap_key =
         managed_template_bootstrap_key(&state.signing_key, user_id, app.org_id, &app.name);
     let password = random_managed_template_claim_password();
@@ -91,7 +94,16 @@ pub async fn claim_managed_template_ownership(
     let mut last_error = None;
 
     loop {
-        match claim_managed_template_ownership_once(&tee_url, &bootstrap_key, &password).await {
+        match claim_managed_template_ownership_once(
+            &tee_url,
+            tee_connect_override
+                .as_ref()
+                .map(|(host, port)| (host.as_str(), *port)),
+            &bootstrap_key,
+            &password,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(err) => {
                 if Instant::now() >= deadline {
@@ -307,6 +319,16 @@ fn managed_template_bootstrap_key(
     UserSigningKey::from_seed(user_id, seed)
 }
 
+fn managed_template_tee_connect_override(app: &App) -> Option<(String, u16)> {
+    if app.name.trim().is_empty() || app.namespace.trim().is_empty() {
+        return None;
+    }
+    Some((
+        format!("{}.{}.svc.cluster.local", app.name, app.namespace),
+        MANAGED_TEMPLATE_TEE_SERVICE_PORT,
+    ))
+}
+
 fn random_managed_template_claim_password() -> String {
     let mut bytes = [0_u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -315,10 +337,18 @@ fn random_managed_template_claim_password() -> String {
 
 async fn claim_managed_template_ownership_once(
     tee_url: &str,
+    connect_override: Option<(&str, u16)>,
     bootstrap_key: &UserSigningKey,
     password: &str,
 ) -> Result<(), String> {
-    let tee = enclava_cli::tee_client::TeeClient::new_for_ownership(tee_url);
+    let tee = match connect_override {
+        Some((host, port)) => {
+            enclava_cli::tee_client::TeeClient::new_for_ownership_with_connect_override(
+                tee_url, host, port,
+            )
+        }
+        None => enclava_cli::tee_client::TeeClient::new_for_ownership(tee_url),
+    };
     let (_attestation, tee) = tee
         .attest_receipt_key()
         .await
@@ -717,6 +747,47 @@ mod tests {
         assert_ne!(first, other);
         assert_eq!(first.len(), 64);
         assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn managed_template_tee_connect_override_targets_workload_service() {
+        let app = App {
+            id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            name: "mini-prod".to_string(),
+            namespace: "cap-tenant-mini-prod".to_string(),
+            instance_id: "mini-prod".to_string(),
+            tenant_id: "tenant".to_string(),
+            service_account: "cap-mini-prod-sa".to_string(),
+            bootstrap_owner_pubkey_hash: "00".repeat(32),
+            tenant_instance_identity_hash: "11".repeat(32),
+            unlock_mode: crate::models::UnlockMode::Auto,
+            domain: "mini-prod.tenant.enclava.dev".to_string(),
+            tee_domain: Some("mini-prod.tenant.tee.enclava.dev".to_string()),
+            custom_domain: None,
+            status: crate::models::AppStatus::Running,
+            signer_identity_subject: None,
+            signer_identity_issuer: None,
+            signer_identity_set_at: None,
+            source_provider: None,
+            source_repository: None,
+            egress_allowlist: serde_json::json!([]),
+            health_path: "/livez".to_string(),
+            health_interval_seconds: 30,
+            health_timeout_seconds: 10,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+
+        let target = managed_template_tee_connect_override(&app);
+
+        assert_eq!(
+            target,
+            Some((
+                "mini-prod.cap-tenant-mini-prod.svc.cluster.local".to_string(),
+                8081
+            ))
+        );
     }
 
     #[test]

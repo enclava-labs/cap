@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 use base64::{
     Engine as _,
@@ -13,7 +13,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use serde::Deserialize;
 use sev::parser::ByteParser;
 use sha2::{Digest, Sha256};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use tokio_rustls::TlsConnector;
 use x509_cert::der::{Decode, Encode};
 
@@ -33,6 +33,41 @@ pub struct TeeClient {
     confidential_base_url: String,
     http: reqwest::Client,
     timeout: std::time::Duration,
+    connect_override: Option<TeeConnectOverride>,
+}
+
+#[derive(Clone, Debug)]
+struct TeeConnectOverride {
+    host: String,
+    port: u16,
+}
+
+impl TeeConnectOverride {
+    fn new(host: &str, port: u16) -> Self {
+        Self {
+            host: host.to_string(),
+            port,
+        }
+    }
+
+    async fn socket_addrs(&self) -> Result<Vec<SocketAddr>, TeeError> {
+        let addrs: Vec<SocketAddr> = lookup_host((self.host.as_str(), self.port))
+            .await
+            .map_err(|err| {
+                TeeError::Attestation(format!(
+                    "TEE connect override lookup failed for {}:{}: {err}",
+                    self.host, self.port
+                ))
+            })?
+            .collect();
+        if addrs.is_empty() {
+            return Err(TeeError::Attestation(format!(
+                "TEE connect override lookup returned no addresses for {}:{}",
+                self.host, self.port
+            )));
+        }
+        Ok(addrs)
+    }
 }
 
 fn accepts_invalid_tee_certs() -> bool {
@@ -42,6 +77,16 @@ fn accepts_invalid_tee_certs() -> bool {
         || std::env::var("ENCLAVA_TEE_ACCEPT_INVALID_CERTS")
             .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
             .unwrap_or(false)
+}
+
+fn confidential_base_url_with_port(base_url: &str, port: u16) -> String {
+    let Ok(mut url) = reqwest::Url::parse(base_url) else {
+        return base_url.to_string();
+    };
+    if url.set_port(Some(port)).is_err() {
+        return base_url.to_string();
+    }
+    url.to_string().trim_end_matches('/').to_string()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -144,8 +189,30 @@ impl TeeClient {
         )
     }
 
+    /// Create a TEE ownership client that preserves the public TEE domain for
+    /// SNI and attestation while dialing a private network endpoint.
+    pub fn new_for_ownership_with_connect_override(
+        app_domain: &str,
+        connect_host: &str,
+        connect_port: u16,
+    ) -> Self {
+        Self::new_with_timeout_and_connect_override(
+            app_domain,
+            std::time::Duration::from_secs(OWNERSHIP_TEE_REQUEST_TIMEOUT_SECONDS),
+            Some(TeeConnectOverride::new(connect_host, connect_port)),
+        )
+    }
+
     /// Create a TEE client with a custom request timeout.
     pub fn new_with_timeout(app_domain: &str, timeout: std::time::Duration) -> Self {
+        Self::new_with_timeout_and_connect_override(app_domain, timeout, None)
+    }
+
+    fn new_with_timeout_and_connect_override(
+        app_domain: &str,
+        timeout: std::time::Duration,
+        connect_override: Option<TeeConnectOverride>,
+    ) -> Self {
         let accept_invalid_certs = accepts_invalid_tee_certs();
         let http = reqwest::Client::builder()
             .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
@@ -165,11 +232,16 @@ impl TeeClient {
         } else {
             format!("{base_url}/.well-known/confidential")
         };
+        let confidential_base_url = match &connect_override {
+            Some(connect) => confidential_base_url_with_port(&confidential_base_url, connect.port),
+            None => confidential_base_url,
+        };
 
         Self {
             confidential_base_url,
             http,
             timeout,
+            connect_override,
         }
     }
 
@@ -184,11 +256,17 @@ impl TeeClient {
             confidential_base_url: self.confidential_base_url.clone(),
             http,
             timeout: self.timeout,
+            connect_override: self.connect_override.clone(),
         }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.confidential_base_url, path)
+    }
+
+    #[cfg(test)]
+    fn logical_host_for_attestation(&self) -> Result<String, TeeError> {
+        Ok(EndpointParts::parse(&self.confidential_base_url)?.host)
     }
 
     async fn check_response(&self, resp: reqwest::Response) -> Result<reqwest::Response, TeeError> {
@@ -413,9 +491,24 @@ impl TeeClient {
         &self,
     ) -> Result<(TransitionReceiptAttestation, TeeClient), TeeError> {
         let endpoint = EndpointParts::parse(&self.confidential_base_url)?;
-        let leaf_spki_der = fetch_tls_leaf_spki_der(&endpoint.host, endpoint.port).await?;
+        let leaf_spki_der = fetch_tls_leaf_spki_der(
+            &endpoint.host,
+            endpoint.port,
+            self.connect_override.as_ref(),
+        )
+        .await?;
         let leaf_spki_sha256: [u8; 32] = Sha256::digest(&leaf_spki_der).into();
-        let pinned_http = build_spki_pinned_client(leaf_spki_sha256, self.timeout)?;
+        let connect_addrs = match &self.connect_override {
+            Some(connect) => Some(connect.socket_addrs().await?),
+            None => None,
+        };
+        let pinned_http = build_spki_pinned_client(
+            leaf_spki_sha256,
+            self.timeout,
+            connect_addrs
+                .as_deref()
+                .map(|addrs| (endpoint.host.as_str(), addrs)),
+        )?;
 
         let mut nonce = [0u8; 32];
         OsRng.fill_bytes(&mut nonce);

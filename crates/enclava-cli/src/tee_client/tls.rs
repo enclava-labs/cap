@@ -77,6 +77,7 @@ impl ServerCertVerifier for SpkiPinnedVerifier {
 pub(super) fn build_spki_pinned_client(
     expected_spki_sha256: [u8; 32],
     timeout: std::time::Duration,
+    resolve_override: Option<(&str, &[SocketAddr])>,
 ) -> Result<reqwest::Client, TeeError> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let algorithms = provider.signature_verification_algorithms;
@@ -89,13 +90,15 @@ pub(super) fn build_spki_pinned_client(
             algorithms,
         }))
         .with_no_client_auth();
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
         .timeout(timeout)
         .https_only(true)
-        .use_preconfigured_tls(tls)
-        .build()
-        .map_err(TeeError::Http)
+        .use_preconfigured_tls(tls);
+    if let Some((domain, addrs)) = resolve_override {
+        builder = builder.resolve_to_addrs(domain, addrs);
+    }
+    builder.build().map_err(TeeError::Http)
 }
 
 #[derive(Debug)]
@@ -138,7 +141,11 @@ impl ServerCertVerifier for NoVerifier {
     }
 }
 
-pub(super) async fn fetch_tls_leaf_spki_der(host: &str, port: u16) -> Result<Vec<u8>, TeeError> {
+pub(super) async fn fetch_tls_leaf_spki_der(
+    host: &str,
+    port: u16,
+    connect_override: Option<&TeeConnectOverride>,
+) -> Result<Vec<u8>, TeeError> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let algorithms = provider.signature_verification_algorithms;
     let tls = ClientConfig::builder_with_provider(Arc::new(provider))
@@ -148,7 +155,10 @@ pub(super) async fn fetch_tls_leaf_spki_der(host: &str, port: u16) -> Result<Vec
         .with_custom_certificate_verifier(Arc::new(NoVerifier { algorithms }))
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(tls));
-    let stream = TcpStream::connect((host, port))
+    let (connect_host, connect_port) = connect_override
+        .map(|connect| (connect.host.as_str(), connect.port))
+        .unwrap_or((host, port));
+    let stream = TcpStream::connect((connect_host, connect_port))
         .await
         .map_err(|err| TeeError::Attestation(format!("TEE TCP connect failed: {err}")))?;
     let server_name = ServerName::try_from(host.to_string())

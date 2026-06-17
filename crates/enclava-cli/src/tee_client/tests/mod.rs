@@ -46,6 +46,24 @@ fn ownership_client_timeout_covers_live_rollout_budget() {
 }
 
 #[test]
+fn ownership_connect_override_preserves_public_tee_domain() {
+    let tee = TeeClient::new_for_ownership_with_connect_override(
+        "https://app.tenant.tee.enclava.dev/.well-known/confidential",
+        "app.cap-tenant-app.svc.cluster.local",
+        8081,
+    );
+
+    assert_eq!(
+        tee.url("/status"),
+        "https://app.tenant.tee.enclava.dev:8081/.well-known/confidential/status"
+    );
+    assert_eq!(
+        tee.logical_host_for_attestation().unwrap(),
+        "app.tenant.tee.enclava.dev"
+    );
+}
+
+#[test]
 fn challenge_response_accepts_live_proxy_shape() {
     let parsed: super::ChallengeResponse = serde_json::from_value(serde_json::json!({
         "challenge": "abc",
