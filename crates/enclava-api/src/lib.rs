@@ -9,6 +9,7 @@ pub mod edge;
 pub mod entitlements;
 pub mod env_gates;
 pub mod kbs;
+pub mod managed_template_signing;
 pub mod models;
 pub mod platform_release;
 pub mod ratelimit;

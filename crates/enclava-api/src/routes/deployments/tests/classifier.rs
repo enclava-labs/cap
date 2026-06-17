@@ -94,6 +94,9 @@ fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
                     .to_string(),
                 container_name: Some("app".to_string()),
                 resources: None,
+                command: Vec::new(),
+                port: None,
+                storage_paths: Vec::new(),
             },
             signing: GenericDeploymentSigning {
                 subject: "https://github.com/acme/confidential-app/.github/workflows/build.yml@refs/heads/main"

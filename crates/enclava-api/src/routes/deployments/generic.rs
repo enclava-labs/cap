@@ -48,6 +48,12 @@ pub struct GenericDeploymentWorkload {
     pub container_name: Option<String>,
     #[serde(default)]
     pub resources: Option<DeployResources>,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub storage_paths: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +70,8 @@ pub struct GenericDeploymentSecurity {
     pub org_keyring_blob: Option<String>,
     #[serde(default)]
     pub signed_policy_artifact: Option<String>,
+    #[serde(default)]
+    pub managed_template_signing: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -269,6 +277,73 @@ pub async fn create_generic_deployment(
         }
     };
 
+    let mut security = body.security;
+    if security.managed_template_signing {
+        if auth.management_origin != crate::auth::middleware::ManagementOrigin::PaasInternal {
+            return Err(json_error(
+                StatusCode::FORBIDDEN,
+                "managed_template_signing is only available through PaaS internal deployments",
+            ));
+        }
+        if security.customer_descriptor_blob.is_some()
+            || security.org_keyring_blob.is_some()
+            || security.signed_policy_artifact.is_some()
+        {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "managed_template_signing cannot be combined with caller-supplied signing artifacts",
+            ));
+        }
+        let port = body.workload.port.ok_or_else(|| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "workload.port is required for managed_template_signing",
+            )
+        })?;
+        let resources = body.workload.resources.clone().ok_or_else(|| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "workload.resources is required for managed_template_signing",
+            )
+        })?;
+        let cpu = resources.cpu.clone().ok_or_else(|| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "workload.resources.cpu is required for managed_template_signing",
+            )
+        })?;
+        let memory = resources.memory.clone().ok_or_else(|| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "workload.resources.memory is required for managed_template_signing",
+            )
+        })?;
+        let artifacts = crate::managed_template_signing::build_managed_template_signing_artifacts(
+            &state,
+            crate::managed_template_signing::ManagedTemplateSigningInput {
+                app: app.clone(),
+                user_id: auth.user_id,
+                image: body.workload.image.clone(),
+                container_name: body
+                    .workload
+                    .container_name
+                    .clone()
+                    .unwrap_or_else(|| "web".to_string()),
+                command: body.workload.command.clone(),
+                port,
+                storage_paths: body.workload.storage_paths.clone(),
+                cpu,
+                memory,
+            },
+        )
+        .await
+        .map_err(managed_template_signing_error_response)?;
+        security.customer_descriptor_blob = Some(artifacts.customer_descriptor_blob);
+        security.org_keyring_blob = Some(artifacts.org_keyring_blob);
+    }
+
+    let generic_workload =
+        generic_workload_snapshot(&body.workload, security.managed_template_signing);
     let deploy_request = DeployRequest {
         image: body.workload.image,
         container_name: body.workload.container_name,
@@ -276,9 +351,9 @@ pub async fn create_generic_deployment(
         external_id: body.external_id,
         source_provider: Some(body.source.provider),
         source_repository: Some(body.source.repository),
-        customer_descriptor_blob: body.security.customer_descriptor_blob,
-        org_keyring_blob: body.security.org_keyring_blob,
-        signed_policy_artifact: body.security.signed_policy_artifact,
+        customer_descriptor_blob: security.customer_descriptor_blob,
+        org_keyring_blob: security.org_keyring_blob,
+        signed_policy_artifact: security.signed_policy_artifact,
     };
     let org_id = auth.org_id;
     let (status, Json(deployed)) = deploy(
@@ -288,6 +363,7 @@ pub async fn create_generic_deployment(
         Json(deploy_request),
     )
     .await?;
+    annotate_generic_deployment_snapshot(&state, deployed.deployment_id, generic_workload).await?;
     let (deployment, app) = fetch_deployment_with_app(&state, org_id, deployed.deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
@@ -296,6 +372,25 @@ pub async fn create_generic_deployment(
         status,
         Json(GenericDeploymentResponse::from_deployment(deployment, &app)),
     ))
+}
+
+fn managed_template_signing_error_response(
+    error: crate::managed_template_signing::ManagedTemplateSigningError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::managed_template_signing::ManagedTemplateSigningError;
+
+    match error {
+        ManagedTemplateSigningError::Validation(message) => {
+            json_error(StatusCode::BAD_REQUEST, message)
+        }
+        ManagedTemplateSigningError::SigningService(error) => signing_error_response(error),
+        ManagedTemplateSigningError::Db(_)
+        | ManagedTemplateSigningError::Serde(_)
+        | ManagedTemplateSigningError::PlatformRelease(_)
+        | ManagedTemplateSigningError::Deploy(_) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+        }
+    }
 }
 
 /// GET /deployments/{deployment_id} -- generic deployment status/details.
@@ -487,6 +582,17 @@ pub(super) fn ensure_idempotent_retry_matches(
     if existing_resources != requested_resources {
         return Err(idempotency_conflict("workload.resources"));
     }
+    let requested_generic =
+        generic_workload_snapshot(&body.workload, body.security.managed_template_signing);
+    match deployment.spec_snapshot.get("generic_workload") {
+        Some(existing_generic) if existing_generic != &requested_generic => {
+            return Err(idempotency_conflict("generic_workload"));
+        }
+        None if requested_generic != default_generic_workload_snapshot() => {
+            return Err(idempotency_conflict("generic_workload"));
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -495,6 +601,45 @@ fn idempotency_conflict(field: &'static str) -> (StatusCode, Json<serde_json::Va
         StatusCode::CONFLICT,
         format!("external_id already exists with different {field}"),
     )
+}
+
+fn default_generic_workload_snapshot() -> serde_json::Value {
+    serde_json::json!({
+        "command": [],
+        "port": null,
+        "storage_paths": [],
+        "managed_template_signing": false,
+    })
+}
+
+fn generic_workload_snapshot(
+    workload: &GenericDeploymentWorkload,
+    managed_template_signing: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "command": workload.command,
+        "port": workload.port,
+        "storage_paths": workload.storage_paths,
+        "managed_template_signing": managed_template_signing,
+    })
+}
+
+async fn annotate_generic_deployment_snapshot(
+    state: &AppState,
+    deployment_id: Uuid,
+    generic_workload: serde_json::Value,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    sqlx::query(
+        "UPDATE deployments
+            SET spec_snapshot = spec_snapshot || jsonb_build_object('generic_workload', $2::jsonb)
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .bind(generic_workload)
+    .execute(&state.db)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    Ok(())
 }
 
 async fn ensure_generic_app_metadata(

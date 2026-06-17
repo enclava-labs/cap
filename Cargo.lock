@@ -1522,6 +1522,7 @@ dependencies = [
  "chrono",
  "data-encoding",
  "ed25519-dalek",
+ "enclava-cli",
  "enclava-common",
  "enclava-engine",
  "futures",
