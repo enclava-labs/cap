@@ -310,11 +310,16 @@ fn idempotent_retry_requires_same_deployment_payload() {
     let app = idempotency_app();
     let deployment = idempotency_deployment(&app);
 
-    ensure_idempotent_retry_matches(&deployment, &app, &idempotency_request(&app.name)).unwrap();
+    ensure_idempotent_retry_matches(&deployment, &app, &idempotency_request(&app.name), false)
+        .unwrap();
 
-    let err =
-        ensure_idempotent_retry_matches(&deployment, &app, &idempotency_request("different-app"))
-            .unwrap_err();
+    let err = ensure_idempotent_retry_matches(
+        &deployment,
+        &app,
+        &idempotency_request("different-app"),
+        false,
+    )
+    .unwrap_err();
 
     assert_eq!(err.0, StatusCode::CONFLICT);
     assert_eq!(

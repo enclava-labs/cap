@@ -1401,7 +1401,7 @@ async fn paas_internal_generic_deployment_recovers_stuck_idempotency_from_extern
     .await
     .expect("insert recovered deployment");
 
-    let request_body = generic_deployment_body(
+    let mut request_body = generic_deployment_body(
         &external_id,
         &app_name,
         "github",
@@ -1410,6 +1410,10 @@ async fn paas_internal_generic_deployment_recovers_stuck_idempotency_from_extern
         github_signer_subject(),
         github_signer_issuer(),
     );
+    request_body["workload"]["command"] = serde_json::json!(["/bin/sh", "-c", "exec /app/start"]);
+    request_body["workload"]["port"] = serde_json::json!(8080);
+    request_body["workload"]["storage_paths"] = serde_json::json!(["/state/app-data"]);
+    request_body["security"] = serde_json::json!({ "managed_template_signing": true });
     let request_hash = Sha256::digest(
         serde_json::to_vec(&serde_json::json!({
             "cap_user_id": cap_user_id,

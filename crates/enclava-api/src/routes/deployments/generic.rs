@@ -149,7 +149,13 @@ pub(crate) async fn recover_generic_deployment_by_external_id(
     else {
         return Ok(None);
     };
-    ensure_idempotent_retry_matches(&deployment, &app, body)?;
+    let requested_generic =
+        generic_workload_snapshot(&body.workload, body.security.managed_template_signing);
+    let missing_generic = deployment.spec_snapshot.get("generic_workload").is_none();
+    ensure_idempotent_retry_matches(&deployment, &app, body, true)?;
+    if missing_generic && requested_generic != default_generic_workload_snapshot() {
+        annotate_generic_deployment_snapshot(state, deployment.id, requested_generic).await?;
+    }
     Ok(Some(GenericDeploymentResponse::from_deployment(
         deployment, &app,
     )))
@@ -272,7 +278,7 @@ pub async fn create_generic_deployment(
         && let Some((deployment, app)) =
             fetch_deployment_by_external_id(&state, auth.org_id, external_id).await?
     {
-        ensure_idempotent_retry_matches(&deployment, &app, &body)?;
+        ensure_idempotent_retry_matches(&deployment, &app, &body, false)?;
         return Ok((
             StatusCode::OK,
             Json(GenericDeploymentResponse::from_deployment(deployment, &app)),
@@ -600,6 +606,7 @@ pub(super) fn ensure_idempotent_retry_matches(
     deployment: &Deployment,
     app: &App,
     body: &GenericDeploymentRequest,
+    allow_missing_generic_workload: bool,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if app.name != body.app.name {
         return Err(idempotency_conflict("app.name"));
@@ -658,7 +665,9 @@ pub(super) fn ensure_idempotent_retry_matches(
         Some(existing_generic) if existing_generic != &requested_generic => {
             return Err(idempotency_conflict("generic_workload"));
         }
-        None if requested_generic != default_generic_workload_snapshot() => {
+        None if requested_generic != default_generic_workload_snapshot()
+            && !allow_missing_generic_workload =>
+        {
             return Err(idempotency_conflict("generic_workload"));
         }
         _ => {}
