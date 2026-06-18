@@ -62,6 +62,10 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
 fn internal_routes() -> Router<AppState> {
     Router::new()
         .route(
+            "/internal/kbs/signed-policy/reconcile",
+            axum::routing::post(routes::internal::reconcile_signed_policy_artifacts),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}",
             axum::routing::put(routes::internal::upsert_paas_org),
         )

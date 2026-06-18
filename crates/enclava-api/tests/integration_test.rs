@@ -608,6 +608,31 @@ async fn standalone_cap_does_not_mount_paas_internal_routes() {
     .await;
 
     response.assert_status(StatusCode::NOT_FOUND);
+
+    let response = add_internal_headers(
+        server.post("/internal/kbs/signed-policy/reconcile"),
+        "standalone-kbs-reconcile-check",
+    )
+    .await;
+
+    response.assert_status(StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn paas_managed_signed_policy_reconcile_route_fails_closed_without_kbs_config() {
+    let (state, _pool) = setup_paas_managed_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    let response = add_internal_headers(
+        server.post("/internal/kbs/signed-policy/reconcile"),
+        "kbs-reconcile-no-config",
+    )
+    .await;
+
+    response.assert_status(StatusCode::BAD_GATEWAY);
+    let body: Value = response.json();
+    assert_eq!(body["error"], "signed policy reconciliation failed");
 }
 
 #[tokio::test]

@@ -170,6 +170,24 @@ pub struct InternalListResponse {
     pub items: Vec<serde_json::Value>,
 }
 
+pub async fn reconcile_signed_policy_artifacts(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::kbs::reconcile_signed_policy_artifacts(&state.db, state.kbs_policy.as_ref(), None)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "signed policy reconciliation failed",
+                    "message": error.to_string(),
+                })),
+            )
+        })?;
+    Ok(Json(serde_json::json!({"status": "reconciled"})))
+}
+
 fn default_active_status() -> String {
     "active".to_string()
 }
@@ -1884,5 +1902,23 @@ mod tests {
             created_at,
             created_at + chrono::Duration::seconds(STALE_IDEMPOTENCY_RECOVERY_AFTER_SECONDS),
         ));
+    }
+
+    #[tokio::test]
+    async fn signed_policy_reconcile_fails_closed_without_kbs_config() {
+        let state = crate::test_support::lazy_state();
+        let result = reconcile_signed_policy_artifacts(
+            InternalAuth {
+                client_san: "spiffe://paas.example.test/enclava-paas".to_string(),
+            },
+            State(state),
+        )
+        .await;
+
+        let Err((status, Json(body))) = result else {
+            panic!("reconcile should fail when KBS policy config is absent");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "signed policy reconciliation failed");
     }
 }
