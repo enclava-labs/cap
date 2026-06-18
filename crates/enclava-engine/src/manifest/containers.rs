@@ -478,6 +478,9 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
             env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "10001"),
             env("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", &wait_containers),
+            env("KBS_FETCH_RETRIES", "120"),
+            env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
+            env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
         ]),
         volume_mounts: Some(vec![
             VolumeMount {

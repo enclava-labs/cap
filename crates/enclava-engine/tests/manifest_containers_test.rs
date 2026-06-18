@@ -724,6 +724,30 @@ fn enclava_init_container_waits_for_workloads_and_marks_ready_file() {
             .as_deref(),
         Some("10001")
     );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "KBS_FETCH_RETRIES")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("120")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "KBS_FETCH_RETRY_SLEEP_SECONDS")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "KBS_FETCH_REQUEST_TIMEOUT_SECONDS")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("10")
+    );
     assert!(c.startup_probe.is_none());
     let probe = c.readiness_probe.as_ref().unwrap();
     let command = probe.exec.as_ref().unwrap().command.as_ref().unwrap();
