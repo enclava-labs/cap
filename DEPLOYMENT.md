@@ -97,6 +97,8 @@ Required only when the matching feature is enabled:
 | `ACME_DIRECTORY_URL` | tenant Caddy ACME CA | ACME directory for the DNS-01 broker. |
 | `ACME_ACCOUNT_CREDENTIALS_PATH` | unset | Optional persisted ACME account credentials path. |
 | `ACME_DNS_PROPAGATION_SECONDS` | `30` | DNS propagation wait used by the broker. |
+| `ACME_DNS_LOOKUP_PREFER_SYSTEM` | `false` | Set to `true` to check DNS-01 TXT propagation with the pod's system resolver before falling back to Cloudflare public DNS. |
+| `ACME_DNS_LOOKUP_TIMEOUT_SECONDS` | `10` | Per-resolver TXT lookup timeout used during DNS-01 propagation checks. |
 
 Debug-only flags rejected by release builds:
 

@@ -15,7 +15,7 @@ use instant_acme::{
     NewOrder, OrderStatus, RetryPolicy,
 };
 
-const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct AcmeConfig {
@@ -261,7 +261,22 @@ async fn wait_for_txt_record(
 }
 
 async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
-    match lookup_txt_external(name).await {
+    let timeout = dns_lookup_timeout_from_env();
+    if prefer_system_dns_lookup() {
+        return match lookup_txt_system(name, timeout).await {
+            Ok(values) => Ok(values),
+            Err(err) => {
+                tracing::warn!(
+                    record = %name,
+                    error = %err,
+                    "system DNS lookup failed; falling back to external resolver"
+                );
+                lookup_txt_external(name, timeout).await
+            }
+        };
+    }
+
+    match lookup_txt_external(name, timeout).await {
         Ok(values) => Ok(values),
         Err(err) => {
             tracing::warn!(
@@ -269,12 +284,12 @@ async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
                 error = %err,
                 "external DNS lookup failed; falling back to system resolver"
             );
-            lookup_txt_system(name).await
+            lookup_txt_system(name, timeout).await
         }
     }
 }
 
-async fn lookup_txt_external(name: &str) -> Result<Vec<String>, String> {
+async fn lookup_txt_external(name: &str, timeout: Duration) -> Result<Vec<String>, String> {
     let resolver = TokioResolver::builder_with_config(
         ResolverConfig::udp_and_tcp(&CLOUDFLARE),
         TokioRuntimeProvider::default(),
@@ -282,28 +297,45 @@ async fn lookup_txt_external(name: &str) -> Result<Vec<String>, String> {
     .with_options(ResolverOpts::default())
     .build()
     .map_err(|e| e.to_string())?;
-    let response = dns_lookup_with_timeout(
-        "external",
-        name,
-        DNS_LOOKUP_TIMEOUT,
-        resolver.txt_lookup(name),
-    )
-    .await?;
+    let response =
+        dns_lookup_with_timeout("external", name, timeout, resolver.txt_lookup(name)).await?;
     collect_txt_values(response)
 }
 
-async fn lookup_txt_system(name: &str) -> Result<Vec<String>, String> {
+async fn lookup_txt_system(name: &str, timeout: Duration) -> Result<Vec<String>, String> {
     let resolver = TokioResolver::builder_tokio()
         .and_then(|builder| builder.build())
         .map_err(|e| e.to_string())?;
-    let response = dns_lookup_with_timeout(
-        "system",
-        name,
-        DNS_LOOKUP_TIMEOUT,
-        resolver.txt_lookup(name),
-    )
-    .await?;
+    let response =
+        dns_lookup_with_timeout("system", name, timeout, resolver.txt_lookup(name)).await?;
     collect_txt_values(response)
+}
+
+fn dns_lookup_timeout_from_env() -> Duration {
+    std::env::var("ACME_DNS_LOOKUP_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| parse_dns_lookup_timeout(&value))
+        .unwrap_or(DEFAULT_DNS_LOOKUP_TIMEOUT)
+}
+
+fn parse_dns_lookup_timeout(value: &str) -> Option<Duration> {
+    let seconds = value.trim().parse::<u64>().ok()?;
+    if seconds == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(seconds))
+}
+
+fn prefer_system_dns_lookup() -> bool {
+    let value = std::env::var("ACME_DNS_LOOKUP_PREFER_SYSTEM").ok();
+    prefer_system_dns_from_env_value(value.as_deref())
+}
+
+fn prefer_system_dns_from_env_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
 }
 
 async fn dns_lookup_with_timeout<T, E, F>(
@@ -441,6 +473,44 @@ mod tests {
             lookup.contains("external DNS lookup failed; falling back to system resolver"),
             "ACME DNS-01 TXT fallback should log external resolver failures for live diagnosis"
         );
+    }
+
+    #[test]
+    fn dns01_txt_lookup_can_prefer_system_resolver() {
+        let source = include_str!("acme.rs");
+        let lookup = source
+            .split("async fn lookup_txt")
+            .nth(1)
+            .expect("lookup_txt function");
+
+        assert!(
+            source.contains("ACME_DNS_LOOKUP_PREFER_SYSTEM")
+                && lookup.contains("prefer_system_dns_lookup()"),
+            "ACME DNS-01 TXT lookup should allow system-first resolver preference"
+        );
+        assert!(
+            lookup.contains("system DNS lookup failed; falling back to external resolver"),
+            "system-first DNS mode should keep external resolver fallback"
+        );
+    }
+
+    #[test]
+    fn dns_lookup_timeout_env_parsing_rejects_zero() {
+        assert_eq!(
+            super::parse_dns_lookup_timeout("2"),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(super::parse_dns_lookup_timeout("0"), None);
+        assert_eq!(super::parse_dns_lookup_timeout("not-a-number"), None);
+    }
+
+    #[test]
+    fn dns_lookup_prefer_system_env_parsing_is_truthy_only() {
+        assert!(super::prefer_system_dns_from_env_value(Some("1")));
+        assert!(super::prefer_system_dns_from_env_value(Some("true")));
+        assert!(super::prefer_system_dns_from_env_value(Some("YES")));
+        assert!(!super::prefer_system_dns_from_env_value(Some("0")));
+        assert!(!super::prefer_system_dns_from_env_value(None));
     }
 
     #[tokio::test]
