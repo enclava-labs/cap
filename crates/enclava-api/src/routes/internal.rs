@@ -762,6 +762,12 @@ fn to_value<T: Serialize>(
     })
 }
 
+fn is_idempotency_request_in_progress(error: &(StatusCode, Json<serde_json::Value>)) -> bool {
+    error.0 == StatusCode::CONFLICT
+        && error.1.0.get("error").and_then(serde_json::Value::as_str)
+            == Some("idempotency_request_in_progress")
+}
+
 async fn begin_actor_idempotent_request(
     state: &AppState,
     headers: &HeaderMap,
@@ -1616,10 +1622,25 @@ pub async fn create_paas_generic_deployment(
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     require_deploy_entitlement(&state, auth.org_id).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/deployments");
-    if let Some(response) =
-        begin_actor_idempotent_request(&state, &headers, "POST", &path, &auth, &body).await?
-    {
-        return Ok(response);
+    match begin_actor_idempotent_request(&state, &headers, "POST", &path, &auth, &body).await {
+        Ok(Some(response)) => return Ok(response),
+        Ok(None) => {}
+        Err(error) if is_idempotency_request_in_progress(&error) => {
+            let parsed = parse_internal_body(body)?;
+            if let Some(response) =
+                crate::routes::deployments::recover_generic_deployment_by_external_id(
+                    &state, &auth, &parsed,
+                )
+                .await?
+            {
+                let response = to_value(response)?;
+                finish_actor_idempotent_request(&state, &headers, StatusCode::OK, &response)
+                    .await?;
+                return Ok((StatusCode::OK, Json(response)));
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
     }
     let parsed = parse_internal_body(body)?;
     let (status, Json(response)) = crate::routes::deployments::create_generic_deployment(

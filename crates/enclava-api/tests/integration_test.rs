@@ -1281,6 +1281,158 @@ async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_pre
 }
 
 #[tokio::test]
+async fn paas_internal_generic_deployment_recovers_stuck_idempotency_from_external_id() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("generic-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+    let external_id = format!("deploy-{suffix}");
+    let image = "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let idempotency_key = format!("generic-stuck-idem-{suffix}");
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+
+    let cap_org_id: Uuid = sqlx::query_scalar(
+        "SELECT cap_id
+           FROM paas_external_mappings
+          WHERE resource_type = 'organization'
+            AND paas_external_id = $1",
+    )
+    .bind(&paas_org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("cap org mapping");
+    let cap_user_id: Uuid = sqlx::query_scalar(
+        "SELECT cap_id
+           FROM paas_external_mappings
+          WHERE resource_type = 'user'
+            AND paas_external_id = $1",
+    )
+    .bind(&paas_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("cap user mapping");
+
+    let app_id = Uuid::new_v4();
+    let deployment_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO apps (
+            id, org_id, name, namespace, instance_id, tenant_id, service_account,
+            bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, unlock_mode,
+            domain, tee_domain, signer_identity_subject, signer_identity_issuer,
+            signer_identity_set_at, source_provider, source_repository
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'auto'::unlock_enum, $10, $11, $12, $13, now(), $14, $15)",
+    )
+    .bind(app_id)
+    .bind(cap_org_id)
+    .bind(&app_name)
+    .bind(format!("cap-{app_name}"))
+    .bind(format!("tenant-{}", &suffix[..12]))
+    .bind("test")
+    .bind(format!("cap-{app_name}-sa"))
+    .bind("11".repeat(32))
+    .bind("22".repeat(32))
+    .bind(format!("{app_name}.enclava.dev"))
+    .bind(format!("{app_name}.tee.enclava.dev"))
+    .bind(github_signer_subject())
+    .bind(github_signer_issuer())
+    .bind("github")
+    .bind("acme/confidential-app")
+    .execute(&pool)
+    .await
+    .expect("insert recovered app");
+
+    sqlx::query(
+        "INSERT INTO deployments (
+            id, org_id, app_id, trigger, status, spec_snapshot, image_digest,
+            cosign_verified, external_id, source_provider, source_repository
+         )
+         VALUES ($1, $2, $3, 'api'::trigger_enum, 'pending'::deploy_status_enum, $4, $5, true, $6, $7, $8)",
+    )
+    .bind(deployment_id)
+    .bind(cap_org_id)
+    .bind(app_id)
+    .bind(serde_json::json!({
+        "app_name": app_name,
+        "namespace": format!("cap-{app_name}"),
+        "instance_id": format!("tenant-{}", &suffix[..12]),
+        "image": image,
+        "image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container_name": "app",
+        "resources": null,
+        "external_id": external_id,
+        "source_provider": "github",
+        "source_repository": "acme/confidential-app",
+    }))
+    .bind("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    .bind(&external_id)
+    .bind("github")
+    .bind("acme/confidential-app")
+    .execute(&pool)
+    .await
+    .expect("insert recovered deployment");
+
+    let request_body = generic_deployment_body(
+        &external_id,
+        &app_name,
+        "github",
+        "acme/confidential-app",
+        image,
+        github_signer_subject(),
+        github_signer_issuer(),
+    );
+    let request_hash = Sha256::digest(
+        serde_json::to_vec(&serde_json::json!({
+            "cap_user_id": cap_user_id,
+            "cap_org_id": cap_org_id,
+            "body": request_body,
+        }))
+        .expect("serialize idempotency request hash"),
+    )
+    .to_vec();
+    sqlx::query(
+        "INSERT INTO cap_internal_idempotency (idempotency_key, method, path, request_hash)
+         VALUES ($1, 'POST', $2, $3)",
+    )
+    .bind(&idempotency_key)
+    .bind(format!("/internal/paas/orgs/{paas_org_id}/deployments"))
+    .bind(request_hash)
+    .execute(&pool)
+    .await
+    .expect("insert stuck idempotency record");
+
+    let retry = add_internal_actor_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/deployments")),
+        &idempotency_key,
+        &paas_user_id,
+    )
+    .json(&request_body)
+    .await;
+    retry.assert_status_ok();
+    let retry_body: Value = retry.json();
+    assert_eq!(
+        retry_body["deployment_id"].as_str(),
+        Some(deployment_id.to_string().as_str())
+    );
+
+    let stored_status: Option<i32> = sqlx::query_scalar(
+        "SELECT response_status
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1",
+    )
+    .bind(&idempotency_key)
+    .fetch_one(&pool)
+    .await
+    .expect("stored idempotency status");
+    assert_eq!(stored_status, Some(StatusCode::OK.as_u16() as i32));
+}
+
+#[tokio::test]
 async fn app_logs_returns_explicit_unavailable_until_log_proxy_exists() {
     let (state, _pool) = setup_test_state().await;
     let app = test_router(state);

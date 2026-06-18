@@ -135,6 +135,26 @@ impl GenericDeploymentResponse {
     }
 }
 
+pub(crate) async fn recover_generic_deployment_by_external_id(
+    state: &AppState,
+    auth: &AuthContext,
+    body: &GenericDeploymentRequest,
+) -> Result<Option<GenericDeploymentResponse>, (StatusCode, Json<serde_json::Value>)> {
+    validate_external_id(body.external_id.as_deref())?;
+    let Some(external_id) = body.external_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some((deployment, app)) =
+        fetch_deployment_by_external_id(state, auth.org_id, external_id).await?
+    else {
+        return Ok(None);
+    };
+    ensure_idempotent_retry_matches(&deployment, &app, body)?;
+    Ok(Some(GenericDeploymentResponse::from_deployment(
+        deployment, &app,
+    )))
+}
+
 pub(super) fn json_error(
     status: StatusCode,
     message: impl Into<String>,

@@ -383,6 +383,7 @@ impl DeploymentResponse {
 
 mod generic;
 use generic::json_error;
+pub(crate) use generic::recover_generic_deployment_by_external_id;
 pub use generic::{
     GenericConfigTokenResponse, GenericDeploymentApp, GenericDeploymentRequest,
     GenericDeploymentResponse, GenericDeploymentSecurity, GenericDeploymentSigning,
