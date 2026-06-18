@@ -79,6 +79,16 @@ const KBS_POLICY_CONFIGMAP_VALUE_SOFT_LIMIT: usize = 850_000;
 const SIGNED_POLICY_RECONCILE_DEPLOY_STATUSES: &[&str] =
     &["pending", "applying", "watching", "healthy", "failed"];
 
+#[cfg(test)]
+fn signed_policy_reconcile_status_rank(status: &str) -> u8 {
+    match status {
+        "pending" | "applying" | "watching" => 0,
+        "healthy" => 1,
+        "failed" => 2,
+        _ => 3,
+    }
+}
+
 pub async fn ensure_owner_binding(
     db: &PgPool,
     config: Option<&KbsPolicyConfig>,
@@ -279,6 +289,7 @@ pub async fn reconcile_signed_policy_artifacts(
         WITH ranked AS (
             SELECT wa.signed_policy_artifact,
                    d.created_at,
+                   d.status::text AS deploy_status,
                    row_number() OVER (
                        PARTITION BY wa.app_id
                        ORDER BY d.created_at DESC
@@ -290,7 +301,16 @@ pub async fn reconcile_signed_policy_artifacts(
         SELECT signed_policy_artifact
         FROM ranked
         WHERE rn <= $1
-        ORDER BY created_at DESC
+        ORDER BY
+            CASE deploy_status
+                WHEN 'pending' THEN 0
+                WHEN 'applying' THEN 0
+                WHEN 'watching' THEN 0
+                WHEN 'healthy' THEN 1
+                WHEN 'failed' THEN 2
+                ELSE 3
+            END,
+            created_at DESC
         "#,
     )
     .bind(config.signed_policy_retention)
@@ -914,5 +934,21 @@ owner_resource_bindings := {}
             "failed deployments can still have live pods/PVCs that need their signed policy artifact to restart and unlock"
         );
         assert!(!SIGNED_POLICY_RECONCILE_DEPLOY_STATUSES.contains(&"rolled_back"));
+    }
+
+    #[test]
+    fn signed_policy_reconciliation_prioritizes_booting_deployments() {
+        assert!(
+            signed_policy_reconcile_status_rank("pending")
+                < signed_policy_reconcile_status_rank("failed")
+        );
+        assert!(
+            signed_policy_reconcile_status_rank("applying")
+                < signed_policy_reconcile_status_rank("healthy")
+        );
+        assert!(
+            signed_policy_reconcile_status_rank("watching")
+                < signed_policy_reconcile_status_rank("failed")
+        );
     }
 }
