@@ -1,4 +1,10 @@
 use super::*;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
 use ed25519_dalek::{Signer, SigningKey};
 use enclava_common::descriptor::{
     Capabilities, EnvVar, Mount, OciRuntimeSpec, Port, Resources, SecurityContext, Sidecars,
@@ -32,6 +38,98 @@ fn signing_service_timeout_rejects_invalid_values() {
         parse_signing_service_timeout(Some("abc".to_string())).unwrap_err(),
         SigningServiceError::InvalidTimeout(_)
     ));
+}
+
+#[tokio::test]
+async fn bootstrap_org_retries_transient_upstream_failure() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_handler = attempts.clone();
+    let app = Router::new().route(
+        "/bootstrap-org",
+        post(move || {
+            let attempts = attempts_for_handler.clone();
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 1 {
+                    return (StatusCode::BAD_GATEWAY, "signing service warming up").into_response();
+                }
+                axum::Json(BootstrapOrgResponse {
+                    org_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+                    state: "bootstrapped".to_string(),
+                    owner_pubkey_fingerprint: "aa".repeat(32),
+                })
+                .into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = SigningServiceClient::new_with_timeout(
+        format!("http://{addr}"),
+        None,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let org_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let response = client
+        .bootstrap_org(&BootstrapOrgRequest {
+            org_id,
+            owner_pubkey_hex: "aa".repeat(32),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(response.org_id, org_id);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn bootstrap_org_does_not_retry_client_rejection() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_handler = attempts.clone();
+    let app = Router::new().route(
+        "/bootstrap-org",
+        post(move || {
+            let attempts = attempts_for_handler.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::BAD_REQUEST, "bad owner key").into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = SigningServiceClient::new_with_timeout(
+        format!("http://{addr}"),
+        None,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let org_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let err = client
+        .bootstrap_org(&BootstrapOrgRequest {
+            org_id,
+            owner_pubkey_hex: "aa".repeat(32),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        SigningServiceError::Upstream {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            ..
+        }
+    ));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
 fn descriptor() -> DeploymentDescriptor {

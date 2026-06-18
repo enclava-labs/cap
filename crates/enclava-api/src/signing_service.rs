@@ -14,6 +14,7 @@ use enclava_common::descriptor::{DeploymentDescriptor, descriptor_core_hash};
 use enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH;
 use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
 use reqwest::Url;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -22,6 +23,8 @@ use uuid::Uuid;
 use crate::models::App;
 
 const DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_SIGNING_SERVICE_RETRY_ATTEMPTS: usize = 6;
+const DEFAULT_SIGNING_SERVICE_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SigningServiceError {
@@ -57,6 +60,13 @@ pub struct SigningServiceClient {
     base_url: Url,
     bearer_token: Option<String>,
     http: reqwest::Client,
+    retry: SigningServiceRetry,
+}
+
+#[derive(Clone, Copy)]
+struct SigningServiceRetry {
+    attempts: usize,
+    base_delay: Duration,
 }
 
 impl SigningServiceClient {
@@ -72,6 +82,20 @@ impl SigningServiceClient {
         base_url: String,
         bearer_token: Option<String>,
         timeout: Duration,
+    ) -> Result<Self, SigningServiceError> {
+        Self::new_with_timeout_and_retry(
+            base_url,
+            bearer_token,
+            timeout,
+            SigningServiceRetry::default(),
+        )
+    }
+
+    fn new_with_timeout_and_retry(
+        base_url: String,
+        bearer_token: Option<String>,
+        timeout: Duration,
+        retry: SigningServiceRetry,
     ) -> Result<Self, SigningServiceError> {
         let mut base_url = Url::parse(&base_url)
             .map_err(|err| SigningServiceError::InvalidUrl(err.to_string()))?;
@@ -92,6 +116,7 @@ impl SigningServiceClient {
             base_url,
             bearer_token,
             http,
+            retry: retry.normalized(),
         })
     }
 
@@ -120,43 +145,105 @@ impl SigningServiceClient {
         &self,
         request: &AgentPolicyRequest,
     ) -> Result<AgentPolicyResponse, SigningServiceError> {
-        let url = self
-            .base_url
-            .join("agent-policy")
-            .map_err(|err| SigningServiceError::InvalidUrl(err.to_string()))?;
-        let mut builder = self.http.post(url).json(request);
-        if let Some(token) = self.bearer_token.as_deref() {
-            builder = builder.bearer_auth(token);
-        }
-        let response = builder.send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(SigningServiceError::Upstream { status, body });
-        }
-        Ok(response.json().await?)
+        self.post_json_with_retry("agent-policy", request).await
     }
 
     pub async fn bootstrap_org(
         &self,
         request: &BootstrapOrgRequest,
     ) -> Result<BootstrapOrgResponse, SigningServiceError> {
+        self.post_json_with_retry("bootstrap-org", request).await
+    }
+
+    async fn post_json_with_retry<T, R>(
+        &self,
+        endpoint: &'static str,
+        request: &T,
+    ) -> Result<R, SigningServiceError>
+    where
+        T: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
         let url = self
             .base_url
-            .join("bootstrap-org")
+            .join(endpoint)
             .map_err(|err| SigningServiceError::InvalidUrl(err.to_string()))?;
-        let mut builder = self.http.post(url).json(request);
-        if let Some(token) = self.bearer_token.as_deref() {
-            builder = builder.bearer_auth(token);
-        }
-        let response = builder.send().await?;
-        let status = response.status();
-        if !status.is_success() {
+
+        for attempt in 1..=self.retry.attempts {
+            let mut builder = self.http.post(url.clone()).json(request);
+            if let Some(token) = self.bearer_token.as_deref() {
+                builder = builder.bearer_auth(token);
+            }
+
+            let response = match builder.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    if attempt < self.retry.attempts {
+                        self.sleep_before_retry(endpoint, attempt, &error.to_string())
+                            .await;
+                        continue;
+                    }
+                    return Err(SigningServiceError::Http(error));
+                }
+            };
+            let status = response.status();
+            if status.is_success() {
+                return Ok(response.json().await?);
+            }
             let body = response.text().await.unwrap_or_default();
+            if retryable_status(status) && attempt < self.retry.attempts {
+                self.sleep_before_retry(endpoint, attempt, &format!("status {status}: {body}"))
+                    .await;
+                continue;
+            }
             return Err(SigningServiceError::Upstream { status, body });
         }
-        Ok(response.json().await?)
+
+        unreachable!("retry attempts are normalized to at least one")
     }
+
+    async fn sleep_before_retry(&self, endpoint: &'static str, attempt: usize, error: &str) {
+        let delay = self.retry.delay_after(attempt);
+        tracing::warn!(
+            endpoint,
+            attempt,
+            max_attempts = self.retry.attempts,
+            delay_ms = delay.as_millis(),
+            error,
+            "signing service request failed; retrying"
+        );
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+impl Default for SigningServiceRetry {
+    fn default() -> Self {
+        Self {
+            attempts: DEFAULT_SIGNING_SERVICE_RETRY_ATTEMPTS,
+            base_delay: DEFAULT_SIGNING_SERVICE_RETRY_BASE_DELAY,
+        }
+    }
+}
+
+impl SigningServiceRetry {
+    fn normalized(self) -> Self {
+        Self {
+            attempts: self.attempts.max(1),
+            base_delay: self.base_delay,
+        }
+    }
+
+    fn delay_after(self, attempt: usize) -> Duration {
+        let factor = 1u128 << attempt.saturating_sub(1).min(5);
+        let millis = self.base_delay.as_millis().saturating_mul(factor);
+        Duration::from_millis(millis.min(u64::MAX as u128) as u64)
+    }
+}
+
+fn retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
 fn signing_service_timeout_from_env() -> Result<Duration, SigningServiceError> {
