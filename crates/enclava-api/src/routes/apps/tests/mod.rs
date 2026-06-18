@@ -1,7 +1,7 @@
 use super::{
     CreateAppRequest, RotateSignerRequest, SignerRotationTokenRequest, create_app, derive_identity,
     issue_signer_rotation_token_route, list_apps, normalize_health_config,
-    workload_teardown_instance_id,
+    request_workload_teardown, workload_teardown_instance_id,
 };
 use crate::models::{App, AppStatus, Role, UnlockMode};
 use axum::Json;
@@ -124,6 +124,49 @@ fn teardown_token_instance_id_matches_attestation_proxy_owner_instance_id() {
     assert_eq!(
         workload_teardown_instance_id(&app),
         "cap-a826eb13-demo-demo"
+    );
+}
+
+#[tokio::test]
+async fn workload_teardown_notification_connection_failure_is_best_effort() {
+    let app = App {
+        id: uuid::Uuid::new_v4(),
+        org_id: uuid::Uuid::new_v4(),
+        name: "demo".to_string(),
+        namespace: "cap-a826eb13-demo".to_string(),
+        instance_id: "a826eb13-12345678".to_string(),
+        tenant_id: "a826eb13".to_string(),
+        service_account: "cap-demo-sa".to_string(),
+        bootstrap_owner_pubkey_hash: "00".repeat(32),
+        tenant_instance_identity_hash: "11".repeat(32),
+        unlock_mode: UnlockMode::Password,
+        domain: "demo.a826eb13.enclava.dev".to_string(),
+        tee_domain: Some("127.0.0.1:9".to_string()),
+        custom_domain: None,
+        status: AppStatus::Running,
+        signer_identity_subject: None,
+        signer_identity_issuer: None,
+        signer_identity_set_at: None,
+        source_provider: None,
+        source_repository: None,
+        egress_allowlist: serde_json::json!([]),
+        health_path: "/health".to_string(),
+        health_interval_seconds: 30,
+        health_timeout_seconds: 5,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    let result = request_workload_teardown(
+        &crate::test_support::lazy_state(),
+        &crate::test_support::auth_context(Role::Owner, &["apps:write"]),
+        &app,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "teardown proxy contact failures must not block app cleanup"
     );
 }
 

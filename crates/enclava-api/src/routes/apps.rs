@@ -134,34 +134,31 @@ async fn request_workload_teardown(
         .send()
         .await
         .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": "failed to contact workload teardown endpoint",
-                    "detail": e.to_string(),
-                })),
-            )
-        })?;
+            tracing::warn!(
+                url = %url,
+                error = %e,
+                "workload teardown endpoint unreachable -- continuing cleanup"
+            );
+        });
+
+    let response = match response {
+        Ok(response) => response,
+        Err(()) => return Ok(()),
+    };
 
     if response.status().is_success() {
         return Ok(());
     }
 
     let status = response.status();
-    let status_code = status.as_u16();
     let body = response.text().await.unwrap_or_default();
-    Err((
-        if matches!(status_code, 409 | 423) {
-            StatusCode::CONFLICT
-        } else {
-            StatusCode::BAD_GATEWAY
-        },
-        Json(serde_json::json!({
-            "error": "workload teardown failed",
-            "status": status_code,
-            "body": body,
-        })),
-    ))
+    tracing::warn!(
+        url = %url,
+        status = %status,
+        body = %body,
+        "workload teardown endpoint returned non-success -- continuing cleanup"
+    );
+    Ok(())
 }
 
 /// Comprehensive app name validation
