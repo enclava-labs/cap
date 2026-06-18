@@ -96,6 +96,10 @@ fn internal_routes() -> Router<AppState> {
             axum::routing::post(routes::internal::deploy_paas_app),
         )
         .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}",
+            axum::routing::delete(routes::internal::delete_paas_app),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/runtime/recover",
             axum::routing::post(routes::internal::recover_paas_app_runtime),
         )

@@ -1183,6 +1183,26 @@ async fn paas_internal_agent_policy_route_reaches_cap_policy_broker() {
 }
 
 #[tokio::test]
+async fn paas_internal_delete_app_route_is_wired_for_actor_context() {
+    let (state, _pool) = setup_paas_managed_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+
+    let response = add_internal_headers(
+        server.delete(&format!("/internal/paas/orgs/{paas_org_id}/apps/stale-app")),
+        &format!("hosted-app-delete-{suffix}"),
+    )
+    .json(&serde_json::json!({}))
+    .await;
+
+    response.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = response.json();
+    assert_eq!(body["error"], "x-enclava-paas-user-id is required");
+}
+
+#[tokio::test]
 async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_preconditions() {
     let (mut state, pool) = setup_paas_managed_test_state().await;
     state.require_customer_signed_policy_artifact = true;
