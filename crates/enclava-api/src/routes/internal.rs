@@ -1642,16 +1642,42 @@ pub async fn create_paas_generic_deployment(
         }
         Err(error) => return Err(error),
     }
-    let parsed = parse_internal_body(body)?;
-    let (status, Json(response)) = crate::routes::deployments::create_generic_deployment(
-        auth,
+    let parsed = match parse_internal_body(body.clone()) {
+        Ok(parsed) => parsed,
+        Err((status, Json(error_body))) => {
+            finish_actor_idempotent_request(&state, &headers, status, &error_body).await?;
+            return Err((status, Json(error_body)));
+        }
+    };
+    let result = crate::routes::deployments::create_generic_deployment(
+        auth.clone(),
         State(state.clone()),
         Json(parsed),
     )
-    .await?;
-    let response = to_value(response)?;
-    finish_actor_idempotent_request(&state, &headers, status, &response).await?;
-    Ok((status, Json(response)))
+    .await;
+    match result {
+        Ok((status, Json(response))) => {
+            let response = to_value(response)?;
+            finish_actor_idempotent_request(&state, &headers, status, &response).await?;
+            Ok((status, Json(response)))
+        }
+        Err((status, Json(error_body))) => {
+            let parsed = parse_internal_body(body)?;
+            if let Some(recovered) =
+                crate::routes::deployments::recover_generic_deployment_by_external_id(
+                    &state, &auth, &parsed,
+                )
+                .await?
+            {
+                let response = to_value(recovered)?;
+                finish_actor_idempotent_request(&state, &headers, StatusCode::OK, &response)
+                    .await?;
+                return Ok((StatusCode::OK, Json(response)));
+            }
+            finish_actor_idempotent_request(&state, &headers, status, &error_body).await?;
+            Err((status, Json(error_body)))
+        }
+    }
 }
 
 pub async fn get_paas_generic_deployment(

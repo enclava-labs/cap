@@ -1194,6 +1194,16 @@ async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_pre
     let org_name = format!("generic-{}", &suffix[..16]);
     let app_name = format!("app-{}", &suffix[..12]);
     let external_id = format!("deploy-{suffix}");
+    let idempotency_key = format!("generic-deploy-{suffix}");
+    let request_body = generic_deployment_body(
+        &external_id,
+        &app_name,
+        "github",
+        "acme/confidential-app",
+        "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "https://github.com/acme/confidential-app/.github/workflows/build.yml@refs/heads/main",
+        "https://token.actions.githubusercontent.com",
+    );
 
     add_internal_headers(
         server.put(&format!("/internal/paas/orgs/{paas_org_id}")),
@@ -1243,18 +1253,10 @@ async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_pre
 
     let response = add_internal_actor_headers(
         server.post(&format!("/internal/paas/orgs/{paas_org_id}/deployments")),
-        &format!("generic-deploy-{suffix}"),
+        &idempotency_key,
         &paas_user_id,
     )
-    .json(&generic_deployment_body(
-        &external_id,
-        &app_name,
-        "github",
-        "acme/confidential-app",
-        "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "https://github.com/acme/confidential-app/.github/workflows/build.yml@refs/heads/main",
-        "https://token.actions.githubusercontent.com",
-    ))
+    .json(&request_body)
     .await;
 
     response.assert_status(StatusCode::BAD_REQUEST);
@@ -1278,6 +1280,28 @@ async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_pre
         persisted_app_source(&pool, cap_org_id, &app_name).await,
         ("github".to_string(), "acme/confidential-app".to_string())
     );
+
+    let stored_status: Option<i32> = sqlx::query_scalar(
+        "SELECT response_status
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1",
+    )
+    .bind(&idempotency_key)
+    .fetch_one(&pool)
+    .await
+    .expect("stored idempotency status");
+    assert_eq!(stored_status, Some(StatusCode::BAD_REQUEST.as_u16() as i32));
+
+    let retry = add_internal_actor_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/deployments")),
+        &idempotency_key,
+        &paas_user_id,
+    )
+    .json(&request_body)
+    .await;
+    retry.assert_status(StatusCode::BAD_REQUEST);
+    let retry_body: Value = retry.json();
+    assert_eq!(retry_body, body);
 }
 
 #[tokio::test]
