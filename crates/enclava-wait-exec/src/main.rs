@@ -33,9 +33,18 @@ fn run(argv: Vec<OsString>) -> Result<(), String> {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_READY_FILE));
 
     signal_started(&started_dir, &name)?;
-    wait_until_ready(&ready_file);
+    eprintln!(
+        "enclava-wait-exec: {name} signaled startup; waiting for {}",
+        ready_file.display()
+    );
+    wait_until_ready(&ready_file, &name);
 
     let (program, args) = command_from_args(argv);
+    eprintln!(
+        "enclava-wait-exec: {name} observed {}; execing {}",
+        ready_file.display(),
+        PathBuf::from(&program).display()
+    );
     let err = Command::new(&program).args(&args).exec();
     Err(format!(
         "failed to exec {}: {err}",
@@ -182,9 +191,17 @@ fn start_time_ticks_from_stat(stat: &str) -> Result<u64, String> {
         .map_err(|err| format!("invalid process stat start_time: {err}"))
 }
 
-fn wait_until_ready(ready_file: &Path) {
+fn wait_until_ready(ready_file: &Path, name: &str) {
+    let mut elapsed = 0u64;
     while !ready_file.exists() {
         thread::sleep(Duration::from_secs(1));
+        elapsed += 1;
+        if elapsed % 10 == 0 {
+            eprintln!(
+                "enclava-wait-exec: {name} still waiting for {} after {elapsed}s",
+                ready_file.display()
+            );
+        }
     }
 }
 
