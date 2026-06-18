@@ -665,6 +665,7 @@ fn kbs_proxy_health_url(kbs_url: &str) -> String {
     let trimmed = kbs_url.trim_end_matches('/');
     let base = trimmed
         .strip_suffix("/cdh/resource")
+        .or_else(|| trimmed.strip_suffix("/internal/owner-seed"))
         .unwrap_or(trimmed)
         .trim_end_matches('/');
     format!("{base}/health")

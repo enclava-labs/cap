@@ -230,13 +230,21 @@ fn tenant_ingress_bind_plan_uses_shared_tls_mount_not_namespace_bind() {
 }
 
 #[test]
-fn kbs_proxy_health_url_strips_cdh_resource_suffix() {
+fn kbs_proxy_health_url_strips_resource_suffixes() {
     assert_eq!(
         kbs_proxy_health_url("http://127.0.0.1:8081/cdh/resource"),
         "http://127.0.0.1:8081/health"
     );
     assert_eq!(
         kbs_proxy_health_url("http://127.0.0.1:8081/cdh/resource/"),
+        "http://127.0.0.1:8081/health"
+    );
+    assert_eq!(
+        kbs_proxy_health_url("http://127.0.0.1:8081/internal/owner-seed"),
+        "http://127.0.0.1:8081/health"
+    );
+    assert_eq!(
+        kbs_proxy_health_url("http://127.0.0.1:8081/internal/owner-seed/"),
         "http://127.0.0.1:8081/health"
     );
     assert_eq!(
