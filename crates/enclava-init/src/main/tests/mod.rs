@@ -108,7 +108,7 @@ fn cap_config_dir_is_prepared_for_proxy_writer() {
     std::fs::create_dir_all(&state).unwrap();
     let mut chowned = Vec::new();
 
-    prepare_cap_config_dir_with(&state, |path, identity| {
+    prepare_cap_config_dir_with(&state, 10001, 10001, |path, identity| {
         chowned.push((path.to_path_buf(), identity));
         Ok(())
     })
@@ -116,14 +116,38 @@ fn cap_config_dir_is_prepared_for_proxy_writer() {
 
     let config_root = state.join(".enclava");
     let config_dir = state.join(".enclava/config");
+    let runtime_dir = config_dir.join(".runtime");
     let ready_marker = state.join(".enclava/luks-ready");
     assert!(config_root.is_dir());
     assert!(config_dir.is_dir());
     assert!(
+        runtime_dir.is_dir(),
+        "app runtime state must be writable under encrypted CAP config handoff"
+    );
+    assert!(
         ready_marker.is_file(),
         "CAP config writes must be able to prove they see the decrypted LUKS volume"
     );
-    assert_eq!(chowned, vec![(config_root, numeric_identity(0, 0))]);
+    assert_eq!(
+        chowned,
+        vec![
+            (config_root, numeric_identity(0, 0)),
+            (runtime_dir.clone(), numeric_identity(10001, 10001)),
+        ]
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&runtime_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o2770
+        );
+    }
 }
 
 #[test]

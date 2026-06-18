@@ -25,6 +25,7 @@ const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
 const CAP_CONFIG_RELATIVE_DIR: &str = ".enclava/config";
 const CAP_CONFIG_READY_MARKER_RELATIVE_PATH: &str = ".enclava/luks-ready";
+const CAP_CONFIG_RUNTIME_DIR: &str = ".runtime";
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -743,7 +744,7 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
 
     chown::chown(state_root, app_identity)
         .with_context(|| format!("chown {}", state_root.display()))?;
-    prepare_cap_config_dir_with(state_root, |path, identity| {
+    prepare_cap_config_dir_with(state_root, cfg.app_uid, cfg.app_gid, |path, identity| {
         chown::chown_recursive(path, identity)?;
         Ok(())
     })?;
@@ -895,7 +896,12 @@ fn cap_config_ready_marker(state_root: &Path) -> PathBuf {
     state_root.join(CAP_CONFIG_READY_MARKER_RELATIVE_PATH)
 }
 
-fn prepare_cap_config_dir_with<F>(state_root: &Path, mut chown_recursive: F) -> Result<()>
+fn prepare_cap_config_dir_with<F>(
+    state_root: &Path,
+    app_uid: u32,
+    app_gid: u32,
+    mut chown_recursive: F,
+) -> Result<()>
 where
     F: FnMut(&Path, ExecIdentity) -> Result<()>,
 {
@@ -905,7 +911,8 @@ where
         0o755,
         0o755,
         &mut chown_recursive,
-    )
+    )?;
+    prepare_cap_config_runtime_dir_with(state_root, app_uid, app_gid, &mut chown_recursive)
 }
 
 fn prepare_app_data_cap_config_dir_with<F>(
@@ -925,7 +932,20 @@ where
         &mut chown_recursive,
     )?;
 
-    let runtime_dir = cap_config_dir(app_data_root).join(".runtime");
+    prepare_cap_config_runtime_dir_with(app_data_root, app_uid, app_gid, &mut chown_recursive)?;
+    Ok(())
+}
+
+fn prepare_cap_config_runtime_dir_with<F>(
+    state_root: &Path,
+    app_uid: u32,
+    app_gid: u32,
+    chown_recursive: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&Path, ExecIdentity) -> Result<()>,
+{
+    let runtime_dir = cap_config_dir(state_root).join(CAP_CONFIG_RUNTIME_DIR);
     std::fs::create_dir_all(&runtime_dir)
         .with_context(|| format!("creating CAP app runtime dir {}", runtime_dir.display()))?;
     #[cfg(unix)]
