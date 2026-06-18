@@ -900,7 +900,21 @@ where
         0o750,
         0o2750,
         &mut chown_recursive,
-    )
+    )?;
+
+    let runtime_dir = cap_config_dir(app_data_root).join(".runtime");
+    std::fs::create_dir_all(&runtime_dir)
+        .with_context(|| format!("creating CAP app runtime dir {}", runtime_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o2770))
+            .with_context(|| format!("chmod {}", runtime_dir.display()))?;
+    }
+    chown_recursive(&runtime_dir, numeric_identity(0, app_gid))
+        .with_context(|| format!("chown {}", runtime_dir.display()))?;
+    Ok(())
 }
 
 fn prepare_cap_config_dir_owned_with<F>(

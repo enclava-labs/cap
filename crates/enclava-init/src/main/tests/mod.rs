@@ -140,16 +140,24 @@ fn app_data_cap_config_dir_is_prepared_for_proxy_and_app_group() {
 
     let config_root = app_data.join(".enclava");
     let config_dir = app_data.join(".enclava/config");
+    let runtime_dir = config_dir.join(".runtime");
     let ready_marker = app_data.join(".enclava/luks-ready");
     assert!(config_root.is_dir());
     assert!(config_dir.is_dir());
+    assert!(
+        runtime_dir.is_dir(),
+        "app runtime state must be writable under encrypted app-data config"
+    );
     assert!(
         ready_marker.is_file(),
         "CAP config writes must be able to prove they see the decrypted LUKS app-data volume"
     );
     assert_eq!(
         chowned,
-        vec![(config_root.clone(), numeric_identity(0, 10001))]
+        vec![
+            (config_root.clone(), numeric_identity(0, 10001)),
+            (runtime_dir.clone(), numeric_identity(0, 10001)),
+        ]
     );
 
     #[cfg(unix)]
@@ -166,6 +174,14 @@ fn app_data_cap_config_dir_is_prepared_for_proxy_and_app_group() {
         assert_eq!(
             std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o7777,
             0o2750
+        );
+        assert_eq!(
+            std::fs::metadata(&runtime_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o2770
         );
     }
 }
