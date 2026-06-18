@@ -560,7 +560,7 @@ pub fn build_enclava_tools_init_container() -> Container {
             "/bin/sh".to_string(),
             "-eu".to_string(),
             "-c".to_string(),
-            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers".to_string(),
+            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready".to_string(),
         ]),
         volume_mounts: Some(vec![
             VolumeMount {

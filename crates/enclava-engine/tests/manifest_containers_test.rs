@@ -783,6 +783,7 @@ fn enclava_tools_init_container_prepares_group_restricted_wait_handoff() {
     let c = build_enclava_tools_init_container();
     let command = c.command.as_ref().unwrap().join(" ");
     assert!(command.contains("install -d -m 02770 -o 0 -g 10001 /run/enclava/containers"));
+    assert!(command.contains("printf 'not-ready\\n' > /run/enclava/init-ready"));
     let mounts = c.volume_mounts.as_ref().unwrap();
     assert!(
         mounts

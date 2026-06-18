@@ -1,3 +1,5 @@
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -185,11 +187,7 @@ use namespace_bind::{
     wait_for_container_start_sentinels,
 };
 fn clear_ready_file(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    write_ready_file_state(path, b"not-ready\n")
 }
 
 fn clear_error_file(path: &Path) {
@@ -238,13 +236,32 @@ fn format_failure_message(message: &str) -> String {
 }
 
 fn mark_ready_file(path: &Path) -> Result<()> {
-    writes::atomic_write(path, b"ready\n", 0o644).map_err(Into::into)
+    write_ready_file_state(path, b"ready\n")
 }
 
 fn ready_file_exists(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .map(|m| m.is_file())
+    std::fs::read_to_string(path)
+        .map(|value| value.trim() == "ready")
         .unwrap_or(false)
+}
+
+fn write_ready_file_state(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("ready file path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let dir = std::fs::OpenOptions::new().read(true).open(parent)?;
+    dir.sync_all()?;
+    Ok(())
 }
 
 fn stay_alive_forever(cfg: &Config) -> ! {
