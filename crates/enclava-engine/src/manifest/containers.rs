@@ -55,6 +55,10 @@ pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 pub const CADDY_BROKER_CERT_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.crt";
 pub const CADDY_BROKER_KEY_PATH: &str = "/run/enclava/caddy-runtime/certificates/tls.key";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
+const STATE_CAP_CONFIG_DIR: &str = "/state/.enclava/config";
+const STATE_CAP_CONFIG_READY_MARKER: &str = "/state/.enclava/luks-ready";
+const APP_DATA_CAP_CONFIG_DIR: &str = "/state/app-data/.enclava/config";
+const APP_DATA_CAP_CONFIG_READY_MARKER: &str = "/state/app-data/.enclava/luks-ready";
 const APP_STARTUP_PROBE_PERIOD_SECONDS: i32 = 5;
 const APP_STARTUP_PROBE_FAILURE_THRESHOLD: i32 = 17_280;
 const APP_HTTP_PROBE_MAX_PERIOD_SECONDS: i32 = 15;
@@ -116,6 +120,23 @@ fn ownership_mode_str(mode: UnlockMode) -> &'static str {
         UnlockMode::Auto => "auto-unlock",
         UnlockMode::Password => "password",
     }
+}
+
+fn cap_config_paths(app: &ConfidentialApp) -> (&'static str, &'static str) {
+    let uses_app_data = app
+        .primary_container()
+        .is_some_and(|primary| primary.storage_paths.iter().any(storage_path_uses_app_data));
+
+    if uses_app_data {
+        (APP_DATA_CAP_CONFIG_DIR, APP_DATA_CAP_CONFIG_READY_MARKER)
+    } else {
+        (STATE_CAP_CONFIG_DIR, STATE_CAP_CONFIG_READY_MARKER)
+    }
+}
+
+fn storage_path_uses_app_data(path: &String) -> bool {
+    let rel = path.trim_start_matches('/');
+    rel.strip_prefix("state/").unwrap_or(rel).replace('/', "-") == "app-data"
 }
 
 fn required_config_keys_from_primary(app: &ConfidentialApp) -> Option<String> {
@@ -684,6 +705,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
     let mode = ownership_mode_str(app.unlock_mode);
     let legacy = legacy_bootstrap_enabled();
     let (_, expected_init_data_hash) = cc_init_data::compute_cc_init_data(app);
+    let (cap_config_dir, cap_config_ready_marker) = cap_config_paths(app);
 
     let mut env_vars = vec![
         env("ATTESTATION_WORKLOAD_CONTAINER", &primary.name),
@@ -701,11 +723,8 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("ATTESTATION_TLS_PORT", "8443"),
         env("TEE_DOMAIN", &app.domain.tee_domain),
         env("CAP_API_SIGNING_PUBKEY", &app.api_signing_pubkey),
-        env("CAP_CONFIG_DIR", "/state/app-data/.enclava/config"),
-        env(
-            "CAP_CONFIG_READY_MARKER",
-            "/state/app-data/.enclava/luks-ready",
-        ),
+        env("CAP_CONFIG_DIR", cap_config_dir),
+        env("CAP_CONFIG_READY_MARKER", cap_config_ready_marker),
         env("CAP_CONFIG_FILE_GID", "10001"),
         env("STORAGE_OWNERSHIP_MODE", mode),
         env("INSTANCE_ID", &app.owner_instance_id()),

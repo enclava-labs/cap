@@ -456,6 +456,32 @@ fn proxy_container_uses_luks_state_root_for_config_storage() {
 }
 
 #[test]
+fn proxy_container_uses_base_state_config_storage_without_app_data_bind() {
+    let mut app = sample_app();
+    app.containers[0].storage_paths = vec!["/home/lio".to_string()];
+
+    let c = build_attestation_proxy_container(&app);
+    let env = c.env.as_ref().unwrap();
+
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "CAP_CONFIG_DIR")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/state/.enclava/config")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "CAP_CONFIG_READY_MARKER")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/state/.enclava/luks-ready")
+    );
+}
+
+#[test]
 fn proxy_container_receives_workload_required_config_keys() {
     let mut app = sample_app();
     app.containers[0].command = Some(vec![
