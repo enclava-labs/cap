@@ -132,7 +132,7 @@ fn app_data_cap_config_dir_is_prepared_for_proxy_and_app_group() {
     std::fs::create_dir_all(&app_data).unwrap();
     let mut chowned = Vec::new();
 
-    prepare_app_data_cap_config_dir_with(&app_data, 10001, |path, identity| {
+    prepare_app_data_cap_config_dir_with(&app_data, 10001, 10001, |path, identity| {
         chowned.push((path.to_path_buf(), identity));
         Ok(())
     })
@@ -156,7 +156,7 @@ fn app_data_cap_config_dir_is_prepared_for_proxy_and_app_group() {
         chowned,
         vec![
             (config_root.clone(), numeric_identity(0, 10001)),
-            (runtime_dir.clone(), numeric_identity(0, 10001)),
+            (runtime_dir.clone(), numeric_identity(10001, 10001)),
         ]
     );
 

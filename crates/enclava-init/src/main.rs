@@ -768,10 +768,15 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
         chown::chown_recursive(&dir, app_identity)
             .with_context(|| format!("chown {}", dir.display()))?;
         if bind.subdir == "app-data" {
-            prepare_app_data_cap_config_dir_with(&dir, cfg.app_gid, |path, identity| {
-                chown::chown_recursive(path, identity)?;
-                Ok(())
-            })?;
+            prepare_app_data_cap_config_dir_with(
+                &dir,
+                cfg.app_uid,
+                cfg.app_gid,
+                |path, identity| {
+                    chown::chown_recursive(path, identity)?;
+                    Ok(())
+                },
+            )?;
         }
     }
 
@@ -888,6 +893,7 @@ where
 
 fn prepare_app_data_cap_config_dir_with<F>(
     app_data_root: &Path,
+    app_uid: u32,
     app_gid: u32,
     mut chown_recursive: F,
 ) -> Result<()>
@@ -912,7 +918,7 @@ where
         std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o2770))
             .with_context(|| format!("chmod {}", runtime_dir.display()))?;
     }
-    chown_recursive(&runtime_dir, numeric_identity(0, app_gid))
+    chown_recursive(&runtime_dir, numeric_identity(app_uid, app_gid))
         .with_context(|| format!("chown {}", runtime_dir.display()))?;
     Ok(())
 }
