@@ -12,6 +12,8 @@ use crate::auth::middleware::{AuthContext, ManagementOrigin};
 use crate::models::Role;
 use crate::state::AppState;
 
+const STALE_IDEMPOTENCY_RECOVERY_AFTER_SECONDS: i64 = 120;
+
 pub struct InternalAuth {
     pub client_san: String,
 }
@@ -766,6 +768,34 @@ fn is_idempotency_request_in_progress(error: &(StatusCode, Json<serde_json::Valu
     error.0 == StatusCode::CONFLICT
         && error.1.0.get("error").and_then(serde_json::Value::as_str)
             == Some("idempotency_request_in_progress")
+}
+
+fn idempotency_recovery_is_stale(
+    created_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    now.signed_duration_since(created_at)
+        >= chrono::Duration::seconds(STALE_IDEMPOTENCY_RECOVERY_AFTER_SECONDS)
+}
+
+async fn in_progress_idempotency_is_stale(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<bool, (StatusCode, Json<serde_json::Value>)> {
+    let key = idempotency_key(headers)?;
+    let created_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT created_at
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1
+            AND response_status IS NULL",
+    )
+    .bind(key)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| db_error())?;
+
+    Ok(created_at
+        .is_some_and(|created_at| idempotency_recovery_is_stale(created_at, chrono::Utc::now())))
 }
 
 async fn begin_actor_idempotent_request(
@@ -1648,7 +1678,7 @@ pub async fn create_paas_generic_deployment(
         Ok(Some(response)) => return Ok(response),
         Ok(None) => {}
         Err(error) if is_idempotency_request_in_progress(&error) => {
-            let parsed = parse_internal_body(body)?;
+            let parsed = parse_internal_body(body.clone())?;
             if let Some(response) =
                 crate::routes::deployments::recover_generic_deployment_by_external_id(
                     &state, &auth, &parsed,
@@ -1660,7 +1690,47 @@ pub async fn create_paas_generic_deployment(
                     .await?;
                 return Ok((StatusCode::OK, Json(response)));
             }
-            return Err(error);
+            if !in_progress_idempotency_is_stale(&state, &headers).await? {
+                return Err(error);
+            }
+            tracing::warn!(
+                paas_org_id = %paas_org_id,
+                "recovering stale PaaS generic deployment idempotency reservation"
+            );
+            let result = crate::routes::deployments::create_generic_deployment(
+                auth.clone(),
+                State(state.clone()),
+                Json(parsed),
+            )
+            .await;
+            match result {
+                Ok((status, Json(response))) => {
+                    let response = to_value(response)?;
+                    finish_actor_idempotent_request(&state, &headers, status, &response).await?;
+                    return Ok((status, Json(response)));
+                }
+                Err((status, Json(error_body))) => {
+                    let parsed = parse_internal_body(body)?;
+                    if let Some(recovered) =
+                        crate::routes::deployments::recover_generic_deployment_by_external_id(
+                            &state, &auth, &parsed,
+                        )
+                        .await?
+                    {
+                        let response = to_value(recovered)?;
+                        finish_actor_idempotent_request(
+                            &state,
+                            &headers,
+                            StatusCode::OK,
+                            &response,
+                        )
+                        .await?;
+                        return Ok((StatusCode::OK, Json(response)));
+                    }
+                    finish_actor_idempotent_request(&state, &headers, status, &error_body).await?;
+                    return Err((status, Json(error_body)));
+                }
+            }
         }
         Err(error) => return Err(error),
     }
@@ -1796,4 +1866,23 @@ pub async fn update_paas_unlock_mode(
     let response = to_value(response)?;
     finish_actor_idempotent_request(&state, &headers, StatusCode::OK, &response).await?;
     Ok((StatusCode::OK, Json(response)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_idempotency_recovery_waits_for_cutoff() {
+        let created_at = chrono::Utc::now();
+
+        assert!(!idempotency_recovery_is_stale(
+            created_at,
+            created_at + chrono::Duration::seconds(STALE_IDEMPOTENCY_RECOVERY_AFTER_SECONDS - 1),
+        ));
+        assert!(idempotency_recovery_is_stale(
+            created_at,
+            created_at + chrono::Duration::seconds(STALE_IDEMPOTENCY_RECOVERY_AFTER_SECONDS),
+        ));
+    }
 }
