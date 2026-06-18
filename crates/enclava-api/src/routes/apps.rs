@@ -25,6 +25,7 @@ use enclava_common::validate::validate_http_path;
 const DEFAULT_HEALTH_PATH: &str = "/health";
 const DEFAULT_HEALTH_INTERVAL_SECONDS: u32 = 30;
 const DEFAULT_HEALTH_TIMEOUT_SECONDS: u32 = 5;
+const WORKLOAD_TEARDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Helper function for consistent internal server error responses
 fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
@@ -131,6 +132,7 @@ async fn request_workload_teardown(
         .tee_http_client
         .post(&url)
         .bearer_auth(token)
+        .timeout(WORKLOAD_TEARDOWN_TIMEOUT)
         .send()
         .await
         .map_err(|e| {
