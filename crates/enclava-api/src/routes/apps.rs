@@ -822,9 +822,6 @@ pub async fn delete_app(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    request_workload_teardown(&state, &auth, &app).await?;
-
-    // Mark as deleting after workload-owned KBS material has been removed.
     sqlx::query("UPDATE apps SET status = 'deleting', updated_at = now() WHERE id = $1")
         .bind(app.id)
         .execute(&state.db)
@@ -835,6 +832,8 @@ pub async fn delete_app(
                 Json(serde_json::json!({"error": "database error"})),
             )
         })?;
+
+    request_workload_teardown(&state, &auth, &app).await?;
 
     crate::dns::delete_all_dns_records_for_app(
         &state.db,
@@ -940,6 +939,13 @@ pub async fn delete_app(
                 Json(serde_json::json!({"error": "database error"})),
             )
         })?;
+
+    if let Err(e) =
+        crate::kbs::reconcile_signed_policy_artifacts(&state.db, state.kbs_policy.as_ref(), None)
+            .await
+    {
+        tracing::warn!(app_id = %app.id, error = %e, "failed to refresh signed KBS policy after app delete");
+    }
 
     // Audit
     let _ = sqlx::query(

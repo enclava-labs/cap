@@ -78,6 +78,40 @@ struct SignedPolicyArtifactRow {
 const KBS_POLICY_CONFIGMAP_VALUE_SOFT_LIMIT: usize = 850_000;
 const SIGNED_POLICY_RECONCILE_DEPLOY_STATUSES: &[&str] =
     &["pending", "applying", "watching", "healthy", "failed"];
+const SIGNED_POLICY_RECONCILE_APP_STATUSES: &[&str] = &["creating", "running", "failed"];
+const SIGNED_POLICY_ARTIFACT_ROWS_SQL: &str = r#"
+        WITH ranked AS (
+            SELECT wa.signed_policy_artifact,
+                   d.created_at,
+                   d.status::text AS deploy_status,
+                   row_number() OVER (
+                       PARTITION BY wa.app_id
+                       ORDER BY d.created_at DESC
+                   ) AS rn
+            FROM workload_artifacts wa
+            JOIN deployments d ON d.id = wa.deploy_id AND d.app_id = wa.app_id
+            JOIN apps a ON a.id = wa.app_id
+            WHERE d.status::text = ANY($2)
+              AND a.status::text = ANY($3)
+        )
+        SELECT signed_policy_artifact
+        FROM ranked
+        WHERE rn <= $1
+        ORDER BY
+            CASE deploy_status
+                WHEN 'pending' THEN 0
+                WHEN 'applying' THEN 0
+                WHEN 'watching' THEN 0
+                WHEN 'healthy' THEN 1
+                WHEN 'failed' THEN 2
+                ELSE 3
+            END,
+            created_at DESC
+        "#;
+
+fn signed_policy_artifact_rows_query() -> &'static str {
+    SIGNED_POLICY_ARTIFACT_ROWS_SQL
+}
 
 #[cfg(test)]
 fn signed_policy_reconcile_status_rank(status: &str) -> u8 {
@@ -284,39 +318,12 @@ pub async fn reconcile_signed_policy_artifacts(
         return Err(KbsPolicyError::NotConfigured);
     };
 
-    let rows: Vec<SignedPolicyArtifactRow> = sqlx::query_as(
-        r#"
-        WITH ranked AS (
-            SELECT wa.signed_policy_artifact,
-                   d.created_at,
-                   d.status::text AS deploy_status,
-                   row_number() OVER (
-                       PARTITION BY wa.app_id
-                       ORDER BY d.created_at DESC
-                   ) AS rn
-            FROM workload_artifacts wa
-            JOIN deployments d ON d.id = wa.deploy_id AND d.app_id = wa.app_id
-            WHERE d.status::text = ANY($2)
-        )
-        SELECT signed_policy_artifact
-        FROM ranked
-        WHERE rn <= $1
-        ORDER BY
-            CASE deploy_status
-                WHEN 'pending' THEN 0
-                WHEN 'applying' THEN 0
-                WHEN 'watching' THEN 0
-                WHEN 'healthy' THEN 1
-                WHEN 'failed' THEN 2
-                ELSE 3
-            END,
-            created_at DESC
-        "#,
-    )
-    .bind(config.signed_policy_retention)
-    .bind(SIGNED_POLICY_RECONCILE_DEPLOY_STATUSES)
-    .fetch_all(db)
-    .await?;
+    let rows: Vec<SignedPolicyArtifactRow> = sqlx::query_as(signed_policy_artifact_rows_query())
+        .bind(config.signed_policy_retention)
+        .bind(SIGNED_POLICY_RECONCILE_DEPLOY_STATUSES)
+        .bind(SIGNED_POLICY_RECONCILE_APP_STATUSES)
+        .fetch_all(db)
+        .await?;
 
     if rows.is_empty() && extra_artifact.is_none() {
         return Ok(());
@@ -950,5 +957,17 @@ owner_resource_bindings := {}
             signed_policy_reconcile_status_rank("watching")
                 < signed_policy_reconcile_status_rank("failed")
         );
+    }
+
+    #[test]
+    fn signed_policy_reconciliation_filters_deleted_or_stopped_apps() {
+        let query = signed_policy_artifact_rows_query();
+        assert!(query.contains("JOIN apps a ON a.id = wa.app_id"));
+        assert!(query.contains("a.status::text = ANY($3)"));
+        assert!(SIGNED_POLICY_RECONCILE_APP_STATUSES.contains(&"creating"));
+        assert!(SIGNED_POLICY_RECONCILE_APP_STATUSES.contains(&"running"));
+        assert!(SIGNED_POLICY_RECONCILE_APP_STATUSES.contains(&"failed"));
+        assert!(!SIGNED_POLICY_RECONCILE_APP_STATUSES.contains(&"deleting"));
+        assert!(!SIGNED_POLICY_RECONCILE_APP_STATUSES.contains(&"stopped"));
     }
 }
