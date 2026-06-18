@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -19,6 +20,9 @@ pub const KEY_RELATIVE_PATH: &str = "certificates/tls.key";
 const METADATA_RELATIVE_PATH: &str = "certificates/tls.metadata.json";
 const METADATA_VERSION: u8 = 1;
 const TLS_KEY_DERIVATION_INFO_PREFIX: &[u8] = b"enclava-tenant-tls-p256-key-v1";
+const TLS_BROKER_REQUEST_TIMEOUT_SECONDS: u64 = 180;
+const TLS_BROKER_RETRY_ATTEMPTS: u32 = 20;
+const TLS_BROKER_RETRY_SLEEP_SECONDS: u64 = 15;
 
 #[derive(Debug, Serialize)]
 struct CertificateRequest<'a> {
@@ -37,6 +41,12 @@ struct CertificateMetadata {
     version: u8,
     broker_url: String,
     hostnames: Vec<String>,
+}
+
+#[derive(Debug)]
+struct BrokerRequestError {
+    message: String,
+    retryable: bool,
 }
 
 pub fn provision_static_tls_certificate(
@@ -85,7 +95,7 @@ pub fn provision_static_tls_certificate(
     .context("resolving KBS attestation token for TLS certificate broker")?;
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(TLS_BROKER_REQUEST_TIMEOUT_SECONDS))
         .build()
         .context("building TLS certificate broker client")?;
     let request = CertificateRequest {
@@ -93,22 +103,7 @@ pub fn provision_static_tls_certificate(
         csr_der_base64: base64::engine::general_purpose::STANDARD.encode(csr_der),
         cc_init_data_hash: local_cc_init_data_hash(cfg)?,
     };
-    let response = client
-        .post(broker_url)
-        .header("Authorization", format!("Attestation {token}"))
-        .json(&request)
-        .send()
-        .with_context(|| format!("requesting TLS certificate from {broker_url}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().unwrap_or_default();
-        return Err(anyhow!(
-            "TLS certificate broker returned HTTP {status}: {body}"
-        ));
-    }
-    let body: CertificateResponse = response
-        .json()
-        .context("decoding TLS certificate broker response")?;
+    let body = request_certificate_with_retries(&client, broker_url, &token, &request)?;
     if !body
         .certificate_chain_pem
         .contains("-----BEGIN CERTIFICATE-----")
@@ -124,6 +119,79 @@ pub fn provision_static_tls_certificate(
     writes::atomic_write(&metadata_path(persistent_root), &metadata_json, 0o644)
         .with_context(|| format!("writing {}", metadata_path(persistent_root).display()))?;
     Ok(())
+}
+
+fn request_certificate_with_retries(
+    client: &reqwest::blocking::Client,
+    broker_url: &str,
+    token: &str,
+    request: &CertificateRequest<'_>,
+) -> Result<CertificateResponse> {
+    for attempt in 1..=TLS_BROKER_RETRY_ATTEMPTS {
+        match request_certificate_once(client, broker_url, token, request) {
+            Ok(body) => return Ok(body),
+            Err(err) if err.retryable && attempt < TLS_BROKER_RETRY_ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = TLS_BROKER_RETRY_ATTEMPTS,
+                    retry_sleep_seconds = TLS_BROKER_RETRY_SLEEP_SECONDS,
+                    error = %err.message,
+                    "TLS certificate broker returned a retryable error"
+                );
+                thread::sleep(Duration::from_secs(TLS_BROKER_RETRY_SLEEP_SECONDS));
+            }
+            Err(err) => return Err(anyhow!(err.message)),
+        }
+    }
+    unreachable!("TLS broker retry loop must return on success or final error")
+}
+
+fn request_certificate_once(
+    client: &reqwest::blocking::Client,
+    broker_url: &str,
+    token: &str,
+    request: &CertificateRequest<'_>,
+) -> Result<CertificateResponse, BrokerRequestError> {
+    let response = client
+        .post(broker_url)
+        .header("Authorization", format!("Attestation {token}"))
+        .json(&request)
+        .send()
+        .map_err(|err| BrokerRequestError {
+            message: format!("requesting TLS certificate from {broker_url}: {err}"),
+            retryable: true,
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().unwrap_or_default();
+        return Err(BrokerRequestError {
+            message: format!("TLS certificate broker returned HTTP {status}: {body}"),
+            retryable: broker_response_is_retryable(status, &body),
+        });
+    }
+    response.json().map_err(|err| BrokerRequestError {
+        message: format!("decoding TLS certificate broker response: {err}"),
+        retryable: false,
+    })
+}
+
+fn broker_response_is_retryable(status: reqwest::StatusCode, body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    let temporary_acme_error = body.contains("service busy")
+        || body.contains("retry later")
+        || body.contains("try again later")
+        || body.contains("temporarily unavailable");
+    let exact_set_limit =
+        body.contains("too many certificates") || body.contains("exact set of identifiers");
+
+    matches!(
+        status,
+        reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+    ) && temporary_acme_error
+        && !exact_set_limit
 }
 
 pub fn cert_path(persistent_root: &Path) -> PathBuf {
@@ -565,5 +633,25 @@ hkdf-info = "tls-state-luks-key"
                 b"descriptor_core_hash = \"abc\"\n"
             )))
         );
+    }
+
+    #[test]
+    fn acme_service_busy_broker_response_is_retryable() {
+        let body = r#"{"error":"acme_certificate_issuance_failed","detail":"ACME failed: API error: Service busy; retry later. (urn:ietf:params:acme:error:rateLimited)"}"#;
+
+        assert!(broker_response_is_retryable(
+            reqwest::StatusCode::BAD_GATEWAY,
+            body
+        ));
+    }
+
+    #[test]
+    fn exact_set_rate_limit_broker_response_is_not_retryable() {
+        let body = "ACME failed: API error: too many certificates (5) already issued for this exact set of identifiers in the last 168h0m0s, retry after 2026-06-10 19:38:28 UTC";
+
+        assert!(!broker_response_is_retryable(
+            reqwest::StatusCode::BAD_GATEWAY,
+            body
+        ));
     }
 }
