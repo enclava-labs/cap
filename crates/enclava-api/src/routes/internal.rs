@@ -1249,6 +1249,7 @@ pub async fn deploy_paas_app(
         customer_descriptor_blob: body.customer_descriptor_blob,
         org_keyring_blob: body.org_keyring_blob,
         signed_policy_artifact: body.signed_policy_artifact,
+        workload_security_profile: None,
     };
     let (status, Json(response)) = crate::routes::deployments::deploy(
         auth,

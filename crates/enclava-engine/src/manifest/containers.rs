@@ -47,6 +47,8 @@ pub fn enclava_init_image() -> String {
 }
 
 pub const ENCLAVA_WAIT_EXEC_PATH: &str = "/enclava-tools/enclava-wait-exec";
+const WORKLOAD_SECURITY_PROFILE_ENV: &str = "ENCLAVA_WORKLOAD_SECURITY_PROFILE";
+const ROOTFUL_SUDO_WORKLOAD_PROFILE: &str = "rootful-sudo";
 pub const APP_SEED_PATH: &str = "/state/app/seed";
 pub const CADDY_SEED_PATH: &str = "/state/caddy/seed";
 pub const CADDY_ACME_TLS_PORT: i32 = 10443;
@@ -137,6 +139,13 @@ fn cap_config_paths(app: &ConfidentialApp) -> (&'static str, &'static str) {
 fn storage_path_uses_app_data(path: &String) -> bool {
     let rel = path.trim_start_matches('/');
     rel.strip_prefix("state/").unwrap_or(rel).replace('/', "-") == "app-data"
+}
+
+fn primary_uses_rootful_sudo_profile(primary: &crate::types::Container) -> bool {
+    primary
+        .env
+        .get(WORKLOAD_SECURITY_PROFILE_ENV)
+        .is_some_and(|profile| profile == ROOTFUL_SUDO_WORKLOAD_PROFILE)
 }
 
 fn required_config_keys_from_primary(app: &ConfidentialApp) -> Option<String> {
@@ -267,6 +276,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
 
     let app_port = primary.port.unwrap_or(8080);
     let legacy = legacy_bootstrap_enabled();
+    let rootful_sudo = primary_uses_rootful_sudo_profile(primary);
 
     let mut env_vars = Vec::new();
     if legacy {
@@ -394,6 +404,29 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".to_string()]),
                 add: Some(vec!["SYS_ADMIN".to_string()]),
+            }),
+            ..Default::default()
+        }
+    } else if rootful_sudo {
+        SecurityContext {
+            privileged: Some(false),
+            allow_privilege_escalation: Some(true),
+            run_as_user: Some(10001),
+            run_as_group: Some(10001),
+            run_as_non_root: Some(true),
+            read_only_root_filesystem: Some(false),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                add: Some(vec![
+                    "CHOWN".to_string(),
+                    "DAC_OVERRIDE".to_string(),
+                    "FOWNER".to_string(),
+                    "FSETID".to_string(),
+                    "MKNOD".to_string(),
+                    "SETFCAP".to_string(),
+                    "SETGID".to_string(),
+                    "SETUID".to_string(),
+                ]),
             }),
             ..Default::default()
         }

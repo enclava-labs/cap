@@ -31,6 +31,30 @@ fn app_container_is_not_privileged() {
 }
 
 #[test]
+fn app_container_rootful_sudo_profile_allows_setuid_and_writable_rootfs() {
+    let mut app = sample_app();
+    app.containers[0].env.insert(
+        "ENCLAVA_WORKLOAD_SECURITY_PROFILE".to_string(),
+        "rootful-sudo".to_string(),
+    );
+
+    let c = build_app_container(&app);
+    let sc = c.security_context.as_ref().unwrap();
+
+    assert_eq!(sc.privileged, Some(false));
+    assert_eq!(sc.allow_privilege_escalation, Some(true));
+    assert_eq!(sc.run_as_user, Some(10001));
+    assert_eq!(sc.run_as_group, Some(10001));
+    assert_eq!(sc.run_as_non_root, Some(true));
+    assert_eq!(sc.read_only_root_filesystem, Some(false));
+    let caps = sc.capabilities.as_ref().unwrap();
+    assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
+    assert!(caps.add.as_ref().unwrap().contains(&"SETUID".to_string()));
+    assert!(caps.add.as_ref().unwrap().contains(&"SETGID".to_string()));
+    assert!(caps.add.as_ref().unwrap().contains(&"CHOWN".to_string()));
+}
+
+#[test]
 fn app_container_does_not_use_sh_c() {
     let c = build_app_container(&sample_app());
     if let Some(cmd) = c.command.as_ref() {

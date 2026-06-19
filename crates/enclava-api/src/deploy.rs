@@ -19,6 +19,70 @@ use uuid::Uuid;
 
 use crate::models::{App, AppContainer, AppResources, AppStatus};
 
+pub(crate) const WORKLOAD_SECURITY_PROFILE_ENV: &str = "ENCLAVA_WORKLOAD_SECURITY_PROFILE";
+pub(crate) const ROOTFUL_SUDO_WORKLOAD_PROFILE: &str = "rootful-sudo";
+const ROOTFUL_SUDO_CAPABILITIES: &[&str] = &[
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "FSETID",
+    "MKNOD",
+    "SETFCAP",
+    "SETGID",
+    "SETUID",
+];
+
+pub(crate) fn validate_workload_security_profile(profile: &str) -> Result<(), String> {
+    match profile {
+        ROOTFUL_SUDO_WORKLOAD_PROFILE => Ok(()),
+        other => Err(format!("unsupported workload_security_profile {other:?}")),
+    }
+}
+
+pub(crate) fn apply_workload_security_profile(
+    app: &mut ConfidentialApp,
+    profile: Option<&str>,
+) -> Result<(), DeployError> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    validate_workload_security_profile(profile).map_err(DeployError::Validation)?;
+    let primary = app
+        .containers
+        .iter_mut()
+        .find(|container| container.is_primary)
+        .ok_or(DeployError::NoContainers)?;
+    primary.env.insert(
+        WORKLOAD_SECURITY_PROFILE_ENV.to_string(),
+        profile.to_string(),
+    );
+    Ok(())
+}
+
+pub(crate) fn apply_workload_security_profile_to_oci(
+    oci: &mut enclava_common::descriptor::OciRuntimeSpec,
+    profile: Option<&str>,
+) -> Result<(), String> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    validate_workload_security_profile(profile)?;
+    match profile {
+        ROOTFUL_SUDO_WORKLOAD_PROFILE => {
+            oci.security_context.read_only_root_fs = false;
+            oci.security_context.allow_privilege_escalation = true;
+            oci.security_context.privileged = false;
+            oci.capabilities.drop = vec!["ALL".to_string()];
+            oci.capabilities.add = ROOTFUL_SUDO_CAPABILITIES
+                .iter()
+                .map(|capability| capability.to_string())
+                .collect();
+            Ok(())
+        }
+        _ => unreachable!("validated workload security profile"),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct DeploymentOutcome {
     deploy_status: &'static str,
@@ -76,6 +140,7 @@ pub struct ApplyDeploymentManifestsRequest {
     pub signed_descriptor: Option<DeploymentDescriptor>,
     pub local_workload_artifacts_json: Option<String>,
     pub local_trustee_policy_json: Option<String>,
+    pub workload_security_profile: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -867,6 +932,7 @@ pub async fn apply_deployment_manifests(
         signed_descriptor,
         local_workload_artifacts_json,
         local_trustee_policy_json,
+        workload_security_profile,
     } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
     let mut app_spec = build_confidential_app(
@@ -878,6 +944,7 @@ pub async fn apply_deployment_manifests(
     )
     .await?;
     apply_signed_descriptor_runtime(&mut app_spec, signed_descriptor.as_ref());
+    apply_workload_security_profile(&mut app_spec, workload_security_profile.as_deref())?;
     app_spec.workload_artifact_binding = workload_artifact_binding;
     if let (Some(workload_artifacts), Some(trustee_policy)) =
         (local_workload_artifacts_json, local_trustee_policy_json)

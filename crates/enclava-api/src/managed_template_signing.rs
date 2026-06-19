@@ -58,6 +58,7 @@ pub struct ManagedTemplateSigningInput {
     pub storage_paths: Vec<String>,
     pub cpu: String,
     pub memory: String,
+    pub workload_security_profile: Option<String>,
 }
 
 pub struct ManagedTemplateSigningArtifacts {
@@ -188,6 +189,20 @@ pub async fn build_managed_template_signing_artifacts(
         "tenant_instance_identity_hash",
         &input.app.tenant_instance_identity_hash,
     )?;
+    let mut oci_runtime_spec = cap_app_oci_runtime_spec(CapAppOciRuntimeSpecInput {
+        container_name: input.container_name,
+        port: input.port,
+        workload_command: input.command,
+        storage_paths: input.storage_paths,
+        cpu_limit: input.cpu,
+        memory_limit: input.memory,
+    });
+    crate::deploy::apply_workload_security_profile_to_oci(
+        &mut oci_runtime_spec,
+        input.workload_security_profile.as_deref(),
+    )
+    .map_err(ManagedTemplateSigningError::Validation)?;
+
     let mut descriptor = build_descriptor(DeploymentDescriptorBuildInput {
         org_id: input.app.org_id,
         org_slug,
@@ -215,14 +230,7 @@ pub async fn build_managed_template_signing_artifacts(
                 .unwrap_or_default(),
             issuer: input.app.signer_identity_issuer.clone().unwrap_or_default(),
         },
-        oci_runtime_spec: cap_app_oci_runtime_spec(CapAppOciRuntimeSpecInput {
-            container_name: input.container_name,
-            port: input.port,
-            workload_command: input.command,
-            storage_paths: input.storage_paths,
-            cpu_limit: input.cpu,
-            memory_limit: input.memory,
-        }),
+        oci_runtime_spec,
         sidecars: Sidecars {
             attestation_proxy_digest: proxy_image.digest().to_string(),
             caddy_digest: caddy_image.digest().to_string(),
@@ -269,6 +277,7 @@ pub async fn build_managed_template_signing_artifacts(
         &state.api_url,
         image_ref,
         &descriptor,
+        input.workload_security_profile.as_deref(),
     )?;
     crate::routes::deployments::select_local_signed_artifact_delivery(&mut app_spec.attestation);
     app_spec.workload_artifact_binding = Some(binding);
@@ -495,6 +504,7 @@ fn confidential_app_for_template_hash(
     api_url: &str,
     image_ref: ImageRef,
     descriptor: &enclava_common::descriptor::DeploymentDescriptor,
+    workload_security_profile: Option<&str>,
 ) -> Result<ConfidentialApp, ManagedTemplateSigningError> {
     let unlock_mode = match app.unlock_mode {
         crate::models::UnlockMode::Auto => enclava_common::types::UnlockMode::Auto,
@@ -504,7 +514,7 @@ fn confidential_app_for_template_hash(
         crate::routes::apps::engine_egress_allowlist_from_json(&app.egress_allowlist)
             .map_err(ManagedTemplateSigningError::Validation)?;
 
-    Ok(ConfidentialApp {
+    let mut app_spec = ConfidentialApp {
         app_id: app.id,
         name: app.name.clone(),
         namespace: app.namespace.clone(),
@@ -569,7 +579,9 @@ fn confidential_app_for_template_hash(
         egress_allowlist,
         workload_artifact_binding: None,
         generated_agent_policy: None,
-    })
+    };
+    crate::deploy::apply_workload_security_profile(&mut app_spec, workload_security_profile)?;
+    Ok(app_spec)
 }
 
 fn app_unlock_mode(mode: crate::models::UnlockMode) -> &'static str {

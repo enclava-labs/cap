@@ -822,6 +822,7 @@ pub async fn update_unlock_mode(
                 signed_descriptor,
                 local_workload_artifacts_json,
                 local_trustee_policy_json,
+                workload_security_profile: None,
             },
         )
         .await

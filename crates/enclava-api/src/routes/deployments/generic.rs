@@ -72,6 +72,8 @@ pub struct GenericDeploymentSecurity {
     pub signed_policy_artifact: Option<String>,
     #[serde(default)]
     pub managed_template_signing: bool,
+    #[serde(default)]
+    pub workload_security_profile: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,8 +151,11 @@ pub(crate) async fn recover_generic_deployment_by_external_id(
     else {
         return Ok(None);
     };
-    let requested_generic =
-        generic_workload_snapshot(&body.workload, body.security.managed_template_signing);
+    let requested_generic = generic_workload_snapshot(
+        &body.workload,
+        body.security.managed_template_signing,
+        body.security.workload_security_profile.as_deref(),
+    );
     let missing_generic = deployment.spec_snapshot.get("generic_workload").is_none();
     ensure_idempotent_retry_matches(&deployment, &app, body, true)?;
     if missing_generic && requested_generic != default_generic_workload_snapshot() {
@@ -249,6 +254,18 @@ pub async fn create_generic_deployment(
             StatusCode::FORBIDDEN,
             "managed_template_signing is only available through PaaS internal deployments",
         ));
+    }
+    if let Some(profile) = body.security.workload_security_profile.as_deref() {
+        crate::deploy::validate_workload_security_profile(profile)
+            .map_err(|message| json_error(StatusCode::BAD_REQUEST, message))?;
+        if !managed_template_signing
+            || auth.management_origin != crate::auth::middleware::ManagementOrigin::PaasInternal
+        {
+            return Err(json_error(
+                StatusCode::FORBIDDEN,
+                "workload_security_profile is only available for PaaS managed template deployments",
+            ));
+        }
     }
     let org_id = auth.org_id;
     let user_id = auth.user_id;
@@ -388,6 +405,7 @@ pub async fn create_generic_deployment(
                 storage_paths: body.workload.storage_paths.clone(),
                 cpu,
                 memory,
+                workload_security_profile: security.workload_security_profile.clone(),
             },
         )
         .await
@@ -396,8 +414,12 @@ pub async fn create_generic_deployment(
         security.org_keyring_blob = Some(artifacts.org_keyring_blob);
     }
 
-    let generic_workload =
-        generic_workload_snapshot(&body.workload, security.managed_template_signing);
+    let generic_workload = generic_workload_snapshot(
+        &body.workload,
+        security.managed_template_signing,
+        security.workload_security_profile.as_deref(),
+    );
+    let workload_security_profile = security.workload_security_profile.clone();
     let deploy_request = DeployRequest {
         image: body.workload.image,
         container_name: body.workload.container_name,
@@ -408,6 +430,7 @@ pub async fn create_generic_deployment(
         customer_descriptor_blob: security.customer_descriptor_blob,
         org_keyring_blob: security.org_keyring_blob,
         signed_policy_artifact: security.signed_policy_artifact,
+        workload_security_profile,
     };
     let (status, Json(deployed)) = deploy(
         auth,
@@ -659,11 +682,17 @@ pub(super) fn ensure_idempotent_retry_matches(
     if existing_resources != requested_resources {
         return Err(idempotency_conflict("workload.resources"));
     }
-    let requested_generic =
-        generic_workload_snapshot(&body.workload, body.security.managed_template_signing);
+    let requested_generic = generic_workload_snapshot(
+        &body.workload,
+        body.security.managed_template_signing,
+        body.security.workload_security_profile.as_deref(),
+    );
     match deployment.spec_snapshot.get("generic_workload") {
-        Some(existing_generic) if existing_generic != &requested_generic => {
-            return Err(idempotency_conflict("generic_workload"));
+        Some(existing_generic) => {
+            let existing_generic = normalize_generic_workload_snapshot(existing_generic);
+            if existing_generic != requested_generic {
+                return Err(idempotency_conflict("generic_workload"));
+            }
         }
         None if requested_generic != default_generic_workload_snapshot()
             && !allow_missing_generic_workload =>
@@ -688,18 +717,31 @@ fn default_generic_workload_snapshot() -> serde_json::Value {
         "port": null,
         "storage_paths": [],
         "managed_template_signing": false,
+        "workload_security_profile": null,
     })
+}
+
+fn normalize_generic_workload_snapshot(value: &serde_json::Value) -> serde_json::Value {
+    let mut normalized = value.clone();
+    if let Some(object) = normalized.as_object_mut() {
+        object
+            .entry("workload_security_profile")
+            .or_insert(serde_json::Value::Null);
+    }
+    normalized
 }
 
 fn generic_workload_snapshot(
     workload: &GenericDeploymentWorkload,
     managed_template_signing: bool,
+    workload_security_profile: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
         "command": workload.command,
         "port": workload.port,
         "storage_paths": workload.storage_paths,
         "managed_template_signing": managed_template_signing,
+        "workload_security_profile": workload_security_profile,
     })
 }
 

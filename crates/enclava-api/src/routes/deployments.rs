@@ -244,6 +244,8 @@ pub struct DeployRequest {
     pub org_keyring_blob: Option<String>,
     #[serde(default)]
     pub signed_policy_artifact: Option<String>,
+    #[serde(default)]
+    pub workload_security_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -401,6 +403,16 @@ pub async fn deploy(
 ) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    if let Some(profile) = body.workload_security_profile.as_deref() {
+        crate::deploy::validate_workload_security_profile(profile)
+            .map_err(|message| json_error(StatusCode::BAD_REQUEST, message))?;
+        if auth.management_origin != crate::auth::middleware::ManagementOrigin::PaasInternal {
+            return Err(json_error(
+                StatusCode::FORBIDDEN,
+                "workload_security_profile is only available through PaaS internal deployments",
+            ));
+        }
+    }
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -447,6 +459,12 @@ pub async fn deploy(
         body.org_keyring_blob.clone(),
     )
     .map_err(signing_error_response)?;
+    if body.workload_security_profile.is_some() && signing_artifacts.is_none() {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "workload_security_profile requires signed deployment artifacts",
+        ));
+    }
     let effective_resources =
         merge_signed_descriptor_resources(body.resources.clone(), signing_artifacts.as_ref())
             .map_err(|message| json_error(StatusCode::BAD_REQUEST, message))?;
@@ -737,6 +755,16 @@ pub async fn deploy(
                 Json(serde_json::json!({"error": e.to_string()})),
             )
         })?;
+        crate::deploy::apply_workload_security_profile(
+            &mut app_spec,
+            body.workload_security_profile.as_deref(),
+        )
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+        })?;
         let binding = artifacts.binding();
         app_spec.workload_artifact_binding = Some(binding.clone());
 
@@ -809,6 +837,7 @@ pub async fn deploy(
         "external_id": &body.external_id,
         "source_provider": source_provider,
         "source_repository": &body.source_repository,
+        "workload_security_profile": &body.workload_security_profile,
         "signed_descriptor_core_hash": signing_artifacts
             .as_ref()
             .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
@@ -916,6 +945,7 @@ pub async fn deploy(
     let signed_descriptor = signing_artifacts
         .as_ref()
         .map(|artifacts| artifacts.descriptor.clone());
+    let workload_security_profile = body.workload_security_profile.clone();
     tokio::spawn(async move {
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
@@ -955,6 +985,7 @@ pub async fn deploy(
                 signed_descriptor,
                 local_workload_artifacts_json,
                 local_trustee_policy_json,
+                workload_security_profile,
             },
         )
         .await
