@@ -12,12 +12,14 @@ use kube::Api;
 use kube::api::ListParams;
 use serde::Serialize;
 use serde_json::json;
+use std::time::Duration;
+use tokio::time::MissedTickBehavior;
 
 use crate::auth::{middleware::AuthContext, scopes};
-use crate::models::{App, UnlockMode};
+use crate::models::{App, AppStatus, UnlockMode};
 use crate::state::AppState;
 use enclava_engine::apply::watch::{
-    force_delete_stale_terminating_pods, kata_start_error_needs_pod_recreate,
+    KataPodRecreatePlan, force_delete_stale_terminating_pods, kata_start_error_needs_pod_recreate,
     plan_stale_terminating_pod_force_deletes, plan_unready_running_pod_recreates,
     pod_label_selector, recreate_kata_start_error_pods, recreate_unready_running_pods,
 };
@@ -47,6 +49,105 @@ pub struct RuntimeRecoveryResponse {
     pub status: String,
     pub recovered_pods: Vec<RuntimeRecoveryPodResponse>,
     pub unlock_may_be_required: bool,
+}
+
+pub fn background_runtime_recovery_candidate(status: AppStatus, unlock_mode: UnlockMode) -> bool {
+    matches!(
+        (status, unlock_mode),
+        (AppStatus::Running, UnlockMode::Auto)
+    )
+}
+
+pub async fn run_background_runtime_recovery(state: AppState, interval: Duration) {
+    if interval.is_zero() {
+        tracing::info!("background runtime recovery disabled");
+        return;
+    }
+
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+
+        let client = match kube::Client::try_default().await {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::warn!(error = %err, "background runtime recovery skipped: Kubernetes client unavailable");
+                continue;
+            }
+        };
+
+        match background_runtime_recovery_once(&state, client).await {
+            Ok(recovered) if recovered > 0 => {
+                tracing::info!(
+                    recovered_pods = recovered,
+                    "background runtime recovery restarted stuck pod(s)"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, "background runtime recovery pass failed");
+            }
+        }
+    }
+}
+
+async fn background_runtime_recovery_once(
+    state: &AppState,
+    client: kube::Client,
+) -> anyhow::Result<usize> {
+    let apps: Vec<App> = sqlx::query_as(
+        "SELECT * FROM apps WHERE status = 'running'::app_status_enum AND unlock_mode = 'auto'::unlock_enum",
+    )
+    .fetch_all(&state.db)
+    .await?;
+
+    let mut recovered_count = 0;
+    for app in apps
+        .into_iter()
+        .filter(|app| background_runtime_recovery_candidate(app.status, app.unlock_mode))
+    {
+        match recover_runtime_app(client.clone(), &app).await {
+            Ok(recovered) => {
+                if !recovered.is_empty() {
+                    tracing::warn!(
+                        app = %app.name,
+                        namespace = %app.namespace,
+                        recovered_pods = recovered.len(),
+                        "background runtime recovery restarted app pod(s)"
+                    );
+                }
+                recovered_count += recovered.len();
+            }
+            Err(err) => {
+                tracing::warn!(
+                    app = %app.name,
+                    namespace = %app.namespace,
+                    error = %err,
+                    "background runtime recovery failed for app"
+                );
+            }
+        }
+    }
+
+    Ok(recovered_count)
+}
+
+async fn recover_runtime_app(
+    client: kube::Client,
+    app: &App,
+) -> anyhow::Result<Vec<KataPodRecreatePlan>> {
+    let mut recovered =
+        recreate_kata_start_error_pods(client.clone(), &app.namespace, &app.name).await?;
+    let stale_terminating_recovered =
+        force_delete_stale_terminating_pods(client.clone(), &app.namespace, &app.name).await?;
+    recovered.extend(stale_terminating_recovered);
+    let unready_recovered =
+        recreate_unready_running_pods(client, &app.namespace, &app.name).await?;
+    recovered.extend(unready_recovered);
+
+    Ok(recovered)
 }
 
 /// GET /apps/{name}/status -- live status (pod, TEE, unlock).
@@ -193,42 +294,15 @@ pub async fn recover_runtime(
             Json(serde_json::json!({"error": "kubernetes client unavailable"})),
         )
     })?;
-    let mut recovered = recreate_kata_start_error_pods(client.clone(), &app.namespace, &app.name)
-        .await
-        .map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "runtime recovery failed",
-                    "message": err.to_string(),
-                })),
-            )
-        })?;
-    let stale_terminating_recovered =
-        force_delete_stale_terminating_pods(client.clone(), &app.namespace, &app.name)
-            .await
-            .map_err(|err| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": "runtime recovery failed",
-                        "message": err.to_string(),
-                    })),
-                )
-            })?;
-    recovered.extend(stale_terminating_recovered);
-    let unready_recovered = recreate_unready_running_pods(client, &app.namespace, &app.name)
-        .await
-        .map_err(|err| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "runtime recovery failed",
-                    "message": err.to_string(),
-                })),
-            )
-        })?;
-    recovered.extend(unready_recovered);
+    let recovered = recover_runtime_app(client, &app).await.map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "runtime recovery failed",
+                "message": err.to_string(),
+            })),
+        )
+    })?;
     let status = if recovered.is_empty() {
         "not_needed"
     } else {
@@ -318,12 +392,37 @@ pub async fn app_logs(
 
 #[cfg(test)]
 mod tests {
-    use super::{confidential_status_url, effective_app_status, runtime_recovery_reason_from_pods};
+    use super::{
+        background_runtime_recovery_candidate, confidential_status_url, effective_app_status,
+        runtime_recovery_reason_from_pods,
+    };
     use k8s_openapi::api::core::v1::{
         ContainerState, ContainerStateRunning, ContainerStatus, Pod, PodStatus,
     };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
     use k8s_openapi::jiff::Timestamp;
+
+    #[test]
+    fn background_runtime_recovery_is_limited_to_running_auto_unlock_apps() {
+        use crate::models::{AppStatus, UnlockMode};
+
+        assert!(background_runtime_recovery_candidate(
+            AppStatus::Running,
+            UnlockMode::Auto
+        ));
+        assert!(!background_runtime_recovery_candidate(
+            AppStatus::Running,
+            UnlockMode::Password
+        ));
+        assert!(!background_runtime_recovery_candidate(
+            AppStatus::Creating,
+            UnlockMode::Auto
+        ));
+        assert!(!background_runtime_recovery_candidate(
+            AppStatus::Deleting,
+            UnlockMode::Auto
+        ));
+    }
 
     #[test]
     fn unlocked_tee_does_not_mark_creating_app_running() {

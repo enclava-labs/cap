@@ -3,7 +3,7 @@ use ed25519_dalek::pkcs8::DecodePrivateKey;
 use enclava_common::image::ImageRef;
 use enclava_engine::types::{AttestationConfig, CaddyTlsMode};
 use rand::rngs::OsRng;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use enclava_api::{
@@ -69,6 +69,17 @@ fn load_management_mode() -> CapManagementMode {
         .unwrap_or("standalone")
         .parse()
         .expect("invalid CAP_MANAGEMENT_MODE")
+}
+
+fn load_runtime_recovery_interval() -> anyhow::Result<Option<Duration>> {
+    let seconds = match env_nonempty("CAP_RUNTIME_RECOVERY_INTERVAL_SECONDS") {
+        Some(value) => value.parse::<u64>().map_err(|err| {
+            anyhow::anyhow!("invalid CAP_RUNTIME_RECOVERY_INTERVAL_SECONDS: {err}")
+        })?,
+        None => 60,
+    };
+
+    Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
 }
 
 fn load_caddy_tls_mode() -> anyhow::Result<CaddyTlsMode> {
@@ -822,6 +833,28 @@ async fn main() {
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_applies)),
         internal_auth,
     };
+
+    match load_runtime_recovery_interval() {
+        Ok(Some(interval)) => {
+            let recovery_state = state.clone();
+            tokio::spawn(async move {
+                enclava_api::routes::status::run_background_runtime_recovery(
+                    recovery_state,
+                    interval,
+                )
+                .await;
+            });
+            tracing::info!(
+                interval_seconds = interval.as_secs(),
+                "background runtime recovery enabled"
+            );
+        }
+        Ok(None) => tracing::info!("background runtime recovery disabled"),
+        Err(e) => {
+            eprintln!("startup refused: {e}");
+            std::process::exit(1);
+        }
+    }
 
     let app = build_router(state);
 
