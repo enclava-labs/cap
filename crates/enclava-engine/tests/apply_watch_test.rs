@@ -7,7 +7,7 @@ use enclava_engine::apply::watch::{
 };
 use k8s_openapi::api::core::v1::{
     ContainerState, ContainerStateRunning, ContainerStateTerminated, ContainerStateWaiting,
-    ContainerStatus, Pod, PodStatus,
+    ContainerStatus, Pod, PodCondition, PodStatus,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use k8s_openapi::jiff::Timestamp;
@@ -412,6 +412,54 @@ fn recent_unready_web_container_is_not_recreated_during_unlock_startup() {
                 state: Some(ContainerState {
                     running: Some(ContainerStateRunning {
                         started_at: Some(started_at.clone()),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert!(unready_running_pod_needs_recreate(&pod, now).is_none());
+}
+
+#[test]
+fn recently_lost_ready_condition_is_not_recreated_from_container_age() {
+    let started_at = Time(
+        "2026-06-16T12:00:00Z"
+            .parse::<Timestamp>()
+            .expect("timestamp parses"),
+    );
+    let lost_ready_at = Time(
+        "2026-06-16T12:39:00Z"
+            .parse::<Timestamp>()
+            .expect("timestamp parses"),
+    );
+    let now = "2026-06-16T12:40:00Z"
+        .parse::<Timestamp>()
+        .expect("timestamp parses");
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("debian-ssh-0".to_string()),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            conditions: Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "False".to_string(),
+                last_transition_time: Some(lost_ready_at),
+                ..Default::default()
+            }]),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                ready: false,
+                restart_count: 0,
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning {
+                        started_at: Some(started_at),
                     }),
                     ..Default::default()
                 }),

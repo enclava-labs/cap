@@ -243,18 +243,35 @@ pub fn unready_running_pod_needs_recreate(pod: &Pod, now: Timestamp) -> Option<S
         return None;
     }
 
+    let unready_since = status
+        .conditions
+        .as_ref()
+        .and_then(|conditions| {
+            conditions
+                .iter()
+                .find(|condition| condition.type_ == "Ready" && condition.status != "True")
+        })
+        .and_then(|condition| condition.last_transition_time.as_ref())
+        .or_else(|| {
+            web.state
+                .as_ref()
+                .and_then(|state| state.running.as_ref())
+                .and_then(|running| running.started_at.as_ref())
+        })?;
+    let unready_seconds = now.duration_since(unready_since.0).as_secs();
+    if unready_seconds < UNREADY_RUNNING_POD_RECREATE_AFTER_SECONDS {
+        return None;
+    }
+
     let started_at = web
         .state
         .as_ref()
         .and_then(|state| state.running.as_ref())
         .and_then(|running| running.started_at.as_ref())?;
-    let unready_seconds = now.duration_since(started_at.0).as_secs();
-    if unready_seconds < UNREADY_RUNNING_POD_RECREATE_AFTER_SECONDS {
-        return None;
-    }
+    let running_seconds = now.duration_since(started_at.0).as_secs();
 
     Some(format!(
-        "container '{}' has been running unready for {unready_seconds}s; recreate pod to recover hung app inside Kata sandbox",
+        "container '{}' has been unready for {unready_seconds}s after running for {running_seconds}s; recreate pod to recover hung app inside Kata sandbox",
         web.name
     ))
 }
