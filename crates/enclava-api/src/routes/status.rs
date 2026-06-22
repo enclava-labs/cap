@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn unlocked_unready_web_pod_requires_runtime_recovery() {
+    fn unlocked_unready_web_pod_does_not_require_runtime_recovery() {
         let started_at = Time(
             "2026-06-16T12:23:29Z"
                 .parse::<Timestamp>()
@@ -509,11 +509,7 @@ mod tests {
             ..Default::default()
         };
 
-        let reason = runtime_recovery_reason_from_pods(&[pod], now, Some("unlocked"))
-            .expect("unlocked unready pod should require runtime recovery");
-
-        assert!(reason.contains("routstr-core-prod-0"));
-        assert!(reason.contains("unready"));
+        assert!(runtime_recovery_reason_from_pods(&[pod], now, Some("unlocked")).is_none());
     }
 
     #[test]

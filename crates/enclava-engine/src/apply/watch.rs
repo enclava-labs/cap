@@ -8,9 +8,6 @@ use super::engine::{ApplyEngine, ApplyError};
 use super::types::{DeployPhase, DeployStatus};
 
 const STALE_TERMINATING_POD_FORCE_DELETE_BUFFER_SECONDS: i64 = 10;
-const UNREADY_RUNNING_POD_RECREATE_AFTER_SECONDS: i64 = 600;
-const POST_READY_UNREADY_RUNNING_POD_RECREATE_AFTER_SECONDS: i64 = 90;
-const POST_READY_UNREADY_RUNNING_POD_MIN_RUNNING_SECONDS: i64 = 600;
 
 pub fn pod_label_selector(statefulset_name: &str) -> String {
     format!("app={statefulset_name}")
@@ -226,62 +223,12 @@ pub fn plan_stale_terminating_pod_force_deletes(
         .collect()
 }
 
-pub fn unready_running_pod_needs_recreate(pod: &Pod, now: Timestamp) -> Option<String> {
-    if pod.metadata.deletion_timestamp.is_some() {
-        return None;
-    }
-
-    let status = pod.status.as_ref()?;
-    if status.phase.as_deref() != Some("Running") {
-        return None;
-    }
-
-    let web = status
-        .container_statuses
-        .as_ref()?
-        .iter()
-        .find(|container| container.name == "web")?;
-    if web.ready {
-        return None;
-    }
-
-    let started_at = web
-        .state
-        .as_ref()
-        .and_then(|state| state.running.as_ref())
-        .and_then(|running| running.started_at.as_ref())?;
-    let ready_condition_unready_since = status
-        .conditions
-        .as_ref()
-        .and_then(|conditions| {
-            conditions
-                .iter()
-                .find(|condition| condition.type_ == "Ready" && condition.status != "True")
-        })
-        .and_then(|condition| condition.last_transition_time.as_ref());
-    let unready_since = ready_condition_unready_since.unwrap_or(started_at);
-    let unready_seconds = now.duration_since(unready_since.0).as_secs();
-    let recreate_after_seconds = ready_condition_unready_since
-        .map(|unready_since| {
-            let ran_before_unready = unready_since.0.duration_since(started_at.0).as_secs();
-            if ran_before_unready >= POST_READY_UNREADY_RUNNING_POD_MIN_RUNNING_SECONDS {
-                POST_READY_UNREADY_RUNNING_POD_RECREATE_AFTER_SECONDS
-            } else {
-                UNREADY_RUNNING_POD_RECREATE_AFTER_SECONDS
-            }
-        })
-        .unwrap_or(UNREADY_RUNNING_POD_RECREATE_AFTER_SECONDS);
-
-    if unready_seconds < recreate_after_seconds {
-        return None;
-    }
-
-    let running_seconds = now.duration_since(started_at.0).as_secs();
-
-    Some(format!(
-        "container '{}' has been unready for {unready_seconds}s after running for {running_seconds}s; recreate pod to recover hung app inside Kata sandbox",
-        web.name
-    ))
+pub fn unready_running_pod_needs_recreate(_pod: &Pod, _now: Timestamp) -> Option<String> {
+    // Web readiness is application state, not proof that the Kata sandbox is stuck.
+    // Runtime recovery stays limited to explicit runtime failures such as StartError
+    // and stale terminating pods; otherwise transient app readiness can kill
+    // long-lived sessions.
+    None
 }
 
 pub fn plan_unready_running_pod_recreates(

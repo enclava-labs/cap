@@ -348,7 +348,7 @@ fn kata_start_error_repair_plan_selects_only_runtime_start_errors() {
 }
 
 #[test]
-fn long_running_unready_web_container_needs_whole_pod_recreate() {
+fn long_running_unready_web_container_does_not_need_whole_pod_recreate() {
     let started_at = Time(
         "2026-06-16T12:23:29Z"
             .parse::<Timestamp>()
@@ -381,11 +381,7 @@ fn long_running_unready_web_container_needs_whole_pod_recreate() {
         ..Default::default()
     };
 
-    let reason = unready_running_pod_needs_recreate(&pod, now)
-        .expect("long-running unready web container should need pod recreation");
-
-    assert!(reason.contains("web"));
-    assert!(reason.contains("unready"));
+    assert!(unready_running_pod_needs_recreate(&pod, now).is_none());
 }
 
 #[test]
@@ -474,7 +470,7 @@ fn recently_lost_ready_condition_is_not_recreated_from_container_age() {
 }
 
 #[test]
-fn post_ready_unready_web_container_recreates_after_short_recovery_window() {
+fn post_ready_unready_web_container_does_not_recreate_after_short_recovery_window() {
     let started_at = Time(
         "2026-06-16T12:00:00Z"
             .parse::<Timestamp>()
@@ -518,15 +514,11 @@ fn post_ready_unready_web_container_recreates_after_short_recovery_window() {
         ..Default::default()
     };
 
-    let reason = unready_running_pod_needs_recreate(&pod, now)
-        .expect("post-ready unready web container should need pod recreation");
-
-    assert!(reason.contains("web"));
-    assert!(reason.contains("unready"));
+    assert!(unready_running_pod_needs_recreate(&pod, now).is_none());
 }
 
 #[test]
-fn unready_running_repair_plan_selects_only_stale_web_container() {
+fn unready_running_repair_plan_ignores_app_readiness_failure() {
     let started_at = Time(
         "2026-06-16T12:23:29Z"
             .parse::<Timestamp>()
@@ -584,9 +576,7 @@ fn unready_running_repair_plan_selects_only_stale_web_container() {
 
     let plan = plan_unready_running_pod_recreates(&[stale_unready_pod, ready_pod], now);
 
-    assert_eq!(plan.len(), 1);
-    assert_eq!(plan[0].pod_name, "routstr-core-prod-0");
-    assert!(plan[0].reason.contains("unready"));
+    assert!(plan.is_empty());
 }
 
 /// Integration test: requires a running cluster.
