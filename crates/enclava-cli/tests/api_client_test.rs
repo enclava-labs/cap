@@ -86,7 +86,7 @@ async fn list_templates_gets_hosted_templates_route() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 4096];
         let n = stream.read(&mut buf).unwrap();
-        let body = r#"[{"slug":"debian-ssh-ngrok","name":"Debian SSH over ngrok","description":"SSH template","version":"2026-06-18","image":"ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","config_keys":[]}]"#;
+        let body = r#"[{"slug":"debian-ssh-ngrok","name":"Debian SSH over ngrok","description":"SSH template","version":"2026-06-18","image":"ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff","config_keys":[]}]"#;
         stream
             .write_all(
                 format!(
@@ -117,7 +117,7 @@ async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 8192];
         let n = stream.read(&mut buf).unwrap();
-        let body = r#"{"template":{"slug":"debian-ssh-ngrok","name":"Debian SSH over ngrok","description":"SSH template","version":"2026-06-18","image":"ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","config_keys":[]},"app":{"name":"shell"},"deployment":{"cap_deployment_id":"deploy-1","status":"pending"},"config_token":{"token":"redacted","tee_url":"https://shell.tee.example/.well-known/confidential/config","expires_in_seconds":300},"cap":{"app_domain":"shell.example"}}"#;
+        let body = r#"{"template":{"slug":"debian-ssh-ngrok","name":"Debian SSH over ngrok","description":"SSH template","version":"2026-06-18","image":"ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff","config_keys":[]},"app":{"name":"shell"},"deployment":{"cap_deployment_id":"deploy-1","status":"pending"},"config_token":{"token":"redacted","tee_url":"https://shell.tee.example/.well-known/confidential/config","expires_in_seconds":300},"cap":{"app_domain":"shell.example"}}"#;
         stream
             .write_all(
                 format!(

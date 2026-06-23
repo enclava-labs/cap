@@ -677,7 +677,7 @@ mod tests {
             name: "Debian SSH over ngrok".to_string(),
             description: "SSH template".to_string(),
             version: "2026-06-18".to_string(),
-            image: "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            image: "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff".to_string(),
             config_keys: vec![
                 HostedTemplateConfigKey {
                     key: "NGROK_AUTHTOKEN".to_string(),

@@ -195,7 +195,7 @@ fn hosted_template_response_accepts_stable_ssh_endpoint_metadata() {
         "name": "Debian SSH over ngrok",
         "description": "Confidential Debian shell with SSH exposed through an ngrok TCP tunnel.",
         "version": "2026-06-18",
-        "image": "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "image": "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff",
         "source_provider": "github",
         "source_repository": "enclava-labs/debian-ssh-ngrok-template",
         "signer_subject": "https://github.com/enclava-labs/debian-ssh-ngrok-template/.github/workflows/image.yml@refs/heads/main",
@@ -277,7 +277,7 @@ fn template_instance_response_accepts_config_token_and_cap_payload() {
             "name": "Debian SSH over ngrok",
             "description": "Confidential Debian shell with SSH exposed through an ngrok TCP tunnel.",
             "version": "2026-06-18",
-            "image": "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "image": "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff",
             "config_keys": []
         },
         "app": {
