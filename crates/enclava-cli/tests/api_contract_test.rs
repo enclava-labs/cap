@@ -240,7 +240,13 @@ fn hosted_template_response_accepts_stable_ssh_endpoint_metadata() {
                 "required": false,
                 "secret": false,
                 "generated": false,
-                "default_value": null
+                "default_value": null,
+                "validation": {
+                    "format": "ngrok_tcp_url",
+                    "example": "6.tcp.eu.ngrok.io:17958",
+                    "max_bytes": 255,
+                    "allowed_algorithms": []
+                }
             }
         ]
     });
@@ -255,6 +261,12 @@ fn hosted_template_response_accepts_stable_ssh_endpoint_metadata() {
         .expect("stable ssh config key");
     assert_eq!(stable.label, "Stable SSH endpoint");
     assert!(!stable.required);
+    let stable_validation = stable.validation.as_ref().expect("stable validation");
+    assert_eq!(stable_validation.format.as_deref(), Some("ngrok_tcp_url"));
+    assert_eq!(
+        stable_validation.example.as_deref(),
+        Some("6.tcp.eu.ngrok.io:17958")
+    );
 }
 
 #[test]

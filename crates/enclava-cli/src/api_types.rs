@@ -217,6 +217,10 @@ pub struct HostedTemplateConfigKey {
 #[derive(Debug, Clone, Deserialize)]
 pub struct HostedTemplateConfigValidation {
     #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub example: Option<String>,
+    #[serde(default)]
     pub max_bytes: Option<u32>,
     #[serde(default)]
     pub max_items: Option<u32>,

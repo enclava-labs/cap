@@ -83,6 +83,15 @@ async fn list() -> Result<(), Box<dyn std::error::Error>> {
     for template in templates {
         println!("  {} ({})", template.slug, template.version);
         println!("    {}", template.description);
+        if let Some(summary) = template_required_inputs(&template) {
+            println!("    Required inputs: {summary}");
+        }
+        if let Some(summary) = template_optional_inputs(&template) {
+            println!("    Optional inputs: {summary}");
+        }
+        if let Some(hint) = stable_ssh_endpoint_hint(&template) {
+            println!("    Stable SSH: {hint}");
+        }
         if let Some(path) = template.persistence_path {
             println!("    Persistent path: {path}");
         }
@@ -218,6 +227,64 @@ fn template_key<'a>(
     key: &str,
 ) -> Option<&'a HostedTemplateConfigKey> {
     template.config_keys.iter().find(|entry| entry.key == key)
+}
+
+fn template_required_inputs(template: &HostedTemplate) -> Option<String> {
+    template_input_summary(template, true)
+}
+
+fn template_optional_inputs(template: &HostedTemplate) -> Option<String> {
+    template_input_summary(template, false)
+}
+
+fn template_input_summary(template: &HostedTemplate, required: bool) -> Option<String> {
+    let labels = template
+        .config_keys
+        .iter()
+        .filter(|entry| entry.required == required)
+        .map(template_input_label)
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels.join(", "))
+    }
+}
+
+fn template_input_label(entry: &HostedTemplateConfigKey) -> String {
+    if entry
+        .validation
+        .as_ref()
+        .and_then(|validation| validation.example.as_ref())
+        .is_some()
+        && entry
+            .validation
+            .as_ref()
+            .and_then(|validation| validation.format.as_deref())
+            == Some("ngrok_tcp_url")
+    {
+        return format!("{} (--ngrok-tcp-url)", entry.label);
+    }
+    entry.label.clone()
+}
+
+fn stable_ssh_endpoint_hint(template: &HostedTemplate) -> Option<String> {
+    let entry = template.config_keys.iter().find(|entry| {
+        entry.key == "NGROK_TCP_URL"
+            || entry
+                .validation
+                .as_ref()
+                .and_then(|validation| validation.format.as_deref())
+                == Some("ngrok_tcp_url")
+    })?;
+    let example = entry
+        .validation
+        .as_ref()
+        .and_then(|validation| validation.example.as_deref())
+        .unwrap_or("6.tcp.eu.ngrok.io:17958");
+    Some(format!(
+        "pass --ngrok-tcp-url {example} for a stable command"
+    ))
 }
 
 fn read_ngrok_authtoken(
@@ -440,6 +507,57 @@ fn ensure_ssh_command_matches_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enclava_cli::api_types::HostedTemplateConfigValidation;
+
+    fn hosted_template_with_stable_ssh() -> HostedTemplate {
+        HostedTemplate {
+            slug: "debian-ssh-ngrok".to_string(),
+            name: "Debian SSH over ngrok".to_string(),
+            description: "SSH template".to_string(),
+            version: "2026-06-18".to_string(),
+            image: "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            config_keys: vec![
+                HostedTemplateConfigKey {
+                    key: "NGROK_AUTHTOKEN".to_string(),
+                    label: "ngrok auth token".to_string(),
+                    description: "Token used by the workload.".to_string(),
+                    input_type: "password".to_string(),
+                    required: true,
+                    secret: true,
+                    default_value: None,
+                    validation: None,
+                },
+                HostedTemplateConfigKey {
+                    key: "DEBIAN_SSH_AUTHORIZED_KEYS".to_string(),
+                    label: "SSH public keys".to_string(),
+                    description: "One SSH public key per line.".to_string(),
+                    input_type: "ssh_public_keys".to_string(),
+                    required: true,
+                    secret: false,
+                    default_value: None,
+                    validation: None,
+                },
+                HostedTemplateConfigKey {
+                    key: "NGROK_TCP_URL".to_string(),
+                    label: "Stable SSH endpoint".to_string(),
+                    description: "Optional reserved ngrok TCP address.".to_string(),
+                    input_type: "text".to_string(),
+                    required: false,
+                    secret: false,
+                    default_value: None,
+                    validation: Some(HostedTemplateConfigValidation {
+                        format: Some("ngrok_tcp_url".to_string()),
+                        example: Some("6.tcp.eu.ngrok.io:17958".to_string()),
+                        max_bytes: Some(255),
+                        max_items: None,
+                        allowed_algorithms: vec![],
+                    }),
+                },
+            ],
+            persistence_path: Some("/state".to_string()),
+            security_notes: vec![],
+        }
+    }
 
     #[test]
     fn ngrok_tcp_url_normalizes_tcp_scheme() {
@@ -477,6 +595,24 @@ mod tests {
                 "6.tcp.eu.ngrok.io:17958",
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn template_input_summary_surfaces_stable_ssh_endpoint() {
+        let template = hosted_template_with_stable_ssh();
+
+        assert_eq!(
+            template_required_inputs(&template).as_deref(),
+            Some("ngrok auth token, SSH public keys")
+        );
+        assert_eq!(
+            template_optional_inputs(&template).as_deref(),
+            Some("Stable SSH endpoint (--ngrok-tcp-url)")
+        );
+        assert_eq!(
+            stable_ssh_endpoint_hint(&template).as_deref(),
+            Some("pass --ngrok-tcp-url 6.tcp.eu.ngrok.io:17958 for a stable command")
         );
     }
 }
