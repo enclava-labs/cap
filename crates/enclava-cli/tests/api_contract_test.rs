@@ -317,15 +317,18 @@ fn ssh_command_response_accepts_pending_and_ready_states() {
     let pending: SshCommandResponse = serde_json::from_value(serde_json::json!({
         "status": "pending",
         "command": null,
+        "endpoint": null,
         "app_url": null
     }))
     .unwrap();
     assert_eq!(pending.status, "pending");
     assert!(pending.command.is_none());
+    assert!(pending.endpoint.is_none());
 
     let ready: SshCommandResponse = serde_json::from_value(serde_json::json!({
         "status": "ready",
         "command": "ssh -p 17958 user@6.tcp.eu.ngrok.io",
+        "endpoint": "6.tcp.eu.ngrok.io:17958",
         "app_url": "https://shell.example.test"
     }))
     .unwrap();
@@ -334,6 +337,7 @@ fn ssh_command_response_accepts_pending_and_ready_states() {
         ready.command.as_deref(),
         Some("ssh -p 17958 user@6.tcp.eu.ngrok.io")
     );
+    assert_eq!(ready.endpoint.as_deref(), Some("6.tcp.eu.ngrok.io:17958"));
     assert_eq!(ready.app_url.as_deref(), Some("https://shell.example.test"));
 }
 

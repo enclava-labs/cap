@@ -213,9 +213,9 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         .unwrap_or("pending")
         .to_string();
 
-    let ssh_command = if args.no_wait {
+    let (ssh_command, ssh_endpoint) = if args.no_wait {
         pb.set_position(4);
-        None
+        (None, None)
     } else {
         pb.set_position(3);
         if stable_endpoint.is_some() {
@@ -234,7 +234,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             app_url = url;
         }
         pb.set_position(4);
-        response.command
+        (response.command, response.endpoint)
     };
     pb.finish_with_message("Template deployed");
 
@@ -247,6 +247,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             &deployment_id,
             stable_endpoint.as_deref(),
             ssh_command.as_deref(),
+            ssh_endpoint.as_deref(),
             args.json,
         )?
     );
@@ -673,10 +674,13 @@ fn deploy_response_output(
     deployment_id: &str,
     stable_endpoint: Option<&str>,
     ssh_command: Option<&str>,
+    ssh_endpoint: Option<&str>,
     json: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let endpoint = ssh_endpoint
+        .map(str::to_string)
+        .or_else(|| ssh_command.and_then(ssh_endpoint_string));
     if json {
-        let endpoint = ssh_command.and_then(ssh_endpoint_string);
         let output = serde_json::json!({
             "template": template_slug,
             "instance": instance_name,
@@ -703,7 +707,7 @@ fn deploy_response_output(
     }
     if let Some(command) = ssh_command {
         lines.push(format!("  SSH:        {command}"));
-        if let Some(endpoint) = ssh_endpoint_string(command) {
+        if let Some(endpoint) = endpoint {
             lines.push(format!("  Endpoint:   {endpoint}"));
         }
     } else {
@@ -719,8 +723,11 @@ fn ssh_command_response_output(
     response: &SshCommandResponse,
     json: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let endpoint = response
+        .endpoint
+        .clone()
+        .or_else(|| response.command.as_deref().and_then(ssh_endpoint_string));
     if json {
-        let endpoint = response.command.as_deref().and_then(ssh_endpoint_string);
         let output = serde_json::json!({
             "app_name": instance_name,
             "status": response.status.as_str(),
@@ -737,7 +744,7 @@ fn ssh_command_response_output(
     }
     if let Some(command) = response.command.as_deref() {
         lines.push(format!("  SSH:        {command}"));
-        if let Some(endpoint) = ssh_endpoint_string(command) {
+        if let Some(endpoint) = endpoint {
             lines.push(format!("  Endpoint:   {endpoint}"));
         }
     } else {
@@ -987,6 +994,7 @@ mod tests {
         let pending = SshCommandResponse {
             status: "pending".to_string(),
             command: None,
+            endpoint: None,
             app_url: None,
         };
         validate_ssh_command_response(&pending, Some("6.tcp.eu.ngrok.io:17958")).unwrap();
@@ -994,6 +1002,7 @@ mod tests {
         let ready = SshCommandResponse {
             status: "ready".to_string(),
             command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io".to_string()),
+            endpoint: Some("6.tcp.eu.ngrok.io:17958".to_string()),
             app_url: Some("https://shell.example.test".to_string()),
         };
         validate_ssh_command_response(&ready, Some("tcp://6.tcp.eu.ngrok.io:17958")).unwrap();
@@ -1001,6 +1010,7 @@ mod tests {
         let mismatched = SshCommandResponse {
             status: "ready".to_string(),
             command: Some("ssh -p 17959 user@6.tcp.eu.ngrok.io".to_string()),
+            endpoint: Some("6.tcp.eu.ngrok.io:17959".to_string()),
             app_url: None,
         };
         let err = validate_ssh_command_response(&mismatched, Some("6.tcp.eu.ngrok.io:17958"))
@@ -1010,6 +1020,7 @@ mod tests {
         let missing = SshCommandResponse {
             status: "ready".to_string(),
             command: None,
+            endpoint: None,
             app_url: None,
         };
         let err = validate_ssh_command_response(&missing, None).unwrap_err();
@@ -1025,6 +1036,7 @@ mod tests {
             "deploy-123",
             Some("6.tcp.eu.ngrok.io:17958"),
             Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
+            Some("6.tcp.eu.ngrok.io:17958"),
             false,
         )
         .unwrap();
@@ -1047,6 +1059,7 @@ mod tests {
             "deploy-123",
             Some("6.tcp.eu.ngrok.io:17958"),
             Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
+            Some("6.tcp.eu.ngrok.io:17958"),
             true,
         )
         .unwrap();
@@ -1072,7 +1085,8 @@ mod tests {
     fn ssh_command_output_surfaces_endpoint_for_humans() {
         let response = SshCommandResponse {
             status: "ready".to_string(),
-            command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io".to_string()),
+            command: Some("ssh -p 17959 user@6.tcp.eu.ngrok.io".to_string()),
+            endpoint: Some("6.tcp.eu.ngrok.io:17958".to_string()),
             app_url: Some("https://shell.example.test".to_string()),
         };
 
@@ -1080,7 +1094,7 @@ mod tests {
 
         assert!(output.contains("  Status:     ready"));
         assert!(output.contains("  URL:        https://shell.example.test"));
-        assert!(output.contains("  SSH:        ssh -p 17958 user@6.tcp.eu.ngrok.io"));
+        assert!(output.contains("  SSH:        ssh -p 17959 user@6.tcp.eu.ngrok.io"));
         assert!(output.contains("  Endpoint:   6.tcp.eu.ngrok.io:17958"));
     }
 
@@ -1088,7 +1102,8 @@ mod tests {
     fn ssh_command_output_json_is_machine_readable() {
         let response = SshCommandResponse {
             status: "ready".to_string(),
-            command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io".to_string()),
+            command: Some("ssh -p 17959 user@6.tcp.eu.ngrok.io".to_string()),
+            endpoint: Some("6.tcp.eu.ngrok.io:17958".to_string()),
             app_url: Some("https://shell.example.test".to_string()),
         };
 
@@ -1101,7 +1116,7 @@ mod tests {
                 "app_name": "shell",
                 "status": "ready",
                 "app_url": "https://shell.example.test",
-                "command": "ssh -p 17958 user@6.tcp.eu.ngrok.io",
+                "command": "ssh -p 17959 user@6.tcp.eu.ngrok.io",
                 "endpoint": "6.tcp.eu.ngrok.io:17958"
             })
         );

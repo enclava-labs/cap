@@ -256,6 +256,8 @@ pub struct SshCommandResponse {
     #[serde(default)]
     pub command: Option<String>,
     #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
     pub app_url: Option<String>,
 }
 

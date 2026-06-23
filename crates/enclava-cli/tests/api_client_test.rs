@@ -162,7 +162,7 @@ async fn get_template_ssh_command_uses_hosted_paas_route() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 4096];
         let n = stream.read(&mut buf).unwrap();
-        let body = r#"{"status":"ready","command":"ssh -p 17958 user@6.tcp.eu.ngrok.io","app_url":"https://shell.example.test"}"#;
+        let body = r#"{"status":"ready","command":"ssh -p 17958 user@6.tcp.eu.ngrok.io","endpoint":"6.tcp.eu.ngrok.io:17958","app_url":"https://shell.example.test"}"#;
         stream
             .write_all(
                 format!(
@@ -185,6 +185,10 @@ async fn get_template_ssh_command_uses_hosted_paas_route() {
     assert_eq!(
         response.command.as_deref(),
         Some("ssh -p 17958 user@6.tcp.eu.ngrok.io")
+    );
+    assert_eq!(
+        response.endpoint.as_deref(),
+        Some("6.tcp.eu.ngrok.io:17958")
     );
     assert_eq!(
         response.app_url.as_deref(),
