@@ -54,8 +54,9 @@ enclava template deploy --name shell \
 
 `--ngrok-tcp-url` is optional, but it is the stable SSH endpoint path: the CLI
 normalizes the reserved ngrok TCP address, writes it directly to the TEE config
-endpoint with the ngrok token and SSH public keys, waits for `/ssh.txt`, and
-fails if the published SSH command does not match the reserved host and port.
+endpoint with the ngrok token and SSH public keys, waits for the hosted PaaS
+`/apps/<name>/ssh-command` broker, and fails if the returned SSH command does
+not match the reserved host and port.
 
 ## Repository Layout
 
