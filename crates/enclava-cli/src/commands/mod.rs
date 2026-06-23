@@ -8,6 +8,7 @@ pub mod key;
 pub mod org;
 pub mod ownership;
 pub mod prepare;
+pub mod template;
 
 use clap::{Parser, Subcommand};
 
@@ -47,6 +48,9 @@ pub enum Command {
     /// Manage app configuration secrets
     #[command(subcommand)]
     Config(config::ConfigCommand),
+    /// Manage hosted templates
+    #[command(subcommand)]
+    Template(template::TemplateCommand),
     /// Manage custom domains
     #[command(subcommand)]
     Domains(domains::DomainsCommand),
@@ -92,6 +96,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Status(args) => app::status(args).await,
         Command::Logs(args) => app::logs(args).await,
         Command::Config(cmd) => config::run(cmd).await,
+        Command::Template(cmd) => template::run(cmd).await,
         Command::Domains(cmd) => domains::run(cmd).await,
         Command::Claim(args) => ownership::claim(args).await,
         Command::Unlock(args) => ownership::unlock(args).await,

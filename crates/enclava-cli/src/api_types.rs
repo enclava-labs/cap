@@ -184,6 +184,68 @@ pub struct DeployResponse {
     pub app_domain: String,
 }
 
+// --- Hosted Templates ---
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HostedTemplate {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub image: String,
+    pub config_keys: Vec<HostedTemplateConfigKey>,
+    #[serde(default)]
+    pub persistence_path: Option<String>,
+    #[serde(default)]
+    pub security_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HostedTemplateConfigKey {
+    pub key: String,
+    pub label: String,
+    pub description: String,
+    pub input_type: String,
+    pub required: bool,
+    pub secret: bool,
+    #[serde(default)]
+    pub default_value: Option<String>,
+    #[serde(default)]
+    pub validation: Option<HostedTemplateConfigValidation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HostedTemplateConfigValidation {
+    #[serde(default)]
+    pub max_bytes: Option<u32>,
+    #[serde(default)]
+    pub max_items: Option<u32>,
+    #[serde(default)]
+    pub allowed_algorithms: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateTemplateInstanceRequest {
+    pub template_slug: String,
+    pub instance_name: String,
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TemplateInstanceResponse {
+    pub template: HostedTemplate,
+    pub app: serde_json::Value,
+    pub deployment: TemplateDeploymentResponse,
+    pub config_token: Option<ConfigTokenResponse>,
+    pub cap: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TemplateDeploymentResponse {
+    pub cap_deployment_id: Option<String>,
+    pub status: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,

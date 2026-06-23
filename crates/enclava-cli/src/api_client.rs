@@ -319,6 +319,41 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    // --- Hosted Templates ---
+
+    pub async fn list_templates(&self) -> Result<Vec<HostedTemplate>, ApiError> {
+        let resp = self
+            .http
+            .get(self.url("/templates"))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn create_template_instance(
+        &self,
+        req: &CreateTemplateInstanceRequest,
+    ) -> Result<TemplateInstanceResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url("/template-instances"))
+            .headers(self.auth_headers()?)
+            .header(
+                "Idempotency-Key",
+                format!(
+                    "template-instance-{}-{}",
+                    req.template_slug, req.instance_name
+                ),
+            )
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     // --- Status ---
 
     pub async fn get_status(&self, app_name: &str) -> Result<AppStatus, ApiError> {
