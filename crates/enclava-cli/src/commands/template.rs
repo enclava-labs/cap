@@ -436,15 +436,74 @@ fn validate_ssh_public_keys(
         {
             return Err(format!("line {} has a malformed SSH public key", index + 1).into());
         }
-        base64::engine::general_purpose::STANDARD
+        let decoded = base64::engine::general_purpose::STANDARD
             .decode(body)
             .map_err(|_| format!("line {} has a malformed SSH public key", index + 1))?;
+        if !ssh_public_key_blob_matches_algorithm(algorithm, &decoded) {
+            return Err(format!("line {} has a malformed SSH public key", index + 1).into());
+        }
     }
     if count == 0 {
         Err("at least one SSH public key is required".into())
     } else {
         Ok(())
     }
+}
+
+fn ssh_public_key_blob_matches_algorithm(algorithm: &str, blob: &[u8]) -> bool {
+    let Some((blob_algorithm, offset)) = read_ssh_string(blob, 0) else {
+        return false;
+    };
+    if !ssh_key_algorithm_matches(algorithm, blob_algorithm) {
+        return false;
+    }
+    match algorithm {
+        "ssh-ed25519" => {
+            let Some((key, offset)) = read_ssh_bytes(blob, offset) else {
+                return false;
+            };
+            key.len() == 32 && offset == blob.len()
+        }
+        "ecdsa-sha2-nistp256" => {
+            let Some((curve, offset)) = read_ssh_string(blob, offset) else {
+                return false;
+            };
+            let Some((point, offset)) = read_ssh_bytes(blob, offset) else {
+                return false;
+            };
+            curve == "nistp256" && !point.is_empty() && offset == blob.len()
+        }
+        "rsa-sha2-256" | "rsa-sha2-512" => {
+            let Some((exponent, offset)) = read_ssh_bytes(blob, offset) else {
+                return false;
+            };
+            let Some((modulus, offset)) = read_ssh_bytes(blob, offset) else {
+                return false;
+            };
+            !exponent.is_empty() && !modulus.is_empty() && offset == blob.len()
+        }
+        _ => false,
+    }
+}
+
+fn ssh_key_algorithm_matches(algorithm: &str, blob_algorithm: &str) -> bool {
+    algorithm == blob_algorithm
+        || matches!(algorithm, "rsa-sha2-256" | "rsa-sha2-512") && blob_algorithm == "ssh-rsa"
+}
+
+fn read_ssh_string(blob: &[u8], offset: usize) -> Option<(&str, usize)> {
+    let (value, offset) = read_ssh_bytes(blob, offset)?;
+    std::str::from_utf8(value).ok().map(|value| (value, offset))
+}
+
+fn read_ssh_bytes(blob: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+    let length_end = offset.checked_add(4)?;
+    let length_bytes: [u8; 4] = blob.get(offset..length_end)?.try_into().ok()?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
+    let start = length_end;
+    let end = start.checked_add(length)?;
+    let value = blob.get(start..end)?;
+    Some((value, end))
 }
 
 fn normalize_ngrok_tcp_url(value: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -609,6 +668,8 @@ fn ensure_ssh_command_matches_endpoint(
 mod tests {
     use super::*;
     use enclava_cli::api_types::HostedTemplateConfigValidation;
+
+    const VALID_ED25519_PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOlL21WHthjyXNuxzes5bVqCCqgyWDuMvXcWhOxRGL1P cli-test@example";
 
     fn hosted_template_with_stable_ssh() -> HostedTemplate {
         HostedTemplate {
@@ -807,5 +868,14 @@ mod tests {
         );
         assert_eq!(dynamic_pairs[0].0, "NGROK_AUTHTOKEN");
         assert_eq!(dynamic_pairs[1].0, "DEBIAN_SSH_AUTHORIZED_KEYS");
+    }
+
+    #[test]
+    fn ssh_public_key_validation_requires_public_key_blob() {
+        validate_ssh_public_keys(VALID_ED25519_PUBLIC_KEY, None).unwrap();
+
+        let err = validate_ssh_public_keys("ssh-ed25519 cmFuZG9tLWJhc2U2NA==", None).unwrap_err();
+
+        assert!(err.to_string().contains("malformed SSH public key"));
     }
 }
