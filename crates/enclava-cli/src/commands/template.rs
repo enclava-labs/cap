@@ -661,14 +661,7 @@ fn validate_ssh_command_response(
             return Err(format!("PaaS returned an invalid SSH command: {command}").into());
         }
         if let Some(reported_endpoint) = response.endpoint.as_deref() {
-            let command_endpoint = ssh_endpoint_string(command)
-                .ok_or_else(|| format!("could not parse SSH command: {command}"))?;
-            if reported_endpoint != command_endpoint {
-                return Err(format!(
-                    "PaaS SSH endpoint {reported_endpoint} does not match SSH command endpoint {command_endpoint}"
-                )
-                .into());
-            }
+            ensure_reported_ssh_endpoint_matches_command(command, reported_endpoint)?;
         }
         if let Some(endpoint) = stable_endpoint {
             ensure_ssh_command_matches_endpoint(command, endpoint)?;
@@ -687,9 +680,7 @@ fn deploy_response_output(
     ssh_endpoint: Option<&str>,
     json: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let endpoint = ssh_endpoint
-        .map(str::to_string)
-        .or_else(|| ssh_command.and_then(ssh_endpoint_string));
+    let endpoint = display_ssh_endpoint(ssh_command, ssh_endpoint)?;
     if json {
         let output = serde_json::json!({
             "template": template_slug,
@@ -733,10 +724,8 @@ fn ssh_command_response_output(
     response: &SshCommandResponse,
     json: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let endpoint = response
-        .endpoint
-        .clone()
-        .or_else(|| response.command.as_deref().and_then(ssh_endpoint_string));
+    validate_ssh_command_response(response, None)?;
+    let endpoint = display_ssh_endpoint(response.command.as_deref(), response.endpoint.as_deref())?;
     if json {
         let output = serde_json::json!({
             "app_name": instance_name,
@@ -797,6 +786,22 @@ fn ssh_endpoint_string(command: &str) -> Option<String> {
     Some(format!("{host}:{port}"))
 }
 
+fn display_ssh_endpoint(
+    command: Option<&str>,
+    reported_endpoint: Option<&str>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(command) = command else {
+        return Ok(None);
+    };
+    let command_endpoint = ssh_endpoint_string(command)
+        .ok_or_else(|| format!("could not parse SSH command: {command}"))?;
+    if let Some(reported_endpoint) = reported_endpoint {
+        ensure_reported_ssh_endpoint_matches_command(command, reported_endpoint)?;
+        return Ok(Some(reported_endpoint.to_string()));
+    }
+    Ok(Some(command_endpoint))
+}
+
 fn parse_ssh_endpoint(command: &str) -> Option<(&str, &str)> {
     let parts = command.split_whitespace().collect::<Vec<_>>();
     if parts.len() != 4 || parts[0] != "ssh" || parts[1] != "-p" {
@@ -815,6 +820,21 @@ fn parse_ssh_endpoint(command: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((host, parts[2]))
+}
+
+fn ensure_reported_ssh_endpoint_matches_command(
+    command: &str,
+    reported_endpoint: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let command_endpoint = ssh_endpoint_string(command)
+        .ok_or_else(|| format!("could not parse SSH command: {command}"))?;
+    if reported_endpoint == command_endpoint {
+        return Ok(());
+    }
+    Err(format!(
+        "PaaS SSH endpoint {reported_endpoint} does not match SSH command endpoint {command_endpoint}"
+    )
+    .into())
 }
 
 fn ensure_ssh_command_matches_endpoint(
@@ -1112,10 +1132,30 @@ mod tests {
     }
 
     #[test]
+    fn deploy_output_rejects_mismatched_broker_endpoint() {
+        let err = deploy_response_output(
+            "debian-ssh-ngrok",
+            "shell",
+            "https://shell.example.test",
+            "deploy-123",
+            Some("6.tcp.eu.ngrok.io:17958"),
+            Some("ssh -p 17959 user@6.tcp.eu.ngrok.io"),
+            Some("6.tcp.eu.ngrok.io:17958"),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("does not match SSH command endpoint")
+        );
+    }
+
+    #[test]
     fn ssh_command_output_surfaces_endpoint_for_humans() {
         let response = SshCommandResponse {
             status: "ready".to_string(),
-            command: Some("ssh -p 17959 user@6.tcp.eu.ngrok.io".to_string()),
+            command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io".to_string()),
             endpoint: Some("6.tcp.eu.ngrok.io:17958".to_string()),
             app_url: Some("https://shell.example.test".to_string()),
         };
@@ -1124,7 +1164,7 @@ mod tests {
 
         assert!(output.contains("  Status:     ready"));
         assert!(output.contains("  URL:        https://shell.example.test"));
-        assert!(output.contains("  SSH:        ssh -p 17959 user@6.tcp.eu.ngrok.io"));
+        assert!(output.contains("  SSH:        ssh -p 17958 user@6.tcp.eu.ngrok.io"));
         assert!(output.contains("  Endpoint:   6.tcp.eu.ngrok.io:17958"));
     }
 
@@ -1132,7 +1172,7 @@ mod tests {
     fn ssh_command_output_json_is_machine_readable() {
         let response = SshCommandResponse {
             status: "ready".to_string(),
-            command: Some("ssh -p 17959 user@6.tcp.eu.ngrok.io".to_string()),
+            command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io".to_string()),
             endpoint: Some("6.tcp.eu.ngrok.io:17958".to_string()),
             app_url: Some("https://shell.example.test".to_string()),
         };
@@ -1146,9 +1186,26 @@ mod tests {
                 "app_name": "shell",
                 "status": "ready",
                 "app_url": "https://shell.example.test",
-                "command": "ssh -p 17959 user@6.tcp.eu.ngrok.io",
+                "command": "ssh -p 17958 user@6.tcp.eu.ngrok.io",
                 "endpoint": "6.tcp.eu.ngrok.io:17958"
             })
+        );
+    }
+
+    #[test]
+    fn ssh_command_output_rejects_mismatched_broker_endpoint() {
+        let response = SshCommandResponse {
+            status: "ready".to_string(),
+            command: Some("ssh -p 17959 user@6.tcp.eu.ngrok.io".to_string()),
+            endpoint: Some("6.tcp.eu.ngrok.io:17958".to_string()),
+            app_url: Some("https://shell.example.test".to_string()),
+        };
+
+        let err = ssh_command_response_output("shell", &response, true).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("does not match SSH command endpoint")
         );
     }
 
