@@ -152,3 +152,41 @@ async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
         Some("https://shell.tee.example/.well-known/confidential/config")
     );
 }
+
+#[tokio::test]
+async fn get_template_ssh_command_uses_hosted_paas_route() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = r#"{"status":"ready","command":"ssh -p 17958 user@6.tcp.eu.ngrok.io","app_url":"https://shell.example.test"}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let response = client.get_template_ssh_command("shell").await.unwrap();
+
+    let request = handle.join().unwrap();
+    assert!(request.starts_with("GET /apps/shell/ssh-command "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert_eq!(
+        response.command.as_deref(),
+        Some("ssh -p 17958 user@6.tcp.eu.ngrok.io")
+    );
+    assert_eq!(
+        response.app_url.as_deref(),
+        Some("https://shell.example.test")
+    );
+}

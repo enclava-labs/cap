@@ -250,6 +250,15 @@ pub struct TemplateDeploymentResponse {
     pub status: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SshCommandResponse {
+    pub status: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub app_url: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,

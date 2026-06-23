@@ -354,6 +354,20 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn get_template_ssh_command(
+        &self,
+        app_name: &str,
+    ) -> Result<SshCommandResponse, ApiError> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/apps/{app_name}/ssh-command")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     // --- Status ---
 
     pub async fn get_status(&self, app_name: &str) -> Result<AppStatus, ApiError> {

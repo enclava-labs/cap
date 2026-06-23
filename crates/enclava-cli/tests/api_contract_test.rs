@@ -313,6 +313,31 @@ fn template_instance_response_accepts_config_token_and_cap_payload() {
 }
 
 #[test]
+fn ssh_command_response_accepts_pending_and_ready_states() {
+    let pending: SshCommandResponse = serde_json::from_value(serde_json::json!({
+        "status": "pending",
+        "command": null,
+        "app_url": null
+    }))
+    .unwrap();
+    assert_eq!(pending.status, "pending");
+    assert!(pending.command.is_none());
+
+    let ready: SshCommandResponse = serde_json::from_value(serde_json::json!({
+        "status": "ready",
+        "command": "ssh -p 17958 user@6.tcp.eu.ngrok.io",
+        "app_url": "https://shell.example.test"
+    }))
+    .unwrap();
+    assert_eq!(ready.status, "ready");
+    assert_eq!(
+        ready.command.as_deref(),
+        Some("ssh -p 17958 user@6.tcp.eu.ngrok.io")
+    );
+    assert_eq!(ready.app_url.as_deref(), Some("https://shell.example.test"));
+}
+
+#[test]
 fn create_template_instance_request_sends_empty_config_object() {
     let req = CreateTemplateInstanceRequest {
         template_slug: "debian-ssh-ngrok".to_string(),

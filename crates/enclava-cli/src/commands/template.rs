@@ -10,14 +10,15 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use enclava_cli::{
     api_client::ApiClient,
-    api_types::{CreateTemplateInstanceRequest, HostedTemplate, HostedTemplateConfigKey},
+    api_types::{
+        CreateTemplateInstanceRequest, HostedTemplate, HostedTemplateConfigKey, SshCommandResponse,
+    },
     config::{self, CliPaths},
     tee_client::TeeClient,
 };
 
 const DEBIAN_SSH_NGROK_TEMPLATE: &str = "debian-ssh-ngrok";
 const DEFAULT_SSH_TIMEOUT_SECONDS: u64 = 600;
-const MAX_SSH_COMMAND_BYTES: usize = 256;
 
 #[derive(Subcommand)]
 pub enum TemplateCommand {
@@ -50,10 +51,10 @@ pub struct TemplateDeployArgs {
     /// Reserved ngrok TCP address for a stable SSH command, e.g. 6.tcp.eu.ngrok.io:17958.
     #[arg(long = "ngrok-tcp-url")]
     pub ngrok_tcp_url: Option<String>,
-    /// Do not wait for /ssh.txt after config delivery.
+    /// Do not wait for the PaaS SSH command after config delivery.
     #[arg(long)]
     pub no_wait: bool,
-    /// Seconds to wait for /ssh.txt.
+    /// Seconds to wait for the PaaS SSH command.
     #[arg(long, default_value_t = DEFAULT_SSH_TIMEOUT_SECONDS)]
     pub ssh_timeout_seconds: u64,
 }
@@ -174,8 +175,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         .and_then(serde_json::Value::as_str)
         .ok_or("template response did not include app_domain")?
         .to_string();
-    let ssh_url = ssh_command_url_from_app_domain(&app_domain)?;
-    let app_url = app_url_from_ssh_command_url(&ssh_url).unwrap_or_else(|| app_domain.clone());
+    let mut app_url = app_url_from_app_domain(&app_domain)?;
     let deployment_id = response
         .deployment
         .cap_deployment_id
@@ -193,14 +193,18 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         } else {
             pb.set_message("Waiting for SSH command...");
         }
-        let command = wait_for_ssh_command(
-            &ssh_url,
+        let response = wait_for_paas_ssh_command(
+            &api,
+            &args.name,
             stable_endpoint.as_deref(),
             Duration::from_secs(args.ssh_timeout_seconds),
         )
         .await?;
+        if let Some(url) = response.app_url {
+            app_url = url;
+        }
         pb.set_position(4);
-        Some(command)
+        response.command
     };
     pb.finish_with_message("Template deployed");
 
@@ -215,7 +219,10 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     if let Some(command) = ssh_command {
         println!("  SSH:        {command}");
     } else {
-        println!("  SSH:        pending at {ssh_url}");
+        println!(
+            "  SSH:        pending via PaaS /apps/{}/ssh-command",
+            args.name
+        );
     }
     Ok(())
 }
@@ -460,7 +467,7 @@ fn is_ngrok_tcp_host(host: &str) -> bool {
         && matches!(labels[labels.len() - 1], "io" | "app")
 }
 
-fn ssh_command_url_from_app_domain(app_domain: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn app_url_from_app_domain(app_domain: &str) -> Result<String, Box<dyn std::error::Error>> {
     let app_domain = app_domain.trim();
     if app_domain.is_empty() {
         return Err("template response included an empty app_domain".into());
@@ -479,53 +486,35 @@ fn ssh_command_url_from_app_domain(app_domain: &str) -> Result<String, Box<dyn s
     {
         return Err("template response included an invalid app_domain".into());
     }
-    url.set_path("/ssh.txt");
+    url.set_path("");
     url.set_query(None);
     url.set_fragment(None);
-    Ok(url.to_string())
+    Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
-fn app_url_from_ssh_command_url(ssh_url: &str) -> Option<String> {
-    ssh_url.strip_suffix("/ssh.txt").map(str::to_string)
-}
-
-async fn wait_for_ssh_command(
-    ssh_url: &str,
+async fn wait_for_paas_ssh_command(
+    api: &ApiClient,
+    app_name: &str,
     stable_endpoint: Option<&str>,
     timeout: Duration,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+) -> Result<SshCommandResponse, Box<dyn std::error::Error>> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if let Ok(response) = client.get(ssh_url).send().await
-            && response.status().is_success()
+        let response = api.get_template_ssh_command(app_name).await?;
+        if response.status == "ready"
+            && let Some(command) = response.command.as_deref()
         {
-            if response
-                .content_length()
-                .is_some_and(|length| length > MAX_SSH_COMMAND_BYTES as u64)
-            {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+            if !valid_ssh_command(command) {
+                return Err(format!("PaaS returned an invalid SSH command: {command}").into());
             }
-            let body = response.bytes().await?;
-            if body.len() > MAX_SSH_COMMAND_BYTES {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
+            if let Some(endpoint) = stable_endpoint {
+                ensure_ssh_command_matches_endpoint(command, endpoint)?;
             }
-            let command = std::str::from_utf8(&body)?.trim().to_string();
-            if valid_ssh_command(&command) {
-                if let Some(endpoint) = stable_endpoint {
-                    ensure_ssh_command_matches_endpoint(&command, endpoint)?;
-                }
-                return Ok(command);
-            }
+            return Ok(response);
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    Err(format!("timed out waiting for SSH command at {ssh_url}").into())
+    Err(format!("timed out waiting for PaaS SSH command for app {app_name}").into())
 }
 
 fn valid_ssh_command(command: &str) -> bool {
@@ -660,23 +649,19 @@ mod tests {
     }
 
     #[test]
-    fn ssh_command_url_normalizes_domain_and_full_url() {
+    fn app_url_normalizes_domain_and_full_url() {
         assert_eq!(
-            ssh_command_url_from_app_domain("shell.example.test").unwrap(),
-            "https://shell.example.test/ssh.txt"
+            app_url_from_app_domain("shell.example.test").unwrap(),
+            "https://shell.example.test"
         );
         assert_eq!(
-            ssh_command_url_from_app_domain("http://localhost:8080/path?ignored=true").unwrap(),
-            "http://localhost:8080/ssh.txt"
-        );
-        assert_eq!(
-            app_url_from_ssh_command_url("https://shell.example.test/ssh.txt").as_deref(),
-            Some("https://shell.example.test")
+            app_url_from_app_domain("http://localhost:8080/path?ignored=true").unwrap(),
+            "http://localhost:8080"
         );
     }
 
     #[test]
-    fn ssh_command_url_rejects_invalid_app_domains() {
+    fn app_url_rejects_invalid_app_domains() {
         for domain in [
             "",
             "ftp://shell.example.test",
@@ -684,7 +669,7 @@ mod tests {
             "not a host",
         ] {
             assert!(
-                ssh_command_url_from_app_domain(domain).is_err(),
+                app_url_from_app_domain(domain).is_err(),
                 "{domain} should be rejected"
             );
         }
