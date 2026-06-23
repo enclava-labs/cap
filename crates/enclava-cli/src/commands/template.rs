@@ -583,6 +583,9 @@ fn parse_ssh_endpoint(command: &str) -> Option<(&str, &str)> {
         return None;
     }
     let host = parts[3].strip_prefix("user@")?;
+    if host.is_empty() {
+        return None;
+    }
     Some((host, parts[2]))
 }
 
@@ -736,6 +739,7 @@ mod tests {
         assert!(valid_ssh_command("ssh -p 17958 user@6.tcp.eu.ngrok.io"));
         assert!(!valid_ssh_command("ssh -p nope user@6.tcp.eu.ngrok.io"));
         assert!(!valid_ssh_command("ssh -p 0 user@6.tcp.eu.ngrok.io"));
+        assert!(!valid_ssh_command("ssh -p 17958 user@"));
     }
 
     #[test]
