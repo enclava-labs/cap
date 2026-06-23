@@ -369,6 +369,7 @@ impl ApiClient {
         &self,
         app_name: &str,
     ) -> Result<SshCommandResponse, ApiError> {
+        let app_name = path_segment(app_name);
         let resp = self
             .http
             .get(self.url(&format!("/apps/{app_name}/ssh-command")))
@@ -441,6 +442,7 @@ impl ApiClient {
         key: &str,
         deleted: bool,
     ) -> Result<(), ApiError> {
+        let app_name = path_segment(app_name);
         let resp = self
             .http
             .post(self.url(&format!("/apps/{app_name}/config/sync")))
@@ -674,4 +676,17 @@ impl ApiClient {
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
     }
+}
+
+fn path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }

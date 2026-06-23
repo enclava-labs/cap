@@ -67,12 +67,12 @@ async fn sync_config_key_posts_metadata_callback() {
 
     let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
     client
-        .sync_config_key("demo", "P0_KEY", false)
+        .sync_config_key("demo/shell", "P0_KEY", false)
         .await
         .unwrap();
 
     let request = handle.join().unwrap();
-    assert!(request.starts_with("POST /apps/demo/config/sync "));
+    assert!(request.starts_with("POST /apps/demo%2Fshell/config/sync "));
     assert!(request.contains("authorization: Bearer test-token"));
     assert!(request.contains(r#""key_name":"P0_KEY""#));
     assert!(request.contains(r#""deleted":false"#));
@@ -177,10 +177,10 @@ async fn get_template_ssh_command_uses_hosted_paas_route() {
     });
 
     let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
-    let response = client.get_template_ssh_command("shell").await.unwrap();
+    let response = client.get_template_ssh_command("shell/main").await.unwrap();
 
     let request = handle.join().unwrap();
-    assert!(request.starts_with("GET /apps/shell/ssh-command "));
+    assert!(request.starts_with("GET /apps/shell%2Fmain/ssh-command "));
     assert!(request.contains("authorization: Bearer test-token"));
     assert_eq!(
         response.command.as_deref(),
