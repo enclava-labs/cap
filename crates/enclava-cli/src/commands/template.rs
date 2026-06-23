@@ -109,6 +109,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         )
         .into());
     }
+    let instance_name = normalize_slug(&args.name)?;
 
     let api = build_api_client()?;
     let templates = api.list_templates().await?;
@@ -143,7 +144,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     let response = api
         .create_template_instance(&CreateTemplateInstanceRequest {
             template_slug: args.template.clone(),
-            instance_name: args.name.clone(),
+            instance_name: instance_name.clone(),
             config: serde_json::json!({}),
         })
         .await?;
@@ -165,7 +166,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         debian_ssh_config_pairs(ngrok_authtoken, public_keys, stable_endpoint.as_ref());
     for (key, value) in &config_pairs {
         tee.config_set(key, value, &token.token).await?;
-        api.sync_config_key(&args.name, key, false).await?;
+        api.sync_config_key(&instance_name, key, false).await?;
     }
     pb.set_position(2);
 
@@ -195,7 +196,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         }
         let response = wait_for_paas_ssh_command(
             &api,
-            &args.name,
+            &instance_name,
             stable_endpoint.as_deref(),
             Duration::from_secs(args.ssh_timeout_seconds),
         )
@@ -210,7 +211,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
 
     println!();
     println!("  Template:   {}", response.template.slug);
-    println!("  Instance:   {}", args.name);
+    println!("  Instance:   {instance_name}");
     println!("  URL:        {app_url}");
     println!("  Deploy:     {deployment_id}");
     if let Some(endpoint) = stable_endpoint {
@@ -221,7 +222,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     } else {
         println!(
             "  SSH:        pending via PaaS /apps/{}/ssh-command",
-            args.name
+            instance_name
         );
     }
     Ok(())
@@ -290,6 +291,23 @@ fn stable_ssh_endpoint_hint(template: &HostedTemplate) -> Option<String> {
     Some(format!(
         "pass --ngrok-tcp-url {example} for a stable command"
     ))
+}
+
+fn normalize_slug(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let slug = value.trim().to_ascii_lowercase();
+    if slug.len() < 2
+        || slug.len() > 63
+        || !slug.bytes().any(|byte| byte.is_ascii_lowercase())
+        || !slug
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || slug.starts_with('-')
+        || slug.ends_with('-')
+    {
+        Err("instance name must be 2-63 letters, numbers, or hyphens".into())
+    } else {
+        Ok(slug)
+    }
 }
 
 fn debian_ssh_config_pairs(
@@ -660,6 +678,14 @@ mod tests {
         assert!(normalize_ngrok_tcp_url("example.com:22").is_err());
         assert!(normalize_ngrok_tcp_url("tcp.eu.ngrok.io:17958").is_err());
         assert!(normalize_ngrok_tcp_url("6.tcp.eu.extra.ngrok.io:17958").is_err());
+    }
+
+    #[test]
+    fn template_instance_name_uses_server_slug_rules() {
+        assert_eq!(normalize_slug(" Shell-01 ").unwrap(), "shell-01");
+        assert!(normalize_slug("1234").is_err());
+        assert!(normalize_slug("-shell").is_err());
+        assert!(normalize_slug("shell_01").is_err());
     }
 
     #[test]
