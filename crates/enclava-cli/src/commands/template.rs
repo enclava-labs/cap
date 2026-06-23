@@ -59,6 +59,9 @@ pub struct TemplateDeployArgs {
     /// Seconds to wait for the PaaS SSH command.
     #[arg(long, default_value_t = DEFAULT_SSH_TIMEOUT_SECONDS)]
     pub ssh_timeout_seconds: u64,
+    /// Print machine-readable JSON with deployment and SSH command details.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -155,7 +158,11 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         .map(normalize_ngrok_tcp_url)
         .transpose()?;
 
-    let pb = ProgressBar::new(4);
+    let pb = if args.json {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new(4)
+    };
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{bar:30.cyan/blue}] {msg}")?
@@ -231,22 +238,18 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     };
     pb.finish_with_message("Template deployed");
 
-    println!();
-    println!("  Template:   {}", response.template.slug);
-    println!("  Instance:   {instance_name}");
-    println!("  URL:        {app_url}");
-    println!("  Deploy:     {deployment_id}");
-    if let Some(endpoint) = stable_endpoint {
-        println!("  Stable SSH: {endpoint}");
-    }
-    if let Some(command) = ssh_command {
-        println!("  SSH:        {command}");
-    } else {
-        println!(
-            "  SSH:        pending via PaaS /apps/{}/ssh-command",
-            instance_name
-        );
-    }
+    print!(
+        "{}",
+        deploy_response_output(
+            &response.template.slug,
+            &instance_name,
+            &app_url,
+            &deployment_id,
+            stable_endpoint.as_deref(),
+            ssh_command.as_deref(),
+            args.json,
+        )?
+    );
     Ok(())
 }
 
@@ -663,6 +666,54 @@ fn validate_ssh_command_response(
     Ok(())
 }
 
+fn deploy_response_output(
+    template_slug: &str,
+    instance_name: &str,
+    app_url: &str,
+    deployment_id: &str,
+    stable_endpoint: Option<&str>,
+    ssh_command: Option<&str>,
+    json: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if json {
+        let endpoint = ssh_command.and_then(ssh_endpoint_string);
+        let output = serde_json::json!({
+            "template": template_slug,
+            "instance": instance_name,
+            "app_url": app_url,
+            "deployment_id": deployment_id,
+            "stable_endpoint": stable_endpoint,
+            "ssh_command_status": if ssh_command.is_some() { "ready" } else { "pending" },
+            "command": ssh_command,
+            "endpoint": endpoint,
+            "ssh_command_path": format!("/apps/{instance_name}/ssh-command"),
+        });
+        return Ok(format!("{}\n", serde_json::to_string_pretty(&output)?));
+    }
+
+    let mut lines = vec![
+        String::new(),
+        format!("  Template:   {template_slug}"),
+        format!("  Instance:   {instance_name}"),
+        format!("  URL:        {app_url}"),
+        format!("  Deploy:     {deployment_id}"),
+    ];
+    if let Some(endpoint) = stable_endpoint {
+        lines.push(format!("  Stable SSH: {endpoint}"));
+    }
+    if let Some(command) = ssh_command {
+        lines.push(format!("  SSH:        {command}"));
+        if let Some(endpoint) = ssh_endpoint_string(command) {
+            lines.push(format!("  Endpoint:   {endpoint}"));
+        }
+    } else {
+        lines.push(format!(
+            "  SSH:        pending via PaaS /apps/{instance_name}/ssh-command"
+        ));
+    }
+    Ok(format!("{}\n", lines.join("\n")))
+}
+
 fn ssh_command_response_output(
     instance_name: &str,
     response: &SshCommandResponse,
@@ -963,6 +1014,58 @@ mod tests {
         };
         let err = validate_ssh_command_response(&missing, None).unwrap_err();
         assert!(err.to_string().contains("ready without a command"));
+    }
+
+    #[test]
+    fn deploy_output_surfaces_stable_ssh_details_for_humans() {
+        let output = deploy_response_output(
+            "debian-ssh-ngrok",
+            "shell",
+            "https://shell.example.test",
+            "deploy-123",
+            Some("6.tcp.eu.ngrok.io:17958"),
+            Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
+            false,
+        )
+        .unwrap();
+
+        assert!(output.contains("  Template:   debian-ssh-ngrok"));
+        assert!(output.contains("  Instance:   shell"));
+        assert!(output.contains("  URL:        https://shell.example.test"));
+        assert!(output.contains("  Deploy:     deploy-123"));
+        assert!(output.contains("  Stable SSH: 6.tcp.eu.ngrok.io:17958"));
+        assert!(output.contains("  SSH:        ssh -p 17958 user@6.tcp.eu.ngrok.io"));
+        assert!(output.contains("  Endpoint:   6.tcp.eu.ngrok.io:17958"));
+    }
+
+    #[test]
+    fn deploy_output_json_is_machine_readable() {
+        let output = deploy_response_output(
+            "debian-ssh-ngrok",
+            "shell",
+            "https://shell.example.test",
+            "deploy-123",
+            Some("6.tcp.eu.ngrok.io:17958"),
+            Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
+            true,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "template": "debian-ssh-ngrok",
+                "instance": "shell",
+                "app_url": "https://shell.example.test",
+                "deployment_id": "deploy-123",
+                "stable_endpoint": "6.tcp.eu.ngrok.io:17958",
+                "ssh_command_status": "ready",
+                "command": "ssh -p 17958 user@6.tcp.eu.ngrok.io",
+                "endpoint": "6.tcp.eu.ngrok.io:17958",
+                "ssh_command_path": "/apps/shell/ssh-command"
+            })
+        );
     }
 
     #[test]

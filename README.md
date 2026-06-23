@@ -49,7 +49,8 @@ enclava template list
 enclava template deploy --name shell \
   --ssh-public-key-file ~/.ssh/id_ed25519.pub \
   --ngrok-authtoken-file ../ngrok-secret.txt \
-  --ngrok-tcp-url 6.tcp.eu.ngrok.io:17958
+  --ngrok-tcp-url 6.tcp.eu.ngrok.io:17958 \
+  --json
 enclava template ssh-command --name shell --wait \
   --ngrok-tcp-url 6.tcp.eu.ngrok.io:17958
 enclava template ssh-command --name shell --json
@@ -61,8 +62,8 @@ endpoint with the ngrok token and SSH public keys, waits for the hosted PaaS
 `/apps/<name>/ssh-command` broker, and fails if the returned SSH command does
 not match the reserved host and port. Use `enclava template ssh-command` after a
 `--no-wait` deployment or timeout to fetch the same PaaS-rendered command later.
-Pass `--json` when automation needs the command and parsed `endpoint` as
-structured output.
+Pass `--json` on deploy or command lookup when automation needs the app URL,
+command, and parsed `endpoint` as structured output.
 
 ## Repository Layout
 
