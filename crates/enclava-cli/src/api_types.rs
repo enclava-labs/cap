@@ -555,7 +555,10 @@ pub struct UnlockEndpointResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct ApiErrorBody {
-    pub error: String,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
     pub message: Option<String>,
     pub detail: Option<String>,
     pub reason: Option<String>,

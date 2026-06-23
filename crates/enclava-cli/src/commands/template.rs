@@ -527,7 +527,22 @@ async fn wait_for_paas_ssh_command(
 fn should_retry_paas_ssh_command_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
-        ApiError::Api { status, .. } => matches!(*status, 408 | 425 | 429 | 500..=599),
+        ApiError::Api { status, code, .. } => {
+            if matches!(
+                code.as_deref(),
+                Some(
+                    "unauthenticated"
+                        | "org_permission_denied"
+                        | "app_not_found"
+                        | "ssh_command_not_available"
+                        | "cap_response_invalid"
+                        | "not_implemented_hosted"
+                )
+            ) {
+                return false;
+            }
+            matches!(*status, 408 | 425 | 429 | 500..=599)
+        }
         ApiError::NotAuthenticated => false,
     }
 }
@@ -702,6 +717,7 @@ mod tests {
         for status in [408, 425, 429, 500, 502, 503, 504] {
             assert!(should_retry_paas_ssh_command_error(&ApiError::Api {
                 status,
+                code: None,
                 message: "temporary".to_string(),
             }));
         }
@@ -709,9 +725,15 @@ mod tests {
         for status in [400, 401, 403, 404, 409, 422] {
             assert!(!should_retry_paas_ssh_command_error(&ApiError::Api {
                 status,
+                code: None,
                 message: "permanent".to_string(),
             }));
         }
+        assert!(!should_retry_paas_ssh_command_error(&ApiError::Api {
+            status: 502,
+            code: Some("cap_response_invalid".to_string()),
+            message: "CAP app response included an invalid app domain".to_string(),
+        }));
         assert!(!should_retry_paas_ssh_command_error(
             &ApiError::NotAuthenticated
         ));

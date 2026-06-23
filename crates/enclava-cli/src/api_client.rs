@@ -14,7 +14,11 @@ pub enum ApiError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("API error ({status}): {message}")]
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        code: Option<String>,
+        message: String,
+    },
     #[error("not authenticated -- run `enclava login` first")]
     NotAuthenticated,
 }
@@ -60,6 +64,7 @@ impl ApiClient {
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {token}")).map_err(|e| ApiError::Api {
                 status: 0,
+                code: None,
                 message: format!("invalid auth token: {e}"),
             })?,
         );
@@ -68,6 +73,7 @@ impl ApiClient {
                 "X-Enclava-Org",
                 HeaderValue::from_str(org).map_err(|e| ApiError::Api {
                     status: 0,
+                    code: None,
                     message: format!("invalid org header: {e}"),
                 })?,
             );
@@ -81,25 +87,30 @@ impl ApiClient {
             Ok(resp)
         } else {
             let status_code = status.as_u16();
-            let message = match resp.json::<ApiErrorBody>().await {
+            let (code, message) = match resp.json::<ApiErrorBody>().await {
                 Ok(body) => {
+                    let code = body.code.or_else(|| body.error.clone());
+                    let label = code
+                        .clone()
+                        .unwrap_or_else(|| format!("HTTP {status_code}"));
                     let mut message = body
                         .message
                         .or(body.detail)
-                        .unwrap_or_else(|| body.error.clone());
+                        .unwrap_or_else(|| label.clone());
                     if let Some(reason) = body.reason {
                         message = format!("{message} ({reason})");
                     }
-                    if message == body.error {
-                        message
+                    if message == label {
+                        (code, message)
                     } else {
-                        format!("{}: {message}", body.error)
+                        (code, format!("{label}: {message}"))
                     }
                 }
-                Err(_) => format!("HTTP {status_code}"),
+                Err(_) => (None, format!("HTTP {status_code}")),
             };
             Err(ApiError::Api {
                 status: status_code,
+                code,
                 message,
             })
         }

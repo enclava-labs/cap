@@ -854,6 +854,7 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
         Err(ApiError::Api {
             status: 501,
             message,
+            ..
         }) => {
             println!("{message}");
             return Ok(());

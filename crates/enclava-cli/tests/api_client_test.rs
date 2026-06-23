@@ -38,6 +38,7 @@ fn client_from_config() {
 fn api_error_display() {
     let err = ApiError::Api {
         status: 404,
+        code: None,
         message: "app not found".to_string(),
     };
     assert!(err.to_string().contains("404"));
@@ -189,4 +190,45 @@ async fn get_template_ssh_command_uses_hosted_paas_route() {
         response.app_url.as_deref(),
         Some("https://shell.example.test")
     );
+}
+
+#[tokio::test]
+async fn api_errors_preserve_paas_error_code() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = r#"{"code":"cap_response_invalid","message":"CAP app response included an invalid app domain"}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 502 Bad Gateway\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let err = client.get_template_ssh_command("shell").await.unwrap_err();
+
+    let request = handle.join().unwrap();
+    assert!(request.starts_with("GET /apps/shell/ssh-command "));
+    match err {
+        ApiError::Api {
+            status,
+            code,
+            message,
+        } => {
+            assert_eq!(status, 502);
+            assert_eq!(code.as_deref(), Some("cap_response_invalid"));
+            assert!(message.contains("CAP app response included an invalid app domain"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
 }
