@@ -26,6 +26,8 @@ pub enum TemplateCommand {
     List,
     /// Deploy a hosted template instance
     Deploy(TemplateDeployArgs),
+    /// Fetch the PaaS-rendered SSH command for a hosted template app
+    SshCommand(TemplateSshCommandArgs),
 }
 
 #[derive(Args)]
@@ -59,6 +61,22 @@ pub struct TemplateDeployArgs {
     pub ssh_timeout_seconds: u64,
 }
 
+#[derive(Args)]
+pub struct TemplateSshCommandArgs {
+    /// Instance/app name to inspect
+    #[arg(long)]
+    pub name: String,
+    /// Reserved ngrok TCP address expected in the returned stable SSH command.
+    #[arg(long = "ngrok-tcp-url")]
+    pub ngrok_tcp_url: Option<String>,
+    /// Wait until PaaS reports the SSH command as ready.
+    #[arg(long)]
+    pub wait: bool,
+    /// Seconds to wait for the PaaS SSH command when --wait is set.
+    #[arg(long, default_value_t = DEFAULT_SSH_TIMEOUT_SECONDS)]
+    pub ssh_timeout_seconds: u64,
+}
+
 fn build_api_client() -> Result<ApiClient, Box<dyn std::error::Error>> {
     let paths = CliPaths::resolve()?;
     let cli_config = config::load_config(&paths)?;
@@ -70,6 +88,7 @@ pub async fn run(cmd: TemplateCommand) -> Result<(), Box<dyn std::error::Error>>
     match cmd {
         TemplateCommand::List => list().await,
         TemplateCommand::Deploy(args) => deploy(args).await,
+        TemplateCommand::SshCommand(args) => ssh_command(args).await,
     }
 }
 
@@ -225,6 +244,31 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             instance_name
         );
     }
+    Ok(())
+}
+
+async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let instance_name = normalize_slug(&args.name)?;
+    let stable_endpoint = args
+        .ngrok_tcp_url
+        .as_deref()
+        .map(normalize_ngrok_tcp_url)
+        .transpose()?;
+    let api = build_api_client()?;
+    let response = if args.wait {
+        wait_for_paas_ssh_command(
+            &api,
+            &instance_name,
+            stable_endpoint.as_deref(),
+            Duration::from_secs(args.ssh_timeout_seconds),
+        )
+        .await?
+    } else {
+        let response = api.get_template_ssh_command(&instance_name).await?;
+        validate_ssh_command_response(&response, stable_endpoint.as_deref())?;
+        response
+    };
+    print_ssh_command_response(&instance_name, &response);
     Ok(())
 }
 
@@ -585,20 +629,47 @@ async fn wait_for_paas_ssh_command(
             }
             Err(error) => return Err(error.into()),
         };
-        if response.status == "ready"
-            && let Some(command) = response.command.as_deref()
-        {
-            if !valid_ssh_command(command) {
-                return Err(format!("PaaS returned an invalid SSH command: {command}").into());
-            }
-            if let Some(endpoint) = stable_endpoint {
-                ensure_ssh_command_matches_endpoint(command, endpoint)?;
-            }
+        if response.status == "ready" {
+            validate_ssh_command_response(&response, stable_endpoint)?;
             return Ok(response);
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
     Err(format!("timed out waiting for PaaS SSH command for app {app_name}").into())
+}
+
+fn validate_ssh_command_response(
+    response: &SshCommandResponse,
+    stable_endpoint: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if response.status == "ready" {
+        let command = response
+            .command
+            .as_deref()
+            .ok_or("PaaS reported SSH command ready without a command")?;
+        if !valid_ssh_command(command) {
+            return Err(format!("PaaS returned an invalid SSH command: {command}").into());
+        }
+        if let Some(endpoint) = stable_endpoint {
+            ensure_ssh_command_matches_endpoint(command, endpoint)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_ssh_command_response(instance_name: &str, response: &SshCommandResponse) {
+    println!("  Status:     {}", response.status);
+    if let Some(app_url) = response.app_url.as_deref() {
+        println!("  URL:        {app_url}");
+    }
+    if let Some(command) = response.command.as_deref() {
+        println!("  SSH:        {command}");
+    } else {
+        println!(
+            "  SSH:        pending via PaaS /apps/{}/ssh-command",
+            instance_name
+        );
+    }
 }
 
 fn should_retry_paas_ssh_command_error(error: &ApiError) -> bool {
@@ -828,6 +899,40 @@ mod tests {
         assert!(!should_retry_paas_ssh_command_error(
             &ApiError::NotAuthenticated
         ));
+    }
+
+    #[test]
+    fn ssh_command_response_validation_allows_pending_and_validates_ready() {
+        let pending = SshCommandResponse {
+            status: "pending".to_string(),
+            command: None,
+            app_url: None,
+        };
+        validate_ssh_command_response(&pending, Some("6.tcp.eu.ngrok.io:17958")).unwrap();
+
+        let ready = SshCommandResponse {
+            status: "ready".to_string(),
+            command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io".to_string()),
+            app_url: Some("https://shell.example.test".to_string()),
+        };
+        validate_ssh_command_response(&ready, Some("tcp://6.tcp.eu.ngrok.io:17958")).unwrap();
+
+        let mismatched = SshCommandResponse {
+            status: "ready".to_string(),
+            command: Some("ssh -p 17959 user@6.tcp.eu.ngrok.io".to_string()),
+            app_url: None,
+        };
+        let err = validate_ssh_command_response(&mismatched, Some("6.tcp.eu.ngrok.io:17958"))
+            .unwrap_err();
+        assert!(err.to_string().contains("does not match reserved endpoint"));
+
+        let missing = SshCommandResponse {
+            status: "ready".to_string(),
+            command: None,
+            app_url: None,
+        };
+        let err = validate_ssh_command_response(&missing, None).unwrap_err();
+        assert!(err.to_string().contains("ready without a command"));
     }
 
     #[test]
