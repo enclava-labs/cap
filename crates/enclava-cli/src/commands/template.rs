@@ -9,7 +9,7 @@ use clap::{Args, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use enclava_cli::{
-    api_client::ApiClient,
+    api_client::{ApiClient, ApiError},
     api_types::{
         CreateTemplateInstanceRequest, HostedTemplate, HostedTemplateConfigKey, SshCommandResponse,
     },
@@ -500,7 +500,14 @@ async fn wait_for_paas_ssh_command(
 ) -> Result<SshCommandResponse, Box<dyn std::error::Error>> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        let response = api.get_template_ssh_command(app_name).await?;
+        let response = match api.get_template_ssh_command(app_name).await {
+            Ok(response) => response,
+            Err(error) if should_retry_paas_ssh_command_error(&error) => {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         if response.status == "ready"
             && let Some(command) = response.command.as_deref()
         {
@@ -515,6 +522,14 @@ async fn wait_for_paas_ssh_command(
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
     Err(format!("timed out waiting for PaaS SSH command for app {app_name}").into())
+}
+
+fn should_retry_paas_ssh_command_error(error: &ApiError) -> bool {
+    match error {
+        ApiError::Http(_) => true,
+        ApiError::Api { status, .. } => matches!(*status, 408 | 425 | 429 | 500..=599),
+        ApiError::NotAuthenticated => false,
+    }
 }
 
 fn valid_ssh_command(command: &str) -> bool {
@@ -680,6 +695,26 @@ mod tests {
         assert!(valid_ssh_command("ssh -p 17958 user@6.tcp.eu.ngrok.io"));
         assert!(!valid_ssh_command("ssh -p nope user@6.tcp.eu.ngrok.io"));
         assert!(!valid_ssh_command("ssh -p 0 user@6.tcp.eu.ngrok.io"));
+    }
+
+    #[test]
+    fn paas_ssh_command_poll_retries_only_transient_api_errors() {
+        for status in [408, 425, 429, 500, 502, 503, 504] {
+            assert!(should_retry_paas_ssh_command_error(&ApiError::Api {
+                status,
+                message: "temporary".to_string(),
+            }));
+        }
+
+        for status in [400, 401, 403, 404, 409, 422] {
+            assert!(!should_retry_paas_ssh_command_error(&ApiError::Api {
+                status,
+                message: "permanent".to_string(),
+            }));
+        }
+        assert!(!should_retry_paas_ssh_command_error(
+            &ApiError::NotAuthenticated
+        ));
     }
 
     #[test]
