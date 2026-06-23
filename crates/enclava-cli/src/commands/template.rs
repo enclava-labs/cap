@@ -660,6 +660,16 @@ fn validate_ssh_command_response(
         if !valid_ssh_command(command) {
             return Err(format!("PaaS returned an invalid SSH command: {command}").into());
         }
+        if let Some(reported_endpoint) = response.endpoint.as_deref() {
+            let command_endpoint = ssh_endpoint_string(command)
+                .ok_or_else(|| format!("could not parse SSH command: {command}"))?;
+            if reported_endpoint != command_endpoint {
+                return Err(format!(
+                    "PaaS SSH endpoint {reported_endpoint} does not match SSH command endpoint {command_endpoint}"
+                )
+                .into());
+            }
+        }
         if let Some(endpoint) = stable_endpoint {
             ensure_ssh_command_matches_endpoint(command, endpoint)?;
         }
@@ -1006,6 +1016,26 @@ mod tests {
             app_url: Some("https://shell.example.test".to_string()),
         };
         validate_ssh_command_response(&ready, Some("tcp://6.tcp.eu.ngrok.io:17958")).unwrap();
+
+        let missing_reported_endpoint = SshCommandResponse {
+            status: "ready".to_string(),
+            command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io".to_string()),
+            endpoint: None,
+            app_url: Some("https://shell.example.test".to_string()),
+        };
+        validate_ssh_command_response(&missing_reported_endpoint, None).unwrap();
+
+        let mismatched_reported_endpoint = SshCommandResponse {
+            status: "ready".to_string(),
+            command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io".to_string()),
+            endpoint: Some("6.tcp.eu.ngrok.io:17959".to_string()),
+            app_url: None,
+        };
+        let err = validate_ssh_command_response(&mismatched_reported_endpoint, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match SSH command endpoint")
+        );
 
         let mismatched = SshCommandResponse {
             status: "ready".to_string(),
