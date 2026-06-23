@@ -45,6 +45,19 @@ approved session before calling `/users/me`. After login/signup, the CLI also
 ensures the personal-org keyring is ready so manual deploy does not require
 manual `enclava org keyring ...` commands.
 
+Hosted PaaS template route work can be tested with the focused CLI package
+checks:
+
+```bash
+cargo test -p enclava-cli template::tests -- --nocapture
+cargo run -p enclava-cli -- template deploy --help
+```
+
+The deploy subcommand expects a hosted PaaS session and calls `GET /templates`
+and `POST /template-instances`. It then delivers `NGROK_AUTHTOKEN`,
+`DEBIAN_SSH_AUTHORIZED_KEYS`, and optional `NGROK_TCP_URL` directly to the TEE
+config endpoint, so do not add PaaS-side storage of those config values.
+
 ## Deploy Flow Development
 
 The current user-facing CLI path should stay free of platform-owned env

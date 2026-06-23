@@ -187,3 +187,130 @@ fn deployment_entry_accepts_legacy_deployment_id_field() {
 
     assert_eq!(entry.id, "90dc3149-02e2-4d44-8398-67637abbcbbe");
 }
+
+#[test]
+fn hosted_template_response_accepts_stable_ssh_endpoint_metadata() {
+    let body = serde_json::json!({
+        "slug": "debian-ssh-ngrok",
+        "name": "Debian SSH over ngrok",
+        "description": "Confidential Debian shell with SSH exposed through an ngrok TCP tunnel.",
+        "version": "2026-06-18",
+        "image": "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "source_provider": "github",
+        "source_repository": "enclava-labs/debian-ssh-ngrok-template",
+        "signer_subject": "https://github.com/enclava-labs/debian-ssh-ngrok-template/.github/workflows/image.yml@refs/heads/main",
+        "signer_issuer": "https://token.actions.githubusercontent.com",
+        "container_name": "web",
+        "unlock_mode": "auto",
+        "health_path": "/healthz",
+        "health_interval": 15,
+        "health_timeout": 5,
+        "resources": {
+            "cpu": "2",
+            "memory": "4Gi",
+            "storage": "10Gi"
+        },
+        "persistence_path": "/home/user",
+        "tls_policy": "confidential_per_instance_tls",
+        "workload_security_profile": "rootful-sudo",
+        "security_notes": ["SSH access is enabled."],
+        "egress_allowlist": [
+            { "host": "connect.ngrok-agent.com", "ports": [443] }
+        ],
+        "config_keys": [
+            {
+                "key": "DEBIAN_SSH_AUTHORIZED_KEYS",
+                "label": "SSH public keys",
+                "description": "One SSH public key per line.",
+                "input_type": "ssh_public_keys",
+                "required": true,
+                "secret": false,
+                "generated": false,
+                "validation": {
+                    "max_bytes": 32768,
+                    "max_items": 10,
+                    "allowed_algorithms": ["ssh-ed25519"]
+                }
+            },
+            {
+                "key": "NGROK_TCP_URL",
+                "label": "Stable SSH endpoint",
+                "description": "Optional reserved ngrok TCP address.",
+                "input_type": "text",
+                "required": false,
+                "secret": false,
+                "generated": false,
+                "default_value": null
+            }
+        ]
+    });
+
+    let template: HostedTemplate = serde_json::from_value(body).unwrap();
+
+    assert_eq!(template.slug, "debian-ssh-ngrok");
+    let stable = template
+        .config_keys
+        .iter()
+        .find(|entry| entry.key == "NGROK_TCP_URL")
+        .expect("stable ssh config key");
+    assert_eq!(stable.label, "Stable SSH endpoint");
+    assert!(!stable.required);
+}
+
+#[test]
+fn template_instance_response_accepts_config_token_and_cap_payload() {
+    let body = serde_json::json!({
+        "template": {
+            "slug": "debian-ssh-ngrok",
+            "name": "Debian SSH over ngrok",
+            "description": "Confidential Debian shell with SSH exposed through an ngrok TCP tunnel.",
+            "version": "2026-06-18",
+            "image": "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "config_keys": []
+        },
+        "app": {
+            "name": "shell",
+            "status": "creating"
+        },
+        "deployment": {
+            "cap_deployment_id": "00000000-0000-0000-0000-000000000001",
+            "status": "pending"
+        },
+        "config_token": {
+            "token": "redacted",
+            "tee_url": "https://shell.tee.example/.well-known/confidential/config",
+            "expires_in_seconds": 300
+        },
+        "cap": {
+            "app_domain": "shell.example"
+        }
+    });
+
+    let response: TemplateInstanceResponse = serde_json::from_value(body).unwrap();
+
+    assert_eq!(response.template.slug, "debian-ssh-ngrok");
+    assert_eq!(
+        response.deployment.cap_deployment_id.as_deref(),
+        Some("00000000-0000-0000-0000-000000000001")
+    );
+    assert_eq!(
+        response.config_token.unwrap().tee_url.as_deref(),
+        Some("https://shell.tee.example/.well-known/confidential/config")
+    );
+    assert_eq!(response.cap["app_domain"], "shell.example");
+}
+
+#[test]
+fn create_template_instance_request_sends_empty_config_object() {
+    let req = CreateTemplateInstanceRequest {
+        template_slug: "debian-ssh-ngrok".to_string(),
+        instance_name: "shell".to_string(),
+        config: serde_json::json!({}),
+    };
+
+    let value = serde_json::to_value(&req).unwrap();
+
+    assert_eq!(value["template_slug"], "debian-ssh-ngrok");
+    assert_eq!(value["instance_name"], "shell");
+    assert_eq!(value["config"], serde_json::json!({}));
+}

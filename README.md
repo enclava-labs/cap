@@ -39,6 +39,24 @@ generated agent policy, and signed policy artifact before applying Kubernetes
 resources. `enclava logs` currently returns an explicit unavailable response
 until the Kubernetes log proxy is wired.
 
+When the CLI is authenticated against hosted PaaS API mode, it also exposes the
+hosted Debian SSH template flow. This is a PaaS convenience path layered on the
+same CLI binary; CAP itself still stays plan-name-free and does not own hosted
+billing or product semantics.
+
+```bash
+enclava template list
+enclava template deploy --name shell \
+  --ssh-public-key-file ~/.ssh/id_ed25519.pub \
+  --ngrok-authtoken-file ../ngrok-secret.txt \
+  --ngrok-tcp-url 6.tcp.eu.ngrok.io:17958
+```
+
+`--ngrok-tcp-url` is optional, but it is the stable SSH endpoint path: the CLI
+normalizes the reserved ngrok TCP address, writes it directly to the TEE config
+endpoint with the ngrok token and SSH public keys, waits for `/ssh.txt`, and
+fails if the published SSH command does not match the reserved host and port.
+
 ## Repository Layout
 
 | Path | Purpose |

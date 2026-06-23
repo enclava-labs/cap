@@ -1,4 +1,7 @@
-use enclava_cli::api_client::{ApiClient, ApiError};
+use enclava_cli::{
+    api_client::{ApiClient, ApiError},
+    api_types::CreateTemplateInstanceRequest,
+};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
@@ -72,4 +75,80 @@ async fn sync_config_key_posts_metadata_callback() {
     assert!(request.contains("authorization: Bearer test-token"));
     assert!(request.contains(r#""key_name":"P0_KEY""#));
     assert!(request.contains(r#""deleted":false"#));
+}
+
+#[tokio::test]
+async fn list_templates_gets_hosted_templates_route() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = r#"[{"slug":"debian-ssh-ngrok","name":"Debian SSH over ngrok","description":"SSH template","version":"2026-06-18","image":"ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","config_keys":[]}]"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let templates = client.list_templates().await.unwrap();
+
+    let request = handle.join().unwrap();
+    assert!(request.starts_with("GET /templates "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert_eq!(templates[0].slug, "debian-ssh-ngrok");
+}
+
+#[tokio::test]
+async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).unwrap();
+        let body = r#"{"template":{"slug":"debian-ssh-ngrok","name":"Debian SSH over ngrok","description":"SSH template","version":"2026-06-18","image":"ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","config_keys":[]},"app":{"name":"shell"},"deployment":{"cap_deployment_id":"deploy-1","status":"pending"},"config_token":{"token":"redacted","tee_url":"https://shell.tee.example/.well-known/confidential/config","expires_in_seconds":300},"cap":{"app_domain":"shell.example"}}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let response = client
+        .create_template_instance(&CreateTemplateInstanceRequest {
+            template_slug: "debian-ssh-ngrok".to_string(),
+            instance_name: "shell".to_string(),
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+    let request = handle.join().unwrap();
+    assert!(request.starts_with("POST /template-instances "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert!(request.contains("idempotency-key: template-instance-debian-ssh-ngrok-shell"));
+    assert!(request.contains(r#""template_slug":"debian-ssh-ngrok""#));
+    assert!(request.contains(r#""instance_name":"shell""#));
+    assert!(request.contains(r#""config":{}"#));
+    assert_eq!(
+        response.config_token.unwrap().tee_url.as_deref(),
+        Some("https://shell.tee.example/.well-known/confidential/config")
+    );
 }
