@@ -181,7 +181,11 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         None
     } else {
         pb.set_position(3);
-        pb.set_message("Waiting for stable SSH command...");
+        if stable_endpoint.is_some() {
+            pb.set_message("Waiting for stable SSH command...");
+        } else {
+            pb.set_message("Waiting for SSH command...");
+        }
         let command = wait_for_ssh_command(
             &app_domain,
             stable_endpoint.as_deref(),
@@ -229,7 +233,7 @@ fn read_ngrok_authtoken(
         value
     } else {
         return Err(
-            "ngrok auth token is required; pass --ngrok-authtoken-file or set NGROK_AUTHTOKEN"
+            "ngrok auth token is required; pass --ngrok-authtoken, --ngrok-authtoken-file, or set NGROK_AUTHTOKEN"
                 .into(),
         );
     };
@@ -264,7 +268,7 @@ fn read_ssh_public_keys(
         .collect::<Vec<_>>()
         .join("\n");
     if value.trim().is_empty() {
-        Err("at least one SSH public key is required; pass --ssh-public-key-file".into())
+        Err("at least one SSH public key is required; pass --ssh-public-key or --ssh-public-key-file".into())
     } else {
         Ok(value)
     }
@@ -364,14 +368,15 @@ fn normalize_ngrok_tcp_url(value: &str) -> Result<String, Box<dyn std::error::Er
 
 fn is_ngrok_tcp_host(host: &str) -> bool {
     let labels = host.split('.').collect::<Vec<_>>();
-    labels.len() >= 4
-        && labels.iter().all(|label| {
-            !label.is_empty()
-                && label
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-        })
-        && labels.contains(&"tcp")
+    if !matches!(labels.len(), 4 | 5) {
+        return false;
+    }
+    labels.iter().all(|label| {
+        !label.is_empty()
+            && label
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    }) && labels[1] == "tcp"
         && labels[labels.len() - 2] == "ngrok"
         && matches!(labels[labels.len() - 1], "io" | "app")
 }
@@ -446,11 +451,17 @@ mod tests {
             normalize_ngrok_tcp_url("TCP://6.TCP.EU.NGROK.IO:17958").unwrap(),
             "6.tcp.eu.ngrok.io:17958"
         );
+        assert_eq!(
+            normalize_ngrok_tcp_url("1.tcp.ngrok.io:22222").unwrap(),
+            "1.tcp.ngrok.io:22222"
+        );
     }
 
     #[test]
     fn ngrok_tcp_url_rejects_non_ngrok_hosts() {
         assert!(normalize_ngrok_tcp_url("example.com:22").is_err());
+        assert!(normalize_ngrok_tcp_url("tcp.eu.ngrok.io:17958").is_err());
+        assert!(normalize_ngrok_tcp_url("6.tcp.eu.extra.ngrok.io:17958").is_err());
     }
 
     #[test]
