@@ -159,13 +159,8 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     let tee = TeeClient::from_config_url(tee_url);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
-    let mut config_pairs = vec![
-        ("NGROK_AUTHTOKEN", ngrok_authtoken),
-        ("DEBIAN_SSH_AUTHORIZED_KEYS", public_keys),
-    ];
-    if let Some(endpoint) = stable_endpoint.as_ref() {
-        config_pairs.push(("NGROK_TCP_URL", endpoint.clone()));
-    }
+    let config_pairs =
+        debian_ssh_config_pairs(ngrok_authtoken, public_keys, stable_endpoint.as_ref());
     for (key, value) in &config_pairs {
         tee.config_set(key, value, &token.token).await?;
         api.sync_config_key(&args.name, key, false).await?;
@@ -285,6 +280,20 @@ fn stable_ssh_endpoint_hint(template: &HostedTemplate) -> Option<String> {
     Some(format!(
         "pass --ngrok-tcp-url {example} for a stable command"
     ))
+}
+
+fn debian_ssh_config_pairs(
+    ngrok_authtoken: String,
+    public_keys: String,
+    stable_endpoint: Option<&String>,
+) -> Vec<(&'static str, String)> {
+    let mut pairs = Vec::new();
+    if let Some(endpoint) = stable_endpoint {
+        pairs.push(("NGROK_TCP_URL", endpoint.clone()));
+    }
+    pairs.push(("NGROK_AUTHTOKEN", ngrok_authtoken));
+    pairs.push(("DEBIAN_SSH_AUTHORIZED_KEYS", public_keys));
+    pairs
 }
 
 fn read_ngrok_authtoken(
@@ -614,5 +623,27 @@ mod tests {
             stable_ssh_endpoint_hint(&template).as_deref(),
             Some("pass --ngrok-tcp-url 6.tcp.eu.ngrok.io:17958 for a stable command")
         );
+    }
+
+    #[test]
+    fn debian_ssh_config_pairs_write_stable_endpoint_before_required_keys() {
+        let endpoint = "6.tcp.eu.ngrok.io:17958".to_string();
+        let pairs = debian_ssh_config_pairs(
+            "ngrok-token".to_string(),
+            "ssh-ed25519 AAAA".to_string(),
+            Some(&endpoint),
+        );
+
+        assert_eq!(pairs[0], ("NGROK_TCP_URL", endpoint));
+        assert_eq!(pairs[1].0, "NGROK_AUTHTOKEN");
+        assert_eq!(pairs[2].0, "DEBIAN_SSH_AUTHORIZED_KEYS");
+
+        let dynamic_pairs = debian_ssh_config_pairs(
+            "ngrok-token".to_string(),
+            "ssh-ed25519 AAAA".to_string(),
+            None,
+        );
+        assert_eq!(dynamic_pairs[0].0, "NGROK_AUTHTOKEN");
+        assert_eq!(dynamic_pairs[1].0, "DEBIAN_SSH_AUTHORIZED_KEYS");
     }
 }
