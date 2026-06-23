@@ -52,6 +52,7 @@ enclava template deploy --name shell \
   --ngrok-tcp-url 6.tcp.eu.ngrok.io:17958
 enclava template ssh-command --name shell --wait \
   --ngrok-tcp-url 6.tcp.eu.ngrok.io:17958
+enclava template ssh-command --name shell --json
 ```
 
 `--ngrok-tcp-url` is optional, but it is the stable SSH endpoint path: the CLI
@@ -60,6 +61,8 @@ endpoint with the ngrok token and SSH public keys, waits for the hosted PaaS
 `/apps/<name>/ssh-command` broker, and fails if the returned SSH command does
 not match the reserved host and port. Use `enclava template ssh-command` after a
 `--no-wait` deployment or timeout to fetch the same PaaS-rendered command later.
+Pass `--json` when automation needs the command and parsed `endpoint` as
+structured output.
 
 ## Repository Layout
 
