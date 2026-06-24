@@ -235,9 +235,9 @@ fn hosted_template_response_accepts_stable_ssh_endpoint_metadata() {
             {
                 "key": "NGROK_TCP_URL",
                 "label": "Stable SSH endpoint",
-                "description": "Optional reserved ngrok TCP address.",
+                "description": "Required reserved ngrok TCP address.",
                 "input_type": "text",
-                "required": false,
+                "required": true,
                 "secret": false,
                 "generated": false,
                 "default_value": null,
@@ -260,7 +260,7 @@ fn hosted_template_response_accepts_stable_ssh_endpoint_metadata() {
         .find(|entry| entry.key == "NGROK_TCP_URL")
         .expect("stable ssh config key");
     assert_eq!(stable.label, "Stable SSH endpoint");
-    assert!(!stable.required);
+    assert!(stable.required);
     let stable_validation = stable.validation.as_ref().expect("stable validation");
     assert_eq!(stable_validation.format.as_deref(), Some("ngrok_tcp_url"));
     assert_eq!(

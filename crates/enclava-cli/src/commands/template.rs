@@ -50,7 +50,7 @@ pub struct TemplateDeployArgs {
     /// File containing the ngrok auth token.
     #[arg(long = "ngrok-authtoken-file", value_name = "PATH")]
     pub ngrok_authtoken_file: Option<PathBuf>,
-    /// Reserved ngrok TCP address for a stable SSH command, e.g. 6.tcp.eu.ngrok.io:17958.
+    /// Required reserved ngrok TCP address for a stable SSH command, e.g. 6.tcp.eu.ngrok.io:17958.
     #[arg(long = "ngrok-tcp-url")]
     pub ngrok_tcp_url: Option<String>,
     /// Do not wait for the PaaS SSH command after config delivery.
@@ -152,11 +152,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         args.ngrok_authtoken.as_deref(),
         args.ngrok_authtoken_file.as_ref(),
     )?;
-    let stable_endpoint = args
-        .ngrok_tcp_url
-        .as_deref()
-        .map(normalize_ngrok_tcp_url)
-        .transpose()?;
+    let stable_endpoint = required_deploy_stable_endpoint(args.ngrok_tcp_url.as_deref())?;
 
     let pb = if args.json {
         ProgressBar::hidden()
@@ -191,8 +187,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     let tee = TeeClient::from_config_url(tee_url);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
-    let config_pairs =
-        debian_ssh_config_pairs(ngrok_authtoken, public_keys, stable_endpoint.as_ref());
+    let config_pairs = debian_ssh_config_pairs(ngrok_authtoken, public_keys, &stable_endpoint);
     for (key, value) in &config_pairs {
         tee.config_set(key, value, &token.token).await?;
         api.sync_config_key(&instance_name, key, false).await?;
@@ -218,15 +213,11 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         (None, None)
     } else {
         pb.set_position(3);
-        if stable_endpoint.is_some() {
-            pb.set_message("Waiting for stable SSH command...");
-        } else {
-            pb.set_message("Waiting for SSH command...");
-        }
+        pb.set_message("Waiting for stable SSH command...");
         let response = wait_for_paas_ssh_command(
             &api,
             &instance_name,
-            stable_endpoint.as_deref(),
+            Some(stable_endpoint.as_str()),
             Duration::from_secs(args.ssh_timeout_seconds),
         )
         .await?;
@@ -245,7 +236,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             &instance_name,
             &app_url,
             &deployment_id,
-            stable_endpoint.as_deref(),
+            Some(stable_endpoint.as_str()),
             ssh_command.as_deref(),
             ssh_endpoint.as_deref(),
             args.json,
@@ -364,15 +355,20 @@ fn normalize_slug(value: &str) -> Result<String, Box<dyn std::error::Error>> {
     }
 }
 
+fn required_deploy_stable_endpoint(
+    value: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    normalize_ngrok_tcp_url(
+        value.ok_or("--ngrok-tcp-url is required for hosted Debian SSH deployments")?,
+    )
+}
+
 fn debian_ssh_config_pairs(
     ngrok_authtoken: String,
     public_keys: String,
-    stable_endpoint: Option<&String>,
+    stable_endpoint: &String,
 ) -> Vec<(&'static str, String)> {
-    let mut pairs = Vec::new();
-    if let Some(endpoint) = stable_endpoint {
-        pairs.push(("NGROK_TCP_URL", endpoint.clone()));
-    }
+    let mut pairs = vec![("NGROK_TCP_URL", stable_endpoint.clone())];
     pairs.push(("NGROK_AUTHTOKEN", ngrok_authtoken));
     pairs.push(("DEBIAN_SSH_AUTHORIZED_KEYS", public_keys));
     pairs
@@ -892,9 +888,9 @@ mod tests {
                 HostedTemplateConfigKey {
                     key: "NGROK_TCP_URL".to_string(),
                     label: "Stable SSH endpoint".to_string(),
-                    description: "Optional reserved ngrok TCP address.".to_string(),
+                    description: "Required reserved ngrok TCP address.".to_string(),
                     input_type: "text".to_string(),
-                    required: false,
+                    required: true,
                     secret: false,
                     default_value: None,
                     validation: Some(HostedTemplateConfigValidation {
@@ -932,6 +928,16 @@ mod tests {
         assert!(normalize_ngrok_tcp_url("example.com:22").is_err());
         assert!(normalize_ngrok_tcp_url("tcp.eu.ngrok.io:17958").is_err());
         assert!(normalize_ngrok_tcp_url("6.tcp.eu.extra.ngrok.io:17958").is_err());
+    }
+
+    #[test]
+    fn deploy_requires_stable_ssh_endpoint() {
+        let err = required_deploy_stable_endpoint(None).unwrap_err();
+        assert!(err.to_string().contains("--ngrok-tcp-url is required"));
+        assert_eq!(
+            required_deploy_stable_endpoint(Some("tcp://6.TCP.EU.NGROK.IO:17958")).unwrap(),
+            "6.tcp.eu.ngrok.io:17958"
+        );
     }
 
     #[test]
@@ -1220,12 +1226,9 @@ mod tests {
 
         assert_eq!(
             template_required_inputs(&template).as_deref(),
-            Some("ngrok auth token, SSH public keys")
+            Some("ngrok auth token, SSH public keys, Stable SSH endpoint (--ngrok-tcp-url)")
         );
-        assert_eq!(
-            template_optional_inputs(&template).as_deref(),
-            Some("Stable SSH endpoint (--ngrok-tcp-url)")
-        );
+        assert_eq!(template_optional_inputs(&template), None);
         assert_eq!(
             stable_ssh_endpoint_hint(&template).as_deref(),
             Some("pass --ngrok-tcp-url 6.tcp.eu.ngrok.io:17958 for a stable command")
@@ -1238,20 +1241,12 @@ mod tests {
         let pairs = debian_ssh_config_pairs(
             "ngrok-token".to_string(),
             "ssh-ed25519 AAAA".to_string(),
-            Some(&endpoint),
+            &endpoint,
         );
 
         assert_eq!(pairs[0], ("NGROK_TCP_URL", endpoint));
         assert_eq!(pairs[1].0, "NGROK_AUTHTOKEN");
         assert_eq!(pairs[2].0, "DEBIAN_SSH_AUTHORIZED_KEYS");
-
-        let dynamic_pairs = debian_ssh_config_pairs(
-            "ngrok-token".to_string(),
-            "ssh-ed25519 AAAA".to_string(),
-            None,
-        );
-        assert_eq!(dynamic_pairs[0].0, "NGROK_AUTHTOKEN");
-        assert_eq!(dynamic_pairs[1].0, "DEBIAN_SSH_AUTHORIZED_KEYS");
     }
 
     #[test]

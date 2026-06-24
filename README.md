@@ -56,9 +56,9 @@ enclava template ssh-command --name shell --wait \
 enclava template ssh-command --name shell --json
 ```
 
-`--ngrok-tcp-url` is optional, but it is the stable SSH endpoint path: the CLI
-normalizes the reserved ngrok TCP address, writes it directly to the TEE config
-endpoint with the ngrok token and SSH public keys, waits for the hosted PaaS
+`--ngrok-tcp-url` is required for hosted Debian SSH deploys: the CLI normalizes
+the reserved ngrok TCP address, writes it directly to the TEE config endpoint
+with the ngrok token and SSH public keys, waits for the hosted PaaS
 `/apps/<name>/ssh-command` broker, and fails if the returned SSH command does
 not match the reserved host and port. Ready broker responses must include the
 parsed `endpoint` field; the CLI fails closed if it is missing or does not match

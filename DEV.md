@@ -55,7 +55,7 @@ cargo run -p enclava-cli -- template deploy --help
 
 The deploy subcommand expects a hosted PaaS session and calls `GET /templates`
 and `POST /template-instances`. It then delivers `NGROK_AUTHTOKEN`,
-`DEBIAN_SSH_AUTHORIZED_KEYS`, and optional `NGROK_TCP_URL` directly to the TEE
+`DEBIAN_SSH_AUTHORIZED_KEYS`, and required `NGROK_TCP_URL` directly to the TEE
 config endpoint, so do not add PaaS-side storage of those config values.
 
 ## Deploy Flow Development
