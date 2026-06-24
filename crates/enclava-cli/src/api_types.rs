@@ -253,8 +253,10 @@ pub struct TemplateDeploymentResponse {
 #[derive(Debug, Deserialize)]
 pub struct SshCommandResponse {
     pub status: String,
+    /// Null while pending; required by the hosted stable SSH contract when ready.
     #[serde(default)]
     pub command: Option<String>,
+    /// Null while pending; required by the hosted stable SSH contract when ready.
     #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default)]

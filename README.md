@@ -60,10 +60,12 @@ enclava template ssh-command --name shell --json
 normalizes the reserved ngrok TCP address, writes it directly to the TEE config
 endpoint with the ngrok token and SSH public keys, waits for the hosted PaaS
 `/apps/<name>/ssh-command` broker, and fails if the returned SSH command does
-not match the reserved host and port. Use `enclava template ssh-command` after a
-`--no-wait` deployment or timeout to fetch the same PaaS-rendered command later.
-Pass `--json` on deploy or command lookup when automation needs the app URL,
-command, and parsed `endpoint` as structured output.
+not match the reserved host and port. Ready broker responses must include the
+parsed `endpoint` field; the CLI fails closed if it is missing or does not match
+the rendered command. Use `enclava template ssh-command` after a `--no-wait`
+deployment or timeout to fetch the same PaaS-rendered command later. Pass
+`--json` on deploy or command lookup when automation needs the app URL, command,
+and parsed `endpoint` as structured output.
 
 ## Repository Layout
 
