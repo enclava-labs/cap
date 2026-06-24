@@ -660,9 +660,11 @@ fn validate_ssh_command_response(
         if !valid_ssh_command(command) {
             return Err(format!("PaaS returned an invalid SSH command: {command}").into());
         }
-        if let Some(reported_endpoint) = response.endpoint.as_deref() {
-            ensure_reported_ssh_endpoint_matches_command(command, reported_endpoint)?;
-        }
+        let reported_endpoint = response
+            .endpoint
+            .as_deref()
+            .ok_or("PaaS /ssh-command response did not include endpoint for ready SSH command")?;
+        ensure_reported_ssh_endpoint_matches_command(command, reported_endpoint)?;
         if let Some(endpoint) = stable_endpoint {
             ensure_ssh_command_matches_endpoint(command, endpoint)?;
         }
@@ -795,10 +797,9 @@ fn display_ssh_endpoint(
     };
     let command_endpoint = ssh_endpoint_string(command)
         .ok_or_else(|| format!("could not parse SSH command: {command}"))?;
-    if let Some(reported_endpoint) = reported_endpoint {
-        ensure_reported_ssh_endpoint_matches_command(command, reported_endpoint)?;
-        return Ok(Some(reported_endpoint.to_string()));
-    }
+    let reported_endpoint = reported_endpoint
+        .ok_or("PaaS /ssh-command response did not include endpoint for ready SSH command")?;
+    ensure_reported_ssh_endpoint_matches_command(command, reported_endpoint)?;
     Ok(Some(command_endpoint))
 }
 
@@ -1043,7 +1044,11 @@ mod tests {
             endpoint: None,
             app_url: Some("https://shell.example.test".to_string()),
         };
-        validate_ssh_command_response(&missing_reported_endpoint, None).unwrap();
+        let err = validate_ssh_command_response(&missing_reported_endpoint, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("did not include endpoint for ready SSH command")
+        );
 
         let mismatched_reported_endpoint = SshCommandResponse {
             status: "ready".to_string(),
