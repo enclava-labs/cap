@@ -219,20 +219,6 @@ fn hosted_template_response_accepts_stable_ssh_endpoint_metadata() {
         ],
         "config_keys": [
             {
-                "key": "DEBIAN_SSH_AUTHORIZED_KEYS",
-                "label": "SSH public keys",
-                "description": "One SSH public key per line.",
-                "input_type": "ssh_public_keys",
-                "required": true,
-                "secret": false,
-                "generated": false,
-                "validation": {
-                    "max_bytes": 32768,
-                    "max_items": 10,
-                    "allowed_algorithms": ["ssh-ed25519"]
-                }
-            },
-            {
                 "key": "NGROK_TCP_URL",
                 "label": "Stable SSH endpoint",
                 "description": "Required reserved ngrok TCP address.",
@@ -246,6 +232,20 @@ fn hosted_template_response_accepts_stable_ssh_endpoint_metadata() {
                     "example": "6.tcp.eu.ngrok.io:17958",
                     "max_bytes": 255,
                     "allowed_algorithms": []
+                }
+            },
+            {
+                "key": "DEBIAN_SSH_AUTHORIZED_KEYS",
+                "label": "SSH public keys",
+                "description": "One SSH public key per line.",
+                "input_type": "ssh_public_keys",
+                "required": true,
+                "secret": false,
+                "generated": false,
+                "validation": {
+                    "max_bytes": 32768,
+                    "max_items": 10,
+                    "allowed_algorithms": ["ssh-ed25519"]
                 }
             }
         ]

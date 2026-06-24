@@ -866,6 +866,22 @@ mod tests {
             image: "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff".to_string(),
             config_keys: vec![
                 HostedTemplateConfigKey {
+                    key: "NGROK_TCP_URL".to_string(),
+                    label: "Stable SSH endpoint".to_string(),
+                    description: "Required reserved ngrok TCP address.".to_string(),
+                    input_type: "text".to_string(),
+                    required: true,
+                    secret: false,
+                    default_value: None,
+                    validation: Some(HostedTemplateConfigValidation {
+                        format: Some("ngrok_tcp_url".to_string()),
+                        example: Some("6.tcp.eu.ngrok.io:17958".to_string()),
+                        max_bytes: Some(255),
+                        max_items: None,
+                        allowed_algorithms: vec![],
+                    }),
+                },
+                HostedTemplateConfigKey {
                     key: "NGROK_AUTHTOKEN".to_string(),
                     label: "ngrok auth token".to_string(),
                     description: "Token used by the workload.".to_string(),
@@ -884,22 +900,6 @@ mod tests {
                     secret: false,
                     default_value: None,
                     validation: None,
-                },
-                HostedTemplateConfigKey {
-                    key: "NGROK_TCP_URL".to_string(),
-                    label: "Stable SSH endpoint".to_string(),
-                    description: "Required reserved ngrok TCP address.".to_string(),
-                    input_type: "text".to_string(),
-                    required: true,
-                    secret: false,
-                    default_value: None,
-                    validation: Some(HostedTemplateConfigValidation {
-                        format: Some("ngrok_tcp_url".to_string()),
-                        example: Some("6.tcp.eu.ngrok.io:17958".to_string()),
-                        max_bytes: Some(255),
-                        max_items: None,
-                        allowed_algorithms: vec![],
-                    }),
                 },
             ],
             persistence_path: Some("/state".to_string()),
@@ -1226,7 +1226,7 @@ mod tests {
 
         assert_eq!(
             template_required_inputs(&template).as_deref(),
-            Some("ngrok auth token, SSH public keys, Stable SSH endpoint (--ngrok-tcp-url)")
+            Some("Stable SSH endpoint (--ngrok-tcp-url), ngrok auth token, SSH public keys")
         );
         assert_eq!(template_optional_inputs(&template), None);
         assert_eq!(
