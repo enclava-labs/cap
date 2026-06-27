@@ -1,6 +1,7 @@
 use super::{
     CreateAppRequest, RotateSignerRequest, SignerRotationTokenRequest, create_app,
-    issue_signer_rotation_token_route, list_apps, workload_teardown_instance_id,
+    issue_signer_rotation_token_route, list_apps, requires_workload_teardown,
+    workload_teardown_instance_id,
 };
 use crate::models::{App, AppStatus, Role, UnlockMode};
 use axum::Json;
@@ -77,6 +78,15 @@ fn teardown_token_instance_id_matches_attestation_proxy_owner_instance_id() {
         workload_teardown_instance_id(&app),
         "cap-a826eb13-demo-demo"
     );
+}
+
+#[test]
+fn only_running_apps_require_workload_teardown_endpoint() {
+    assert!(requires_workload_teardown(AppStatus::Running));
+    assert!(!requires_workload_teardown(AppStatus::Creating));
+    assert!(!requires_workload_teardown(AppStatus::Failed));
+    assert!(!requires_workload_teardown(AppStatus::Stopped));
+    assert!(!requires_workload_teardown(AppStatus::Deleting));
 }
 
 #[tokio::test]

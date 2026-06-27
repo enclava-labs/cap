@@ -15,7 +15,7 @@ use crate::auth::jwt::{
 };
 use crate::auth::middleware::{AuthContext, ManagementOrigin};
 use crate::auth::scopes;
-use crate::models::App;
+use crate::models::{App, AppStatus};
 use crate::source_provider::{
     SourceProvider, validate_signing_identity, validate_source_repository,
 };
@@ -97,11 +97,26 @@ fn workload_teardown_instance_id(app: &App) -> String {
     format!("{}-{}", app.namespace, app.name)
 }
 
+fn requires_workload_teardown(status: AppStatus) -> bool {
+    matches!(status, AppStatus::Running)
+}
+
 async fn request_workload_teardown(
     state: &AppState,
     auth: &AuthContext,
     app: &App,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if !requires_workload_teardown(app.status) {
+        tracing::info!(
+            app_id = %app.id,
+            app_name = %app.name,
+            namespace = %app.namespace,
+            status = ?app.status,
+            "skipping workload teardown endpoint for non-running app"
+        );
+        return Ok(());
+    }
+
     let token = crate::auth::jwt::issue_config_token(
         &state.signing_key,
         auth.user_id,
