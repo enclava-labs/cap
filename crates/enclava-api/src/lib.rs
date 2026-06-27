@@ -78,6 +78,10 @@ fn internal_routes() -> Router<AppState> {
                 .post(routes::internal::create_paas_app),
         )
         .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}",
+            axum::routing::delete(routes::internal::delete_paas_app),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}/members",
             axum::routing::get(routes::internal::list_paas_members),
         )

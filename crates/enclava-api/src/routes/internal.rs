@@ -986,6 +986,30 @@ pub async fn list_paas_apps(
     }))
 }
 
+pub async fn delete_paas_app(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Path((paas_org_id, app_name)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::apps::validate_app_name(&app_name)
+        .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
+    let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}");
+    if let Some(response) =
+        begin_actor_idempotent_request(&state, &headers, "DELETE", &path, &auth, &body).await?
+    {
+        return Ok(response);
+    }
+    let status =
+        crate::routes::apps::delete_app(auth, State(state.clone()), Path(app_name)).await?;
+    let response = serde_json::json!({"status": "deleted"});
+    finish_actor_idempotent_request(&state, &headers, status, &response).await?;
+    Ok((status, Json(response)))
+}
+
 pub async fn list_paas_members(
     _auth: InternalAuth,
     State(state): State<AppState>,
