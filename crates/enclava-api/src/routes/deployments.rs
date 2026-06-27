@@ -212,16 +212,16 @@ fn parse_memory_gi(s: &str) -> Result<f64, String> {
     if value <= 0.0 {
         return Err("memory value must be positive".to_string());
     }
-    if value > 1024.0 {
-        return Err("memory value too large (max 1024Gi)".to_string());
-    }
 
-    // Convert to GiB
-    match unit {
+    let gib = match unit {
         "Gi" | "GiB" => Ok(value),
         "Mi" | "MiB" => Ok(value / 1024.0),
         _ => Err(format!("unsupported memory unit: {unit}")),
+    }?;
+    if gib > 1024.0 {
+        return Err("memory value too large (max 1024Gi)".to_string());
     }
+    Ok(gib)
 }
 
 #[derive(Debug, Deserialize)]
@@ -936,3 +936,16 @@ pub async fn deployment_history(
 
 mod rollback;
 pub use rollback::rollback;
+
+#[cfg(test)]
+mod tests {
+    use super::parse_memory_gi;
+
+    #[test]
+    fn parse_memory_gi_validates_after_unit_conversion() {
+        assert_eq!(parse_memory_gi("8Gi").expect("8Gi"), 8.0);
+        assert_eq!(parse_memory_gi("8192Mi").expect("8192Mi"), 8.0);
+        assert_eq!(parse_memory_gi("1048576Mi").expect("1024Gi in Mi"), 1024.0);
+        assert!(parse_memory_gi("1048577Mi").is_err());
+    }
+}
