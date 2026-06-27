@@ -170,9 +170,7 @@ fn parse_image_parts(image_ref: &str) -> Result<(String, String), CosignError> {
 async fn load_trust_root() -> Result<Arc<SigstoreTrustRoot>, CosignError> {
     if let Ok(path) = std::env::var("SIGSTORE_TUF_ROOT_PATH") {
         let data = std::fs::read(&path).map_err(|e| {
-            CosignError::TrustRoot(format!(
-                "failed to read SIGSTORE_TUF_ROOT_PATH {path}: {e}"
-            ))
+            CosignError::TrustRoot(format!("failed to read SIGSTORE_TUF_ROOT_PATH {path}: {e}"))
         })?;
         let root = SigstoreTrustRoot::from_trusted_root_json_unchecked(&data).map_err(|e| {
             CosignError::TrustRoot(format!("invalid bundled trusted_root.json: {e}"))
@@ -220,9 +218,7 @@ fn build_constraints(
         }
         VerificationPolicy::PublicKey { pem } => {
             let verifier = PublicKeyVerifier::new(pem.as_bytes(), &SigningScheme::default())
-                .map_err(|e| {
-                    CosignError::InvalidPolicy(format!("invalid public key PEM: {e}"))
-                })?;
+                .map_err(|e| CosignError::InvalidPolicy(format!("invalid public key PEM: {e}")))?;
             vec![Box::new(verifier)]
         }
     };

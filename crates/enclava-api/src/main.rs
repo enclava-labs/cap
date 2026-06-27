@@ -222,9 +222,7 @@ fn load_hmac_key() -> anyhow::Result<[u8; 32]> {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(text.trim())
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "SESSION_HMAC_KEY_PATH is neither raw 32 bytes nor base64: {e}"
-                )
+                anyhow::anyhow!("SESSION_HMAC_KEY_PATH is neither raw 32 bytes nor base64: {e}")
             })?;
         if decoded.len() != 32 {
             anyhow::bail!(
