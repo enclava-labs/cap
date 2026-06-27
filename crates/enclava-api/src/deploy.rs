@@ -387,7 +387,7 @@ pub async fn build_confidential_app(
             .map(|path| {
                 let subdir = path.strip_prefix('/').unwrap_or(path).replace('/', "-");
                 BindMount {
-                    source: format!("/data/{}", subdir),
+                    source: format!("/data/{subdir}"),
                     destination: path.clone(),
                 }
             })

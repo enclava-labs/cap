@@ -341,9 +341,9 @@ pub async fn unlock_status(
         ))?;
 
     let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
-    let tee_url = format!("https://{}/.well-known/confidential", domain);
+    let tee_url = format!("https://{domain}/.well-known/confidential");
 
-    let status_url = format!("https://{}/.well-known/confidential/status", domain);
+    let status_url = format!("https://{domain}/.well-known/confidential/status");
     let ownership_state = match state.tee_http_client.get(&status_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             resp.json::<serde_json::Value>().await.ok().and_then(|v| {
@@ -395,12 +395,12 @@ pub async fn unlock_endpoint(
         ))?;
 
     let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
-    let base = format!("https://{}/.well-known/confidential", domain);
+    let base = format!("https://{domain}/.well-known/confidential");
 
     Ok(Json(UnlockEndpointResponse {
         tee_url: base.clone(),
-        unlock_endpoint: format!("{}/unlock", base),
-        claim_endpoint: format!("{}/bootstrap/claim", base),
+        unlock_endpoint: format!("{base}/unlock"),
+        claim_endpoint: format!("{base}/bootstrap/claim"),
     }))
 }
 
@@ -784,7 +784,7 @@ pub async fn update_unlock_mode(
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
             Err(e) => {
-                let error_message = format!("deployment apply limiter closed: {}", e);
+                let error_message = format!("deployment apply limiter closed: {e}");
                 let _ = crate::deploy::set_deployment_status(
                     &db,
                     deploy_id,

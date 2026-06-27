@@ -585,7 +585,7 @@ async fn paas_internal_org_member_and_entitlement_sync_are_idempotent() {
     .await
     .expect("synced entitlement");
     assert_eq!(entitlement.0, 3);
-    assert_eq!(entitlement.1, true);
+    assert!(entitlement.1);
     assert_eq!(entitlement.2["max_apps"], 2);
 }
 

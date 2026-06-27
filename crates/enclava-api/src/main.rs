@@ -178,23 +178,23 @@ fn build_trustee_http_client() -> anyhow::Result<reqwest::Client> {
 }
 
 fn read_key_file(path: &str) -> anyhow::Result<Vec<u8>> {
-    std::fs::read(path).map_err(|e| anyhow::anyhow!("failed to read key file {}: {}", path, e))
+    std::fs::read(path).map_err(|e| anyhow::anyhow!("failed to read key file {path}: {e}"))
 }
 
 fn load_signing_key() -> anyhow::Result<SigningKey> {
     if let Ok(path) = std::env::var("API_SIGNING_KEY_PATH") {
         let bytes = read_key_file(&path)?;
         return SigningKey::from_pkcs8_der(&bytes)
-            .map_err(|e| anyhow::anyhow!("invalid API_SIGNING_KEY_PATH PKCS#8 key: {}", e));
+            .map_err(|e| anyhow::anyhow!("invalid API_SIGNING_KEY_PATH PKCS#8 key: {e}"));
     }
 
     if let Ok(b64) = std::env::var("API_SIGNING_KEY_PKCS8_BASE64") {
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(b64.trim())
-            .map_err(|e| anyhow::anyhow!("invalid API_SIGNING_KEY_PKCS8_BASE64: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("invalid API_SIGNING_KEY_PKCS8_BASE64: {e}"))?;
         return SigningKey::from_pkcs8_der(&bytes)
-            .map_err(|e| anyhow::anyhow!("invalid API_SIGNING_KEY_PKCS8_BASE64 key: {}", e));
+            .map_err(|e| anyhow::anyhow!("invalid API_SIGNING_KEY_PKCS8_BASE64 key: {e}"));
     }
 
     if env_flag("ALLOW_EPHEMERAL_KEYS") {
@@ -217,14 +217,13 @@ fn load_hmac_key() -> anyhow::Result<[u8; 32]> {
         }
 
         let text = std::str::from_utf8(&bytes)
-            .map_err(|e| anyhow::anyhow!("SESSION_HMAC_KEY_PATH content is not UTF-8: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("SESSION_HMAC_KEY_PATH content is not UTF-8: {e}"))?;
         use base64::Engine;
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(text.trim())
             .map_err(|e| {
                 anyhow::anyhow!(
-                    "SESSION_HMAC_KEY_PATH is neither raw 32 bytes nor base64: {}",
-                    e
+                    "SESSION_HMAC_KEY_PATH is neither raw 32 bytes nor base64: {e}"
                 )
             })?;
         if decoded.len() != 32 {
@@ -242,7 +241,7 @@ fn load_hmac_key() -> anyhow::Result<[u8; 32]> {
         use base64::Engine;
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(b64.trim())
-            .map_err(|e| anyhow::anyhow!("invalid SESSION_HMAC_KEY_BASE64: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("invalid SESSION_HMAC_KEY_BASE64: {e}"))?;
         if decoded.len() != 32 {
             anyhow::bail!(
                 "SESSION_HMAC_KEY_BASE64 must decode to exactly 32 bytes, got {}",
@@ -264,10 +263,10 @@ fn load_hmac_key() -> anyhow::Result<[u8; 32]> {
 
 fn parse_image_ref(name: &str, value: &str) -> anyhow::Result<ImageRef> {
     let image = ImageRef::parse(value)
-        .map_err(|e| anyhow::anyhow!("invalid {name} image reference: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("invalid {name} image reference: {e}"))?;
     image
         .require_digest()
-        .map_err(|e| anyhow::anyhow!("invalid {name}: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("invalid {name}: {e}"))?;
     Ok(image)
 }
 
@@ -287,7 +286,7 @@ fn load_url_value(
         return Ok(None);
     };
     let url =
-        reqwest::Url::parse(&value).map_err(|e| anyhow::anyhow!("invalid {name} URL: {}", e))?;
+        reqwest::Url::parse(&value).map_err(|e| anyhow::anyhow!("invalid {name} URL: {e}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         anyhow::bail!("invalid {name}: URL scheme must be http or https");
     }
@@ -305,7 +304,7 @@ fn load_pubkey_hex_value(
         }
         return Ok(None);
     };
-    let raw = hex::decode(&value).map_err(|e| anyhow::anyhow!("invalid {name}: {}", e))?;
+    let raw = hex::decode(&value).map_err(|e| anyhow::anyhow!("invalid {name}: {e}"))?;
     if raw.len() != 32 {
         anyhow::bail!("invalid {name}: expected 32-byte Ed25519 public key hex");
     }
@@ -323,7 +322,7 @@ fn load_platform_release(enabled: bool) -> anyhow::Result<Option<PlatformRelease
         return Ok(None);
     }
     let release = PlatformRelease::load_verified()
-        .map_err(|e| anyhow::anyhow!("failed to load signed platform release: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to load signed platform release: {e}"))?;
     if release.expected_runtime_class
         != enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
     {
@@ -652,7 +651,7 @@ async fn main() {
     let platform_domain =
         std::env::var("PLATFORM_DOMAIN").unwrap_or_else(|_| "enclava.dev".to_string());
     let tee_domain_suffix =
-        std::env::var("TEE_DOMAIN_SUFFIX").unwrap_or_else(|_| format!("tee.{}", platform_domain));
+        std::env::var("TEE_DOMAIN_SUFFIX").unwrap_or_else(|_| format!("tee.{platform_domain}"));
 
     let pool = enclava_api::db::pool::create_pool(&database_url)
         .await

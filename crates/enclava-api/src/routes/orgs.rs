@@ -720,7 +720,7 @@ pub async fn list_members(
         .map(|(user_id, display_name, role)| MemberResponse {
             user_id,
             display_name,
-            role: format!("{:?}", role).to_lowercase(),
+            role: format!("{role:?}").to_lowercase(),
         })
         .collect();
 

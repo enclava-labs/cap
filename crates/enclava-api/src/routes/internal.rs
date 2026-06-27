@@ -1111,7 +1111,7 @@ pub async fn list_paas_status(
 ) -> Result<Json<InternalListResponse>, (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
     let (cap_org_id, _org_name, _org_slug) = mapped_cap_org(&state, &paas_org_id).await?;
-    let rows: Vec<(
+    type PaasStatusRow = (
         Uuid,
         String,
         String,
@@ -1120,7 +1120,8 @@ pub async fn list_paas_status(
         Option<Uuid>,
         Option<String>,
         Option<String>,
-    )> = sqlx::query_as(
+    );
+    let rows: Vec<PaasStatusRow> = sqlx::query_as(
         r#"
         SELECT a.id,
                a.name,

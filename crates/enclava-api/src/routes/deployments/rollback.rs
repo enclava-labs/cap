@@ -212,7 +212,7 @@ pub async fn rollback(
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
             Err(e) => {
-                let error_message = format!("deployment apply limiter closed: {}", e);
+                let error_message = format!("deployment apply limiter closed: {e}");
                 let _ = crate::deploy::set_deployment_status(
                     &db,
                     deploy_id,

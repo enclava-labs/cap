@@ -30,7 +30,7 @@ pub async fn resolve_tag_to_digest(
     let base_url = registry_base_url(registry)?;
 
     // HEAD request for the manifest, accepting OCI and Docker media types
-    let url = format!("{}/v2/{}/manifests/{}", base_url, repository, tag);
+    let url = format!("{base_url}/v2/{repository}/manifests/{tag}");
     client.check_url(&url)?;
 
     let response = client
@@ -48,8 +48,7 @@ pub async fn resolve_tag_to_digest(
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(RegistryError::NotFound(format!(
-            "{}/{}:{}",
-            registry, repository, tag
+            "{registry}/{repository}:{tag}"
         )));
     }
 
@@ -78,7 +77,7 @@ pub fn registry_base_url(registry: &str) -> Result<String, RegistryError> {
     match registry {
         "docker.io" => Ok("https://registry-1.docker.io".to_string()),
         "ghcr.io" => Ok("https://ghcr.io".to_string()),
-        r if r.contains('.') => Ok(format!("https://{}", r)),
+        r if r.contains('.') => Ok(format!("https://{r}")),
         _ => Err(RegistryError::UnsupportedRegistry(registry.to_string())),
     }
 }

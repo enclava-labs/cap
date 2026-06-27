@@ -183,7 +183,7 @@ pub(crate) fn validate_app_name(name: &str) -> Result<(), String> {
         "grafana",
     ];
     if reserved.contains(&name) {
-        return Err(format!("'{}' is a reserved name", name));
+        return Err(format!("'{name}' is a reserved name"));
     }
 
     // Character validation (Kubernetes DNS-1123 subdomain)
@@ -314,9 +314,9 @@ pub(crate) fn derive_identity(
 ) -> Result<(String, String, String, String, String, String), String> {
     let tenant_id = org_name.to_string();
     let app_id_short = &app_id.to_string()[..8];
-    let instance_id = format!("{}-{}", tenant_id, app_id_short);
-    let namespace = format!("cap-{}-{}", org_name, app_name);
-    let service_account = format!("cap-{}-sa", app_name);
+    let instance_id = format!("{tenant_id}-{app_id_short}");
+    let namespace = format!("cap-{org_name}-{app_name}");
+    let service_account = format!("cap-{app_name}-sa");
 
     let bootstrap_owner_pubkey_hash = match unlock_mode {
         "password" => {
@@ -334,7 +334,7 @@ pub(crate) fn derive_identity(
             let hash = Sha256::digest(pubkey_bytes);
             hex::encode(hash)
         }
-        _ => return Err(format!("invalid unlock_mode: {}", unlock_mode)),
+        _ => return Err(format!("invalid unlock_mode: {unlock_mode}")),
     };
 
     let identity_hash = enclava_common::crypto::compute_identity_hash(

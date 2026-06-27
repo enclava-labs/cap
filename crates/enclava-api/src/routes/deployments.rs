@@ -207,7 +207,7 @@ fn parse_memory_gi(s: &str) -> Result<f64, String> {
 
     let value: f64 = value_str
         .parse()
-        .map_err(|_| format!("invalid memory value: {}", value_str))?;
+        .map_err(|_| format!("invalid memory value: {value_str}"))?;
 
     if value <= 0.0 {
         return Err("memory value must be positive".to_string());
@@ -220,7 +220,7 @@ fn parse_memory_gi(s: &str) -> Result<f64, String> {
     match unit {
         "Gi" | "GiB" => Ok(value),
         "Mi" | "MiB" => Ok(value / 1024.0),
-        _ => Err(format!("unsupported memory unit: {}", unit)),
+        _ => Err(format!("unsupported memory unit: {unit}")),
     }
 }
 
@@ -814,7 +814,7 @@ pub async fn deploy(
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
             Err(e) => {
-                let error_message = format!("deployment apply limiter closed: {}", e);
+                let error_message = format!("deployment apply limiter closed: {e}");
                 let _ = crate::deploy::set_deployment_status(
                     &db,
                     deploy_id,

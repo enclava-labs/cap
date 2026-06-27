@@ -159,7 +159,7 @@ mod tests {
 
     fn req_with(peer: &str, xff: Option<&str>) -> Request<()> {
         let mut req = Request::builder().uri("/").body(()).unwrap();
-        let socket: SocketAddr = format!("{}:54321", peer).parse().unwrap();
+        let socket: SocketAddr = format!("{peer}:54321").parse().unwrap();
         req.extensions_mut().insert(ConnectInfo(socket));
         if let Some(xff) = xff {
             req.headers_mut()

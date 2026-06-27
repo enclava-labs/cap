@@ -231,7 +231,7 @@ pub async fn create_challenge(
     .map_err(|_| internal_error())?;
 
     Ok(Json(ChallengeResponse {
-        txt_record_name: format!("{}{}", CHALLENGE_PREFIX, domain),
+        txt_record_name: format!("{CHALLENGE_PREFIX}{domain}"),
         txt_record_value: format!("enclava-domain-verification={token}"),
         domain,
         expires_at,
@@ -310,7 +310,7 @@ pub async fn verify_challenge(
         ));
     }
 
-    let txt_name = format!("{}{}", CHALLENGE_PREFIX, domain);
+    let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
     let expected = format!("enclava-domain-verification={token}");
 
     let live = lookup_txt(&txt_name).await.map_err(|e| {

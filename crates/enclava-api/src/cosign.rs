@@ -132,7 +132,7 @@ fn looks_like_not_signed_error(err: &str) -> bool {
 /// Convert a digest like "sha256:abcdef..." to the cosign tag format "sha256-abcdef..."
 fn digest_to_cosign_tag(digest: &str, suffix: &str) -> String {
     let tag = digest.replace(':', "-");
-    format!("{}.{}", tag, suffix)
+    format!("{tag}.{suffix}")
 }
 
 /// Parse an image reference into (registry, repository) components.
@@ -160,8 +160,7 @@ fn parse_image_parts(image_ref: &str) -> Result<(String, String), CosignError> {
         }
         3 => Ok((parts[0].to_string(), format!("{}/{}", parts[1], parts[2]))),
         _ => Err(CosignError::VerificationFailed(format!(
-            "cannot parse image reference: {}",
-            image_ref
+            "cannot parse image reference: {image_ref}"
         ))),
     }
 }
@@ -172,19 +171,18 @@ async fn load_trust_root() -> Result<Arc<SigstoreTrustRoot>, CosignError> {
     if let Ok(path) = std::env::var("SIGSTORE_TUF_ROOT_PATH") {
         let data = std::fs::read(&path).map_err(|e| {
             CosignError::TrustRoot(format!(
-                "failed to read SIGSTORE_TUF_ROOT_PATH {}: {}",
-                path, e
+                "failed to read SIGSTORE_TUF_ROOT_PATH {path}: {e}"
             ))
         })?;
         let root = SigstoreTrustRoot::from_trusted_root_json_unchecked(&data).map_err(|e| {
-            CosignError::TrustRoot(format!("invalid bundled trusted_root.json: {}", e))
+            CosignError::TrustRoot(format!("invalid bundled trusted_root.json: {e}"))
         })?;
         return Ok(Arc::new(root));
     }
 
     let root = SigstoreTrustRoot::new(None)
         .await
-        .map_err(|e| CosignError::TrustRoot(format!("sigstore TUF fetch failed: {}", e)))?;
+        .map_err(|e| CosignError::TrustRoot(format!("sigstore TUF fetch failed: {e}")))?;
     Ok(Arc::new(root))
 }
 
@@ -223,7 +221,7 @@ fn build_constraints(
         VerificationPolicy::PublicKey { pem } => {
             let verifier = PublicKeyVerifier::new(pem.as_bytes(), &SigningScheme::default())
                 .map_err(|e| {
-                    CosignError::InvalidPolicy(format!("invalid public key PEM: {}", e))
+                    CosignError::InvalidPolicy(format!("invalid public key PEM: {e}"))
                 })?;
             vec![Box::new(verifier)]
         }
@@ -242,7 +240,7 @@ pub async fn verify_image(
 
     let image: OciReference = image_ref
         .parse()
-        .map_err(|e| CosignError::VerificationFailed(format!("invalid image reference: {}", e)))?;
+        .map_err(|e| CosignError::VerificationFailed(format!("invalid image reference: {e}")))?;
     let (registry, _) = parse_image_parts(image_ref)?;
 
     let mut oci_client_config = ClientConfig::default();
@@ -253,10 +251,10 @@ pub async fn verify_image(
     let mut cosign_client = ClientBuilder::default()
         .with_oci_client_config(oci_client_config)
         .with_trust_repository(trust_root.as_ref())
-        .map_err(|e| CosignError::TrustRoot(format!("trust repository setup failed: {}", e)))?
+        .map_err(|e| CosignError::TrustRoot(format!("trust repository setup failed: {e}")))?
         .build()
         .map_err(|e| {
-            CosignError::VerificationFailed(format!("failed to initialize sigstore client: {}", e))
+            CosignError::VerificationFailed(format!("failed to initialize sigstore client: {e}"))
         })?;
 
     let auth = registry_auth_from_env(&registry);
@@ -264,13 +262,12 @@ pub async fn verify_image(
         .triangulate(&image, &auth)
         .await
         .map_err(|e| {
-            CosignError::VerificationFailed(format!("failed to triangulate signature image: {}", e))
+            CosignError::VerificationFailed(format!("failed to triangulate signature image: {e}"))
         })?;
 
     if source_image_digest != image_digest {
         return Err(CosignError::VerificationFailed(format!(
-            "image digest mismatch: resolved {}, expected {}",
-            source_image_digest, image_digest
+            "image digest mismatch: resolved {source_image_digest}, expected {image_digest}"
         )));
     }
 
@@ -281,27 +278,24 @@ pub async fn verify_image(
         .map_err(|e| {
             let msg = e.to_string();
             if looks_like_not_signed_error(&msg) {
-                CosignError::NotSigned(format!("no cosign signature found for {}", image_digest))
+                CosignError::NotSigned(format!("no cosign signature found for {image_digest}"))
             } else {
                 CosignError::VerificationFailed(format!(
-                    "failed to fetch/verify signature layers: {}",
-                    msg
+                    "failed to fetch/verify signature layers: {msg}"
                 ))
             }
         })?;
 
     if trusted_layers.is_empty() {
         return Err(CosignError::NotSigned(format!(
-            "no Rekor-attested signature layers for {}",
-            image_digest
+            "no Rekor-attested signature layers for {image_digest}"
         )));
     }
 
     let constraints = build_constraints(policy)?;
     verify_constraints(&trusted_layers, constraints.iter()).map_err(|e| {
         CosignError::VerificationFailed(format!(
-            "signature did not satisfy app's verification policy: {}",
-            e
+            "signature did not satisfy app's verification policy: {e}"
         ))
     })?;
 
@@ -390,7 +384,7 @@ pub async fn fetch_attestations(
 ) -> Result<(Option<serde_json::Value>, Option<serde_json::Value>), CosignError> {
     let (registry, repository) = parse_image_parts(image_ref)?;
     let base_url = registry_base_url(&registry)
-        .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {}", e)))?;
+        .map_err(|e| CosignError::VerificationFailed(format!("unsupported registry: {e}")))?;
 
     let provenance = fetch_attestation_tag(client, &base_url, &repository, digest, "att").await?;
     let sbom = fetch_attestation_tag(client, &base_url, &repository, digest, "sbom").await?;
@@ -406,7 +400,7 @@ async fn fetch_attestation_tag(
     suffix: &str,
 ) -> Result<Option<serde_json::Value>, CosignError> {
     let tag = digest_to_cosign_tag(digest, suffix);
-    let url = format!("{}/v2/{}/manifests/{}", base_url, repository, tag);
+    let url = format!("{base_url}/v2/{repository}/manifests/{tag}");
 
     let response = client
         .get(&url)

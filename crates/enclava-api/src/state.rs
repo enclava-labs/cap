@@ -17,8 +17,9 @@ use tokio::sync::Semaphore;
 /// A CAP process is either a standalone control plane that accepts public
 /// management writes, or a PaaS-managed control plane that only accepts
 /// management writes through authenticated `/internal/paas/*` routes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CapManagementMode {
+    #[default]
     Standalone,
     PaasManaged,
 }
@@ -33,12 +34,6 @@ impl CapManagementMode {
 
     pub fn internal_paas_routes_enabled(self) -> bool {
         matches!(self, Self::PaasManaged)
-    }
-}
-
-impl Default for CapManagementMode {
-    fn default() -> Self {
-        Self::Standalone
     }
 }
 
