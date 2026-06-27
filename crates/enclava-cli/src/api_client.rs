@@ -688,7 +688,12 @@ fn path_segment(value: &str) -> String {
 }
 
 fn template_instance_idempotency_key(req: &CreateTemplateInstanceRequest) -> String {
-    let body = serde_json::to_vec(req).unwrap_or_else(|_| {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "template_slug": req.template_slug,
+        "instance_name": req.instance_name,
+        "config": req.config,
+    }))
+    .unwrap_or_else(|_| {
         format!("{}:{}:{}", req.template_slug, req.instance_name, req.config).into_bytes()
     });
     let digest = Sha256::digest(body);
@@ -711,6 +716,9 @@ mod tests {
             config: serde_json::json!({
                 "NGROK_TCP_URL": endpoint
             }),
+            customer_descriptor_blob: None,
+            org_keyring_blob: None,
+            signed_policy_artifact: None,
         }
     }
 

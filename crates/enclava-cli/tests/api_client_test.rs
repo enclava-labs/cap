@@ -136,6 +136,9 @@ async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
         template_slug: "debian-ssh-ngrok".to_string(),
         instance_name: "shell".to_string(),
         config: serde_json::json!({}),
+        customer_descriptor_blob: None,
+        org_keyring_blob: None,
+        signed_policy_artifact: None,
     };
     let response = client
         .create_template_instance(&request_body)
@@ -143,7 +146,14 @@ async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
         .unwrap();
     let request_digest = {
         use sha2::{Digest, Sha256};
-        hex::encode(Sha256::digest(serde_json::to_vec(&request_body).unwrap()))
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&serde_json::json!({
+                "template_slug": request_body.template_slug,
+                "instance_name": request_body.instance_name,
+                "config": request_body.config,
+            }))
+            .unwrap(),
+        ))
     };
 
     let request = handle.join().unwrap();

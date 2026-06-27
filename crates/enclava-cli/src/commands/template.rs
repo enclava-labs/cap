@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     path::PathBuf,
     time::{Duration, Instant},
@@ -11,12 +12,17 @@ use indicatif::{ProgressBar, ProgressStyle};
 use enclava_cli::{
     api_client::{ApiClient, ApiError},
     api_types::{
-        AppResponse, CreateTemplateInstanceRequest, HostedTemplate, HostedTemplateConfigKey,
-        SshCommandResponse, TemplateInstanceResponse,
+        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, HostedTemplate,
+        HostedTemplateConfigKey, ServiceSpec, SshCommandResponse, TemplateInstanceResponse,
+    },
+    app_config::{
+        AppConfig, AppSection, HealthSection, ResourcesSection, StorageSection, UnlockSection,
     },
     config::{self, CliPaths},
     tee_client::{TeeClient, TeeError},
 };
+
+use crate::commands::app::{SignedDeployBlobParams, build_signed_deploy_blobs};
 
 const DEBIAN_SSH_NGROK_TEMPLATE: &str = "debian-ssh-ngrok";
 const DEBIAN_SSH_FRP_TEMPLATE: &str = "debian-ssh-frp";
@@ -91,11 +97,28 @@ pub struct TemplateSshCommandArgs {
     pub json: bool,
 }
 
-fn build_api_client() -> Result<ApiClient, Box<dyn std::error::Error>> {
+struct TemplateApiContext {
+    api: ApiClient,
+    paths: CliPaths,
+    cli_config: config::CliConfig,
+    creds: config::Credentials,
+}
+
+fn build_api_context() -> Result<TemplateApiContext, Box<dyn std::error::Error>> {
     let paths = CliPaths::resolve()?;
     let cli_config = config::load_config(&paths)?;
     let creds = config::load_credentials(&paths)?;
-    Ok(ApiClient::from_config(&cli_config, &creds))
+    let api = ApiClient::from_config(&cli_config, &creds);
+    Ok(TemplateApiContext {
+        api,
+        paths,
+        cli_config,
+        creds,
+    })
+}
+
+fn build_api_client() -> Result<ApiClient, Box<dyn std::error::Error>> {
+    Ok(build_api_context()?.api)
 }
 
 pub async fn run(cmd: TemplateCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -154,7 +177,8 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         );
     }
 
-    let api = build_api_client()?;
+    let ctx = build_api_context()?;
+    let api = &ctx.api;
     let templates = api.list_templates().await?;
     let template = templates
         .iter()
@@ -176,13 +200,32 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     let pb = if args.json {
         ProgressBar::hidden()
     } else {
-        ProgressBar::new(4)
+        ProgressBar::new(5)
     };
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{bar:30.cyan/blue}] {msg}")?
             .progress_chars("=> "),
     );
+    pb.set_message("Preparing template app...");
+
+    let app = ensure_template_app(api, template, &instance_name).await?;
+    pb.set_position(1);
+    pb.set_message("Signing deployment descriptor...");
+
+    let app_config = template_app_config(template, &instance_name);
+    let signed_blobs = build_signed_deploy_blobs(SignedDeployBlobParams {
+        api,
+        paths: &ctx.paths,
+        cli_config: &ctx.cli_config,
+        creds: &ctx.creds,
+        app: &app,
+        app_config: &app_config,
+        image: &template.image,
+        target_unlock_mode: Some(template.unlock_mode.as_str()),
+    })
+    .await?;
+    pb.set_position(2);
     pb.set_message("Creating template instance...");
 
     let response = match api
@@ -190,6 +233,9 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             template_slug: args.template.clone(),
             instance_name: instance_name.clone(),
             config: template_create_config(explicit_stable_endpoint.as_deref()),
+            customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
+            org_keyring_blob: Some(signed_blobs.org_keyring_blob),
+            signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
         })
         .await
     {
@@ -200,7 +246,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         &response,
         explicit_stable_endpoint.as_deref(),
     )?;
-    pb.set_position(1);
+    pb.set_position(3);
     pb.set_message("Delivering config to TEE...");
 
     let token = response
@@ -228,7 +274,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         &config_pairs,
     )
     .await?;
-    pb.set_position(2);
+    pb.set_position(4);
 
     let mut app_url = app_url_from_template_response_cap(&response.cap)?;
     let deployment_id = response
@@ -239,10 +285,10 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         .to_string();
 
     let (ssh_command, ssh_endpoint) = if args.no_wait {
-        pb.set_position(4);
+        pb.set_position(5);
         (None, None)
     } else {
-        pb.set_position(3);
+        pb.set_position(4);
         pb.set_message("Waiting for stable SSH endpoint command...");
         let response = wait_for_paas_ssh_command(
             &api,
@@ -255,7 +301,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         if let Some(url) = response.app_url {
             app_url = normalize_paas_ssh_command_app_url(&url)?;
         }
-        pb.set_position(4);
+        pb.set_position(5);
         (response.command, response.endpoint)
     };
     pb.finish_with_message("Template deployed");
@@ -334,6 +380,97 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
         )?
     );
     Ok(())
+}
+
+async fn ensure_template_app(
+    api: &ApiClient,
+    template: &HostedTemplate,
+    instance_name: &str,
+) -> Result<AppResponse, Box<dyn std::error::Error>> {
+    match api.get_app(instance_name).await {
+        Ok(app) => return Ok(app),
+        Err(ApiError::Api { status: 404, .. }) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    match api
+        .create_app(&template_create_app_request(template, instance_name)?)
+        .await
+    {
+        Ok(app) => Ok(app),
+        Err(ApiError::Api { status: 409, .. }) => Ok(api.get_app(instance_name).await?),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn template_create_app_request(
+    template: &HostedTemplate,
+    instance_name: &str,
+) -> Result<CreateAppRequest, Box<dyn std::error::Error>> {
+    let signer_identity_subject =
+        required_template_value(template.signer_subject.as_deref(), "signer_subject")?;
+    let signer_identity_issuer =
+        required_template_value(template.signer_issuer.as_deref(), "signer_issuer")?;
+    let storage_defaults = StorageSection::default();
+    Ok(CreateAppRequest {
+        name: instance_name.to_string(),
+        port: template.port,
+        image: None,
+        unlock_mode: template.unlock_mode.clone(),
+        bootstrap_pubkey_hash: None,
+        storage_size: template.resources.storage.clone(),
+        tls_storage_size: storage_defaults.tls_size,
+        storage_paths: template.storage_paths.clone(),
+        cpu: template.resources.cpu.clone(),
+        memory: template.resources.memory.clone(),
+        services: Vec::<ServiceSpec>::new(),
+        health_path: template.health_path.clone(),
+        health_interval: template.health_interval,
+        health_timeout: template.health_timeout,
+        signer_identity_subject: Some(signer_identity_subject),
+        signer_identity_issuer: Some(signer_identity_issuer),
+        egress_allowlist: template.egress_allowlist.clone(),
+    })
+}
+
+fn template_app_config(template: &HostedTemplate, instance_name: &str) -> AppConfig {
+    let storage_defaults = StorageSection::default();
+    AppConfig {
+        app: AppSection {
+            name: instance_name.to_string(),
+            port: template.port,
+            command: template.command.clone(),
+        },
+        storage: StorageSection {
+            paths: template.storage_paths.clone(),
+            size: template.resources.storage.clone(),
+            tls_size: storage_defaults.tls_size,
+        },
+        unlock: UnlockSection {
+            mode: template.unlock_mode.clone(),
+        },
+        services: HashMap::new(),
+        resources: ResourcesSection {
+            cpu: template.resources.cpu.clone(),
+            memory: template.resources.memory.clone(),
+        },
+        health: template.health_path.as_ref().map(|path| HealthSection {
+            path: path.clone(),
+            interval: template.health_interval.unwrap_or(30),
+            timeout: template.health_timeout.unwrap_or(5),
+        }),
+    }
+}
+
+fn required_template_value(
+    value: Option<&str>,
+    field: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("template metadata is missing required `{field}`").into())
 }
 
 fn template_key<'a>(
@@ -1670,7 +1807,10 @@ fn ensure_ssh_command_matches_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enclava_cli::api_types::{ConfigTokenResponse, HostedTemplateConfigValidation};
+    use enclava_cli::api_types::{
+        ConfigTokenResponse, HostedTemplateConfigValidation, HostedTemplateEgressRule,
+        HostedTemplateResources,
+    };
     const VALID_ED25519_PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOlL21WHthjyXNuxzes5bVqCCqgyWDuMvXcWhOxRGL1P cli-test@example";
 
     fn hosted_template_with_stable_ssh() -> HostedTemplate {
@@ -1684,6 +1824,31 @@ mod tests {
             ],
             version: "2026-06-18".to_string(),
             image: "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff".to_string(),
+            source_provider: Some("github".to_string()),
+            source_repository: Some("enclava-labs/debian-ssh-ngrok-template".to_string()),
+            signer_subject: Some("https://github.com/enclava-labs/enclava-paas/.github/workflows/debian-ssh-ngrok-template-image.yml@refs/heads/main".to_string()),
+            signer_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
+            container_name: "web".to_string(),
+            command: vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                "exec /usr/local/bin/debian-ssh-entrypoint".to_string(),
+            ],
+            port: 8080,
+            unlock_mode: "auto".to_string(),
+            health_path: Some("/healthz".to_string()),
+            health_interval: Some(30),
+            health_timeout: Some(5),
+            resources: HostedTemplateResources {
+                cpu: "1".to_string(),
+                memory: "1Gi".to_string(),
+                storage: "10Gi".to_string(),
+            },
+            storage_paths: vec![],
+            egress_allowlist: vec![HostedTemplateEgressRule {
+                host: "6.tcp.eu.ngrok.io".to_string(),
+                ports: vec![17958],
+            }],
             paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
             config_keys: vec![
                 HostedTemplateConfigKey {

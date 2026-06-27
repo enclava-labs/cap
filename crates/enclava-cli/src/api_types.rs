@@ -118,6 +118,8 @@ pub struct CreateAppRequest {
     pub signer_identity_subject: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signer_identity_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_allowlist: Vec<HostedTemplateEgressRule>,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,6 +214,34 @@ pub struct HostedTemplate {
     pub features: Vec<String>,
     pub version: String,
     pub image: String,
+    #[serde(default)]
+    pub source_provider: Option<String>,
+    #[serde(default)]
+    pub source_repository: Option<String>,
+    #[serde(default)]
+    pub signer_subject: Option<String>,
+    #[serde(default)]
+    pub signer_issuer: Option<String>,
+    #[serde(default = "default_template_container_name")]
+    pub container_name: String,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default = "default_template_port")]
+    pub port: u16,
+    #[serde(default = "default_template_unlock_mode")]
+    pub unlock_mode: String,
+    #[serde(default)]
+    pub health_path: Option<String>,
+    #[serde(default)]
+    pub health_interval: Option<u32>,
+    #[serde(default)]
+    pub health_timeout: Option<u32>,
+    #[serde(default)]
+    pub resources: HostedTemplateResources,
+    #[serde(default)]
+    pub storage_paths: Vec<String>,
+    #[serde(default)]
+    pub egress_allowlist: Vec<HostedTemplateEgressRule>,
     pub config_keys: Vec<HostedTemplateConfigKey>,
     #[serde(default)]
     pub paas_managed_config_keys: Vec<String>,
@@ -219,6 +249,42 @@ pub struct HostedTemplate {
     pub persistence_path: Option<String>,
     #[serde(default)]
     pub security_notes: Vec<String>,
+}
+
+fn default_template_container_name() -> String {
+    "web".to_string()
+}
+
+fn default_template_port() -> u16 {
+    8080
+}
+
+fn default_template_unlock_mode() -> String {
+    "auto".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostedTemplateResources {
+    pub cpu: String,
+    pub memory: String,
+    pub storage: String,
+}
+
+impl Default for HostedTemplateResources {
+    fn default() -> Self {
+        Self {
+            cpu: "1".to_string(),
+            memory: "1Gi".to_string(),
+            storage: "5Gi".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostedTemplateEgressRule {
+    pub host: String,
+    #[serde(default)]
+    pub ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -254,6 +320,12 @@ pub struct CreateTemplateInstanceRequest {
     pub template_slug: String,
     pub instance_name: String,
     pub config: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub customer_descriptor_blob: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_keyring_blob: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_policy_artifact: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

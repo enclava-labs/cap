@@ -427,6 +427,9 @@ fn create_template_instance_request_can_omit_stable_endpoint_expectation() {
         template_slug: "debian-ssh-ngrok".to_string(),
         instance_name: "shell".to_string(),
         config: serde_json::json!({}),
+        customer_descriptor_blob: None,
+        org_keyring_blob: None,
+        signed_policy_artifact: None,
     };
 
     let value = serde_json::to_value(&req).unwrap();
