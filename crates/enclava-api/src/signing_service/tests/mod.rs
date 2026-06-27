@@ -501,6 +501,7 @@ fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> Confide
         bootstrap_owner_pubkey_hash: "aa".repeat(32),
         tenant_instance_identity_hash: hex::encode(descriptor.identity_hash),
         service_account: descriptor.service_account.clone(),
+        image_pull_secret_name: None,
         signer_identity_subject: Some(descriptor.signer_identity.subject.clone()),
         signer_identity_issuer: Some(descriptor.signer_identity.issuer.clone()),
         containers: vec![Container {

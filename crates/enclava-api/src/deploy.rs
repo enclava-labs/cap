@@ -4,7 +4,12 @@ use enclava_common::image::ImageRef;
 use enclava_common::types::{ResourceLimits, UnlockMode as CommonUnlockMode};
 use enclava_engine::apply::{
     engine::ApplyEngine,
-    orchestrator::{apply_all, manifest_hash},
+    gateway::apply_gateway_resources,
+    namespace::apply_namespace,
+    network_policy::apply_network_policy,
+    orchestrator::{MANIFEST_HASH_ANNOTATION, manifest_hash},
+    resources::{apply_namespaced_resource, apply_standard_resources},
+    statefulset::apply_statefulset,
     types::{DeployPhase, DeployStatus as EngineDeployStatus},
     watch::watch_rollout,
 };
@@ -13,10 +18,22 @@ use enclava_engine::types::{
     AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec,
     WorkloadArtifactBinding,
 };
+use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::models::{App, AppContainer, AppResources, AppStatus};
+
+const DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME: &str = "enclava-registry-auth";
+const TENANT_IMAGE_PULL_SECRET_NAME_ENV: &str = "TENANT_IMAGE_PULL_SECRET_NAME";
+
+#[derive(Debug, Clone)]
+struct TenantImagePullSecretConfig {
+    name: String,
+    username: String,
+    token: String,
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct DeploymentOutcome {
@@ -60,6 +77,137 @@ fn classify_rollout_result(
             error_message: Some(err),
         },
     }
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn configured_tenant_image_pull_secret_name() -> Option<String> {
+    if let Some(name) = env_nonempty(TENANT_IMAGE_PULL_SECRET_NAME_ENV) {
+        return Some(name);
+    }
+
+    match (env_nonempty("GHCR_USERNAME"), env_nonempty("GHCR_TOKEN")) {
+        (Some(_), Some(_)) => Some(DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME.to_string()),
+        _ => None,
+    }
+}
+
+fn tenant_image_pull_secret_config_from_env() -> Option<TenantImagePullSecretConfig> {
+    let username = env_nonempty("GHCR_USERNAME")?;
+    let token = env_nonempty("GHCR_TOKEN")?;
+    let name = configured_tenant_image_pull_secret_name()
+        .unwrap_or_else(|| DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME.to_string());
+
+    Some(TenantImagePullSecretConfig {
+        name,
+        username,
+        token,
+    })
+}
+
+fn generate_tenant_image_pull_secret(
+    namespace: &str,
+    config: &TenantImagePullSecretConfig,
+) -> Secret {
+    use base64::Engine as _;
+
+    let auth = base64::engine::general_purpose::STANDARD
+        .encode(format!("{}:{}", config.username, config.token));
+    let docker_config_json = serde_json::json!({
+        "auths": {
+            "ghcr.io": {
+                "username": config.username,
+                "password": config.token,
+                "auth": auth,
+            }
+        }
+    })
+    .to_string();
+
+    let mut string_data = std::collections::BTreeMap::new();
+    string_data.insert(".dockerconfigjson".to_string(), docker_config_json);
+
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(config.name.clone()),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        },
+        string_data: Some(string_data),
+        type_: Some("kubernetes.io/dockerconfigjson".to_string()),
+        ..Default::default()
+    }
+}
+
+async fn apply_all_with_tenant_image_pull_secret(
+    engine: &ApplyEngine,
+    manifests: &enclava_engine::manifest::GeneratedManifests,
+    manifest_hash: &str,
+    image_pull_secret_config: Option<&TenantImagePullSecretConfig>,
+) -> Result<(), DeployError> {
+    let ns_name = manifests
+        .namespace
+        .metadata
+        .name
+        .as_deref()
+        .ok_or_else(|| {
+            enclava_engine::apply::engine::ApplyError::NamespaceNotReady(
+                "namespace has no name".to_string(),
+            )
+        })?;
+
+    apply_namespace(engine, &manifests.namespace).await?;
+    tracing::info!(namespace = %ns_name, "step 1/5: namespace ready");
+
+    if let Some(config) = image_pull_secret_config {
+        let secret = generate_tenant_image_pull_secret(ns_name, config);
+        apply_namespaced_resource(engine, ns_name, &secret).await?;
+        tracing::info!(
+            namespace = %ns_name,
+            secret = %config.name,
+            "tenant image pull secret applied"
+        );
+    }
+
+    apply_standard_resources(engine, manifests).await?;
+    tracing::info!(namespace = %ns_name, "step 2/5: standard resources applied");
+
+    apply_network_policy(engine, ns_name, &manifests.network_policy).await?;
+    tracing::info!(namespace = %ns_name, "step 3/5: CiliumNetworkPolicy applied");
+
+    apply_gateway_resources(
+        engine,
+        ns_name,
+        &manifests.envoy_proxy,
+        &manifests.gateway,
+        &manifests.tls_route,
+    )
+    .await?;
+    tracing::info!(namespace = %ns_name, "step 4/5: Gateway API resources applied");
+
+    let mut sts = manifests.statefulset.clone();
+    sts.metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .insert(
+            MANIFEST_HASH_ANNOTATION.to_string(),
+            manifest_hash.to_string(),
+        );
+
+    apply_statefulset(engine, ns_name, &sts).await?;
+    tracing::info!(
+        namespace = %ns_name,
+        manifest_hash = %manifest_hash,
+        "step 5/5: StatefulSet applied"
+    );
+
+    tracing::info!(namespace = %ns_name, "apply_all complete");
+    Ok(())
 }
 
 pub struct ApplyDeploymentManifestsRequest {
@@ -255,6 +403,7 @@ pub async fn build_confidential_app(
         bootstrap_owner_pubkey_hash: app.bootstrap_owner_pubkey_hash.clone(),
         tenant_instance_identity_hash: app.tenant_instance_identity_hash.clone(),
         service_account: app.service_account.clone(),
+        image_pull_secret_name: configured_tenant_image_pull_secret_name(),
         signer_identity_subject: app.signer_identity_subject.clone(),
         signer_identity_issuer: app.signer_identity_issuer.clone(),
         containers,
@@ -370,6 +519,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tenant_image_pull_secret_uses_dockerconfigjson_shape() {
+        let config = TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_fake".to_string(),
+        };
+
+        let secret = generate_tenant_image_pull_secret("tenant-ns", &config);
+        let string_data = secret.string_data.as_ref().unwrap();
+        let docker_config: serde_json::Value =
+            serde_json::from_str(string_data.get(".dockerconfigjson").unwrap()).unwrap();
+
+        assert_eq!(
+            secret.metadata.name.as_deref(),
+            Some("enclava-registry-auth")
+        );
+        assert_eq!(secret.metadata.namespace.as_deref(), Some("tenant-ns"));
+        assert_eq!(
+            secret.type_.as_deref(),
+            Some("kubernetes.io/dockerconfigjson")
+        );
+        assert_eq!(
+            docker_config["auths"]["ghcr.io"]["username"].as_str(),
+            Some("cap-bot")
+        );
+        assert_eq!(
+            docker_config["auths"]["ghcr.io"]["password"].as_str(),
+            Some("ghp_fake")
+        );
+        assert_eq!(
+            docker_config["auths"]["ghcr.io"]["auth"].as_str(),
+            Some("Y2FwLWJvdDpnaHBfZmFrZQ==")
+        );
+    }
+
     fn customer_app_descriptor() -> DeploymentDescriptor {
         DeploymentDescriptor {
             schema_version: "v1".to_string(),
@@ -474,6 +659,7 @@ mod tests {
             bootstrap_owner_pubkey_hash: "00".repeat(32),
             tenant_instance_identity_hash: hex::encode(descriptor.identity_hash),
             service_account: descriptor.service_account.clone(),
+            image_pull_secret_name: None,
             signer_identity_subject: Some(descriptor.signer_identity.subject.clone()),
             signer_identity_issuer: Some(descriptor.signer_identity.issuer.clone()),
             containers: vec![Container {
@@ -550,6 +736,7 @@ mod tests {
             bootstrap_owner_pubkey_hash: "00".repeat(32),
             tenant_instance_identity_hash: hex::encode(descriptor.identity_hash),
             service_account: descriptor.service_account.clone(),
+            image_pull_secret_name: None,
             signer_identity_subject: Some(descriptor.signer_identity.subject.clone()),
             signer_identity_issuer: Some(descriptor.signer_identity.issuer.clone()),
             containers: vec![Container {
@@ -798,6 +985,7 @@ pub async fn apply_deployment_manifests(
     enclava_engine::validate::validate_app(&app_spec)
         .map_err(|e| DeployError::Validation(e.to_string()))?;
 
+    let tenant_image_pull_secret_config = tenant_image_pull_secret_config_from_env();
     let manifests = generate_all_manifests(&app_spec);
     let hash = manifest_hash(&manifests);
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
@@ -817,7 +1005,13 @@ pub async fn apply_deployment_manifests(
     }
 
     let engine = ApplyEngine::try_default().await?;
-    apply_all(&engine, &manifests).await?;
+    apply_all_with_tenant_image_pull_secret(
+        &engine,
+        &manifests,
+        &hash,
+        tenant_image_pull_secret_config.as_ref(),
+    )
+    .await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
         .bind(app.org_id)

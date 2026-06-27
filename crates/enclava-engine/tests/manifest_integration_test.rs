@@ -157,6 +157,18 @@ fn all_namespaced_resources_share_namespace() {
 }
 
 #[test]
+fn service_account_references_image_pull_secret_when_configured() {
+    let mut app = sample_app();
+    app.image_pull_secret_name = Some("enclava-registry-auth".to_string());
+
+    let m = generate_all_manifests(&app);
+    let image_pull_secrets = m.service_account.image_pull_secrets.as_ref().unwrap();
+
+    assert_eq!(image_pull_secrets.len(), 1);
+    assert_eq!(image_pull_secrets[0].name, "enclava-registry-auth");
+}
+
+#[test]
 fn all_managed_resources_have_managed_by_label() {
     let app = sample_app();
     let m = generate_all_manifests(&app);

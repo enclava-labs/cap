@@ -31,6 +31,11 @@ pub struct ConfidentialApp {
     pub tenant_instance_identity_hash: String,
     /// Kubernetes ServiceAccount name for this app.
     pub service_account: String,
+    /// Optional Kubernetes image-pull secret attached to the ServiceAccount.
+    /// The referenced Secret is created by the control plane in the tenant
+    /// namespace and is only used by the kubelet for registry authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_pull_secret_name: Option<String>,
     /// Customer-controlled signer identity bound into KBS policy when present.
     pub signer_identity_subject: Option<String>,
     pub signer_identity_issuer: Option<String>,

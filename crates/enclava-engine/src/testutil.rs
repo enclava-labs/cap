@@ -26,6 +26,7 @@ pub fn sample_app() -> ConfidentialApp {
         bootstrap_owner_pubkey_hash: TEST_PUBKEY_HASH.to_string(),
         tenant_instance_identity_hash: identity_hash,
         service_account: "cap-test-app-sa".to_string(),
+        image_pull_secret_name: None,
         signer_identity_subject: Some(
             "https://github.com/test/app/.github/workflows/build.yml@refs/heads/main".to_string(),
         ),

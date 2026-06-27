@@ -19,6 +19,9 @@ use enclava_cli::{
 };
 
 const DEBIAN_SSH_NGROK_TEMPLATE: &str = "debian-ssh-ngrok";
+const DEBIAN_SSH_FRP_TEMPLATE: &str = "debian-ssh-frp";
+const DEFAULT_DEBIAN_SSH_TEMPLATE: &str = DEBIAN_SSH_FRP_TEMPLATE;
+const FRP_RELAY_HOST: &str = "relay.enclava.me";
 const DEFAULT_SSH_TIMEOUT_SECONDS: u64 = 600;
 const TEMPLATE_CONFIG_DELIVERY_ATTEMPTS: usize = 30;
 const TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS: u64 = 2;
@@ -36,7 +39,7 @@ pub enum TemplateCommand {
 #[derive(Args)]
 pub struct TemplateDeployArgs {
     /// Template slug to deploy
-    #[arg(default_value = DEBIAN_SSH_NGROK_TEMPLATE)]
+    #[arg(default_value = DEFAULT_DEBIAN_SSH_TEMPLATE)]
     pub template: String,
     /// Instance/app name to create
     #[arg(long)]
@@ -138,19 +141,18 @@ async fn list() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Error>> {
-    if args.template != DEBIAN_SSH_NGROK_TEMPLATE {
-        return Err(format!(
-            "template '{}' is not supported by this CLI yet; use `{DEBIAN_SSH_NGROK_TEMPLATE}`",
-            args.template
-        )
-        .into());
-    }
     let instance_name = normalize_slug(&args.name)?;
     let explicit_stable_endpoint = args
         .ngrok_tcp_url
         .as_deref()
-        .map(normalize_ngrok_tcp_url)
+        .map(normalize_stable_ssh_endpoint)
         .transpose()?;
+    if args.template == DEBIAN_SSH_FRP_TEMPLATE && explicit_stable_endpoint.is_some() {
+        return Err(
+            "--stable-ssh-endpoint is not supported for debian-ssh-frp; PaaS allocates the FRP relay port"
+                .into(),
+        );
+    }
 
     let api = build_api_client()?;
     let templates = api.list_templates().await?;
@@ -158,6 +160,13 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         .iter()
         .find(|template| template.slug == args.template)
         .ok_or_else(|| format!("template '{}' is not available", args.template))?;
+    if template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS").is_none() {
+        return Err(format!(
+            "template '{}' is not a Debian SSH template supported by this CLI",
+            args.template
+        )
+        .into());
+    }
 
     let public_keys = read_ssh_public_keys(&args.ssh_public_keys, &args.ssh_public_key_files)?;
     validate_ssh_public_keys(
@@ -253,16 +262,16 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
 
     print!(
         "{}",
-        deploy_response_output(
-            &response.template.slug,
-            &instance_name,
-            &app_url,
-            &deployment_id,
-            Some(stable_endpoint.as_str()),
-            ssh_command.as_deref(),
-            ssh_endpoint.as_deref(),
-            args.json,
-        )?
+        deploy_response_output(DeployResponseOutput {
+            template_slug: &response.template.slug,
+            instance_name: &instance_name,
+            app_url: &app_url,
+            deployment_id: &deployment_id,
+            stable_endpoint: Some(stable_endpoint.as_str()),
+            ssh_command: ssh_command.as_deref(),
+            ssh_endpoint: ssh_endpoint.as_deref(),
+            json: args.json,
+        })?
     );
     Ok(())
 }
@@ -272,7 +281,7 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
     let explicit_stable_endpoint = args
         .ngrok_tcp_url
         .as_deref()
-        .map(normalize_ngrok_tcp_url)
+        .map(normalize_stable_ssh_endpoint)
         .transpose()?;
     let api = build_api_client()?;
     let app = api.get_app(&instance_name).await?;
@@ -410,9 +419,13 @@ fn template_input_label(entry: &HostedTemplateConfigKey) -> String {
 fn stored_stable_endpoint_from_app(
     app: &AppResponse,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    if app.template_slug.as_deref() != Some(DEBIAN_SSH_NGROK_TEMPLATE) {
+    if !app
+        .template_slug
+        .as_deref()
+        .is_some_and(is_supported_stable_ssh_template)
+    {
         return Err(
-            "Stable SSH endpoint command lookup is only available for debian-ssh-ngrok apps with stable SSH endpoints".into(),
+            "Stable SSH endpoint command lookup is only available for Debian SSH apps with stable SSH endpoints".into(),
         );
     }
     let Some(endpoint) = app.template_expected.stable_ssh_endpoint.as_deref() else {
@@ -427,7 +440,7 @@ fn stored_stable_endpoint_from_app(
                 .into(),
         );
     }
-    match normalize_ngrok_tcp_url(endpoint) {
+    match normalize_stable_ssh_endpoint(endpoint) {
         Ok(normalized) if endpoint == normalized => Ok(normalized),
         _ => Err(
             "Hosted Debian SSH app has invalid stored stable SSH endpoint expectation; redeploy the template so PaaS reserves a stable SSH endpoint"
@@ -454,7 +467,7 @@ fn stored_stable_endpoint_from_template_instance_response(
                 .into(),
         );
     }
-    let normalized = normalize_ngrok_tcp_url(endpoint)
+    let normalized = normalize_stable_ssh_endpoint(endpoint)
         .map_err(|_| "PaaS template response included an invalid stored stable SSH endpoint")?;
     if endpoint != normalized {
         return Err(
@@ -462,7 +475,7 @@ fn stored_stable_endpoint_from_template_instance_response(
         );
     }
     if let Some(submitted_endpoint) = submitted_endpoint {
-        let submitted = normalize_ngrok_tcp_url(submitted_endpoint)
+        let submitted = normalize_stable_ssh_endpoint(submitted_endpoint)
             .map_err(|_| "submitted stable SSH endpoint is invalid")?;
         if normalized != submitted {
             return Err(format!(
@@ -524,6 +537,10 @@ fn normalize_slug(value: &str) -> Result<String, Box<dyn std::error::Error>> {
     } else {
         Ok(slug)
     }
+}
+
+fn is_supported_stable_ssh_template(slug: &str) -> bool {
+    matches!(slug, DEBIAN_SSH_NGROK_TEMPLATE | DEBIAN_SSH_FRP_TEMPLATE)
 }
 
 fn template_create_config(explicit_stable_endpoint: Option<&str>) -> serde_json::Value {
@@ -736,7 +753,7 @@ fn validate_ssh_public_keys(
         "rsa-sha2-256",
     ];
 
-    if value.as_bytes().len() > max_bytes {
+    if value.len() > max_bytes {
         return Err(format!("SSH public keys must be {max_bytes} bytes or smaller").into());
     }
     let mut count = 0usize;
@@ -839,6 +856,24 @@ fn read_ssh_bytes(blob: &[u8], offset: usize) -> Option<(&[u8], usize)> {
 }
 
 pub(crate) fn normalize_ngrok_tcp_url(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    normalize_reserved_endpoint(value, is_ngrok_tcp_host)
+        .map_err(|_| "reserved stable SSH endpoint must look like 6.tcp.eu.ngrok.io:17958".into())
+}
+
+fn normalize_stable_ssh_endpoint(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    normalize_reserved_endpoint(value, |host| is_ngrok_tcp_host(host) || is_frp_relay_host(host))
+        .map_err(|_| {
+            format!(
+                "reserved stable SSH endpoint must look like 6.tcp.eu.ngrok.io:17958 or {FRP_RELAY_HOST}:20001"
+            )
+            .into()
+        })
+}
+
+fn normalize_reserved_endpoint(
+    value: &str,
+    valid_host: impl Fn(&str) -> bool,
+) -> Result<String, Box<dyn std::error::Error>> {
     let trimmed = value.trim();
     let address = if trimmed
         .get(..6)
@@ -850,13 +885,13 @@ pub(crate) fn normalize_ngrok_tcp_url(value: &str) -> Result<String, Box<dyn std
     }
     .to_ascii_lowercase();
     let Some((host, port_text)) = address.rsplit_once(':') else {
-        return Err("reserved stable SSH endpoint must look like 6.tcp.eu.ngrok.io:17958".into());
+        return Err("reserved stable SSH endpoint must include host and port".into());
     };
     let host = host.trim_end_matches('.');
     let port = parse_tcp_port(port_text)
         .ok_or("reserved stable SSH endpoint must include a valid TCP port")?;
-    if port == 0 || !is_ngrok_tcp_host(host) {
-        return Err("reserved stable SSH endpoint must look like 6.tcp.eu.ngrok.io:17958".into());
+    if port == 0 || !valid_host(host) {
+        return Err("reserved stable SSH endpoint host is invalid".into());
     }
     Ok(format!("{host}:{port}"))
 }
@@ -1001,6 +1036,10 @@ fn is_ngrok_tcp_host(host: &str) -> bool {
     }) && labels[1] == "tcp"
         && labels[labels.len() - 2] == "ngrok"
         && matches!(labels[labels.len() - 1], "io" | "app")
+}
+
+fn is_frp_relay_host(host: &str) -> bool {
+    host == FRP_RELAY_HOST
 }
 
 fn app_url_from_app_domain(app_domain: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -1212,9 +1251,9 @@ fn validate_ssh_command_response(
     stable_endpoint: &str,
     expected_app_url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stable_endpoint = normalize_ngrok_tcp_url(stable_endpoint)
+    let stable_endpoint = normalize_stable_ssh_endpoint(stable_endpoint)
         .map_err(|_| "expected stable SSH endpoint is invalid")?;
-    let api_stable_endpoint = normalize_ngrok_tcp_url(&response.stable_ssh_endpoint)
+    let api_stable_endpoint = normalize_stable_ssh_endpoint(&response.stable_ssh_endpoint)
         .map_err(|_| "PaaS /ssh-command stable_ssh_endpoint is invalid")?;
     if response.stable_ssh_endpoint != api_stable_endpoint {
         return Err(format!(
@@ -1289,19 +1328,33 @@ fn validate_ssh_command_app_url(
     Ok(())
 }
 
-fn deploy_response_output(
-    template_slug: &str,
-    instance_name: &str,
-    app_url: &str,
-    deployment_id: &str,
-    stable_endpoint: Option<&str>,
-    ssh_command: Option<&str>,
-    ssh_endpoint: Option<&str>,
+struct DeployResponseOutput<'a> {
+    template_slug: &'a str,
+    instance_name: &'a str,
+    app_url: &'a str,
+    deployment_id: &'a str,
+    stable_endpoint: Option<&'a str>,
+    ssh_command: Option<&'a str>,
+    ssh_endpoint: Option<&'a str>,
     json: bool,
+}
+
+fn deploy_response_output(
+    output: DeployResponseOutput<'_>,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let DeployResponseOutput {
+        template_slug,
+        instance_name,
+        app_url,
+        deployment_id,
+        stable_endpoint,
+        ssh_command,
+        ssh_endpoint,
+        json,
+    } = output;
     let app_url = normalize_paas_ssh_command_app_url(app_url)?;
     let stable_endpoint = stable_endpoint
-        .map(normalize_ngrok_tcp_url)
+        .map(normalize_stable_ssh_endpoint)
         .transpose()
         .map_err(|_| "stable SSH endpoint output is invalid")?;
     let endpoint = display_ssh_endpoint(ssh_command, ssh_endpoint)?;
@@ -1351,7 +1404,7 @@ fn ssh_command_response_output(
     expected_app_url: &str,
     json: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let stable_endpoint = normalize_ngrok_tcp_url(stable_endpoint)?;
+    let stable_endpoint = normalize_stable_ssh_endpoint(stable_endpoint)?;
     validate_ssh_command_response(response, &stable_endpoint, expected_app_url)?;
     let endpoint = display_ssh_endpoint(response.command.as_deref(), response.endpoint.as_deref())?;
     let app_url = response_app_url_for_output(response)?;
@@ -1523,11 +1576,9 @@ fn parse_ssh_endpoint(command: &str) -> Option<(&str, &str)> {
     if parts.len() != 4 || parts[0] != "ssh" || parts[1] != "-p" {
         return None;
     }
-    if parse_canonical_tcp_port(parts[2]).is_none() {
-        return None;
-    }
+    parse_canonical_tcp_port(parts[2])?;
     let host = parts[3].strip_prefix("user@")?;
-    if !is_canonical_ngrok_tcp_ssh_host(host) {
+    if !is_canonical_stable_ssh_host(host) {
         return None;
     }
     Some((host, parts[2]))
@@ -1548,10 +1599,10 @@ fn parse_tcp_port(port_text: &str) -> Option<u16> {
     }
 }
 
-fn is_canonical_ngrok_tcp_ssh_host(host: &str) -> bool {
+fn is_canonical_stable_ssh_host(host: &str) -> bool {
     host == host.trim_end_matches('.')
         && host == host.to_ascii_lowercase()
-        && is_ngrok_tcp_ssh_host(host)
+        && (is_ngrok_tcp_ssh_host(host) || is_frp_relay_host(host))
 }
 
 fn is_ngrok_tcp_ssh_host(host: &str) -> bool {
@@ -1580,7 +1631,7 @@ fn ensure_reported_ssh_endpoint_matches_command(
     let command_endpoint = ssh_endpoint_string(command)
         .ok_or_else(|| format!("could not parse stable SSH endpoint command: {command}"))?;
     let raw_reported_endpoint = reported_endpoint.trim();
-    let normalized_reported_endpoint = normalize_ngrok_tcp_url(raw_reported_endpoint)
+    let normalized_reported_endpoint = normalize_stable_ssh_endpoint(raw_reported_endpoint)
         .map_err(|_| "PaaS /ssh-command response endpoint is not a reserved stable SSH endpoint")?;
     if reported_endpoint != raw_reported_endpoint
         || raw_reported_endpoint != normalized_reported_endpoint
@@ -1605,7 +1656,7 @@ fn ensure_ssh_command_matches_endpoint(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let actual = ssh_endpoint_string(command)
         .ok_or_else(|| format!("could not parse stable SSH endpoint command: {command}"))?;
-    let expected = normalize_ngrok_tcp_url(endpoint)?;
+    let expected = normalize_stable_ssh_endpoint(endpoint)?;
     if actual == expected {
         Ok(())
     } else {
@@ -1690,6 +1741,7 @@ mod tests {
     #[test]
     fn ngrok_tcp_url_rejects_non_ngrok_hosts() {
         assert!(normalize_ngrok_tcp_url("example.com:22").is_err());
+        assert!(normalize_ngrok_tcp_url("relay.enclava.me:20001").is_err());
         assert!(normalize_ngrok_tcp_url("tcp.eu.ngrok.io:17958").is_err());
         assert!(normalize_ngrok_tcp_url("6.foo.eu.ngrok.io:17958").is_err());
         assert!(normalize_ngrok_tcp_url("6.tcp.eu.extra.ngrok.io:17958").is_err());
@@ -1704,6 +1756,14 @@ mod tests {
         assert!(normalize_ngrok_tcp_url("6.tcp.eu.ngrok.io:+123").is_err());
         assert!(normalize_ngrok_tcp_url("6.tcp.eu.ngrok.io:1e2").is_err());
         assert!(normalize_ngrok_tcp_url("6.tcp.eu.ngrok.io:000123").is_err());
+    }
+
+    #[test]
+    fn stable_ssh_endpoint_accepts_frp_relay_host() {
+        assert_eq!(
+            normalize_stable_ssh_endpoint("tcp://Relay.Enclava.Me:20001").unwrap(),
+            "relay.enclava.me:20001"
+        );
     }
 
     #[test]
@@ -1790,7 +1850,7 @@ mod tests {
         let crate::commands::Command::Template(TemplateCommand::Deploy(args)) = cli.command else {
             panic!("expected template deploy command");
         };
-        assert_eq!(args.template, DEBIAN_SSH_NGROK_TEMPLATE);
+        assert_eq!(args.template, DEBIAN_SSH_FRP_TEMPLATE);
         assert_eq!(args.ngrok_tcp_url, None);
         assert_eq!(
             template_create_config(args.ngrok_tcp_url.as_deref()),
@@ -1911,7 +1971,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_templates_do_not_require_stable_ssh_endpoint() {
+    async fn unknown_templates_are_resolved_by_paas_before_ssh_validation() {
         let err = deploy(TemplateDeployArgs {
             template: "future-template".to_string(),
             name: "shell".to_string(),
@@ -1923,11 +1983,14 @@ mod tests {
             json: false,
         })
         .await
-        .expect_err("unsupported templates should fail before stable SSH endpoint validation");
+        .expect_err("unknown templates should fail before stable SSH endpoint validation");
 
+        let message = err.to_string();
         assert!(
-            err.to_string()
-                .contains("template 'future-template' is not supported")
+            !message.contains("stored stable SSH endpoint")
+                && !message.contains("PaaS template response")
+                && !message.contains("submitted stable SSH endpoint"),
+            "unknown template errors must not come from stable SSH endpoint validation: {message}"
         );
     }
 
@@ -1980,7 +2043,14 @@ mod tests {
             stored_stable_endpoint_from_app(&non_template)
                 .unwrap_err()
                 .to_string()
-                .contains("only available for debian-ssh-ngrok apps")
+                .contains("only available for Debian SSH apps")
+        );
+
+        let mut frp_app = stable_ssh_app_response(Some("relay.enclava.me:20001"));
+        frp_app.template_slug = Some(DEBIAN_SSH_FRP_TEMPLATE.to_string());
+        assert_eq!(
+            stored_stable_endpoint_from_app(&frp_app).unwrap(),
+            "relay.enclava.me:20001"
         );
 
         for endpoint in [None, Some("   ")] {
@@ -2288,7 +2358,10 @@ mod tests {
     #[test]
     fn ssh_command_parser_requires_nonzero_tcp_port() {
         assert!(valid_ssh_command("ssh -p 17958 user@6.tcp.eu.ngrok.io"));
+        assert!(valid_ssh_command("ssh -p 20001 user@relay.enclava.me"));
         assert!(!valid_ssh_command("ssh -p 17958 user@6.TCP.EU.NGROK.IO."));
+        assert!(!valid_ssh_command("ssh -p 20001 user@Relay.Enclava.Me"));
+        assert!(!valid_ssh_command("ssh -p 20001 user@relay.enclava.me."));
         assert!(!valid_ssh_command("ssh -p 00123 user@6.tcp.eu.ngrok.io"));
         assert!(!valid_ssh_command(" ssh -p 17958 user@6.tcp.eu.ngrok.io"));
         assert!(!valid_ssh_command("ssh  -p 17958 user@6.tcp.eu.ngrok.io"));
@@ -2719,16 +2792,16 @@ mod tests {
 
     #[test]
     fn deploy_output_surfaces_stable_ssh_details_for_humans() {
-        let output = deploy_response_output(
-            "debian-ssh-ngrok",
-            "shell",
-            "https://shell.enclava.dev",
-            "deploy-123",
-            Some("6.tcp.eu.ngrok.io:17958"),
-            Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
-            Some("6.tcp.eu.ngrok.io:17958"),
-            false,
-        )
+        let output = deploy_response_output(DeployResponseOutput {
+            template_slug: "debian-ssh-ngrok",
+            instance_name: "shell",
+            app_url: "https://shell.enclava.dev",
+            deployment_id: "deploy-123",
+            stable_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            ssh_command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
+            ssh_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            json: false,
+        })
         .unwrap();
 
         assert!(output.contains("  Template:   debian-ssh-ngrok"));
@@ -2744,16 +2817,16 @@ mod tests {
 
     #[test]
     fn deploy_output_json_is_machine_readable() {
-        let output = deploy_response_output(
-            "debian-ssh-ngrok",
-            "shell",
-            "https://shell.enclava.dev",
-            "deploy-123",
-            Some("6.tcp.eu.ngrok.io:17958"),
-            Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
-            Some("6.tcp.eu.ngrok.io:17958"),
-            true,
-        )
+        let output = deploy_response_output(DeployResponseOutput {
+            template_slug: "debian-ssh-ngrok",
+            instance_name: "shell",
+            app_url: "https://shell.enclava.dev",
+            deployment_id: "deploy-123",
+            stable_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            ssh_command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
+            ssh_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            json: true,
+        })
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();
 
@@ -2776,16 +2849,16 @@ mod tests {
 
     #[test]
     fn deploy_output_canonicalizes_and_validates_stable_endpoint() {
-        let output = deploy_response_output(
-            "debian-ssh-ngrok",
-            "shell",
-            "https://shell.enclava.dev",
-            "deploy-123",
-            Some("tcp://6.TCP.EU.NGROK.IO.:00123"),
-            None,
-            None,
-            true,
-        )
+        let output = deploy_response_output(DeployResponseOutput {
+            template_slug: "debian-ssh-ngrok",
+            instance_name: "shell",
+            app_url: "https://shell.enclava.dev",
+            deployment_id: "deploy-123",
+            stable_endpoint: Some("tcp://6.TCP.EU.NGROK.IO.:00123"),
+            ssh_command: None,
+            ssh_endpoint: None,
+            json: true,
+        })
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(value["stable_ssh_endpoint"], "6.tcp.eu.ngrok.io:123");
@@ -2793,16 +2866,16 @@ mod tests {
         assert_eq!(value["ssh_command_status"], "pending");
         assert_eq!(value["endpoint"], serde_json::Value::Null);
 
-        let err = deploy_response_output(
-            "debian-ssh-ngrok",
-            "shell",
-            "https://shell.enclava.dev",
-            "deploy-123",
-            Some("example.com:22"),
-            None,
-            None,
-            true,
-        )
+        let err = deploy_response_output(DeployResponseOutput {
+            template_slug: "debian-ssh-ngrok",
+            instance_name: "shell",
+            app_url: "https://shell.enclava.dev",
+            deployment_id: "deploy-123",
+            stable_endpoint: Some("example.com:22"),
+            ssh_command: None,
+            ssh_endpoint: None,
+            json: true,
+        })
         .unwrap_err();
         assert!(
             err.to_string()
@@ -2812,31 +2885,31 @@ mod tests {
 
     #[test]
     fn deploy_output_normalizes_app_url_for_stable_ssh_handoff() {
-        let human = deploy_response_output(
-            "debian-ssh-ngrok",
-            "shell",
-            "https://Shell.Enclava.Dev./",
-            "deploy-123",
-            Some("6.tcp.eu.ngrok.io:17958"),
-            Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
-            Some("6.tcp.eu.ngrok.io:17958"),
-            false,
-        )
+        let human = deploy_response_output(DeployResponseOutput {
+            template_slug: "debian-ssh-ngrok",
+            instance_name: "shell",
+            app_url: "https://Shell.Enclava.Dev./",
+            deployment_id: "deploy-123",
+            stable_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            ssh_command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
+            ssh_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            json: false,
+        })
         .unwrap();
         assert!(human.contains("  URL:        https://shell.enclava.dev"));
         assert!(!human.contains("Shell.Enclava.Dev"));
         assert!(!human.contains("/ssh.txt"));
 
-        let json = deploy_response_output(
-            "debian-ssh-ngrok",
-            "shell",
-            "https://Shell.Enclava.Dev./",
-            "deploy-123",
-            Some("6.tcp.eu.ngrok.io:17958"),
-            Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
-            Some("6.tcp.eu.ngrok.io:17958"),
-            true,
-        )
+        let json = deploy_response_output(DeployResponseOutput {
+            template_slug: "debian-ssh-ngrok",
+            instance_name: "shell",
+            app_url: "https://Shell.Enclava.Dev./",
+            deployment_id: "deploy-123",
+            stable_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            ssh_command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
+            ssh_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            json: true,
+        })
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["app_url"], "https://shell.enclava.dev");
@@ -2844,16 +2917,16 @@ mod tests {
 
     #[test]
     fn deploy_output_rejects_mismatched_endpoint_api_endpoint() {
-        let err = deploy_response_output(
-            "debian-ssh-ngrok",
-            "shell",
-            "https://shell.enclava.dev",
-            "deploy-123",
-            Some("6.tcp.eu.ngrok.io:17958"),
-            Some("ssh -p 17959 user@6.tcp.eu.ngrok.io"),
-            Some("6.tcp.eu.ngrok.io:17958"),
-            false,
-        )
+        let err = deploy_response_output(DeployResponseOutput {
+            template_slug: "debian-ssh-ngrok",
+            instance_name: "shell",
+            app_url: "https://shell.enclava.dev",
+            deployment_id: "deploy-123",
+            stable_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            ssh_command: Some("ssh -p 17959 user@6.tcp.eu.ngrok.io"),
+            ssh_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            json: false,
+        })
         .unwrap_err();
 
         assert!(

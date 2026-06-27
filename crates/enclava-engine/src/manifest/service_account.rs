@@ -1,4 +1,4 @@
-use k8s_openapi::api::core::v1::ServiceAccount;
+use k8s_openapi::api::core::v1::{LocalObjectReference, ServiceAccount};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
@@ -20,6 +20,10 @@ pub fn generate_service_account(app: &ConfidentialApp) -> ServiceAccount {
             labels: Some(labels),
             ..Default::default()
         },
+        image_pull_secrets: app
+            .image_pull_secret_name
+            .as_ref()
+            .map(|name| vec![LocalObjectReference { name: name.clone() }]),
         // Phase 0 item E: confidential workloads must never automount the
         // default token; nothing inside the TEE talks to the K8s API.
         automount_service_account_token: Some(false),

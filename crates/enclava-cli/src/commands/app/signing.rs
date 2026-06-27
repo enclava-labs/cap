@@ -248,6 +248,7 @@ pub(crate) fn confidential_app_for_cc_hash(
             .service_account
             .clone()
             .unwrap_or_else(|| format!("cap-{}-sa", app.name)),
+        image_pull_secret_name: None,
         signer_identity_subject: app.signer_identity_subject.clone(),
         signer_identity_issuer: app.signer_identity_issuer.clone(),
         containers: vec![Container {
