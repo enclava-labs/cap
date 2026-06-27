@@ -1628,7 +1628,7 @@ mod tests {
             name: "Debian Stable SSH Endpoint".to_string(),
             description: "SSH template".to_string(),
             features: vec![
-                "SSH over a stable endpoint".to_string(),
+                "SSH over a stable SSH endpoint".to_string(),
                 "PaaS-provisioned ngrok TCP address".to_string(),
             ],
             version: "2026-06-18".to_string(),
