@@ -152,8 +152,7 @@ pub async fn watch_rollout(
     loop {
         if start.elapsed() >= deadline {
             return Ok(DeployStatus::timed_out(&format!(
-                "rollout did not complete within {:?}",
-                deadline
+                "rollout did not complete within {deadline:?}"
             )));
         }
 
@@ -290,8 +289,7 @@ pub async fn watch_rollout(
         let sleep_dur = poll.min(remaining);
         if sleep_dur.is_zero() {
             return Ok(DeployStatus::timed_out(&format!(
-                "rollout did not complete within {:?}",
-                deadline
+                "rollout did not complete within {deadline:?}"
             )));
         }
         tokio::time::sleep(sleep_dur).await;

@@ -91,7 +91,7 @@ pub async fn scale_statefulset_to_zero(
         if start.elapsed() >= timeout_duration {
             return Err(ApplyError::CleanupStepFailed {
                 step: "scale_to_zero".to_string(),
-                detail: format!("pods did not terminate within {:?}", timeout_duration),
+                detail: format!("pods did not terminate within {timeout_duration:?}"),
             });
         }
 
@@ -200,8 +200,7 @@ pub async fn delete_pvcs_and_wait(
                 return Err(ApplyError::CleanupStepFailed {
                     step: "delete_pvcs".to_string(),
                     detail: format!(
-                        "PVCs {:?} not deleted within {:?} -- possible finalizer issue",
-                        names, timeout_duration
+                        "PVCs {names:?} not deleted within {timeout_duration:?} -- possible finalizer issue"
                     ),
                 });
             }
@@ -251,8 +250,7 @@ pub async fn delete_namespace_and_wait(
             return Err(ApplyError::CleanupStepFailed {
                 step: "delete_namespace".to_string(),
                 detail: format!(
-                    "namespace '{namespace}' stuck in Terminating after {:?}",
-                    timeout_duration
+                    "namespace '{namespace}' stuck in Terminating after {timeout_duration:?}"
                 ),
             });
         }

@@ -825,7 +825,7 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     println!("App:      {}", status.app_name);
-    println!("Status:   {}", status_colored);
+    println!("Status:   {status_colored}");
     println!("Domain:   https://{}", status.domain);
     match stable_ssh_endpoint {
         StableSshEndpointState::Ready(endpoint) => {

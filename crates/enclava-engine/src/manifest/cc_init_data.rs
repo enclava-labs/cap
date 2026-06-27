@@ -378,7 +378,7 @@ fn build_agent_policy(
         rego_string(instance)
     ));
     rego.push_str("}\n\n");
-    rego.push_str(&format!("policy_data := {}\n", policy_data));
+    rego.push_str(&format!("policy_data := {policy_data}\n"));
     rego
 }
 

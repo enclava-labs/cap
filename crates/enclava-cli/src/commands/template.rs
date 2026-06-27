@@ -266,7 +266,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     let mut config_token = token.token.clone();
     let config_pairs = debian_ssh_config_pairs(public_keys);
     deliver_template_config_with_retry(
-        &api,
+        api,
         &mut tee,
         &instance_name,
         &mut config_token,
@@ -291,7 +291,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         pb.set_position(4);
         pb.set_message("Waiting for stable SSH endpoint command...");
         let response = wait_for_paas_ssh_command(
-            &api,
+            api,
             &instance_name,
             stable_endpoint.as_str(),
             app_url.as_str(),
