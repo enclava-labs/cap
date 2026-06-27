@@ -1,5 +1,6 @@
 use crate::api_types::*;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use sha2::{Digest, Sha256};
 
 /// Typed HTTP client for the Enclava Platform API.
 pub struct ApiClient {
@@ -347,17 +348,12 @@ impl ApiClient {
         &self,
         req: &CreateTemplateInstanceRequest,
     ) -> Result<TemplateInstanceResponse, ApiError> {
+        let idempotency_key = template_instance_idempotency_key(req);
         let resp = self
             .http
             .post(self.url("/template-instances"))
             .headers(self.auth_headers()?)
-            .header(
-                "Idempotency-Key",
-                format!(
-                    "template-instance-{}-{}",
-                    req.template_slug, req.instance_name
-                ),
-            )
+            .header("Idempotency-Key", idempotency_key)
             .json(req)
             .send()
             .await?;
@@ -689,4 +685,50 @@ fn path_segment(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn template_instance_idempotency_key(req: &CreateTemplateInstanceRequest) -> String {
+    let body = serde_json::to_vec(req).unwrap_or_else(|_| {
+        format!("{}:{}:{}", req.template_slug, req.instance_name, req.config).into_bytes()
+    });
+    let digest = Sha256::digest(body);
+    format!(
+        "template-instance-{}-{}-{}",
+        req.template_slug,
+        req.instance_name,
+        &hex::encode(digest)[..16]
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn template_request(endpoint: &str) -> CreateTemplateInstanceRequest {
+        CreateTemplateInstanceRequest {
+            template_slug: "debian-ssh-ngrok".to_string(),
+            instance_name: "shell".to_string(),
+            config: serde_json::json!({
+                "NGROK_TCP_URL": endpoint
+            }),
+        }
+    }
+
+    #[test]
+    fn template_instance_idempotency_key_binds_stable_endpoint_request() {
+        let first = template_request("6.tcp.eu.ngrok.io:17958");
+        let retry = template_request("6.tcp.eu.ngrok.io:17958");
+        let changed_endpoint = template_request("6.tcp.eu.ngrok.io:17959");
+
+        assert_eq!(
+            template_instance_idempotency_key(&first),
+            template_instance_idempotency_key(&retry),
+            "retries of the exact same stable SSH request must use the same idempotency key"
+        );
+        assert_ne!(
+            template_instance_idempotency_key(&first),
+            template_instance_idempotency_key(&changed_endpoint),
+            "changing the reserved stable SSH endpoint must use a different idempotency key"
+        );
+    }
 }

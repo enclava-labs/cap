@@ -48,24 +48,55 @@ billing or product semantics.
 enclava template list
 enclava template deploy --name shell \
   --ssh-public-key-file ~/.ssh/id_ed25519.pub \
-  --ngrok-authtoken-file ../ngrok-secret.txt \
-  --ngrok-tcp-url 6.tcp.eu.ngrok.io:17958 \
   --json
-enclava template ssh-command --name shell --wait \
-  --ngrok-tcp-url 6.tcp.eu.ngrok.io:17958
+enclava template ssh-command --name shell --wait
 enclava template ssh-command --name shell --json
+enclava status --app shell
 ```
 
-`--ngrok-tcp-url` is required for hosted Debian SSH deploys: the CLI normalizes
-the reserved ngrok TCP address, writes it directly to the TEE config endpoint
-with the ngrok token and SSH public keys, waits for the hosted PaaS
-`/apps/<name>/ssh-command` broker, and fails if the returned SSH command does
-not match the reserved host and port. Ready broker responses must include the
-parsed `endpoint` field; the CLI fails closed if it is missing or does not match
-the rendered command. Use `enclava template ssh-command` after a `--no-wait`
-deployment or timeout to fetch the same PaaS-rendered command later. Pass
-`--json` on deploy or command lookup when automation needs the app URL, command,
-and parsed `endpoint` as structured output.
+Hosted Debian SSH deploys reserve their stable SSH endpoint in PaaS by default.
+The CLI sends template creation to PaaS, reads the stored endpoint from the
+template response, writes SSH public keys directly to the TEE config endpoint,
+waits for the hosted PaaS
+`/apps/<name>/ssh-command` API, and fails if the returned stable SSH endpoint
+command does not match the reserved host and port. Ready API responses must
+include the public `app_url`, canonical stable SSH endpoint `command`, and
+canonical parsed `endpoint` fields; the command must already use the exact
+`ssh -p <port> user@<lowercase-ngrok-host>` shape with a non-padded decimal
+port. The CLI fails closed if any ready field is missing, non-canonical, or if
+the endpoint does not match the stable SSH endpoint command. Pending API
+responses may include the public `app_url` once CAP has returned it; `command`
+and `endpoint` remain null until the stable SSH endpoint command is ready. Use
+`enclava template ssh-command` after a `--no-wait`
+deployment or timeout to fetch the same PaaS-rendered stable SSH endpoint
+command later. The CLI
+reads the stored stable SSH endpoint expectation from PaaS app metadata before
+polling, so browser-created apps do not require retyping the reserved address.
+Passing `--stable-ssh-endpoint` to `template deploy` imports an existing
+reserved endpoint instead of letting PaaS reserve one. Passing it to
+`template ssh-command` adds a caller-supplied assertion and makes the CLI reject
+the lookup before polling if that assertion differs from the stored endpoint, or
+reject any stable SSH endpoint command that does not match that endpoint. Pass
+`--json` on deploy or command lookup when automation needs the
+app URL, expected `stable_ssh_endpoint` (`stable_endpoint` is kept as a
+compatibility alias), stable SSH endpoint command, and canonical parsed `endpoint`
+as structured output. The `enclava status --app <name>` command also redisplays the stored
+stable SSH endpoint for Debian SSH template apps and shows the validating
+`template ssh-command` follow-up with
+`--wait`; if the endpoint metadata is missing or invalid,
+`status` prints a redeploy action instead of hiding stable SSH. If an
+older hosted Debian SSH app returns `stable_ssh_endpoint_missing` or
+`stable_ssh_endpoint_invalid`, redeploy it so PaaS reserves and stores the
+non-secret stable SSH endpoint expectation it must enforce. The ngrok agent
+authtoken is PaaS-managed and injected through the PaaS deployment environment
+as `DEBIAN_SSH_NGROK_AUTHTOKEN`; endpoint reservation uses a separate PaaS
+management credential, `NGROK_API_KEY`. The hosted CLI does not accept or read
+ngrok token/API-key flags, local text/token files, or env vars. `--ngrok-tcp-url`
+remains accepted as a compatibility alias for existing automation.
+
+Run `scripts/test-stable-ssh-cli.sh` before changing the hosted Debian SSH CLI
+path. It pins the endpoint-first human output, JSON fields, `/ssh-command`
+response contract, and idempotency key behavior for stable SSH deployments.
 
 ## Repository Layout
 

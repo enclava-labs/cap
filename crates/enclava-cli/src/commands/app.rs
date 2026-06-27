@@ -33,6 +33,8 @@ use enclava_engine::types::{
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::commands::template::normalize_ngrok_tcp_url;
+
 const DEPLOY_HEALTH_TIMEOUT_SECONDS: u64 = 900;
 
 /// Resolve app name from --app flag or enclava.toml.
@@ -782,6 +784,11 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     let (api, _paths, _cli_config) = build_api_client()?;
 
     let mut status = api.get_status(&app_name).await?;
+    let app_metadata = api.get_app(&app_name).await.ok();
+    let stable_ssh_endpoint = app_metadata
+        .as_ref()
+        .map(stable_ssh_endpoint_state_from_app)
+        .unwrap_or(StableSshEndpointState::NotStableTemplate);
     if let Ok(endpoint) = api.get_unlock_endpoint(&app_name).await {
         let tee = TeeClient::new_for_ownership(&endpoint.tee_url);
         if let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
@@ -810,8 +817,8 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     let status_colored = match status.status.as_str() {
-        "running" => status.status.green().to_string(),
-        "creating" | "deploying" => status.status.yellow().to_string(),
+        "running" | "ready" | "healthy" => status.status.green().to_string(),
+        "creating" | "deploying" | "applying" | "pending" => status.status.yellow().to_string(),
         "failed" | "stopped" => status.status.red().to_string(),
         _ => status.status.clone(),
     };
@@ -819,6 +826,23 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     println!("App:      {}", status.app_name);
     println!("Status:   {}", status_colored);
     println!("Domain:   https://{}", status.domain);
+    match stable_ssh_endpoint {
+        StableSshEndpointState::Ready(endpoint) => {
+            println!("Stable SSH endpoint: {endpoint}");
+            println!("Validate:  enclava template ssh-command --name {app_name} --wait");
+        }
+        StableSshEndpointState::Missing => {
+            println!(
+                "Stable SSH endpoint metadata missing; redeploy the template so PaaS reserves a stable SSH endpoint"
+            );
+        }
+        StableSshEndpointState::Invalid => {
+            println!(
+                "Stable SSH endpoint metadata invalid; redeploy the template so PaaS reserves a stable SSH endpoint"
+            );
+        }
+        StableSshEndpointState::NotStableTemplate => {}
+    }
     if let Some(phase) = &status.pod_phase {
         println!("Pod:      {phase}");
     }
@@ -833,6 +857,30 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StableSshEndpointState {
+    NotStableTemplate,
+    Ready(String),
+    Missing,
+    Invalid,
+}
+
+fn stable_ssh_endpoint_state_from_app(app: &AppResponse) -> StableSshEndpointState {
+    if app.template_slug.as_deref() != Some("debian-ssh-ngrok") {
+        return StableSshEndpointState::NotStableTemplate;
+    }
+    let Some(endpoint) = app.template_expected.stable_ssh_endpoint.as_deref() else {
+        return StableSshEndpointState::Missing;
+    };
+    if endpoint.trim().is_empty() {
+        return StableSshEndpointState::Missing;
+    }
+    match normalize_ngrok_tcp_url(endpoint) {
+        Ok(normalized) if endpoint == normalized => StableSshEndpointState::Ready(normalized),
+        _ => StableSshEndpointState::Invalid,
+    }
 }
 
 #[derive(Args)]

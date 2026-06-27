@@ -3,6 +3,7 @@
 //! not shared with the API crate (the CLI does not depend on enclava-api).
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // --- Auth ---
 
@@ -86,6 +87,14 @@ pub struct CurrentUserOrg {
     pub deploy_block_reason: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct TemplateExpected {
+    #[serde(default)]
+    pub stable_ssh_endpoint: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
 // --- Apps ---
 
 #[derive(Debug, Serialize)]
@@ -153,6 +162,8 @@ pub struct AppResponse {
     pub tenant_instance_identity_hash: Option<String>,
     pub domain: String,
     #[serde(default)]
+    pub app_domain: Option<String>,
+    #[serde(default)]
     pub tee_domain: Option<String>,
     pub custom_domain: Option<String>,
     pub status: String,
@@ -161,6 +172,12 @@ pub struct AppResponse {
     pub signer_identity_subject: Option<String>,
     #[serde(default)]
     pub signer_identity_issuer: Option<String>,
+    #[serde(default)]
+    pub template_slug: Option<String>,
+    #[serde(default)]
+    pub template_version: Option<String>,
+    #[serde(default)]
+    pub template_expected: TemplateExpected,
     pub created_at: String,
 }
 
@@ -191,9 +208,13 @@ pub struct HostedTemplate {
     pub slug: String,
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub features: Vec<String>,
     pub version: String,
     pub image: String,
     pub config_keys: Vec<HostedTemplateConfigKey>,
+    #[serde(default)]
+    pub paas_managed_config_keys: Vec<String>,
     #[serde(default)]
     pub persistence_path: Option<String>,
     #[serde(default)]
@@ -238,29 +259,95 @@ pub struct CreateTemplateInstanceRequest {
 #[derive(Debug, Deserialize)]
 pub struct TemplateInstanceResponse {
     pub template: HostedTemplate,
-    pub app: serde_json::Value,
+    pub app: TemplateInstanceAppResponse,
     pub deployment: TemplateDeploymentResponse,
     pub config_token: Option<ConfigTokenResponse>,
     pub cap: serde_json::Value,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct TemplateDeploymentResponse {
-    pub cap_deployment_id: Option<String>,
-    pub status: String,
+#[derive(Debug, Default, Deserialize)]
+pub struct TemplateInstanceAppResponse {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub template_expected: TemplateExpected,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
+pub struct TemplateDeploymentResponse {
+    #[serde(default)]
+    pub cap_deployment_id: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub template_expected: TemplateExpected,
+}
+
+#[derive(Debug)]
 pub struct SshCommandResponse {
     pub status: String,
-    /// Null while pending; required by the hosted stable SSH contract when ready.
-    #[serde(default)]
+    /// Canonical reserved stable SSH endpoint stored by PaaS for this app.
+    /// Required field: present while pending and ready.
+    pub stable_ssh_endpoint: String,
+    /// Canonical stable SSH endpoint command derived from the stable SSH endpoint.
+    /// Required nullable field: null while pending, non-null when ready.
     pub command: Option<String>,
-    /// Null while pending; required by the hosted stable SSH contract when ready.
-    #[serde(default)]
+    /// Canonical `host:port` endpoint. Required nullable field: null while
+    /// pending, non-null when ready and matching the stable SSH endpoint command.
     pub endpoint: Option<String>,
-    #[serde(default)]
+    /// Public app URL backing the stable SSH endpoint command API. Required nullable field:
+    /// null before CAP has returned an app URL, may be non-null while pending,
+    /// non-null when ready.
     pub app_url: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for SshCommandResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("SshCommandResponse must be a JSON object"))?;
+        let status = object
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("missing string field `status`"))?
+            .to_string();
+        let stable_ssh_endpoint = object
+            .get("stable_ssh_endpoint")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::custom("missing string field `stable_ssh_endpoint`"))?
+            .to_string();
+        Ok(Self {
+            status,
+            stable_ssh_endpoint,
+            command: required_nullable_string(object, "command")?,
+            endpoint: required_nullable_string(object, "endpoint")?,
+            app_url: required_nullable_string(object, "app_url")?,
+        })
+    }
+}
+
+fn required_nullable_string<E>(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Result<Option<String>, E>
+where
+    E: serde::de::Error,
+{
+    match object.get(field) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(E::custom(format!(
+            "field `{field}` must be a string or null"
+        ))),
+        None => Err(E::custom(format!("missing field `{field}`"))),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -470,6 +557,12 @@ pub struct DeploymentEntry {
     pub image_digest: Option<String>,
     #[serde(default)]
     pub error_message: Option<String>,
+    #[serde(default)]
+    pub template_slug: Option<String>,
+    #[serde(default)]
+    pub template_version: Option<String>,
+    #[serde(default)]
+    pub template_expected: TemplateExpected,
     pub created_at: String,
     pub completed_at: Option<String>,
 }
@@ -570,7 +663,7 @@ pub struct ApiErrorBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigKeysResponse, ConfigTokenResponse};
+    use super::{ConfigKeysResponse, ConfigTokenResponse, SshCommandResponse};
 
     #[test]
     fn config_token_accepts_live_api_shape() {
@@ -618,5 +711,79 @@ mod tests {
 
         assert_eq!(parsed.keys.len(), 1);
         assert_eq!(parsed.keys[0].key, "DATABASE_URL");
+    }
+
+    #[test]
+    fn ssh_command_response_accepts_required_nullable_pending_fields() {
+        let parsed: SshCommandResponse = serde_json::from_value(serde_json::json!({
+            "status": "pending",
+            "stable_ssh_endpoint": "6.tcp.eu.ngrok.io:17958",
+            "command": null,
+            "endpoint": null,
+            "app_url": null
+        }))
+        .expect("pending SSH command response should decode with required nullable fields");
+
+        assert_eq!(parsed.status, "pending");
+        assert_eq!(parsed.stable_ssh_endpoint, "6.tcp.eu.ngrok.io:17958");
+        assert_eq!(parsed.command, None);
+        assert_eq!(parsed.endpoint, None);
+        assert_eq!(parsed.app_url, None);
+
+        let parsed: SshCommandResponse = serde_json::from_value(serde_json::json!({
+            "status": "pending",
+            "stable_ssh_endpoint": "6.tcp.eu.ngrok.io:17958",
+            "command": null,
+            "endpoint": null,
+            "app_url": "https://shell.enclava.dev"
+        }))
+        .expect("pending SSH command response may include a known app URL");
+
+        assert_eq!(parsed.status, "pending");
+        assert_eq!(parsed.stable_ssh_endpoint, "6.tcp.eu.ngrok.io:17958");
+        assert_eq!(parsed.command, None);
+        assert_eq!(parsed.endpoint, None);
+        assert_eq!(parsed.app_url.as_deref(), Some("https://shell.enclava.dev"));
+    }
+
+    #[test]
+    fn ssh_command_response_rejects_omitted_required_nullable_fields() {
+        let error = serde_json::from_value::<SshCommandResponse>(serde_json::json!({
+            "status": "pending",
+            "command": null,
+            "endpoint": null,
+            "app_url": null
+        }))
+        .expect_err("missing stable_ssh_endpoint field must fail the hosted SSH contract");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing string field `stable_ssh_endpoint`")
+        );
+
+        let error = serde_json::from_value::<SshCommandResponse>(serde_json::json!({
+            "status": "pending",
+            "stable_ssh_endpoint": "6.tcp.eu.ngrok.io:17958",
+            "endpoint": null,
+            "app_url": null
+        }))
+        .expect_err("missing command field must fail the hosted SSH contract");
+
+        assert!(error.to_string().contains("missing field `command`"));
+    }
+
+    #[test]
+    fn ssh_command_response_rejects_wrong_required_nullable_field_type() {
+        let error = serde_json::from_value::<SshCommandResponse>(serde_json::json!({
+            "status": "pending",
+            "stable_ssh_endpoint": "6.tcp.eu.ngrok.io:17958",
+            "command": [],
+            "endpoint": null,
+            "app_url": null
+        }))
+        .expect_err("non-string command field must fail the hosted SSH contract");
+
+        assert!(error.to_string().contains("must be a string or null"));
     }
 }

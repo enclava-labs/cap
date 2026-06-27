@@ -38,6 +38,7 @@ fn test_app_response() -> AppResponse {
         bootstrap_owner_pubkey_hash: Some("33".repeat(32)),
         tenant_instance_identity_hash: Some("44".repeat(32)),
         domain: "demo.org.enclava.dev".to_string(),
+        app_domain: None,
         tee_domain: Some("demo.org.tee.enclava.dev".to_string()),
         custom_domain: None,
         status: "created".to_string(),
@@ -46,6 +47,9 @@ fn test_app_response() -> AppResponse {
             "https://github.com/acme/demo/.github/workflows/image.yml@refs/heads/main".to_string(),
         ),
         signer_identity_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
+        template_slug: None,
+        template_version: None,
+        template_expected: TemplateExpected::default(),
         created_at: "2026-05-09T00:00:00Z".to_string(),
     }
 }
@@ -199,6 +203,53 @@ fn deploy_unlocks_existing_password_storage_even_without_config_push() {
 }
 
 #[test]
+fn stable_ssh_endpoint_from_app_requires_debian_ssh_template_metadata() {
+    let mut app = test_app_response();
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::NotStableTemplate
+    );
+
+    app.template_slug = Some("mini-enclava-go".to_string());
+    app.template_expected.stable_ssh_endpoint = Some("6.tcp.eu.ngrok.io:17958".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::NotStableTemplate
+    );
+
+    app.template_slug = Some("debian-ssh-ngrok".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Ready("6.tcp.eu.ngrok.io:17958".to_string())
+    );
+
+    app.template_expected.stable_ssh_endpoint = None;
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Missing
+    );
+
+    app.template_expected.stable_ssh_endpoint = Some("   ".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Missing
+    );
+
+    app.template_expected.stable_ssh_endpoint =
+        Some(" TCP://6.TCP.EU.NGROK.IO.:00123 ".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Invalid
+    );
+
+    app.template_expected.stable_ssh_endpoint = Some("example.com:22".to_string());
+    assert_eq!(
+        stable_ssh_endpoint_state_from_app(&app),
+        StableSshEndpointState::Invalid
+    );
+}
+
+#[test]
 fn deploy_claims_fresh_created_password_app_when_unlock_status_is_unavailable() {
     assert!(deploy_needs_initial_claim(true, None, "creating"));
 }
@@ -305,6 +356,43 @@ fn status_command_falls_back_to_attested_tee_status() {
     assert!(
         api_status < endpoint && endpoint < tee && tee < attest && attest < state,
         "status must fall back to attested direct TEE state when API live status lacks TEE fields"
+    );
+}
+
+#[test]
+fn status_command_surfaces_stable_ssh_endpoint_with_validating_follow_up() {
+    let source = include_str!("../../app.rs");
+    let fn_start = source
+        .find("pub async fn status")
+        .expect("status function exists");
+    let fn_end = source[fn_start..]
+        .find("#[derive(Args)]\npub struct LogsArgs")
+        .expect("logs args follow status function")
+        + fn_start;
+    let body = &source[fn_start..fn_end];
+
+    assert!(body.contains("Stable SSH endpoint: {endpoint}"));
+    assert!(
+        body.contains("Validate:  enclava template ssh-command --name {app_name} --wait"),
+        "status should show a follow-up command that reads the stored stable SSH endpoint"
+    );
+    assert!(
+        body.contains("\"running\" | \"ready\" | \"healthy\" => status.status.green().to_string()"),
+        "status should render hosted healthy status vocabulary consistently"
+    );
+    assert!(
+        body.contains(
+            "\"creating\" | \"deploying\" | \"applying\" | \"pending\" => status.status.yellow().to_string()"
+        ),
+        "status should render hosted pending status vocabulary consistently"
+    );
+    assert!(
+        body.contains("Stable SSH endpoint metadata missing; redeploy the template so PaaS reserves a stable SSH endpoint"),
+        "status should make legacy Debian SSH apps without stable SSH endpoint metadata actionable"
+    );
+    assert!(
+        body.contains("Stable SSH endpoint metadata invalid; redeploy the template so PaaS reserves a stable SSH endpoint"),
+        "status should make corrupt Debian SSH endpoint metadata actionable"
     );
 }
 

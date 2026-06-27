@@ -108,17 +108,37 @@ fn app_response_accepts_phase7_fields_when_server_exposes_them() {
         "namespace": "cap-x-y",
         "instance_id": "cli-x-y",
         "domain": "testapp.enclava.local",
+        "app_domain": "testapp.apps.enclava.dev",
         "tee_domain": "testapp.tee.enclava.local",
         "custom_domain": null,
         "unlock_mode": "password",
         "status": "creating",
         "signer_identity_subject": "https://github.com/acme/repo/.github/workflows/deploy.yml@refs/heads/main",
         "signer_identity_issuer": "https://token.actions.githubusercontent.com",
+        "template_slug": "debian-ssh-ngrok",
+        "template_version": "2026-06-18",
+        "template_expected": {
+            "stable_ssh_endpoint": "6.tcp.eu.ngrok.io:17958",
+            "future_non_secret_expectation": "kept"
+        },
         "created_at": "2026-04-18T14:14:35Z"
     });
     let app: AppResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(app.app_domain.as_deref(), Some("testapp.apps.enclava.dev"));
     assert_eq!(app.tee_domain.as_deref(), Some("testapp.tee.enclava.local"));
     assert!(app.signer_identity_subject.unwrap().contains("github.com"));
+    assert_eq!(app.template_slug.as_deref(), Some("debian-ssh-ngrok"));
+    assert_eq!(
+        app.template_expected.stable_ssh_endpoint.as_deref(),
+        Some("6.tcp.eu.ngrok.io:17958")
+    );
+    assert_eq!(
+        app.template_expected
+            .extra
+            .get("future_non_secret_expectation")
+            .and_then(|value| value.as_str()),
+        Some("kept")
+    );
 }
 
 #[test]
@@ -179,6 +199,11 @@ fn deployment_entry_accepts_legacy_deployment_id_field() {
         "deployment_id": "90dc3149-02e2-4d44-8398-67637abbcbbe",
         "status": "running",
         "image_digest": "sha256:abc",
+        "template_slug": "debian-ssh-ngrok",
+        "template_version": "2026-06-18",
+        "template_expected": {
+            "stable_ssh_endpoint": "6.tcp.eu.ngrok.io:17958"
+        },
         "created_at": "2026-05-24T10:00:00Z",
         "completed_at": null
     });
@@ -186,19 +211,24 @@ fn deployment_entry_accepts_legacy_deployment_id_field() {
     let entry: DeploymentEntry = serde_json::from_value(body).unwrap();
 
     assert_eq!(entry.id, "90dc3149-02e2-4d44-8398-67637abbcbbe");
+    assert_eq!(entry.template_slug.as_deref(), Some("debian-ssh-ngrok"));
+    assert_eq!(
+        entry.template_expected.stable_ssh_endpoint.as_deref(),
+        Some("6.tcp.eu.ngrok.io:17958")
+    );
 }
 
 #[test]
 fn hosted_template_response_accepts_stable_ssh_endpoint_metadata() {
     let body = serde_json::json!({
         "slug": "debian-ssh-ngrok",
-        "name": "Debian SSH over ngrok",
-        "description": "Confidential Debian shell with SSH exposed through an ngrok TCP tunnel.",
+        "name": "Debian Stable SSH Endpoint",
+        "description": "Confidential Debian shell with a stable SSH endpoint backed by ngrok TCP.",
         "version": "2026-06-18",
         "image": "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff",
         "source_provider": "github",
-        "source_repository": "enclava-labs/debian-ssh-ngrok-template",
-        "signer_subject": "https://github.com/enclava-labs/debian-ssh-ngrok-template/.github/workflows/image.yml@refs/heads/main",
+        "source_repository": "enclava-labs/enclava-paas",
+        "signer_subject": "https://github.com/enclava-labs/enclava-paas/.github/workflows/debian-ssh-ngrok-template-image.yml@refs/heads/main",
         "signer_issuer": "https://token.actions.githubusercontent.com",
         "container_name": "web",
         "unlock_mode": "auto",
@@ -221,11 +251,11 @@ fn hosted_template_response_accepts_stable_ssh_endpoint_metadata() {
             {
                 "key": "NGROK_TCP_URL",
                 "label": "Stable SSH endpoint",
-                "description": "Required reserved ngrok TCP address.",
+                "description": "Optional existing reserved stable SSH endpoint.",
                 "input_type": "text",
-                "required": true,
+                "required": false,
                 "secret": false,
-                "generated": false,
+                "generated": true,
                 "default_value": null,
                 "validation": {
                     "format": "ngrok_tcp_url",
@@ -254,18 +284,40 @@ fn hosted_template_response_accepts_stable_ssh_endpoint_metadata() {
     let template: HostedTemplate = serde_json::from_value(body).unwrap();
 
     assert_eq!(template.slug, "debian-ssh-ngrok");
+    assert_eq!(template.name, "Debian Stable SSH Endpoint");
+    assert!(
+        template.description.contains("stable SSH endpoint"),
+        "stable SSH template description should lead with the stable SSH endpoint offering"
+    );
+    assert!(
+        !template
+            .description
+            .contains("SSH exposed through an ngrok TCP tunnel"),
+        "stable SSH template description should not frame ngrok as the product surface"
+    );
     let stable = template
         .config_keys
         .iter()
         .find(|entry| entry.key == "NGROK_TCP_URL")
         .expect("stable ssh config key");
     assert_eq!(stable.label, "Stable SSH endpoint");
-    assert!(stable.required);
+    assert!(
+        stable.description.contains("stable SSH endpoint"),
+        "stable SSH endpoint metadata description should name the stable SSH endpoint"
+    );
+    assert!(!stable.required);
     let stable_validation = stable.validation.as_ref().expect("stable validation");
     assert_eq!(stable_validation.format.as_deref(), Some("ngrok_tcp_url"));
     assert_eq!(
         stable_validation.example.as_deref(),
         Some("6.tcp.eu.ngrok.io:17958")
+    );
+    assert!(
+        template
+            .config_keys
+            .iter()
+            .all(|entry| entry.key != "NGROK_AUTHTOKEN"),
+        "PaaS-managed ngrok token must not be exposed in hosted template config keys"
     );
 }
 
@@ -274,27 +326,34 @@ fn template_instance_response_accepts_config_token_and_cap_payload() {
     let body = serde_json::json!({
         "template": {
             "slug": "debian-ssh-ngrok",
-            "name": "Debian SSH over ngrok",
-            "description": "Confidential Debian shell with SSH exposed through an ngrok TCP tunnel.",
+            "name": "Debian Stable SSH Endpoint",
+            "description": "Confidential Debian shell with a stable SSH endpoint backed by ngrok TCP.",
             "version": "2026-06-18",
             "image": "ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff",
             "config_keys": []
         },
         "app": {
             "name": "shell",
-            "status": "creating"
+            "status": "creating",
+            "template_expected": {
+                "stable_ssh_endpoint": "6.tcp.eu.ngrok.io:17958"
+            }
         },
         "deployment": {
             "cap_deployment_id": "00000000-0000-0000-0000-000000000001",
-            "status": "pending"
+            "status": "pending",
+            "template_expected": {
+                "stable_ssh_endpoint": "6.tcp.eu.ngrok.io:17958"
+            }
         },
         "config_token": {
             "token": "redacted",
-            "tee_url": "https://shell.tee.example/.well-known/confidential/config",
+            "tee_url": "https://shell.tee.enclava.dev/.well-known/confidential/config",
             "expires_in_seconds": 300
         },
         "cap": {
-            "app_domain": "shell.example"
+            "app_domain": "shell.enclava.dev",
+            "domain": "legacy-shell.enclava.dev"
         }
     });
 
@@ -302,47 +361,68 @@ fn template_instance_response_accepts_config_token_and_cap_payload() {
 
     assert_eq!(response.template.slug, "debian-ssh-ngrok");
     assert_eq!(
+        response
+            .app
+            .template_expected
+            .stable_ssh_endpoint
+            .as_deref(),
+        Some("6.tcp.eu.ngrok.io:17958")
+    );
+    assert_eq!(
+        response
+            .deployment
+            .template_expected
+            .stable_ssh_endpoint
+            .as_deref(),
+        Some("6.tcp.eu.ngrok.io:17958")
+    );
+    assert_eq!(
         response.deployment.cap_deployment_id.as_deref(),
         Some("00000000-0000-0000-0000-000000000001")
     );
     assert_eq!(
         response.config_token.unwrap().tee_url.as_deref(),
-        Some("https://shell.tee.example/.well-known/confidential/config")
+        Some("https://shell.tee.enclava.dev/.well-known/confidential/config")
     );
-    assert_eq!(response.cap["app_domain"], "shell.example");
+    assert_eq!(response.cap["app_domain"], "shell.enclava.dev");
+    assert_eq!(response.cap["domain"], "legacy-shell.enclava.dev");
 }
 
 #[test]
 fn ssh_command_response_accepts_pending_and_ready_states() {
     let pending: SshCommandResponse = serde_json::from_value(serde_json::json!({
         "status": "pending",
+        "stable_ssh_endpoint": "6.tcp.eu.ngrok.io:17958",
         "command": null,
         "endpoint": null,
         "app_url": null
     }))
     .unwrap();
     assert_eq!(pending.status, "pending");
+    assert_eq!(pending.stable_ssh_endpoint, "6.tcp.eu.ngrok.io:17958");
     assert!(pending.command.is_none());
     assert!(pending.endpoint.is_none());
 
     let ready: SshCommandResponse = serde_json::from_value(serde_json::json!({
         "status": "ready",
+        "stable_ssh_endpoint": "6.tcp.eu.ngrok.io:17958",
         "command": "ssh -p 17958 user@6.tcp.eu.ngrok.io",
         "endpoint": "6.tcp.eu.ngrok.io:17958",
-        "app_url": "https://shell.example.test"
+        "app_url": "https://shell.enclava.dev"
     }))
     .unwrap();
     assert_eq!(ready.status, "ready");
+    assert_eq!(ready.stable_ssh_endpoint, "6.tcp.eu.ngrok.io:17958");
     assert_eq!(
         ready.command.as_deref(),
         Some("ssh -p 17958 user@6.tcp.eu.ngrok.io")
     );
     assert_eq!(ready.endpoint.as_deref(), Some("6.tcp.eu.ngrok.io:17958"));
-    assert_eq!(ready.app_url.as_deref(), Some("https://shell.example.test"));
+    assert_eq!(ready.app_url.as_deref(), Some("https://shell.enclava.dev"));
 }
 
 #[test]
-fn create_template_instance_request_sends_empty_config_object() {
+fn create_template_instance_request_can_omit_stable_endpoint_expectation() {
     let req = CreateTemplateInstanceRequest {
         template_slug: "debian-ssh-ngrok".to_string(),
         instance_name: "shell".to_string(),

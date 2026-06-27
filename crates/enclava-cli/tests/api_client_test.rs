@@ -86,7 +86,7 @@ async fn list_templates_gets_hosted_templates_route() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 4096];
         let n = stream.read(&mut buf).unwrap();
-        let body = r#"[{"slug":"debian-ssh-ngrok","name":"Debian SSH over ngrok","description":"SSH template","version":"2026-06-18","image":"ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff","config_keys":[]}]"#;
+        let body = r#"[{"slug":"debian-ssh-ngrok","name":"Debian Stable SSH Endpoint","description":"SSH template","version":"2026-06-18","image":"ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff","config_keys":[]}]"#;
         stream
             .write_all(
                 format!(
@@ -117,7 +117,7 @@ async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 8192];
         let n = stream.read(&mut buf).unwrap();
-        let body = r#"{"template":{"slug":"debian-ssh-ngrok","name":"Debian SSH over ngrok","description":"SSH template","version":"2026-06-18","image":"ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff","config_keys":[]},"app":{"name":"shell"},"deployment":{"cap_deployment_id":"deploy-1","status":"pending"},"config_token":{"token":"redacted","tee_url":"https://shell.tee.example/.well-known/confidential/config","expires_in_seconds":300},"cap":{"app_domain":"shell.example"}}"#;
+        let body = r#"{"template":{"slug":"debian-ssh-ngrok","name":"Debian Stable SSH Endpoint","description":"SSH template","version":"2026-06-18","image":"ghcr.io/enclava-labs/debian-ssh-ngrok-template@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff","config_keys":[]},"app":{"name":"shell","template_expected":{"stable_ssh_endpoint":"6.tcp.eu.ngrok.io:17958"}},"deployment":{"cap_deployment_id":"deploy-1","status":"pending","template_expected":{"stable_ssh_endpoint":"6.tcp.eu.ngrok.io:17958"}},"config_token":{"token":"redacted","tee_url":"https://shell.tee.enclava.dev/.well-known/confidential/config","expires_in_seconds":300},"cap":{"app_domain":"shell.enclava.dev"}}"#;
         stream
             .write_all(
                 format!(
@@ -132,25 +132,50 @@ async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
     });
 
     let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let request_body = CreateTemplateInstanceRequest {
+        template_slug: "debian-ssh-ngrok".to_string(),
+        instance_name: "shell".to_string(),
+        config: serde_json::json!({}),
+    };
     let response = client
-        .create_template_instance(&CreateTemplateInstanceRequest {
-            template_slug: "debian-ssh-ngrok".to_string(),
-            instance_name: "shell".to_string(),
-            config: serde_json::json!({}),
-        })
+        .create_template_instance(&request_body)
         .await
         .unwrap();
+    let request_digest = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(serde_json::to_vec(&request_body).unwrap()))
+    };
 
     let request = handle.join().unwrap();
     assert!(request.starts_with("POST /template-instances "));
     assert!(request.contains("authorization: Bearer test-token"));
-    assert!(request.contains("idempotency-key: template-instance-debian-ssh-ngrok-shell"));
+    assert!(request.contains(&format!(
+        "idempotency-key: template-instance-debian-ssh-ngrok-shell-{}",
+        &request_digest[..16]
+    )));
+    assert!(!request.contains("idempotency-key: template-instance-debian-ssh-ngrok-shell\r\n"));
     assert!(request.contains(r#""template_slug":"debian-ssh-ngrok""#));
     assert!(request.contains(r#""instance_name":"shell""#));
     assert!(request.contains(r#""config":{}"#));
     assert_eq!(
+        response
+            .app
+            .template_expected
+            .stable_ssh_endpoint
+            .as_deref(),
+        Some("6.tcp.eu.ngrok.io:17958")
+    );
+    assert_eq!(
+        response
+            .deployment
+            .template_expected
+            .stable_ssh_endpoint
+            .as_deref(),
+        Some("6.tcp.eu.ngrok.io:17958")
+    );
+    assert_eq!(
         response.config_token.unwrap().tee_url.as_deref(),
-        Some("https://shell.tee.example/.well-known/confidential/config")
+        Some("https://shell.tee.enclava.dev/.well-known/confidential/config")
     );
 }
 
@@ -162,7 +187,7 @@ async fn get_template_ssh_command_uses_hosted_paas_route() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 4096];
         let n = stream.read(&mut buf).unwrap();
-        let body = r#"{"status":"ready","command":"ssh -p 17958 user@6.tcp.eu.ngrok.io","endpoint":"6.tcp.eu.ngrok.io:17958","app_url":"https://shell.example.test"}"#;
+        let body = r#"{"status":"ready","stable_ssh_endpoint":"6.tcp.eu.ngrok.io:17958","command":"ssh -p 17958 user@6.tcp.eu.ngrok.io","endpoint":"6.tcp.eu.ngrok.io:17958","app_url":"https://shell.enclava.dev"}"#;
         stream
             .write_all(
                 format!(
@@ -192,7 +217,7 @@ async fn get_template_ssh_command_uses_hosted_paas_route() {
     );
     assert_eq!(
         response.app_url.as_deref(),
-        Some("https://shell.example.test")
+        Some("https://shell.enclava.dev")
     );
 }
 
