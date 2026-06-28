@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
 
 use base64::{
     Engine as _,
@@ -33,6 +36,7 @@ pub struct TeeClient {
     confidential_base_url: String,
     http: reqwest::Client,
     timeout: std::time::Duration,
+    resolve_ip: Option<IpAddr>,
 }
 
 fn accepts_invalid_tee_certs() -> bool {
@@ -130,31 +134,48 @@ impl TeeClient {
     /// Create a TEE client for the given app domain.
     /// The domain is the HTTPS endpoint of the app (e.g., "myapp.enclava.dev").
     pub fn new(app_domain: &str) -> Self {
-        Self::new_with_timeout(
+        Self::new_with_timeout_and_resolve_ip(
             app_domain,
             std::time::Duration::from_secs(DEFAULT_TEE_REQUEST_TIMEOUT_SECONDS),
+            None,
+        )
+    }
+
+    pub fn new_with_resolve_ip(app_domain: &str, resolve_ip: Option<IpAddr>) -> Self {
+        Self::new_with_timeout_and_resolve_ip(
+            app_domain,
+            std::time::Duration::from_secs(DEFAULT_TEE_REQUEST_TIMEOUT_SECONDS),
+            resolve_ip,
         )
     }
 
     /// Create a TEE client for ownership claim/unlock requests.
     pub fn new_for_ownership(app_domain: &str) -> Self {
-        Self::new_with_timeout(
+        Self::new_with_timeout_and_resolve_ip(
             app_domain,
             std::time::Duration::from_secs(OWNERSHIP_TEE_REQUEST_TIMEOUT_SECONDS),
+            None,
+        )
+    }
+
+    pub fn new_for_ownership_with_resolve_ip(app_domain: &str, resolve_ip: Option<IpAddr>) -> Self {
+        Self::new_with_timeout_and_resolve_ip(
+            app_domain,
+            std::time::Duration::from_secs(OWNERSHIP_TEE_REQUEST_TIMEOUT_SECONDS),
+            resolve_ip,
         )
     }
 
     /// Create a TEE client with a custom request timeout.
     pub fn new_with_timeout(app_domain: &str, timeout: std::time::Duration) -> Self {
-        let accept_invalid_certs = accepts_invalid_tee_certs();
-        let http = reqwest::Client::builder()
-            .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
-            .timeout(timeout)
-            .danger_accept_invalid_certs(accept_invalid_certs)
-            .https_only(true) // Enforce HTTPS
-            .build()
-            .expect("failed to build HTTP client");
+        Self::new_with_timeout_and_resolve_ip(app_domain, timeout, None)
+    }
 
+    fn new_with_timeout_and_resolve_ip(
+        app_domain: &str,
+        timeout: std::time::Duration,
+        resolve_ip: Option<IpAddr>,
+    ) -> Self {
         let base_url = if app_domain.starts_with("https://") || app_domain.starts_with("http://") {
             app_domain.trim_end_matches('/').to_string()
         } else {
@@ -165,18 +186,25 @@ impl TeeClient {
         } else {
             format!("{base_url}/.well-known/confidential")
         };
+        let http = build_tee_http_client(&confidential_base_url, timeout, resolve_ip)
+            .expect("failed to build HTTP client");
 
         Self {
             confidential_base_url,
             http,
             timeout,
+            resolve_ip,
         }
     }
 
     pub fn from_config_url(config_url: &str) -> Self {
+        Self::from_config_url_with_resolve_ip(config_url, None)
+    }
+
+    pub fn from_config_url_with_resolve_ip(config_url: &str, resolve_ip: Option<IpAddr>) -> Self {
         let trimmed = config_url.trim_end_matches('/');
         let base = trimmed.strip_suffix("/config").unwrap_or(trimmed);
-        Self::new(base)
+        Self::new_with_resolve_ip(base, resolve_ip)
     }
 
     fn with_http(&self, http: reqwest::Client) -> Self {
@@ -184,6 +212,7 @@ impl TeeClient {
             confidential_base_url: self.confidential_base_url.clone(),
             http,
             timeout: self.timeout,
+            resolve_ip: self.resolve_ip,
         }
     }
 
@@ -413,9 +442,16 @@ impl TeeClient {
         &self,
     ) -> Result<(TransitionReceiptAttestation, TeeClient), TeeError> {
         let endpoint = EndpointParts::parse(&self.confidential_base_url)?;
-        let leaf_spki_der = fetch_tls_leaf_spki_der(&endpoint.host, endpoint.port).await?;
+        let leaf_spki_der =
+            fetch_tls_leaf_spki_der(&endpoint.host, endpoint.port, self.resolve_ip).await?;
         let leaf_spki_sha256: [u8; 32] = Sha256::digest(&leaf_spki_der).into();
-        let pinned_http = build_spki_pinned_client(leaf_spki_sha256, self.timeout)?;
+        let pinned_http = build_spki_pinned_client(
+            leaf_spki_sha256,
+            self.timeout,
+            &endpoint.host,
+            endpoint.port,
+            self.resolve_ip,
+        )?;
 
         let mut nonce = [0u8; 32];
         OsRng.fill_bytes(&mut nonce);
@@ -466,6 +502,27 @@ impl TeeClient {
         };
         Ok((transition_attestation, self.with_http(pinned_http)))
     }
+}
+
+fn build_tee_http_client(
+    confidential_base_url: &str,
+    timeout: std::time::Duration,
+    resolve_ip: Option<IpAddr>,
+) -> Result<reqwest::Client, TeeError> {
+    let accept_invalid_certs = accepts_invalid_tee_certs();
+    let mut builder = reqwest::Client::builder()
+        .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(timeout)
+        .danger_accept_invalid_certs(accept_invalid_certs)
+        .https_only(true);
+    if let Some(resolve_ip) = resolve_ip {
+        let endpoint = EndpointParts::parse(confidential_base_url)?;
+        builder = builder.resolve(
+            endpoint.host.as_str(),
+            SocketAddr::new(resolve_ip, endpoint.port),
+        );
+    }
+    builder.build().map_err(TeeError::Http)
 }
 
 fn claim_state_json_is_successful(body: &serde_json::Value) -> bool {

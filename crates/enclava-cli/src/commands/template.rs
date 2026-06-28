@@ -258,7 +258,8 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         .as_deref()
         .ok_or("PaaS did not return a TEE config URL")?;
     let tee_url = template_config_endpoint_url(tee_url)?;
-    let tee = TeeClient::from_config_url(&tee_url);
+    let mut tee_resolve_ip = token.tee_resolve_ip;
+    let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
     let mut tee = tee;
     let mut tee_url = tee_url;
@@ -271,6 +272,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         &instance_name,
         &mut config_token,
         &mut tee_url,
+        &mut tee_resolve_ip,
         &config_pairs,
     )
     .await?;
@@ -697,6 +699,7 @@ async fn deliver_template_config_with_retry(
     instance_name: &str,
     config_token: &mut String,
     tee_url: &mut String,
+    tee_resolve_ip: &mut Option<std::net::IpAddr>,
     pairs: &[(&'static str, String)],
 ) -> Result<(), Box<dyn std::error::Error>> {
     for (key, value) in pairs {
@@ -708,6 +711,7 @@ async fn deliver_template_config_with_retry(
             value,
             config_token,
             tee_url,
+            tee_resolve_ip,
         )
         .await?;
         sync_template_config_key_with_retry(api, instance_name, key).await?;
@@ -723,6 +727,7 @@ async fn set_template_config_key_with_retry(
     value: &str,
     config_token: &mut String,
     tee_url: &mut String,
+    tee_resolve_ip: &mut Option<std::net::IpAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
         match tee.config_set(key, value, config_token).await {
@@ -735,11 +740,16 @@ async fn set_template_config_key_with_retry(
                     refresh_template_config_token_with_retry(api, instance_name, key).await?;
                 let refreshed_tee_url =
                     refreshed_template_config_endpoint_url(&refreshed, tee_url)?;
-                if refreshed_tee_url != *tee_url {
-                    let refreshed_tee = TeeClient::from_config_url(&refreshed_tee_url);
+                let refreshed_tee_resolve_ip = refreshed.tee_resolve_ip.or(*tee_resolve_ip);
+                if refreshed_tee_url != *tee_url || refreshed_tee_resolve_ip != *tee_resolve_ip {
+                    let refreshed_tee = TeeClient::from_config_url_with_resolve_ip(
+                        &refreshed_tee_url,
+                        refreshed_tee_resolve_ip,
+                    );
                     let (_attestation, refreshed_tee) = refreshed_tee.attest_receipt_key().await?;
                     *tee = refreshed_tee;
                     *tee_url = refreshed_tee_url;
+                    *tee_resolve_ip = refreshed_tee_resolve_ip;
                 }
                 *config_token = refreshed.token;
                 tokio::time::sleep(template_config_delivery_retry_delay()).await;
@@ -3389,6 +3399,7 @@ mod tests {
         let refreshed = ConfigTokenResponse {
             token: "next-token".to_string(),
             tee_url: Some("https://NEW.Enclava.Dev./.well-known/confidential".to_string()),
+            tee_resolve_ip: Some("95.217.56.248".parse().unwrap()),
             expires_at: None,
             expires_in_seconds: None,
         };
@@ -3401,6 +3412,7 @@ mod tests {
         let without_tee_url = ConfigTokenResponse {
             token: "next-token".to_string(),
             tee_url: None,
+            tee_resolve_ip: None,
             expires_at: None,
             expires_in_seconds: None,
         };

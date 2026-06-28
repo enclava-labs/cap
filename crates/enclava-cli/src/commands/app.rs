@@ -397,8 +397,12 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         let tee = token_resp
             .tee_url
             .as_deref()
-            .map(TeeClient::from_config_url)
-            .unwrap_or_else(|| TeeClient::new(&resp.app_domain));
+            .map(|tee_url| {
+                TeeClient::from_config_url_with_resolve_ip(tee_url, token_resp.tee_resolve_ip)
+            })
+            .unwrap_or_else(|| {
+                TeeClient::new_with_resolve_ip(&resp.app_domain, token_resp.tee_resolve_ip)
+            });
         let (_attestation, tee) = tee.attest_receipt_key().await?;
 
         for (key, value) in &config_pairs {
@@ -442,7 +446,8 @@ async fn wait_for_bootstrap_endpoint(
     pb: &ProgressBar,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
-    let tee = TeeClient::new_for_ownership(&endpoint.tee_url);
+    let tee =
+        TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let start = std::time::Instant::now();
 
     loop {
@@ -493,7 +498,9 @@ async fn wait_for_deploy_runtime(
         .get_unlock_endpoint(app_name)
         .await
         .ok()
-        .map(|endpoint| TeeClient::new_for_ownership(&endpoint.tee_url));
+        .map(|endpoint| {
+            TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip)
+        });
 
     loop {
         if start.elapsed() > max_wait {
@@ -648,7 +655,8 @@ async fn ensure_password_storage_unlocked_for_config(
     pb: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
-    let tee = TeeClient::new_for_ownership(&endpoint.tee_url);
+    let tee =
+        TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
     let status = tee.status_json().await?;
     let state = tee_unlock_state(&status);
@@ -725,7 +733,8 @@ async fn claim_initial_ownership(
     app_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
-    let tee = TeeClient::new_for_ownership(&endpoint.tee_url);
+    let tee =
+        TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     let challenge = tee.bootstrap_challenge().await?;
@@ -791,7 +800,10 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
         .map(stable_ssh_endpoint_state_from_app)
         .unwrap_or(StableSshEndpointState::NotStableTemplate);
     if let Ok(endpoint) = api.get_unlock_endpoint(&app_name).await {
-        let tee = TeeClient::new_for_ownership(&endpoint.tee_url);
+        let tee = TeeClient::new_for_ownership_with_resolve_ip(
+            &endpoint.tee_url,
+            endpoint.tee_resolve_ip,
+        );
         if let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
             && let Ok(tee_status_json) = attested_tee.status_json().await
         {

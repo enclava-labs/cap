@@ -5,7 +5,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use std::time::{Duration, Instant};
 
 use enclava_cli::api_client::ApiClient;
-use enclava_cli::api_types::UpdateUnlockModeRequest;
+use enclava_cli::api_types::{UnlockEndpointResponse, UpdateUnlockModeRequest};
 use enclava_cli::app_config::AppConfig;
 use enclava_cli::config::{self, CliPaths};
 use enclava_cli::keys;
@@ -71,13 +71,12 @@ fn resolve_app_name(explicit: &Option<String>) -> Result<String, Box<dyn std::er
     Ok(config.app.name)
 }
 
-/// Get the TEE URL for an app by querying the API.
-async fn resolve_tee_url(
+/// Get the TEE endpoint for an app by querying the API.
+async fn resolve_tee_endpoint(
     api: &ApiClient,
     app_name: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let endpoint = api.get_unlock_endpoint(app_name).await?;
-    Ok(endpoint.tee_url)
+) -> Result<UnlockEndpointResponse, Box<dyn std::error::Error>> {
+    Ok(api.get_unlock_endpoint(app_name).await?)
 }
 
 /// Build an authenticated API client from stored config/credentials.
@@ -115,8 +114,9 @@ fn load_or_derive_bootstrap_private_key(
 pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_name = resolve_app_name(&args.app)?;
     let (api, paths) = build_api_client()?;
-    let tee_url = resolve_tee_url(&api, &app_name).await?;
-    let tee = TeeClient::new_for_ownership(&tee_url);
+    let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
+    let tee =
+        TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     println!("Claiming ownership of {app_name}...");
@@ -184,8 +184,9 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
 pub async fn unlock(args: UnlockArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_name = resolve_app_name(&args.app)?;
     let (api, _paths) = build_api_client()?;
-    let tee_url = resolve_tee_url(&api, &app_name).await?;
-    let tee = TeeClient::new_for_ownership(&tee_url);
+    let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
+    let tee =
+        TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     let password = Password::new().with_prompt("Unlock password").interact()?;
@@ -234,8 +235,9 @@ async fn wait_for_unlock_completion(tee: &TeeClient) -> Result<(), Box<dyn std::
 pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_name = resolve_app_name(&args.app)?;
     let (api, _paths) = build_api_client()?;
-    let tee_url = resolve_tee_url(&api, &app_name).await?;
-    let tee = TeeClient::new_for_ownership(&tee_url);
+    let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
+    let tee =
+        TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     let mnemonic: String = Input::new()
@@ -256,8 +258,8 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
 pub async fn change_password(args: ChangePasswordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_name = resolve_app_name(&args.app)?;
     let (api, _paths) = build_api_client()?;
-    let tee_url = resolve_tee_url(&api, &app_name).await?;
-    let tee = TeeClient::new(&tee_url);
+    let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
+    let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
     let current = Password::new().with_prompt("Current password").interact()?;
@@ -295,8 +297,8 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                     target_unlock_mode: Some("auto"),
                 })
                 .await?;
-            let tee_url = resolve_tee_url(&api, &app_name).await?;
-            let tee = TeeClient::new(&tee_url);
+            let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
+            let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
             let (transition_attestation, tee) = tee.attest_receipt_key().await?;
 
             let password = Password::new()
@@ -358,8 +360,8 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                     target_unlock_mode: Some("password"),
                 })
                 .await?;
-            let tee_url = resolve_tee_url(&api, &app_name).await?;
-            let tee = TeeClient::new(&tee_url);
+            let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
+            let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
             let (transition_attestation, tee) = tee.attest_receipt_key().await?;
 
             let password = Password::new()

@@ -291,7 +291,7 @@ fn deploy_bootstrap_probe_uses_ownership_timeout_client() {
     let body = &source[fn_start..fn_end];
 
     assert!(
-        body.contains("TeeClient::new_for_ownership(&endpoint.tee_url)"),
+        body.contains("TeeClient::new_for_ownership_with_resolve_ip"),
         "bootstrap probe must allow ownership attestation to take longer than the short poll interval"
     );
 }

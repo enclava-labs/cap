@@ -79,10 +79,12 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             let tee = token_resp
                 .tee_url
                 .as_deref()
-                .map(TeeClient::from_config_url)
+                .map(|tee_url| {
+                    TeeClient::from_config_url_with_resolve_ip(tee_url, token_resp.tee_resolve_ip)
+                })
                 .unwrap_or_else(|| {
                     let tee_domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
-                    TeeClient::new(tee_domain)
+                    TeeClient::new_with_resolve_ip(tee_domain, token_resp.tee_resolve_ip)
                 });
             let (_attestation, tee) = tee.attest_receipt_key().await?;
             for (key, value) in &pairs {
@@ -122,10 +124,12 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             let tee = token_resp
                 .tee_url
                 .as_deref()
-                .map(TeeClient::from_config_url)
+                .map(|tee_url| {
+                    TeeClient::from_config_url_with_resolve_ip(tee_url, token_resp.tee_resolve_ip)
+                })
                 .unwrap_or_else(|| {
                     let tee_domain = app_info.tee_domain.as_deref().unwrap_or(&app_info.domain);
-                    TeeClient::new(tee_domain)
+                    TeeClient::new_with_resolve_ip(tee_domain, token_resp.tee_resolve_ip)
                 });
             let (_attestation, tee) = tee.attest_receipt_key().await?;
             tee.config_unset(&key, &token_resp.token).await?;

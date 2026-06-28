@@ -3,7 +3,7 @@
 //! not shared with the API crate (the CLI does not depend on enclava-api).
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, net::IpAddr};
 
 // --- Auth ---
 
@@ -471,6 +471,8 @@ pub struct ConfigTokenResponse {
     #[serde(default)]
     pub tee_url: Option<String>,
     #[serde(default)]
+    pub tee_resolve_ip: Option<IpAddr>,
+    #[serde(default)]
     pub expires_at: Option<String>,
     #[serde(default)]
     pub expires_in_seconds: Option<u64>,
@@ -716,6 +718,8 @@ pub struct MemberResponse {
 #[derive(Debug, Deserialize)]
 pub struct UnlockEndpointResponse {
     pub tee_url: String,
+    #[serde(default)]
+    pub tee_resolve_ip: Option<IpAddr>,
     pub unlock_endpoint: String,
     pub claim_endpoint: String,
 }
@@ -742,6 +746,7 @@ mod tests {
         let parsed: ConfigTokenResponse = serde_json::from_value(serde_json::json!({
             "token": "jwt",
             "tee_url": "https://app.example/.well-known/confidential/config",
+            "tee_resolve_ip": "95.217.56.248",
             "expires_in_seconds": 300,
         }))
         .expect("live config-token response should decode");
@@ -750,6 +755,10 @@ mod tests {
         assert_eq!(
             parsed.tee_url.as_deref(),
             Some("https://app.example/.well-known/confidential/config")
+        );
+        assert_eq!(
+            parsed.tee_resolve_ip,
+            Some("95.217.56.248".parse().unwrap())
         );
         assert_eq!(parsed.expires_in_seconds, Some(300));
         assert_eq!(parsed.expires_at, None);

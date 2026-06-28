@@ -1,5 +1,6 @@
 use super::{TeeClient, accepts_invalid_tee_certs, normalize_unlock_mode};
 use sev::parser::ByteParser;
+use std::net::IpAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -33,6 +34,22 @@ fn accepts_api_returned_config_base() {
         tee.url("/config/MY_KEY"),
         "https://app.enclava.dev/.well-known/confidential/config/MY_KEY"
     );
+}
+
+#[test]
+fn paas_provided_edge_resolve_ip_is_preserved() {
+    let resolve_ip: IpAddr = "95.217.56.248".parse().unwrap();
+    let tee = TeeClient::from_config_url_with_resolve_ip(
+        "https://app.enclava.dev/.well-known/confidential/config",
+        Some(resolve_ip),
+    );
+    let ownership = TeeClient::new_for_ownership_with_resolve_ip(
+        "https://app.enclava.dev/.well-known/confidential",
+        Some(resolve_ip),
+    );
+
+    assert_eq!(tee.resolve_ip, Some(resolve_ip));
+    assert_eq!(ownership.resolve_ip, Some(resolve_ip));
 }
 
 #[test]
