@@ -51,6 +51,25 @@ pub const CADDY_ACME_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
+const CADDY_DNS01_BROKER_TLS_HANDOFF_SCRIPT: &str = "trap 'exit 0' TERM INT\n\
+i=0\n\
+while [ \"$i\" -lt 300 ]; do\n\
+  if [ -r '/run/enclava/caddy-runtime/certificates/tls.crt' ] && [ -r '/run/enclava/caddy-runtime/certificates/tls.key' ]; then break; fi\n\
+  if [ \"$i\" = 0 ] || [ $((i % 10)) -eq 0 ]; then echo 'tenant-ingress waiting for TLS certificate handoff' >&2; fi\n\
+  i=$((i + 1))\n\
+  sleep 1\n\
+done\n\
+if [ ! -r '/run/enclava/caddy-runtime/certificates/tls.crt' ] || [ ! -r '/run/enclava/caddy-runtime/certificates/tls.key' ]; then echo 'tenant-ingress TLS certificate handoff missing or unreadable' >&2; exit 1; fi\n\
+while true; do\n\
+  rc=0\n\
+  if /usr/bin/caddy validate --config /etc/caddy/Caddyfile; then\n\
+    /usr/bin/caddy run --config /etc/caddy/Caddyfile || rc=$?\n\
+  else\n\
+    rc=$?\n\
+  fi\n\
+  echo \"tenant-ingress caddy exited rc=$rc; restarting in 5s\" >&2\n\
+  sleep 5\n\
+done";
 const CAP_CONFIG_READY_MARKER: &str = "/state/.enclava/luks-ready";
 const CAP_CONFIG_FILE_GID: &str = "10001";
 
@@ -766,6 +785,15 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
                     .to_string(),
             ]),
             None,
+        )
+    } else if app.attestation.caddy_tls_mode == CaddyTlsMode::Dns01Broker {
+        (
+            Some(vec![ENCLAVA_WAIT_EXEC_PATH.to_string()]),
+            Some(vec![
+                "/bin/sh".to_string(),
+                "-ec".to_string(),
+                CADDY_DNS01_BROKER_TLS_HANDOFF_SCRIPT.to_string(),
+            ]),
         )
     } else {
         (

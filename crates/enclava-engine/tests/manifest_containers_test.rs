@@ -435,6 +435,25 @@ fn caddy_container_waits_for_init_ready_before_starting_caddy() {
 }
 
 #[test]
+fn caddy_container_dns01_broker_waits_for_tls_handoff_before_starting_caddy() {
+    let mut app = sample_app();
+    app.attestation.caddy_tls_mode = CaddyTlsMode::Dns01Broker;
+
+    let c = build_caddy_container(&app);
+
+    assert_eq!(
+        c.command.as_ref().unwrap(),
+        &vec!["/enclava-tools/enclava-wait-exec".to_string()]
+    );
+    let args = c.args.as_ref().unwrap();
+    assert_eq!(args[0], "/bin/sh");
+    assert_eq!(args[1], "-ec");
+    assert!(args[2].contains("tenant-ingress waiting for TLS certificate handoff"));
+    assert!(args[2].contains("/usr/bin/caddy validate --config /etc/caddy/Caddyfile"));
+    assert!(args[2].contains("/usr/bin/caddy run --config /etc/caddy/Caddyfile"));
+}
+
+#[test]
 fn caddy_container_does_not_mount_extra_tools() {
     let c = build_caddy_container(&sample_app());
     let vm = c.volume_mounts.as_ref().unwrap();
