@@ -174,9 +174,10 @@ mod namespace_bind;
 #[cfg(test)]
 use namespace_bind::{
     ExpectedIdentity, MountSourceStrategy, SentinelRecord, WorkloadNamespace,
-    bind_mount_plan_for_workload, find_workload_pid_by_env, mount_source_strategy,
-    namespace_source, parse_sentinel_record, paths_resolve_to_same_object, validate_sentinel_name,
-    validate_sentinel_record, workload_proc_root_path, workload_target_path,
+    bind_mount_plan_for_workload, expected_identity, find_workload_pid_by_env,
+    mount_source_strategy, namespace_source, parse_sentinel_record, paths_resolve_to_same_object,
+    validate_sentinel_name, validate_sentinel_record, workload_proc_root_path,
+    workload_target_path,
 };
 use namespace_bind::{
     app_bind_mount_dir, bind_mounts_into_workload_namespaces, run_bind_mount_into_ns,

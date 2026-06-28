@@ -318,6 +318,31 @@ fn workload_pid_fallback_finds_wait_exec_process_by_container_name() {
 }
 
 #[test]
+fn workload_identity_matches_sidecar_runtime_users() {
+    let dir = tempdir().unwrap();
+    let cfg = config_with_signed_cc(dir.path(), "policy_data := {}\n");
+
+    assert_eq!(
+        expected_identity(&cfg, "web"),
+        ExpectedIdentity {
+            uid: 10001,
+            gid: 10001,
+        }
+    );
+    assert_eq!(
+        expected_identity(&cfg, "tenant-ingress"),
+        ExpectedIdentity {
+            uid: 10002,
+            gid: 10002,
+        }
+    );
+    assert_eq!(
+        expected_identity(&cfg, "attestation-proxy"),
+        ExpectedIdentity { uid: 0, gid: 0 }
+    );
+}
+
+#[test]
 fn workload_pid_fallback_rejects_missing_mount_namespace() {
     let dir = tempdir().unwrap();
     let proc_dir = dir.path().join("456");

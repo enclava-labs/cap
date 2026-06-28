@@ -121,12 +121,14 @@ fn collect_workload_namespaces_once(
     Ok(namespaces)
 }
 
-fn expected_identity(cfg: &Config, name: &str) -> ExpectedIdentity {
+pub(super) fn expected_identity(cfg: &Config, name: &str) -> ExpectedIdentity {
     if name == "tenant-ingress" {
         ExpectedIdentity {
             uid: cfg.caddy_uid,
             gid: cfg.caddy_gid,
         }
+    } else if name == "attestation-proxy" {
+        ExpectedIdentity { uid: 0, gid: 0 }
     } else {
         ExpectedIdentity {
             uid: cfg.app_uid,
