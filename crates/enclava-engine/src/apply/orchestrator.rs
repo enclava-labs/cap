@@ -36,6 +36,7 @@ pub fn manifest_hash(manifests: &GeneratedManifests) -> String {
         manifests.envoy_proxy.clone(),
         manifests.gateway.clone(),
         manifests.tls_route.clone(),
+        manifests.tee_tls_route.clone(),
         serde_json::to_value(&manifests.bootstrap_configmap).unwrap_or_default(),
         serde_json::to_value(&manifests.startup_configmap).unwrap_or_default(),
         serde_json::to_value(&manifests.ingress_configmap).unwrap_or_default(),
@@ -89,6 +90,7 @@ pub async fn apply_all(
         &manifests.envoy_proxy,
         &manifests.gateway,
         &manifests.tls_route,
+        &manifests.tee_tls_route,
     )
     .await?;
     tracing::info!(namespace = %ns_name, "step 4/5: Gateway API resources applied");

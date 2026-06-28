@@ -102,9 +102,11 @@ pub async fn apply_gateway_resources(
     envoy_proxy: &Value,
     gateway: &Value,
     tls_route: &Value,
+    tee_tls_route: &Value,
 ) -> Result<(), ApplyError> {
     apply_dynamic_resource(engine, namespace, envoy_proxy, &envoy_proxy_api_resource()).await?;
     apply_dynamic_resource(engine, namespace, gateway, &gateway_api_resource()).await?;
     apply_dynamic_resource(engine, namespace, tls_route, &tls_route_api_resource()).await?;
+    apply_dynamic_resource(engine, namespace, tee_tls_route, &tls_route_api_resource()).await?;
     Ok(())
 }

@@ -76,6 +76,23 @@ fn generate_all_manifests_returns_all_resources() {
         m.tls_route["spec"]["rules"][0]["backendRefs"][0]["name"],
         "test-app"
     );
+    assert_eq!(m.tee_tls_route["kind"], "TLSRoute");
+    assert_eq!(
+        m.tee_tls_route["metadata"]["name"],
+        "tenant-tee-passthrough-test-app"
+    );
+    assert_eq!(
+        m.tee_tls_route["spec"]["hostnames"][0],
+        "test-app.abcd1234.tee.enclava.dev"
+    );
+    assert_eq!(
+        m.tee_tls_route["spec"]["rules"][0]["backendRefs"][0]["name"],
+        "test-app"
+    );
+    assert_eq!(
+        m.tee_tls_route["spec"]["rules"][0]["backendRefs"][0]["port"],
+        8081
+    );
 
     // Bootstrap ConfigMap
     assert_eq!(
@@ -154,6 +171,10 @@ fn all_namespaced_resources_share_namespace() {
     assert_eq!(m.envoy_proxy["metadata"]["namespace"].as_str(), Some(ns));
     assert_eq!(m.gateway["metadata"]["namespace"].as_str(), Some(ns));
     assert_eq!(m.tls_route["metadata"]["namespace"].as_str(), Some(ns));
+    assert_eq!(
+        m.tee_tls_route["metadata"]["namespace"].as_str(),
+        Some(ns)
+    );
 }
 
 #[test]
@@ -300,6 +321,9 @@ fn manifests_serialize_to_yaml() {
 
     let tls_route_yaml = serde_yaml::to_string(&m.tls_route).unwrap();
     assert!(tls_route_yaml.contains("tenant-passthrough-test-app"));
+
+    let tee_tls_route_yaml = serde_yaml::to_string(&m.tee_tls_route).unwrap();
+    assert!(tee_tls_route_yaml.contains("tenant-tee-passthrough-test-app"));
 
     // CiliumNetworkPolicy is Value, uses serde_json for serialization
     let np_yaml = serde_yaml::to_string(&m.network_policy).unwrap();

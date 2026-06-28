@@ -32,6 +32,10 @@ pub fn tls_route_name(app: &ConfidentialApp) -> String {
     format!("tenant-passthrough-{}", app.name)
 }
 
+pub fn tee_tls_route_name(app: &ConfidentialApp) -> String {
+    format!("tenant-tee-passthrough-{}", app.name)
+}
+
 pub fn sni_route_name(app: &ConfidentialApp) -> String {
     format!("{}-sni-route", app.name)
 }
@@ -141,19 +145,47 @@ pub fn generate_gateway(app: &ConfidentialApp) -> Value {
     })
 }
 
-/// Generate a TLSRoute from the tenant Gateway to the tenant Service.
+/// Generate a TLSRoute from the tenant Gateway to the tenant ingress Service port.
 pub fn generate_tls_route(app: &ConfidentialApp) -> Value {
+    generate_tls_route_to_service_port(
+        app,
+        &tls_route_name(app),
+        app.primary_domain(),
+        443,
+    )
+}
+
+/// Generate a TLSRoute from the tenant Gateway to the attestation proxy Service port.
+///
+/// The TEE API must be reachable before the workload and tenant-ingress sidecars
+/// are ready, so it cannot share the app-domain route that targets Caddy on
+/// Service port 443.
+pub fn generate_tee_tls_route(app: &ConfidentialApp) -> Value {
+    generate_tls_route_to_service_port(
+        app,
+        &tee_tls_route_name(app),
+        &app.domain.tee_domain,
+        8081,
+    )
+}
+
+fn generate_tls_route_to_service_port(
+    app: &ConfidentialApp,
+    name: &str,
+    hostname: &str,
+    port: u16,
+) -> Value {
     json!({
         "apiVersion": "gateway.networking.k8s.io/v1alpha3",
         "kind": "TLSRoute",
         "metadata": {
-            "name": tls_route_name(app),
+            "name": name,
             "namespace": app.namespace,
             "labels": labels(app),
         },
         "spec": {
             "hostnames": [
-                app.primary_domain()
+                hostname
             ],
             "parentRefs": [
                 {
@@ -170,7 +202,7 @@ pub fn generate_tls_route(app: &ConfidentialApp) -> Value {
                             "group": "",
                             "kind": "Service",
                             "name": app.name,
-                            "port": 443,
+                            "port": port,
                             "weight": 1
                         }
                     ]

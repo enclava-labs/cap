@@ -186,6 +186,7 @@ async fn apply_all_with_tenant_image_pull_secret(
         &manifests.envoy_proxy,
         &manifests.gateway,
         &manifests.tls_route,
+        &manifests.tee_tls_route,
     )
     .await?;
     tracing::info!(namespace = %ns_name, "step 4/5: Gateway API resources applied");
