@@ -275,12 +275,14 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             read_only: Some(true),
             ..Default::default()
         });
-        volume_mounts.push(VolumeMount {
-            name: "startup".to_string(),
-            mount_path: "/startup".to_string(),
-            read_only: Some(true),
-            ..Default::default()
-        });
+        if primary.command.is_none() {
+            volume_mounts.push(VolumeMount {
+                name: "startup".to_string(),
+                mount_path: "/startup".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
         volume_mounts.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),

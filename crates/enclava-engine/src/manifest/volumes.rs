@@ -75,15 +75,20 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             empty_dir: Some(EmptyDirVolumeSource::default()),
             ..Default::default()
         });
-        v.push(Volume {
-            name: "startup".to_string(),
-            config_map: Some(ConfigMapVolumeSource {
-                name: format!("{}-startup", app.name),
-                default_mode: Some(0o555),
+        if app
+            .primary_container()
+            .is_some_and(|primary| primary.command.is_none())
+        {
+            v.push(Volume {
+                name: "startup".to_string(),
+                config_map: Some(ConfigMapVolumeSource {
+                    name: format!("{}-startup", app.name),
+                    default_mode: Some(0o555),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
-            ..Default::default()
-        });
+            });
+        }
         v.push(Volume {
             name: "unlock-socket".to_string(),
             empty_dir: Some(EmptyDirVolumeSource {

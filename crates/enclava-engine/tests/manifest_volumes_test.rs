@@ -48,6 +48,17 @@ fn volumes_has_startup_fallback_configmap() {
 }
 
 #[test]
+fn volumes_omit_startup_configmap_for_explicit_command() {
+    let mut app = sample_app();
+    app.containers[0].command = Some(vec!["/usr/local/bin/template-entrypoint".to_string()]);
+
+    let vols = build_volumes(&app);
+    assert!(vols.iter().all(|v| v.name != "startup"));
+    assert!(vols.iter().any(|v| v.name == "enclava-tools"));
+    assert!(vols.iter().any(|v| v.name == "unlock-socket"));
+}
+
+#[test]
 fn volumes_have_shared_decrypted_mountpoints() {
     let vols = build_volumes(&sample_app());
     assert!(vols.iter().any(|v| v.name == "state-mount"));

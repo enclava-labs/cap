@@ -147,6 +147,41 @@ fn generate_all_manifests_returns_all_resources() {
 }
 
 #[test]
+fn explicit_command_app_statefulset_omits_startup_volume_and_mount() {
+    let mut app = sample_app();
+    app.containers[0].command = Some(vec![
+        "/bin/sh".to_string(),
+        "-lc".to_string(),
+        "exec /usr/local/bin/template-entrypoint".to_string(),
+    ]);
+
+    let m = generate_all_manifests(&app);
+    let pod = m
+        .statefulset
+        .spec
+        .as_ref()
+        .unwrap()
+        .template
+        .spec
+        .as_ref()
+        .unwrap();
+    assert!(
+        pod.volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|v| v.name != "startup")
+    );
+
+    let app_container = pod.containers.iter().find(|c| c.name == "web").unwrap();
+    let mounts = app_container.volume_mounts.as_ref().unwrap();
+    assert!(mounts.iter().all(|m| m.name != "startup"));
+    assert!(mounts.iter().any(|m| m.name == "enclava-tools"));
+    assert!(mounts.iter().any(|m| m.name == "unlock-socket"));
+    assert!(mounts.iter().any(|m| m.name == "state-mount"));
+}
+
+#[test]
 fn all_namespaced_resources_share_namespace() {
     let app = sample_app();
     let m = generate_all_manifests(&app);
