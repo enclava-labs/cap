@@ -449,6 +449,7 @@ fn caddy_container_dns01_broker_waits_for_tls_handoff_before_starting_caddy() {
     assert_eq!(args[0], "/bin/sh");
     assert_eq!(args[1], "-ec");
     assert!(args[2].contains("tenant-ingress waiting for TLS certificate handoff"));
+    assert!(args[2].contains("\n  if [ -r '/run/enclava/caddy-runtime/certificates/tls.crt' ]"));
     assert!(args[2].contains("/usr/bin/caddy validate --config /etc/caddy/Caddyfile"));
     assert!(args[2].contains("/usr/bin/caddy run --config /etc/caddy/Caddyfile"));
 }
