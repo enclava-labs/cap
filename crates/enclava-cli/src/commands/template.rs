@@ -260,8 +260,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     let tee_url = template_config_endpoint_url(tee_url)?;
     let mut tee_resolve_ip = token.tee_resolve_ip;
     let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
-    let (_attestation, tee) = tee.attest_receipt_key().await?;
-    let mut tee = tee;
+    let mut tee = attest_template_config_tee_with_retry(tee).await?;
     let mut tee_url = tee_url;
 
     let mut config_token = token.token.clone();
@@ -746,8 +745,7 @@ async fn set_template_config_key_with_retry(
                         &refreshed_tee_url,
                         refreshed_tee_resolve_ip,
                     );
-                    let (_attestation, refreshed_tee) = refreshed_tee.attest_receipt_key().await?;
-                    *tee = refreshed_tee;
+                    *tee = attest_template_config_tee_with_retry(refreshed_tee).await?;
                     *tee_url = refreshed_tee_url;
                     *tee_resolve_ip = refreshed_tee_resolve_ip;
                 }
@@ -764,6 +762,24 @@ async fn set_template_config_key_with_retry(
         }
     }
     Err(format!("TEE config write failed for {key}").into())
+}
+
+async fn attest_template_config_tee_with_retry(
+    tee: TeeClient,
+) -> Result<TeeClient, Box<dyn std::error::Error>> {
+    for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
+        match tee.attest_receipt_key().await {
+            Ok((_attestation, attested_tee)) => return Ok(attested_tee),
+            Err(error)
+                if should_retry_template_config_tee_error(&error)
+                    && attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS =>
+            {
+                tokio::time::sleep(template_config_delivery_retry_delay()).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("TEE attestation failed before config delivery".into())
 }
 
 async fn sync_template_config_key_with_retry(
@@ -833,8 +849,16 @@ fn should_retry_template_config_tee_error(error: &TeeError) -> bool {
     match error {
         TeeError::Http(_) => true,
         TeeError::Tee { status, .. } => matches!(*status, 408 | 409 | 425 | 429) || *status >= 500,
-        TeeError::InvalidHeader(_) | TeeError::Attestation(_) => false,
+        TeeError::Attestation(message) => is_transient_template_config_attestation_error(message),
+        TeeError::InvalidHeader(_) => false,
     }
+}
+
+fn is_transient_template_config_attestation_error(message: &str) -> bool {
+    message.starts_with("TEE TCP connect failed:")
+        || message.starts_with("TEE TLS handshake failed:")
+        || message == "TEE did not present a certificate"
+        || message == "TEE certificate chain is empty"
 }
 
 fn should_retry_template_config_sync_error(error: &ApiError) -> bool {
@@ -3377,6 +3401,26 @@ mod tests {
             }),
             "config token refresh uses the same transient PaaS retry classifier"
         );
+        for message in [
+            "TEE TCP connect failed: failed to lookup address information: Name or service not known",
+            "TEE TLS handshake failed: tls handshake eof",
+            "TEE did not present a certificate",
+            "TEE certificate chain is empty",
+        ] {
+            assert!(should_retry_template_config_tee_error(
+                &TeeError::Attestation(message.to_string())
+            ));
+        }
+        for message in [
+            "TEE URL must be https",
+            "TEE host is not a valid DNS name",
+            "certificate parse failed: bad certificate",
+            "SNP report validation failed",
+        ] {
+            assert!(!should_retry_template_config_tee_error(
+                &TeeError::Attestation(message.to_string())
+            ));
+        }
         for status in [400, 403, 404, 422] {
             assert!(!should_retry_template_config_tee_error(&TeeError::Tee {
                 status,
