@@ -29,7 +29,7 @@ const DEBIAN_SSH_FRP_TEMPLATE: &str = "debian-ssh-frp";
 const DEFAULT_DEBIAN_SSH_TEMPLATE: &str = DEBIAN_SSH_FRP_TEMPLATE;
 const FRP_RELAY_HOST: &str = "relay.enclava.me";
 const DEFAULT_SSH_TIMEOUT_SECONDS: u64 = 600;
-const TEMPLATE_CONFIG_DELIVERY_ATTEMPTS: usize = 30;
+const TEMPLATE_CONFIG_DELIVERY_ATTEMPTS: usize = 121;
 const TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS: u64 = 2;
 
 #[derive(Subcommand)]
@@ -3435,6 +3435,20 @@ mod tests {
         assert!(!should_retry_template_config_sync_error(
             &ApiError::NotAuthenticated
         ));
+    }
+
+    #[test]
+    fn template_config_delivery_retry_budget_covers_live_rollout_delay() {
+        let generated_readiness_delay_with_jitter = Duration::from_secs(240);
+        let retry_budget = Duration::from_secs(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS.saturating_sub(1) as u64
+                * TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS,
+        );
+
+        assert!(
+            retry_budget >= generated_readiness_delay_with_jitter,
+            "template config delivery must cover the 180s generated readiness delay plus rollout jitter"
+        );
     }
 
     #[test]
