@@ -62,14 +62,14 @@ pub(super) fn wait_for_container_start_sentinels(cfg: &Config) -> Result<Vec<Wor
         "waiting for workload containers before bind-mounting decrypted volumes"
     );
     let started = Instant::now();
-    let mut last_error = anyhow!("workload containers did not signal startup");
     loop {
-        match collect_workload_namespaces_once(cfg, &dir, Path::new("/proc"), &containers) {
+        let err = match collect_workload_namespaces_once(cfg, &dir, Path::new("/proc"), &containers)
+        {
             Ok(namespaces) => return Ok(namespaces),
-            Err(err) => last_error = err,
-        }
+            Err(err) => err,
+        };
         if started.elapsed() >= timeout {
-            return Err(last_error).context(format!(
+            return Err(err).context(format!(
                 "timed out after {}s waiting for workload containers",
                 timeout.as_secs()
             ));
