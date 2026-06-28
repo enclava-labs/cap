@@ -427,6 +427,7 @@ fn create_template_instance_request_can_omit_stable_endpoint_expectation() {
         template_slug: "debian-ssh-ngrok".to_string(),
         instance_name: "shell".to_string(),
         config: serde_json::json!({}),
+        bootstrap_pubkey_hash: Some("11".repeat(32)),
         customer_descriptor_blob: None,
         org_keyring_blob: None,
         signed_policy_artifact: None,
@@ -437,4 +438,5 @@ fn create_template_instance_request_can_omit_stable_endpoint_expectation() {
     assert_eq!(value["template_slug"], "debian-ssh-ngrok");
     assert_eq!(value["instance_name"], "shell");
     assert_eq!(value["config"], serde_json::json!({}));
+    assert_eq!(value["bootstrap_pubkey_hash"], "11".repeat(32));
 }

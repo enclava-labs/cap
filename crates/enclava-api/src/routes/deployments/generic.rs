@@ -79,6 +79,8 @@ pub struct GenericConfigTokenResponse {
     pub deployment_id: Uuid,
     pub token: String,
     pub tee_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tee_resolve_ip: Option<std::net::IpAddr>,
     pub expires_in_seconds: u64,
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
@@ -322,6 +324,7 @@ pub async fn generic_config_token(
         deployment_id,
         token: token.token,
         tee_url: token.tee_url,
+        tee_resolve_ip: token.tee_resolve_ip,
         expires_in_seconds: token.expires_in_seconds,
         expires_at: chrono::Utc::now() + chrono::Duration::seconds(token.expires_in_seconds as i64),
     }))

@@ -8,10 +8,11 @@ use k8s_openapi::api::{
 };
 use kube::{
     Api, Client,
-    api::{Patch, PatchParams},
+    api::{ApiResource, DynamicObject, Patch, PatchParams},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::PgPool;
+use std::net::IpAddr;
 
 /// Fixed PostgreSQL advisory lock id for serialising HAProxy ConfigMap edits.
 ///
@@ -265,6 +266,54 @@ pub async fn resolve_backend_target(
         .filter(|ip| !ip.is_empty() && ip != "None")
         .unwrap_or_else(|| format!("{app_name}.{namespace}.svc.cluster.local"));
     Ok(format!("{cluster_ip}:{port}"))
+}
+
+fn gateway_api_resource() -> ApiResource {
+    ApiResource {
+        group: "gateway.networking.k8s.io".to_string(),
+        version: "v1".to_string(),
+        api_version: "gateway.networking.k8s.io/v1".to_string(),
+        kind: "Gateway".to_string(),
+        plural: "gateways".to_string(),
+    }
+}
+
+/// Resolve the in-cluster dataplane IP for an instance-scoped tenant Gateway.
+///
+/// This is intended for internal platform callers such as PaaS workers that
+/// must preserve the tenant TEE Host/SNI while avoiding public edge hairpinning.
+pub async fn resolve_gateway_address(
+    app_name: &str,
+    namespace: &str,
+) -> Result<Option<IpAddr>, EdgeRouteError> {
+    validate_app_name(app_name)
+        .map_err(|_| EdgeRouteError::InvalidAppName(format!("invalid app name: {app_name}")))?;
+    let client = Client::try_default().await?;
+    let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &gateway_api_resource());
+    let gateway_name = format!("tenant-gateway-{app_name}");
+    let gateway = match api.get(&gateway_name).await {
+        Ok(gateway) => gateway,
+        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let serialized = serde_json::to_value(&gateway).unwrap_or_else(|_| gateway.data.clone());
+    Ok(gateway_resolve_ip_from_value(&serialized)
+        .or_else(|| gateway_resolve_ip_from_value(&gateway.data)))
+}
+
+fn gateway_resolve_ip_from_value(value: &Value) -> Option<IpAddr> {
+    value
+        .pointer("/status/addresses")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|kind| kind.eq_ignore_ascii_case("IPAddress"))
+        })
+        .filter_map(|entry| entry.get("value").and_then(Value::as_str))
+        .find_map(|value| value.parse::<IpAddr>().ok())
 }
 
 fn render_route_into(config: &str, route: &SniRoute) -> String {
@@ -572,5 +621,33 @@ mod tests {
         assert!(rendered.contains("custom.example.com"));
         assert!(rendered.contains("server tenant 5.6.7.8:443 check"));
         assert!(!rendered.contains("server tenant 1.2.3.4:443 check"));
+    }
+
+    #[test]
+    fn gateway_resolve_ip_reads_gateway_status_address() {
+        let gateway = json!({
+            "status": {
+                "addresses": [
+                    {"type": "Hostname", "value": "ignored.internal"},
+                    {"type": "IPAddress", "value": "10.43.77.218"}
+                ]
+            }
+        });
+
+        assert_eq!(
+            gateway_resolve_ip_from_value(&gateway),
+            Some("10.43.77.218".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn gateway_resolve_ip_ignores_missing_or_invalid_status_address() {
+        for gateway in [
+            json!({}),
+            json!({"status": {"addresses": []}}),
+            json!({"status": {"addresses": [{"type": "IPAddress", "value": "not-an-ip"}]}}),
+        ] {
+            assert_eq!(gateway_resolve_ip_from_value(&gateway), None);
+        }
     }
 }

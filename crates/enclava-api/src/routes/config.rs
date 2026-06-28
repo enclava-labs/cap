@@ -9,6 +9,7 @@ use axum::{
     http::StatusCode,
 };
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use uuid::Uuid;
 
 use crate::auth::jwt::issue_config_token;
@@ -21,6 +22,8 @@ use crate::state::AppState;
 pub struct ConfigTokenResponse {
     pub token: String,
     pub tee_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tee_resolve_ip: Option<IpAddr>,
     pub expires_in_seconds: u64,
 }
 
@@ -79,10 +82,24 @@ pub async fn issue_config_token_route(
             Json(serde_json::json!({"error": "tee domain not configured"})),
         )
     })?;
+    let tee_resolve_ip = match crate::edge::resolve_gateway_address(&app.name, &app.namespace).await
+    {
+        Ok(resolve_ip) => resolve_ip,
+        Err(error) => {
+            tracing::warn!(
+                app = %app.name,
+                namespace = %app.namespace,
+                error = %error,
+                "could not resolve tenant Gateway address for config-token response"
+            );
+            None
+        }
+    };
 
     Ok(Json(ConfigTokenResponse {
         token,
         tee_url,
+        tee_resolve_ip,
         expires_in_seconds: 300,
     }))
 }

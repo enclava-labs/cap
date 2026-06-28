@@ -692,9 +692,17 @@ fn template_instance_idempotency_key(req: &CreateTemplateInstanceRequest) -> Str
         "template_slug": req.template_slug,
         "instance_name": req.instance_name,
         "config": req.config,
+        "bootstrap_pubkey_hash": req.bootstrap_pubkey_hash,
     }))
     .unwrap_or_else(|_| {
-        format!("{}:{}:{}", req.template_slug, req.instance_name, req.config).into_bytes()
+        format!(
+            "{}:{}:{}:{}",
+            req.template_slug,
+            req.instance_name,
+            req.config,
+            req.bootstrap_pubkey_hash.as_deref().unwrap_or("")
+        )
+        .into_bytes()
     });
     let digest = Sha256::digest(body);
     format!(
@@ -716,6 +724,7 @@ mod tests {
             config: serde_json::json!({
                 "NGROK_TCP_URL": endpoint
             }),
+            bootstrap_pubkey_hash: Some("11".repeat(32)),
             customer_descriptor_blob: None,
             org_keyring_blob: None,
             signed_policy_artifact: None,

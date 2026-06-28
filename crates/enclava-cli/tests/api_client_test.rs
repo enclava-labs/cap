@@ -136,6 +136,7 @@ async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
         template_slug: "debian-ssh-ngrok".to_string(),
         instance_name: "shell".to_string(),
         config: serde_json::json!({}),
+        bootstrap_pubkey_hash: Some("11".repeat(32)),
         customer_descriptor_blob: None,
         org_keyring_blob: None,
         signed_policy_artifact: None,
@@ -151,6 +152,7 @@ async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
                 "template_slug": request_body.template_slug,
                 "instance_name": request_body.instance_name,
                 "config": request_body.config,
+                "bootstrap_pubkey_hash": request_body.bootstrap_pubkey_hash,
             }))
             .unwrap(),
         ))
@@ -167,6 +169,7 @@ async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
     assert!(request.contains(r#""template_slug":"debian-ssh-ngrok""#));
     assert!(request.contains(r#""instance_name":"shell""#));
     assert!(request.contains(r#""config":{}"#));
+    assert!(request.contains(&format!(r#""bootstrap_pubkey_hash":"{}""#, "11".repeat(32))));
     assert_eq!(
         response
             .app

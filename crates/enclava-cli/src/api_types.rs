@@ -321,6 +321,8 @@ pub struct CreateTemplateInstanceRequest {
     pub instance_name: String,
     pub config: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_pubkey_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub customer_descriptor_blob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub org_keyring_blob: Option<String>,

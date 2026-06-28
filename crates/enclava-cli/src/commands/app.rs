@@ -438,7 +438,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-async fn wait_for_bootstrap_endpoint(
+pub(crate) async fn wait_for_bootstrap_endpoint(
     api: &ApiClient,
     app_name: &str,
     max_wait: Duration,
@@ -726,7 +726,7 @@ async fn wait_for_deploy_unlock_completion(
     }
 }
 
-async fn claim_initial_ownership(
+pub(crate) async fn claim_initial_ownership(
     api: &ApiClient,
     paths: &CliPaths,
     _cli_config: &config::CliConfig,
@@ -772,9 +772,9 @@ async fn claim_initial_ownership(
     };
 
     if let Some(mnemonic) = result.and_then(|result| result.mnemonic) {
-        println!();
-        println!("IMPORTANT: Save your recovery mnemonic. This is shown ONCE.");
-        println!("{mnemonic}");
+        eprintln!();
+        eprintln!("IMPORTANT: Save your recovery mnemonic. This is shown ONCE.");
+        eprintln!("{mnemonic}");
     }
 
     Ok(())

@@ -7,7 +7,9 @@ use std::{
 
 use base64::Engine as _;
 use clap::{Args, Subcommand};
+use ed25519_dalek::SigningKey;
 use indicatif::{ProgressBar, ProgressStyle};
+use sha2::{Digest, Sha256};
 
 use enclava_cli::{
     api_client::{ApiClient, ApiError},
@@ -19,10 +21,14 @@ use enclava_cli::{
         AppConfig, AppSection, HealthSection, ResourcesSection, StorageSection, UnlockSection,
     },
     config::{self, CliPaths},
+    keys,
     tee_client::{TeeClient, TeeError},
 };
 
-use crate::commands::app::{SignedDeployBlobParams, build_signed_deploy_blobs};
+use crate::commands::app::{
+    SignedDeployBlobParams, build_signed_deploy_blobs, claim_initial_ownership,
+    ensure_manual_deploy_keyring, wait_for_bootstrap_endpoint,
+};
 
 const DEBIAN_SSH_NGROK_TEMPLATE: &str = "debian-ssh-ngrok";
 const DEBIAN_SSH_FRP_TEMPLATE: &str = "debian-ssh-frp";
@@ -209,7 +215,15 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     );
     pb.set_message("Preparing template app...");
 
-    let app = ensure_template_app(api, template, &instance_name).await?;
+    let bootstrap_pubkey_hash =
+        template_bootstrap_pubkey_hash(api, &ctx.paths, template, &instance_name).await?;
+    let app = ensure_template_app(
+        api,
+        template,
+        &instance_name,
+        bootstrap_pubkey_hash.as_deref(),
+    )
+    .await?;
     pb.set_position(1);
     pb.set_message("Signing deployment descriptor...");
 
@@ -233,6 +247,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             template_slug: args.template.clone(),
             instance_name: instance_name.clone(),
             config: template_create_config(explicit_stable_endpoint.as_deref()),
+            bootstrap_pubkey_hash: bootstrap_pubkey_hash.clone(),
             customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
             org_keyring_blob: Some(signed_blobs.org_keyring_blob),
             signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
@@ -247,6 +262,20 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         explicit_stable_endpoint.as_deref(),
     )?;
     pb.set_position(3);
+    if template.unlock_mode == "password" {
+        pb.set_message("Waiting for ownership claim endpoint...");
+        if wait_for_bootstrap_endpoint(
+            api,
+            &instance_name,
+            Duration::from_secs(args.ssh_timeout_seconds),
+            Duration::from_secs(3),
+            &pb,
+        )
+        .await?
+        {
+            claim_initial_ownership(api, &ctx.paths, &ctx.cli_config, &instance_name).await?;
+        }
+    }
     pb.set_message("Delivering config to TEE...");
 
     let token = response
@@ -387,6 +416,7 @@ async fn ensure_template_app(
     api: &ApiClient,
     template: &HostedTemplate,
     instance_name: &str,
+    bootstrap_pubkey_hash: Option<&str>,
 ) -> Result<AppResponse, Box<dyn std::error::Error>> {
     match api.get_app(instance_name).await {
         Ok(app) => return Ok(app),
@@ -395,7 +425,11 @@ async fn ensure_template_app(
     }
 
     match api
-        .create_app(&template_create_app_request(template, instance_name)?)
+        .create_app(&template_create_app_request(
+            template,
+            instance_name,
+            bootstrap_pubkey_hash,
+        )?)
         .await
     {
         Ok(app) => Ok(app),
@@ -407,6 +441,7 @@ async fn ensure_template_app(
 fn template_create_app_request(
     template: &HostedTemplate,
     instance_name: &str,
+    bootstrap_pubkey_hash: Option<&str>,
 ) -> Result<CreateAppRequest, Box<dyn std::error::Error>> {
     let signer_identity_subject =
         required_template_value(template.signer_subject.as_deref(), "signer_subject")?;
@@ -418,7 +453,7 @@ fn template_create_app_request(
         port: template.port,
         image: None,
         unlock_mode: template.unlock_mode.clone(),
-        bootstrap_pubkey_hash: None,
+        bootstrap_pubkey_hash: bootstrap_pubkey_hash.map(str::to_string),
         storage_size: template.resources.storage.clone(),
         tls_storage_size: storage_defaults.tls_size,
         storage_paths: template.storage_paths.clone(),
@@ -432,6 +467,24 @@ fn template_create_app_request(
         signer_identity_issuer: Some(signer_identity_issuer),
         egress_allowlist: template.egress_allowlist.clone(),
     })
+}
+
+async fn template_bootstrap_pubkey_hash(
+    api: &ApiClient,
+    paths: &CliPaths,
+    template: &HostedTemplate,
+    instance_name: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if template.unlock_mode != "password" {
+        return Ok(None);
+    }
+    let (org_id, org_name, _) = ensure_manual_deploy_keyring(api, paths).await?;
+    let seed = keys::load_or_create_recovery_seed(paths)?;
+    let app_seed = keys::derive_app_bootstrap_seed(org_id, instance_name, &seed)?;
+    let signing_key = SigningKey::from_bytes(&app_seed);
+    let public_key_hash = hex::encode(Sha256::digest(signing_key.verifying_key().to_bytes()));
+    config::save_bootstrap_key(paths, &org_name, instance_name, &hex::encode(app_seed))?;
+    Ok(Some(public_key_hash))
 }
 
 fn template_app_config(template: &HostedTemplate, instance_name: &str) -> AppConfig {
@@ -848,7 +901,9 @@ fn should_refresh_template_config_token(error: &TeeError) -> bool {
 fn should_retry_template_config_tee_error(error: &TeeError) -> bool {
     match error {
         TeeError::Http(_) => true,
-        TeeError::Tee { status, .. } => matches!(*status, 408 | 409 | 425 | 429) || *status >= 500,
+        TeeError::Tee { status, .. } => {
+            matches!(*status, 408 | 409 | 423 | 425 | 429) || *status >= 500
+        }
         TeeError::Attestation(message) => is_transient_template_config_attestation_error(message),
         TeeError::InvalidHeader(_) => false,
     }
@@ -1869,7 +1924,7 @@ mod tests {
                 "exec /usr/local/bin/debian-ssh-entrypoint".to_string(),
             ],
             port: 8080,
-            unlock_mode: "auto".to_string(),
+            unlock_mode: "password".to_string(),
             health_path: Some("/healthz".to_string()),
             health_interval: Some(30),
             health_timeout: Some(5),
@@ -2215,7 +2270,7 @@ mod tests {
             tee_domain: None,
             custom_domain: None,
             status: "running".to_string(),
-            unlock_mode: "auto".to_string(),
+            unlock_mode: "password".to_string(),
             signer_identity_subject: None,
             signer_identity_issuer: None,
             template_slug: Some(DEBIAN_SSH_NGROK_TEMPLATE.to_string()),
@@ -2367,6 +2422,45 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("does not match submitted --stable-ssh-endpoint")
+        );
+    }
+
+    #[test]
+    fn template_deploy_claims_password_template_before_config_delivery() {
+        let source = include_str!("template.rs");
+        let deploy_start = source.find("async fn deploy").expect("deploy exists");
+        let deploy_end = source[deploy_start..]
+            .find("async fn ssh_command")
+            .expect("ssh_command follows deploy")
+            + deploy_start;
+        let body = &source[deploy_start..deploy_end];
+
+        let bootstrap_hash = body
+            .find("template_bootstrap_pubkey_hash")
+            .expect("template deploy derives bootstrap hash");
+        let ensure_app = body
+            .find("ensure_template_app")
+            .expect("template deploy creates app");
+        let create_instance = body
+            .find("create_template_instance")
+            .expect("template deploy creates template instance");
+        let wait_claim = body
+            .find("wait_for_bootstrap_endpoint")
+            .expect("template deploy waits for ownership claim endpoint");
+        let claim = body
+            .find("claim_initial_ownership")
+            .expect("template deploy claims ownership");
+        let config = body
+            .find("deliver_template_config_with_retry")
+            .expect("template deploy writes customer config");
+
+        assert!(
+            bootstrap_hash < ensure_app
+                && ensure_app < create_instance
+                && create_instance < wait_claim
+                && wait_claim < claim
+                && claim < config,
+            "password-mode template deploy must make the config store writable before writing config"
         );
     }
 
@@ -3382,11 +3476,13 @@ mod tests {
             status: 401,
             message: "expired token".to_string(),
         }));
-        for status in [408, 409, 425, 429, 500, 503] {
+        for status in [408, 409, 423, 425, 429, 500, 503] {
             assert!(should_retry_template_config_tee_error(&TeeError::Tee {
                 status,
                 message: "transient".to_string(),
             }));
+        }
+        for status in [408, 409, 425, 429, 500, 503] {
             assert!(should_retry_template_config_sync_error(&ApiError::Api {
                 status,
                 code: Some("transient".to_string()),
