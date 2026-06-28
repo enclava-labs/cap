@@ -99,10 +99,10 @@ fn ownership_mode_str(mode: UnlockMode) -> &'static str {
 
 fn required_config_keys_from_primary(app: &ConfidentialApp) -> Option<String> {
     let primary = app.primary_container()?;
-    if let Some(value) = primary.env.get("ENCLAVA_REQUIRED_CONFIG_KEYS") {
-        if let Some(keys) = normalize_required_config_keys(value) {
-            return Some(keys);
-        }
+    if let Some(value) = primary.env.get("ENCLAVA_REQUIRED_CONFIG_KEYS")
+        && let Some(keys) = normalize_required_config_keys(value)
+    {
+        return Some(keys);
     }
     primary
         .command
