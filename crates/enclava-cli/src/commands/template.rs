@@ -754,67 +754,71 @@ async fn deliver_template_config_with_retry(
     tee_resolve_ip: &mut Option<std::net::IpAddr>,
     pairs: &[(&'static str, String)],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut delivery = TemplateConfigDeliveryState {
+        api,
+        tee,
+        instance_name,
+        config_token,
+        tee_url,
+        tee_resolve_ip,
+    };
     for (key, value) in pairs {
-        set_template_config_key_with_retry(
-            api,
-            tee,
-            instance_name,
-            key,
-            value,
-            config_token,
-            tee_url,
-            tee_resolve_ip,
-        )
-        .await?;
+        delivery.set_key(key, value).await?;
         sync_template_config_key_with_retry(api, instance_name, key).await?;
     }
     Ok(())
 }
 
-async fn set_template_config_key_with_retry(
-    api: &ApiClient,
-    tee: &mut TeeClient,
-    instance_name: &str,
-    key: &str,
-    value: &str,
-    config_token: &mut String,
-    tee_url: &mut String,
-    tee_resolve_ip: &mut Option<std::net::IpAddr>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
-        match tee.config_set(key, value, config_token).await {
-            Ok(()) => return Ok(()),
-            Err(error) if should_refresh_template_config_token(&error) => {
-                if attempt == TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
-                    return Err(error.into());
+struct TemplateConfigDeliveryState<'a> {
+    api: &'a ApiClient,
+    tee: &'a mut TeeClient,
+    instance_name: &'a str,
+    config_token: &'a mut String,
+    tee_url: &'a mut String,
+    tee_resolve_ip: &'a mut Option<std::net::IpAddr>,
+}
+
+impl TemplateConfigDeliveryState<'_> {
+    async fn set_key(&mut self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+        for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
+            match self.tee.config_set(key, value, self.config_token).await {
+                Ok(()) => return Ok(()),
+                Err(error) if should_refresh_template_config_token(&error) => {
+                    if attempt == TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
+                        return Err(error.into());
+                    }
+                    let refreshed =
+                        refresh_template_config_token_with_retry(self.api, self.instance_name, key)
+                            .await?;
+                    let refreshed_tee_url =
+                        refreshed_template_config_endpoint_url(&refreshed, self.tee_url)?;
+                    let refreshed_tee_resolve_ip =
+                        refreshed.tee_resolve_ip.or(*self.tee_resolve_ip);
+                    if refreshed_tee_url != *self.tee_url
+                        || refreshed_tee_resolve_ip != *self.tee_resolve_ip
+                    {
+                        let refreshed_tee = TeeClient::from_config_url_with_resolve_ip(
+                            &refreshed_tee_url,
+                            refreshed_tee_resolve_ip,
+                        );
+                        *self.tee = attest_template_config_tee_with_retry(refreshed_tee).await?;
+                        *self.tee_url = refreshed_tee_url;
+                        *self.tee_resolve_ip = refreshed_tee_resolve_ip;
+                    }
+                    *self.config_token = refreshed.token;
+                    tokio::time::sleep(template_config_delivery_retry_delay()).await;
                 }
-                let refreshed =
-                    refresh_template_config_token_with_retry(api, instance_name, key).await?;
-                let refreshed_tee_url =
-                    refreshed_template_config_endpoint_url(&refreshed, tee_url)?;
-                let refreshed_tee_resolve_ip = refreshed.tee_resolve_ip.or(*tee_resolve_ip);
-                if refreshed_tee_url != *tee_url || refreshed_tee_resolve_ip != *tee_resolve_ip {
-                    let refreshed_tee = TeeClient::from_config_url_with_resolve_ip(
-                        &refreshed_tee_url,
-                        refreshed_tee_resolve_ip,
-                    );
-                    *tee = attest_template_config_tee_with_retry(refreshed_tee).await?;
-                    *tee_url = refreshed_tee_url;
-                    *tee_resolve_ip = refreshed_tee_resolve_ip;
+                Err(error)
+                    if should_retry_template_config_tee_error(&error)
+                        && attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS =>
+                {
+                    tokio::time::sleep(template_config_delivery_retry_delay()).await;
                 }
-                *config_token = refreshed.token;
-                tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                Err(error) => return Err(error.into()),
             }
-            Err(error)
-                if should_retry_template_config_tee_error(&error)
-                    && attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS =>
-            {
-                tokio::time::sleep(template_config_delivery_retry_delay()).await;
-            }
-            Err(error) => return Err(error.into()),
         }
+        Err(format!("TEE config write failed for {key}").into())
     }
-    Err(format!("TEE config write failed for {key}").into())
 }
 
 async fn attest_template_config_tee_with_retry(
