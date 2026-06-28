@@ -590,7 +590,6 @@ fn proxy_volume_mounts(legacy: bool) -> Vec<VolumeMount> {
         v.push(VolumeMount {
             name: "unlock-socket".to_string(),
             mount_path: "/run/enclava".to_string(),
-            read_only: Some(true),
             ..Default::default()
         });
         v.push(VolumeMount {

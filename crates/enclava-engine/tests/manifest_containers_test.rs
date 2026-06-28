@@ -263,7 +263,7 @@ fn proxy_container_mounts_unlock_socket() {
         .iter()
         .find(|m| m.name == "unlock-socket" && m.mount_path == "/run/enclava")
         .unwrap();
-    assert_eq!(ready_m.read_only, Some(true));
+    assert_eq!(ready_m.read_only, None);
     let env = c.env.as_ref().unwrap();
     assert_eq!(
         env.iter()
