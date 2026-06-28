@@ -171,10 +171,7 @@ fn all_namespaced_resources_share_namespace() {
     assert_eq!(m.envoy_proxy["metadata"]["namespace"].as_str(), Some(ns));
     assert_eq!(m.gateway["metadata"]["namespace"].as_str(), Some(ns));
     assert_eq!(m.tls_route["metadata"]["namespace"].as_str(), Some(ns));
-    assert_eq!(
-        m.tee_tls_route["metadata"]["namespace"].as_str(),
-        Some(ns)
-    );
+    assert_eq!(m.tee_tls_route["metadata"]["namespace"].as_str(), Some(ns));
 }
 
 #[test]

@@ -147,12 +147,7 @@ pub fn generate_gateway(app: &ConfidentialApp) -> Value {
 
 /// Generate a TLSRoute from the tenant Gateway to the tenant ingress Service port.
 pub fn generate_tls_route(app: &ConfidentialApp) -> Value {
-    generate_tls_route_to_service_port(
-        app,
-        &tls_route_name(app),
-        app.primary_domain(),
-        443,
-    )
+    generate_tls_route_to_service_port(app, &tls_route_name(app), app.primary_domain(), 443)
 }
 
 /// Generate a TLSRoute from the tenant Gateway to the attestation proxy Service port.
@@ -161,12 +156,7 @@ pub fn generate_tls_route(app: &ConfidentialApp) -> Value {
 /// are ready, so it cannot share the app-domain route that targets Caddy on
 /// Service port 443.
 pub fn generate_tee_tls_route(app: &ConfidentialApp) -> Value {
-    generate_tls_route_to_service_port(
-        app,
-        &tee_tls_route_name(app),
-        &app.domain.tee_domain,
-        8081,
-    )
+    generate_tls_route_to_service_port(app, &tee_tls_route_name(app), &app.domain.tee_domain, 8081)
 }
 
 fn generate_tls_route_to_service_port(
