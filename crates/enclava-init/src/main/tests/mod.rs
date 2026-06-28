@@ -11,6 +11,7 @@ fn ready_probe_reflects_ready_file_state() {
     assert!(ready_file_exists(&ready));
     clear_ready_file(&ready).unwrap();
     assert!(!ready_file_exists(&ready));
+    assert_eq!(std::fs::read_to_string(&ready).unwrap(), "not-ready\n");
 }
 
 #[test]

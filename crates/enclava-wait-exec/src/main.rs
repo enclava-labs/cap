@@ -183,9 +183,15 @@ fn start_time_ticks_from_stat(stat: &str) -> Result<u64, String> {
 }
 
 fn wait_until_ready(ready_file: &Path) {
-    while !ready_file.exists() {
+    while !ready_file_is_ready(ready_file) {
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn ready_file_is_ready(ready_file: &Path) -> bool {
+    fs::read_to_string(ready_file)
+        .map(|value| value.trim() == "ready")
+        .unwrap_or(false)
 }
 
 fn command_from_args(argv: Vec<OsString>) -> (OsString, Vec<OsString>) {
@@ -231,6 +237,21 @@ mod tests {
         assert!(sentinel.contains("version=1\n"));
         assert!(sentinel.contains("container=web\n"));
         assert!(sentinel.contains(&format!("pid={}\n", process::id())));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ready_file_requires_ready_content() {
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let ready = dir.join("init-ready");
+
+        fs::write(&ready, "not-ready\n").unwrap();
+        assert!(!ready_file_is_ready(&ready));
+
+        fs::write(&ready, "ready\n").unwrap();
+        assert!(ready_file_is_ready(&ready));
+
         fs::remove_dir_all(dir).unwrap();
     }
 

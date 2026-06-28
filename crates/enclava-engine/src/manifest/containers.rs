@@ -51,6 +51,8 @@ pub const CADDY_ACME_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
+const CAP_CONFIG_READY_MARKER: &str = "/state/.enclava/luks-ready";
+const CAP_CONFIG_FILE_GID: &str = "10001";
 
 fn shell_escape_arg(arg: &str) -> String {
     if arg.is_empty() {
@@ -72,6 +74,53 @@ fn ownership_mode_str(mode: UnlockMode) -> &'static str {
         UnlockMode::Auto => "auto-unlock",
         UnlockMode::Password => "password",
     }
+}
+
+fn required_config_keys_from_primary(app: &ConfidentialApp) -> Option<String> {
+    let primary = app.primary_container()?;
+    if let Some(value) = primary.env.get("ENCLAVA_REQUIRED_CONFIG_KEYS") {
+        if let Some(keys) = normalize_required_config_keys(value) {
+            return Some(keys);
+        }
+    }
+    primary
+        .command
+        .as_ref()?
+        .iter()
+        .find_map(|arg| required_config_keys_from_arg(arg))
+}
+
+fn required_config_keys_from_arg(arg: &str) -> Option<String> {
+    const PREFIX: &str = "ENCLAVA_REQUIRED_CONFIG_KEYS=";
+    let value = arg.split_once(PREFIX)?.1;
+    let value = value
+        .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
+        .next()
+        .unwrap_or_default()
+        .trim_matches('"')
+        .trim_matches('\'');
+    normalize_required_config_keys(value)
+}
+
+fn normalize_required_config_keys(value: &str) -> Option<String> {
+    let keys = value
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    if keys.is_empty() || keys.iter().any(|key| !is_valid_config_key(key)) {
+        return None;
+    }
+    Some(keys.join(","))
+}
+
+fn is_valid_config_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(ch) if ch.is_ascii_alphabetic() || ch == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn env(name: &str, value: &str) -> EnvVar {
@@ -336,7 +385,10 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
 /// The sidecar needs device-mapper and mount namespace rights. App and caddy
 /// remain unprivileged and only consume the decrypted mountpoints.
 pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
-    let wait_containers = format!("{},tenant-ingress", app.primary_container().unwrap().name);
+    let wait_containers = format!(
+        "{},tenant-ingress,attestation-proxy",
+        app.primary_container().unwrap().name
+    );
     Container {
         name: "enclava-init".to_string(),
         image: Some(enclava_init_image()),
@@ -348,6 +400,9 @@ pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
             env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
             env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "10001"),
             env("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", &wait_containers),
+            env("KBS_FETCH_RETRIES", "120"),
+            env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
+            env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
         ]),
         volume_mounts: Some(vec![
             VolumeMount {
@@ -430,7 +485,7 @@ pub fn build_enclava_tools_init_container() -> Container {
             "/bin/sh".to_string(),
             "-eu".to_string(),
             "-c".to_string(),
-            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers".to_string(),
+            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready".to_string(),
         ]),
         volume_mounts: Some(vec![
             VolumeMount {
@@ -534,7 +589,11 @@ fn proxy_security_context(_legacy: bool) -> SecurityContext {
         run_as_user: Some(0),
         run_as_group: Some(0),
         capabilities: Some(Capabilities {
-            add: Some(vec!["MKNOD".to_string()]),
+            add: Some(vec![
+                "CHOWN".to_string(),
+                "MKNOD".to_string(),
+                "SYS_PTRACE".to_string(),
+            ]),
             drop: Some(vec!["ALL".to_string()]),
         }),
         ..Default::default()
@@ -561,6 +620,8 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("TEE_DOMAIN", &app.domain.tee_domain),
         env("CAP_API_SIGNING_PUBKEY", &app.api_signing_pubkey),
         env("CAP_CONFIG_DIR", "/state/.enclava/config"),
+        env("CAP_CONFIG_READY_MARKER", CAP_CONFIG_READY_MARKER),
+        env("CAP_CONFIG_FILE_GID", CAP_CONFIG_FILE_GID),
         env("STORAGE_OWNERSHIP_MODE", mode),
         env("INSTANCE_ID", &app.owner_instance_id()),
         env("OWNER_CIPHERTEXT_BACKEND", "kbs-resource"),
@@ -577,7 +638,12 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("KBS_FETCH_MAX_SLEEP_SECONDS", "10"),
         env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
     ];
+    if let Some(keys) = required_config_keys_from_primary(app) {
+        env_vars.push(env("CAP_CONFIG_REQUIRED_KEYS", &keys));
+    }
     if !legacy {
+        env_vars.push(env("ENCLAVA_CONTAINER_NAME", "attestation-proxy"));
+        env_vars.push(env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"));
         env_vars.push(env("ENCLAVA_INIT_UNLOCK_SOCKET", UNLOCK_SOCKET_PATH));
     }
     if let Some(cert) = cc_init_data::trustee_kbs_ca_cert_pem() {

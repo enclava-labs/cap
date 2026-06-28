@@ -241,7 +241,16 @@ fn proxy_container_can_create_sev_guest_device_for_auto_unlock() {
     assert_eq!(sc.read_only_root_filesystem, Some(true));
     let caps = sc.capabilities.as_ref().unwrap();
     assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
-    assert_eq!(caps.add.as_deref(), Some(&["MKNOD".to_string()][..]));
+    assert_eq!(
+        caps.add.as_deref(),
+        Some(
+            &[
+                "CHOWN".to_string(),
+                "MKNOD".to_string(),
+                "SYS_PTRACE".to_string()
+            ][..]
+        )
+    );
 }
 
 #[test]
@@ -298,6 +307,72 @@ fn proxy_container_mounts_state_filesystem_for_config_storage() {
             .value
             .as_deref(),
         Some("/state/.enclava/config")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "CAP_CONFIG_READY_MARKER")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/state/.enclava/luks-ready")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "CAP_CONFIG_FILE_GID")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("10001")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ENCLAVA_CONTAINER_NAME")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("attestation-proxy")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "ENCLAVA_STARTED_DIR")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("/run/enclava/containers")
+    );
+    let caps = c
+        .security_context
+        .as_ref()
+        .unwrap()
+        .capabilities
+        .as_ref()
+        .unwrap();
+    let add = caps.add.as_ref().unwrap();
+    assert!(add.contains(&"CHOWN".to_string()));
+    assert!(add.contains(&"MKNOD".to_string()));
+    assert!(add.contains(&"SYS_PTRACE".to_string()));
+}
+
+#[test]
+fn proxy_container_receives_workload_required_config_keys() {
+    let mut app = sample_app();
+    app.containers[0].command = Some(vec![
+        "/bin/sh".to_string(),
+        "-lc".to_string(),
+        "ENCLAVA_REQUIRED_CONFIG_KEYS=FRP_SERVER_ADDR,FRP_AUTH_TOKEN exec /usr/local/bin/app"
+            .to_string(),
+    ]);
+
+    let c = build_attestation_proxy_container(&app);
+    let env = c.env.as_ref().unwrap();
+
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "CAP_CONFIG_REQUIRED_KEYS")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("FRP_SERVER_ADDR,FRP_AUTH_TOKEN")
     );
 }
 
@@ -511,7 +586,7 @@ fn enclava_init_container_waits_for_workloads_and_marks_ready_file() {
             .unwrap()
             .value
             .as_deref(),
-        Some("web,tenant-ingress")
+        Some("web,tenant-ingress,attestation-proxy")
     );
     assert_eq!(
         env.iter()
@@ -520,6 +595,30 @@ fn enclava_init_container_waits_for_workloads_and_marks_ready_file() {
             .value
             .as_deref(),
         Some("10001")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "KBS_FETCH_RETRIES")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("120")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "KBS_FETCH_RETRY_SLEEP_SECONDS")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("2")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "KBS_FETCH_REQUEST_TIMEOUT_SECONDS")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("10")
     );
     assert!(c.startup_probe.is_none());
     let probe = c.readiness_probe.as_ref().unwrap();
@@ -547,7 +646,7 @@ fn enclava_init_container_waits_for_tenant_ingress_sentinel() {
             .unwrap()
             .value
             .as_deref(),
-        Some("web,tenant-ingress")
+        Some("web,tenant-ingress,attestation-proxy")
     );
 }
 
@@ -580,6 +679,7 @@ fn enclava_tools_init_container_prepares_group_restricted_wait_handoff() {
     let c = build_enclava_tools_init_container();
     let command = c.command.as_ref().unwrap().join(" ");
     assert!(command.contains("install -d -m 02770 -o 0 -g 10001 /run/enclava/containers"));
+    assert!(command.contains("printf 'not-ready\\n' > /run/enclava/init-ready"));
     let mounts = c.volume_mounts.as_ref().unwrap();
     assert!(
         mounts
