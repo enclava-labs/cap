@@ -255,6 +255,59 @@ fn deploy_claims_fresh_created_password_app_when_unlock_status_is_unavailable() 
 }
 
 #[test]
+fn deploy_preflights_password_input_before_remote_side_effects() {
+    let source = include_str!("../../app.rs");
+    let deploy_start = source.find("pub async fn deploy").expect("deploy exists");
+    let deploy_end = source[deploy_start..]
+        .find("// Phase 1: Deploy")
+        .expect("phase 1 follows deploy setup")
+        + deploy_start;
+    let setup = &source[deploy_start..deploy_end];
+
+    let password_input = setup
+        .find("StoragePasswordInput::from_file_option")
+        .expect("deploy prepares storage password input");
+    let preflight = setup
+        .find("storage_password.ensure_available_for_password_mode")
+        .expect("deploy preflights password input availability");
+    let sign = setup
+        .find("build_signed_deploy_blobs")
+        .expect("deploy signs local blobs before remote deployment");
+    let remote_deploy = source[deploy_start..]
+        .find("api.deploy")
+        .expect("deploy mutates remote app")
+        + deploy_start;
+
+    assert!(
+        password_input < preflight && preflight < sign && deploy_end < remote_deploy,
+        "password-mode deploy must verify password input before signing and before remote mutation"
+    );
+}
+
+#[test]
+fn deploy_accepts_storage_password_file_flag() {
+    use clap::Parser as _;
+
+    let cli = crate::commands::Cli::try_parse_from([
+        "enclava",
+        "deploy",
+        "--image",
+        "ghcr.io/acme/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "--storage-password-file",
+        "/tmp/enclava-password",
+    ])
+    .expect("deploy should accept storage password file");
+
+    let crate::commands::Command::Deploy(args) = cli.command else {
+        panic!("expected deploy command");
+    };
+    assert_eq!(
+        args.storage_password_file.as_deref(),
+        Some(std::path::Path::new("/tmp/enclava-password"))
+    );
+}
+
+#[test]
 fn deploy_bootstrap_probe_attests_before_calling_claim_endpoint() {
     let source = include_str!("../../app.rs");
     let fn_start = source
@@ -551,5 +604,25 @@ fn parse_config_inputs_reads_values_from_files() {
             ),
             ("MINT_SPARK_API_KEY".to_string(), "secret-value".to_string()),
         ]
+    );
+}
+
+#[test]
+fn storage_password_file_trims_newlines_and_rejects_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let password_path = temp.path().join("storage-password");
+    std::fs::write(&password_path, "secret value\r\n").unwrap();
+    assert_eq!(
+        read_storage_password_file(&password_path).unwrap(),
+        "secret value"
+    );
+
+    let empty_path = temp.path().join("empty-password");
+    std::fs::write(&empty_path, "\n").unwrap();
+    assert!(
+        read_storage_password_file(&empty_path)
+            .unwrap_err()
+            .to_string()
+            .contains("is empty")
     );
 }

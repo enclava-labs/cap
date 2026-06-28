@@ -26,8 +26,8 @@ use enclava_cli::{
 };
 
 use crate::commands::app::{
-    SignedDeployBlobParams, build_signed_deploy_blobs, claim_initial_ownership,
-    ensure_manual_deploy_keyring, wait_for_bootstrap_endpoint,
+    SignedDeployBlobParams, StoragePasswordInput, build_signed_deploy_blobs,
+    claim_initial_ownership, ensure_manual_deploy_keyring, wait_for_bootstrap_endpoint,
 };
 
 const DEBIAN_SSH_NGROK_TEMPLATE: &str = "debian-ssh-ngrok";
@@ -75,6 +75,9 @@ pub struct TemplateDeployArgs {
     /// Seconds to wait for the stable SSH endpoint command.
     #[arg(long, default_value_t = DEFAULT_SSH_TIMEOUT_SECONDS)]
     pub ssh_timeout_seconds: u64,
+    /// File containing the initial storage password for non-interactive password-mode template deploys.
+    #[arg(long = "storage-password-file", value_name = "PATH")]
+    pub storage_password_file: Option<PathBuf>,
     /// Print machine-readable JSON with deployment, stable SSH endpoint, and stable SSH endpoint command details.
     #[arg(long)]
     pub json: bool,
@@ -203,6 +206,11 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         &public_keys,
         template_key(template, "DEBIAN_SSH_AUTHORIZED_KEYS"),
     )?;
+    let storage_password =
+        StoragePasswordInput::from_file_option(args.storage_password_file.as_ref())?;
+    if template.unlock_mode == "password" {
+        storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
+    }
     let pb = if args.json {
         ProgressBar::hidden()
     } else {
@@ -273,7 +281,14 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         )
         .await?
         {
-            claim_initial_ownership(api, &ctx.paths, &ctx.cli_config, &instance_name).await?;
+            claim_initial_ownership(
+                api,
+                &ctx.paths,
+                &ctx.cli_config,
+                &instance_name,
+                &storage_password,
+            )
+            .await?;
         }
     }
     pb.set_message("Delivering config to TEE...");
@@ -2132,6 +2147,24 @@ mod tests {
             args.ngrok_tcp_url.as_deref(),
             Some("6.tcp.eu.ngrok.io:17958")
         );
+
+        let cli = crate::commands::Cli::try_parse_from([
+            "enclava",
+            "template",
+            "deploy",
+            "--name",
+            "shell",
+            "--storage-password-file",
+            "/tmp/enclava-password",
+        ])
+        .expect("template deploy should accept storage password file");
+        let crate::commands::Command::Template(TemplateCommand::Deploy(args)) = cli.command else {
+            panic!("expected template deploy command");
+        };
+        assert_eq!(
+            args.storage_password_file.as_deref(),
+            Some(std::path::Path::new("/tmp/enclava-password"))
+        );
     }
 
     #[test]
@@ -2164,6 +2197,10 @@ mod tests {
         assert!(
             help.contains("stable SSH endpoint command details"),
             "template deploy JSON help should name the stable SSH endpoint command: {help}"
+        );
+        assert!(
+            help.contains("--storage-password-file <PATH>"),
+            "template deploy help should expose non-interactive password-mode deploy support: {help}"
         );
         let command_centric_hint = ["for a stable SSH", " command"].concat();
         assert!(
@@ -2238,6 +2275,7 @@ mod tests {
             ngrok_tcp_url: None,
             no_wait: false,
             ssh_timeout_seconds: DEFAULT_SSH_TIMEOUT_SECONDS,
+            storage_password_file: None,
             json: false,
         })
         .await
@@ -2442,6 +2480,9 @@ mod tests {
         let bootstrap_hash = body
             .find("template_bootstrap_pubkey_hash")
             .expect("template deploy derives bootstrap hash");
+        let password_preflight = body
+            .find("storage_password.ensure_available_for_password_mode")
+            .expect("template deploy preflights password input availability");
         let ensure_app = body
             .find("ensure_template_app")
             .expect("template deploy creates app");
@@ -2459,7 +2500,8 @@ mod tests {
             .expect("template deploy writes customer config");
 
         assert!(
-            bootstrap_hash < ensure_app
+            password_preflight < bootstrap_hash
+                && bootstrap_hash < ensure_app
                 && ensure_app < create_instance
                 && create_instance < wait_claim
                 && wait_claim < claim

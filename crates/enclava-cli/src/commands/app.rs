@@ -3,7 +3,11 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
-use std::time::{Duration, Instant};
+use std::{
+    io::IsTerminal,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -85,6 +89,77 @@ fn parse_config_inputs(
         ));
     }
     Ok(pairs)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoragePasswordInput {
+    value: Option<String>,
+}
+
+impl StoragePasswordInput {
+    pub(crate) fn from_file_option(
+        path: Option<&PathBuf>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        match path {
+            Some(path) => Ok(Self {
+                value: Some(read_storage_password_file(path)?),
+            }),
+            None => Ok(Self { value: None }),
+        }
+    }
+
+    pub(crate) fn ensure_available_for_password_mode(
+        &self,
+        action: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.value.is_some() || storage_password_prompt_available() {
+            return Ok(());
+        }
+        Err(format!(
+            "{action} requires an interactive terminal or --storage-password-file <PATH> before changing remote resources"
+        )
+        .into())
+    }
+
+    fn initial_claim_password(&self) -> Result<String, Box<dyn std::error::Error>> {
+        match &self.value {
+            Some(value) => Ok(value.clone()),
+            None => Ok(dialoguer::Password::new()
+                .with_prompt("Set initial storage password")
+                .with_confirmation("Confirm initial storage password", "Passwords don't match")
+                .interact()?),
+        }
+    }
+
+    fn unlock_password(&self) -> Result<String, Box<dyn std::error::Error>> {
+        match &self.value {
+            Some(value) => Ok(value.clone()),
+            None => Ok(dialoguer::Password::new()
+                .with_prompt("Unlock password")
+                .interact()?),
+        }
+    }
+}
+
+fn read_storage_password_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let value = std::fs::read_to_string(path)
+        .map_err(|err| {
+            format!(
+                "failed to read storage password file {}: {err}",
+                path.display()
+            )
+        })?
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    if value.is_empty() {
+        Err(format!("storage password file {} is empty", path.display()).into())
+    } else {
+        Ok(value)
+    }
+}
+
+fn storage_password_prompt_available() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
 fn deploy_should_unlock_before_config(
@@ -256,6 +331,9 @@ pub struct DeployArgs {
     /// Set config key from a local file without exposing the value in process arguments.
     #[arg(long = "set-file", value_name = "KEY=PATH")]
     pub config_file_vars: Vec<String>,
+    /// File containing the storage password for non-interactive password-mode deploys.
+    #[arg(long = "storage-password-file", value_name = "PATH")]
+    pub storage_password_file: Option<PathBuf>,
 }
 
 pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -272,6 +350,11 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     let creds = config::load_credentials(&paths)?;
     let app = api.get_app(&app_name).await?;
     let is_password_mode = app.unlock_mode == "password";
+    let storage_password =
+        StoragePasswordInput::from_file_option(args.storage_password_file.as_ref())?;
+    if is_password_mode {
+        storage_password.ensure_available_for_password_mode("password-mode deploy")?;
+    }
     let signed_blobs = build_signed_deploy_blobs(SignedDeployBlobParams {
         api: &api,
         paths: &paths,
@@ -337,7 +420,8 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         pb.set_position(3);
         pb.set_message("Waiting for ownership claim endpoint...");
         if wait_for_bootstrap_endpoint(&api, &app_name, max_wait, poll_interval, &pb).await? {
-            claim_initial_ownership(&api, &paths, &cli_config, &app_name).await?;
+            claim_initial_ownership(&api, &paths, &cli_config, &app_name, &storage_password)
+                .await?;
             pb.set_message("Ownership claimed");
         } else {
             let runtime_target = if deploy_should_unlock_before_config(
@@ -360,7 +444,13 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             .await?;
             if deploy_should_unlock_before_config(is_password_mode, false, !config_pairs.is_empty())
             {
-                ensure_password_storage_unlocked_for_config(&api, &app_name, &pb).await?;
+                ensure_password_storage_unlocked_for_config(
+                    &api,
+                    &app_name,
+                    &pb,
+                    &storage_password,
+                )
+                .await?;
             }
         }
     } else {
@@ -383,7 +473,8 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         )
         .await?;
         if deploy_should_unlock_before_config(is_password_mode, false, !config_pairs.is_empty()) {
-            ensure_password_storage_unlocked_for_config(&api, &app_name, &pb).await?;
+            ensure_password_storage_unlocked_for_config(&api, &app_name, &pb, &storage_password)
+                .await?;
         }
     }
 
@@ -653,6 +744,7 @@ async fn ensure_password_storage_unlocked_for_config(
     api: &ApiClient,
     app_name: &str,
     pb: &ProgressBar,
+    storage_password: &StoragePasswordInput,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
     let tee =
@@ -665,9 +757,7 @@ async fn ensure_password_storage_unlocked_for_config(
         "unlocked" => Ok(()),
         "locked" => {
             pb.set_message("Unlocking storage before config delivery...");
-            let password = dialoguer::Password::new()
-                .with_prompt("Unlock password")
-                .interact()?;
+            let password = storage_password.unlock_password()?;
             tee.unlock(&password).await?;
             wait_for_deploy_unlock_completion(&tee).await?;
             Ok(())
@@ -731,6 +821,7 @@ pub(crate) async fn claim_initial_ownership(
     paths: &CliPaths,
     _cli_config: &config::CliConfig,
     app_name: &str,
+    storage_password: &StoragePasswordInput,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
     let tee =
@@ -751,10 +842,7 @@ pub(crate) async fn claim_initial_ownership(
     let signature = URL_SAFE_NO_PAD.encode(signing_key.sign(&challenge_bytes).to_bytes());
     let bootstrap_pubkey = URL_SAFE_NO_PAD.encode(verifying_key.to_bytes());
 
-    let password = dialoguer::Password::new()
-        .with_prompt("Set initial storage password")
-        .with_confirmation("Confirm initial storage password", "Passwords don't match")
-        .interact()?;
+    let password = storage_password.initial_claim_password()?;
 
     let result = match tee
         .bootstrap_claim(&challenge.nonce, &bootstrap_pubkey, &signature, &password)
