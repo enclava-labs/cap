@@ -8,7 +8,7 @@ use enclava_engine::manifest::containers::{
     build_caddy_container, build_enclava_init_container, build_enclava_tools_init_container,
 };
 use enclava_engine::testutil::sample_app;
-use enclava_engine::types::CaddyTlsMode;
+use enclava_engine::types::{CaddyTlsMode, WorkloadSecurityProfile};
 
 // === App container (Phase 5 default) ===
 
@@ -28,6 +28,35 @@ fn app_container_is_not_privileged() {
     let caps = sc.capabilities.as_ref().unwrap();
     assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
     assert!(caps.add.as_deref().map(|v| v.is_empty()).unwrap_or(true));
+}
+
+#[test]
+fn app_container_platform_managed_ssh_relay_profile_runs_root_supervisor() {
+    let mut app = sample_app();
+    app.containers[0].workload_security_profile = WorkloadSecurityProfile::PlatformManagedSshRelay;
+
+    let c = build_app_container(&app);
+    let sc = c.security_context.as_ref().unwrap();
+    assert_eq!(sc.privileged, Some(false));
+    assert_eq!(sc.allow_privilege_escalation, Some(false));
+    assert_eq!(sc.run_as_user, Some(0));
+    assert_eq!(sc.run_as_group, Some(0));
+    assert_eq!(sc.run_as_non_root, Some(false));
+    assert_eq!(sc.read_only_root_filesystem, Some(true));
+    let caps = sc.capabilities.as_ref().unwrap();
+    assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
+    assert_eq!(
+        caps.add.as_deref(),
+        Some(
+            &[
+                "CHOWN".to_string(),
+                "DAC_OVERRIDE".to_string(),
+                "FOWNER".to_string(),
+                "SETGID".to_string(),
+                "SETUID".to_string(),
+            ][..]
+        )
+    );
 }
 
 #[test]
@@ -352,6 +381,16 @@ fn proxy_container_mounts_state_filesystem_for_config_storage() {
             .value
             .as_deref(),
         Some("10001")
+    );
+    let mut root_only_app = sample_app();
+    root_only_app.containers[0].workload_security_profile =
+        WorkloadSecurityProfile::PlatformManagedSshRelay;
+    let root_only = build_attestation_proxy_container(&root_only_app);
+    let root_only_env = root_only.env.as_ref().unwrap();
+    assert!(
+        root_only_env
+            .iter()
+            .all(|e| e.name != "CAP_CONFIG_FILE_GID")
     );
     assert_eq!(
         env.iter()

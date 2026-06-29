@@ -3,6 +3,7 @@
 use enclava_engine::manifest::cc_init_data;
 use enclava_engine::manifest::enclava_init_config::generate_enclava_init_configmap;
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::WorkloadSecurityProfile;
 
 #[test]
 fn cm_name_is_per_app() {
@@ -36,6 +37,17 @@ fn config_toml_has_runtime_ownership_and_app_bind_mounts() {
     assert!(toml_text.contains("[[app-bind-mounts]]"));
     assert!(toml_text.contains("subdir = \"app-data\""));
     assert!(toml_text.contains("mount-path = \"/app/data\""));
+}
+
+#[test]
+fn config_toml_makes_managed_config_root_only_for_platform_ssh_relay() {
+    let mut app = sample_app();
+    app.containers[0].workload_security_profile = WorkloadSecurityProfile::PlatformManagedSshRelay;
+    let cm = generate_enclava_init_configmap(&app);
+    let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
+
+    assert!(toml_text.contains("managed-config-gid = 0"));
+    assert!(toml_text.contains("managed-config-dir-mode = 448"));
 }
 
 #[test]

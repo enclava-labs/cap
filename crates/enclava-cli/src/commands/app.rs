@@ -32,7 +32,7 @@ use enclava_common::types::{ResourceLimits, UnlockMode};
 use enclava_engine::manifest::cc_init_data;
 use enclava_engine::types::{
     AttestationConfig, ConfidentialApp, Container, DomainSpec, GeneratedAgentPolicy, StorageSpec,
-    WorkloadArtifactBinding,
+    WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -364,6 +364,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         app_config: &app_config,
         image: &args.image,
         target_unlock_mode: None,
+        workload_security_profile: WorkloadSecurityProfile::Restricted,
     })
     .await?;
 

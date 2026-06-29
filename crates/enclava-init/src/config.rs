@@ -55,6 +55,12 @@ pub struct Config {
     #[serde(default = "default_app_gid")]
     pub app_gid: u32,
 
+    #[serde(default)]
+    pub managed_config_gid: Option<u32>,
+
+    #[serde(default)]
+    pub managed_config_dir_mode: Option<u32>,
+
     #[serde(default = "default_caddy_uid")]
     pub caddy_uid: u32,
 

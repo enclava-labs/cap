@@ -16,7 +16,7 @@ use enclava_engine::apply::{
 use enclava_engine::manifest::generate_all_manifests;
 use enclava_engine::types::{
     AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec,
-    WorkloadArtifactBinding,
+    WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -308,6 +308,15 @@ fn deserialize_workload_command(command: Option<&str>) -> Option<Vec<String>> {
     }
 }
 
+fn parse_workload_security_profile(
+    value: Option<&str>,
+) -> Result<WorkloadSecurityProfile, DeployError> {
+    value
+        .unwrap_or("restricted")
+        .parse()
+        .map_err(DeployError::Validation)
+}
+
 pub(crate) fn set_primary_descriptor_runtime(
     app: &mut ConfidentialApp,
     descriptor: &enclava_common::descriptor::DeploymentDescriptor,
@@ -377,6 +386,9 @@ pub async fn build_confidential_app(
             command: deserialize_workload_command(row.command.as_deref()),
             env: std::collections::HashMap::new(),
             storage_paths,
+            workload_security_profile: parse_workload_security_profile(
+                row.workload_security_profile.as_deref(),
+            )?,
             is_primary: row.is_primary,
         });
     }
@@ -725,6 +737,7 @@ mod tests {
                 command: None,
                 env: std::collections::HashMap::new(),
                 storage_paths: Vec::new(),
+                workload_security_profile: WorkloadSecurityProfile::Restricted,
                 is_primary: true,
             }],
             storage: StorageSpec::new("5Gi", "2Gi"),
@@ -802,6 +815,7 @@ mod tests {
                 command: None,
                 env: std::collections::HashMap::new(),
                 storage_paths: vec!["/data".to_string()],
+                workload_security_profile: WorkloadSecurityProfile::Restricted,
                 is_primary: true,
             }],
             storage: StorageSpec::new("5Gi", "2Gi"),

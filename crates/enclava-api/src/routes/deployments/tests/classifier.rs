@@ -117,6 +117,125 @@ fn attestation_config() -> AttestationConfig {
         }
 }
 
+fn deployment_descriptor_for_security_profile_tests()
+-> enclava_common::descriptor::DeploymentDescriptor {
+    use chrono::TimeZone;
+    use enclava_common::descriptor::{
+        Capabilities, DeploymentDescriptor, OciRuntimeSpec, Port, Resources, SecurityContext,
+        Sidecars, SignerIdentity,
+    };
+
+    DeploymentDescriptor {
+        schema_version: "v1".to_string(),
+        org_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+        org_slug: "org".to_string(),
+        app_id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+        app_name: "app".to_string(),
+        deploy_id: Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+        created_at: chrono::Utc
+            .with_ymd_and_hms(2026, 6, 29, 0, 0, 0)
+            .unwrap(),
+        nonce: [7; 32],
+        app_domain: "app.org.enclava.dev".to_string(),
+        tee_domain: "app.org.tee.enclava.dev".to_string(),
+        custom_domains: Vec::new(),
+        namespace: "cap-org-app".to_string(),
+        service_account: "cap-app-sa".to_string(),
+        identity_hash: [9; 32],
+        image_ref: "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        image_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        signer_identity: SignerIdentity {
+            subject: "https://github.com/acme/app/.github/workflows/build.yml@refs/heads/main"
+                .to_string(),
+            issuer: "https://token.actions.githubusercontent.com".to_string(),
+        },
+        oci_runtime_spec: OciRuntimeSpec {
+            command: vec!["/enclava-tools/enclava-wait-exec".to_string()],
+            args: vec!["/usr/local/bin/app".to_string()],
+            env: Vec::new(),
+            ports: vec![Port {
+                container_port: 8080,
+                protocol: "TCP".to_string(),
+            }],
+            mounts: Vec::new(),
+            capabilities: Capabilities {
+                add: Vec::new(),
+                drop: vec!["ALL".to_string()],
+            },
+            security_context: SecurityContext {
+                run_as_user: 10001,
+                run_as_group: 10001,
+                read_only_root_fs: true,
+                allow_privilege_escalation: false,
+                privileged: false,
+            },
+            resources: Resources::default(),
+        },
+        sidecars: Sidecars {
+            attestation_proxy_digest: "sha256:1111".to_string(),
+            caddy_digest: "sha256:2222".to_string(),
+        },
+        api_signing_pubkey: "api-pubkey".to_string(),
+        expected_firmware_measurement: [3; 32],
+        expected_runtime_class: "kata-qemu-snp".to_string(),
+        kbs_resource_path: "default/cap-org-app-tls-owner".to_string(),
+        unlock_mode: "password".to_string(),
+        policy_template_id: "kbs-release-policy-v3".to_string(),
+        policy_template_sha256: [4; 32],
+        platform_release_version: "platform-2026.06".to_string(),
+        expected_agent_policy_hash: [5; 32],
+        expected_cc_init_data_hash: [6; 32],
+        expected_kbs_policy_hash: [8; 32],
+    }
+}
+
+#[test]
+fn signed_descriptor_profile_accepts_only_known_security_shapes() {
+    use enclava_common::descriptor::{Capabilities, SecurityContext};
+
+    let restricted = deployment_descriptor_for_security_profile_tests();
+    assert_eq!(
+        signed_descriptor_profile(&restricted),
+        Some(WorkloadSecurityProfile::Restricted)
+    );
+
+    let mut legacy_unset = deployment_descriptor_for_security_profile_tests();
+    legacy_unset.oci_runtime_spec.security_context = SecurityContext::default();
+    legacy_unset.oci_runtime_spec.capabilities = Capabilities::default();
+    assert_eq!(
+        signed_descriptor_profile(&legacy_unset),
+        Some(WorkloadSecurityProfile::Restricted)
+    );
+
+    let mut relay = deployment_descriptor_for_security_profile_tests();
+    relay.oci_runtime_spec.security_context = SecurityContext {
+        run_as_user: 0,
+        run_as_group: 0,
+        read_only_root_fs: true,
+        allow_privilege_escalation: false,
+        privileged: false,
+    };
+    relay.oci_runtime_spec.capabilities = Capabilities {
+        drop: vec!["ALL".to_string()],
+        add: PLATFORM_MANAGED_SSH_RELAY_CAPS
+            .iter()
+            .map(|cap| (*cap).to_string())
+            .collect(),
+    };
+    assert_eq!(
+        signed_descriptor_profile(&relay),
+        Some(WorkloadSecurityProfile::PlatformManagedSshRelay)
+    );
+
+    let mut malformed = deployment_descriptor_for_security_profile_tests();
+    malformed.oci_runtime_spec.security_context = relay.oci_runtime_spec.security_context;
+    malformed.oci_runtime_spec.capabilities = Capabilities {
+        drop: vec!["ALL".to_string()],
+        add: vec!["SETUID".to_string()],
+    };
+    assert_eq!(signed_descriptor_profile(&malformed), None);
+}
+
 #[test]
 fn github_actions_oidc_url_with_at_is_url_policy() {
     let policy = classify_signer_identity(
@@ -283,6 +402,7 @@ async fn deploy_rejects_member_before_database_access() {
             customer_descriptor_blob: None,
             org_keyring_blob: None,
             signed_policy_artifact: None,
+            workload_security_profile: None,
         }),
     )
     .await;

@@ -207,6 +207,7 @@ pub(crate) struct ConfidentialAppForCcHash<'a> {
     pub(crate) tenant_id: String,
     pub(crate) tenant_instance_identity_hash: [u8; 32],
     pub(crate) bootstrap_owner_pubkey_hash: String,
+    pub(crate) workload_security_profile: WorkloadSecurityProfile,
 }
 
 pub(crate) fn confidential_app_for_cc_hash(
@@ -224,6 +225,7 @@ pub(crate) fn confidential_app_for_cc_hash(
         tenant_id,
         tenant_instance_identity_hash,
         bootstrap_owner_pubkey_hash,
+        workload_security_profile,
     } = params;
     let api_signing_pubkey = deployment_context.api_signing_pubkey.trim().to_string();
     if api_signing_pubkey.is_empty() {
@@ -258,6 +260,7 @@ pub(crate) fn confidential_app_for_cc_hash(
             command: None,
             env: HashMap::new(),
             storage_paths: app_config.storage.paths.clone(),
+            workload_security_profile,
             is_primary: true,
         }],
         storage: StorageSpec::new(&app_config.storage.size, &app_config.storage.tls_size),
@@ -428,6 +431,7 @@ pub(crate) struct SignedDeployBlobParams<'a> {
     pub app_config: &'a AppConfig,
     pub image: &'a str,
     pub target_unlock_mode: Option<&'a str>,
+    pub workload_security_profile: WorkloadSecurityProfile,
 }
 
 pub(crate) struct SignedDeployBlobs {
@@ -448,6 +452,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         app_config,
         image,
         target_unlock_mode,
+        workload_security_profile,
     } = params;
     let image_ref = enclava_common::image::ImageRef::parse(image)?;
     if !image_ref.has_digest() {
@@ -569,6 +574,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             port: app_config.app.port,
             workload_command: app_config.app.command.clone(),
             storage_paths: app_config.storage.paths.clone(),
+            workload_security_profile,
             cpu_limit: app_config.resources.cpu.clone(),
             memory_limit: app_config.resources.memory.clone(),
         }),
@@ -613,6 +619,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             tenant_id,
             tenant_instance_identity_hash: identity_hash,
             bootstrap_owner_pubkey_hash: bootstrap_pubkey_hash,
+            workload_security_profile,
         },
     )?;
     let cc_init_options = cc_init_data::CcInitDataOptions {

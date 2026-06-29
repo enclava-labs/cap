@@ -8,6 +8,7 @@ use enclava_cli::keyring::{Role, sign_keyring, single_member_keyring, verify_key
 use enclava_cli::keys::UserSigningKey;
 use enclava_engine::manifest::containers::build_app_container;
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::WorkloadSecurityProfile;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
@@ -41,6 +42,7 @@ fn cap_oci_runtime_spec_matches_rendered_app_container_fields() {
         port: primary.port.unwrap(),
         workload_command: primary.command.clone().unwrap_or_default(),
         storage_paths: primary.storage_paths.clone(),
+        workload_security_profile: primary.workload_security_profile,
         cpu_limit: app.resources.cpu.clone(),
         memory_limit: app.resources.memory.clone(),
     });
@@ -170,6 +172,7 @@ fn cap_oci_runtime_spec_preserves_workload_command_as_wait_exec_args() {
         port: primary.port.unwrap(),
         workload_command: primary.command.clone().unwrap_or_default(),
         storage_paths: primary.storage_paths.clone(),
+        workload_security_profile: primary.workload_security_profile,
         cpu_limit: app.resources.cpu.clone(),
         memory_limit: app.resources.memory.clone(),
     });
@@ -177,6 +180,54 @@ fn cap_oci_runtime_spec_preserves_workload_command_as_wait_exec_args() {
 
     assert_eq!(descriptor_oci.command, rendered.command.unwrap());
     assert_eq!(descriptor_oci.args, rendered.args.unwrap());
+}
+
+#[test]
+fn cap_oci_runtime_spec_matches_platform_managed_ssh_relay_profile() {
+    let mut app = sample_app();
+    app.containers[0].workload_security_profile = WorkloadSecurityProfile::PlatformManagedSshRelay;
+    let primary = app.primary_container().unwrap();
+    let descriptor_oci = cap_app_oci_runtime_spec(CapAppOciRuntimeSpecInput {
+        container_name: primary.name.clone(),
+        port: primary.port.unwrap(),
+        workload_command: primary.command.clone().unwrap_or_default(),
+        storage_paths: primary.storage_paths.clone(),
+        workload_security_profile: primary.workload_security_profile,
+        cpu_limit: app.resources.cpu.clone(),
+        memory_limit: app.resources.memory.clone(),
+    });
+    let rendered = build_app_container(&app);
+    let rendered_sc = rendered.security_context.unwrap();
+
+    assert_eq!(descriptor_oci.security_context.run_as_user, 0);
+    assert_eq!(
+        descriptor_oci.security_context.run_as_user,
+        rendered_sc.run_as_user.unwrap() as u32
+    );
+    assert_eq!(
+        descriptor_oci.security_context.run_as_group,
+        rendered_sc.run_as_group.unwrap() as u32
+    );
+    assert_eq!(
+        descriptor_oci.capabilities.add,
+        rendered_sc
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .add
+            .clone()
+            .unwrap()
+    );
+    assert_eq!(
+        descriptor_oci.capabilities.drop,
+        rendered_sc
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .drop
+            .clone()
+            .unwrap()
+    );
 }
 
 #[test]

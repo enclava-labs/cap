@@ -106,7 +106,7 @@ fn managed_config_dir_is_prepared_for_proxy_writes_and_workload_reads() {
     let state_root = dir.path().join("state");
     let mut chowned = Vec::new();
 
-    prepare_managed_config_dir_at(&state_root, 10001, |path, identity| {
+    prepare_managed_config_dir_at(&state_root, 10001, 0o750, |path, identity| {
         chowned.push((path.to_path_buf(), identity));
         Ok(())
     })
@@ -146,6 +146,51 @@ fn managed_config_dir_is_prepared_for_proxy_writes_and_workload_reads() {
     let config_mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
     assert_eq!(managed_mode, 0o750);
     assert_eq!(config_mode, 0o750);
+}
+
+#[test]
+fn managed_config_dir_can_be_prepared_root_only_for_platform_supervisor() {
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    let mut chowned = Vec::new();
+
+    prepare_managed_config_dir_at(&state_root, 0, 0o700, |path, identity| {
+        chowned.push((path.to_path_buf(), identity));
+        Ok(())
+    })
+    .unwrap();
+
+    let managed_root = state_root.join(".enclava");
+    let config_dir = state_root.join(".enclava/config");
+    assert_eq!(
+        chowned,
+        vec![
+            (
+                managed_root.clone(),
+                ExecIdentity {
+                    uid: 0,
+                    gid: 0,
+                    kind: IdentityKind::Numeric,
+                },
+            ),
+            (
+                config_dir.clone(),
+                ExecIdentity {
+                    uid: 0,
+                    gid: 0,
+                    kind: IdentityKind::Numeric,
+                },
+            ),
+        ]
+    );
+    let managed_mode = std::fs::metadata(&managed_root)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let config_mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(managed_mode, 0o700);
+    assert_eq!(config_mode, 0o700);
 }
 
 #[test]
@@ -267,6 +312,8 @@ fn config_with_signed_cc(dir: &Path, cc_body: &str) -> Config {
         attempts_path: "/run/enclava/unlock-attempts".to_string(),
         app_uid: 10001,
         app_gid: 10001,
+        managed_config_gid: None,
+        managed_config_dir_mode: None,
         caddy_uid: 10002,
         caddy_gid: 10002,
         app_bind_mounts: Vec::new(),

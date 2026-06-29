@@ -24,6 +24,7 @@ use enclava_cli::{
     keys,
     tee_client::{TeeClient, TeeError},
 };
+use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
     SignedDeployBlobParams, StoragePasswordInput, build_signed_deploy_blobs,
@@ -236,6 +237,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     pb.set_message("Signing deployment descriptor...");
 
     let app_config = template_app_config(template, &instance_name);
+    let workload_security_profile = template_workload_security_profile(template)?;
     let signed_blobs = build_signed_deploy_blobs(SignedDeployBlobParams {
         api,
         paths: &ctx.paths,
@@ -245,6 +247,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         app_config: &app_config,
         image: &template.image,
         target_unlock_mode: Some(template.unlock_mode.as_str()),
+        workload_security_profile,
     })
     .await?;
     pb.set_position(2);
@@ -529,6 +532,17 @@ fn template_app_config(template: &HostedTemplate, instance_name: &str) -> AppCon
             timeout: template.health_timeout.unwrap_or(5),
         }),
     }
+}
+
+fn template_workload_security_profile(
+    template: &HostedTemplate,
+) -> Result<WorkloadSecurityProfile, Box<dyn std::error::Error>> {
+    template
+        .workload_security_profile
+        .as_deref()
+        .unwrap_or("restricted")
+        .parse()
+        .map_err(|error: String| error.into())
 }
 
 fn required_template_value(
@@ -1936,6 +1950,7 @@ mod tests {
             source_repository: Some("enclava-labs/debian-ssh-ngrok-template".to_string()),
             signer_subject: Some("https://github.com/enclava-labs/enclava-paas/.github/workflows/debian-ssh-ngrok-template-image.yml@refs/heads/main".to_string()),
             signer_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
+            workload_security_profile: Some("restricted".to_string()),
             container_name: "web".to_string(),
             command: vec![
                 "/bin/sh".to_string(),

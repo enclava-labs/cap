@@ -248,6 +248,8 @@ pub struct HostedTemplate {
     #[serde(default)]
     pub persistence_path: Option<String>,
     #[serde(default)]
+    pub workload_security_profile: Option<String>,
+    #[serde(default)]
     pub security_notes: Vec<String>,
 }
 

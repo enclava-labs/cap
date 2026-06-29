@@ -140,6 +140,7 @@ pub struct AppContainer {
     pub port: Option<i32>,
     pub command: Option<String>,
     pub storage_paths: Option<Vec<String>>,
+    pub workload_security_profile: Option<String>,
     pub is_primary: bool,
 }
 

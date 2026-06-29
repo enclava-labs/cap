@@ -111,6 +111,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
                 tenant_id: "org".to_string(),
                 tenant_instance_identity_hash: [4; 32],
                 bootstrap_owner_pubkey_hash: "33".repeat(32),
+                workload_security_profile: WorkloadSecurityProfile::Restricted,
             },
         )
         .unwrap();
@@ -170,6 +171,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
                 tenant_id: "org".to_string(),
                 tenant_instance_identity_hash: [4; 32],
                 bootstrap_owner_pubkey_hash: "33".repeat(32),
+                workload_security_profile: WorkloadSecurityProfile::Restricted,
             },
         )
         .unwrap();

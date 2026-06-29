@@ -213,8 +213,49 @@ pub struct Container {
     pub env: std::collections::HashMap<String, String>,
     /// Paths to bind-mount from the app-data LUKS volume.
     pub storage_paths: Vec<String>,
+    /// Runtime security profile for the workload container. The default
+    /// restricted profile runs the container as the workload user. Platform
+    /// templates that need a root-owned supervisor without exposing its files
+    /// to the SSH login user opt into a named profile.
+    #[serde(default, skip_serializing_if = "WorkloadSecurityProfile::is_default")]
+    pub workload_security_profile: WorkloadSecurityProfile,
     /// Whether this is the primary container (gets domain routing).
     pub is_primary: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkloadSecurityProfile {
+    #[default]
+    Restricted,
+    PlatformManagedSshRelay,
+}
+
+impl WorkloadSecurityProfile {
+    pub fn is_default(profile: &Self) -> bool {
+        *profile == Self::Restricted
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Restricted => "restricted",
+            Self::PlatformManagedSshRelay => "platform-managed-ssh-relay",
+        }
+    }
+}
+
+impl std::str::FromStr for WorkloadSecurityProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "" | "restricted" => Ok(Self::Restricted),
+            "platform-managed-ssh-relay" => Ok(Self::PlatformManagedSshRelay),
+            other => Err(format!(
+                "unsupported workload_security_profile {other:?}; expected restricted or platform-managed-ssh-relay"
+            )),
+        }
+    }
 }
 
 /// Two-volume storage specification.

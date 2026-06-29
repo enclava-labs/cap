@@ -8,7 +8,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
 use crate::manifest::cc_init_data;
-use crate::types::ConfidentialApp;
+use crate::types::{ConfidentialApp, WorkloadSecurityProfile};
 use enclava_common::canonical::ce_v1_hash;
 use enclava_common::types::UnlockMode;
 
@@ -21,6 +21,7 @@ const APP_UID: u32 = 10001;
 const APP_GID: u32 = 10001;
 const CADDY_UID: u32 = 10002;
 const CADDY_GID: u32 = 10002;
+const ROOT_ONLY_MANAGED_CONFIG_DIR_MODE: u32 = 0o700;
 
 pub fn configmap_name(app_name: &str) -> String {
     format!("{app_name}-enclava-init")
@@ -73,6 +74,12 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     out.push_str("attempts-path = \"/run/enclava-unlock/unlock-attempts\"\n");
     out.push_str(&format!("app-uid = {APP_UID}\n"));
     out.push_str(&format!("app-gid = {APP_GID}\n"));
+    if primary_uses_platform_managed_ssh_relay(app) {
+        out.push_str("managed-config-gid = 0\n");
+        out.push_str(&format!(
+            "managed-config-dir-mode = {ROOT_ONLY_MANAGED_CONFIG_DIR_MODE}\n"
+        ));
+    }
     out.push_str(&format!("caddy-uid = {CADDY_UID}\n"));
     out.push_str(&format!("caddy-gid = {CADDY_GID}\n"));
     out.push_str(&format!("argon2-salt-hex = \"{}\"\n", argon2_salt_hex(app)));
@@ -166,6 +173,12 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     }
 
     out
+}
+
+fn primary_uses_platform_managed_ssh_relay(app: &ConfidentialApp) -> bool {
+    app.primary_container().is_some_and(|primary| {
+        primary.workload_security_profile == WorkloadSecurityProfile::PlatformManagedSshRelay
+    })
 }
 
 pub(crate) fn argon2_salt_hex(app: &ConfidentialApp) -> String {

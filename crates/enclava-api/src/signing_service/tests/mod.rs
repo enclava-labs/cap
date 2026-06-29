@@ -8,6 +8,7 @@ use enclava_common::image::ImageRef;
 use enclava_common::types::{Durability, ResourceLimits, UnlockMode};
 use enclava_engine::types::{
     AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec, VolumeSpec,
+    WorkloadSecurityProfile,
 };
 
 #[test]
@@ -512,6 +513,7 @@ fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> Confide
             command: None,
             env: std::collections::HashMap::new(),
             storage_paths: vec!["/app/data".to_string()],
+            workload_security_profile: WorkloadSecurityProfile::Restricted,
             is_primary: true,
         }],
         storage: StorageSpec {

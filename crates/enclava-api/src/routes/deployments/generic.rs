@@ -58,6 +58,8 @@ pub struct GenericDeploymentSecurity {
     pub org_keyring_blob: Option<String>,
     #[serde(default)]
     pub signed_policy_artifact: Option<String>,
+    #[serde(default)]
+    pub workload_security_profile: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -277,6 +279,7 @@ pub async fn create_generic_deployment(
         customer_descriptor_blob: body.security.customer_descriptor_blob,
         org_keyring_blob: body.security.org_keyring_blob,
         signed_policy_artifact: body.security.signed_policy_artifact,
+        workload_security_profile: body.security.workload_security_profile,
     };
     let org_id = auth.org_id;
     let (status, Json(deployed)) = deploy(
@@ -491,6 +494,19 @@ pub(super) fn ensure_idempotent_retry_matches(
         serde_json::to_value(&body.workload.resources).unwrap_or(serde_json::Value::Null);
     if existing_resources != requested_resources {
         return Err(idempotency_conflict("workload.resources"));
+    }
+    let existing_profile = deployment
+        .spec_snapshot
+        .get("workload_security_profile")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("restricted");
+    let requested_profile = body
+        .security
+        .workload_security_profile
+        .as_deref()
+        .unwrap_or("restricted");
+    if existing_profile != requested_profile {
+        return Err(idempotency_conflict("security.workload_security_profile"));
     }
     Ok(())
 }

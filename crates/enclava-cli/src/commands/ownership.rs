@@ -10,6 +10,7 @@ use enclava_cli::app_config::AppConfig;
 use enclava_cli::config::{self, CliPaths};
 use enclava_cli::keys;
 use enclava_cli::tee_client::TeeClient;
+use enclava_engine::types::WorkloadSecurityProfile;
 use uuid::Uuid;
 
 #[derive(Args)]
@@ -295,6 +296,7 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                     app_config: &app_config,
                     image: &image,
                     target_unlock_mode: Some("auto"),
+                    workload_security_profile: WorkloadSecurityProfile::Restricted,
                 })
                 .await?;
             let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
@@ -358,6 +360,7 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                     app_config: &app_config,
                     image: &image,
                     target_unlock_mode: Some("password"),
+                    workload_security_profile: WorkloadSecurityProfile::Restricted,
                 })
                 .await?;
             let endpoint = resolve_tee_endpoint(&api, &app_name).await?;

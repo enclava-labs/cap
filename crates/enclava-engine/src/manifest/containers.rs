@@ -16,7 +16,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 use crate::manifest::cc_init_data;
-use crate::types::{CaddyTlsMode, ConfidentialApp};
+use crate::types::{CaddyTlsMode, ConfidentialApp, WorkloadSecurityProfile};
 use enclava_common::types::UnlockMode;
 
 /// True when the operator has opted back into the legacy bootstrap_script.sh
@@ -74,6 +74,8 @@ const CADDY_DNS01_BROKER_TLS_HANDOFF_SCRIPT: &str = concat!(
 );
 const CAP_CONFIG_READY_MARKER: &str = "/state/.enclava/luks-ready";
 const CAP_CONFIG_FILE_GID: &str = "10001";
+const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
+    &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
 
 fn shell_escape_arg(arg: &str) -> String {
     if arg.is_empty() {
@@ -306,6 +308,26 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".to_string()]),
                 add: Some(vec!["SYS_ADMIN".to_string()]),
+            }),
+            ..Default::default()
+        }
+    } else if primary.workload_security_profile == WorkloadSecurityProfile::PlatformManagedSshRelay
+    {
+        SecurityContext {
+            privileged: Some(false),
+            allow_privilege_escalation: Some(false),
+            run_as_user: Some(0),
+            run_as_group: Some(0),
+            run_as_non_root: Some(false),
+            read_only_root_filesystem: Some(true),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                add: Some(
+                    PLATFORM_MANAGED_SSH_RELAY_CAPS
+                        .iter()
+                        .map(|cap| (*cap).to_string())
+                        .collect(),
+                ),
             }),
             ..Default::default()
         }
@@ -643,7 +665,6 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("CAP_API_SIGNING_PUBKEY", &app.api_signing_pubkey),
         env("CAP_CONFIG_DIR", "/state/.enclava/config"),
         env("CAP_CONFIG_READY_MARKER", CAP_CONFIG_READY_MARKER),
-        env("CAP_CONFIG_FILE_GID", CAP_CONFIG_FILE_GID),
         env("STORAGE_OWNERSHIP_MODE", mode),
         env("INSTANCE_ID", &app.owner_instance_id()),
         env("OWNER_CIPHERTEXT_BACKEND", "kbs-resource"),
@@ -660,6 +681,9 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("KBS_FETCH_MAX_SLEEP_SECONDS", "10"),
         env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
     ];
+    if primary.workload_security_profile != WorkloadSecurityProfile::PlatformManagedSshRelay {
+        env_vars.push(env("CAP_CONFIG_FILE_GID", CAP_CONFIG_FILE_GID));
+    }
     if let Some(keys) = required_config_keys_from_primary(app) {
         env_vars.push(env("CAP_CONFIG_REQUIRED_KEYS", &keys));
     }

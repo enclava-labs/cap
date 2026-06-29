@@ -3,6 +3,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
+use enclava_engine::types::WorkloadSecurityProfile;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -10,6 +11,9 @@ use crate::auth::{middleware::AuthContext, scopes};
 use crate::models::{App, Deployment};
 use crate::source_provider::{SourceProvider, validate_source_context};
 use crate::state::AppState;
+
+const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
+    &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
 
 fn deploy_blocked_response(
     status: StatusCode,
@@ -224,6 +228,58 @@ fn parse_memory_gi(s: &str) -> Result<f64, String> {
     Ok(gib)
 }
 
+fn validate_workload_security_profile(
+    value: Option<&str>,
+) -> Result<WorkloadSecurityProfile, (StatusCode, Json<serde_json::Value>)> {
+    value
+        .unwrap_or("restricted")
+        .parse::<WorkloadSecurityProfile>()
+        .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))
+}
+
+fn signed_descriptor_profile(
+    descriptor: &enclava_common::descriptor::DeploymentDescriptor,
+) -> Option<WorkloadSecurityProfile> {
+    let sec = &descriptor.oci_runtime_spec.security_context;
+    let caps = &descriptor.oci_runtime_spec.capabilities;
+    let drops_all = caps.drop.iter().any(|cap| cap.eq_ignore_ascii_case("ALL"));
+    let legacy_unset_security = sec.run_as_user == 0
+        && sec.run_as_group == 0
+        && !sec.read_only_root_fs
+        && !sec.allow_privilege_escalation
+        && !sec.privileged
+        && caps.add.is_empty()
+        && caps.drop.is_empty();
+    let restricted = sec.run_as_user == 10001
+        && sec.run_as_group == 10001
+        && sec.read_only_root_fs
+        && !sec.allow_privilege_escalation
+        && !sec.privileged
+        && drops_all
+        && caps.add.is_empty();
+    if legacy_unset_security || restricted {
+        return Some(WorkloadSecurityProfile::Restricted);
+    }
+
+    let relay = sec.run_as_user == 0
+        && sec.run_as_group == 0
+        && sec.read_only_root_fs
+        && !sec.allow_privilege_escalation
+        && !sec.privileged
+        && drops_all
+        && caps.add.len() == PLATFORM_MANAGED_SSH_RELAY_CAPS.len()
+        && PLATFORM_MANAGED_SSH_RELAY_CAPS.iter().all(|required| {
+            caps.add
+                .iter()
+                .any(|cap| cap.eq_ignore_ascii_case(required))
+        });
+    if relay {
+        Some(WorkloadSecurityProfile::PlatformManagedSshRelay)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DeployRequest {
     pub image: String,
@@ -243,6 +299,8 @@ pub struct DeployRequest {
     pub org_keyring_blob: Option<String>,
     #[serde(default)]
     pub signed_policy_artifact: Option<String>,
+    #[serde(default)]
+    pub workload_security_profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -331,6 +389,8 @@ pub async fn deploy(
 ) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    let workload_security_profile =
+        validate_workload_security_profile(body.workload_security_profile.as_deref())?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -381,6 +441,20 @@ pub async fn deploy(
         return Err(signing_error_response(
             crate::signing_service::SigningServiceError::ArtifactWithoutBlobs,
         ));
+    }
+    if let Some(artifacts) = signing_artifacts.as_ref() {
+        let signed_profile = signed_descriptor_profile(&artifacts.descriptor).ok_or_else(|| {
+            signing_error_response(crate::signing_service::SigningServiceError::Mismatch(
+                "workload_security_profile".into(),
+            ))
+        })?;
+        if signed_profile != workload_security_profile {
+            return Err(signing_error_response(
+                crate::signing_service::SigningServiceError::Mismatch(
+                    "workload_security_profile".into(),
+                ),
+            ));
+        }
     }
     if customer_signed_deploy_required(
         state.attestation.as_ref(),
@@ -575,14 +649,16 @@ pub async fn deploy(
                  image_digest = $2,
                  command = COALESCE($3, command),
                  port = COALESCE($4, port),
-                 storage_paths = COALESCE($5, storage_paths)
-             WHERE app_id = $6 AND name = $7",
+                 storage_paths = COALESCE($5, storage_paths),
+                 workload_security_profile = $6
+             WHERE app_id = $7 AND name = $8",
         )
         .bind(&body.image)
         .bind(Some(&image_digest))
         .bind(signed_workload_command.as_ref())
         .bind(signed_container_port)
         .bind(signed_storage_paths.as_ref())
+        .bind(workload_security_profile.as_str())
         .bind(app.id)
         .bind(container_name)
         .execute(&state.db)
@@ -595,8 +671,8 @@ pub async fn deploy(
         })?;
     } else {
         sqlx::query(
-            "INSERT INTO app_containers (id, app_id, name, image_ref, image_digest, command, port, storage_paths, is_primary)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)",
+            "INSERT INTO app_containers (id, app_id, name, image_ref, image_digest, command, port, storage_paths, workload_security_profile, is_primary)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)",
         )
         .bind(Uuid::new_v4())
         .bind(app.id)
@@ -606,6 +682,7 @@ pub async fn deploy(
         .bind(signed_workload_command.as_ref())
         .bind(signed_container_port)
         .bind(signed_storage_paths.as_ref())
+        .bind(workload_security_profile.as_str())
         .execute(&state.db)
         .await
         .map_err(|_| {
@@ -709,6 +786,7 @@ pub async fn deploy(
         "signed_descriptor_core_hash": signing_artifacts
             .as_ref()
             .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
+        "workload_security_profile": workload_security_profile.as_str(),
     });
 
     // Create deployment record. cosign_verified is set from the actual

@@ -745,7 +745,12 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
         .with_context(|| format!("chown {}", state_root.display()))?;
     chown::chown_recursive(tls_state_root, caddy_identity)
         .with_context(|| format!("chown {}", tls_state_root.display()))?;
-    prepare_managed_config_dir(state_root, cfg.app_gid)?;
+    prepare_managed_config_dir(
+        state_root,
+        cfg.managed_config_gid.unwrap_or(cfg.app_gid),
+        cfg.managed_config_dir_mode
+            .unwrap_or(MANAGED_CONFIG_DIR_MODE),
+    )?;
 
     let caddy_tls_dir = caddy_tls_bind_dir(tls_state_root);
     std::fs::create_dir_all(&caddy_tls_dir)
@@ -786,13 +791,18 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-fn prepare_managed_config_dir(state_root: &Path, app_gid: u32) -> Result<()> {
-    prepare_managed_config_dir_at(state_root, app_gid, |path, identity| {
+fn prepare_managed_config_dir(state_root: &Path, managed_gid: u32, mode: u32) -> Result<()> {
+    prepare_managed_config_dir_at(state_root, managed_gid, mode, |path, identity| {
         chown::chown(path, identity).map_err(Into::into)
     })
 }
 
-fn prepare_managed_config_dir_at<F>(state_root: &Path, app_gid: u32, mut chown_dir: F) -> Result<()>
+fn prepare_managed_config_dir_at<F>(
+    state_root: &Path,
+    managed_gid: u32,
+    mode: u32,
+    mut chown_dir: F,
+) -> Result<()>
 where
     F: FnMut(&Path, chown::ExecIdentity) -> Result<()>,
 {
@@ -800,7 +810,7 @@ where
     let config_dir = state_root.join(MANAGED_CONFIG_DIR);
     let config_identity = chown::ExecIdentity {
         uid: 0,
-        gid: app_gid,
+        gid: managed_gid,
         kind: chown::IdentityKind::Numeric,
     };
 
@@ -808,7 +818,7 @@ where
         .with_context(|| format!("creating {}", config_dir.display()))?;
     for dir in [&managed_root, &config_dir] {
         chown_dir(dir, config_identity).with_context(|| format!("chown {}", dir.display()))?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(MANAGED_CONFIG_DIR_MODE))
+        fs::set_permissions(dir, fs::Permissions::from_mode(mode))
             .with_context(|| format!("chmod {}", dir.display()))?;
     }
 

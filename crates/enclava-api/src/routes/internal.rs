@@ -161,6 +161,8 @@ pub struct InternalDeployRequest {
     pub org_keyring_blob: Option<String>,
     #[serde(default)]
     pub signed_policy_artifact: Option<String>,
+    #[serde(default)]
+    pub workload_security_profile: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1218,6 +1220,7 @@ pub async fn deploy_paas_app(
         customer_descriptor_blob: body.customer_descriptor_blob,
         org_keyring_blob: body.org_keyring_blob,
         signed_policy_artifact: body.signed_policy_artifact,
+        workload_security_profile: body.workload_security_profile,
     };
     let (status, Json(response)) = crate::routes::deployments::deploy(
         auth,

@@ -43,6 +43,7 @@ pub fn sample_app() -> ConfidentialApp {
             command: None,
             env: HashMap::new(),
             storage_paths: vec!["/app/data".to_string()],
+            workload_security_profile: WorkloadSecurityProfile::Restricted,
             is_primary: true,
         }],
         storage: StorageSpec::new("10Gi", "2Gi"),

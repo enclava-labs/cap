@@ -55,6 +55,7 @@ pub struct CapAppOciRuntimeSpecInput {
     pub port: u16,
     pub workload_command: Vec<String>,
     pub storage_paths: Vec<String>,
+    pub workload_security_profile: enclava_engine::types::WorkloadSecurityProfile,
     pub cpu_limit: String,
     pub memory_limit: String,
 }
@@ -65,6 +66,8 @@ pub const CAP_APP_UID: u32 = 10001;
 pub const CAP_APP_GID: u32 = 10001;
 pub const CAP_APP_CPU_REQUEST: &str = "250m";
 pub const CAP_APP_MEMORY_REQUEST: &str = "512Mi";
+const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
+    &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
 
 fn storage_subdir(path: &str) -> String {
     path.trim_start_matches('/').replace('/', "-")
@@ -100,6 +103,38 @@ pub fn cap_app_oci_runtime_spec(input: CapAppOciRuntimeSpecInput) -> OciRuntimeS
         options: vec!["rw".to_string()],
     }));
 
+    let (capabilities, security_context) = match input.workload_security_profile {
+        enclava_engine::types::WorkloadSecurityProfile::PlatformManagedSshRelay => (
+            Capabilities {
+                add: PLATFORM_MANAGED_SSH_RELAY_CAPS
+                    .iter()
+                    .map(|cap| (*cap).to_string())
+                    .collect(),
+                drop: vec!["ALL".to_string()],
+            },
+            SecurityContext {
+                run_as_user: 0,
+                run_as_group: 0,
+                read_only_root_fs: true,
+                allow_privilege_escalation: false,
+                privileged: false,
+            },
+        ),
+        enclava_engine::types::WorkloadSecurityProfile::Restricted => (
+            Capabilities {
+                add: Vec::new(),
+                drop: vec!["ALL".to_string()],
+            },
+            SecurityContext {
+                run_as_user: CAP_APP_UID,
+                run_as_group: CAP_APP_GID,
+                read_only_root_fs: true,
+                allow_privilege_escalation: false,
+                privileged: false,
+            },
+        ),
+    };
+
     OciRuntimeSpec {
         command: vec![CAP_WAIT_EXEC_PATH.to_string()],
         args: input.workload_command,
@@ -115,17 +150,8 @@ pub fn cap_app_oci_runtime_spec(input: CapAppOciRuntimeSpecInput) -> OciRuntimeS
             protocol: "TCP".to_string(),
         }],
         mounts,
-        capabilities: Capabilities {
-            add: Vec::new(),
-            drop: vec!["ALL".to_string()],
-        },
-        security_context: SecurityContext {
-            run_as_user: CAP_APP_UID,
-            run_as_group: CAP_APP_GID,
-            read_only_root_fs: true,
-            allow_privilege_escalation: false,
-            privileged: false,
-        },
+        capabilities,
+        security_context,
         resources: Resources {
             requests: vec![
                 named_value("cpu", CAP_APP_CPU_REQUEST),
