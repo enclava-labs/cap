@@ -19,6 +19,8 @@ const LOCAL_WORKLOAD_ARTIFACTS_PATH: &str = "/etc/enclava-init/workload-artifact
 const LOCAL_TRUSTEE_POLICY_PATH: &str = "/etc/enclava-init/trustee-policy.json";
 const APP_UID: u32 = 10001;
 const APP_GID: u32 = 10001;
+const ROOT_UID: u32 = 0;
+const ROOT_GID: u32 = 0;
 const CADDY_UID: u32 = 10002;
 const CADDY_GID: u32 = 10002;
 const ROOT_ONLY_MANAGED_CONFIG_DIR_MODE: u32 = 0o700;
@@ -72,8 +74,8 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     out.push_str("state-root = \"/state\"\n");
     out.push_str("unlock-socket = \"/run/enclava-unlock/unlock.sock\"\n");
     out.push_str("attempts-path = \"/run/enclava-unlock/unlock-attempts\"\n");
-    out.push_str(&format!("app-uid = {APP_UID}\n"));
-    out.push_str(&format!("app-gid = {APP_GID}\n"));
+    out.push_str(&format!("app-uid = {}\n", primary_app_uid(app)));
+    out.push_str(&format!("app-gid = {}\n", primary_app_gid(app)));
     if primary_uses_platform_managed_ssh_relay(app) {
         out.push_str("managed-config-gid = 0\n");
         out.push_str(&format!(
@@ -179,6 +181,22 @@ fn primary_uses_platform_managed_ssh_relay(app: &ConfidentialApp) -> bool {
     app.primary_container().is_some_and(|primary| {
         primary.workload_security_profile == WorkloadSecurityProfile::PlatformManagedSshRelay
     })
+}
+
+fn primary_app_uid(app: &ConfidentialApp) -> u32 {
+    if primary_uses_platform_managed_ssh_relay(app) {
+        ROOT_UID
+    } else {
+        APP_UID
+    }
+}
+
+fn primary_app_gid(app: &ConfidentialApp) -> u32 {
+    if primary_uses_platform_managed_ssh_relay(app) {
+        ROOT_GID
+    } else {
+        APP_GID
+    }
 }
 
 pub(crate) fn argon2_salt_hex(app: &ConfidentialApp) -> String {
