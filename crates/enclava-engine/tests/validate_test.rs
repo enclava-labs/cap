@@ -1,4 +1,5 @@
 use enclava_engine::testutil::{sample_app, sample_password_app};
+use enclava_engine::types::{ConfidentialRuntimeProfile, GpuResourceSpec};
 use enclava_engine::validate::validate_app;
 
 #[test]
@@ -103,4 +104,41 @@ fn rejects_caddy_without_digest() {
         enclava_common::image::ImageRef::parse("ghcr.io/enclava-labs/caddy:v1").unwrap();
     let err = validate_app(&app).unwrap_err();
     assert!(err.to_string().contains("caddy"));
+}
+
+#[test]
+fn rejects_nvidia_gpu_profile_without_gpu_resource() {
+    let mut app = sample_app();
+    app.runtime_profile = ConfidentialRuntimeProfile::NvidiaGpuSnp;
+
+    let err = validate_app(&app).unwrap_err();
+
+    assert!(err.to_string().contains("GPU runtime profile requires"));
+}
+
+#[test]
+fn rejects_gpu_resource_without_nvidia_profile() {
+    let mut app = sample_app();
+    app.gpu = Some(GpuResourceSpec {
+        resource_name: "nvidia.com/GH100_H100_PCIE".to_string(),
+        count: 1,
+        cdi_device: None,
+    });
+
+    let err = validate_app(&app).unwrap_err();
+
+    assert!(err.to_string().contains("only valid"));
+}
+
+#[test]
+fn valid_nvidia_gpu_profile_passes_with_gpu_resource() {
+    let mut app = sample_app();
+    app.runtime_profile = ConfidentialRuntimeProfile::NvidiaGpuSnp;
+    app.gpu = Some(GpuResourceSpec {
+        resource_name: "nvidia.com/GH100_H100_PCIE".to_string(),
+        count: 1,
+        cdi_device: Some("nvidia.com/pgpu=0".to_string()),
+    });
+
+    validate_app(&app).expect("GPU runtime app should be valid with GPU resource");
 }

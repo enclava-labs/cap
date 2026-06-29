@@ -123,6 +123,25 @@ pub async fn rollback(
     let rollback_storage_paths = rollback_descriptor
         .as_ref()
         .map(crate::deploy::descriptor_storage_paths);
+    let rollback_runtime_profile = rollback_descriptor
+        .as_ref()
+        .map(|descriptor| {
+            enclava_engine::types::ConfidentialRuntimeProfile::from_runtime_class(
+                &descriptor.expected_runtime_class,
+            )
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "unsupported descriptor expected_runtime_class {}",
+                            descriptor.expected_runtime_class
+                        )
+                    })),
+                )
+            })
+        })
+        .transpose()?;
     if customer_signed_deploy_required(
         state.attestation.as_ref(),
         state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
@@ -242,6 +261,7 @@ pub async fn rollback(
                 kbs_policy_config: kbs_policy,
                 api_signing_pubkey,
                 api_url,
+                runtime_profile: rollback_runtime_profile,
                 workload_artifact_binding,
                 signed_policy_artifact,
                 local_workload_artifacts_json,

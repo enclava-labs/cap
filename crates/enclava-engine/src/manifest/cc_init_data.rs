@@ -74,11 +74,12 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         "signer_identity_issuer",
         app.signer_identity_issuer.as_deref(),
     );
+    let runtime_class = app.runtime_profile.runtime_class();
     assert_non_empty("image_digest", &image_digest);
     assert_non_empty("namespace", &app.namespace);
     assert_non_empty("service_account", &app.service_account);
     assert_non_empty("identity_hash", &app.tenant_instance_identity_hash);
-    assert_non_empty("runtime_class", DEFAULT_RUNTIME_CLASS);
+    assert_non_empty("runtime_class", runtime_class);
     assert_non_empty(
         "sidecar_digests.attestation_proxy",
         app.attestation.proxy_image.digest(),
@@ -103,7 +104,7 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     toml.push('\n');
     toml.push_str("[data]\n");
     push_toml_string(&mut toml, "image_digest", &image_digest);
-    push_toml_string(&mut toml, "runtime_class", DEFAULT_RUNTIME_CLASS);
+    push_toml_string(&mut toml, "runtime_class", runtime_class);
     push_toml_string(&mut toml, "namespace", &app.namespace);
     push_toml_string(&mut toml, "service_account", &app.service_account);
     push_toml_string(
@@ -248,7 +249,7 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     toml
 }
 
-/// The SNP runtime class CAP requires. enclava-init reads this from cc_init_data
+/// The legacy SNP runtime class CAP requires by default. enclava-init reads this from cc_init_data
 /// at boot and refuses to start if the rendered Pod's `runtimeClassName` differs.
 pub const DEFAULT_RUNTIME_CLASS: &str = "kata-qemu-snp";
 
@@ -459,11 +460,25 @@ pub fn verify_runtime_class_binding(
         .as_ref()
         .and_then(|s| s.template.spec.as_ref())
         .and_then(|p| p.runtime_class_name.as_deref());
-    match actual {
-        Some(name) if name == DEFAULT_RUNTIME_CLASS => Ok(()),
-        Some(other) => Err(format!(
-            "rendered Pod runtimeClassName is `{other}`, expected `{DEFAULT_RUNTIME_CLASS}`"
+    let annotation = sts
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.metadata.as_ref())
+        .and_then(|m| m.annotations.as_ref())
+        .and_then(|a| a.get("io.containerd.cri.runtime-handler"))
+        .map(String::as_str);
+    match (actual, annotation) {
+        (Some(name), Some(handler))
+            if name == handler && crate::types::supported_runtime_class(name) =>
+        {
+            Ok(())
+        }
+        (Some(name), Some(handler)) if name != handler => Err(format!(
+            "rendered Pod runtimeClassName `{name}` does not match runtime-handler annotation `{handler}`"
         )),
-        None => Err("rendered Pod has no runtimeClassName".to_string()),
+        (Some(other), _) => Err(format!(
+            "unsupported rendered Pod runtimeClassName `{other}`"
+        )),
+        (None, _) => Err("rendered Pod has no runtimeClassName".to_string()),
     }
 }

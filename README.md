@@ -157,8 +157,12 @@ runtime:
 - Digest-pinned `attestation-proxy`, `caddy-ingress`, and `enclava-init` images.
 - A signed platform release compiled or supplied with the pinned release root
   key.
-- A Kubernetes cluster with the confidential runtime class used by
-  `enclava-engine`.
+- A Kubernetes cluster with the confidential runtime class selected by the
+  signed platform release. CAP renders `kata-qemu-snp` by default and can bind
+  signed TDX descriptors to `kata-qemu-tdx`.
+- NVIDIA GPU confidential workloads require NVIDIA GPU Operator/Kata runtime
+  setup, GPU passthrough node labels, and an explicit GPU extended resource name
+  such as the product-specific resource advertised by the device plugin.
 - Trustee KBS reachable by the guest AA/CDH path over the configured HTTPS
   endpoint.
 - Policy signing service reachable by CAP for generated agent policy and signed

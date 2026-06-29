@@ -20,6 +20,14 @@ pub enum ValidationError {
     InvalidIdentityHashHex,
     #[error("sidecar image '{name}' must be pinned by digest: {detail}")]
     SidecarImageNotPinned { name: String, detail: String },
+    #[error("NVIDIA GPU runtime profile requires gpu resource spec")]
+    MissingGpuResource,
+    #[error("gpu resource spec requires a non-empty resource_name")]
+    EmptyGpuResourceName,
+    #[error("gpu resource spec count must be greater than zero")]
+    InvalidGpuCount,
+    #[error("gpu resource spec is only valid with an NVIDIA GPU runtime profile")]
+    UnexpectedGpuResource,
 }
 
 /// Validates that a ConfidentialApp spec is well-formed.
@@ -81,6 +89,16 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
             name: "caddy".to_string(),
             detail: e.to_string(),
         });
+    }
+
+    match (app.runtime_profile.is_nvidia_gpu(), app.gpu.as_ref()) {
+        (true, None) => return Err(ValidationError::MissingGpuResource),
+        (false, Some(_)) => return Err(ValidationError::UnexpectedGpuResource),
+        (_, Some(gpu)) if gpu.resource_name.trim().is_empty() => {
+            return Err(ValidationError::EmptyGpuResourceName);
+        }
+        (_, Some(gpu)) if gpu.count == 0 => return Err(ValidationError::InvalidGpuCount),
+        _ => {}
     }
 
     Ok(())

@@ -18,6 +18,8 @@ use crate::types::ConfidentialApp;
 pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     let (cc_init_data_encoded, cc_init_data_hash) = cc_init_data::compute_cc_init_data(app);
     let kbs_url = cc_init_data::trustee_kbs_url();
+    let runtime_profile = app.runtime_profile;
+    let runtime_class = runtime_profile.runtime_class();
 
     let mut pod_labels = BTreeMap::new();
     pod_labels.insert("app".to_string(), app.name.clone());
@@ -25,7 +27,7 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     let mut annotations = BTreeMap::new();
     annotations.insert(
         "io.containerd.cri.runtime-handler".to_string(),
-        "kata-qemu-snp".to_string(),
+        runtime_class.to_string(),
     );
     annotations.insert(
         "io.katacontainers.config.hypervisor.kernel_params".to_string(),
@@ -47,6 +49,9 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
         crate::types::TENANT_INSTANCE_ANNOTATION.to_string(),
         app.name.clone(),
     );
+    if let Some(cdi_device) = app.gpu.as_ref().and_then(|gpu| gpu.cdi_device.as_deref()) {
+        annotations.insert("cdi.k8s.io/gpu".to_string(), cdi_device.to_string());
+    }
 
     let legacy = legacy_bootstrap_enabled();
 
@@ -56,6 +61,30 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
         "true".to_string(),
     );
     node_selector.insert("node.kubernetes.io/worker".to_string(), "true".to_string());
+    match runtime_profile {
+        crate::types::ConfidentialRuntimeProfile::Tdx
+        | crate::types::ConfidentialRuntimeProfile::NvidiaGpuTdx => {
+            node_selector.insert(
+                "feature.node.kubernetes.io/cpu-security.tdx.enabled".to_string(),
+                "true".to_string(),
+            );
+        }
+        crate::types::ConfidentialRuntimeProfile::SevSnp
+        | crate::types::ConfidentialRuntimeProfile::NvidiaGpuSnp => {}
+    }
+    if runtime_profile.is_nvidia_gpu() {
+        node_selector.insert(
+            "nvidia.com/gpu.workload.config".to_string(),
+            "vm-passthrough".to_string(),
+        );
+        node_selector.insert("nvidia.com/cc.capable".to_string(), "true".to_string());
+    }
+    if runtime_profile == crate::types::ConfidentialRuntimeProfile::NvidiaGpuSnp {
+        node_selector.insert(
+            "feature.node.kubernetes.io/cpu-security.sev.snp.enabled".to_string(),
+            "true".to_string(),
+        );
+    }
 
     let mut selector_labels = BTreeMap::new();
     selector_labels.insert("app".to_string(), app.name.clone());
@@ -124,9 +153,7 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
-                    runtime_class_name: Some(
-                        super::cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
-                    ),
+                    runtime_class_name: Some(runtime_class.to_string()),
                     service_account_name: Some(app.service_account.clone()),
                     automount_service_account_token: Some(false),
                     enable_service_links: Some(false),

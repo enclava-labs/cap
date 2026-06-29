@@ -226,6 +226,7 @@ pub struct ApplyDeploymentManifestsRequest {
     pub kbs_policy_config: Option<crate::kbs::KbsPolicyConfig>,
     pub api_signing_pubkey: String,
     pub api_url: String,
+    pub runtime_profile: Option<enclava_engine::types::ConfidentialRuntimeProfile>,
     pub workload_artifact_binding: Option<WorkloadArtifactBinding>,
     pub signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
     pub local_workload_artifacts_json: Option<String>,
@@ -428,6 +429,8 @@ pub async fn build_confidential_app(
             cpu: resources.cpu_limit,
             memory: resources.memory_limit,
         },
+        runtime_profile: enclava_engine::types::ConfidentialRuntimeProfile::default(),
+        gpu: None,
         attestation: attestation_config.clone(),
         egress_allowlist: app.egress_allowlist.0.clone(),
         workload_artifact_binding: None,
@@ -740,6 +743,8 @@ mod tests {
                 cpu: "1".to_string(),
                 memory: "1Gi".to_string(),
             },
+            runtime_profile: enclava_engine::types::ConfidentialRuntimeProfile::default(),
+            gpu: None,
             attestation: AttestationConfig {
                 proxy_image: ImageRef::parse(
                     "ghcr.io/enclava-labs/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -817,6 +822,8 @@ mod tests {
                 cpu: "1".to_string(),
                 memory: "1Gi".to_string(),
             },
+            runtime_profile: enclava_engine::types::ConfidentialRuntimeProfile::default(),
+            gpu: None,
             attestation: AttestationConfig {
                 proxy_image: ImageRef::parse(
                     "ghcr.io/enclava-labs/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -997,6 +1004,7 @@ pub async fn apply_deployment_manifests(
         kbs_policy_config,
         api_signing_pubkey,
         api_url,
+        runtime_profile,
         workload_artifact_binding,
         signed_policy_artifact,
         local_workload_artifacts_json,
@@ -1011,6 +1019,9 @@ pub async fn apply_deployment_manifests(
         &api_url,
     )
     .await?;
+    if let Some(runtime_profile) = runtime_profile {
+        app_spec.runtime_profile = runtime_profile;
+    }
     app_spec.workload_artifact_binding = workload_artifact_binding;
     if let (Some(workload_artifacts), Some(trustee_policy)) =
         (local_workload_artifacts_json, local_trustee_policy_json)

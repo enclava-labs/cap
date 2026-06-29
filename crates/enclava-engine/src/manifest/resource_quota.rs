@@ -82,6 +82,17 @@ pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
     hard.insert("secrets".to_string(), Quantity("50".to_string()));
     hard.insert("configmaps".to_string(), Quantity("50".to_string()));
 
+    if let Some(gpu) = app.gpu.as_ref() {
+        hard.insert(
+            format!("requests.{}", gpu.resource_name),
+            Quantity(gpu.count.to_string()),
+        );
+        hard.insert(
+            format!("limits.{}", gpu.resource_name),
+            Quantity(gpu.count.to_string()),
+        );
+    }
+
     let mut labels = BTreeMap::new();
     labels.insert(
         "app.kubernetes.io/managed-by".to_string(),

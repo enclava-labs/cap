@@ -334,6 +334,19 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
         None
     };
 
+    let mut requests = std::collections::BTreeMap::new();
+    requests.insert("memory".to_string(), Quantity("512Mi".to_string()));
+    requests.insert("cpu".to_string(), Quantity("250m".to_string()));
+
+    let mut limits = std::collections::BTreeMap::new();
+    limits.insert("memory".to_string(), Quantity(app.resources.memory.clone()));
+    limits.insert("cpu".to_string(), Quantity(app.resources.cpu.clone()));
+    if let Some(gpu) = app.gpu.as_ref() {
+        let count = Quantity(gpu.count.to_string());
+        requests.insert(gpu.resource_name.clone(), count.clone());
+        limits.insert(gpu.resource_name.clone(), count);
+    }
+
     Container {
         name: primary.name.clone(),
         image: Some(primary.image.digest_ref()),
@@ -348,18 +361,8 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
         volume_mounts: Some(volume_mounts),
         security_context: Some(security_context),
         resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
-            requests: Some({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity("512Mi".to_string()));
-                m.insert("cpu".to_string(), Quantity("250m".to_string()));
-                m
-            }),
-            limits: Some({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity(app.resources.memory.clone()));
-                m.insert("cpu".to_string(), Quantity(app.resources.cpu.clone()));
-                m
-            }),
+            requests: Some(requests),
+            limits: Some(limits),
             ..Default::default()
         }),
         liveness_probe: None,
@@ -633,8 +636,14 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("ATTESTATION_WORKLOAD_CONTAINER", &primary.name),
         env_field_ref("ATTESTATION_POD_NAME", "metadata.name"),
         env_field_ref("ATTESTATION_POD_NAMESPACE", "metadata.namespace"),
-        env("ATTESTATION_PROFILE", "coco-sev-snp"),
-        env("ATTESTATION_RUNTIME_CLASS", "kata-qemu-snp"),
+        env(
+            "ATTESTATION_PROFILE",
+            app.runtime_profile.attestation_profile(),
+        ),
+        env(
+            "ATTESTATION_RUNTIME_CLASS",
+            app.runtime_profile.runtime_class(),
+        ),
         env("ATTESTATION_WORKLOAD_IMAGE", &primary.image.digest_ref()),
         env("ATTESTATION_BIND", "127.0.0.1"),
         env("ATTESTATION_TLS_BIND", "0.0.0.0"),

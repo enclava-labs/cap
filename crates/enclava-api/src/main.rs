@@ -321,13 +321,10 @@ fn load_platform_release(enabled: bool) -> anyhow::Result<Option<PlatformRelease
     }
     let release = PlatformRelease::load_verified()
         .map_err(|e| anyhow::anyhow!("failed to load signed platform release: {e}"))?;
-    if release.expected_runtime_class
-        != enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
-    {
+    if !enclava_engine::types::supported_runtime_class(&release.expected_runtime_class) {
         anyhow::bail!(
-            "signed platform release runtime class `{}` does not match API runtime class `{}`",
-            release.expected_runtime_class,
-            enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
+            "signed platform release runtime class `{}` is not supported by this API build",
+            release.expected_runtime_class
         );
     }
     Ok(Some(release))

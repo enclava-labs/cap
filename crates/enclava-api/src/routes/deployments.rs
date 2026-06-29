@@ -618,7 +618,23 @@ pub async fn deploy(
 
     let mut workload_artifact_binding = None;
     let mut signed_policy_artifact = None;
+    let mut runtime_profile = None;
     if let Some(artifacts) = signing_artifacts.as_ref() {
+        let descriptor_runtime_profile =
+            enclava_engine::types::ConfidentialRuntimeProfile::from_runtime_class(
+                &artifacts.descriptor.expected_runtime_class,
+            )
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "unsupported descriptor expected_runtime_class {}",
+                            artifacts.descriptor.expected_runtime_class
+                        )
+                    })),
+                )
+            })?;
         let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
         artifacts
             .validate_deployment_inputs(&app, &image_digest, &api_signing_pubkey)
@@ -644,6 +660,7 @@ pub async fn deploy(
                 Json(serde_json::json!({"error": e.to_string()})),
             )
         })?;
+        app_spec.runtime_profile = descriptor_runtime_profile;
         let binding = artifacts.binding();
         app_spec.workload_artifact_binding = Some(binding.clone());
 
@@ -688,6 +705,7 @@ pub async fn deploy(
             .map_err(signing_error_response)?;
         workload_artifact_binding = Some(binding);
         signed_policy_artifact = Some(signed);
+        runtime_profile = Some(descriptor_runtime_profile);
     }
 
     let deploy_id = signing_artifacts
@@ -844,6 +862,7 @@ pub async fn deploy(
                 kbs_policy_config: kbs_policy,
                 api_signing_pubkey,
                 api_url,
+                runtime_profile,
                 workload_artifact_binding,
                 signed_policy_artifact,
                 local_workload_artifacts_json,

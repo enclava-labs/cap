@@ -7,7 +7,8 @@ use enclava_common::descriptor::{
 use enclava_common::image::ImageRef;
 use enclava_common::types::{Durability, ResourceLimits, UnlockMode};
 use enclava_engine::types::{
-    AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec, VolumeSpec,
+    AttestationConfig, BindMount, ConfidentialApp, ConfidentialRuntimeProfile, Container,
+    DomainSpec, StorageSpec, VolumeSpec,
 };
 
 #[test]
@@ -547,6 +548,8 @@ fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> Confide
             cpu: "1".to_string(),
             memory: "512Mi".to_string(),
         },
+        runtime_profile: ConfidentialRuntimeProfile::default(),
+        gpu: None,
         attestation: AttestationConfig {
             proxy_image: ImageRef::parse(&format!(
                 "ghcr.io/enclava-labs/attestation-proxy@{}",

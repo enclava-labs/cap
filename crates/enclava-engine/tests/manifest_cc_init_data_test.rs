@@ -1,6 +1,8 @@
 use enclava_engine::manifest::cc_init_data::{build_toml, encode_cc_init_data, sha256_hex};
 use enclava_engine::testutil::sample_app;
-use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
+use enclava_engine::types::{
+    ConfidentialRuntimeProfile, GeneratedAgentPolicy, WorkloadArtifactBinding,
+};
 use sha2::{Digest, Sha256};
 
 #[test]
@@ -358,6 +360,16 @@ fn toml_binds_runtime_class() {
     let app = sample_app();
     let toml = build_toml(&app);
     assert!(toml.contains("runtime_class = \"kata-qemu-snp\""));
+}
+
+#[test]
+fn toml_binds_tdx_runtime_class() {
+    let mut app = sample_app();
+    app.runtime_profile = ConfidentialRuntimeProfile::Tdx;
+
+    let toml = build_toml(&app);
+
+    assert!(toml.contains("runtime_class = \"kata-qemu-tdx\""));
 }
 
 #[test]

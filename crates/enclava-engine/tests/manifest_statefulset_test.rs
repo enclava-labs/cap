@@ -1,5 +1,6 @@
 use enclava_engine::manifest::statefulset::generate_statefulset;
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::{ConfidentialRuntimeProfile, GpuResourceSpec};
 
 #[test]
 fn statefulset_name() {
@@ -44,6 +45,89 @@ fn statefulset_runtime_class() {
         pod_spec.runtime_class_name.as_deref(),
         Some("kata-qemu-snp")
     );
+}
+
+#[test]
+fn statefulset_renders_tdx_runtime_profile() {
+    let mut app = sample_app();
+    app.runtime_profile = ConfidentialRuntimeProfile::Tdx;
+
+    let sts = generate_statefulset(&app);
+    let template = &sts.spec.as_ref().unwrap().template;
+    let pod_spec = template.spec.as_ref().unwrap();
+    let annotations = template
+        .metadata
+        .as_ref()
+        .unwrap()
+        .annotations
+        .as_ref()
+        .unwrap();
+    let node_selector = pod_spec.node_selector.as_ref().unwrap();
+
+    assert_eq!(
+        pod_spec.runtime_class_name.as_deref(),
+        Some("kata-qemu-tdx")
+    );
+    assert_eq!(
+        annotations.get("io.containerd.cri.runtime-handler"),
+        Some(&"kata-qemu-tdx".to_string())
+    );
+    assert_eq!(
+        node_selector.get("feature.node.kubernetes.io/cpu-security.tdx.enabled"),
+        Some(&"true".to_string())
+    );
+}
+
+#[test]
+fn statefulset_renders_nvidia_gpu_snp_profile() {
+    let mut app = sample_app();
+    app.runtime_profile = ConfidentialRuntimeProfile::NvidiaGpuSnp;
+    app.gpu = Some(GpuResourceSpec {
+        resource_name: "nvidia.com/GH100_H100_PCIE".to_string(),
+        count: 1,
+        cdi_device: Some("nvidia.com/pgpu=0".to_string()),
+    });
+
+    let sts = generate_statefulset(&app);
+    let template = &sts.spec.as_ref().unwrap().template;
+    let pod_spec = template.spec.as_ref().unwrap();
+    let annotations = template
+        .metadata
+        .as_ref()
+        .unwrap()
+        .annotations
+        .as_ref()
+        .unwrap();
+    let node_selector = pod_spec.node_selector.as_ref().unwrap();
+    let primary = pod_spec
+        .containers
+        .iter()
+        .find(|container| container.name == "web")
+        .unwrap();
+    let resources = primary.resources.as_ref().unwrap();
+    let limits = resources.limits.as_ref().unwrap();
+
+    assert_eq!(
+        pod_spec.runtime_class_name.as_deref(),
+        Some("kata-qemu-nvidia-gpu-snp")
+    );
+    assert_eq!(
+        annotations.get("io.containerd.cri.runtime-handler"),
+        Some(&"kata-qemu-nvidia-gpu-snp".to_string())
+    );
+    assert_eq!(
+        annotations.get("cdi.k8s.io/gpu"),
+        Some(&"nvidia.com/pgpu=0".to_string())
+    );
+    assert_eq!(
+        node_selector.get("nvidia.com/gpu.workload.config"),
+        Some(&"vm-passthrough".to_string())
+    );
+    assert_eq!(
+        node_selector.get("nvidia.com/cc.capable"),
+        Some(&"true".to_string())
+    );
+    assert_eq!(limits.get("nvidia.com/GH100_H100_PCIE").unwrap().0, "1");
 }
 
 #[test]

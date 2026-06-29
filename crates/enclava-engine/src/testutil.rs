@@ -55,6 +55,8 @@ pub fn sample_app() -> ConfidentialApp {
         api_signing_pubkey: "test-pubkey-placeholder".to_string(),
         api_url: "https://api.enclava.dev".to_string(),
         resources: ResourceLimits::default(),
+        runtime_profile: ConfidentialRuntimeProfile::default(),
+        gpu: None,
         attestation: AttestationConfig {
             proxy_image: ImageRef::parse(
                 "ghcr.io/enclava-labs/attestation-proxy@sha256:\

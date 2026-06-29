@@ -236,6 +236,16 @@ pub(crate) fn confidential_app_for_cc_hash(
         other => return Err(format!("unsupported unlock mode {other}").into()),
     };
 
+    let runtime_profile = enclava_engine::types::ConfidentialRuntimeProfile::from_runtime_class(
+        &release.expected_runtime_class,
+    )
+    .ok_or_else(|| {
+        format!(
+            "platform release runtime class {} is not supported by this CLI build",
+            release.expected_runtime_class
+        )
+    })?;
+
     Ok(ConfidentialApp {
         app_id: Uuid::parse_str(&app.id)?,
         name: app.name.clone(),
@@ -273,6 +283,8 @@ pub(crate) fn confidential_app_for_cc_hash(
             cpu: app_config.resources.cpu.clone(),
             memory: app_config.resources.memory.clone(),
         },
+        runtime_profile,
+        gpu: None,
         attestation: AttestationConfig {
             proxy_image: enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?,
             caddy_image: enclava_common::image::ImageRef::parse(&release.caddy_ingress_image)?,

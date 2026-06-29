@@ -1,5 +1,6 @@
 use enclava_engine::manifest::resource_quota::generate_resource_quota;
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::{ConfidentialRuntimeProfile, GpuResourceSpec};
 
 #[test]
 fn resource_quota_name_and_namespace() {
@@ -59,6 +60,29 @@ fn resource_quota_has_pods_services_secrets_configmaps() {
     assert!(hard.contains_key("services"));
     assert!(hard.contains_key("secrets"));
     assert!(hard.contains_key("configmaps"));
+}
+
+#[test]
+fn resource_quota_includes_gpu_resources_when_requested() {
+    let mut app = sample_app();
+    app.runtime_profile = ConfidentialRuntimeProfile::NvidiaGpuSnp;
+    app.gpu = Some(GpuResourceSpec {
+        resource_name: "nvidia.com/GH100_H100_PCIE".to_string(),
+        count: 1,
+        cdi_device: None,
+    });
+
+    let rq = generate_resource_quota(&app);
+    let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
+
+    assert_eq!(
+        hard.get("requests.nvidia.com/GH100_H100_PCIE").unwrap().0,
+        "1"
+    );
+    assert_eq!(
+        hard.get("limits.nvidia.com/GH100_H100_PCIE").unwrap().0,
+        "1"
+    );
 }
 
 #[test]

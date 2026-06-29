@@ -539,7 +539,23 @@ pub async fn update_unlock_mode(
     let mut signed_workload_command = None;
     let mut signed_container_port = None;
     let mut signed_storage_paths = None;
+    let mut runtime_profile = None;
     if let Some(artifacts) = signing_artifacts.as_ref() {
+        let descriptor_runtime_profile =
+            enclava_engine::types::ConfidentialRuntimeProfile::from_runtime_class(
+                &artifacts.descriptor.expected_runtime_class,
+            )
+            .ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "unsupported descriptor expected_runtime_class {}",
+                            artifacts.descriptor.expected_runtime_class
+                        )
+                    })),
+                )
+            })?;
         let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
         let image_digest_ref = image_digest.as_deref().ok_or((
             StatusCode::BAD_REQUEST,
@@ -583,6 +599,7 @@ pub async fn update_unlock_mode(
                 Json(serde_json::json!({"error": e.to_string()})),
             )
         })?;
+        app_spec.runtime_profile = descriptor_runtime_profile;
         crate::deploy::set_primary_descriptor_runtime(&mut app_spec, &artifacts.descriptor);
         let binding = artifacts.binding();
         app_spec.workload_artifact_binding = Some(binding.clone());
@@ -609,6 +626,7 @@ pub async fn update_unlock_mode(
             .map_err(crate::routes::deployments::signing_error_response)?;
         workload_artifact_binding = Some(binding);
         signed_policy_artifact = Some(signed);
+        runtime_profile = Some(descriptor_runtime_profile);
     }
 
     let receipt_json = serde_json::to_value(receipt).map_err(|_| {
@@ -814,6 +832,7 @@ pub async fn update_unlock_mode(
                 kbs_policy_config: kbs_policy,
                 api_signing_pubkey,
                 api_url,
+                runtime_profile,
                 workload_artifact_binding,
                 signed_policy_artifact,
                 local_workload_artifacts_json,

@@ -6,6 +6,83 @@ use uuid::Uuid;
 pub const TENANT_INSTANCE_ANNOTATION: &str = "tenant.enclava.dev/instance";
 pub const LEGACY_TENANT_INSTANCE_ANNOTATION: &str = "tenant.flowforge.sh/instance";
 
+/// Confidential runtime profile selected for a workload.
+///
+/// This is intentionally higher-level than `runtimeClassName`: CAP signs and
+/// verifies the runtime class as a trust claim, but also needs one place to
+/// derive attestation profile, scheduling selectors, and GPU passthrough
+/// resources from that class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfidentialRuntimeProfile {
+    /// Existing CAP baseline: Kata confidential containers on AMD SEV-SNP.
+    #[default]
+    SevSnp,
+    /// Kata confidential containers on Intel TDX without GPU passthrough.
+    Tdx,
+    /// NVIDIA confidential GPU passthrough on AMD SEV-SNP.
+    NvidiaGpuSnp,
+    /// NVIDIA confidential GPU passthrough on Intel TDX.
+    NvidiaGpuTdx,
+}
+
+impl ConfidentialRuntimeProfile {
+    pub fn runtime_class(self) -> &'static str {
+        match self {
+            Self::SevSnp => "kata-qemu-snp",
+            Self::Tdx => "kata-qemu-tdx",
+            Self::NvidiaGpuSnp => "kata-qemu-nvidia-gpu-snp",
+            Self::NvidiaGpuTdx => "kata-qemu-nvidia-gpu-tdx",
+        }
+    }
+
+    pub fn attestation_profile(self) -> &'static str {
+        match self {
+            Self::SevSnp | Self::NvidiaGpuSnp => "coco-sev-snp",
+            Self::Tdx | Self::NvidiaGpuTdx => "coco-tdx",
+        }
+    }
+
+    pub fn is_nvidia_gpu(self) -> bool {
+        matches!(self, Self::NvidiaGpuSnp | Self::NvidiaGpuTdx)
+    }
+
+    pub fn from_runtime_class(runtime_class: &str) -> Option<Self> {
+        match runtime_class {
+            "kata-qemu-snp" => Some(Self::SevSnp),
+            "kata-qemu-tdx" => Some(Self::Tdx),
+            "kata-qemu-nvidia-gpu-snp" => Some(Self::NvidiaGpuSnp),
+            "kata-qemu-nvidia-gpu-tdx" => Some(Self::NvidiaGpuTdx),
+            _ => None,
+        }
+    }
+
+    pub fn is_default(profile: &Self) -> bool {
+        *profile == Self::default()
+    }
+}
+
+pub fn supported_runtime_class(runtime_class: &str) -> bool {
+    ConfidentialRuntimeProfile::from_runtime_class(runtime_class).is_some()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GpuResourceSpec {
+    /// Kubernetes extended resource exposed by the NVIDIA device plugin, for
+    /// example `nvidia.com/GH100_H100_PCIE` on H100 passthrough nodes.
+    pub resource_name: String,
+    #[serde(default = "default_gpu_count")]
+    pub count: u32,
+    /// Optional CDI selector used by NVIDIA passthrough examples, for example
+    /// `nvidia.com/pgpu=0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdi_device: Option<String>,
+}
+
+fn default_gpu_count() -> u32 {
+    1
+}
+
 /// Complete specification for a confidential application deployment.
 /// This is the sole input to the engine's manifest generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +130,15 @@ pub struct ConfidentialApp {
     pub api_url: String,
     /// CPU and memory limits.
     pub resources: ResourceLimits,
+    /// Confidential runtime profile. Defaults to the existing SNP CPU runtime.
+    #[serde(
+        default,
+        skip_serializing_if = "ConfidentialRuntimeProfile::is_default"
+    )]
+    pub runtime_profile: ConfidentialRuntimeProfile,
+    /// GPU passthrough resource requested by NVIDIA GPU runtime profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuResourceSpec>,
     /// Attestation proxy and ingress sidecar configuration.
     pub attestation: AttestationConfig,
     /// Per-app world-egress allowlist (Phase 11). Default: empty -> no

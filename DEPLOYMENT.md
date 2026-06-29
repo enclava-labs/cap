@@ -140,6 +140,14 @@ pin the API image digest in `deploy/api/kustomization.yaml`, add the production
 env values above, and verify the service account/RBAC can apply only the
 tenant resources CAP owns.
 
+CAP treats the signed descriptor's `expected_runtime_class` as part of the
+trust contract. Supported runtime classes are `kata-qemu-snp`, `kata-qemu-tdx`,
+`kata-qemu-nvidia-gpu-snp`, and `kata-qemu-nvidia-gpu-tdx` when the cluster
+provides the matching Kata runtime. NVIDIA GPU profiles also require a GPU spec
+with the cluster-advertised extended resource name, for example a
+product-specific `nvidia.com/...` resource, and optionally a CDI selector such
+as `nvidia.com/pgpu=0`.
+
 ## Image Verification
 
 CAP verifies platform sidecars at API startup and verifies user workload images
