@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::types::{ConfidentialApp, EgressRule};
+use crate::types::{ConfidentialApp, EgressMode, EgressRule};
 
 /// Platform-default FQDN egress allowlist.
 ///
@@ -9,6 +9,24 @@ use crate::types::{ConfidentialApp, EgressRule};
 const PLATFORM_DEFAULT_FQDNS: &[&str] = &[
     "acme-v02.api.letsencrypt.org",
     "acme-staging-v02.api.letsencrypt.org",
+];
+
+const PUBLIC_INTERNET_CIDR: &str = "0.0.0.0/0";
+const PUBLIC_INTERNET_DEFAULT_EXCLUDED_CIDRS: &[&str] = &[
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
 ];
 
 /// Generate a CiliumNetworkPolicy (cilium.io/v2 CRD).
@@ -104,6 +122,10 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
         egress.push(rule);
     }
 
+    if app.egress_mode == EgressMode::PublicInternet {
+        egress.push(public_internet_egress_rule(app));
+    }
+
     for rule in &app.egress_allowlist {
         egress.push(egress_rule_value(rule));
     }
@@ -140,6 +162,25 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
             ],
             "egress": egress,
         }
+    })
+}
+
+fn public_internet_egress_rule(app: &ConfidentialApp) -> Value {
+    let mut excluded = PUBLIC_INTERNET_DEFAULT_EXCLUDED_CIDRS
+        .iter()
+        .map(|cidr| (*cidr).to_string())
+        .collect::<Vec<_>>();
+    excluded.extend(app.public_internet_egress_excluded_cidrs.iter().cloned());
+    excluded.sort();
+    excluded.dedup();
+
+    json!({
+        "toCIDRSet": [
+            {
+                "cidr": PUBLIC_INTERNET_CIDR,
+                "except": excluded
+            }
+        ]
     })
 }
 

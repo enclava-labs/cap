@@ -144,6 +144,8 @@ pub struct InternalCreateAppRequest {
     pub signer_identity_issuer: Option<String>,
     #[serde(default)]
     pub egress_allowlist: Vec<crate::routes::apps::CreateEgressAllowRule>,
+    #[serde(default = "crate::routes::apps::default_egress_mode")]
+    pub egress_mode: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -894,6 +896,8 @@ pub async fn create_paas_app(
         };
     let egress_allowlist = crate::routes::apps::validate_egress_allowlist(&body.egress_allowlist)
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
+    let egress_mode = crate::routes::apps::validate_egress_mode(&body.egress_mode)
+        .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
 
     sqlx::query(
         "INSERT INTO apps (
@@ -901,9 +905,9 @@ pub async fn create_paas_app(
             bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
             unlock_mode, domain, tee_domain,
             signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
-            egress_allowlist
+            egress_allowlist, egress_mode
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17)",
     )
     .bind(app_id)
     .bind(cap_org_id)
@@ -921,6 +925,7 @@ pub async fn create_paas_app(
     .bind(body.signer_identity_issuer.as_deref())
     .bind(signer_set_at)
     .bind(sqlx::types::Json(egress_allowlist.clone()))
+    .bind(egress_mode.as_str())
     .execute(&state.db)
     .await
     .map_err(|error| {

@@ -126,6 +126,7 @@ pub struct App {
     pub source_provider: Option<String>,
     pub source_repository: Option<String>,
     pub egress_allowlist: Json<Vec<EgressRule>>,
+    pub egress_mode: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

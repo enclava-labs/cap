@@ -296,6 +296,8 @@ pub(crate) fn confidential_app_for_cc_hash(
             platform_trustee_policy_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
             signing_service_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
         },
+        egress_mode: enclava_engine::types::EgressMode::Restricted,
+        public_internet_egress_excluded_cidrs: Vec::new(),
         egress_allowlist: Vec::new(),
         workload_artifact_binding: Some(workload_artifact_binding),
         generated_agent_policy: Some(generated_agent_policy),

@@ -20,7 +20,7 @@ use crate::source_provider::{
     SourceProvider, validate_signing_identity, validate_source_repository,
 };
 use crate::state::{AppState, CapManagementMode};
-use enclava_engine::types::EgressRule;
+use enclava_engine::types::{EgressMode, EgressRule};
 use sqlx::types::Json as SqlJson;
 
 /// Helper function for consistent internal server error responses
@@ -255,10 +255,17 @@ pub struct CreateAppRequest {
     /// Per-app FQDN egress allowlist rendered into the tenant Cilium policy.
     #[serde(default)]
     pub egress_allowlist: Vec<CreateEgressAllowRule>,
+    /// Tenant egress posture. Defaults to restricted.
+    #[serde(default = "default_egress_mode")]
+    pub egress_mode: String,
 }
 
 fn default_unlock_mode() -> String {
     "password".to_string()
+}
+
+pub(crate) fn default_egress_mode() -> String {
+    EgressMode::Restricted.as_str().to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +308,10 @@ pub(crate) fn validate_egress_allowlist(
         .collect()
 }
 
+pub(crate) fn validate_egress_mode(value: &str) -> Result<EgressMode, String> {
+    value.parse()
+}
+
 #[derive(Debug, Serialize)]
 pub struct AppResponse {
     pub id: Uuid,
@@ -319,6 +330,7 @@ pub struct AppResponse {
     pub signer_identity_issuer: Option<String>,
     pub source_provider: Option<String>,
     pub source_repository: Option<String>,
+    pub egress_mode: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -341,6 +353,7 @@ impl From<App> for AppResponse {
             signer_identity_issuer: a.signer_identity_issuer,
             source_provider: a.source_provider,
             source_repository: a.source_repository,
+            egress_mode: a.egress_mode,
             created_at: a.created_at,
         }
     }
@@ -448,6 +461,12 @@ pub async fn create_app(
             Json(serde_json::json!({"error": e})),
         )
     })?;
+    let egress_mode = validate_egress_mode(&body.egress_mode).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+    })?;
 
     // Enforce core entitlement app limit.
     let org: crate::models::Organization =
@@ -548,8 +567,8 @@ pub async fn create_app(
         service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
          unlock_mode, domain, tee_domain,
          signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
-        source_provider, source_repository, egress_allowlist)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18)",
+        source_provider, source_repository, egress_allowlist, egress_mode)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
     )
     .bind(app_id)
     .bind(auth.org_id)
@@ -569,6 +588,7 @@ pub async fn create_app(
     .bind(body.source_provider.map(SourceProvider::as_str))
     .bind(body.source_repository.as_deref())
     .bind(SqlJson(egress_allowlist.clone()))
+    .bind(egress_mode.as_str())
     .execute(&state.db)
     .await;
 
@@ -624,7 +644,8 @@ pub async fn create_app(
     .bind(serde_json::json!({
         "name": &body.name,
         "unlock_mode": &body.unlock_mode,
-        "egress_allowlist": egress_allowlist
+        "egress_allowlist": egress_allowlist,
+        "egress_mode": egress_mode.as_str()
     }))
     .execute(&state.db)
     .await;

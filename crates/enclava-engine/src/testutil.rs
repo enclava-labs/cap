@@ -78,6 +78,8 @@ pub fn sample_app() -> ConfidentialApp {
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
         },
+        egress_mode: EgressMode::Restricted,
+        public_internet_egress_excluded_cidrs: Vec::new(),
         egress_allowlist: Vec::new(),
         workload_artifact_binding: None,
         generated_agent_policy: None,

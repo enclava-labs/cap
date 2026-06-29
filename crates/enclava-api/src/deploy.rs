@@ -15,18 +15,20 @@ use enclava_engine::apply::{
 };
 use enclava_engine::manifest::generate_all_manifests;
 use enclava_engine::types::{
-    AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec,
+    AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, EgressMode, StorageSpec,
     WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use sqlx::PgPool;
+use std::net::IpAddr;
 use uuid::Uuid;
 
 use crate::models::{App, AppContainer, AppResources, AppStatus};
 
 const DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME: &str = "enclava-registry-auth";
 const TENANT_IMAGE_PULL_SECRET_NAME_ENV: &str = "TENANT_IMAGE_PULL_SECRET_NAME";
+const PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS_ENV: &str = "CAP_PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS";
 
 #[derive(Debug, Clone)]
 struct TenantImagePullSecretConfig {
@@ -108,6 +110,43 @@ fn tenant_image_pull_secret_config_from_env() -> Option<TenantImagePullSecretCon
         username,
         token,
     })
+}
+
+fn public_internet_egress_excluded_cidrs_from_env() -> Vec<String> {
+    let Some(raw) = env_nonempty(PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS_ENV) else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(|entry| {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return None;
+            }
+            match normalize_ipv4_cidr(entry) {
+                Some(cidr) => Some(cidr),
+                None => {
+                    tracing::warn!(
+                        env = PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS_ENV,
+                        cidr = entry,
+                        "ignoring invalid public internet egress exclusion CIDR"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+fn normalize_ipv4_cidr(value: &str) -> Option<String> {
+    let (addr, bits) = value.split_once('/')?;
+    let bits = bits.trim().parse::<u8>().ok()?;
+    if bits > 32 {
+        return None;
+    }
+    let IpAddr::V4(addr) = addr.trim().parse::<IpAddr>().ok()? else {
+        return None;
+    };
+    Some(format!("{addr}/{bits}"))
 }
 
 fn should_reconcile_global_signed_policy_artifacts(
@@ -397,6 +436,12 @@ pub async fn build_confidential_app(
         crate::models::UnlockMode::Auto => CommonUnlockMode::Auto,
         crate::models::UnlockMode::Password => CommonUnlockMode::Password,
     };
+    let egress_mode = app.egress_mode.parse::<EgressMode>().map_err(|error| {
+        DeployError::Validation(format!(
+            "stored egress_mode for app {} is invalid: {error}",
+            app.name
+        ))
+    })?;
 
     let mut storage = StorageSpec::new(&resources.app_data_size, &resources.tls_data_size);
     // Set bind mounts from the primary container
@@ -441,6 +486,8 @@ pub async fn build_confidential_app(
             memory: resources.memory_limit,
         },
         attestation: attestation_config.clone(),
+        egress_mode,
+        public_internet_egress_excluded_cidrs: public_internet_egress_excluded_cidrs_from_env(),
         egress_allowlist: app.egress_allowlist.0.clone(),
         workload_artifact_binding: None,
         generated_agent_policy: None,
@@ -773,6 +820,8 @@ mod tests {
                 platform_trustee_policy_pubkey_hex: None,
                 signing_service_pubkey_hex: None,
             },
+            egress_mode: EgressMode::Restricted,
+            public_internet_egress_excluded_cidrs: Vec::new(),
             egress_allowlist: Vec::new(),
             workload_artifact_binding: None,
             generated_agent_policy: None,
@@ -851,6 +900,8 @@ mod tests {
                 platform_trustee_policy_pubkey_hex: None,
                 signing_service_pubkey_hex: None,
             },
+            egress_mode: EgressMode::Restricted,
+            public_internet_egress_excluded_cidrs: Vec::new(),
             egress_allowlist: Vec::new(),
             workload_artifact_binding: None,
             generated_agent_policy: None,

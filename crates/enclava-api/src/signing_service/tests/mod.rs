@@ -165,6 +165,7 @@ fn api_app_for_descriptor(
         source_provider: None,
         source_repository: None,
         egress_allowlist: sqlx::types::Json(Vec::new()),
+        egress_mode: "restricted".to_string(),
         created_at: "2026-04-01T00:00:00Z".parse().unwrap(),
         updated_at: "2026-04-01T00:00:00Z".parse().unwrap(),
     }
@@ -571,6 +572,8 @@ fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> Confide
             platform_trustee_policy_pubkey_hex: Some("bb".repeat(32)),
             signing_service_pubkey_hex: Some("bb".repeat(32)),
         },
+        egress_mode: enclava_engine::types::EgressMode::Restricted,
+        public_internet_egress_excluded_cidrs: Vec::new(),
         egress_allowlist: vec![],
         workload_artifact_binding: None,
         generated_agent_policy: None,

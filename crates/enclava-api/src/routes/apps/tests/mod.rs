@@ -1,7 +1,8 @@
 use super::{
     CreateAppRequest, RotateSignerRequest, SignerRotationTokenRequest, create_app,
     issue_signer_rotation_token_route, list_apps, request_workload_teardown,
-    requires_workload_teardown, validate_egress_allowlist, workload_teardown_instance_id,
+    requires_workload_teardown, validate_egress_allowlist, validate_egress_mode,
+    workload_teardown_instance_id,
 };
 use crate::models::{App, AppStatus, Role, UnlockMode};
 use axum::Json;
@@ -17,7 +18,21 @@ fn create_request_defaults_to_password_unlock() {
     .unwrap();
 
     assert_eq!(body.unlock_mode, "password");
+    assert_eq!(body.egress_mode, "restricted");
     assert!(body.egress_allowlist.is_empty());
+}
+
+#[test]
+fn egress_mode_accepts_restricted_and_public_internet() {
+    assert_eq!(
+        validate_egress_mode("restricted").unwrap().as_str(),
+        "restricted"
+    );
+    assert_eq!(
+        validate_egress_mode("public_internet").unwrap().as_str(),
+        "public_internet"
+    );
+    assert!(validate_egress_mode("cluster").is_err());
 }
 
 #[test]
@@ -108,6 +123,7 @@ fn teardown_token_instance_id_matches_attestation_proxy_owner_instance_id() {
         source_provider: None,
         source_repository: None,
         egress_allowlist: sqlx::types::Json(Vec::new()),
+        egress_mode: "restricted".to_string(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -156,6 +172,7 @@ async fn unreachable_running_workload_teardown_is_best_effort() {
         source_provider: None,
         source_repository: None,
         egress_allowlist: sqlx::types::Json(Vec::new()),
+        egress_mode: "restricted".to_string(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -179,6 +196,7 @@ async fn create_app_rejects_member_before_database_access() {
             source_provider: None,
             source_repository: None,
             egress_allowlist: Vec::new(),
+            egress_mode: "restricted".to_string(),
         }),
     )
     .await;

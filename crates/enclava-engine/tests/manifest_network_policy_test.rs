@@ -126,6 +126,51 @@ fn world_is_never_in_default_egress() {
 }
 
 #[test]
+fn public_internet_egress_uses_cidr_exclusions_not_world_entity() {
+    use enclava_engine::types::EgressMode;
+
+    let mut app = sample_app();
+    app.egress_mode = EgressMode::PublicInternet;
+    app.public_internet_egress_excluded_cidrs = vec!["95.217.56.192/26".to_string()];
+
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    let public_rule = egress
+        .iter()
+        .find(|rule| rule["toCIDRSet"][0]["cidr"].as_str() == Some("0.0.0.0/0"))
+        .expect("public internet CIDR rule");
+    let except = public_rule["toCIDRSet"][0]["except"]
+        .as_array()
+        .expect("public egress exclusions");
+    let except = except
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+
+    assert!(except.contains(&"10.0.0.0/8"));
+    assert!(except.contains(&"169.254.0.0/16"));
+    assert!(except.contains(&"172.16.0.0/12"));
+    assert!(except.contains(&"192.168.0.0/16"));
+    assert!(except.contains(&"95.217.56.192/26"));
+    assert!(
+        !serde_json::to_string(&val).unwrap().contains("toEntities"),
+        "public internet mode must not use broad Cilium entities"
+    );
+}
+
+#[test]
+fn restricted_egress_mode_does_not_emit_public_cidr() {
+    let app = sample_app();
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    assert!(
+        egress
+            .iter()
+            .all(|rule| rule["toCIDRSet"][0]["cidr"].as_str() != Some("0.0.0.0/0"))
+    );
+}
+
+#[test]
 fn default_egress_includes_acme_endpoints() {
     let app = sample_app();
     let val = generate_network_policy(&app);

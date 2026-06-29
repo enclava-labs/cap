@@ -288,6 +288,7 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
         signer_identity_subject,
         signer_identity_issuer,
         egress_allowlist: vec![],
+        egress_mode: None,
     };
 
     let spinner = ProgressBar::new_spinner();

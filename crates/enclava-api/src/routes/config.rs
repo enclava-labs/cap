@@ -310,6 +310,7 @@ mod tests {
             source_provider: None,
             source_repository: None,
             egress_allowlist: sqlx::types::Json(Vec::new()),
+            egress_mode: "restricted".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -340,6 +341,7 @@ mod tests {
             source_provider: None,
             source_repository: None,
             egress_allowlist: sqlx::types::Json(Vec::new()),
+            egress_mode: "restricted".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -375,6 +377,7 @@ mod tests {
             source_provider: None,
             source_repository: None,
             egress_allowlist: sqlx::types::Json(Vec::new()),
+            egress_mode: "restricted".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

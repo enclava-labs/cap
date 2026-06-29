@@ -120,6 +120,8 @@ pub struct CreateAppRequest {
     pub signer_identity_issuer: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress_allowlist: Vec<HostedTemplateEgressRule>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -242,6 +244,8 @@ pub struct HostedTemplate {
     pub storage_paths: Vec<String>,
     #[serde(default)]
     pub egress_allowlist: Vec<HostedTemplateEgressRule>,
+    #[serde(default = "default_template_egress_mode")]
+    pub egress_mode: String,
     pub config_keys: Vec<HostedTemplateConfigKey>,
     #[serde(default)]
     pub paas_managed_config_keys: Vec<String>,
@@ -263,6 +267,10 @@ fn default_template_port() -> u16 {
 
 fn default_template_unlock_mode() -> String {
     "auto".to_string()
+}
+
+fn default_template_egress_mode() -> String {
+    "restricted".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

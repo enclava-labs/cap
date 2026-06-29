@@ -55,8 +55,17 @@ pub struct ConfidentialApp {
     pub resources: ResourceLimits,
     /// Attestation proxy and ingress sidecar configuration.
     pub attestation: AttestationConfig,
-    /// Per-app world-egress allowlist (Phase 11). Default: empty -> no
-    /// world-egress rules emitted. Each rule is rendered as a Cilium `toFQDNs`
+    /// Tenant egress posture. Default is restricted: no broad public internet
+    /// egress, only platform-required routes and explicit FQDN allowlist rules.
+    #[serde(default)]
+    pub egress_mode: EgressMode,
+    /// Additional IPv4 CIDRs excluded from `public_internet` egress. Operators
+    /// use this to block cluster/node public ranges that are not covered by
+    /// private RFC1918 exclusions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_internet_egress_excluded_cidrs: Vec<String>,
+    /// Per-app FQDN egress allowlist (Phase 11). Default: empty -> no
+    /// FQDN rules emitted. Each rule is rendered as a Cilium `toFQDNs`
     /// egress entry restricted to the listed TCP ports.
     #[serde(default)]
     pub egress_allowlist: Vec<EgressRule>,
@@ -111,6 +120,37 @@ mod hex_bytes32 {
 pub struct EgressRule {
     pub host: String,
     pub ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressMode {
+    #[default]
+    Restricted,
+    PublicInternet,
+}
+
+impl EgressMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Restricted => "restricted",
+            Self::PublicInternet => "public_internet",
+        }
+    }
+}
+
+impl std::str::FromStr for EgressMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "restricted" => Ok(Self::Restricted),
+            "public_internet" | "public-internet" => Ok(Self::PublicInternet),
+            other => Err(format!(
+                "invalid egress_mode {other:?}; expected restricted or public_internet"
+            )),
+        }
+    }
 }
 
 /// Tenant Caddy TLS issuer mode.

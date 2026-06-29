@@ -887,6 +887,7 @@ mod tests {
             source_provider: None,
             source_repository: None,
             egress_allowlist: sqlx::types::Json(Vec::new()),
+            egress_mode: "restricted".to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

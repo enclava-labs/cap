@@ -485,6 +485,7 @@ fn template_create_app_request(
         signer_identity_subject: Some(signer_identity_subject),
         signer_identity_issuer: Some(signer_identity_issuer),
         egress_allowlist: template.egress_allowlist.clone(),
+        egress_mode: Some(template.egress_mode.clone()),
     })
 }
 
@@ -2085,6 +2086,7 @@ mod tests {
                 host: "6.tcp.eu.ngrok.io".to_string(),
                 ports: vec![17958],
             }],
+            egress_mode: "restricted".to_string(),
             paas_managed_config_keys: vec!["NGROK_AUTHTOKEN".to_string()],
             config_keys: vec![
                 HostedTemplateConfigKey {
