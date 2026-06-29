@@ -1,5 +1,6 @@
+use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -23,6 +24,9 @@ const DEFAULT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS: u64 = 10;
 const CADDY_RUNTIME_HANDOFF_PATH: &str = "/run/enclava/caddy-runtime";
 const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
+const MANAGED_CONFIG_ROOT: &str = ".enclava";
+const MANAGED_CONFIG_DIR: &str = ".enclava/config";
+const MANAGED_CONFIG_DIR_MODE: u32 = 0o750;
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -741,6 +745,7 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
         .with_context(|| format!("chown {}", state_root.display()))?;
     chown::chown_recursive(tls_state_root, caddy_identity)
         .with_context(|| format!("chown {}", tls_state_root.display()))?;
+    prepare_managed_config_dir(state_root, cfg.app_gid)?;
 
     let caddy_tls_dir = caddy_tls_bind_dir(tls_state_root);
     std::fs::create_dir_all(&caddy_tls_dir)
@@ -776,6 +781,35 @@ fn prepare_mount_ownership(cfg: &Config) -> Result<()> {
         })?;
         chown::chown_recursive(&dir, app_identity)
             .with_context(|| format!("chown {}", dir.display()))?;
+    }
+
+    Ok(())
+}
+
+fn prepare_managed_config_dir(state_root: &Path, app_gid: u32) -> Result<()> {
+    prepare_managed_config_dir_at(state_root, app_gid, |path, identity| {
+        chown::chown(path, identity).map_err(Into::into)
+    })
+}
+
+fn prepare_managed_config_dir_at<F>(state_root: &Path, app_gid: u32, mut chown_dir: F) -> Result<()>
+where
+    F: FnMut(&Path, chown::ExecIdentity) -> Result<()>,
+{
+    let managed_root = state_root.join(MANAGED_CONFIG_ROOT);
+    let config_dir = state_root.join(MANAGED_CONFIG_DIR);
+    let config_identity = chown::ExecIdentity {
+        uid: 0,
+        gid: app_gid,
+        kind: chown::IdentityKind::Numeric,
+    };
+
+    fs::create_dir_all(&config_dir)
+        .with_context(|| format!("creating {}", config_dir.display()))?;
+    for dir in [&managed_root, &config_dir] {
+        chown_dir(dir, config_identity).with_context(|| format!("chown {}", dir.display()))?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(MANAGED_CONFIG_DIR_MODE))
+            .with_context(|| format!("chmod {}", dir.display()))?;
     }
 
     Ok(())

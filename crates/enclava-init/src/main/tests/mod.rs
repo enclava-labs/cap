@@ -101,6 +101,54 @@ fn caddy_tls_bind_source_is_below_tls_state_root() {
 }
 
 #[test]
+fn managed_config_dir_is_prepared_for_proxy_writes_and_workload_reads() {
+    let dir = tempdir().unwrap();
+    let state_root = dir.path().join("state");
+    let mut chowned = Vec::new();
+
+    prepare_managed_config_dir_at(&state_root, 10001, |path, identity| {
+        chowned.push((path.to_path_buf(), identity));
+        Ok(())
+    })
+    .unwrap();
+
+    let managed_root = state_root.join(".enclava");
+    let config_dir = state_root.join(".enclava/config");
+    assert!(managed_root.is_dir());
+    assert!(config_dir.is_dir());
+    assert_eq!(
+        chowned,
+        vec![
+            (
+                managed_root.clone(),
+                ExecIdentity {
+                    uid: 0,
+                    gid: 10001,
+                    kind: IdentityKind::Numeric,
+                },
+            ),
+            (
+                config_dir.clone(),
+                ExecIdentity {
+                    uid: 0,
+                    gid: 10001,
+                    kind: IdentityKind::Numeric,
+                },
+            ),
+        ]
+    );
+
+    let managed_mode = std::fs::metadata(&managed_root)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let config_mode = std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(managed_mode, 0o750);
+    assert_eq!(config_mode, 0o750);
+}
+
+#[test]
 fn caddy_runtime_sync_copies_nested_files_and_skips_symlinks() {
     let dir = tempdir().unwrap();
     let src = dir.path().join("src");
