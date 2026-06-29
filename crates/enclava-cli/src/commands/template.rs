@@ -38,6 +38,7 @@ const FRP_RELAY_HOST: &str = "relay.enclava.me";
 const DEFAULT_SSH_TIMEOUT_SECONDS: u64 = 600;
 const TEMPLATE_CONFIG_DELIVERY_ATTEMPTS: usize = 121;
 const TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS: u64 = 2;
+const MAX_SSH_COMMAND_BYTES: usize = 256;
 
 #[derive(Subcommand)]
 pub enum TemplateCommand {
@@ -1500,9 +1501,121 @@ async fn wait_for_paas_ssh_command(
         if response.status == "ready" {
             return Ok(response);
         }
+        if let Some(response) =
+            fetch_direct_ssh_command_response(&response, stable_endpoint, expected_app_url).await?
+        {
+            return Ok(response);
+        }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
     Err(format!("timed out waiting for stable SSH endpoint command for app {app_name}").into())
+}
+
+async fn fetch_direct_ssh_command_response(
+    response: &SshCommandResponse,
+    stable_endpoint: &str,
+    expected_app_url: &str,
+) -> Result<Option<SshCommandResponse>, Box<dyn std::error::Error>> {
+    if response.status != "pending" {
+        return Ok(None);
+    }
+    let Some(app_url) = response.app_url.as_deref() else {
+        return Ok(None);
+    };
+    let app_url =
+        normalize_app_url(app_url).map_err(|_| "PaaS /ssh-command response app_url is invalid")?;
+    let expected_app_url =
+        normalize_app_url(expected_app_url).map_err(|_| "expected app URL is invalid")?;
+    if app_url != expected_app_url {
+        return Err(format!(
+            "PaaS /ssh-command app_url {app_url} does not match expected app URL {expected_app_url}"
+        )
+        .into());
+    }
+    let ssh_url = ssh_txt_url_from_app_url(&app_url)?;
+    let command = match fetch_direct_ssh_command(&ssh_url).await? {
+        Some(command) => command,
+        None => return Ok(None),
+    };
+    ensure_ssh_command_matches_endpoint(&command, stable_endpoint)?;
+    let endpoint = ssh_endpoint_string(&command)
+        .ok_or_else(|| format!("could not parse stable SSH endpoint command: {command}"))?;
+    let ready = SshCommandResponse {
+        status: "ready".to_string(),
+        stable_ssh_endpoint: normalize_stable_ssh_endpoint(stable_endpoint)?,
+        command: Some(command),
+        endpoint: Some(endpoint),
+        app_url: Some(app_url),
+    };
+    validate_ssh_command_response(&ready, stable_endpoint, expected_app_url.as_str())?;
+    Ok(Some(ready))
+}
+
+fn ssh_txt_url_from_app_url(app_url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut url = reqwest::Url::parse(app_url)?;
+    url.set_path("/ssh.txt");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+async fn fetch_direct_ssh_command(
+    ssh_url: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        // The app command is non-secret and is validated against the PaaS-reserved endpoint.
+        // Preprod uses Let's Encrypt staging chains, so this fallback must not depend on
+        // public browser trust roots to confirm workload readiness.
+        .danger_accept_invalid_certs(true)
+        .build()?;
+    let response = match client
+        .get(ssh_url)
+        .header(reqwest::header::ACCEPT, "text/plain")
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SSH_COMMAND_BYTES as u64)
+    {
+        return Err("stable SSH endpoint command response is too large".into());
+    }
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        Err(_) => return Ok(None),
+    };
+    if body.len() > MAX_SSH_COMMAND_BYTES {
+        return Err("stable SSH endpoint command response is too large".into());
+    }
+    let body = std::str::from_utf8(&body)
+        .map_err(|_| "stable SSH endpoint command response is not UTF-8")?;
+    let command = ssh_command_body_line(body)
+        .ok_or("stable SSH endpoint command response must contain exactly one command line")?;
+    if !valid_ssh_command(command) {
+        return Err(format!("invalid stable SSH endpoint command: {command}").into());
+    }
+    Ok(Some(command.to_string()))
+}
+
+fn ssh_command_body_line(body: &str) -> Option<&str> {
+    if let Some(line) = body.strip_suffix('\n') {
+        if line.contains('\n') || line.ends_with('\r') {
+            return None;
+        }
+        return Some(line);
+    }
+    if body.contains('\n') {
+        return None;
+    }
+    Some(body)
 }
 
 fn validate_ssh_command_response(
@@ -3142,6 +3255,55 @@ mod tests {
         let err = validate_ssh_command_response(&missing, expected_endpoint, expected_app_url)
             .unwrap_err();
         assert!(err.to_string().contains("ready without a command"));
+    }
+
+    #[tokio::test]
+    async fn pending_paas_ssh_command_can_be_confirmed_from_public_app_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind direct ssh command fixture");
+        let addr = listener.local_addr().expect("direct ssh command addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept direct ssh command request");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let body = "ssh -p 20051 user@relay.enclava.me\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write direct ssh command response");
+        });
+        let app_url = format!("http://{addr}");
+        let pending = SshCommandResponse {
+            status: "pending".to_string(),
+            stable_ssh_endpoint: "relay.enclava.me:20051".to_string(),
+            command: None,
+            endpoint: None,
+            app_url: Some(app_url.clone()),
+        };
+
+        let ready = fetch_direct_ssh_command_response(&pending, "relay.enclava.me:20051", &app_url)
+            .await
+            .expect("direct app URL fallback should not fail")
+            .expect("direct app URL should confirm readiness");
+
+        assert_eq!(ready.status, "ready");
+        assert_eq!(
+            ready.command.as_deref(),
+            Some("ssh -p 20051 user@relay.enclava.me")
+        );
+        assert_eq!(ready.endpoint.as_deref(), Some("relay.enclava.me:20051"));
+        assert_eq!(ready.app_url.as_deref(), Some(app_url.as_str()));
     }
 
     #[test]
