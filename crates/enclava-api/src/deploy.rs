@@ -110,16 +110,11 @@ fn tenant_image_pull_secret_config_from_env() -> Option<TenantImagePullSecretCon
     })
 }
 
-fn has_local_signed_policy_verification_artifacts(attestation: &AttestationConfig) -> bool {
-    attestation.local_workload_artifacts_json.is_some()
-        && attestation.local_trustee_policy_json.is_some()
-}
-
 fn should_reconcile_global_signed_policy_artifacts(
     signed_policy_artifact_present: bool,
-    attestation: &AttestationConfig,
+    _attestation: &AttestationConfig,
 ) -> bool {
-    signed_policy_artifact_present && !has_local_signed_policy_verification_artifacts(attestation)
+    signed_policy_artifact_present
 }
 
 fn generate_tenant_image_pull_secret(
@@ -592,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn signed_deploy_with_local_artifacts_skips_global_kbs_policy_reconcile() {
+    fn signed_deploy_with_local_artifacts_still_reconciles_global_kbs_policy() {
         let mut attestation = test_attestation_config();
         assert!(should_reconcile_global_signed_policy_artifacts(
             true,
@@ -606,7 +601,7 @@ mod tests {
         ));
 
         attestation.local_trustee_policy_json = Some("{\"policy\":true}".to_string());
-        assert!(!should_reconcile_global_signed_policy_artifacts(
+        assert!(should_reconcile_global_signed_policy_artifacts(
             true,
             &attestation
         ));
@@ -1064,7 +1059,7 @@ pub async fn apply_deployment_manifests(
             tracing::info!(
                 app_id = %app.id,
                 deployment_id = %deployment_id,
-                "signed deployment carries local verification artifacts; skipping global KBS policy aggregate reconciliation"
+                "signed deployment did not request global KBS policy aggregate reconciliation"
             );
         }
     } else {

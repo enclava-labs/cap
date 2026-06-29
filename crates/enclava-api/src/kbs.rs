@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -10,6 +12,10 @@ use uuid::Uuid;
 use enclava_engine::manifest::cc_init_data::compute_cc_init_data;
 use enclava_engine::types::ConfidentialApp;
 
+const DEFAULT_SIGNED_POLICY_RETENTION: i64 = 6;
+const DEFAULT_SIGNED_POLICY_MAX_BYTES: usize = 900 * 1024;
+const SIGNED_POLICY_SET_SCHEMA_VERSION: &str = "enclava-signed-policy-set-v1";
+
 #[derive(Debug, Clone)]
 pub struct KbsPolicyConfig {
     pub namespace: String,
@@ -18,6 +24,7 @@ pub struct KbsPolicyConfig {
     pub deployment_name: String,
     pub required: bool,
     pub signed_policy_retention: i64,
+    pub signed_policy_max_bytes: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -272,20 +279,12 @@ pub async fn reconcile_signed_policy_artifacts(
 
     let rows: Vec<SignedPolicyArtifactRow> = sqlx::query_as(
         r#"
-        WITH ranked AS (
-            SELECT wa.signed_policy_artifact,
-                   row_number() OVER (
-                       PARTITION BY wa.app_id
-                       ORDER BY d.created_at DESC
-                   ) AS rn
-            FROM workload_artifacts wa
-            JOIN deployments d ON d.id = wa.deploy_id AND d.app_id = wa.app_id
-            WHERE d.status::text IN ('pending', 'applying', 'watching', 'healthy')
-        )
-        SELECT signed_policy_artifact
-        FROM ranked
-        WHERE rn <= $1
-        ORDER BY rn
+        SELECT wa.signed_policy_artifact
+        FROM workload_artifacts wa
+        JOIN deployments d ON d.id = wa.deploy_id AND d.app_id = wa.app_id
+        WHERE d.status::text IN ('pending', 'applying', 'watching', 'healthy')
+        ORDER BY d.created_at DESC, wa.created_at DESC
+        LIMIT $1
         "#,
     )
     .bind(config.signed_policy_retention)
@@ -296,24 +295,35 @@ pub async fn reconcile_signed_policy_artifacts(
         return Ok(());
     }
 
-    let mut artifacts: Vec<crate::signing_service::SignedPolicyArtifact> = rows
-        .into_iter()
-        .map(|row| serde_json::from_value(row.signed_policy_artifact))
-        .collect::<Result<_, _>>()?;
-
-    if let Some(extra_artifact) = extra_artifact
-        && !artifacts.iter().any(|artifact| {
-            artifact.metadata.descriptor_core_hash == extra_artifact.metadata.descriptor_core_hash
-        })
-    {
-        artifacts.push(extra_artifact.clone());
+    let mut candidates = Vec::with_capacity(rows.len() + usize::from(extra_artifact.is_some()));
+    if let Some(extra_artifact) = extra_artifact {
+        candidates.push(extra_artifact.clone());
     }
+    candidates.extend(
+        rows.into_iter()
+            .map(|row| serde_json::from_value(row.signed_policy_artifact))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+
+    let candidate_count = candidates.len();
+    let artifacts = select_signed_policy_artifacts_for_policy_body(
+        candidates,
+        config.signed_policy_retention,
+        config.signed_policy_max_bytes,
+    )?;
 
     let client = kube::Client::try_default().await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     let cm = cm_api.get(&config.configmap_name).await?;
     let mut data = cm.data.unwrap_or_default();
     let next_policy = signed_policy_artifact_policy_body(&artifacts)?;
+    tracing::info!(
+        candidate_artifacts = candidate_count,
+        selected_artifacts = artifacts.len(),
+        policy_bytes = next_policy.len(),
+        max_policy_bytes = config.signed_policy_max_bytes,
+        "reconciled bounded signed KBS policy artifacts"
+    );
 
     if data.get(&config.policy_key) != Some(&next_policy) {
         data.insert(config.policy_key.clone(), next_policy);
@@ -343,9 +353,37 @@ fn signed_policy_artifact_policy_body(
         return Ok(serde_json::to_string(artifact)?);
     }
     Ok(serde_json::to_string(&SignedPolicyArtifactSet {
-        schema_version: "enclava-signed-policy-set-v1",
+        schema_version: SIGNED_POLICY_SET_SCHEMA_VERSION,
         artifacts,
     })?)
+}
+
+fn select_signed_policy_artifacts_for_policy_body(
+    candidates: Vec<crate::signing_service::SignedPolicyArtifact>,
+    max_artifacts: i64,
+    max_policy_bytes: usize,
+) -> Result<Vec<crate::signing_service::SignedPolicyArtifact>, KbsPolicyError> {
+    let max_artifacts = usize::try_from(max_artifacts.max(1)).unwrap_or(1);
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+
+    for artifact in candidates {
+        if !seen.insert(artifact.metadata.descriptor_core_hash.clone()) {
+            continue;
+        }
+        if selected.len() >= max_artifacts {
+            continue;
+        }
+
+        let mut candidate_selection = selected.clone();
+        candidate_selection.push(artifact.clone());
+        let candidate_body = signed_policy_artifact_policy_body(&candidate_selection)?;
+        if candidate_body.len() <= max_policy_bytes || selected.is_empty() {
+            selected.push(artifact);
+        }
+    }
+
+    Ok(selected)
 }
 
 fn is_signed_policy_artifact_body(policy: &str) -> bool {
@@ -641,7 +679,12 @@ pub fn config_from_env() -> Option<KbsPolicyConfig> {
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
             .filter(|value| *value > 0)
-            .unwrap_or(2),
+            .unwrap_or(DEFAULT_SIGNED_POLICY_RETENTION),
+        signed_policy_max_bytes: std::env::var("KBS_SIGNED_POLICY_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_SIGNED_POLICY_MAX_BYTES),
     })
 }
 
@@ -763,6 +806,37 @@ owner_resource_bindings := {}
         assert!(next.contains("owner_resource_bindings := {}"));
     }
 
+    fn test_signed_policy_artifact(
+        descriptor_hash_byte: &str,
+        payload_bytes: usize,
+    ) -> crate::signing_service::SignedPolicyArtifact {
+        crate::signing_service::SignedPolicyArtifact {
+            metadata: crate::signing_service::PolicyMetadata {
+                app_id: "22222222-2222-2222-2222-222222222222".to_string(),
+                deploy_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                descriptor_core_hash: descriptor_hash_byte.repeat(32),
+                descriptor_signing_pubkey: "bb".repeat(32),
+                platform_release_version: "platform-2026.04".to_string(),
+                policy_template_id: "trustee-resource-policy-v1".to_string(),
+                policy_template_sha256: "cc".repeat(32),
+                agent_policy_sha256: "11".repeat(32),
+                genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+                signed_at: "2026-04-01T12:30:00+00:00".to_string(),
+                key_id: "policy-test-key-v1".to_string(),
+            },
+            rego_text: format!("package policy\n\n# {}\n", "x".repeat(payload_bytes)),
+            rego_sha256: "dd".repeat(32),
+            agent_policy_text: format!(
+                "package agent_policy\n\n# {}\ndefault CreateContainerRequest := true\n",
+                "y".repeat(payload_bytes)
+            ),
+            agent_policy_sha256: "11".repeat(32),
+            signature: "ee".repeat(64),
+            verify_pubkey_b64: "ZmFrZS1wdWJrZXk=".to_string(),
+            org_keyring: None,
+        }
+    }
+
     #[test]
     fn signed_policy_artifact_body_is_authoritative_envelope() {
         let artifact = crate::signing_service::SignedPolicyArtifact {
@@ -832,5 +906,67 @@ owner_resource_bindings := {}
         assert_eq!(parsed["schema_version"], "enclava-signed-policy-set-v1");
         assert_eq!(parsed["artifacts"].as_array().unwrap().len(), 2);
         assert!(is_signed_policy_artifact_body(&body));
+    }
+
+    #[test]
+    fn signed_policy_selection_prefers_first_artifact_and_dedupes_by_descriptor_hash() {
+        let current = test_signed_policy_artifact("aa", 16);
+        let duplicate_old = test_signed_policy_artifact("aa", 4096);
+        let recent_other = test_signed_policy_artifact("bb", 16);
+
+        let selected = select_signed_policy_artifacts_for_policy_body(
+            vec![current.clone(), duplicate_old, recent_other.clone()],
+            6,
+            usize::MAX,
+        )
+        .unwrap();
+
+        assert_eq!(selected, vec![current, recent_other]);
+    }
+
+    #[test]
+    fn signed_policy_selection_enforces_global_retention() {
+        let current = test_signed_policy_artifact("aa", 16);
+        let recent_one = test_signed_policy_artifact("bb", 16);
+        let recent_two = test_signed_policy_artifact("cc", 16);
+
+        let selected = select_signed_policy_artifacts_for_policy_body(
+            vec![current.clone(), recent_one.clone(), recent_two],
+            2,
+            usize::MAX,
+        )
+        .unwrap();
+
+        assert_eq!(selected, vec![current, recent_one]);
+    }
+
+    #[test]
+    fn signed_policy_selection_prunes_old_artifacts_to_byte_budget() {
+        let current = test_signed_policy_artifact("aa", 128);
+        let old = test_signed_policy_artifact("bb", 4096);
+        let current_body_len = signed_policy_artifact_policy_body(std::slice::from_ref(&current))
+            .unwrap()
+            .len();
+
+        let selected = select_signed_policy_artifacts_for_policy_body(
+            vec![current.clone(), old],
+            6,
+            current_body_len + 32,
+        )
+        .unwrap();
+
+        assert_eq!(selected, vec![current]);
+        let selected_body = signed_policy_artifact_policy_body(&selected).unwrap();
+        assert!(selected_body.len() <= current_body_len + 32);
+    }
+
+    #[test]
+    fn signed_policy_selection_keeps_first_artifact_even_when_it_exceeds_budget() {
+        let current = test_signed_policy_artifact("aa", 128);
+
+        let selected =
+            select_signed_policy_artifacts_for_policy_body(vec![current.clone()], 6, 1).unwrap();
+
+        assert_eq!(selected, vec![current]);
     }
 }
