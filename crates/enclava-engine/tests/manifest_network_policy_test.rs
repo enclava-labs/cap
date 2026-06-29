@@ -32,12 +32,36 @@ fn network_policy_ingress_allows_same_namespace() {
 fn network_policy_ingress_allows_envoy_gateway() {
     let app = sample_app();
     let val = generate_network_policy(&app);
-    let from = &val["spec"]["ingress"][0]["fromEndpoints"];
+    let from = &val["spec"]["ingress"][1]["fromEndpoints"];
     assert_eq!(
-        from[1]["matchLabels"]["io.kubernetes.pod.namespace"],
+        from[0]["matchLabels"]["io.kubernetes.pod.namespace"],
         "tenant-envoy"
     );
-    assert_eq!(from[1]["matchLabels"]["app.kubernetes.io/name"], "envoy");
+    assert_eq!(from[0]["matchLabels"]["app.kubernetes.io/name"], "envoy");
+}
+
+#[test]
+fn network_policy_ingress_allows_platform_edge_host_path_on_public_ports() {
+    let app = sample_app();
+    let val = generate_network_policy(&app);
+    let ingress = &val["spec"]["ingress"][2];
+    let entities = ingress["fromEntities"].as_array().unwrap();
+    let entities = entities
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(entities, vec!["host", "remote-node"]);
+    let ports = ingress["toPorts"][0]["ports"].as_array().unwrap();
+    let ports = ports
+        .iter()
+        .map(|port| {
+            (
+                port["port"].as_str().unwrap(),
+                port["protocol"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ports, vec![("10443", "TCP"), ("8443", "TCP")]);
 }
 
 #[test]

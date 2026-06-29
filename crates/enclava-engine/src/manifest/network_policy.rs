@@ -150,12 +150,27 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
                             "matchLabels": {
                                 "io.kubernetes.pod.namespace": &app.namespace
                             }
-                        },
+                        }
+                    ]
+                },
+                {
+                    "fromEndpoints": [
                         {
                             "matchLabels": {
                                 "io.kubernetes.pod.namespace": "tenant-envoy",
                                 "app.kubernetes.io/name": "envoy"
                             }
+                        }
+                    ]
+                },
+                {
+                    "fromEntities": ["host", "remote-node"],
+                    "toPorts": [
+                        {
+                            "ports": [
+                                { "port": "10443", "protocol": "TCP" },
+                                { "port": "8443", "protocol": "TCP" }
+                            ]
                         }
                     ]
                 }
