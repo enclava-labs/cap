@@ -37,7 +37,12 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
                     "ports": [
                         { "port": "53", "protocol": "UDP" },
                         { "port": "53", "protocol": "TCP" }
-                    ]
+                    ],
+                    "rules": {
+                        "dns": [
+                            { "matchPattern": "*" }
+                        ]
+                    }
                 }
             ]
         }),
