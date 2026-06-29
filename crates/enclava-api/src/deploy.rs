@@ -110,6 +110,18 @@ fn tenant_image_pull_secret_config_from_env() -> Option<TenantImagePullSecretCon
     })
 }
 
+fn has_local_signed_policy_verification_artifacts(attestation: &AttestationConfig) -> bool {
+    attestation.local_workload_artifacts_json.is_some()
+        && attestation.local_trustee_policy_json.is_some()
+}
+
+fn should_reconcile_global_signed_policy_artifacts(
+    signed_policy_artifact_present: bool,
+    attestation: &AttestationConfig,
+) -> bool {
+    signed_policy_artifact_present && !has_local_signed_policy_verification_artifacts(attestation)
+}
+
 fn generate_tenant_image_pull_secret(
     namespace: &str,
     config: &TenantImagePullSecretConfig,
@@ -464,6 +476,29 @@ mod tests {
         SecurityContext, Sidecars, SignerIdentity,
     };
 
+    fn test_attestation_config() -> AttestationConfig {
+        AttestationConfig {
+            proxy_image: ImageRef::parse(
+                "ghcr.io/enclava-labs/attestation-proxy@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            .unwrap(),
+            caddy_image: ImageRef::parse(
+                "ghcr.io/enclava-labs/caddy-ingress@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            )
+            .unwrap(),
+            acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+            caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
+            trustee_policy_read_available: true,
+            workload_artifacts_url: None,
+            tls_certificate_broker_url: None,
+            trustee_policy_url: None,
+            local_workload_artifacts_json: None,
+            local_trustee_policy_json: None,
+            platform_trustee_policy_pubkey_hex: None,
+            signing_service_pubkey_hex: None,
+        }
+    }
+
     #[test]
     fn password_redeploy_timeout_stays_healthy_for_manual_unlock() {
         let outcome = classify_rollout_result(
@@ -554,6 +589,31 @@ mod tests {
             docker_config["auths"]["ghcr.io"]["auth"].as_str(),
             Some("Y2FwLWJvdDpnaHBfZmFrZQ==")
         );
+    }
+
+    #[test]
+    fn signed_deploy_with_local_artifacts_skips_global_kbs_policy_reconcile() {
+        let mut attestation = test_attestation_config();
+        assert!(should_reconcile_global_signed_policy_artifacts(
+            true,
+            &attestation
+        ));
+
+        attestation.local_workload_artifacts_json = Some("{\"bundle\":true}".to_string());
+        assert!(should_reconcile_global_signed_policy_artifacts(
+            true,
+            &attestation
+        ));
+
+        attestation.local_trustee_policy_json = Some("{\"policy\":true}".to_string());
+        assert!(!should_reconcile_global_signed_policy_artifacts(
+            true,
+            &attestation
+        ));
+        assert!(!should_reconcile_global_signed_policy_artifacts(
+            false,
+            &attestation
+        ));
     }
 
     fn customer_app_descriptor() -> DeploymentDescriptor {
@@ -992,13 +1052,21 @@ pub async fn apply_deployment_manifests(
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
     set_app_status(&pool, app.id, "creating").await?;
 
-    if signed_policy_artifact.is_some() {
-        crate::kbs::reconcile_signed_policy_artifacts(
-            &pool,
-            kbs_policy_config.as_ref(),
-            signed_policy_artifact.as_ref(),
-        )
-        .await?;
+    if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
+        if should_reconcile_global_signed_policy_artifacts(true, &app_spec.attestation) {
+            crate::kbs::reconcile_signed_policy_artifacts(
+                &pool,
+                kbs_policy_config.as_ref(),
+                Some(signed_policy_artifact),
+            )
+            .await?;
+        } else {
+            tracing::info!(
+                app_id = %app.id,
+                deployment_id = %deployment_id,
+                "signed deployment carries local verification artifacts; skipping global KBS policy aggregate reconciliation"
+            );
+        }
     } else {
         crate::kbs::ensure_owner_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
         crate::kbs::ensure_tls_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
