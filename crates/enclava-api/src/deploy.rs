@@ -429,7 +429,7 @@ pub async fn build_confidential_app(
             memory: resources.memory_limit,
         },
         attestation: attestation_config.clone(),
-        egress_allowlist: Vec::new(),
+        egress_allowlist: app.egress_allowlist.0.clone(),
         workload_artifact_binding: None,
         generated_agent_policy: None,
     })

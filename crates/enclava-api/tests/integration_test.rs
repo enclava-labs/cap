@@ -15,7 +15,7 @@ use enclava_common::{
     },
     image::ImageRef,
 };
-use enclava_engine::types::AttestationConfig;
+use enclava_engine::{manifest::network_policy::generate_network_policy, types::AttestationConfig};
 use rand::rngs::OsRng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -195,6 +195,19 @@ async fn persisted_app_source(pool: &PgPool, org_id: Uuid, app_name: &str) -> (S
     .fetch_one(pool)
     .await
     .expect("persisted app source")
+}
+
+async fn persisted_app_egress(pool: &PgPool, org_id: Uuid, app_name: &str) -> Value {
+    sqlx::query_scalar::<_, Value>(
+        "SELECT egress_allowlist
+           FROM apps
+          WHERE org_id = $1 AND name = $2",
+    )
+    .bind(org_id)
+    .bind(app_name)
+    .fetch_one(pool)
+    .await
+    .expect("persisted app egress allowlist")
 }
 
 async fn bootstrap_paas_internal_org(
@@ -922,6 +935,9 @@ async fn paas_internal_config_sync_bypasses_public_paas_managed_write_guard() {
 #[tokio::test]
 async fn paas_internal_create_app_persists_cli_signer_identity() {
     let (state, pool) = setup_paas_managed_test_state().await;
+    let attestation = state.attestation.clone().expect("test attestation config");
+    let api_signing_pubkey = enclava_api::auth::jwt::public_key_base64(&state.signing_key);
+    let api_url = state.api_url.clone();
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);
     let suffix = Uuid::new_v4().simple().to_string();
@@ -942,6 +958,10 @@ async fn paas_internal_create_app_persists_cli_signer_identity() {
         "bootstrap_pubkey_hash": "1111111111111111111111111111111111111111111111111111111111111111",
         "signer_identity_subject": github_signer_subject(),
         "signer_identity_issuer": github_signer_issuer(),
+        "egress_allowlist": [
+            { "host": "relay.enclava.me", "ports": [20000] },
+            { "host": "rekor.sigstore.dev" }
+        ],
     }))
     .await;
     create.assert_status(StatusCode::CREATED);
@@ -955,6 +975,7 @@ async fn paas_internal_create_app_persists_cli_signer_identity() {
         String,
         Option<String>,
         Option<String>,
+        Value,
     ) = sqlx::query_as(
         "SELECT namespace,
                   instance_id,
@@ -962,7 +983,8 @@ async fn paas_internal_create_app_persists_cli_signer_identity() {
                   bootstrap_owner_pubkey_hash,
                   tenant_instance_identity_hash,
                   signer_identity_subject,
-                  signer_identity_issuer
+                  signer_identity_issuer,
+                  egress_allowlist
            FROM apps
           WHERE name = $1",
     )
@@ -977,6 +999,51 @@ async fn paas_internal_create_app_persists_cli_signer_identity() {
     assert_eq!(create_body["service_account"], pinned.2);
     assert_eq!(create_body["bootstrap_owner_pubkey_hash"], pinned.3);
     assert_eq!(create_body["tenant_instance_identity_hash"], pinned.4);
+    assert_eq!(
+        pinned.7,
+        serde_json::json!([
+            { "host": "relay.enclava.me", "ports": [20000] },
+            { "host": "rekor.sigstore.dev", "ports": [443] }
+        ])
+    );
+
+    let cap_app_id =
+        Uuid::parse_str(create_body["cap_app_id"].as_str().expect("cap app id")).unwrap();
+    sqlx::query(
+        "INSERT INTO app_containers (id, app_id, name, image_ref, image_digest, port, is_primary)
+         VALUES ($1, $2, 'web', $3, $4, 8080, true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(cap_app_id)
+    .bind("ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    .bind("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    .execute(&pool)
+    .await
+    .expect("insert test app container");
+    let persisted_app: enclava_api::models::App =
+        sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+            .bind(cap_app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("persisted app");
+    let app_spec = enclava_api::deploy::build_confidential_app(
+        &pool,
+        &persisted_app,
+        &attestation,
+        &api_signing_pubkey,
+        &api_url,
+    )
+    .await
+    .expect("confidential app spec");
+    let network_policy = generate_network_policy(&app_spec);
+    let egress = network_policy["spec"]["egress"]
+        .as_array()
+        .expect("egress array");
+    let relay_rule = egress
+        .iter()
+        .find(|rule| rule["toFQDNs"][0]["matchName"].as_str() == Some("relay.enclava.me"))
+        .expect("relay egress rule");
+    assert_eq!(relay_rule["toPorts"][0]["ports"][0]["port"], "20000");
 }
 
 #[tokio::test]
@@ -1240,12 +1307,7 @@ async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_pre
     .await
     .assert_status_ok();
 
-    let response = add_internal_actor_headers(
-        server.post(&format!("/internal/paas/orgs/{paas_org_id}/deployments")),
-        &format!("generic-deploy-{suffix}"),
-        &paas_user_id,
-    )
-    .json(&generic_deployment_body(
+    let mut deploy_body = generic_deployment_body(
         &external_id,
         &app_name,
         "github",
@@ -1253,7 +1315,17 @@ async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_pre
         "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "https://github.com/acme/confidential-app/.github/workflows/build.yml@refs/heads/main",
         "https://token.actions.githubusercontent.com",
-    ))
+    );
+    deploy_body["app"]["egress_allowlist"] = serde_json::json!([
+        { "host": "relay.enclava.me", "ports": [20000] }
+    ]);
+
+    let response = add_internal_actor_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/deployments")),
+        &format!("generic-deploy-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&deploy_body)
     .await;
 
     response.assert_status(StatusCode::BAD_REQUEST);
@@ -1276,6 +1348,10 @@ async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_pre
     assert_eq!(
         persisted_app_source(&pool, cap_org_id, &app_name).await,
         ("github".to_string(), "acme/confidential-app".to_string())
+    );
+    assert_eq!(
+        persisted_app_egress(&pool, cap_org_id, &app_name).await,
+        serde_json::json!([{ "host": "relay.enclava.me", "ports": [20000] }])
     );
 }
 

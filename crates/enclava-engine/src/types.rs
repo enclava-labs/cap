@@ -107,7 +107,7 @@ mod hex_bytes32 {
 
 /// One world-egress allowance. Hosts must validate as FQDNs (see
 /// `enclava_common::validate::validate_fqdn`); ports are TCP only.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EgressRule {
     pub host: String,
     pub ports: Vec<u16>,

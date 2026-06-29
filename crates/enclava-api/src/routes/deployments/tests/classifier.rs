@@ -28,6 +28,7 @@ fn idempotency_app() -> App {
         signer_identity_set_at: Some(chrono::Utc::now()),
         source_provider: Some("github".to_string()),
         source_repository: Some("acme/confidential-app".to_string()),
+        egress_allowlist: sqlx::types::Json(Vec::new()),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -76,6 +77,7 @@ fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
                 create_if_missing: true,
                 unlock_mode: "auto".to_string(),
                 bootstrap_pubkey_hash: None,
+                egress_allowlist: Vec::new(),
             },
             source: GenericDeploymentSource {
                 provider: SourceProvider::GitHub,

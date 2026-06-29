@@ -1,5 +1,7 @@
 use chrono::{DateTime, Utc};
+use enclava_engine::types::EgressRule;
 use serde::{Deserialize, Serialize};
+use sqlx::types::Json;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
@@ -123,6 +125,7 @@ pub struct App {
     pub signer_identity_set_at: Option<DateTime<Utc>>,
     pub source_provider: Option<String>,
     pub source_repository: Option<String>,
+    pub egress_allowlist: Json<Vec<EgressRule>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

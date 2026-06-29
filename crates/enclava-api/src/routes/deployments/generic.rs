@@ -21,6 +21,8 @@ pub struct GenericDeploymentApp {
     pub unlock_mode: String,
     #[serde(default)]
     pub bootstrap_pubkey_hash: Option<String>,
+    #[serde(default)]
+    pub egress_allowlist: Vec<crate::routes::apps::CreateEgressAllowRule>,
 }
 
 fn default_generic_unlock_mode() -> String {
@@ -222,6 +224,10 @@ pub async fn create_generic_deployment(
         ));
     }
 
+    let normalized_egress_allowlist =
+        crate::routes::apps::validate_egress_allowlist(&body.app.egress_allowlist)
+            .map_err(|e| json_error(StatusCode::BAD_REQUEST, e))?;
+
     let app = match fetch_app_by_name(&state, auth.org_id, &body.app.name).await? {
         Some(app) => {
             ensure_generic_app_metadata(
@@ -231,6 +237,7 @@ pub async fn create_generic_deployment(
                 &body.source.repository,
                 &body.signing.subject,
                 &body.signing.issuer,
+                &normalized_egress_allowlist,
             )
             .await?
         }
@@ -243,6 +250,7 @@ pub async fn create_generic_deployment(
                 signer_identity_issuer: Some(body.signing.issuer.clone()),
                 source_provider: Some(body.source.provider),
                 source_repository: Some(body.source.repository.clone()),
+                egress_allowlist: body.app.egress_allowlist.clone(),
             };
             let (_, Json(created)) =
                 crate::routes::apps::create_app(auth.clone(), State(state.clone()), Json(create))
@@ -451,6 +459,12 @@ pub(super) fn ensure_idempotent_retry_matches(
     if app.signer_identity_issuer.as_deref() != Some(body.signing.issuer.as_str()) {
         return Err(idempotency_conflict("signing.issuer"));
     }
+    let requested_egress =
+        crate::routes::apps::validate_egress_allowlist(&body.app.egress_allowlist)
+            .map_err(|_| idempotency_conflict("app.egress_allowlist"))?;
+    if app.egress_allowlist.0 != requested_egress {
+        return Err(idempotency_conflict("app.egress_allowlist"));
+    }
     if deployment
         .spec_snapshot
         .get("image")
@@ -495,6 +509,7 @@ async fn ensure_generic_app_metadata(
     repository: &str,
     subject: &str,
     issuer: &str,
+    egress_allowlist: &[enclava_engine::types::EgressRule],
 ) -> Result<App, (StatusCode, Json<serde_json::Value>)> {
     let provider_str = provider.as_str();
     if let Some(existing) = app.source_provider.as_deref()
@@ -535,14 +550,16 @@ async fn ensure_generic_app_metadata(
                 signer_identity_subject = $3,
                 signer_identity_issuer = $4,
                 signer_identity_set_at = COALESCE(signer_identity_set_at, now()),
+                egress_allowlist = $5,
                 updated_at = now()
-          WHERE id = $5
+          WHERE id = $6
           RETURNING *",
     )
     .bind(provider_str)
     .bind(repository)
     .bind(subject)
     .bind(issuer)
+    .bind(sqlx::types::Json(egress_allowlist.to_vec()))
     .bind(app.id)
     .fetch_one(&state.db)
     .await

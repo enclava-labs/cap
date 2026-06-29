@@ -309,6 +309,7 @@ mod tests {
             signer_identity_set_at: None,
             source_provider: None,
             source_repository: None,
+            egress_allowlist: sqlx::types::Json(Vec::new()),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -338,6 +339,7 @@ mod tests {
             signer_identity_set_at: None,
             source_provider: None,
             source_repository: None,
+            egress_allowlist: sqlx::types::Json(Vec::new()),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -372,6 +374,7 @@ mod tests {
             signer_identity_set_at: None,
             source_provider: None,
             source_repository: None,
+            egress_allowlist: sqlx::types::Json(Vec::new()),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

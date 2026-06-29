@@ -1,7 +1,7 @@
 use super::{
     CreateAppRequest, RotateSignerRequest, SignerRotationTokenRequest, create_app,
     issue_signer_rotation_token_route, list_apps, request_workload_teardown,
-    requires_workload_teardown, workload_teardown_instance_id,
+    requires_workload_teardown, validate_egress_allowlist, workload_teardown_instance_id,
 };
 use crate::models::{App, AppStatus, Role, UnlockMode};
 use axum::Json;
@@ -17,6 +17,42 @@ fn create_request_defaults_to_password_unlock() {
     .unwrap();
 
     assert_eq!(body.unlock_mode, "password");
+    assert!(body.egress_allowlist.is_empty());
+}
+
+#[test]
+fn egress_allowlist_defaults_omitted_ports_to_https() {
+    let body: CreateAppRequest = serde_json::from_value(serde_json::json!({
+        "name": "demo",
+        "egress_allowlist": [
+            { "host": "relay.enclava.me", "ports": [20000] },
+            { "host": "rekor.sigstore.dev" }
+        ]
+    }))
+    .unwrap();
+
+    let rules = validate_egress_allowlist(&body.egress_allowlist).unwrap();
+    assert_eq!(rules[0].host, "relay.enclava.me");
+    assert_eq!(rules[0].ports, vec![20000]);
+    assert_eq!(rules[1].host, "rekor.sigstore.dev");
+    assert_eq!(rules[1].ports, vec![443]);
+}
+
+#[test]
+fn egress_allowlist_rejects_ip_hosts_and_empty_ports() {
+    let ip_host: CreateAppRequest = serde_json::from_value(serde_json::json!({
+        "name": "demo",
+        "egress_allowlist": [{ "host": "1.2.3.4", "ports": [443] }]
+    }))
+    .unwrap();
+    assert!(validate_egress_allowlist(&ip_host.egress_allowlist).is_err());
+
+    let empty_ports: CreateAppRequest = serde_json::from_value(serde_json::json!({
+        "name": "demo",
+        "egress_allowlist": [{ "host": "relay.enclava.me", "ports": [] }]
+    }))
+    .unwrap();
+    assert!(validate_egress_allowlist(&empty_ports.egress_allowlist).is_err());
 }
 
 #[test]
@@ -71,6 +107,7 @@ fn teardown_token_instance_id_matches_attestation_proxy_owner_instance_id() {
         signer_identity_set_at: None,
         source_provider: None,
         source_repository: None,
+        egress_allowlist: sqlx::types::Json(Vec::new()),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -118,6 +155,7 @@ async fn unreachable_running_workload_teardown_is_best_effort() {
         signer_identity_set_at: None,
         source_provider: None,
         source_repository: None,
+        egress_allowlist: sqlx::types::Json(Vec::new()),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -140,6 +178,7 @@ async fn create_app_rejects_member_before_database_access() {
             signer_identity_issuer: None,
             source_provider: None,
             source_repository: None,
+            egress_allowlist: Vec::new(),
         }),
     )
     .await;

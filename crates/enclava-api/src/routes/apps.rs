@@ -20,6 +20,8 @@ use crate::source_provider::{
     SourceProvider, validate_signing_identity, validate_source_repository,
 };
 use crate::state::{AppState, CapManagementMode};
+use enclava_engine::types::EgressRule;
+use sqlx::types::Json as SqlJson;
 
 /// Helper function for consistent internal server error responses
 fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
@@ -250,10 +252,53 @@ pub struct CreateAppRequest {
     /// Provider-local repository path, e.g. owner/repo or group/subgroup/project.
     #[serde(default)]
     pub source_repository: Option<String>,
+    /// Per-app FQDN egress allowlist rendered into the tenant Cilium policy.
+    #[serde(default)]
+    pub egress_allowlist: Vec<CreateEgressAllowRule>,
 }
 
 fn default_unlock_mode() -> String {
     "password".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateEgressAllowRule {
+    pub host: String,
+    #[serde(default)]
+    pub ports: Option<Vec<u16>>,
+}
+
+pub(crate) fn validate_egress_allowlist(
+    rules: &[CreateEgressAllowRule],
+) -> Result<Vec<EgressRule>, String> {
+    rules
+        .iter()
+        .map(|rule| {
+            let host = rule.host.as_str();
+            if host.trim() != host {
+                return Err(
+                    "egress_allowlist host must not have surrounding whitespace".to_string()
+                );
+            }
+            if host.parse::<std::net::IpAddr>().is_ok() {
+                return Err(
+                    "egress_allowlist host must be a DNS hostname, not an IP address".to_string(),
+                );
+            }
+            enclava_common::validate::validate_fqdn(host)
+                .map_err(|e| format!("invalid egress_allowlist host: {e}"))?;
+
+            let ports = rule.ports.clone().unwrap_or_else(|| vec![443]);
+            if ports.is_empty() || ports.contains(&0) {
+                return Err("egress_allowlist ports must be between 1 and 65535".to_string());
+            }
+
+            Ok(EgressRule {
+                host: host.to_string(),
+                ports,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -397,6 +442,12 @@ pub async fn create_app(
             Json(serde_json::json!({"error": e})),
         )
     })?;
+    let egress_allowlist = validate_egress_allowlist(&body.egress_allowlist).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+    })?;
 
     // Enforce core entitlement app limit.
     let org: crate::models::Organization =
@@ -497,8 +548,8 @@ pub async fn create_app(
         service_account, bootstrap_owner_pubkey_hash, tenant_instance_identity_hash,
          unlock_mode, domain, tee_domain,
          signer_identity_subject, signer_identity_issuer, signer_identity_set_at,
-         source_provider, source_repository)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17)",
+        source_provider, source_repository, egress_allowlist)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18)",
     )
     .bind(app_id)
     .bind(auth.org_id)
@@ -517,6 +568,7 @@ pub async fn create_app(
     .bind(signer_set_at)
     .bind(body.source_provider.map(SourceProvider::as_str))
     .bind(body.source_repository.as_deref())
+    .bind(SqlJson(egress_allowlist.clone()))
     .execute(&state.db)
     .await;
 
@@ -569,7 +621,11 @@ pub async fn create_app(
     .bind(auth.org_id)
     .bind(app_id)
     .bind(auth.user_id)
-    .bind(serde_json::json!({"name": &body.name, "unlock_mode": &body.unlock_mode}))
+    .bind(serde_json::json!({
+        "name": &body.name,
+        "unlock_mode": &body.unlock_mode,
+        "egress_allowlist": egress_allowlist
+    }))
     .execute(&state.db)
     .await;
 
