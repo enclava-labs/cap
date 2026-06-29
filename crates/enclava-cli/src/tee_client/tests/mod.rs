@@ -63,6 +63,21 @@ fn ownership_client_timeout_covers_live_rollout_budget() {
 }
 
 #[test]
+fn ownership_probe_client_uses_short_timeout_and_preserves_resolve_ip() {
+    let resolve_ip: IpAddr = "95.217.56.248".parse().unwrap();
+    let probe =
+        TeeClient::new_for_ownership_probe_with_resolve_ip("app.enclava.dev", Some(resolve_ip));
+    let claim = TeeClient::new_for_ownership_with_resolve_ip("app.enclava.dev", Some(resolve_ip));
+
+    assert_eq!(probe.resolve_ip, Some(resolve_ip));
+    assert_eq!(probe.timeout, Duration::from_secs(15));
+    assert!(
+        probe.timeout < claim.timeout,
+        "readiness probes must not inherit the long claim/unlock request timeout"
+    );
+}
+
+#[test]
 fn challenge_response_accepts_live_proxy_shape() {
     let parsed: super::ChallengeResponse = serde_json::from_value(serde_json::json!({
         "challenge": "abc",

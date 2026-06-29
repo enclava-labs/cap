@@ -332,7 +332,7 @@ fn deploy_bootstrap_probe_attests_before_calling_claim_endpoint() {
 }
 
 #[test]
-fn deploy_bootstrap_probe_uses_ownership_timeout_client() {
+fn deploy_bootstrap_probe_uses_short_probe_timeout_client() {
     let source = include_str!("../../app.rs");
     let fn_start = source
         .find("async fn wait_for_bootstrap_endpoint")
@@ -344,8 +344,8 @@ fn deploy_bootstrap_probe_uses_ownership_timeout_client() {
     let body = &source[fn_start..fn_end];
 
     assert!(
-        body.contains("TeeClient::new_for_ownership_with_resolve_ip"),
-        "bootstrap probe must allow ownership attestation to take longer than the short poll interval"
+        body.contains("TeeClient::new_for_ownership_probe_with_resolve_ip"),
+        "bootstrap readiness probes must not inherit the long claim/unlock request timeout"
     );
 }
 

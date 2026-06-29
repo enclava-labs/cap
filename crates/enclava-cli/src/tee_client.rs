@@ -29,6 +29,7 @@ const AMD_KDS_BASE_URL: &str = "https://kdsintf.amd.com";
 const AMD_KDS_VCEK_MAX_ATTEMPTS: usize = 8;
 pub const DEFAULT_TEE_REQUEST_TIMEOUT_SECONDS: u64 = 180;
 pub const OWNERSHIP_TEE_REQUEST_TIMEOUT_SECONDS: u64 = 900;
+pub const OWNERSHIP_TEE_PROBE_TIMEOUT_SECONDS: u64 = 15;
 
 /// Direct HTTPS client for the attestation proxy running inside a TEE.
 /// All requests go to https://{app-domain}/.well-known/confidential/...
@@ -162,6 +163,17 @@ impl TeeClient {
         Self::new_with_timeout_and_resolve_ip(
             app_domain,
             std::time::Duration::from_secs(OWNERSHIP_TEE_REQUEST_TIMEOUT_SECONDS),
+            resolve_ip,
+        )
+    }
+
+    pub fn new_for_ownership_probe_with_resolve_ip(
+        app_domain: &str,
+        resolve_ip: Option<IpAddr>,
+    ) -> Self {
+        Self::new_with_timeout_and_resolve_ip(
+            app_domain,
+            std::time::Duration::from_secs(OWNERSHIP_TEE_PROBE_TIMEOUT_SECONDS),
             resolve_ip,
         )
     }

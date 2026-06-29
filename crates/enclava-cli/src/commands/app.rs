@@ -537,8 +537,10 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
     pb: &ProgressBar,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
-    let tee =
-        TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
+    let tee = TeeClient::new_for_ownership_probe_with_resolve_ip(
+        &endpoint.tee_url,
+        endpoint.tee_resolve_ip,
+    );
     let start = std::time::Instant::now();
 
     loop {
