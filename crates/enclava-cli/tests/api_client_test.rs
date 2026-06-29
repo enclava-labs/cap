@@ -242,7 +242,7 @@ async fn deliver_managed_template_config_posts_hosted_paas_route() {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 8192];
         let n = stream.read(&mut buf).unwrap();
-        let body = r#"{"status":"delivered","app_name":"shell","template_slug":"debian-ssh-frp"}"#;
+        let body = r#"{"status":"queued","app_name":"shell","template_slug":"debian-ssh-frp"}"#;
         stream
             .write_all(
                 format!(
@@ -265,7 +265,7 @@ async fn deliver_managed_template_config_posts_hosted_paas_route() {
     let request = handle.join().unwrap();
     assert!(request.starts_with("POST /apps/shell%2Fmain/managed-config/deliver "));
     assert!(request.contains("authorization: Bearer test-token"));
-    assert_eq!(response.status, "delivered");
+    assert_eq!(response.status, "queued");
     assert_eq!(response.app_name, "shell");
     assert_eq!(response.template_slug, "debian-ssh-frp");
 }

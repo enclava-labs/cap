@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     time::{Duration, Instant},
@@ -301,13 +301,22 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             .deliver_managed_template_config(&instance_name)
             .await
             .map_err(managed_template_config_api_error)?;
-        if managed.status != "delivered" {
+        if !matches!(managed.status.as_str(), "queued" | "delivered") {
             return Err(format!(
                 "PaaS managed config delivery returned unexpected status `{}`",
                 managed.status
             )
             .into());
         }
+        pb.set_message("Waiting for platform-managed config...");
+        wait_for_paas_managed_config_keys(
+            api,
+            &instance_name,
+            &template.paas_managed_config_keys,
+            Duration::from_secs(args.ssh_timeout_seconds),
+            &pb,
+        )
+        .await?;
     }
     pb.set_message("Delivering config to TEE...");
 
@@ -902,6 +911,62 @@ async fn sync_template_config_key_with_retry(
         }
     }
     Err(format!("TEE config metadata sync failed for {key}").into())
+}
+
+async fn wait_for_paas_managed_config_keys(
+    api: &ApiClient,
+    instance_name: &str,
+    expected_keys: &[String],
+    timeout: Duration,
+    progress: &ProgressBar,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let expected = expected_keys
+        .iter()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        match api.list_config_keys(instance_name).await {
+            Ok(response) => {
+                let present = response
+                    .keys
+                    .into_iter()
+                    .map(|entry| entry.key)
+                    .collect::<HashSet<_>>();
+                let missing = expected
+                    .iter()
+                    .filter(|key| !present.contains(*key))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if missing.is_empty() {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "PaaS managed config did not become ready before timeout; missing keys: {}",
+                        missing.join(", ")
+                    )
+                    .into());
+                }
+            }
+            Err(error) if should_retry_template_config_sync_error(&error) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "PaaS managed config readiness check did not succeed before timeout: {error}"
+                    )
+                    .into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        progress.tick();
+        tokio::time::sleep(template_config_delivery_retry_delay()).await;
+    }
 }
 
 async fn refresh_template_config_token_with_retry(
@@ -2658,6 +2723,9 @@ mod tests {
         let managed_config = body
             .find("deliver_managed_template_config")
             .expect("template deploy asks PaaS to deliver managed config");
+        let wait_managed_config = body
+            .find("wait_for_paas_managed_config_keys")
+            .expect("template deploy waits for PaaS-managed config metadata");
         let config = body
             .find("deliver_template_config_with_retry")
             .expect("template deploy writes customer config");
@@ -2669,8 +2737,9 @@ mod tests {
                 && create_instance < wait_claim
                 && wait_claim < claim
                 && claim < managed_config
-                && managed_config < config,
-            "password-mode template deploy must make the config store writable and deliver PaaS-managed config before writing customer config"
+                && managed_config < wait_managed_config
+                && wait_managed_config < config,
+            "password-mode template deploy must make the config store writable and wait for PaaS-managed config before writing customer config"
         );
     }
 
