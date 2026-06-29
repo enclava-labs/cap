@@ -137,41 +137,43 @@ async fn request_workload_teardown(
         "https://{}/.well-known/confidential/teardown",
         domain.trim_end_matches('/')
     );
-    let response = state
+    let response = match state
         .tee_http_client
         .post(&url)
         .bearer_auth(token)
         .send()
         .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": "failed to contact workload teardown endpoint",
-                    "detail": e.to_string(),
-                })),
-            )
-        })?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app.id,
+                app_name = %app.name,
+                namespace = %app.namespace,
+                url = %url,
+                error = %error,
+                "workload teardown endpoint unreachable; continuing app deletion"
+            );
+            return Ok(());
+        }
+    };
 
     if response.status().is_success() {
         return Ok(());
     }
 
     let status = response.status();
-    let status_code = status.as_u16();
     let body = response.text().await.unwrap_or_default();
-    Err((
-        if matches!(status_code, 409 | 423) {
-            StatusCode::CONFLICT
-        } else {
-            StatusCode::BAD_GATEWAY
-        },
-        Json(serde_json::json!({
-            "error": "workload teardown failed",
-            "status": status_code,
-            "body": body,
-        })),
-    ))
+    tracing::warn!(
+        app_id = %app.id,
+        app_name = %app.name,
+        namespace = %app.namespace,
+        url = %url,
+        status = status.as_u16(),
+        body = %body,
+        "workload teardown endpoint returned non-success; continuing app deletion"
+    );
+    Ok(())
 }
 
 /// Comprehensive app name validation

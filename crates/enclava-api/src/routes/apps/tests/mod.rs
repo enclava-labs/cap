@@ -1,12 +1,13 @@
 use super::{
     CreateAppRequest, RotateSignerRequest, SignerRotationTokenRequest, create_app,
-    issue_signer_rotation_token_route, list_apps, requires_workload_teardown,
-    workload_teardown_instance_id,
+    issue_signer_rotation_token_route, list_apps, request_workload_teardown,
+    requires_workload_teardown, workload_teardown_instance_id,
 };
 use crate::models::{App, AppStatus, Role, UnlockMode};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use std::time::Duration;
 
 #[test]
 fn create_request_defaults_to_password_unlock() {
@@ -87,6 +88,43 @@ fn only_running_apps_require_workload_teardown_endpoint() {
     assert!(!requires_workload_teardown(AppStatus::Failed));
     assert!(!requires_workload_teardown(AppStatus::Stopped));
     assert!(!requires_workload_teardown(AppStatus::Deleting));
+}
+
+#[tokio::test]
+async fn unreachable_running_workload_teardown_is_best_effort() {
+    let mut state = crate::test_support::lazy_state();
+    state.tee_http_client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    let auth = crate::test_support::auth_context(Role::Admin, &["apps:write"]);
+    let app = App {
+        id: uuid::Uuid::new_v4(),
+        org_id: auth.org_id,
+        name: "demo".to_string(),
+        namespace: "cap-a826eb13-demo".to_string(),
+        instance_id: "a826eb13-12345678".to_string(),
+        tenant_id: "a826eb13".to_string(),
+        service_account: "cap-demo-sa".to_string(),
+        bootstrap_owner_pubkey_hash: "00".repeat(32),
+        tenant_instance_identity_hash: "11".repeat(32),
+        unlock_mode: UnlockMode::Password,
+        domain: "127.0.0.1:9".to_string(),
+        tee_domain: Some("127.0.0.1:9".to_string()),
+        custom_domain: None,
+        status: AppStatus::Running,
+        signer_identity_subject: None,
+        signer_identity_issuer: None,
+        signer_identity_set_at: None,
+        source_provider: None,
+        source_repository: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    request_workload_teardown(&state, &auth, &app)
+        .await
+        .expect("unreachable workload teardown endpoint must not block deletion");
 }
 
 #[tokio::test]
