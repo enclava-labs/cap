@@ -235,6 +235,42 @@ async fn get_template_ssh_command_uses_hosted_paas_route() {
 }
 
 #[tokio::test]
+async fn deliver_managed_template_config_posts_hosted_paas_route() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).unwrap();
+        let body = r#"{"status":"delivered","app_name":"shell","template_slug":"debian-ssh-frp"}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let response = client
+        .deliver_managed_template_config("shell/main")
+        .await
+        .unwrap();
+
+    let request = handle.join().unwrap();
+    assert!(request.starts_with("POST /apps/shell%2Fmain/managed-config/deliver "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert_eq!(response.status, "delivered");
+    assert_eq!(response.app_name, "shell");
+    assert_eq!(response.template_slug, "debian-ssh-frp");
+}
+
+#[tokio::test]
 async fn api_errors_preserve_paas_error_code() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

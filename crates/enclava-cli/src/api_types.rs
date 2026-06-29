@@ -434,6 +434,13 @@ where
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ManagedConfigDeliveryResponse {
+    pub status: String,
+    pub app_name: String,
+    pub template_slug: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,

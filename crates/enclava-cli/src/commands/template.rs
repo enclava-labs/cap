@@ -295,6 +295,20 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             .await?;
         }
     }
+    if !template.paas_managed_config_keys.is_empty() {
+        pb.set_message("Delivering platform-managed config...");
+        let managed = api
+            .deliver_managed_template_config(&instance_name)
+            .await
+            .map_err(managed_template_config_api_error)?;
+        if managed.status != "delivered" {
+            return Err(format!(
+                "PaaS managed config delivery returned unexpected status `{}`",
+                managed.status
+            )
+            .into());
+        }
+    }
     pb.set_message("Delivering config to TEE...");
 
     let token = response
@@ -1869,6 +1883,22 @@ fn template_instance_create_api_error(error: ApiError) -> Box<dyn std::error::Er
     }
 }
 
+fn managed_template_config_api_error(error: ApiError) -> Box<dyn std::error::Error> {
+    match &error {
+        ApiError::Api {
+            code: Some(code),
+            message,
+            ..
+        } if code == "managed_config_delivery_failed" => {
+            format!(
+                "PaaS could not deliver platform-managed template config after ownership claim: {message}"
+            )
+            .into()
+        }
+        _ => error.into(),
+    }
+}
+
 fn stable_ssh_managed_ngrok_setup_error_message(error: &ApiError) -> Option<String> {
     let ApiError::Api { code, message, .. } = error else {
         return None;
@@ -2625,6 +2655,9 @@ mod tests {
         let claim = body
             .find("claim_initial_ownership")
             .expect("template deploy claims ownership");
+        let managed_config = body
+            .find("deliver_managed_template_config")
+            .expect("template deploy asks PaaS to deliver managed config");
         let config = body
             .find("deliver_template_config_with_retry")
             .expect("template deploy writes customer config");
@@ -2635,8 +2668,9 @@ mod tests {
                 && ensure_app < create_instance
                 && create_instance < wait_claim
                 && wait_claim < claim
-                && claim < config,
-            "password-mode template deploy must make the config store writable before writing config"
+                && claim < managed_config
+                && managed_config < config,
+            "password-mode template deploy must make the config store writable and deliver PaaS-managed config before writing customer config"
         );
     }
 

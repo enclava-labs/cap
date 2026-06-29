@@ -376,6 +376,21 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn deliver_managed_template_config(
+        &self,
+        app_name: &str,
+    ) -> Result<ManagedConfigDeliveryResponse, ApiError> {
+        let app_name = path_segment(app_name);
+        let resp = self
+            .http
+            .post(self.url(&format!("/apps/{app_name}/managed-config/deliver")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     // --- Status ---
 
     pub async fn get_status(&self, app_name: &str) -> Result<AppStatus, ApiError> {
