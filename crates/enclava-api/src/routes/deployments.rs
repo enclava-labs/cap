@@ -14,6 +14,14 @@ use crate::state::AppState;
 
 const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
     &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
+const ROOTFUL_SUDO_CAPS: &[&str] = &[
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "SETGID",
+    "SETUID",
+    "AUDIT_WRITE",
+];
 
 fn deploy_blocked_response(
     status: StatusCode,
@@ -283,8 +291,8 @@ fn signed_descriptor_profile(
         && sec.allow_privilege_escalation
         && !sec.privileged
         && drops_all
-        && caps.add.len() == PLATFORM_MANAGED_SSH_RELAY_CAPS.len()
-        && PLATFORM_MANAGED_SSH_RELAY_CAPS.iter().all(|required| {
+        && caps.add.len() == ROOTFUL_SUDO_CAPS.len()
+        && ROOTFUL_SUDO_CAPS.iter().all(|required| {
             caps.add
                 .iter()
                 .any(|cap| cap.eq_ignore_ascii_case(required))

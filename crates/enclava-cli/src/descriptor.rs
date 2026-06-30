@@ -68,6 +68,14 @@ pub const CAP_APP_CPU_REQUEST: &str = "250m";
 pub const CAP_APP_MEMORY_REQUEST: &str = "512Mi";
 const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
     &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
+const ROOTFUL_SUDO_CAPS: &[&str] = &[
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "SETGID",
+    "SETUID",
+    "AUDIT_WRITE",
+];
 
 fn storage_subdir(path: &str) -> String {
     path.trim_start_matches('/').replace('/', "-")
@@ -122,7 +130,7 @@ pub fn cap_app_oci_runtime_spec(input: CapAppOciRuntimeSpecInput) -> OciRuntimeS
         ),
         enclava_engine::types::WorkloadSecurityProfile::RootfulSudo => (
             Capabilities {
-                add: PLATFORM_MANAGED_SSH_RELAY_CAPS
+                add: ROOTFUL_SUDO_CAPS
                     .iter()
                     .map(|cap| (*cap).to_string())
                     .collect(),

@@ -239,7 +239,7 @@ fn signed_descriptor_profile_accepts_only_known_security_shapes() {
     };
     rootful_sudo.oci_runtime_spec.capabilities = Capabilities {
         drop: vec!["ALL".to_string()],
-        add: PLATFORM_MANAGED_SSH_RELAY_CAPS
+        add: ROOTFUL_SUDO_CAPS
             .iter()
             .map(|cap| (*cap).to_string())
             .collect(),

@@ -76,6 +76,14 @@ const CAP_CONFIG_READY_MARKER: &str = "/state/.enclava/luks-ready";
 const CAP_CONFIG_FILE_GID: &str = "10001";
 const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
     &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
+const ROOTFUL_SUDO_CAPS: &[&str] = &[
+    "CHOWN",
+    "DAC_OVERRIDE",
+    "FOWNER",
+    "SETGID",
+    "SETUID",
+    "AUDIT_WRITE",
+];
 
 fn workload_profile_runs_as_root(profile: WorkloadSecurityProfile) -> bool {
     matches!(
@@ -335,10 +343,18 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".to_string()]),
                 add: Some(
-                    PLATFORM_MANAGED_SSH_RELAY_CAPS
-                        .iter()
-                        .map(|cap| (*cap).to_string())
-                        .collect(),
+                    match primary.workload_security_profile {
+                        WorkloadSecurityProfile::PlatformManagedSshRelay => {
+                            PLATFORM_MANAGED_SSH_RELAY_CAPS
+                        }
+                        WorkloadSecurityProfile::RootfulSudo => ROOTFUL_SUDO_CAPS,
+                        WorkloadSecurityProfile::Restricted => {
+                            unreachable!("handled by else branch")
+                        }
+                    }
+                    .iter()
+                    .map(|cap| (*cap).to_string())
+                    .collect(),
                 ),
             }),
             ..Default::default()

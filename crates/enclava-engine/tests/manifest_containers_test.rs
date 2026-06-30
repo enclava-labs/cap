@@ -83,6 +83,7 @@ fn app_container_rootful_sudo_profile_allows_sudo_elevation() {
                 "FOWNER".to_string(),
                 "SETGID".to_string(),
                 "SETUID".to_string(),
+                "AUDIT_WRITE".to_string(),
             ][..]
         )
     );
