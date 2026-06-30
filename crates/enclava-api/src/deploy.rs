@@ -42,6 +42,7 @@ struct DeploymentOutcome {
     deploy_status: &'static str,
     app_status: &'static str,
     error_message: Option<String>,
+    terminal: bool,
 }
 
 fn classify_rollout_result(
@@ -54,6 +55,7 @@ fn classify_rollout_result(
             deploy_status: "healthy",
             app_status: "running",
             error_message: None,
+            terminal: true,
         },
         Ok(status)
             if status.phase == DeployPhase::TimedOut
@@ -64,6 +66,19 @@ fn classify_rollout_result(
                 deploy_status: "healthy",
                 app_status: "running",
                 error_message: None,
+                terminal: true,
+            }
+        }
+        Ok(status)
+            if status.phase == DeployPhase::TimedOut
+                && previous_app_status == AppStatus::Creating
+                && unlock_mode == crate::models::UnlockMode::Password =>
+        {
+            DeploymentOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_message: None,
+                terminal: false,
             }
         }
         Ok(status) => DeploymentOutcome {
@@ -72,11 +87,13 @@ fn classify_rollout_result(
             error_message: status
                 .message
                 .or_else(|| Some(format!("{:?}", status.phase))),
+            terminal: true,
         },
         Err(err) => DeploymentOutcome {
             deploy_status: "failed",
             app_status: "failed",
             error_message: Some(err),
+            terminal: true,
         },
     }
 }
@@ -501,18 +518,20 @@ pub async fn record_deployment_result(
     status: &str,
     manifest_hash: Option<&str>,
     error_message: Option<&str>,
+    terminal: bool,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE deployments
          SET status = $1::deploy_status_enum,
              manifest_hash = $2,
              error_message = $3,
-             completed_at = now()
-         WHERE id = $4",
+             completed_at = CASE WHEN $4 THEN now() ELSE completed_at END
+         WHERE id = $5",
     )
     .bind(status)
     .bind(manifest_hash)
     .bind(error_message)
+    .bind(terminal)
     .bind(deployment_id)
     .execute(pool)
     .await?;
@@ -569,6 +588,7 @@ mod tests {
                 deploy_status: "healthy",
                 app_status: "running",
                 error_message: None,
+                terminal: true,
             }
         );
     }
@@ -585,6 +605,7 @@ mod tests {
 
         assert_eq!(outcome.deploy_status, "failed");
         assert_eq!(outcome.app_status, "failed");
+        assert!(outcome.terminal);
         assert_eq!(
             outcome.error_message.as_deref(),
             Some("rollout did not complete within 600s")
@@ -592,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn password_create_timeout_still_fails() {
+    fn password_create_timeout_stays_watchable_for_initial_claim() {
         let outcome = classify_rollout_result(
             Ok(EngineDeployStatus::timed_out(
                 "rollout did not complete within 600s",
@@ -601,11 +622,14 @@ mod tests {
             crate::models::UnlockMode::Password,
         );
 
-        assert_eq!(outcome.deploy_status, "failed");
-        assert_eq!(outcome.app_status, "failed");
         assert_eq!(
-            outcome.error_message.as_deref(),
-            Some("rollout did not complete within 600s")
+            outcome,
+            DeploymentOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_message: None,
+                terminal: false,
+            }
         );
     }
 
@@ -1184,6 +1208,7 @@ pub async fn apply_deployment_manifests(
             outcome.deploy_status,
             Some(&hash),
             outcome.error_message.as_deref(),
+            outcome.terminal,
         )
         .await
         {
