@@ -274,7 +274,23 @@ fn signed_descriptor_profile(
                 .any(|cap| cap.eq_ignore_ascii_case(required))
         });
     if relay {
-        Some(WorkloadSecurityProfile::PlatformManagedSshRelay)
+        return Some(WorkloadSecurityProfile::PlatformManagedSshRelay);
+    }
+
+    let rootful_sudo = sec.run_as_user == 0
+        && sec.run_as_group == 0
+        && !sec.read_only_root_fs
+        && sec.allow_privilege_escalation
+        && !sec.privileged
+        && drops_all
+        && caps.add.len() == PLATFORM_MANAGED_SSH_RELAY_CAPS.len()
+        && PLATFORM_MANAGED_SSH_RELAY_CAPS.iter().all(|required| {
+            caps.add
+                .iter()
+                .any(|cap| cap.eq_ignore_ascii_case(required))
+        });
+    if rootful_sudo {
+        Some(WorkloadSecurityProfile::RootfulSudo)
     } else {
         None
     }

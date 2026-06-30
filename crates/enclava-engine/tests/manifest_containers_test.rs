@@ -60,6 +60,35 @@ fn app_container_platform_managed_ssh_relay_profile_runs_root_supervisor() {
 }
 
 #[test]
+fn app_container_rootful_sudo_profile_allows_sudo_elevation() {
+    let mut app = sample_app();
+    app.containers[0].workload_security_profile = WorkloadSecurityProfile::RootfulSudo;
+
+    let c = build_app_container(&app);
+    let sc = c.security_context.as_ref().unwrap();
+    assert_eq!(sc.privileged, Some(false));
+    assert_eq!(sc.allow_privilege_escalation, Some(true));
+    assert_eq!(sc.run_as_user, Some(0));
+    assert_eq!(sc.run_as_group, Some(0));
+    assert_eq!(sc.run_as_non_root, Some(false));
+    assert_eq!(sc.read_only_root_filesystem, Some(false));
+    let caps = sc.capabilities.as_ref().unwrap();
+    assert_eq!(caps.drop.as_deref(), Some(&["ALL".to_string()][..]));
+    assert_eq!(
+        caps.add.as_deref(),
+        Some(
+            &[
+                "CHOWN".to_string(),
+                "DAC_OVERRIDE".to_string(),
+                "FOWNER".to_string(),
+                "SETGID".to_string(),
+                "SETUID".to_string(),
+            ][..]
+        )
+    );
+}
+
+#[test]
 fn app_container_does_not_use_sh_c() {
     let c = build_app_container(&sample_app());
     if let Some(cmd) = c.command.as_ref() {
@@ -389,6 +418,15 @@ fn proxy_container_mounts_state_filesystem_for_config_storage() {
     let root_only_env = root_only.env.as_ref().unwrap();
     assert!(
         root_only_env
+            .iter()
+            .all(|e| e.name != "CAP_CONFIG_FILE_GID")
+    );
+    let mut rootful_sudo_app = sample_app();
+    rootful_sudo_app.containers[0].workload_security_profile = WorkloadSecurityProfile::RootfulSudo;
+    let rootful_sudo = build_attestation_proxy_container(&rootful_sudo_app);
+    let rootful_sudo_env = rootful_sudo.env.as_ref().unwrap();
+    assert!(
+        rootful_sudo_env
             .iter()
             .all(|e| e.name != "CAP_CONFIG_FILE_GID")
     );

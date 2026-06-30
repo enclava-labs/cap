@@ -76,7 +76,7 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     out.push_str("attempts-path = \"/run/enclava-unlock/unlock-attempts\"\n");
     out.push_str(&format!("app-uid = {}\n", primary_app_uid(app)));
     out.push_str(&format!("app-gid = {}\n", primary_app_gid(app)));
-    if primary_uses_platform_managed_ssh_relay(app) {
+    if primary_uses_root_workload_identity(app) {
         out.push_str("managed-config-gid = 0\n");
         out.push_str(&format!(
             "managed-config-dir-mode = {ROOT_ONLY_MANAGED_CONFIG_DIR_MODE}\n"
@@ -177,14 +177,17 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     out
 }
 
-fn primary_uses_platform_managed_ssh_relay(app: &ConfidentialApp) -> bool {
+fn primary_uses_root_workload_identity(app: &ConfidentialApp) -> bool {
     app.primary_container().is_some_and(|primary| {
-        primary.workload_security_profile == WorkloadSecurityProfile::PlatformManagedSshRelay
+        matches!(
+            primary.workload_security_profile,
+            WorkloadSecurityProfile::PlatformManagedSshRelay | WorkloadSecurityProfile::RootfulSudo
+        )
     })
 }
 
 fn primary_app_uid(app: &ConfidentialApp) -> u32 {
-    if primary_uses_platform_managed_ssh_relay(app) {
+    if primary_uses_root_workload_identity(app) {
         ROOT_UID
     } else {
         APP_UID
@@ -192,7 +195,7 @@ fn primary_app_uid(app: &ConfidentialApp) -> u32 {
 }
 
 fn primary_app_gid(app: &ConfidentialApp) -> u32 {
-    if primary_uses_platform_managed_ssh_relay(app) {
+    if primary_uses_root_workload_identity(app) {
         ROOT_GID
     } else {
         APP_GID

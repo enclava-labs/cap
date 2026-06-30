@@ -229,6 +229,26 @@ fn signed_descriptor_profile_accepts_only_known_security_shapes() {
         Some(WorkloadSecurityProfile::PlatformManagedSshRelay)
     );
 
+    let mut rootful_sudo = deployment_descriptor_for_security_profile_tests();
+    rootful_sudo.oci_runtime_spec.security_context = SecurityContext {
+        run_as_user: 0,
+        run_as_group: 0,
+        read_only_root_fs: false,
+        allow_privilege_escalation: true,
+        privileged: false,
+    };
+    rootful_sudo.oci_runtime_spec.capabilities = Capabilities {
+        drop: vec!["ALL".to_string()],
+        add: PLATFORM_MANAGED_SSH_RELAY_CAPS
+            .iter()
+            .map(|cap| (*cap).to_string())
+            .collect(),
+    };
+    assert_eq!(
+        signed_descriptor_profile(&rootful_sudo),
+        Some(WorkloadSecurityProfile::RootfulSudo)
+    );
+
     let mut malformed = deployment_descriptor_for_security_profile_tests();
     malformed.oci_runtime_spec.security_context = relay.oci_runtime_spec.security_context;
     malformed.oci_runtime_spec.capabilities = Capabilities {

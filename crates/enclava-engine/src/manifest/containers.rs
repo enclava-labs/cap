@@ -77,6 +77,13 @@ const CAP_CONFIG_FILE_GID: &str = "10001";
 const PLATFORM_MANAGED_SSH_RELAY_CAPS: &[&str] =
     &["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
 
+fn workload_profile_runs_as_root(profile: WorkloadSecurityProfile) -> bool {
+    matches!(
+        profile,
+        WorkloadSecurityProfile::PlatformManagedSshRelay | WorkloadSecurityProfile::RootfulSudo
+    )
+}
+
 fn shell_escape_arg(arg: &str) -> String {
     if arg.is_empty() {
         return "''".to_string();
@@ -311,15 +318,20 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             }),
             ..Default::default()
         }
-    } else if primary.workload_security_profile == WorkloadSecurityProfile::PlatformManagedSshRelay
-    {
+    } else if workload_profile_runs_as_root(primary.workload_security_profile) {
+        let (allow_privilege_escalation, read_only_root_filesystem) =
+            match primary.workload_security_profile {
+                WorkloadSecurityProfile::RootfulSudo => (true, false),
+                WorkloadSecurityProfile::PlatformManagedSshRelay => (false, true),
+                WorkloadSecurityProfile::Restricted => unreachable!("handled by else branch"),
+            };
         SecurityContext {
             privileged: Some(false),
-            allow_privilege_escalation: Some(false),
+            allow_privilege_escalation: Some(allow_privilege_escalation),
             run_as_user: Some(0),
             run_as_group: Some(0),
             run_as_non_root: Some(false),
-            read_only_root_filesystem: Some(true),
+            read_only_root_filesystem: Some(read_only_root_filesystem),
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".to_string()]),
                 add: Some(
@@ -681,7 +693,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env("KBS_FETCH_MAX_SLEEP_SECONDS", "10"),
         env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
     ];
-    if primary.workload_security_profile != WorkloadSecurityProfile::PlatformManagedSshRelay {
+    if !workload_profile_runs_as_root(primary.workload_security_profile) {
         env_vars.push(env("CAP_CONFIG_FILE_GID", CAP_CONFIG_FILE_GID));
     }
     if let Some(keys) = required_config_keys_from_primary(app) {

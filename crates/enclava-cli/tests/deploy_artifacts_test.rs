@@ -231,6 +231,62 @@ fn cap_oci_runtime_spec_matches_platform_managed_ssh_relay_profile() {
 }
 
 #[test]
+fn cap_oci_runtime_spec_matches_rootful_sudo_profile() {
+    let mut app = sample_app();
+    app.containers[0].workload_security_profile = WorkloadSecurityProfile::RootfulSudo;
+    let primary = app.primary_container().unwrap();
+    let descriptor_oci = cap_app_oci_runtime_spec(CapAppOciRuntimeSpecInput {
+        container_name: primary.name.clone(),
+        port: primary.port.unwrap(),
+        workload_command: primary.command.clone().unwrap_or_default(),
+        storage_paths: primary.storage_paths.clone(),
+        workload_security_profile: primary.workload_security_profile,
+        cpu_limit: app.resources.cpu.clone(),
+        memory_limit: app.resources.memory.clone(),
+    });
+    let rendered = build_app_container(&app);
+    let rendered_sc = rendered.security_context.unwrap();
+
+    assert_eq!(descriptor_oci.security_context.run_as_user, 0);
+    assert_eq!(
+        descriptor_oci.security_context.run_as_user,
+        rendered_sc.run_as_user.unwrap() as u32
+    );
+    assert_eq!(
+        descriptor_oci.security_context.run_as_group,
+        rendered_sc.run_as_group.unwrap() as u32
+    );
+    assert_eq!(
+        descriptor_oci.security_context.read_only_root_fs,
+        rendered_sc.read_only_root_filesystem.unwrap()
+    );
+    assert_eq!(
+        descriptor_oci.security_context.allow_privilege_escalation,
+        rendered_sc.allow_privilege_escalation.unwrap()
+    );
+    assert_eq!(
+        descriptor_oci.capabilities.add,
+        rendered_sc
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .add
+            .clone()
+            .unwrap()
+    );
+    assert_eq!(
+        descriptor_oci.capabilities.drop,
+        rendered_sc
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .drop
+            .clone()
+            .unwrap()
+    );
+}
+
+#[test]
 fn deploy_descriptor_and_keyring_envelopes_serialize_for_deploy_request() {
     let deployer =
         UserSigningKey::generate(Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap());

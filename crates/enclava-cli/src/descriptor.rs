@@ -120,6 +120,22 @@ pub fn cap_app_oci_runtime_spec(input: CapAppOciRuntimeSpecInput) -> OciRuntimeS
                 privileged: false,
             },
         ),
+        enclava_engine::types::WorkloadSecurityProfile::RootfulSudo => (
+            Capabilities {
+                add: PLATFORM_MANAGED_SSH_RELAY_CAPS
+                    .iter()
+                    .map(|cap| (*cap).to_string())
+                    .collect(),
+                drop: vec!["ALL".to_string()],
+            },
+            SecurityContext {
+                run_as_user: 0,
+                run_as_group: 0,
+                read_only_root_fs: false,
+                allow_privilege_escalation: true,
+                privileged: false,
+            },
+        ),
         enclava_engine::types::WorkloadSecurityProfile::Restricted => (
             Capabilities {
                 add: Vec::new(),

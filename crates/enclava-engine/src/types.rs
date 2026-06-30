@@ -255,8 +255,8 @@ pub struct Container {
     pub storage_paths: Vec<String>,
     /// Runtime security profile for the workload container. The default
     /// restricted profile runs the container as the workload user. Platform
-    /// templates that need a root-owned supervisor without exposing its files
-    /// to the SSH login user opt into a named profile.
+    /// templates that need a root-owned supervisor or tenant sudo opt into a
+    /// named profile.
     #[serde(default, skip_serializing_if = "WorkloadSecurityProfile::is_default")]
     pub workload_security_profile: WorkloadSecurityProfile,
     /// Whether this is the primary container (gets domain routing).
@@ -269,6 +269,7 @@ pub enum WorkloadSecurityProfile {
     #[default]
     Restricted,
     PlatformManagedSshRelay,
+    RootfulSudo,
 }
 
 impl WorkloadSecurityProfile {
@@ -280,6 +281,7 @@ impl WorkloadSecurityProfile {
         match self {
             Self::Restricted => "restricted",
             Self::PlatformManagedSshRelay => "platform-managed-ssh-relay",
+            Self::RootfulSudo => "rootful-sudo",
         }
     }
 }
@@ -291,8 +293,9 @@ impl std::str::FromStr for WorkloadSecurityProfile {
         match value.trim() {
             "" | "restricted" => Ok(Self::Restricted),
             "platform-managed-ssh-relay" => Ok(Self::PlatformManagedSshRelay),
+            "rootful-sudo" => Ok(Self::RootfulSudo),
             other => Err(format!(
-                "unsupported workload_security_profile {other:?}; expected restricted or platform-managed-ssh-relay"
+                "unsupported workload_security_profile {other:?}; expected restricted, platform-managed-ssh-relay, or rootful-sudo"
             )),
         }
     }
