@@ -11,8 +11,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-features
 ```
 
-`enclava-init` links to `libcryptsetup`. On hosts without the development
-package, use:
+Workspace tests include the API integration suite, so set `DATABASE_URL` to a
+disposable PostgreSQL database or use the targeted commands below.
+
+`enclava-init` links to `libcryptsetup`. On Debian/Ubuntu, install the same
+native packages CI uses:
+
+```bash
+sudo apt-get install -y pkg-config libcryptsetup-dev clang libclang-dev
+```
+
+If those packages are not available locally, run the rest of the workspace with:
 
 ```bash
 cargo test --workspace --exclude enclava-init
@@ -20,13 +29,32 @@ cargo clippy --workspace --all-targets --exclude enclava-init -- -D warnings
 ```
 
 Local API integration tests need a reachable PostgreSQL test database. When the
-database is not configured, prefer targeted unit tests such as:
+database is configured through the development compose stack, use:
+
+```bash
+DATABASE_URL=postgresql://enclava:enclava@localhost:5432/enclava \
+  cargo test -p enclava-api --test integration_test
+```
+
+When the database is not configured, prefer targeted unit tests such as:
 
 ```bash
 cargo test -p enclava-api --lib
 cargo test -p enclava-cli
 cargo test -p enclava-engine
-python3 -m pytest tests/test_cap_hermes_proof.py
+python3 -m pytest tests
+```
+
+The Python checks require `pytest`; install it in your local virtualenv if
+`python3 -m pytest` is not available.
+
+CI additionally runs doctests and, after installing `cargo-audit` and
+`cargo-deny`, the Rust dependency gates:
+
+```bash
+cargo test --doc
+cargo audit --ignore RUSTSEC-2023-0071
+cargo deny check advisories sources
 ```
 
 ## Local API
@@ -51,6 +79,12 @@ checks:
 ```bash
 cargo test -p enclava-cli template::tests -- --nocapture
 cargo run -p enclava-cli -- template deploy --help
+```
+
+Before changing the hosted Debian SSH path, run the stable SSH gate:
+
+```bash
+scripts/test-stable-ssh-cli.sh
 ```
 
 The deploy subcommand expects a hosted PaaS session and calls `GET /templates`
@@ -109,4 +143,7 @@ scripts/nutshell-fast-contract.sh
 ```
 
 It validates the Nutshell app contract and then runs the focused CAP and
-signing-service checks that catch descriptor, runtime, and policy drift.
+signing-service checks that catch descriptor, runtime, and policy drift. The
+script expects sibling `nutshell` and `policy-templates/signing-service`
+checkouts by default; override `NUTSHELL_ROOT` and `POLICY_ROOT` when they live
+elsewhere.
