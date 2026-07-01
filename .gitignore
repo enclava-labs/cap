@@ -10,6 +10,7 @@
 .Codex/
 .remember/
 docs/superpowers/
+codex-security-review.md
 
 # Secrets / keys
 *.env
