@@ -1,8 +1,8 @@
 use super::{
-    CreateAppRequest, RotateSignerRequest, SignerRotationTokenRequest, create_app,
-    issue_signer_rotation_token_route, list_apps, request_workload_teardown,
-    requires_workload_teardown, validate_egress_allowlist, validate_egress_mode,
-    workload_teardown_instance_id,
+    CreateAppRequest, EgressAllowlistAuditReason, RotateSignerRequest, SignerRotationTokenRequest,
+    create_app, egress_allowlist_host_audit_reasons, issue_signer_rotation_token_route, list_apps,
+    request_workload_teardown, requires_workload_teardown, validate_egress_allowlist,
+    validate_egress_mode, workload_teardown_instance_id,
 };
 use crate::models::{App, AppStatus, Role, UnlockMode};
 use axum::Json;
@@ -68,6 +68,48 @@ fn egress_allowlist_rejects_ip_hosts_and_empty_ports() {
     }))
     .unwrap();
     assert!(validate_egress_allowlist(&empty_ports.egress_allowlist).is_err());
+}
+
+#[test]
+fn egress_allowlist_warn_only_audit_classifies_internal_and_rebinding_hosts() {
+    assert_eq!(
+        egress_allowlist_host_audit_reasons("metadata.google.internal"),
+        vec![
+            EgressAllowlistAuditReason::Metadata,
+            EgressAllowlistAuditReason::InternalDnsSuffix
+        ]
+    );
+    assert_eq!(
+        egress_allowlist_host_audit_reasons("kubernetes.default.svc.cluster.local"),
+        vec![
+            EgressAllowlistAuditReason::KubernetesService,
+            EgressAllowlistAuditReason::InternalDnsSuffix
+        ]
+    );
+    assert_eq!(
+        egress_allowlist_host_audit_reasons("169.254.169.254.nip.io"),
+        vec![EgressAllowlistAuditReason::RebindingHelper]
+    );
+    assert!(egress_allowlist_host_audit_reasons("api.stripe.com").is_empty());
+}
+
+#[test]
+fn egress_allowlist_audit_is_warn_only_until_migration_enforces_it() {
+    let body: CreateAppRequest = serde_json::from_value(serde_json::json!({
+        "name": "demo",
+        "egress_allowlist": [
+            { "host": "metadata.google.internal", "ports": [80] },
+            { "host": "kubernetes.default.svc.cluster.local", "ports": [443] },
+            { "host": "169.254.169.254.nip.io", "ports": [8080] }
+        ]
+    }))
+    .unwrap();
+
+    let rules = validate_egress_allowlist(&body.egress_allowlist)
+        .expect("audit is warn-only and must not reject existing values");
+    assert_eq!(rules.len(), 3);
+    assert_eq!(rules[0].host, "metadata.google.internal");
+    assert_eq!(rules[0].ports, vec![80]);
 }
 
 #[test]

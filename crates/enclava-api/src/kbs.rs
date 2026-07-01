@@ -43,6 +43,14 @@ pub enum KbsPolicyError {
     MissingResourceBindingsBlock,
     #[error("failed to serialize signed policy artifact: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error(
+        "signed policy artifact set exceeds byte budget: required_artifacts={required_artifacts}, policy_bytes={policy_bytes}, max_policy_bytes={max_policy_bytes}"
+    )]
+    SignedPolicyBudgetExceeded {
+        required_artifacts: usize,
+        policy_bytes: usize,
+        max_policy_bytes: usize,
+    },
     #[error("Trustee deployment rollout timed out")]
     RolloutTimedOut,
 }
@@ -80,6 +88,13 @@ struct SignedPolicyArtifactSet<'a> {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct SignedPolicyArtifactRow {
     signed_policy_artifact: serde_json::Value,
+    app_artifact_rank: i64,
+}
+
+#[derive(Debug, Clone)]
+struct SignedPolicyArtifactCandidate {
+    artifact: crate::signing_service::SignedPolicyArtifact,
+    required: bool,
 }
 
 pub async fn ensure_owner_binding(
@@ -279,12 +294,22 @@ pub async fn reconcile_signed_policy_artifacts(
 
     let rows: Vec<SignedPolicyArtifactRow> = sqlx::query_as(
         r#"
-        SELECT wa.signed_policy_artifact
-        FROM workload_artifacts wa
-        JOIN deployments d ON d.id = wa.deploy_id AND d.app_id = wa.app_id
-        WHERE d.status::text IN ('pending', 'applying', 'watching', 'healthy')
-        ORDER BY d.created_at DESC, wa.created_at DESC
-        LIMIT $1
+        SELECT signed_policy_artifact, app_artifact_rank
+        FROM (
+            SELECT
+                wa.signed_policy_artifact,
+                d.created_at AS deployment_created_at,
+                wa.created_at AS artifact_created_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY d.app_id
+                    ORDER BY d.created_at DESC, wa.created_at DESC
+                ) AS app_artifact_rank
+            FROM workload_artifacts wa
+            JOIN deployments d ON d.id = wa.deploy_id AND d.app_id = wa.app_id
+            WHERE d.status::text IN ('pending', 'applying', 'watching', 'healthy')
+        ) ranked_active_artifacts
+        WHERE app_artifact_rank <= $1
+        ORDER BY app_artifact_rank ASC, deployment_created_at DESC, artifact_created_at DESC
         "#,
     )
     .bind(config.signed_policy_retention)
@@ -297,20 +322,27 @@ pub async fn reconcile_signed_policy_artifacts(
 
     let mut candidates = Vec::with_capacity(rows.len() + usize::from(extra_artifact.is_some()));
     if let Some(extra_artifact) = extra_artifact {
-        candidates.push(extra_artifact.clone());
+        candidates.push(SignedPolicyArtifactCandidate {
+            artifact: extra_artifact.clone(),
+            required: true,
+        });
     }
     candidates.extend(
         rows.into_iter()
-            .map(|row| serde_json::from_value(row.signed_policy_artifact))
+            .map(|row| {
+                serde_json::from_value(row.signed_policy_artifact).map(|artifact| {
+                    SignedPolicyArtifactCandidate {
+                        artifact,
+                        required: row.app_artifact_rank == 1,
+                    }
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?,
     );
 
     let candidate_count = candidates.len();
-    let artifacts = select_signed_policy_artifacts_for_policy_body(
-        candidates,
-        config.signed_policy_retention,
-        config.signed_policy_max_bytes,
-    )?;
+    let artifacts =
+        select_signed_policy_artifacts_for_policy_body(candidates, config.signed_policy_max_bytes)?;
 
     let client = kube::Client::try_default().await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
@@ -359,27 +391,29 @@ fn signed_policy_artifact_policy_body(
 }
 
 fn select_signed_policy_artifacts_for_policy_body(
-    candidates: Vec<crate::signing_service::SignedPolicyArtifact>,
-    max_artifacts: i64,
+    candidates: Vec<SignedPolicyArtifactCandidate>,
     max_policy_bytes: usize,
 ) -> Result<Vec<crate::signing_service::SignedPolicyArtifact>, KbsPolicyError> {
-    let max_artifacts = usize::try_from(max_artifacts.max(1)).unwrap_or(1);
     let mut selected = Vec::new();
     let mut seen = HashSet::new();
 
-    for artifact in candidates {
+    for candidate in candidates {
+        let artifact = candidate.artifact;
         if !seen.insert(artifact.metadata.descriptor_core_hash.clone()) {
-            continue;
-        }
-        if selected.len() >= max_artifacts {
             continue;
         }
 
         let mut candidate_selection = selected.clone();
         candidate_selection.push(artifact.clone());
         let candidate_body = signed_policy_artifact_policy_body(&candidate_selection)?;
-        if candidate_body.len() <= max_policy_bytes || selected.is_empty() {
+        if candidate_body.len() <= max_policy_bytes {
             selected.push(artifact);
+        } else if candidate.required {
+            return Err(KbsPolicyError::SignedPolicyBudgetExceeded {
+                required_artifacts: candidate_selection.len(),
+                policy_bytes: candidate_body.len(),
+                max_policy_bytes,
+            });
         }
     }
 
@@ -837,6 +871,13 @@ owner_resource_bindings := {}
         }
     }
 
+    fn signed_policy_candidate(
+        artifact: crate::signing_service::SignedPolicyArtifact,
+        required: bool,
+    ) -> SignedPolicyArtifactCandidate {
+        SignedPolicyArtifactCandidate { artifact, required }
+    }
+
     #[test]
     fn signed_policy_artifact_body_is_authoritative_envelope() {
         let artifact = crate::signing_service::SignedPolicyArtifact {
@@ -915,8 +956,11 @@ owner_resource_bindings := {}
         let recent_other = test_signed_policy_artifact("bb", 16);
 
         let selected = select_signed_policy_artifacts_for_policy_body(
-            vec![current.clone(), duplicate_old, recent_other.clone()],
-            6,
+            vec![
+                signed_policy_candidate(current.clone(), true),
+                signed_policy_candidate(duplicate_old, false),
+                signed_policy_candidate(recent_other.clone(), false),
+            ],
             usize::MAX,
         )
         .unwrap();
@@ -925,19 +969,22 @@ owner_resource_bindings := {}
     }
 
     #[test]
-    fn signed_policy_selection_enforces_global_retention() {
+    fn signed_policy_selection_keeps_artifacts_without_global_retention_cap() {
         let current = test_signed_policy_artifact("aa", 16);
         let recent_one = test_signed_policy_artifact("bb", 16);
         let recent_two = test_signed_policy_artifact("cc", 16);
 
         let selected = select_signed_policy_artifacts_for_policy_body(
-            vec![current.clone(), recent_one.clone(), recent_two],
-            2,
+            vec![
+                signed_policy_candidate(current.clone(), true),
+                signed_policy_candidate(recent_one.clone(), true),
+                signed_policy_candidate(recent_two.clone(), true),
+            ],
             usize::MAX,
         )
         .unwrap();
 
-        assert_eq!(selected, vec![current, recent_one]);
+        assert_eq!(selected, vec![current, recent_one, recent_two]);
     }
 
     #[test]
@@ -949,8 +996,10 @@ owner_resource_bindings := {}
             .len();
 
         let selected = select_signed_policy_artifacts_for_policy_body(
-            vec![current.clone(), old],
-            6,
+            vec![
+                signed_policy_candidate(current.clone(), true),
+                signed_policy_candidate(old, false),
+            ],
             current_body_len + 32,
         )
         .unwrap();
@@ -961,12 +1010,22 @@ owner_resource_bindings := {}
     }
 
     #[test]
-    fn signed_policy_selection_keeps_first_artifact_even_when_it_exceeds_budget() {
+    fn signed_policy_selection_fails_if_required_artifact_exceeds_budget() {
         let current = test_signed_policy_artifact("aa", 128);
 
-        let selected =
-            select_signed_policy_artifacts_for_policy_body(vec![current.clone()], 6, 1).unwrap();
+        let err = select_signed_policy_artifacts_for_policy_body(
+            vec![signed_policy_candidate(current, true)],
+            1,
+        )
+        .unwrap_err();
 
-        assert_eq!(selected, vec![current]);
+        assert!(matches!(
+            err,
+            KbsPolicyError::SignedPolicyBudgetExceeded {
+                required_artifacts: 1,
+                max_policy_bytes: 1,
+                ..
+            }
+        ));
     }
 }

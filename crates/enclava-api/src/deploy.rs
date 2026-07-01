@@ -28,6 +28,7 @@ use crate::models::{App, AppContainer, AppResources, AppStatus};
 
 const DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME: &str = "enclava-registry-auth";
 const TENANT_IMAGE_PULL_SECRET_NAME_ENV: &str = "TENANT_IMAGE_PULL_SECRET_NAME";
+const TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV: &str = "TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES";
 const PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS_ENV: &str = "CAP_PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS";
 
 #[derive(Debug, Clone)]
@@ -35,6 +36,14 @@ struct TenantImagePullSecretConfig {
     name: String,
     username: String,
     token: String,
+    allowed_repositories: Vec<ImagePullRepositoryScope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImagePullRepositoryScope {
+    registry: String,
+    repository: String,
+    include_subrepositories: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -126,7 +135,89 @@ fn tenant_image_pull_secret_config_from_env() -> Option<TenantImagePullSecretCon
         name,
         username,
         token,
+        allowed_repositories: tenant_image_pull_allowed_repositories_from_env(),
     })
+}
+
+fn tenant_image_pull_allowed_repositories_from_env() -> Vec<ImagePullRepositoryScope> {
+    let Some(raw) = env_nonempty(TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV) else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(parse_image_pull_repository_scope)
+        .collect()
+}
+
+fn parse_image_pull_repository_scope(raw: &str) -> Option<ImagePullRepositoryScope> {
+    let mut value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let include_subrepositories = value.ends_with("/*");
+    if include_subrepositories {
+        value = value.trim_end_matches("/*");
+    }
+    let value = value.trim_end_matches('/');
+    let (registry, repository) = value.split_once('/')?;
+    if registry.is_empty() || repository.is_empty() {
+        return None;
+    }
+
+    Some(ImagePullRepositoryScope {
+        registry: registry.to_string(),
+        repository: repository.to_string(),
+        include_subrepositories,
+    })
+}
+
+fn tenant_image_pull_secret_config_for_containers(
+    containers: &[Container],
+) -> Option<TenantImagePullSecretConfig> {
+    let config = tenant_image_pull_secret_config_from_env()?;
+    if tenant_image_pull_secret_applies_to_containers(containers, &config) {
+        return Some(config);
+    }
+
+    tracing::warn!(
+        secret = %config.name,
+        allowed_repositories = ?config.allowed_repositories,
+        "tenant image pull secret not attached because workload images are outside configured repository scope"
+    );
+    None
+}
+
+fn tenant_image_pull_secret_applies_to_containers(
+    containers: &[Container],
+    config: &TenantImagePullSecretConfig,
+) -> bool {
+    if containers.is_empty() {
+        return false;
+    }
+    if config.allowed_repositories.is_empty() {
+        return true;
+    }
+
+    containers.iter().all(|container| {
+        config
+            .allowed_repositories
+            .iter()
+            .any(|scope| image_matches_repository_scope(&container.image, scope))
+    })
+}
+
+fn image_matches_repository_scope(image: &ImageRef, scope: &ImagePullRepositoryScope) -> bool {
+    if image.registry() != scope.registry {
+        return false;
+    }
+    if image.repository() == scope.repository {
+        return true;
+    }
+    scope.include_subrepositories
+        && image
+            .repository()
+            .strip_prefix(&scope.repository)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn public_internet_egress_excluded_cidrs_from_env() -> Vec<String> {
@@ -476,6 +567,9 @@ pub async fn build_confidential_app(
             .collect();
     }
 
+    let image_pull_secret_name =
+        tenant_image_pull_secret_config_for_containers(&containers).map(|config| config.name);
+
     Ok(ConfidentialApp {
         app_id: app.id,
         name: app.name.clone(),
@@ -485,7 +579,7 @@ pub async fn build_confidential_app(
         bootstrap_owner_pubkey_hash: app.bootstrap_owner_pubkey_hash.clone(),
         tenant_instance_identity_hash: app.tenant_instance_identity_hash.clone(),
         service_account: app.service_account.clone(),
-        image_pull_secret_name: configured_tenant_image_pull_secret_name(),
+        image_pull_secret_name,
         signer_identity_subject: app.signer_identity_subject.clone(),
         signer_identity_issuer: app.signer_identity_issuer.clone(),
         containers,
@@ -639,6 +733,7 @@ mod tests {
             name: "enclava-registry-auth".to_string(),
             username: "cap-bot".to_string(),
             token: "ghp_fake".to_string(),
+            allowed_repositories: Vec::new(),
         };
 
         let secret = generate_tenant_image_pull_secret("tenant-ns", &config);
@@ -667,6 +762,95 @@ mod tests {
             docker_config["auths"]["ghcr.io"]["auth"].as_str(),
             Some("Y2FwLWJvdDpnaHBfZmFrZQ==")
         );
+    }
+
+    fn pull_secret_config(
+        allowed_repositories: Vec<ImagePullRepositoryScope>,
+    ) -> TenantImagePullSecretConfig {
+        TenantImagePullSecretConfig {
+            name: "enclava-registry-auth".to_string(),
+            username: "cap-bot".to_string(),
+            token: "ghp_fake".to_string(),
+            allowed_repositories,
+        }
+    }
+
+    fn test_container(image_ref: &str) -> Container {
+        Container {
+            name: "web".to_string(),
+            image: ImageRef::parse(image_ref).unwrap(),
+            port: Some(8080),
+            command: None,
+            env: std::collections::HashMap::new(),
+            storage_paths: Vec::new(),
+            workload_security_profile: WorkloadSecurityProfile::Restricted,
+            is_primary: true,
+        }
+    }
+
+    #[test]
+    fn tenant_image_pull_scope_parses_exact_and_prefix_repositories() {
+        assert_eq!(
+            parse_image_pull_repository_scope("ghcr.io/enclava-ai/private-template"),
+            Some(ImagePullRepositoryScope {
+                registry: "ghcr.io".to_string(),
+                repository: "enclava-ai/private-template".to_string(),
+                include_subrepositories: false,
+            })
+        );
+        assert_eq!(
+            parse_image_pull_repository_scope(" ghcr.io/enclava-ai/templates/* "),
+            Some(ImagePullRepositoryScope {
+                registry: "ghcr.io".to_string(),
+                repository: "enclava-ai/templates".to_string(),
+                include_subrepositories: true,
+            })
+        );
+        assert!(parse_image_pull_repository_scope("ghcr.io").is_none());
+    }
+
+    #[test]
+    fn tenant_image_pull_secret_without_scope_preserves_global_fallback() {
+        let config = pull_secret_config(Vec::new());
+        let containers = vec![test_container(
+            "ghcr.io/tenant/private-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )];
+
+        assert!(tenant_image_pull_secret_applies_to_containers(
+            &containers,
+            &config
+        ));
+    }
+
+    #[test]
+    fn tenant_image_pull_secret_scope_requires_every_container_to_match() {
+        let config = pull_secret_config(vec![
+            parse_image_pull_repository_scope("ghcr.io/enclava-ai/private-template").unwrap(),
+            parse_image_pull_repository_scope("ghcr.io/enclava-ai/templates/*").unwrap(),
+        ]);
+        let allowed = vec![
+            test_container(
+                "ghcr.io/enclava-ai/private-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            test_container(
+                "ghcr.io/enclava-ai/templates/ssh@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+        ];
+        let mixed = vec![
+            test_container(
+                "ghcr.io/enclava-ai/private-template@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            test_container(
+                "ghcr.io/tenant/private-app@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            ),
+        ];
+
+        assert!(tenant_image_pull_secret_applies_to_containers(
+            &allowed, &config
+        ));
+        assert!(!tenant_image_pull_secret_applies_to_containers(
+            &mixed, &config
+        ));
     }
 
     #[test]
@@ -1130,7 +1314,8 @@ pub async fn apply_deployment_manifests(
     enclava_engine::validate::validate_app(&app_spec)
         .map_err(|e| DeployError::Validation(e.to_string()))?;
 
-    let tenant_image_pull_secret_config = tenant_image_pull_secret_config_from_env();
+    let tenant_image_pull_secret_config =
+        tenant_image_pull_secret_config_for_containers(&app_spec.containers);
     let manifests = generate_all_manifests(&app_spec);
     let hash = manifest_hash(&manifests);
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;

@@ -75,6 +75,8 @@ Required only when the matching feature is enabled:
 | `DNS_MANAGEMENT_REQUIRED=1` | Makes CAP fail startup unless DNS credentials are configured. |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare API token used for CAP-managed tenant records. |
 | `TENANT_DNS_TARGET` | A/AAAA target for managed tenant records. |
+| `GHCR_USERNAME` and `GHCR_TOKEN` | Optional credentials used to create tenant namespace image-pull secrets for private GHCR pulls. |
+| `TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES` | Optional comma-separated scope for the GHCR tenant pull secret. Entries are `registry/repository` for exact matches or `registry/repository/*` for subrepositories. When unset, existing global GHCR fallback behavior is preserved. |
 
 ## Defaulted Environment
 
@@ -97,6 +99,7 @@ Required only when the matching feature is enabled:
 | `ACME_DIRECTORY_URL` | tenant Caddy ACME CA | ACME directory for the DNS-01 broker. |
 | `ACME_ACCOUNT_CREDENTIALS_PATH` | unset | Optional persisted ACME account credentials path. |
 | `ACME_DNS_PROPAGATION_SECONDS` | `30` | DNS propagation wait used by the broker. |
+| `TENANT_IMAGE_PULL_SECRET_NAME` | `enclava-registry-auth` when GHCR credentials are set | Tenant namespace pull-secret name for configured private image pulls. |
 
 Debug-only flags rejected by release builds:
 

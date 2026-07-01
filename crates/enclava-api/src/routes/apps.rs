@@ -275,6 +275,15 @@ pub struct CreateEgressAllowRule {
     pub ports: Option<Vec<u16>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EgressAllowlistAuditReason {
+    Localhost,
+    Metadata,
+    KubernetesService,
+    InternalDnsSuffix,
+    RebindingHelper,
+}
+
 pub(crate) fn validate_egress_allowlist(
     rules: &[CreateEgressAllowRule],
 ) -> Result<Vec<EgressRule>, String> {
@@ -294,6 +303,7 @@ pub(crate) fn validate_egress_allowlist(
             }
             enclava_common::validate::validate_fqdn(host)
                 .map_err(|e| format!("invalid egress_allowlist host: {e}"))?;
+            audit_egress_allowlist_host(host);
 
             let ports = rule.ports.clone().unwrap_or_else(|| vec![443]);
             if ports.is_empty() || ports.contains(&0) {
@@ -306,6 +316,63 @@ pub(crate) fn validate_egress_allowlist(
             })
         })
         .collect()
+}
+
+fn audit_egress_allowlist_host(host: &str) {
+    let reasons = egress_allowlist_host_audit_reasons(host);
+    if reasons.is_empty() {
+        return;
+    }
+
+    tracing::warn!(
+        host = %host,
+        reasons = ?reasons,
+        "egress_allowlist host matched internal/rebinding audit pattern; accepting in warn-only mode"
+    );
+}
+
+pub(crate) fn egress_allowlist_host_audit_reasons(host: &str) -> Vec<EgressAllowlistAuditReason> {
+    let host = host.to_ascii_lowercase();
+    let mut reasons = Vec::new();
+
+    if host == "localhost" || host.ends_with(".localhost") {
+        add_egress_audit_reason(&mut reasons, EgressAllowlistAuditReason::Localhost);
+    }
+    if host == "metadata" || host == "metadata.google.internal" || host.starts_with("metadata.") {
+        add_egress_audit_reason(&mut reasons, EgressAllowlistAuditReason::Metadata);
+    }
+    if host == "kubernetes.default.svc"
+        || host == "kubernetes.default.svc.cluster.local"
+        || host.ends_with(".svc")
+        || host.ends_with(".svc.cluster.local")
+    {
+        add_egress_audit_reason(&mut reasons, EgressAllowlistAuditReason::KubernetesService);
+    }
+    if host.ends_with(".cluster.local")
+        || host.ends_with(".internal")
+        || host.ends_with(".local")
+        || host.ends_with(".localdomain")
+    {
+        add_egress_audit_reason(&mut reasons, EgressAllowlistAuditReason::InternalDnsSuffix);
+    }
+    if host.ends_with(".nip.io")
+        || host.ends_with(".sslip.io")
+        || host.ends_with(".localtest.me")
+        || host.ends_with(".lvh.me")
+    {
+        add_egress_audit_reason(&mut reasons, EgressAllowlistAuditReason::RebindingHelper);
+    }
+
+    reasons
+}
+
+fn add_egress_audit_reason(
+    reasons: &mut Vec<EgressAllowlistAuditReason>,
+    reason: EgressAllowlistAuditReason,
+) {
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
 }
 
 pub(crate) fn validate_egress_mode(value: &str) -> Result<EgressMode, String> {
