@@ -131,7 +131,7 @@ fn effective_app_status(
     }
     match live_state {
         Some("unlocked") if db_status == "running" => "running".to_string(),
-        Some("locked") => "locked".to_string(),
+        Some("locked") if db_status == "running" => "locked".to_string(),
         _ => db_status.to_string(),
     }
 }
@@ -195,6 +195,22 @@ mod tests {
         assert_eq!(
             effective_app_status("running", Some("unlocked"), None),
             "running"
+        );
+    }
+
+    #[test]
+    fn locked_tee_does_not_mark_creating_app_locked() {
+        assert_eq!(
+            effective_app_status("creating", Some("locked"), None),
+            "creating"
+        );
+    }
+
+    #[test]
+    fn locked_tee_marks_running_app_locked() {
+        assert_eq!(
+            effective_app_status("running", Some("locked"), None),
+            "locked"
         );
     }
 

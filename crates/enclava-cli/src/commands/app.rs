@@ -879,6 +879,15 @@ pub struct StatusArgs {
     pub app: Option<String>,
 }
 
+fn status_with_attested_tee_state(api_status: &str, tee_state: &str) -> String {
+    match tee_state {
+        "locked" if api_status == "running" => "locked".to_string(),
+        "unlocked" if api_status == "running" => api_status.to_string(),
+        "unclaimed" if api_status == "failed" => "creating".to_string(),
+        _ => api_status.to_string(),
+    }
+}
+
 pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
@@ -900,12 +909,7 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
             && let Ok(tee_status_json) = attested_tee.status_json().await
         {
             let state = tee_unlock_state(&tee_status_json);
-            match state {
-                "locked" => status.status = "locked".to_string(),
-                "unlocked" if status.status == "running" => {}
-                "unclaimed" if status.status == "failed" => status.status = "creating".to_string(),
-                _ => {}
-            }
+            status.status = status_with_attested_tee_state(&status.status, state);
             if status.tee_status.is_none() {
                 status.tee_status = Some(state.to_string());
             }

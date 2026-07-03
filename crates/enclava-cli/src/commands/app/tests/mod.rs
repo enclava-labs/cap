@@ -452,6 +452,19 @@ fn status_command_surfaces_stable_ssh_endpoint_with_validating_follow_up() {
 }
 
 #[test]
+fn attested_locked_state_overrides_only_running_status() {
+    assert_eq!(
+        status_with_attested_tee_state("running", "locked"),
+        "locked"
+    );
+    assert_eq!(
+        status_with_attested_tee_state("creating", "locked"),
+        "creating"
+    );
+    assert_eq!(status_with_attested_tee_state("failed", "locked"), "failed");
+}
+
+#[test]
 fn password_redeploy_wait_does_not_accept_stale_unlocked_runtime() {
     let source = include_str!("../../app.rs");
     let fn_start = source
