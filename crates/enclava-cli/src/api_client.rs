@@ -708,14 +708,20 @@ fn template_instance_idempotency_key(req: &CreateTemplateInstanceRequest) -> Str
         "instance_name": req.instance_name,
         "config": req.config,
         "bootstrap_pubkey_hash": req.bootstrap_pubkey_hash,
+        "customer_descriptor_blob_sha256": optional_sha256_hex(req.customer_descriptor_blob.as_deref()),
+        "org_keyring_blob_sha256": optional_sha256_hex(req.org_keyring_blob.as_deref()),
+        "signed_policy_artifact_sha256": optional_sha256_hex(req.signed_policy_artifact.as_deref()),
     }))
     .unwrap_or_else(|_| {
         format!(
-            "{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}",
             req.template_slug,
             req.instance_name,
             req.config,
-            req.bootstrap_pubkey_hash.as_deref().unwrap_or("")
+            req.bootstrap_pubkey_hash.as_deref().unwrap_or(""),
+            optional_sha256_hex(req.customer_descriptor_blob.as_deref()).unwrap_or_default(),
+            optional_sha256_hex(req.org_keyring_blob.as_deref()).unwrap_or_default(),
+            optional_sha256_hex(req.signed_policy_artifact.as_deref()).unwrap_or_default()
         )
         .into_bytes()
     });
@@ -726,6 +732,10 @@ fn template_instance_idempotency_key(req: &CreateTemplateInstanceRequest) -> Str
         req.instance_name,
         &hex::encode(digest)[..16]
     )
+}
+
+fn optional_sha256_hex(value: Option<&str>) -> Option<String> {
+    value.map(|value| hex::encode(Sha256::digest(value.as_bytes())))
 }
 
 #[cfg(test)]
@@ -761,6 +771,44 @@ mod tests {
             template_instance_idempotency_key(&first),
             template_instance_idempotency_key(&changed_endpoint),
             "changing the reserved stable SSH endpoint must use a different idempotency key"
+        );
+    }
+
+    #[test]
+    fn template_instance_idempotency_key_binds_signed_artifacts() {
+        let mut first = template_request("6.tcp.eu.ngrok.io:17958");
+        first.customer_descriptor_blob = Some("descriptor-a".to_string());
+        first.org_keyring_blob = Some("keyring-a".to_string());
+        first.signed_policy_artifact = Some("policy-a".to_string());
+        let retry = CreateTemplateInstanceRequest {
+            template_slug: first.template_slug.clone(),
+            instance_name: first.instance_name.clone(),
+            config: first.config.clone(),
+            bootstrap_pubkey_hash: first.bootstrap_pubkey_hash.clone(),
+            customer_descriptor_blob: first.customer_descriptor_blob.clone(),
+            org_keyring_blob: first.org_keyring_blob.clone(),
+            signed_policy_artifact: first.signed_policy_artifact.clone(),
+        };
+        let mut changed_descriptor = CreateTemplateInstanceRequest {
+            template_slug: first.template_slug.clone(),
+            instance_name: first.instance_name.clone(),
+            config: first.config.clone(),
+            bootstrap_pubkey_hash: first.bootstrap_pubkey_hash.clone(),
+            customer_descriptor_blob: first.customer_descriptor_blob.clone(),
+            org_keyring_blob: first.org_keyring_blob.clone(),
+            signed_policy_artifact: first.signed_policy_artifact.clone(),
+        };
+        changed_descriptor.customer_descriptor_blob = Some("descriptor-b".to_string());
+
+        assert_eq!(
+            template_instance_idempotency_key(&first),
+            template_instance_idempotency_key(&retry),
+            "retries of the same signed template request must use the same idempotency key"
+        );
+        assert_ne!(
+            template_instance_idempotency_key(&first),
+            template_instance_idempotency_key(&changed_descriptor),
+            "new signed descriptors for a destroyed/recreated app name must use a new idempotency key"
         );
     }
 }
