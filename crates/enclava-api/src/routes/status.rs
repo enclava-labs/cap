@@ -6,6 +6,10 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use enclava_engine::apply::watch::{pod_label_selector, pod_runtime_failure_message};
+use k8s_openapi::api::core::v1::Pod;
+use kube::Api;
+use kube::api::ListParams;
 use serde::Serialize;
 use serde_json::json;
 
@@ -79,8 +83,18 @@ pub async fn app_status(
             _ => (None, None, None, None),
         };
 
+    let runtime_failure = live_pod_failure_message(&app.namespace, &app.name).await;
     let db_status = format!("{:?}", app.status).to_lowercase();
-    let effective_status = effective_app_status(&db_status, live_state.as_deref());
+    let effective_status = effective_app_status(
+        &db_status,
+        live_state.as_deref(),
+        runtime_failure.as_deref(),
+    );
+    let pod_status = if runtime_failure.is_some() {
+        Some("Failed".to_string())
+    } else {
+        pod_status
+    };
 
     Ok(Json(AppStatusResponse {
         app_name: app.name,
@@ -94,11 +108,30 @@ pub async fn app_status(
     }))
 }
 
-fn effective_app_status(db_status: &str, live_state: Option<&str>) -> String {
+pub async fn live_pod_failure_message(namespace: &str, app_name: &str) -> Option<String> {
+    let client = kube::Client::try_default().await.ok()?;
+    let pods: Api<Pod> = Api::namespaced(client, namespace);
+    let list = pods
+        .list(&ListParams::default().labels(&pod_label_selector(app_name)))
+        .await
+        .ok()?;
+    list.items.iter().find_map(pod_runtime_failure_message)
+}
+
+fn effective_app_status(
+    db_status: &str,
+    live_state: Option<&str>,
+    runtime_failure: Option<&str>,
+) -> String {
+    if runtime_failure.is_some() {
+        return "failed".to_string();
+    }
+    if matches!(db_status, "failed" | "deleting" | "stopped") {
+        return db_status.to_string();
+    }
     match live_state {
         Some("unlocked") if db_status == "running" => "running".to_string(),
         Some("locked") => "locked".to_string(),
-        Some("unclaimed") if db_status == "failed" => "creating".to_string(),
         _ => db_status.to_string(),
     }
 }
@@ -152,14 +185,33 @@ mod tests {
     #[test]
     fn unlocked_tee_does_not_mark_creating_app_running() {
         assert_eq!(
-            effective_app_status("creating", Some("unlocked")),
+            effective_app_status("creating", Some("unlocked"), None),
             "creating"
         );
     }
 
     #[test]
     fn unlocked_tee_keeps_running_app_running() {
-        assert_eq!(effective_app_status("running", Some("unlocked")), "running");
+        assert_eq!(
+            effective_app_status("running", Some("unlocked"), None),
+            "running"
+        );
+    }
+
+    #[test]
+    fn db_failure_takes_precedence_over_locked_tee() {
+        assert_eq!(
+            effective_app_status("failed", Some("locked"), None),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn runtime_failure_takes_precedence_over_locked_tee() {
+        assert_eq!(
+            effective_app_status("creating", Some("locked"), Some("StartError")),
+            "failed"
+        );
     }
 
     #[test]

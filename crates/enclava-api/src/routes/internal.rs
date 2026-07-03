@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::auth::middleware::{AuthContext, ManagementOrigin};
 use crate::models::Role;
+use crate::routes::status::live_pod_failure_message;
 use crate::state::AppState;
 
 pub struct InternalAuth {
@@ -1068,21 +1069,24 @@ pub async fn list_paas_deployments(
 ) -> Result<Json<InternalListResponse>, (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
     let (cap_org_id, _org_name, _org_slug) = mapped_cap_org(&state, &paas_org_id).await?;
-    let rows: Vec<(
+    type PaasDeploymentRow = (
         Uuid,
         Uuid,
         String,
         String,
         serde_json::Value,
         Option<String>,
-    )> = sqlx::query_as(
+        Option<String>,
+    );
+    let rows: Vec<PaasDeploymentRow> = sqlx::query_as(
         r#"
         SELECT d.id,
                d.app_id,
                a.name,
                d.status::text,
                d.spec_snapshot,
-               d.image_digest
+               d.image_digest,
+               d.error_message
           FROM deployments d
           JOIN apps a ON a.id = d.app_id
          WHERE d.org_id = $1
@@ -1097,7 +1101,15 @@ pub async fn list_paas_deployments(
         items: rows
             .into_iter()
             .map(
-                |(cap_deployment_id, cap_app_id, app_name, status, spec, image_digest)| {
+                |(
+                    cap_deployment_id,
+                    cap_app_id,
+                    app_name,
+                    status,
+                    spec,
+                    image_digest,
+                    error_message,
+                )| {
                     let image = spec
                         .get("image")
                         .and_then(|value| value.as_str())
@@ -1110,6 +1122,7 @@ pub async fn list_paas_deployments(
                         "image": image,
                         "spec": spec,
                         "image_digest": image_digest,
+                        "error_message": error_message,
                     })
                 },
             )
@@ -1129,8 +1142,10 @@ pub async fn list_paas_status(
         String,
         String,
         String,
+        String,
         Option<String>,
         Option<Uuid>,
+        Option<String>,
         Option<String>,
         Option<String>,
     );
@@ -1138,17 +1153,20 @@ pub async fn list_paas_status(
         r#"
         SELECT a.id,
                a.name,
+               a.namespace,
                a.status::text,
                a.domain,
                a.tee_domain,
                latest.id,
                latest.status,
-               latest.image_digest
+               latest.image_digest,
+               latest.error_message
           FROM apps a
           LEFT JOIN LATERAL (
               SELECT d.id,
                      d.status::text AS status,
-                     d.image_digest
+                     d.image_digest,
+                     d.error_message
                 FROM deployments d
                WHERE d.app_id = a.id
                ORDER BY d.created_at DESC, d.id DESC
@@ -1162,39 +1180,50 @@ pub async fn list_paas_status(
     .fetch_all(&state.db)
     .await
     .map_err(|_| db_error())?;
-    Ok(Json(InternalListResponse {
-        items: rows
-            .into_iter()
-            .map(
-                |(
-                    cap_app_id,
-                    app_name,
-                    app_status,
-                    domain,
-                    tee_domain,
-                    cap_deployment_id,
-                    deployment_status,
-                    image_digest,
-                )| {
-                    let latest_deployment = cap_deployment_id.map(|id| {
-                        serde_json::json!({
-                            "cap_deployment_id": id,
-                            "status": deployment_status,
-                            "image_digest": image_digest,
-                        })
-                    });
-                    serde_json::json!({
-                        "cap_app_id": cap_app_id,
-                        "app_name": app_name,
-                        "status": app_status,
-                        "domain": domain,
-                        "tee_domain": tee_domain,
-                        "latest_deployment": latest_deployment,
-                    })
-                },
-            )
-            .collect(),
-    }))
+    let mut items = Vec::with_capacity(rows.len());
+    for (
+        cap_app_id,
+        app_name,
+        namespace,
+        app_status,
+        domain,
+        tee_domain,
+        cap_deployment_id,
+        deployment_status,
+        image_digest,
+        error_message,
+    ) in rows
+    {
+        let runtime_failure = live_pod_failure_message(&namespace, &app_name).await;
+        let app_status = if runtime_failure.is_some() {
+            "failed".to_string()
+        } else {
+            app_status
+        };
+        let deployment_status = if runtime_failure.is_some() && cap_deployment_id.is_some() {
+            Some("failed".to_string())
+        } else {
+            deployment_status
+        };
+        let error_message = runtime_failure.or(error_message);
+        let latest_deployment = cap_deployment_id.map(|id| {
+            serde_json::json!({
+                "cap_deployment_id": id,
+                "status": deployment_status,
+                "image_digest": image_digest,
+                "error_message": error_message,
+            })
+        });
+        items.push(serde_json::json!({
+            "cap_app_id": cap_app_id,
+            "app_name": app_name,
+            "status": app_status,
+            "domain": domain,
+            "tee_domain": tee_domain,
+            "latest_deployment": latest_deployment,
+        }));
+    }
+    Ok(Json(InternalListResponse { items }))
 }
 
 pub async fn deploy_paas_app(

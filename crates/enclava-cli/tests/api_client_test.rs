@@ -153,6 +153,9 @@ async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
                 "instance_name": request_body.instance_name,
                 "config": request_body.config,
                 "bootstrap_pubkey_hash": request_body.bootstrap_pubkey_hash,
+                "customer_descriptor_blob_sha256": Option::<String>::None,
+                "org_keyring_blob_sha256": Option::<String>::None,
+                "signed_policy_artifact_sha256": Option::<String>::None,
             }))
             .unwrap(),
         ))

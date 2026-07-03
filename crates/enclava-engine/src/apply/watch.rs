@@ -1,5 +1,5 @@
 use k8s_openapi::api::apps::v1::StatefulSet;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{ContainerState, ContainerStatus, Pod};
 use k8s_openapi::jiff::Timestamp;
 use kube::api::{Api, DeleteParams, ListParams};
 use tokio::time::Instant;
@@ -8,6 +8,21 @@ use super::engine::{ApplyEngine, ApplyError};
 use super::types::{DeployPhase, DeployStatus};
 
 const STALE_TERMINATING_POD_FORCE_DELETE_BUFFER_SECONDS: i64 = 10;
+const MAX_CONTAINER_FAILURE_DETAIL_CHARS: usize = 300;
+
+const FATAL_WAITING_REASONS: &[&str] = &[
+    "CrashLoopBackOff",
+    "CreateContainerConfigError",
+    "CreateContainerError",
+    "Error",
+    "ErrImagePull",
+    "ImagePullBackOff",
+    "InvalidImageName",
+    "RunContainerError",
+];
+
+const FATAL_TERMINATED_REASONS: &[&str] =
+    &["ContainerCannotRun", "Error", "OOMKilled", "StartError"];
 
 pub fn pod_label_selector(statefulset_name: &str) -> String {
     format!("app={statefulset_name}")
@@ -96,6 +111,102 @@ pub fn classify_pod_phase(snap: &PodSnapshot) -> DeployPhase {
             DeployPhase::TeeBooting
         }
     }
+}
+
+fn detail_or_default(detail: Option<&str>) -> String {
+    let detail = detail
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("no details");
+    detail
+        .chars()
+        .take(MAX_CONTAINER_FAILURE_DETAIL_CHARS)
+        .collect()
+}
+
+fn fatal_waiting_reason(reason: &str) -> bool {
+    FATAL_WAITING_REASONS.contains(&reason)
+}
+
+fn fatal_terminated_reason(reason: &str) -> bool {
+    FATAL_TERMINATED_REASONS.contains(&reason)
+}
+
+fn terminated_failure_message(
+    container_name: &str,
+    state_kind: &str,
+    terminated: &k8s_openapi::api::core::v1::ContainerStateTerminated,
+) -> Option<String> {
+    let reason = terminated.reason.as_deref().unwrap_or_default();
+    if !fatal_terminated_reason(reason) {
+        return None;
+    }
+    Some(format!(
+        "container '{container_name}' {state_kind} {reason} exit {}: {}",
+        terminated.exit_code,
+        detail_or_default(terminated.message.as_deref())
+    ))
+}
+
+fn state_failure_message(
+    container_name: &str,
+    state_kind: &str,
+    state: Option<&ContainerState>,
+) -> Option<String> {
+    let state = state?;
+    if let Some(terminated) = state.terminated.as_ref()
+        && let Some(message) = terminated_failure_message(container_name, state_kind, terminated)
+    {
+        return Some(message);
+    }
+    if let Some(waiting) = state.waiting.as_ref()
+        && let Some(reason) = waiting.reason.as_deref()
+        && fatal_waiting_reason(reason)
+    {
+        return Some(format!(
+            "container '{container_name}' {state_kind} {reason}: {}",
+            detail_or_default(waiting.message.as_deref())
+        ));
+    }
+    None
+}
+
+fn container_runtime_failure_message(status: &ContainerStatus) -> Option<String> {
+    let current_message = state_failure_message(&status.name, "is", status.state.as_ref())?;
+    if let Some(last_message) = state_failure_message(
+        &status.name,
+        "last terminated with",
+        status.last_state.as_ref(),
+    ) {
+        return Some(format!("{current_message}; {last_message}"));
+    }
+    Some(current_message)
+}
+
+/// Return a concise fatal container runtime message for a pod, if one exists.
+///
+/// Kubernetes can keep a pod phase at `Running` while an app container is in
+/// `CrashLoopBackOff` or has a runtime `StartError`, so callers must inspect
+/// container states rather than relying on pod phase alone.
+pub fn pod_runtime_failure_message(pod: &Pod) -> Option<String> {
+    let status = pod.status.as_ref()?;
+    for container in status
+        .init_container_statuses
+        .iter()
+        .flat_map(|statuses| statuses.iter())
+        .chain(
+            status
+                .container_statuses
+                .iter()
+                .flat_map(|statuses| statuses.iter()),
+        )
+    {
+        if let Some(message) = container_runtime_failure_message(container) {
+            let pod_name = pod.metadata.name.as_deref().unwrap_or("<unknown>");
+            return Some(format!("pod '{pod_name}' {message}"));
+        }
+    }
+    None
 }
 
 pub fn stale_terminating_pod_needs_force_delete(pod: &Pod, now: Timestamp) -> bool {
@@ -233,26 +344,9 @@ pub async fn watch_rollout(
             let snap = PodSnapshot::from_pod(pod);
             let phase = classify_pod_phase(&snap);
 
-            if let Some(statuses) = pod
-                .status
-                .as_ref()
-                .and_then(|s| s.container_statuses.as_ref())
-            {
-                for cs in statuses {
-                    if let Some(waiting) = cs.state.as_ref().and_then(|s| s.waiting.as_ref())
-                        && let Some(reason) = &waiting.reason
-                        && (reason == "CrashLoopBackOff" || reason == "Error")
-                    {
-                        let msg = format!(
-                            "container '{}' in {}: {}",
-                            cs.name,
-                            reason,
-                            waiting.message.as_deref().unwrap_or("no details")
-                        );
-                        tracing::warn!(%msg, "crash loop detected");
-                        return Ok(DeployStatus::failed(&msg));
-                    }
-                }
+            if let Some(msg) = pod_runtime_failure_message(pod) {
+                tracing::warn!(%msg, "container runtime failure detected");
+                return Ok(DeployStatus::failed(&msg));
             }
 
             // Track the "worst" (earliest) phase across pods

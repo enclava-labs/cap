@@ -1,8 +1,12 @@
 use enclava_engine::apply::types::DeployPhase;
 use enclava_engine::apply::watch::{
-    PodSnapshot, classify_pod_phase, pod_label_selector, stale_terminating_pod_needs_force_delete,
+    PodSnapshot, classify_pod_phase, pod_label_selector, pod_runtime_failure_message,
+    stale_terminating_pod_needs_force_delete,
 };
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{
+    ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus, Pod,
+    PodStatus,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
 use k8s_openapi::jiff::Timestamp;
 
@@ -78,6 +82,114 @@ fn unknown_phase_maps_to_tee_booting() {
     let phase = classify_pod_phase(&snap);
     // Unknown means the kubelet lost contact -- TEE VM may still be booting
     assert_eq!(phase, DeployPhase::TeeBooting);
+}
+
+#[test]
+fn running_pod_with_crashloop_after_start_error_reports_runtime_failure() {
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some("shell-0".to_string()),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Running".to_string()),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                image: "example.test/web@sha256:abc".to_string(),
+                image_id: "example.test/web@sha256:abc".to_string(),
+                ready: false,
+                restart_count: 3,
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("CrashLoopBackOff".to_string()),
+                        message: Some("back-off restarting failed container=web".to_string()),
+                    }),
+                    ..Default::default()
+                }),
+                last_state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        reason: Some("StartError".to_string()),
+                        exit_code: 128,
+                        message: Some(
+                            "failed to create containerd task: EINVAL: Invalid argument"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let message = pod_runtime_failure_message(&pod).unwrap();
+    assert!(message.contains("pod 'shell-0'"));
+    assert!(message.contains("CrashLoopBackOff"));
+    assert!(message.contains("StartError"));
+    assert!(message.contains("EINVAL"));
+}
+
+#[test]
+fn container_creating_is_not_a_runtime_failure() {
+    let pod = Pod {
+        status: Some(PodStatus {
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                image: "example.test/web@sha256:abc".to_string(),
+                image_id: "example.test/web@sha256:abc".to_string(),
+                ready: false,
+                restart_count: 0,
+                state: Some(ContainerState {
+                    waiting: Some(ContainerStateWaiting {
+                        reason: Some("ContainerCreating".to_string()),
+                        message: Some("creating container".to_string()),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert!(pod_runtime_failure_message(&pod).is_none());
+}
+
+#[test]
+fn running_container_ignores_recovered_last_start_error() {
+    let pod = Pod {
+        status: Some(PodStatus {
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                image: "example.test/web@sha256:abc".to_string(),
+                image_id: "example.test/web@sha256:abc".to_string(),
+                ready: true,
+                restart_count: 1,
+                state: Some(ContainerState {
+                    running: Some(Default::default()),
+                    ..Default::default()
+                }),
+                last_state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        reason: Some("StartError".to_string()),
+                        exit_code: 128,
+                        message: Some("previous runtime start failed".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert!(pod_runtime_failure_message(&pod).is_none());
 }
 
 #[test]

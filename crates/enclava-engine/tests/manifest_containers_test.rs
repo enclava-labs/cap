@@ -7,7 +7,7 @@ use enclava_engine::manifest::containers::{
     ENCLAVA_WAIT_EXEC_PATH, build_app_container, build_attestation_proxy_container,
     build_caddy_container, build_enclava_init_container, build_enclava_tools_init_container,
 };
-use enclava_engine::testutil::sample_app;
+use enclava_engine::testutil::{sample_app, sample_password_app};
 use enclava_engine::types::{CaddyTlsMode, WorkloadSecurityProfile};
 
 // === App container (Phase 5 default) ===
@@ -240,6 +240,14 @@ fn app_container_uses_tcp_readiness_without_liveness() {
         k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
     );
     assert!(readiness.http_get.is_none());
+}
+
+#[test]
+fn password_app_container_omits_startup_probe_while_waiting_for_unlock() {
+    let c = build_app_container(&sample_password_app());
+    assert!(c.startup_probe.is_none());
+    assert!(c.readiness_probe.is_some());
+    assert!(c.liveness_probe.is_none());
 }
 
 // === Attestation proxy ===

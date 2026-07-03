@@ -85,6 +85,21 @@ const ROOTFUL_SUDO_CAPS: &[&str] = &[
     "AUDIT_WRITE",
 ];
 
+fn app_startup_probe(app: &ConfidentialApp, app_port: u16) -> Option<Probe> {
+    if app.unlock_mode == UnlockMode::Password {
+        return None;
+    }
+    Some(Probe {
+        tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
+            port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(app_port as i32),
+            ..Default::default()
+        }),
+        period_seconds: Some(10),
+        failure_threshold: Some(180),
+        ..Default::default()
+    })
+}
+
 fn workload_profile_runs_as_root(profile: WorkloadSecurityProfile) -> bool {
     matches!(
         profile,
@@ -413,21 +428,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             ..Default::default()
         }),
         liveness_probe: None,
-        startup_probe: Some(k8s_openapi::api::core::v1::Probe {
-            tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
-                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                    app_port as i32,
-                ),
-                ..Default::default()
-            }),
-            period_seconds: Some(10),
-            // Password-mode workloads start under enclava-wait-exec and may
-            // spend several minutes waiting for unlock/config before the app
-            // can bind its port. Keep the startup budget long enough to avoid
-            // killing the workload before it has been allowed to start.
-            failure_threshold: Some(180),
-            ..Default::default()
-        }),
+        startup_probe: app_startup_probe(app, app_port),
         readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
             tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {
                 port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
