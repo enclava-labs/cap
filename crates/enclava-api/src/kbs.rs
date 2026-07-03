@@ -14,7 +14,7 @@ use enclava_engine::types::ConfidentialApp;
 
 const DEFAULT_SIGNED_POLICY_RETENTION: i64 = 6;
 const DEFAULT_SIGNED_POLICY_MAX_BYTES: usize = 900 * 1024;
-const SIGNED_POLICY_SET_SCHEMA_VERSION: &str = "enclava-signed-policy-set-v1";
+const SIGNED_POLICY_SET_SCHEMA_VERSION: &str = "enclava-signed-policy-set-v2";
 
 #[derive(Debug, Clone)]
 pub struct KbsPolicyConfig {
@@ -82,7 +82,35 @@ struct KbsTlsBinding {
 #[derive(Debug, Serialize)]
 struct SignedPolicyArtifactSet<'a> {
     schema_version: &'static str,
-    artifacts: &'a [crate::signing_service::SignedPolicyArtifact],
+    artifacts: Vec<CompactSignedPolicyArtifact<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct CompactSignedPolicyArtifact<'a> {
+    metadata: &'a crate::signing_service::PolicyMetadata,
+    rego_text: &'a str,
+    rego_sha256: &'a str,
+    agent_policy_sha256: &'a str,
+    signature: &'a str,
+    verify_pubkey_b64: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    org_keyring: Option<&'a serde_json::Value>,
+}
+
+impl<'a> From<&'a crate::signing_service::SignedPolicyArtifact>
+    for CompactSignedPolicyArtifact<'a>
+{
+    fn from(artifact: &'a crate::signing_service::SignedPolicyArtifact) -> Self {
+        Self {
+            metadata: &artifact.metadata,
+            rego_text: &artifact.rego_text,
+            rego_sha256: &artifact.rego_sha256,
+            agent_policy_sha256: &artifact.agent_policy_sha256,
+            signature: &artifact.signature,
+            verify_pubkey_b64: &artifact.verify_pubkey_b64,
+            org_keyring: artifact.org_keyring.as_ref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -381,9 +409,7 @@ pub async fn reconcile_signed_policy_artifacts(
 fn signed_policy_artifact_policy_body(
     artifacts: &[crate::signing_service::SignedPolicyArtifact],
 ) -> Result<String, KbsPolicyError> {
-    if let [artifact] = artifacts {
-        return Ok(serde_json::to_string(artifact)?);
-    }
+    let artifacts = artifacts.iter().map(Into::into).collect();
     Ok(serde_json::to_string(&SignedPolicyArtifactSet {
         schema_version: SIGNED_POLICY_SET_SCHEMA_VERSION,
         artifacts,
@@ -906,11 +932,14 @@ owner_resource_bindings := {}
 
         let body = signed_policy_artifact_policy_body(std::slice::from_ref(&artifact)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["rego_text"], artifact.rego_text);
+        assert_eq!(parsed["schema_version"], "enclava-signed-policy-set-v2");
+        let compact = &parsed["artifacts"][0];
+        assert_eq!(compact["rego_text"], artifact.rego_text);
         assert_eq!(
-            parsed["metadata"]["policy_template_id"],
+            compact["metadata"]["policy_template_id"],
             artifact.metadata.policy_template_id
         );
+        assert!(compact.get("agent_policy_text").is_none());
         assert!(!body.contains("BEGIN CAP MANAGED"));
     }
 
@@ -944,7 +973,7 @@ owner_resource_bindings := {}
             signed_policy_artifact_policy_body(&[artifact.clone(), artifact.clone()]).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
 
-        assert_eq!(parsed["schema_version"], "enclava-signed-policy-set-v1");
+        assert_eq!(parsed["schema_version"], "enclava-signed-policy-set-v2");
         assert_eq!(parsed["artifacts"].as_array().unwrap().len(), 2);
         assert!(is_signed_policy_artifact_body(&body));
     }

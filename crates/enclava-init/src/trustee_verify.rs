@@ -44,6 +44,37 @@ pub struct PolicyEnvelope {
     pub signature: [u8; 64],
 }
 
+/// Active policy body fetched from Trustee/KBS.
+///
+/// Newer CAP policy sets omit `agent_policy_text` from the shared ConfigMap so
+/// the Kubernetes object stays below its 1 MiB limit. The full text remains in
+/// the workload artifact bundle and is verified against the signed
+/// `agent_policy_sha256`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActivePolicyEnvelope {
+    pub metadata: PolicyMetadata,
+    pub rego_text: String,
+    pub agent_policy_sha256: String,
+    #[serde(default)]
+    pub agent_policy_text: Option<String>,
+    /// Detached Ed25519 signature over the CE-v1 raw bytes of (purpose,
+    /// canonical_policy_metadata_hash, sha256(rego_text)).
+    #[serde(with = "hex::serde")]
+    pub signature: [u8; 64],
+}
+
+impl From<&PolicyEnvelope> for ActivePolicyEnvelope {
+    fn from(env: &PolicyEnvelope) -> Self {
+        Self {
+            metadata: env.metadata.clone(),
+            rego_text: env.rego_text.clone(),
+            agent_policy_sha256: env.agent_policy_sha256.clone(),
+            agent_policy_text: Some(env.agent_policy_text.clone()),
+            signature: env.signature,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PolicyMetadata {
     pub app_id: String,
@@ -215,7 +246,7 @@ pub struct ArtifactFetcher {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SignedPolicyArtifactSet {
     schema_version: String,
-    artifacts: Vec<PolicyEnvelope>,
+    artifacts: Vec<ActivePolicyEnvelope>,
 }
 
 impl ArtifactFetcher {
@@ -236,7 +267,9 @@ impl ArtifactFetcher {
             &self.kbs_attestation_token,
             "fetch policy",
         )?;
-        let policy = parse_trustee_policy_body(policy_body, &bundle)?;
+        let active_policy = parse_trustee_policy_body(policy_body, &bundle)?;
+        verify_active_policy_matches_artifact(&active_policy, &bundle.signed_policy_artifact)?;
+        let policy = bundle.signed_policy_artifact.clone();
         Ok((bundle, policy))
     }
 }
@@ -244,14 +277,17 @@ impl ArtifactFetcher {
 fn parse_trustee_policy_body(
     policy_body: serde_json::Value,
     bundle: &ArtifactsBundle,
-) -> Result<PolicyEnvelope> {
-    if let Ok(policy) = serde_json::from_value::<PolicyEnvelope>(policy_body.clone()) {
+) -> Result<ActivePolicyEnvelope> {
+    if let Ok(policy) = serde_json::from_value::<ActivePolicyEnvelope>(policy_body.clone()) {
         return Ok(policy);
     }
     let policy_set: SignedPolicyArtifactSet = serde_json::from_value(policy_body).map_err(|e| {
         InitError::Kbs(format!("fetch policy: unsupported policy body format: {e}"))
     })?;
-    if policy_set.schema_version != "enclava-signed-policy-set-v1" {
+    if !matches!(
+        policy_set.schema_version.as_str(),
+        "enclava-signed-policy-set-v1" | "enclava-signed-policy-set-v2"
+    ) {
         return Err(InitError::Kbs(format!(
             "fetch policy: unsupported policy set schema_version={}",
             policy_set.schema_version
@@ -365,6 +401,30 @@ fn verify_policy_envelope_signature(
     Err(InitError::TrusteePolicy(
         "policy envelope sig did not verify with descriptor key".into(),
     ))
+}
+
+fn verify_active_policy_matches_artifact(
+    active: &ActivePolicyEnvelope,
+    artifact: &PolicyEnvelope,
+) -> Result<()> {
+    if active.metadata != artifact.metadata
+        || active.rego_text != artifact.rego_text
+        || active.agent_policy_sha256 != artifact.agent_policy_sha256
+        || active.signature != artifact.signature
+    {
+        return Err(InitError::TrusteePolicy(
+            "active Trustee policy does not match workload artifact bundle".into(),
+        ));
+    }
+    if let Some(agent_policy_text) = active.agent_policy_text.as_deref()
+        && agent_policy_text != artifact.agent_policy_text
+    {
+        return Err(InitError::TrusteePolicy(
+            "active Trustee policy agent_policy_text does not match workload artifact bundle"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn verify_descriptor_full_signature(

@@ -34,6 +34,15 @@ fn mk_envelope(sk: &SigningKey, metadata: PolicyMetadata, rego: &str) -> PolicyE
     env
 }
 
+fn compact_active_envelope(env: &PolicyEnvelope) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": env.metadata,
+        "rego_text": env.rego_text,
+        "agent_policy_sha256": env.agent_policy_sha256,
+        "signature": hex::encode(env.signature),
+    })
+}
+
 fn descriptor_json() -> serde_json::Value {
     serde_json::json!({
         "schema_version": "v1",
@@ -339,6 +348,50 @@ fn artifact_fetcher_reads_policy_set_and_selects_matching_artifact() {
     let policy_set = serde_json::json!({
         "schema_version": "enclava-signed-policy-set-v1",
         "artifacts": [non_matching_env, env.clone()],
+    });
+    let dir = tempdir().unwrap();
+    let bundle_path = dir.path().join("workload-artifacts.json");
+    let policy_path = dir.path().join("trustee-policy-set.json");
+    std::fs::write(&bundle_path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    std::fs::write(&policy_path, serde_json::to_vec(&policy_set).unwrap()).unwrap();
+
+    let fetcher = ArtifactFetcher {
+        workload_artifacts_url: format!("file://{}", bundle_path.display()),
+        trustee_policy_url: format!("file://{}", policy_path.display()),
+        kbs_attestation_token: "unused-for-file".into(),
+        timeout: Duration::from_secs(1),
+    };
+    let (_, fetched_policy) = fetcher.fetch().unwrap();
+    assert_eq!(fetched_policy, env);
+}
+
+#[test]
+fn artifact_fetcher_reads_compact_policy_set_and_selects_matching_artifact() {
+    let deployer = SigningKey::generate(&mut OsRng);
+    let descriptor = descriptor_json();
+    let keyring = keyring_json(&deployer, "deployer");
+    let rego = "package enclava\ndefault allow := false\n";
+    let (bundle, env, _, _, _) = build_inputs(
+        &descriptor,
+        keyring,
+        rego,
+        &deployer,
+        &deployer,
+        b"placeholder cc_init_data",
+    );
+    let mut non_matching_metadata = env.metadata.clone();
+    non_matching_metadata.descriptor_core_hash = "ff".repeat(32);
+    let non_matching_env = mk_envelope(
+        &deployer,
+        non_matching_metadata,
+        "package enclava\ndefault allow := true\n",
+    );
+    let policy_set = serde_json::json!({
+        "schema_version": "enclava-signed-policy-set-v2",
+        "artifacts": [
+            compact_active_envelope(&non_matching_env),
+            compact_active_envelope(&env),
+        ],
     });
     let dir = tempdir().unwrap();
     let bundle_path = dir.path().join("workload-artifacts.json");

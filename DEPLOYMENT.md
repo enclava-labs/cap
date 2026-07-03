@@ -108,7 +108,7 @@ For production deploys with policy-read mode enabled:
 | `KBS_POLICY_KEY` | Policy key inside the ConfigMap. Defaults to `policy.rego`. |
 | `KBS_POLICY_DEPLOYMENT` | KBS deployment to restart after policy updates. Defaults to `trustee-deployment`. |
 | `KBS_SIGNED_POLICY_RETENTION` | Number of signed policy artifacts to retain per app. |
-| `KBS_SIGNED_POLICY_MAX_BYTES` | Maximum signed policy artifact bytes retained per app. |
+| `KBS_SIGNED_POLICY_MAX_BYTES` | Maximum serialized signed policy artifact set bytes written to the shared KBS policy ConfigMap. Defaults to 900 KiB, below Kubernetes' 1 MiB ConfigMap data limit. |
 
 ## Common Defaults
 
