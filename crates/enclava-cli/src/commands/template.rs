@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 use enclava_cli::{
     api_client::{ApiClient, ApiError},
     api_types::{
-        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, HostedTemplate,
-        HostedTemplateConfigKey, ServiceSpec, SshCommandResponse, TemplateInstanceResponse,
+        AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, DeploymentEntry,
+        HostedTemplate, HostedTemplateConfigKey, ServiceSpec, SshCommandResponse,
+        TemplateInstanceResponse,
     },
     app_config::{
         AppConfig, AppSection, HealthSection, ResourcesSection, StorageSection, UnlockSection,
@@ -28,7 +29,7 @@ use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
     SignedDeployBlobParams, StoragePasswordInput, build_signed_deploy_blobs,
-    claim_initial_ownership, ensure_manual_deploy_keyring, wait_for_bootstrap_endpoint,
+    claim_initial_ownership, ensure_manual_deploy_keyring,
 };
 
 const DEBIAN_SSH_NGROK_TEMPLATE: &str = "debian-ssh-ngrok";
@@ -273,12 +274,19 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         &response,
         explicit_stable_endpoint.as_deref(),
     )?;
+    let deployment_id = response
+        .deployment
+        .cap_deployment_id
+        .as_deref()
+        .unwrap_or("pending")
+        .to_string();
     pb.set_position(3);
     if template.unlock_mode == "password" {
         pb.set_message("Waiting for ownership claim endpoint...");
-        if wait_for_bootstrap_endpoint(
+        if wait_for_template_bootstrap_endpoint(
             api,
             &instance_name,
+            &deployment_id,
             Duration::from_secs(args.ssh_timeout_seconds),
             Duration::from_secs(3),
             &pb,
@@ -313,6 +321,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             api,
             &instance_name,
             &template.paas_managed_config_keys,
+            &deployment_id,
             Duration::from_secs(args.ssh_timeout_seconds),
             &pb,
         )
@@ -349,12 +358,6 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     pb.set_position(4);
 
     let mut app_url = app_url_from_template_response_cap(&response.cap)?;
-    let deployment_id = response
-        .deployment
-        .cap_deployment_id
-        .as_deref()
-        .unwrap_or("pending")
-        .to_string();
 
     let (ssh_command, ssh_endpoint) = if args.no_wait {
         pb.set_position(5);
@@ -365,6 +368,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         let response = wait_for_paas_ssh_command(
             api,
             &instance_name,
+            &deployment_id,
             stable_endpoint.as_str(),
             app_url.as_str(),
             Duration::from_secs(args.ssh_timeout_seconds),
@@ -407,6 +411,13 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
     let stable_endpoint =
         ssh_command_stable_endpoint(explicit_stable_endpoint.as_deref(), &stored_stable_endpoint)?;
     let expected_app_url = app_url_from_app_response(&app)?;
+    let latest_deployment_id = if args.wait {
+        latest_deployment_id(&api, &instance_name)
+            .await?
+            .unwrap_or_else(|| "pending".to_string())
+    } else {
+        "pending".to_string()
+    };
     let response = if args.wait {
         let pb = if args.json {
             ProgressBar::hidden()
@@ -418,6 +429,7 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
         match wait_for_paas_ssh_command(
             &api,
             &instance_name,
+            &latest_deployment_id,
             stable_endpoint,
             expected_app_url.as_str(),
             Duration::from_secs(args.ssh_timeout_seconds),
@@ -799,6 +811,57 @@ fn debian_ssh_config_pairs(public_keys: String) -> Vec<(&'static str, String)> {
     vec![("DEBIAN_SSH_AUTHORIZED_KEYS", public_keys)]
 }
 
+async fn wait_for_template_bootstrap_endpoint(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+    max_wait: Duration,
+    poll_interval: Duration,
+    pb: &ProgressBar,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let endpoint = api.get_unlock_endpoint(app_name).await?;
+    let tee = TeeClient::new_for_ownership_probe_with_resolve_ip(
+        &endpoint.tee_url,
+        endpoint.tee_resolve_ip,
+    );
+    let start = Instant::now();
+
+    loop {
+        fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
+        if start.elapsed() > max_wait {
+            pb.abandon_with_message("Timeout waiting for ownership claim endpoint");
+            return Err("deploy timed out waiting for TEE ownership claim endpoint".into());
+        }
+
+        match tee.attest_receipt_key().await {
+            Ok((_attestation, attested_tee)) => match attested_tee.bootstrap_challenge().await {
+                Ok(_) => {
+                    pb.set_message("Ownership claim endpoint ready");
+                    return Ok(true);
+                }
+                Err(err)
+                    if attested_tee
+                        .claim_state_is_successful()
+                        .await
+                        .unwrap_or(false) =>
+                {
+                    pb.set_message("Ownership already claimed");
+                    let _ = err;
+                    return Ok(false);
+                }
+                Err(_) => {
+                    pb.set_message("Waiting for ownership claim endpoint...");
+                }
+            },
+            Err(_) => {
+                pb.set_message("Waiting for attested ownership claim endpoint...");
+            }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 async fn deliver_template_config_with_retry(
     api: &ApiClient,
     tee: &mut TeeClient,
@@ -917,6 +980,7 @@ async fn wait_for_paas_managed_config_keys(
     api: &ApiClient,
     instance_name: &str,
     expected_keys: &[String],
+    deployment_id: &str,
     timeout: Duration,
     progress: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -931,6 +995,7 @@ async fn wait_for_paas_managed_config_keys(
     }
     let deadline = Instant::now() + timeout;
     loop {
+        fail_if_template_deployment_failed(api, instance_name, deployment_id).await?;
         match api.list_config_keys(instance_name).await {
             Ok(response) => {
                 let present = response
@@ -1563,12 +1628,14 @@ fn is_reserved_http_app_host(host: &str) -> bool {
 async fn wait_for_paas_ssh_command(
     api: &ApiClient,
     app_name: &str,
+    deployment_id: &str,
     stable_endpoint: &str,
     expected_app_url: &str,
     timeout: Duration,
 ) -> Result<SshCommandResponse, Box<dyn std::error::Error>> {
     let start = Instant::now();
     while start.elapsed() < timeout {
+        fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
         let response = match api.get_template_ssh_command(app_name).await {
             Ok(response) => response,
             Err(error) if should_retry_paas_ssh_command_error(&error) => {
@@ -1589,6 +1656,66 @@ async fn wait_for_paas_ssh_command(
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
     Err(format!("timed out waiting for stable SSH endpoint command for app {app_name}").into())
+}
+
+async fn latest_deployment_id(api: &ApiClient, app_name: &str) -> Result<Option<String>, ApiError> {
+    Ok(api
+        .list_deployments(app_name)
+        .await?
+        .into_iter()
+        .next()
+        .map(|deployment| deployment.id))
+}
+
+async fn fail_if_template_deployment_failed(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if deployment_id == "pending" {
+        return Ok(());
+    }
+    match template_deployment_failure(api, app_name, deployment_id).await {
+        Ok(Some(message)) => Err(message.into()),
+        Ok(None) => Ok(()),
+        Err(error) if should_retry_template_deployment_status_error(&error) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn template_deployment_failure(
+    api: &ApiClient,
+    app_name: &str,
+    deployment_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let deployment = api
+        .list_deployments(app_name)
+        .await?
+        .into_iter()
+        .find(|deployment| deployment.id == deployment_id);
+    Ok(deployment
+        .as_ref()
+        .filter(|deployment| deployment.status == "failed")
+        .map(|deployment| template_deployment_failure_message(deployment, deployment_id)))
+}
+
+fn template_deployment_failure_message(
+    deployment: &DeploymentEntry,
+    deployment_id: &str,
+) -> String {
+    let detail = deployment
+        .error_message
+        .as_deref()
+        .unwrap_or("deployment failed");
+    format!("deployment {deployment_id} failed: {detail}")
+}
+
+fn should_retry_template_deployment_status_error(error: &ApiError) -> bool {
+    match error {
+        ApiError::Http(_) => true,
+        ApiError::Api { status, .. } => matches!(*status, 408 | 409 | 425 | 429) || *status >= 500,
+        ApiError::NotAuthenticated => false,
+    }
 }
 
 async fn fetch_direct_ssh_command_response(
@@ -2715,7 +2842,7 @@ mod tests {
             .find("create_template_instance")
             .expect("template deploy creates template instance");
         let wait_claim = body
-            .find("wait_for_bootstrap_endpoint")
+            .find("wait_for_template_bootstrap_endpoint")
             .expect("template deploy waits for ownership claim endpoint");
         let claim = body
             .find("claim_initial_ownership")
@@ -3465,6 +3592,28 @@ mod tests {
                 "endpoint": "6.tcp.eu.ngrok.io:17958",
                 "ssh_command_path": "/apps/shell/ssh-command"
             })
+        );
+    }
+
+    #[test]
+    fn template_deployment_failure_message_includes_api_error_detail() {
+        let deployment = DeploymentEntry {
+            id: "deploy-123".to_string(),
+            status: "failed".to_string(),
+            image_digest: None,
+            error_message: Some(
+                "KBS policy error: signed policy artifact set exceeds byte budget".to_string(),
+            ),
+            template_slug: Some("debian-ssh-frp".to_string()),
+            template_version: Some("2026.07.03".to_string()),
+            template_expected: Default::default(),
+            created_at: "2026-07-03T15:48:25Z".to_string(),
+            completed_at: None,
+        };
+
+        assert_eq!(
+            template_deployment_failure_message(&deployment, "deploy-123"),
+            "deployment deploy-123 failed: KBS policy error: signed policy artifact set exceeds byte budget"
         );
     }
 
