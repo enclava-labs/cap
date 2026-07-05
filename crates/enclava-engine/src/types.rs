@@ -12,6 +12,8 @@ pub const LEGACY_TENANT_INSTANCE_ANNOTATION: &str = "tenant.flowforge.sh/instanc
 pub struct ConfidentialApp {
     /// Stable UUID, used in KBS paths.
     pub app_id: Uuid,
+    /// CAP deployment UUID for binding encrypted log frames to one rollout.
+    pub deployment_id: Uuid,
     /// Human-readable name (unique within org).
     pub name: String,
     /// Kubernetes namespace (immutable after create).

@@ -489,6 +489,7 @@ pub(crate) fn set_primary_descriptor_runtime(
 pub async fn build_confidential_app(
     pool: &PgPool,
     app: &App,
+    deployment_id: Uuid,
     attestation_config: &AttestationConfig,
     api_signing_pubkey: &str,
     api_url: &str,
@@ -573,6 +574,7 @@ pub async fn build_confidential_app(
 
     Ok(ConfidentialApp {
         app_id: app.id,
+        deployment_id,
         name: app.name.clone(),
         namespace: app.namespace.clone(),
         instance_id: app.instance_id.clone(),
@@ -605,6 +607,16 @@ pub async fn build_confidential_app(
         workload_artifact_binding: None,
         generated_agent_policy: None,
     })
+}
+
+async fn latest_deployment_id_for_app(pool: &PgPool, app_id: Uuid) -> Result<Uuid, sqlx::Error> {
+    let deployment_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM deployments WHERE app_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(app_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(deployment_id.unwrap_or_else(Uuid::nil))
 }
 
 /// Record a deployment result in the database.
@@ -977,6 +989,7 @@ mod tests {
         let descriptor = customer_app_descriptor();
         let mut app = ConfidentialApp {
             app_id: descriptor.app_id,
+            deployment_id: descriptor.deploy_id,
             name: descriptor.app_name.clone(),
             namespace: descriptor.namespace.clone(),
             instance_id: "customer-app-test".to_string(),
@@ -1058,6 +1071,7 @@ mod tests {
             .retain(|mount| mount.destination == "/state");
         let mut app = ConfidentialApp {
             app_id: descriptor.app_id,
+            deployment_id: descriptor.deploy_id,
             name: descriptor.app_name.clone(),
             namespace: descriptor.namespace.clone(),
             instance_id: "customer-app-test".to_string(),
@@ -1183,8 +1197,16 @@ pub async fn reapply_tenant_ingress(
         return Err(DeployError::MissingAttestationConfig);
     };
 
-    let app_spec =
-        build_confidential_app(pool, app, attestation_config, api_signing_pubkey, api_url).await?;
+    let deployment_id = latest_deployment_id_for_app(pool, app.id).await?;
+    let app_spec = build_confidential_app(
+        pool,
+        app,
+        deployment_id,
+        attestation_config,
+        api_signing_pubkey,
+        api_url,
+    )
+    .await?;
     enclava_engine::validate::validate_app(&app_spec)
         .map_err(|e| DeployError::Validation(e.to_string()))?;
 
@@ -1284,6 +1306,7 @@ pub async fn apply_deployment_manifests(
     let mut app_spec = build_confidential_app(
         &pool,
         &app,
+        deployment_id,
         &attestation_config,
         &api_signing_pubkey,
         &api_url,

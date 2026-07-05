@@ -31,6 +31,9 @@ pub struct EncryptedLogFrame {
     pub version: String,
     pub algorithm: String,
     pub key_id: String,
+    pub org_id: String,
+    pub app_name: String,
+    pub deployment_id: String,
     pub recipient_public_key_sha256: String,
     pub sender_public_key_base64url: String,
     pub nonce_base64url: String,
@@ -39,6 +42,13 @@ pub struct EncryptedLogFrame {
     pub container: String,
     pub timestamp: String,
     pub ciphertext_base64url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogFrameContext {
+    pub org_id: String,
+    pub app_name: String,
+    pub deployment_id: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +76,9 @@ struct FrameAad<'a> {
     version: &'a str,
     algorithm: &'a str,
     key_id: &'a str,
+    org_id: &'a str,
+    app_name: &'a str,
+    deployment_id: &'a str,
     recipient_public_key_sha256: &'a str,
     sender_public_key_base64url: &'a str,
     nonce_base64url: &'a str,
@@ -128,6 +141,7 @@ pub fn validate_public_key(
 
 pub fn encrypt_log_frame(
     recipient: &LogEncryptionPublicKey,
+    context: &LogFrameContext,
     sequence: u64,
     stream: impl Into<String>,
     container: impl Into<String>,
@@ -148,6 +162,9 @@ pub fn encrypt_log_frame(
         version: LOG_FRAME_VERSION.to_string(),
         algorithm: LOG_ENCRYPTION_ALGORITHM.to_string(),
         key_id: recipient.key_id.clone(),
+        org_id: context.org_id.clone(),
+        app_name: context.app_name.clone(),
+        deployment_id: context.deployment_id.clone(),
         recipient_public_key_sha256: recipient.public_key_sha256.clone(),
         sender_public_key_base64url,
         nonce_base64url,
@@ -236,6 +253,9 @@ fn validate_frame_metadata(frame: &EncryptedLogFrame) -> Result<(), LogEncryptio
         &frame.stream,
         &frame.container,
         &frame.timestamp,
+        &frame.org_id,
+        &frame.app_name,
+        &frame.deployment_id,
         &frame.sender_public_key_base64url,
         &frame.nonce_base64url,
         &frame.recipient_public_key_sha256,
@@ -259,6 +279,9 @@ fn frame_aad(frame: &EncryptedLogFrame) -> Result<Vec<u8>, LogEncryptionError> {
         version: &frame.version,
         algorithm: &frame.algorithm,
         key_id: &frame.key_id,
+        org_id: &frame.org_id,
+        app_name: &frame.app_name,
+        deployment_id: &frame.deployment_id,
         recipient_public_key_sha256: &frame.recipient_public_key_sha256,
         sender_public_key_base64url: &frame.sender_public_key_base64url,
         nonce_base64url: &frame.nonce_base64url,
@@ -312,8 +335,14 @@ mod tests {
             &keypair.public_key_sha256,
         )
         .unwrap();
+        let context = LogFrameContext {
+            org_id: "org-123".to_string(),
+            app_name: "secure-app".to_string(),
+            deployment_id: "deploy-123".to_string(),
+        };
         let frame = encrypt_log_frame(
             &recipient,
+            &context,
             7,
             "stdout",
             "app",
@@ -323,8 +352,41 @@ mod tests {
         .unwrap();
 
         assert_ne!(frame.ciphertext_base64url, "tenant secret");
+        assert_eq!(frame.org_id, "org-123");
+        assert_eq!(frame.app_name, "secure-app");
+        assert_eq!(frame.deployment_id, "deploy-123");
         let plaintext = decrypt_log_frame(&keypair.private_key_base64url, &frame).unwrap();
         assert_eq!(plaintext, b"tenant secret");
+    }
+
+    #[test]
+    fn decrypt_rejects_tampered_routing_context() {
+        let keypair = generate_log_keypair();
+        let recipient = validate_public_key(
+            "logs-prod",
+            &keypair.public_key_base64url,
+            &keypair.public_key_sha256,
+        )
+        .unwrap();
+        let context = LogFrameContext {
+            org_id: "org-123".to_string(),
+            app_name: "secure-app".to_string(),
+            deployment_id: "deploy-123".to_string(),
+        };
+        let mut frame = encrypt_log_frame(
+            &recipient,
+            &context,
+            1,
+            "stdout",
+            "app",
+            "2026-07-05T12:00:00Z",
+            b"x",
+        )
+        .unwrap();
+        frame.deployment_id = "deploy-456".to_string();
+
+        let err = decrypt_log_frame(&keypair.private_key_base64url, &frame).unwrap_err();
+        assert!(matches!(err, LogEncryptionError::Decrypt));
     }
 
     #[test]
@@ -337,8 +399,21 @@ mod tests {
             &keypair.public_key_sha256,
         )
         .unwrap();
-        let frame = encrypt_log_frame(&recipient, 1, "stdout", "app", "2026-07-05T12:00:00Z", b"x")
-            .unwrap();
+        let context = LogFrameContext {
+            org_id: "org-123".to_string(),
+            app_name: "secure-app".to_string(),
+            deployment_id: "deploy-123".to_string(),
+        };
+        let frame = encrypt_log_frame(
+            &recipient,
+            &context,
+            1,
+            "stdout",
+            "app",
+            "2026-07-05T12:00:00Z",
+            b"x",
+        )
+        .unwrap();
 
         let err = decrypt_log_frame(&other.private_key_base64url, &frame).unwrap_err();
         assert!(matches!(err, LogEncryptionError::WrongKey));

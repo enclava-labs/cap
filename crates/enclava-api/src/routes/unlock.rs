@@ -534,6 +534,10 @@ pub async fn update_unlock_mode(
 
     let mut signed_app = app.clone();
     signed_app.unlock_mode = requested.model_value();
+    let deploy_id = signing_artifacts
+        .as_ref()
+        .map(|artifacts| artifacts.descriptor.deploy_id)
+        .unwrap_or_else(Uuid::new_v4);
     let mut workload_artifact_binding = None;
     let mut signed_policy_artifact = None;
     let mut signed_workload_command = None;
@@ -572,6 +576,7 @@ pub async fn update_unlock_mode(
         let mut app_spec = crate::deploy::build_confidential_app(
             &state.db,
             &signed_app,
+            deploy_id,
             attestation,
             &api_signing_pubkey,
             &state.api_url,
@@ -700,10 +705,6 @@ pub async fn update_unlock_mode(
             )
         })?;
 
-    let deploy_id = signing_artifacts
-        .as_ref()
-        .map(|artifacts| artifacts.descriptor.deploy_id)
-        .unwrap_or_else(Uuid::new_v4);
     let spec_snapshot = serde_json::json!({
         "app_name": updated_app.name,
         "namespace": updated_app.namespace,

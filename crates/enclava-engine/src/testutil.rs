@@ -19,6 +19,7 @@ pub fn sample_app() -> ConfidentialApp {
 
     ConfidentialApp {
         app_id: Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap(),
+        deployment_id: Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap(),
         name: "test-app".to_string(),
         namespace: "cap-test-org-test-app".to_string(),
         instance_id,

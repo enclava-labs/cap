@@ -766,6 +766,10 @@ pub async fn deploy(
         })?;
     }
 
+    let deploy_id = signing_artifacts
+        .as_ref()
+        .map(|artifacts| artifacts.descriptor.deploy_id)
+        .unwrap_or_else(Uuid::new_v4);
     let mut workload_artifact_binding = None;
     let mut signed_policy_artifact = None;
     if let Some(artifacts) = signing_artifacts.as_ref() {
@@ -783,6 +787,7 @@ pub async fn deploy(
         let mut app_spec = crate::deploy::build_confidential_app(
             &state.db,
             &app,
+            deploy_id,
             attestation,
             &api_signing_pubkey,
             &state.api_url,
@@ -840,10 +845,6 @@ pub async fn deploy(
         signed_policy_artifact = Some(signed);
     }
 
-    let deploy_id = signing_artifacts
-        .as_ref()
-        .map(|artifacts| artifacts.descriptor.deploy_id)
-        .unwrap_or_else(Uuid::new_v4);
     let source_provider = body.source_provider.map(SourceProvider::as_str);
     let spec_snapshot = serde_json::json!({
         "app_name": app.name,

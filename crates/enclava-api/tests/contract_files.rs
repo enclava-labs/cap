@@ -25,6 +25,9 @@ fn paas_internal_logs_contract() {
         "tenant_client_decrypts: required",
         "audit_log_bodies: forbidden",
         "EncryptedLogFrame:",
+        "org_id",
+        "app_name",
+        "deployment_id",
         "Error:",
     ] {
         assert!(

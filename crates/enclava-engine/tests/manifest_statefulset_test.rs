@@ -257,6 +257,16 @@ fn statefulset_adds_encrypted_log_relay_only_with_log_key_metadata() {
         env.name == "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL"
             && env.value.as_deref() == Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
     }));
+    assert!(app_container.env.as_ref().unwrap().iter().any(|env| {
+        env.name == "ENCLAVA_LOG_ORG_ID" && env.value.as_deref() == Some("test-org")
+    }));
+    assert!(app_container.env.as_ref().unwrap().iter().any(|env| {
+        env.name == "ENCLAVA_LOG_APP_NAME" && env.value.as_deref() == Some("test-app")
+    }));
+    assert!(app_container.env.as_ref().unwrap().iter().any(|env| {
+        env.name == "ENCLAVA_LOG_DEPLOYMENT_ID"
+            && env.value.as_deref() == Some("11111111-2222-3333-4444-555555555555")
+    }));
     assert!(
         app_container
             .volume_mounts

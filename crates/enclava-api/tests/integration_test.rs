@@ -1029,6 +1029,7 @@ async fn paas_internal_create_app_persists_cli_signer_identity() {
     let app_spec = enclava_api::deploy::build_confidential_app(
         &pool,
         &persisted_app,
+        Uuid::nil(),
         &attestation,
         &api_signing_pubkey,
         &api_url,

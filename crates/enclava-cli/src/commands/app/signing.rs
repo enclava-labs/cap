@@ -199,6 +199,7 @@ fn render_trustee_policy(
 
 pub(crate) struct ConfidentialAppForCcHash<'a> {
     pub(crate) image: enclava_common::image::ImageRef,
+    pub(crate) deployment_id: Uuid,
     pub(crate) release: &'a PlatformRelease,
     pub(crate) workload_artifact_binding: WorkloadArtifactBinding,
     pub(crate) generated_agent_policy: GeneratedAgentPolicy,
@@ -217,6 +218,7 @@ pub(crate) fn confidential_app_for_cc_hash(
 ) -> Result<ConfidentialApp, Box<dyn std::error::Error>> {
     let ConfidentialAppForCcHash {
         image,
+        deployment_id,
         release,
         workload_artifact_binding,
         generated_agent_policy,
@@ -240,6 +242,7 @@ pub(crate) fn confidential_app_for_cc_hash(
 
     Ok(ConfidentialApp {
         app_id: Uuid::parse_str(&app.id)?,
+        deployment_id,
         name: app.name.clone(),
         namespace: app.namespace.clone(),
         instance_id: app.instance_id.clone(),
@@ -614,6 +617,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         app_config,
         ConfidentialAppForCcHash {
             image: image_ref.clone(),
+            deployment_id: descriptor.deploy_id,
             release: &release,
             workload_artifact_binding,
             generated_agent_policy: generated_agent_policy.clone(),

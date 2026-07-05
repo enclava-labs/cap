@@ -497,6 +497,7 @@ fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> Confide
     let image = format!("ghcr.io/enclava-labs/demo@{}", descriptor.image_digest);
     ConfidentialApp {
         app_id: descriptor.app_id,
+        deployment_id: descriptor.deploy_id,
         name: descriptor.app_name.clone(),
         namespace: descriptor.namespace.clone(),
         instance_id: "demo-instance".to_string(),

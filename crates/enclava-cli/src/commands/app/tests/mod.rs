@@ -95,6 +95,8 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
                     "ghcr.io/acme/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 )
                 .unwrap(),
+                deployment_id: uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555")
+                    .unwrap(),
                 release: &test_release(),
                 workload_artifact_binding: WorkloadArtifactBinding {
                     descriptor_core_hash: [1; 32],
@@ -155,6 +157,8 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
                     "ghcr.io/acme/demo@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 )
                 .unwrap(),
+                deployment_id: uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555")
+                    .unwrap(),
                 release: &release,
                 workload_artifact_binding: WorkloadArtifactBinding {
                     descriptor_core_hash: [1; 32],
@@ -480,7 +484,7 @@ fn logs_command_points_missing_scope_to_explicit_reapproval() {
 #[test]
 fn logs_command_decrypts_encrypted_frames_locally() {
     use enclava_common::log_encryption::{
-        encrypt_log_frame, generate_log_keypair, validate_public_key,
+        LogFrameContext, encrypt_log_frame, generate_log_keypair, validate_public_key,
     };
 
     let keypair = generate_log_keypair();
@@ -490,8 +494,14 @@ fn logs_command_decrypts_encrypted_frames_locally() {
         &keypair.public_key_sha256,
     )
     .unwrap();
+    let context = LogFrameContext {
+        org_id: "org-123".to_string(),
+        app_name: "secure-app".to_string(),
+        deployment_id: "deploy-123".to_string(),
+    };
     let frame = encrypt_log_frame(
         &recipient,
+        &context,
         1,
         "stderr",
         "app",

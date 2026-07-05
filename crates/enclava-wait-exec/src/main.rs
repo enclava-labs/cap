@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use chrono::{SecondsFormat, Utc};
 use enclava_common::log_encryption::{
-    LogEncryptionPublicKey, encrypt_log_frame, validate_public_key,
+    LogEncryptionPublicKey, LogFrameContext, encrypt_log_frame, validate_public_key,
 };
 
 const DEFAULT_STARTED_DIR: &str = "/run/enclava/containers";
@@ -71,9 +71,10 @@ fn validate_sentinel_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct EncryptedLogConfig {
     recipient: LogEncryptionPublicKey,
+    context: LogFrameContext,
     spool_path: PathBuf,
     container: String,
 }
@@ -93,6 +94,11 @@ fn encrypted_log_config_from_env(
         .map_err(|_| "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_SHA256 is required".to_string())?;
     let recipient = validate_public_key(key_id, public_key, public_key_sha256)
         .map_err(|err| format!("invalid log encryption public key metadata: {err}"))?;
+    let context = LogFrameContext {
+        org_id: required_env("ENCLAVA_LOG_ORG_ID")?,
+        app_name: required_env("ENCLAVA_LOG_APP_NAME")?,
+        deployment_id: required_env("ENCLAVA_LOG_DEPLOYMENT_ID")?,
+    };
     let container = env::var("ENCLAVA_LOG_CONTAINER_NAME")
         .unwrap_or_else(|_| default_container.to_string())
         .trim()
@@ -103,9 +109,22 @@ fn encrypted_log_config_from_env(
         .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(format!("{container}.jsonl")));
     Ok(Some(EncryptedLogConfig {
         recipient,
+        context,
         spool_path,
         container,
     }))
+}
+
+fn required_env(name: &str) -> Result<String, String> {
+    let value = env::var(name).map_err(|_| format!("{name} is required"))?;
+    if value.is_empty()
+        || value
+            .bytes()
+            .any(|byte| byte == 0 || byte == b'\n' || byte == b'\r')
+    {
+        return Err(format!("{name} must not be empty or contain line breaks"));
+    }
+    Ok(value)
 }
 
 fn run_with_encrypted_logs(
@@ -222,6 +241,7 @@ where
         }
         let frame = encrypt_log_frame(
             &logs.recipient,
+            &logs.context,
             sequence.fetch_add(1, Ordering::Relaxed),
             stream,
             &logs.container,
@@ -488,5 +508,40 @@ mod tests {
             env::remove_var("ENCLAVA_LOG_ENCRYPTION_KEY_ID");
         }
         assert!(encrypted_log_config_from_env("web").unwrap().is_none());
+    }
+
+    #[test]
+    fn encrypted_log_config_requires_and_reads_routing_context() {
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        unsafe {
+            env::set_var("ENCLAVA_LOG_ENCRYPTION_KEY_ID", "logs-prod");
+            env::set_var(
+                "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL",
+                &keypair.public_key_base64url,
+            );
+            env::set_var(
+                "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_SHA256",
+                &keypair.public_key_sha256,
+            );
+            env::remove_var("ENCLAVA_LOG_ORG_ID");
+            env::remove_var("ENCLAVA_LOG_APP_NAME");
+            env::remove_var("ENCLAVA_LOG_DEPLOYMENT_ID");
+        }
+        assert!(
+            encrypted_log_config_from_env("web")
+                .unwrap_err()
+                .contains("ENCLAVA_LOG_ORG_ID is required")
+        );
+
+        unsafe {
+            env::set_var("ENCLAVA_LOG_ORG_ID", "org-123");
+            env::set_var("ENCLAVA_LOG_APP_NAME", "secure-app");
+            env::set_var("ENCLAVA_LOG_DEPLOYMENT_ID", "deploy-123");
+        }
+        let config = encrypted_log_config_from_env("web").unwrap().unwrap();
+        assert_eq!(config.context.org_id, "org-123");
+        assert_eq!(config.context.app_name, "secure-app");
+        assert_eq!(config.context.deployment_id, "deploy-123");
+        assert_eq!(config.container, "web");
     }
 }

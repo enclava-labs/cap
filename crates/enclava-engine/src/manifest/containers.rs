@@ -260,6 +260,12 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
         env_vars.push(env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"));
         if let Some(log_encryption) = app.log_encryption.as_ref() {
             env_vars.push(env("ENCLAVA_LOG_ENCRYPTION_KEY_ID", &log_encryption.key_id));
+            env_vars.push(env("ENCLAVA_LOG_ORG_ID", &app.tenant_id));
+            env_vars.push(env("ENCLAVA_LOG_APP_NAME", &app.name));
+            env_vars.push(env(
+                "ENCLAVA_LOG_DEPLOYMENT_ID",
+                &app.deployment_id.to_string(),
+            ));
             env_vars.push(env(
                 "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL",
                 &log_encryption.public_key_base64url,

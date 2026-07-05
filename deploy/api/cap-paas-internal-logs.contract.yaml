@@ -72,6 +72,9 @@ schemas:
       - version
       - algorithm
       - key_id
+      - org_id
+      - app_name
+      - deployment_id
       - recipient_public_key_sha256
       - sender_public_key_base64url
       - nonce_base64url
@@ -84,6 +87,9 @@ schemas:
       version: enclava-log-frame-v1
       algorithm: x25519-hpke-v1
       key_id: tenant-selected public log key id
+      org_id: tenant organization identifier bound into frame AEAD
+      app_name: hosted app name bound into frame AEAD
+      deployment_id: CAP deployment id bound into frame AEAD
       recipient_public_key_sha256: tenant public key hash
       sender_public_key_base64url: ephemeral sender public key
       nonce_base64url: per-frame nonce
