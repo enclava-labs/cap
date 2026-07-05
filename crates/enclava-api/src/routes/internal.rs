@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{FromRequestParts, Path, State},
+    extract::{FromRequestParts, Path, Query, State},
     http::{HeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
@@ -1022,6 +1022,22 @@ pub async fn delete_paas_app(
     let response = serde_json::json!({"status": "deleted"});
     finish_actor_idempotent_request(&state, &headers, status, &response).await?;
     Ok((status, Json(response)))
+}
+
+pub async fn get_paas_app_logs(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Path((paas_org_id, app_name)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(query): Query<crate::routes::logs::RawLogQuery>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    validate_external_id(&paas_org_id, "paas_org_id")?;
+    validate_org_name(&app_name)?;
+    let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
+    if auth.role == Role::Member {
+        return Err(json_error(StatusCode::FORBIDDEN, "scope_not_allowed"));
+    }
+    crate::routes::logs::paas_app_logs(auth, state, app_name, query).await
 }
 
 pub async fn list_paas_members(

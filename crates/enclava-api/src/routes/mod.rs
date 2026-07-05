@@ -4,6 +4,7 @@ pub mod config;
 pub mod deployments;
 pub mod domains;
 pub mod internal;
+pub mod logs;
 pub mod orgs;
 pub mod platform;
 pub mod status;

@@ -1,0 +1,71 @@
+contract: cap-paas-internal-logs
+version: 1
+owner: enclava-paas
+consumer: cap
+route:
+  method: GET
+  path: /internal/paas/orgs/{paas_org_id}/apps/{app_name}/logs
+auth:
+  service_token: required
+  mtls_client_identity: required
+  actor_header: x-enclava-paas-user-id
+query:
+  follow:
+    type: boolean
+    default: false
+  tail_lines:
+    type: integer
+    min: 1
+    max: 1000
+    defaults:
+      follow_false: 200
+      follow_true: 100
+  since_seconds:
+    type: integer
+    min: 1
+    max:
+      follow_false: 86400
+      follow_true: 3600
+  container:
+    type: kubernetes-container-name
+authorization:
+  cap_actor_roles:
+    - owner
+    - admin
+  denied_role_code: scope_not_allowed
+  entitlement_source: synced_paas_entitlement
+responses:
+  non_follow:
+    status: 200
+    content_type: application/json
+    body: array<LogLine>
+  follow:
+    status: 200
+    content_type: text/plain; charset=utf-8
+    framing: "<RFC3339 timestamp> <container> <message>\\n"
+  errors:
+    "400": invalid_log_query
+    "403": scope_not_allowed
+    "404":
+      - app_not_found
+      - container_not_available
+    "409": logs_pod_not_ready
+    "413": log_response_too_large
+    "429": log_stream_limit_exceeded
+    "502": cap_read_failed
+security:
+  log_bodies_are_sensitive: true
+  cache_control: no-store
+  public_error_redaction: required
+  sidecars_exposed: false
+  audit_log_bodies: forbidden
+schemas:
+  LogLine:
+    required:
+      - timestamp
+      - container
+      - message
+    properties:
+      timestamp: RFC3339 string
+      container: primary workload container name
+      message: raw line payload without trailing newline

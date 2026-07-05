@@ -38,6 +38,10 @@ pub struct AuthResponse {
 pub struct DeviceLoginStartRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub org: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_org_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_scopes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

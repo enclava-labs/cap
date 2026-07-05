@@ -122,6 +122,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
         &cc_init_data::CcInitDataOptions {
             kbs_url: "https://kbs.example.test:8080".to_string(),
             kbs_ca_cert_pem: None,
+            runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
         },
     );
 
@@ -182,6 +183,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
         &cc_init_data::CcInitDataOptions {
             kbs_url: "https://kbs.example.test:8080".to_string(),
             kbs_ca_cert_pem: None,
+            runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
         },
     );
 
@@ -449,6 +451,32 @@ fn status_command_surfaces_stable_ssh_endpoint_with_validating_follow_up() {
         body.contains("Stable SSH endpoint metadata invalid; redeploy the template so PaaS reserves a stable SSH endpoint"),
         "status should make corrupt Debian SSH endpoint metadata actionable"
     );
+}
+
+#[test]
+fn log_output_sanitizer_removes_terminal_control_sequences() {
+    let raw = "ok \u{1b}[31mred\u{1b}[0m \u{1b}]0;title\u{7} done\r";
+    let sanitized = super::sanitize_log_output(raw);
+
+    assert_eq!(sanitized, "ok red  done?");
+    assert!(!sanitized.contains('\u{1b}'));
+}
+
+#[test]
+fn logs_command_points_missing_scope_to_explicit_reapproval() {
+    let source = include_str!("../../app.rs");
+    let fn_start = source
+        .find("pub async fn logs")
+        .expect("logs function exists");
+    let fn_end = source[fn_start..]
+        .find("#[derive(Args)]\npub struct RollbackArgs")
+        .expect("rollback args follow logs function")
+        + fn_start;
+    let body = &source[fn_start..fn_end];
+
+    assert!(body.contains("message.contains(\"apps:logs\")"));
+    assert!(body.contains("enclava login --approve-logs"));
+    assert!(body.contains("sanitize_log_output"));
 }
 
 #[test]

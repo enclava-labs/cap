@@ -22,6 +22,9 @@ pub struct LoginArgs {
     /// Preferred organization name for approval
     #[arg(long)]
     pub org: Option<String>,
+    /// Request explicit hosted workload log access for this CLI session
+    #[arg(long = "approve-logs")]
+    pub approve_logs: bool,
     /// Authenticate with Nostr identity (NIP-98)
     #[arg(long)]
     pub nostr: bool,
@@ -238,6 +241,8 @@ async fn device_login(
     let start = client
         .start_device_login(&DeviceLoginStartRequest {
             org: args.org.clone(),
+            requested_org_slug: args.org.clone(),
+            requested_scopes: device_login_scopes(args.approve_logs),
         })
         .await?;
 
@@ -304,6 +309,18 @@ async fn device_login(
             other => return Err(format!("unexpected device login status: {other}").into()),
         }
     }
+}
+
+fn device_login_scopes(approve_logs: bool) -> Vec<String> {
+    let mut scopes = vec![
+        "apps:read".to_string(),
+        "apps:write".to_string(),
+        "org:admin".to_string(),
+    ];
+    if approve_logs {
+        scopes.push("apps:logs".to_string());
+    }
+    scopes
 }
 
 fn try_open_browser(url: &str) -> bool {

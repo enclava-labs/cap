@@ -1016,6 +1016,16 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
             println!("{message}");
             return Ok(());
         }
+        Err(ApiError::Api {
+            status: 403,
+            code: Some(code),
+            message,
+        }) if code == "missing_scope" && message.contains("apps:logs") => {
+            return Err(format!(
+                "{message}\nRun `enclava login --approve-logs` and approve the new session to read workload logs."
+            )
+            .into());
+        }
         Err(err) => return Err(err.into()),
     };
 
@@ -1028,7 +1038,7 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
         let mut lines = tokio::io::BufReader::new(reader).lines();
         while let Some(line) = lines.next_line().await? {
-            println!("{line}");
+            println!("{}", sanitize_log_output(&line));
         }
     } else {
         // Print all logs at once
@@ -1040,15 +1050,58 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
                         "{} {} {}",
                         line.timestamp,
                         line.container,
-                        line.message.trim_end()
+                        sanitize_log_output(line.message.trim_end())
                     );
                 }
             }
-            Err(_) => print!("{body}"),
+            Err(_) => print!("{}", sanitize_log_output(&body)),
         }
     }
 
     Ok(())
+}
+
+fn sanitize_log_output(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    let mut saw_escape = false;
+                    for next in chars.by_ref() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if saw_escape && next == '\\' {
+                            break;
+                        }
+                        saw_escape = next == '\u{1b}';
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        match ch {
+            '\n' | '\t' => output.push(ch),
+            ch if ch.is_control() => output.push('?'),
+            ch => output.push(ch),
+        }
+    }
+    output
 }
 
 #[derive(Args)]
