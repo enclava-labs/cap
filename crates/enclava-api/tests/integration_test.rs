@@ -1397,6 +1397,90 @@ async fn app_logs_fail_closed_until_encrypted_streaming_exists() {
 }
 
 #[tokio::test]
+async fn paas_internal_app_logs_fail_closed_after_actor_validation() {
+    let (state, _pool) = setup_paas_managed_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("logs-{}", &suffix[..16]);
+    let app_name = format!("logs-{}", &suffix[..12]);
+
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}")),
+        &format!("internal-logs-org-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": org_name,
+        "display_name": "Internal Logs Org",
+        "status": "active",
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    add_internal_headers(
+        server.put(&format!(
+            "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}"
+        )),
+        &format!("internal-logs-member-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "display_name": "Internal Logs User",
+        "role": "owner",
+        "active": true,
+        "version": 1,
+    }))
+    .await
+    .assert_status_ok();
+
+    add_internal_headers(
+        server.put(&format!("/internal/paas/orgs/{paas_org_id}/entitlements")),
+        &format!("internal-logs-entitlement-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "version": 1,
+        "deploy_allowed": true,
+        "block_reason": null,
+        "limits": {
+            "name": "starter",
+            "max_apps": 2,
+            "max_cpu": "2",
+            "max_memory": "4Gi",
+            "max_storage": "20Gi"
+        }
+    }))
+    .await
+    .assert_status_ok();
+
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("internal-logs-app-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "auto",
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let logs = add_internal_actor_headers(
+        server.get(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/logs?tail_lines=1"
+        )),
+        &format!("internal-logs-get-{suffix}"),
+        &paas_user_id,
+    )
+    .await;
+    logs.assert_status(StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(logs.headers()["cache-control"], "no-store");
+    assert_eq!(logs.headers()["pragma"], "no-cache");
+    let body: Value = logs.json();
+    assert_eq!(body["error"], "encrypted_logs_required");
+    assert_eq!(body["code"], "encrypted_logs_required");
+}
+
+#[tokio::test]
 async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);

@@ -42,14 +42,14 @@ pub async fn paas_app_logs(
         return Err(json_error(StatusCode::FORBIDDEN, "scope_not_allowed"));
     }
     require_log_entitlement(&state, &auth).await?;
-    let app_exists =
-        sqlx::query_scalar::<_, i64>("SELECT 1 FROM apps WHERE org_id = $1 AND name = $2")
-            .bind(auth.org_id)
-            .bind(&app_name)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|_| db_error())?
-            .is_some();
+    let app_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM apps WHERE org_id = $1 AND name = $2)",
+    )
+    .bind(auth.org_id)
+    .bind(&app_name)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| db_error())?;
     if !app_exists {
         return Err(json_error(StatusCode::NOT_FOUND, "app_not_found"));
     }
@@ -58,7 +58,13 @@ pub async fn paas_app_logs(
 
 async fn require_log_entitlement(state: &AppState, auth: &AuthContext) -> Result<(), RouteError> {
     let deploy_allowed = sqlx::query_scalar::<_, bool>(
-        "SELECT COALESCE((SELECT deploy_allowed FROM organization_entitlements WHERE org_id = $1), false)",
+        "SELECT COALESCE((
+             SELECT deploy_allowed
+               FROM organization_entitlements
+              WHERE org_id = $1
+              ORDER BY version DESC
+              LIMIT 1
+         ), false)",
     )
     .bind(auth.org_id)
     .fetch_one(&state.db)
