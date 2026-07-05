@@ -1,16 +1,27 @@
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::process::{self, Command, Stdio};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::thread;
 use std::time::Duration;
+
+use chrono::{SecondsFormat, Utc};
+use enclava_common::log_encryption::{
+    LogEncryptionPublicKey, encrypt_log_frame, validate_public_key,
+};
 
 const DEFAULT_STARTED_DIR: &str = "/run/enclava/containers";
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
 const DEFAULT_STARTUP: &str = "/startup/startup.sh";
+const DEFAULT_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
 const STARTED_DIR_MODE: u32 = 0o2770;
 const O_NOFOLLOW: i32 = 0o400000;
 
@@ -36,6 +47,10 @@ fn run(argv: Vec<OsString>) -> Result<(), String> {
     wait_until_ready(&ready_file);
 
     let (program, args) = command_from_args(argv);
+    if let Some(logs) = encrypted_log_config_from_env(&name)? {
+        let code = run_with_encrypted_logs(program, args, logs)?;
+        process::exit(code);
+    }
     let err = Command::new(&program).args(&args).exec();
     Err(format!(
         "failed to exec {}: {err}",
@@ -54,6 +69,177 @@ fn validate_sentinel_name(name: &str) -> Result<(), String> {
         return Err("ENCLAVA_CONTAINER_NAME must be a single path component".to_string());
     }
     Ok(())
+}
+
+#[derive(Clone)]
+struct EncryptedLogConfig {
+    recipient: LogEncryptionPublicKey,
+    spool_path: PathBuf,
+    container: String,
+}
+
+fn encrypted_log_config_from_env(
+    default_container: &str,
+) -> Result<Option<EncryptedLogConfig>, String> {
+    let Some(key_id) = env::var_os("ENCLAVA_LOG_ENCRYPTION_KEY_ID") else {
+        return Ok(None);
+    };
+    let key_id = key_id
+        .into_string()
+        .map_err(|_| "ENCLAVA_LOG_ENCRYPTION_KEY_ID must be UTF-8".to_string())?;
+    let public_key = env::var("ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL")
+        .map_err(|_| "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL is required".to_string())?;
+    let public_key_sha256 = env::var("ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_SHA256")
+        .map_err(|_| "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_SHA256 is required".to_string())?;
+    let recipient = validate_public_key(key_id, public_key, public_key_sha256)
+        .map_err(|err| format!("invalid log encryption public key metadata: {err}"))?;
+    let container = env::var("ENCLAVA_LOG_CONTAINER_NAME")
+        .unwrap_or_else(|_| default_container.to_string())
+        .trim()
+        .to_string();
+    validate_sentinel_name(&container)?;
+    let spool_path = env::var_os("ENCLAVA_LOG_SPOOL_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(format!("{container}.jsonl")));
+    Ok(Some(EncryptedLogConfig {
+        recipient,
+        spool_path,
+        container,
+    }))
+}
+
+fn run_with_encrypted_logs(
+    program: OsString,
+    args: Vec<OsString>,
+    logs: EncryptedLogConfig,
+) -> Result<i32, String> {
+    let spool = open_log_spool(&logs.spool_path)?;
+    let spool = Arc::new(Mutex::new(spool));
+    let sequence = Arc::new(AtomicU64::new(1));
+    let mut child = Command::new(&program)
+        .args(&args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            format!(
+                "failed to spawn {} under encrypted log wrapper: {err}",
+                PathBuf::from(&program).display()
+            )
+        })?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "child stdout was not captured".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "child stderr was not captured".to_string())?;
+    let stdout_thread = spawn_log_forwarder(
+        stdout,
+        "stdout",
+        logs.clone(),
+        Arc::clone(&spool),
+        Arc::clone(&sequence),
+    );
+    let stderr_thread = spawn_log_forwarder(
+        stderr,
+        "stderr",
+        logs,
+        Arc::clone(&spool),
+        Arc::clone(&sequence),
+    );
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("failed to wait for encrypted log child: {err}"))?;
+    for result in [stdout_thread.join(), stderr_thread.join()] {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => eprintln!("enclava-wait-exec encrypted log forwarding failed: {err}"),
+            Err(_) => eprintln!("enclava-wait-exec encrypted log forwarding panicked"),
+        }
+    }
+    Ok(status.code().unwrap_or(1))
+}
+
+fn open_log_spool(path: &Path) -> Result<File, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create log spool dir {}: {err}", parent.display()))?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o640)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|err| {
+            format!(
+                "failed to open encrypted log spool {}: {err}",
+                path.display()
+            )
+        })
+}
+
+fn spawn_log_forwarder<R>(
+    reader: R,
+    stream: &'static str,
+    logs: EncryptedLogConfig,
+    spool: Arc<Mutex<File>>,
+    sequence: Arc<AtomicU64>,
+) -> thread::JoinHandle<Result<(), String>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || forward_encrypted_logs(reader, stream, &logs, &spool, &sequence))
+}
+
+fn forward_encrypted_logs<R>(
+    reader: R,
+    stream: &'static str,
+    logs: &EncryptedLogConfig,
+    spool: &Arc<Mutex<File>>,
+    sequence: &AtomicU64,
+) -> Result<(), String>
+where
+    R: Read,
+{
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let n = reader
+            .read_until(b'\n', &mut buf)
+            .map_err(|err| format!("failed to read child {stream}: {err}"))?;
+        if n == 0 {
+            return Ok(());
+        }
+        while buf.ends_with(b"\n") || buf.ends_with(b"\r") {
+            buf.pop();
+        }
+        let frame = encrypt_log_frame(
+            &logs.recipient,
+            sequence.fetch_add(1, Ordering::Relaxed),
+            stream,
+            &logs.container,
+            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            &buf,
+        )
+        .map_err(|err| format!("failed to encrypt child {stream} log frame: {err}"))?;
+        let line = serde_json::to_vec(&frame)
+            .map_err(|err| format!("failed to encode encrypted log frame: {err}"))?;
+        let mut spool = spool
+            .lock()
+            .map_err(|_| "encrypted log spool lock poisoned".to_string())?;
+        spool
+            .write_all(&line)
+            .and_then(|_| spool.write_all(b"\n"))
+            .and_then(|_| spool.flush())
+            .map_err(|err| format!("failed to write encrypted log spool: {err}"))?;
+    }
 }
 
 fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
@@ -294,5 +480,13 @@ mod tests {
             args,
             vec![OsString::from("run"), OsString::from("--config")]
         );
+    }
+
+    #[test]
+    fn encrypted_log_config_absent_by_default() {
+        unsafe {
+            env::remove_var("ENCLAVA_LOG_ENCRYPTION_KEY_ID");
+        }
+        assert!(encrypted_log_config_from_env("web").unwrap().is_none());
     }
 }

@@ -63,6 +63,8 @@ fn caddyfile_has_well_known_confidential_routes() {
     let data = cm.data.as_ref().unwrap();
     let caddyfile = data.get("Caddyfile").unwrap();
     assert!(caddyfile.contains("/.well-known/confidential/*"));
+    assert!(caddyfile.contains("/.well-known/confidential/logs"));
+    assert!(caddyfile.contains("127.0.0.1:8082"));
 }
 
 #[test]

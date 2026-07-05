@@ -8,6 +8,10 @@ rust-version = { workspace = true }
 name = "enclava-init"
 path = "src/main.rs"
 
+[[bin]]
+name = "enclava-log-relay"
+path = "src/bin/enclava-log-relay.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 argon2 = { workspace = true }

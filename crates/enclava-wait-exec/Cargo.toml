@@ -7,3 +7,8 @@ rust-version = { workspace = true }
 [[bin]]
 name = "enclava-wait-exec"
 path = "src/main.rs"
+
+[dependencies]
+chrono = { workspace = true }
+enclava-common = { workspace = true }
+serde_json = { workspace = true }

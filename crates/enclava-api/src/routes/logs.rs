@@ -1,9 +1,11 @@
 use axum::{
     Json,
+    body::Body,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
+use sqlx::Row;
 
 use crate::{auth::middleware::AuthContext, models::Role, state::AppState};
 
@@ -37,23 +39,46 @@ pub async fn paas_app_logs(
     app_name: String,
     raw_query: RawLogQuery,
 ) -> Result<Response, RouteError> {
-    let _query = validate_query(raw_query)?;
+    let query = validate_query(raw_query)?;
     if !matches!(auth.role, Role::Owner | Role::Admin) {
         return Err(json_error(StatusCode::FORBIDDEN, "scope_not_allowed"));
     }
     require_log_entitlement(&state, &auth).await?;
-    let app_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM apps WHERE org_id = $1 AND name = $2)",
+    let app = sqlx::query(
+        "SELECT id::text AS id, name, domain, tee_domain FROM apps WHERE org_id = $1 AND name = $2",
     )
     .bind(auth.org_id)
     .bind(&app_name)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| db_error())?;
+    let Some(app) = app else {
+        return Err(json_error(StatusCode::NOT_FOUND, "app_not_found"));
+    };
+    let app_id: String = app.try_get("id").map_err(|_| db_error())?;
+    let app_name: String = app.try_get("name").map_err(|_| db_error())?;
+    let domain: String = app.try_get("domain").map_err(|_| db_error())?;
+    let tee_domain: Option<String> = app.try_get("tee_domain").map_err(|_| db_error())?;
+    let encrypted_logs_configured = sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT COALESCE((
+            SELECT spec_snapshot ? 'log_encryption'
+               AND spec_snapshot->'log_encryption' <> 'null'::jsonb
+              FROM deployments
+             WHERE app_id = $1::uuid
+             ORDER BY created_at DESC
+             LIMIT 1
+        ), false)
+        "#,
+    )
+    .bind(&app_id)
     .fetch_one(&state.db)
     .await
     .map_err(|_| db_error())?;
-    if !app_exists {
-        return Err(json_error(StatusCode::NOT_FOUND, "app_not_found"));
+    if !encrypted_logs_configured {
+        return Ok(encrypted_logs_required_response());
     }
-    Ok(encrypted_logs_required_response())
+    proxy_encrypted_logs_from_tee(&state, &app_name, &domain, tee_domain.as_deref(), &query).await
 }
 
 async fn require_log_entitlement(state: &AppState, auth: &AuthContext) -> Result<(), RouteError> {
@@ -144,6 +169,22 @@ fn validate_container_name(value: String) -> Result<String, RouteError> {
     Ok(value)
 }
 
+impl ValidatedLogQuery {
+    fn tee_query_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = vec![
+            ("follow", self.follow.to_string()),
+            ("tail_lines", self.tail_lines.to_string()),
+        ];
+        if let Some(since_seconds) = self.since_seconds {
+            pairs.push(("since_seconds", since_seconds.to_string()));
+        }
+        if let Some(container) = &self.container {
+            pairs.push(("container", container.clone()));
+        }
+        pairs
+    }
+}
+
 fn encrypted_logs_required_response() -> Response {
     let mut response = (
         StatusCode::NOT_IMPLEMENTED,
@@ -156,6 +197,48 @@ fn encrypted_logs_required_response() -> Response {
         .into_response();
     add_no_store_headers(response.headers_mut());
     response
+}
+
+async fn proxy_encrypted_logs_from_tee(
+    state: &AppState,
+    app_name: &str,
+    domain: &str,
+    tee_domain: Option<&str>,
+    query: &ValidatedLogQuery,
+) -> Result<Response, RouteError> {
+    let confidential_domain = tee_domain.unwrap_or(domain);
+    let url = format!("https://{confidential_domain}/.well-known/confidential/logs");
+    let upstream = state
+        .tee_http_client
+        .get(url)
+        .query(&query.tee_query_pairs())
+        .send()
+        .await
+        .map_err(|_| json_error(StatusCode::BAD_GATEWAY, "encrypted_log_stream_unavailable"))?;
+    if !upstream.status().is_success() {
+        return Err(match upstream.status() {
+            reqwest::StatusCode::NOT_FOUND => {
+                json_error(StatusCode::NOT_FOUND, "container_not_available")
+            }
+            reqwest::StatusCode::CONFLICT => json_error(StatusCode::CONFLICT, "logs_not_ready"),
+            _ => json_error(StatusCode::BAD_GATEWAY, "encrypted_log_stream_unavailable"),
+        });
+    }
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .map_err(|_| db_error())?;
+    add_no_store_headers(response.headers_mut());
+    response.headers_mut().insert(
+        "x-enclava-log-format",
+        HeaderValue::from_static("encrypted-jsonl; version=enclava-log-frame-v1"),
+    );
+    response.headers_mut().insert(
+        "x-enclava-log-source",
+        HeaderValue::from_str(app_name).unwrap_or_else(|_| HeaderValue::from_static("app")),
+    );
+    Ok(response)
 }
 
 fn json_error(status: StatusCode, error: impl Into<String>) -> RouteError {

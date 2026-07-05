@@ -51,6 +51,8 @@ pub const CADDY_ACME_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
+pub const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
+pub const ENCLAVA_LOG_RELAY_PORT: i32 = 8082;
 const CADDY_DNS01_BROKER_TLS_HANDOFF_SCRIPT: &str = concat!(
     "trap 'exit 0' TERM INT\n",
     "i=0\n",
@@ -256,6 +258,22 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
         env_vars.push(env("ENCLAVA_CONTAINER_NAME", &primary.name));
         env_vars.push(env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"));
         env_vars.push(env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"));
+        if let Some(log_encryption) = app.log_encryption.as_ref() {
+            env_vars.push(env("ENCLAVA_LOG_ENCRYPTION_KEY_ID", &log_encryption.key_id));
+            env_vars.push(env(
+                "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL",
+                &log_encryption.public_key_base64url,
+            ));
+            env_vars.push(env(
+                "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_SHA256",
+                &log_encryption.public_key_sha256,
+            ));
+            env_vars.push(env("ENCLAVA_LOG_CONTAINER_NAME", &primary.name));
+            env_vars.push(env(
+                "ENCLAVA_LOG_SPOOL_PATH",
+                &format!("{ENCLAVA_LOG_SPOOL_DIR}/{}.jsonl", primary.name),
+            ));
+        }
     }
 
     let (command, args): (Option<Vec<String>>, Option<Vec<String>>) = if legacy {
@@ -326,6 +344,13 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             mount_propagation: Some("HostToContainer".to_string()),
             ..Default::default()
         });
+        if app.log_encryption.is_some() {
+            volume_mounts.push(VolumeMount {
+                name: "logs".to_string(),
+                mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
+                ..Default::default()
+            });
+        }
     }
 
     let security_context = if legacy {
@@ -559,7 +584,7 @@ pub fn build_enclava_tools_init_container() -> Container {
             "/bin/sh".to_string(),
             "-eu".to_string(),
             "-c".to_string(),
-            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready".to_string(),
+            "cp /usr/local/bin/enclava-wait-exec /work/enclava-wait-exec && chmod 0555 /work/enclava-wait-exec && install -d -m 02770 -o 0 -g 10001 /run/enclava/containers && install -d -m 02770 -o 0 -g 10001 /run/enclava-logs && printf 'not-ready\\n' > /run/enclava/init-ready && chmod 0644 /run/enclava/init-ready".to_string(),
         ]),
         volume_mounts: Some(vec![
             VolumeMount {
@@ -570,6 +595,11 @@ pub fn build_enclava_tools_init_container() -> Container {
             VolumeMount {
                 name: "unlock-socket".to_string(),
                 mount_path: "/run/enclava".to_string(),
+                ..Default::default()
+            },
+            VolumeMount {
+                name: "logs".to_string(),
+                mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
                 ..Default::default()
             },
         ]),
@@ -602,6 +632,81 @@ pub fn build_enclava_tools_init_container() -> Container {
         }),
         ..Default::default()
     }
+}
+
+pub fn build_encrypted_log_relay_container(app: &ConfidentialApp) -> Option<Container> {
+    app.log_encryption.as_ref()?;
+    let primary = app
+        .primary_container()
+        .expect("app must have a primary container");
+    Some(Container {
+        name: "encrypted-log-relay".to_string(),
+        image: Some(enclava_init_image()),
+        command: Some(vec!["/usr/local/bin/enclava-log-relay".to_string()]),
+        ports: Some(vec![ContainerPort {
+            container_port: ENCLAVA_LOG_RELAY_PORT,
+            name: Some("log-relay".to_string()),
+            ..Default::default()
+        }]),
+        env: Some(vec![
+            env(
+                "ENCLAVA_LOG_RELAY_BIND",
+                &format!("127.0.0.1:{ENCLAVA_LOG_RELAY_PORT}"),
+            ),
+            env("ENCLAVA_LOG_RELAY_CONTAINER", &primary.name),
+            env(
+                "ENCLAVA_LOG_RELAY_SPOOL_PATH",
+                &format!("{ENCLAVA_LOG_SPOOL_DIR}/{}.jsonl", primary.name),
+            ),
+        ]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "logs".to_string(),
+            mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        }]),
+        security_context: Some(SecurityContext {
+            privileged: Some(false),
+            allow_privilege_escalation: Some(false),
+            run_as_user: Some(0),
+            run_as_group: Some(0),
+            run_as_non_root: Some(false),
+            read_only_root_filesystem: Some(true),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                add: None,
+            }),
+            ..Default::default()
+        }),
+        readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
+            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
+                path: Some("/health".to_string()),
+                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
+                    ENCLAVA_LOG_RELAY_PORT,
+                ),
+                scheme: Some("HTTP".to_string()),
+                ..Default::default()
+            }),
+            period_seconds: Some(10),
+            ..Default::default()
+        }),
+        resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
+            requests: Some({
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("memory".to_string(), Quantity("16Mi".to_string()));
+                m.insert("cpu".to_string(), Quantity("10m".to_string()));
+                m
+            }),
+            limits: Some({
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("memory".to_string(), Quantity("64Mi".to_string()));
+                m.insert("cpu".to_string(), Quantity("50m".to_string()));
+                m
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }
 
 fn enclava_init_ready_probe() -> Probe {

@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use crate::manifest::cc_init_data;
 use crate::manifest::containers::{
     build_app_container, build_attestation_proxy_container, build_caddy_container,
-    build_enclava_init_container, build_enclava_tools_init_container, legacy_bootstrap_enabled,
+    build_enclava_init_container, build_enclava_tools_init_container,
+    build_encrypted_log_relay_container, legacy_bootstrap_enabled,
 };
 use crate::manifest::volumes::{build_volume_claim_templates, build_volumes};
 use crate::types::ConfidentialApp;
@@ -83,15 +84,16 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
             ],
         )
     } else {
-        (
-            Some(vec![build_enclava_tools_init_container()]),
-            vec![
-                build_app_container(app),
-                build_attestation_proxy_container(app),
-                build_caddy_container(app),
-                build_enclava_init_container(app),
-            ],
-        )
+        let mut containers = vec![
+            build_app_container(app),
+            build_attestation_proxy_container(app),
+            build_caddy_container(app),
+            build_enclava_init_container(app),
+        ];
+        if let Some(relay) = build_encrypted_log_relay_container(app) {
+            containers.push(relay);
+        }
+        (Some(vec![build_enclava_tools_init_container()]), containers)
     };
 
     let volumes = build_volumes(app);

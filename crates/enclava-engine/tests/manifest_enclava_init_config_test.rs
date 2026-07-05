@@ -95,8 +95,7 @@ fn config_toml_renders_public_log_encryption_metadata_only() {
         algorithm: "x25519-hpke-v1".to_string(),
         key_id: "logs-prod".to_string(),
         public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-        public_key_sha256: "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
-            .to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
     });
     let cm = generate_enclava_init_configmap(&app);
     let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
@@ -132,7 +131,7 @@ fn config_toml_renders_public_log_encryption_metadata_only() {
         log_encryption
             .get("public-key-sha256")
             .and_then(toml::Value::as_str),
-        Some("66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925")
+        Some("sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU")
     );
     let rendered_log_table = format!("{log_encryption:?}").to_ascii_lowercase();
     for forbidden in ["private", "secret", "seed", "mnemonic"] {

@@ -478,6 +478,52 @@ fn logs_command_points_missing_scope_to_explicit_reapproval() {
 }
 
 #[test]
+fn logs_command_decrypts_encrypted_frames_locally() {
+    use enclava_common::log_encryption::{
+        encrypt_log_frame, generate_log_keypair, validate_public_key,
+    };
+
+    let keypair = generate_log_keypair();
+    let recipient = validate_public_key(
+        "logs-selected",
+        &keypair.public_key_base64url,
+        &keypair.public_key_sha256,
+    )
+    .unwrap();
+    let frame = encrypt_log_frame(
+        &recipient,
+        1,
+        "stderr",
+        "app",
+        "2026-07-05T00:00:00Z",
+        b"tenant secret plaintext",
+    )
+    .unwrap();
+    let line = serde_json::to_string(&frame).unwrap();
+
+    let output = super::decrypted_log_frame_output(&keypair.private_key_base64url, &line).unwrap();
+
+    assert_eq!(
+        output,
+        "2026-07-05T00:00:00Z app stderr tenant secret plaintext"
+    );
+    assert!(!line.contains("tenant secret plaintext"));
+}
+
+#[test]
+fn default_log_private_key_path_sanitizes_components() {
+    let paths =
+        enclava_cli::config::CliPaths::from_root(std::path::PathBuf::from("/tmp/enclava")).unwrap();
+
+    let path = super::default_log_private_key_path(&paths, "../app/name", "logs/../../key");
+
+    assert_eq!(
+        path,
+        std::path::PathBuf::from("/tmp/enclava/keys/logs/.._app_name-logs_.._.._key.x25519")
+    );
+}
+
+#[test]
 fn attested_locked_state_overrides_only_running_status() {
     assert_eq!(
         status_with_attested_tee_state("running", "locked"),

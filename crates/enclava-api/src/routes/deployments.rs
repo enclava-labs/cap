@@ -4,9 +4,9 @@ use axum::{
     http::StatusCode,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use enclava_common::log_encryption::public_key_sha256;
 use enclava_engine::types::{LogEncryptionConfig, WorkloadSecurityProfile};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::auth::{middleware::AuthContext, scopes};
@@ -390,7 +390,7 @@ fn validate_log_encryption_config(
             "invalid log_encryption.public_key length",
         ));
     }
-    let expected_hash = hex::encode(Sha256::digest(&public_key));
+    let expected_hash = public_key_sha256(&public_key);
     if config.public_key_sha256 != expected_hash {
         return Err(json_error(
             StatusCode::BAD_REQUEST,
@@ -1102,8 +1102,7 @@ mod tests {
             algorithm: LOG_ENCRYPTION_ALGORITHM_X25519_HPKE_V1.to_string(),
             key_id: "logs-prod".to_string(),
             public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-            public_key_sha256: "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
-                .to_string(),
+            public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
         }
     }
 

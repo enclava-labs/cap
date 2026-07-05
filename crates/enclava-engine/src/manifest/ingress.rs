@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 
 use super::containers::{
     CADDY_ACME_TLS_PORT, CADDY_INTERNAL_RUNTIME_PATH, CADDY_INTERNAL_TLS_PORT,
+    ENCLAVA_LOG_RELAY_PORT,
 };
 use crate::types::{CaddyTlsMode, ConfidentialApp};
 
@@ -251,6 +252,12 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
     out.push_str("  @attestation-proxy path /v1/attestation /v1/attestation/* /unlock\n");
     out.push_str("  handle @attestation-proxy {\n");
     out.push_str("    reverse_proxy 127.0.0.1:8081\n");
+    out.push_str("  }\n");
+    out.push_str("  @encrypted-logs path /.well-known/confidential/logs\n");
+    out.push_str("  handle @encrypted-logs {\n");
+    out.push_str("    reverse_proxy 127.0.0.1:");
+    out.push_str(&ENCLAVA_LOG_RELAY_PORT.to_string());
+    out.push('\n');
     out.push_str("  }\n");
     out.push_str("  @confidential path /.well-known/confidential/*\n");
     out.push_str("  handle @confidential {\n");

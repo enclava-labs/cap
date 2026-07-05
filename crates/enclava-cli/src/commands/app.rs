@@ -4,7 +4,9 @@ use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::{
+    fs::OpenOptions,
     io::IsTerminal,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -28,6 +30,9 @@ use enclava_cli::keyring::{
 use enclava_cli::keys;
 use enclava_cli::platform_release::PlatformRelease;
 use enclava_cli::tee_client::TeeClient;
+use enclava_common::log_encryption::{
+    EncryptedLogFrame, LOG_ENCRYPTION_ALGORITHM, decrypt_log_frame, generate_log_keypair,
+};
 use enclava_common::types::{ResourceLimits, UnlockMode};
 use enclava_engine::manifest::cc_init_data;
 use enclava_engine::types::{
@@ -1000,6 +1005,9 @@ pub struct LogsArgs {
     /// Follow log output
     #[arg(short, long)]
     pub follow: bool,
+    /// Tenant-held X25519 private log key file created by `enclava log-key generate`
+    #[arg(long = "log-private-key-file")]
+    pub log_private_key_file: Option<PathBuf>,
 }
 
 pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1029,6 +1037,13 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
         Err(err) => return Err(err.into()),
     };
 
+    if !response_is_encrypted_logs(&resp) {
+        return Err(
+            "log response was not encrypted; refusing to print plaintext workload logs".into(),
+        );
+    }
+    let private_key = load_log_private_key(args.log_private_key_file.as_ref())?;
+
     if args.follow {
         // Stream logs line by line
         use tokio::io::AsyncBufReadExt;
@@ -1038,26 +1053,232 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
         let mut lines = tokio::io::BufReader::new(reader).lines();
         while let Some(line) = lines.next_line().await? {
-            println!("{}", sanitize_log_output(&line));
+            print_decrypted_log_frame(&private_key, &line)?;
         }
     } else {
-        // Print all logs at once
         let body = resp.text().await?;
-        match serde_json::from_str::<Vec<LogLine>>(&body) {
-            Ok(lines) => {
-                for line in lines {
-                    println!(
-                        "{} {} {}",
-                        line.timestamp,
-                        line.container,
-                        sanitize_log_output(line.message.trim_end())
-                    );
-                }
-            }
-            Err(_) => print!("{}", sanitize_log_output(&body)),
+        for line in body.lines().filter(|line| !line.trim().is_empty()) {
+            print_decrypted_log_frame(&private_key, line)?;
         }
     }
 
+    Ok(())
+}
+
+fn response_is_encrypted_logs(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get("x-enclava-log-format")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("encrypted-jsonl"))
+}
+
+fn load_log_private_key(path: Option<&PathBuf>) -> Result<String, Box<dyn std::error::Error>> {
+    let value = match path {
+        Some(path) => std::fs::read_to_string(path).map_err(|err| {
+            format!(
+                "failed to read log private key file {}: {err}",
+                path.display()
+            )
+        })?,
+        None => std::env::var("ENCLAVA_LOG_PRIVATE_KEY_BASE64URL")
+            .map_err(|_| "set ENCLAVA_LOG_PRIVATE_KEY_BASE64URL or pass --log-private-key-file")?,
+    };
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        Err("log private key is empty".into())
+    } else {
+        Ok(value)
+    }
+}
+
+fn print_decrypted_log_frame(
+    private_key: &str,
+    line: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", decrypted_log_frame_output(private_key, line)?);
+    Ok(())
+}
+
+fn decrypted_log_frame_output(
+    private_key: &str,
+    line: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let frame: EncryptedLogFrame =
+        serde_json::from_str(line).map_err(|err| format!("invalid encrypted log frame: {err}"))?;
+    let plaintext = decrypt_log_frame(private_key, &frame).map_err(|err| {
+        format!(
+            "failed to decrypt log frame for key {}: {err}",
+            frame.key_id
+        )
+    })?;
+    let message = String::from_utf8_lossy(&plaintext);
+    Ok(format!(
+        "{} {} {} {}",
+        frame.timestamp,
+        frame.container,
+        frame.stream,
+        sanitize_log_output(message.trim_end())
+    ))
+}
+
+#[derive(Subcommand)]
+pub enum LogKeyCommand {
+    /// Generate a tenant-held private key and register only its public key
+    Generate(LogKeyGenerateArgs),
+    /// List public log keys registered for an app
+    List(LogKeyAppArgs),
+    /// Select an existing public log key for future deploys
+    Select(LogKeySelectArgs),
+    /// Revoke a public log key
+    Revoke(LogKeySelectArgs),
+}
+
+#[derive(Args)]
+pub struct LogKeyGenerateArgs {
+    /// App name (defaults to enclava.toml app.name)
+    #[arg(long)]
+    pub app: Option<String>,
+    /// Stable tenant key id, for example logs-laptop-2026q3
+    #[arg(long = "key-id")]
+    pub key_id: String,
+    /// Optional label stored server-side with the public key
+    #[arg(long)]
+    pub label: Option<String>,
+    /// Where to write the tenant-held private key
+    #[arg(long = "private-key-file")]
+    pub private_key_file: Option<PathBuf>,
+    /// Register the key without selecting it for the app
+    #[arg(long = "no-activate")]
+    pub no_activate: bool,
+}
+
+#[derive(Args)]
+pub struct LogKeyAppArgs {
+    /// App name (defaults to enclava.toml app.name)
+    #[arg(long)]
+    pub app: Option<String>,
+}
+
+#[derive(Args)]
+pub struct LogKeySelectArgs {
+    /// App name (defaults to enclava.toml app.name)
+    #[arg(long)]
+    pub app: Option<String>,
+    /// Registered log key id
+    #[arg(long = "key-id")]
+    pub key_id: String,
+}
+
+pub async fn log_key(cmd: LogKeyCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match cmd {
+        LogKeyCommand::Generate(args) => generate_log_key(args).await,
+        LogKeyCommand::List(args) => list_log_keys(args).await,
+        LogKeyCommand::Select(args) => select_log_key(args).await,
+        LogKeyCommand::Revoke(args) => revoke_log_key(args).await,
+    }
+}
+
+async fn generate_log_key(args: LogKeyGenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let app_name = resolve_app_name(&args.app)?;
+    let (api, paths, _cli_config) = build_api_client()?;
+    paths.ensure_dirs()?;
+    let keypair = generate_log_keypair();
+    let private_key_file = args
+        .private_key_file
+        .unwrap_or_else(|| default_log_private_key_path(&paths, &app_name, &args.key_id));
+    write_private_log_key(&private_key_file, &keypair.private_key_base64url)?;
+    let key = api
+        .register_log_key(
+            &app_name,
+            &RegisterLogEncryptionKeyRequest {
+                key_id: args.key_id,
+                algorithm: LOG_ENCRYPTION_ALGORITHM.to_string(),
+                public_key_base64url: keypair.public_key_base64url,
+                label: args.label,
+                activate_for_app: !args.no_activate,
+            },
+        )
+        .await?;
+    println!("Registered log key: {}", key.key_id);
+    println!("Public key hash: {}", key.public_key_sha256);
+    println!("Private key file: {}", private_key_file.display());
+    Ok(())
+}
+
+async fn list_log_keys(args: LogKeyAppArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let app_name = resolve_app_name(&args.app)?;
+    let (api, _paths, _cli_config) = build_api_client()?;
+    let list = api.list_log_keys(&app_name).await?;
+    println!("App: {}", list.app_name);
+    println!(
+        "Active key: {}",
+        list.active_key_id.as_deref().unwrap_or("-")
+    );
+    for key in list.keys {
+        let active = if key.active_for_app { "active" } else { "-" };
+        println!(
+            "{} {} {} {}",
+            key.key_id, key.status, active, key.public_key_sha256
+        );
+    }
+    Ok(())
+}
+
+async fn select_log_key(args: LogKeySelectArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let app_name = resolve_app_name(&args.app)?;
+    let (api, _paths, _cli_config) = build_api_client()?;
+    let key = api.select_log_key(&app_name, &args.key_id).await?;
+    println!("Selected log key: {}", key.key_id);
+    Ok(())
+}
+
+async fn revoke_log_key(args: LogKeySelectArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let app_name = resolve_app_name(&args.app)?;
+    let (api, _paths, _cli_config) = build_api_client()?;
+    let key = api.revoke_log_key(&app_name, &args.key_id).await?;
+    println!("Revoked log key: {}", key.key_id);
+    Ok(())
+}
+
+fn default_log_private_key_path(paths: &CliPaths, app_name: &str, key_id: &str) -> PathBuf {
+    let app_component = log_private_key_path_component(app_name);
+    let key_component = log_private_key_path_component(key_id);
+    paths
+        .keys_dir
+        .join("logs")
+        .join(format!("{app_component}-{key_component}.x25519"))
+}
+
+fn log_private_key_path_component(input: &str) -> String {
+    let component: String = input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if component.is_empty() {
+        "key".to_string()
+    } else {
+        component
+    }
+}
+
+fn write_private_log_key(path: &Path, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|err| format!("failed to create log private key {}: {err}", path.display()))?;
+    use std::io::Write as _;
+    writeln!(file, "{key}")?;
     Ok(())
 }
 

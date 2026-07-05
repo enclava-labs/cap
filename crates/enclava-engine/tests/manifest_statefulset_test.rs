@@ -1,5 +1,6 @@
 use enclava_engine::manifest::statefulset::generate_statefulset;
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::LogEncryptionConfig;
 
 #[test]
 fn statefulset_name() {
@@ -216,6 +217,66 @@ fn statefulset_phase5_uses_only_steady_state_containers() {
         .find(|c| c.name == "attestation-proxy")
         .unwrap();
     assert!(proxy.restart_policy.is_none());
+}
+
+#[test]
+fn statefulset_adds_encrypted_log_relay_only_with_log_key_metadata() {
+    let without_logs = generate_statefulset(&sample_app());
+    let without_logs_pod = without_logs
+        .spec
+        .as_ref()
+        .unwrap()
+        .template
+        .spec
+        .as_ref()
+        .unwrap();
+    assert!(
+        !without_logs_pod
+            .containers
+            .iter()
+            .any(|c| c.name == "encrypted-log-relay")
+    );
+
+    let mut app = sample_app();
+    app.log_encryption = Some(LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+    });
+    let sts = generate_statefulset(&app);
+    let pod = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+    let app_container = pod.containers.iter().find(|c| c.name == "web").unwrap();
+    let relay = pod
+        .containers
+        .iter()
+        .find(|c| c.name == "encrypted-log-relay")
+        .expect("encrypted log relay sidecar");
+
+    assert!(app_container.env.as_ref().unwrap().iter().any(|env| {
+        env.name == "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL"
+            && env.value.as_deref() == Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    }));
+    assert!(
+        app_container
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|mount| { mount.name == "logs" && mount.mount_path == "/run/enclava-logs" })
+    );
+    assert_eq!(
+        relay.command.as_ref().unwrap(),
+        &vec!["/usr/local/bin/enclava-log-relay".to_string()]
+    );
+    assert!(
+        relay
+            .volume_mounts
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|mount| { mount.name == "logs" && mount.read_only == Some(true) })
+    );
 }
 
 #[test]

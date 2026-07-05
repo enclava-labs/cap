@@ -3,6 +3,7 @@ pub mod crypto;
 pub mod descriptor;
 pub mod hostnames;
 pub mod image;
+pub mod log_encryption;
 pub mod orgs;
 pub mod types;
 pub mod validate;

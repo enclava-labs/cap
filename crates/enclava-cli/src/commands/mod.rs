@@ -45,6 +45,9 @@ pub enum Command {
     Status(app::StatusArgs),
     /// Stream app logs
     Logs(app::LogsArgs),
+    /// Manage hosted log encryption keys
+    #[command(subcommand)]
+    LogKey(app::LogKeyCommand),
     /// Manage app configuration secrets
     #[command(subcommand)]
     Config(config::ConfigCommand),
@@ -95,6 +98,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Deploy(args) => app::deploy(args).await,
         Command::Status(args) => app::status(args).await,
         Command::Logs(args) => app::logs(args).await,
+        Command::LogKey(cmd) => app::log_key(cmd).await,
         Command::Config(cmd) => config::run(cmd).await,
         Command::Template(cmd) => template::run(cmd).await,
         Command::Domains(cmd) => domains::run(cmd).await,
