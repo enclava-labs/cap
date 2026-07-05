@@ -425,6 +425,7 @@ async fn deploy_rejects_member_before_database_access() {
             org_keyring_blob: None,
             signed_policy_artifact: None,
             workload_security_profile: None,
+            log_encryption: None,
         }),
     )
     .await;

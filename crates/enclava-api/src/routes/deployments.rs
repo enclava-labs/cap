@@ -3,8 +3,10 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
-use enclava_engine::types::WorkloadSecurityProfile;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use enclava_engine::types::{LogEncryptionConfig, WorkloadSecurityProfile};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::auth::{middleware::AuthContext, scopes};
@@ -22,6 +24,7 @@ const ROOTFUL_SUDO_CAPS: &[&str] = &[
     "SETUID",
     "AUDIT_WRITE",
 ];
+const LOG_ENCRYPTION_ALGORITHM_X25519_HPKE_V1: &str = "x25519-hpke-v1";
 
 fn deploy_blocked_response(
     status: StatusCode,
@@ -325,6 +328,8 @@ pub struct DeployRequest {
     pub signed_policy_artifact: Option<String>,
     #[serde(default)]
     pub workload_security_profile: Option<String>,
+    #[serde(default)]
+    pub log_encryption: Option<LogEncryptionConfig>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -350,6 +355,49 @@ pub struct AgentPolicyResponse {
     pub agent_policy_text: String,
     pub agent_policy_sha256: String,
     pub genpolicy_version_pin: String,
+}
+
+fn validate_log_encryption_config(
+    value: Option<LogEncryptionConfig>,
+) -> Result<Option<LogEncryptionConfig>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(config) = value else {
+        return Ok(None);
+    };
+    if config.algorithm != LOG_ENCRYPTION_ALGORITHM_X25519_HPKE_V1 {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported log_encryption.algorithm",
+        ));
+    }
+    if config.key_id.trim().is_empty()
+        || config.key_id.len() > 128
+        || !config
+            .key_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid log_encryption.key_id",
+        ));
+    }
+    let public_key = URL_SAFE_NO_PAD
+        .decode(config.public_key_base64url.as_bytes())
+        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid log_encryption.public_key"))?;
+    if public_key.len() != 32 {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid log_encryption.public_key length",
+        ));
+    }
+    let expected_hash = hex::encode(Sha256::digest(&public_key));
+    if config.public_key_sha256 != expected_hash {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "log_encryption.public_key_sha256 mismatch",
+        ));
+    }
+    Ok(Some(config))
 }
 
 #[derive(Debug, Serialize)]
@@ -415,6 +463,7 @@ pub async fn deploy(
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
     let workload_security_profile =
         validate_workload_security_profile(body.workload_security_profile.as_deref())?;
+    let log_encryption = validate_log_encryption_config(body.log_encryption.clone())?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -811,6 +860,7 @@ pub async fn deploy(
             .as_ref()
             .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
         "workload_security_profile": workload_security_profile.as_str(),
+        "log_encryption": &log_encryption,
     });
 
     // Create deployment record. cosign_verified is set from the actual
@@ -950,6 +1000,7 @@ pub async fn deploy(
                 signed_policy_artifact,
                 local_workload_artifacts_json,
                 local_trustee_policy_json,
+                log_encryption,
             },
         )
         .await
@@ -1041,7 +1092,20 @@ pub use rollback::rollback;
 
 #[cfg(test)]
 mod tests {
-    use super::parse_memory_gi;
+    use super::{
+        LOG_ENCRYPTION_ALGORITHM_X25519_HPKE_V1, LogEncryptionConfig, StatusCode, parse_memory_gi,
+        validate_log_encryption_config,
+    };
+
+    fn valid_log_encryption_config() -> LogEncryptionConfig {
+        LogEncryptionConfig {
+            algorithm: LOG_ENCRYPTION_ALGORITHM_X25519_HPKE_V1.to_string(),
+            key_id: "logs-prod".to_string(),
+            public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            public_key_sha256: "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
+                .to_string(),
+        }
+    }
 
     #[test]
     fn parse_memory_gi_validates_after_unit_conversion() {
@@ -1049,5 +1113,34 @@ mod tests {
         assert_eq!(parse_memory_gi("8192Mi").expect("8192Mi"), 8.0);
         assert_eq!(parse_memory_gi("1048576Mi").expect("1024Gi in Mi"), 1024.0);
         assert!(parse_memory_gi("1048577Mi").is_err());
+    }
+
+    #[test]
+    fn log_encryption_config_accepts_public_x25519_key_metadata() {
+        let config = valid_log_encryption_config();
+        let validated = validate_log_encryption_config(Some(config.clone()))
+            .expect("valid log encryption config")
+            .expect("config returned");
+        assert_eq!(validated, config);
+    }
+
+    #[test]
+    fn log_encryption_config_rejects_hash_mismatch() {
+        let mut config = valid_log_encryption_config();
+        config.public_key_sha256 = "00".repeat(32);
+        let (status, body) =
+            validate_log_encryption_config(Some(config)).expect_err("hash mismatch rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["error"], "log_encryption.public_key_sha256 mismatch");
+    }
+
+    #[test]
+    fn log_encryption_config_rejects_unknown_algorithm() {
+        let mut config = valid_log_encryption_config();
+        config.algorithm = "plaintext".to_string();
+        let (status, body) =
+            validate_log_encryption_config(Some(config)).expect_err("algorithm rejected");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["error"], "unsupported log_encryption.algorithm");
     }
 }

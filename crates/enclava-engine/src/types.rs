@@ -69,6 +69,11 @@ pub struct ConfidentialApp {
     /// egress entry restricted to the listed TCP ports.
     #[serde(default)]
     pub egress_allowlist: Vec<EgressRule>,
+    /// Tenant public log encryption key selected by PaaS for this deployment.
+    /// This is public metadata only. Tenant private decryption material must
+    /// never be passed to CAP, enclava-init, Kubernetes, or GitOps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_encryption: Option<LogEncryptionConfig>,
     /// Customer-signed descriptor/keyring values that must be carried in
     /// cc_init_data so enclava-init can fetch and verify workload artifacts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,6 +125,14 @@ mod hex_bytes32 {
 pub struct EgressRule {
     pub host: String,
     pub ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEncryptionConfig {
+    pub algorithm: String,
+    pub key_id: String,
+    pub public_key_base64url: String,
+    pub public_key_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

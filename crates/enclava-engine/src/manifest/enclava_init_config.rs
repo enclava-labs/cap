@@ -174,6 +174,27 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
         }
     }
 
+    if let Some(log_encryption) = app.log_encryption.as_ref() {
+        out.push_str("\n[log-encryption]\n");
+        out.push_str("required = true\n");
+        out.push_str(&format!(
+            "algorithm = {}\n",
+            toml_string(&log_encryption.algorithm)
+        ));
+        out.push_str(&format!(
+            "key-id = {}\n",
+            toml_string(&log_encryption.key_id)
+        ));
+        out.push_str(&format!(
+            "public-key-base64url = {}\n",
+            toml_string(&log_encryption.public_key_base64url)
+        ));
+        out.push_str(&format!(
+            "public-key-sha256 = {}\n",
+            toml_string(&log_encryption.public_key_sha256)
+        ));
+    }
+
     out
 }
 

@@ -15,8 +15,8 @@ use enclava_engine::apply::{
 };
 use enclava_engine::manifest::generate_all_manifests;
 use enclava_engine::types::{
-    AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, EgressMode, StorageSpec,
-    WorkloadArtifactBinding, WorkloadSecurityProfile,
+    AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, EgressMode,
+    LogEncryptionConfig, StorageSpec, WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -377,6 +377,7 @@ pub struct ApplyDeploymentManifestsRequest {
     pub signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
     pub local_workload_artifacts_json: Option<String>,
     pub local_trustee_policy_json: Option<String>,
+    pub log_encryption: Option<LogEncryptionConfig>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -600,6 +601,7 @@ pub async fn build_confidential_app(
         egress_mode,
         public_internet_egress_excluded_cidrs: public_internet_egress_excluded_cidrs_from_env(),
         egress_allowlist: app.egress_allowlist.0.clone(),
+        log_encryption: None,
         workload_artifact_binding: None,
         generated_agent_policy: None,
     })
@@ -1031,6 +1033,7 @@ mod tests {
             egress_mode: EgressMode::Restricted,
             public_internet_egress_excluded_cidrs: Vec::new(),
             egress_allowlist: Vec::new(),
+            log_encryption: None,
             workload_artifact_binding: None,
             generated_agent_policy: None,
         };
@@ -1111,6 +1114,7 @@ mod tests {
             egress_mode: EgressMode::Restricted,
             public_internet_egress_excluded_cidrs: Vec::new(),
             egress_allowlist: Vec::new(),
+            log_encryption: None,
             workload_artifact_binding: None,
             generated_agent_policy: None,
         };
@@ -1274,6 +1278,7 @@ pub async fn apply_deployment_manifests(
         signed_policy_artifact,
         local_workload_artifacts_json,
         local_trustee_policy_json,
+        log_encryption,
     } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
     let mut app_spec = build_confidential_app(
@@ -1285,6 +1290,7 @@ pub async fn apply_deployment_manifests(
     )
     .await?;
     app_spec.workload_artifact_binding = workload_artifact_binding;
+    app_spec.log_encryption = log_encryption;
     if let (Some(workload_artifacts), Some(trustee_policy)) =
         (local_workload_artifacts_json, local_trustee_policy_json)
     {

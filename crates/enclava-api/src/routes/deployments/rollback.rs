@@ -246,6 +246,7 @@ pub async fn rollback(
                 signed_policy_artifact,
                 local_workload_artifacts_json,
                 local_trustee_policy_json,
+                log_encryption: None,
             },
         )
         .await

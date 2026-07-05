@@ -62,6 +62,8 @@ pub struct GenericDeploymentSecurity {
     pub signed_policy_artifact: Option<String>,
     #[serde(default)]
     pub workload_security_profile: Option<String>,
+    #[serde(default)]
+    pub log_encryption: Option<LogEncryptionConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -288,6 +290,7 @@ pub async fn create_generic_deployment(
         org_keyring_blob: body.security.org_keyring_blob,
         signed_policy_artifact: body.security.signed_policy_artifact,
         workload_security_profile: body.security.workload_security_profile,
+        log_encryption: body.security.log_encryption.clone(),
     };
     let org_id = auth.org_id;
     let (status, Json(deployed)) = deploy(
@@ -520,6 +523,16 @@ pub(super) fn ensure_idempotent_retry_matches(
         .unwrap_or("restricted");
     if existing_profile != requested_profile {
         return Err(idempotency_conflict("security.workload_security_profile"));
+    }
+    let existing_log_encryption = deployment
+        .spec_snapshot
+        .get("log_encryption")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let requested_log_encryption =
+        serde_json::to_value(&body.security.log_encryption).unwrap_or(serde_json::Value::Null);
+    if existing_log_encryption != requested_log_encryption {
+        return Err(idempotency_conflict("security.log_encryption"));
     }
     Ok(())
 }

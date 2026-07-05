@@ -166,6 +166,8 @@ pub struct InternalDeployRequest {
     pub signed_policy_artifact: Option<String>,
     #[serde(default)]
     pub workload_security_profile: Option<String>,
+    #[serde(default)]
+    pub log_encryption: Option<enclava_engine::types::LogEncryptionConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1271,6 +1273,7 @@ pub async fn deploy_paas_app(
         org_keyring_blob: body.org_keyring_blob,
         signed_policy_artifact: body.signed_policy_artifact,
         workload_security_profile: body.workload_security_profile,
+        log_encryption: body.log_encryption,
     };
     let (status, Json(response)) = crate::routes::deployments::deploy(
         auth,

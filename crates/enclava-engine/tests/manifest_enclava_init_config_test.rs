@@ -3,7 +3,7 @@
 use enclava_engine::manifest::cc_init_data;
 use enclava_engine::manifest::enclava_init_config::generate_enclava_init_configmap;
 use enclava_engine::testutil::sample_app;
-use enclava_engine::types::WorkloadSecurityProfile;
+use enclava_engine::types::{LogEncryptionConfig, WorkloadSecurityProfile};
 
 #[test]
 fn cm_name_is_per_app() {
@@ -86,6 +86,61 @@ fn config_toml_parses() {
     let cm = generate_enclava_init_configmap(&sample_app());
     let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
     let _: toml::Value = toml::from_str(toml_text).expect("config.toml must parse");
+}
+
+#[test]
+fn config_toml_renders_public_log_encryption_metadata_only() {
+    let mut app = sample_app();
+    app.log_encryption = Some(LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
+            .to_string(),
+    });
+    let cm = generate_enclava_init_configmap(&app);
+    let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
+    let parsed: toml::Value = toml::from_str(toml_text).expect("config.toml must parse");
+    let log_encryption = parsed
+        .get("log-encryption")
+        .and_then(toml::Value::as_table)
+        .expect("log-encryption table");
+
+    assert_eq!(
+        log_encryption
+            .get("required")
+            .and_then(toml::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        log_encryption
+            .get("algorithm")
+            .and_then(toml::Value::as_str),
+        Some("x25519-hpke-v1")
+    );
+    assert_eq!(
+        log_encryption.get("key-id").and_then(toml::Value::as_str),
+        Some("logs-prod")
+    );
+    assert_eq!(
+        log_encryption
+            .get("public-key-base64url")
+            .and_then(toml::Value::as_str),
+        Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+    );
+    assert_eq!(
+        log_encryption
+            .get("public-key-sha256")
+            .and_then(toml::Value::as_str),
+        Some("66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925")
+    );
+    let rendered_log_table = format!("{log_encryption:?}").to_ascii_lowercase();
+    for forbidden in ["private", "secret", "seed", "mnemonic"] {
+        assert!(
+            !rendered_log_table.contains(forbidden),
+            "log encryption config must not render private material hint {forbidden}"
+        );
+    }
 }
 
 #[test]

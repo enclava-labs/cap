@@ -81,6 +81,7 @@ pub fn sample_app() -> ConfidentialApp {
         egress_mode: EgressMode::Restricted,
         public_internet_egress_excluded_cidrs: Vec::new(),
         egress_allowlist: Vec::new(),
+        log_encryption: None,
         workload_artifact_binding: None,
         generated_agent_policy: None,
     }

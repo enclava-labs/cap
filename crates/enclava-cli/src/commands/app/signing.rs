@@ -299,6 +299,7 @@ pub(crate) fn confidential_app_for_cc_hash(
         egress_mode: enclava_engine::types::EgressMode::Restricted,
         public_internet_egress_excluded_cidrs: Vec::new(),
         egress_allowlist: Vec::new(),
+        log_encryption: None,
         workload_artifact_binding: Some(workload_artifact_binding),
         generated_agent_policy: Some(generated_agent_policy),
     })
