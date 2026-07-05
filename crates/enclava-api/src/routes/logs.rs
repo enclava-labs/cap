@@ -174,10 +174,8 @@ async fn resolve_log_container(
     let [primary] = primary.as_slice() else {
         return Err(json_error(StatusCode::CONFLICT, "logs_pod_not_ready"));
     };
-    if let Some(requested) = requested {
-        if requested != *primary {
-            return Err(json_error(StatusCode::NOT_FOUND, "container_not_available"));
-        }
+    if let Some(requested) = requested && requested != *primary {
+        return Err(json_error(StatusCode::NOT_FOUND, "container_not_available"));
     }
     Ok((*primary).to_string())
 }
@@ -289,7 +287,7 @@ fn parse_kube_log_line(raw: &str, container: &str) -> Result<LogLine, RouteError
         .ok_or_else(|| json_error(StatusCode::BAD_GATEWAY, "cap_log_decode_failed"))?;
     DateTime::parse_from_rfc3339(timestamp)
         .map_err(|_| json_error(StatusCode::BAD_GATEWAY, "cap_log_decode_failed"))?;
-    if message.as_bytes().len() > MAX_LOG_MESSAGE_BYTES {
+    if message.len() > MAX_LOG_MESSAGE_BYTES {
         return Err(json_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "log_response_too_large",
