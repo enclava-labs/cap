@@ -182,7 +182,6 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
         &cc_init_data::CcInitDataOptions {
             kbs_url: "https://kbs.example.test:8080".to_string(),
             kbs_ca_cert_pem: None,
-            runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
         },
     );
 
