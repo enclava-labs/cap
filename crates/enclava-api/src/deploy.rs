@@ -19,7 +19,6 @@ use enclava_engine::types::{
     WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
 use k8s_openapi::api::core::v1::Secret;
-use k8s_openapi::api::rbac::v1::{RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use sqlx::PgPool;
 use std::net::IpAddr;
@@ -31,11 +30,6 @@ const DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME: &str = "enclava-registry-auth";
 const TENANT_IMAGE_PULL_SECRET_NAME_ENV: &str = "TENANT_IMAGE_PULL_SECRET_NAME";
 const TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV: &str = "TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES";
 const PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS_ENV: &str = "CAP_PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS";
-const CAP_LOG_READER_SERVICE_ACCOUNT_NAME_ENV: &str = "CAP_LOG_READER_SERVICE_ACCOUNT_NAME";
-const CAP_LOG_READER_SERVICE_ACCOUNT_NAMESPACE_ENV: &str =
-    "CAP_LOG_READER_SERVICE_ACCOUNT_NAMESPACE";
-const CAP_LOG_READER_CLUSTER_ROLE_ENV: &str = "CAP_LOG_READER_CLUSTER_ROLE";
-const CAP_LOG_READER_DEFAULT_ROLE_BINDING_NAME: &str = "cap-log-reader-pods-log";
 
 #[derive(Debug, Clone)]
 struct TenantImagePullSecretConfig {
@@ -58,13 +52,6 @@ struct DeploymentOutcome {
     app_status: &'static str,
     error_message: Option<String>,
     terminal: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LogReaderRbacConfig {
-    service_account_name: String,
-    service_account_namespace: String,
-    cluster_role_name: String,
 }
 
 fn classify_rollout_result(
@@ -150,35 +137,6 @@ fn tenant_image_pull_secret_config_from_env() -> Option<TenantImagePullSecretCon
         token,
         allowed_repositories: tenant_image_pull_allowed_repositories_from_env(),
     })
-}
-
-fn log_reader_rbac_config_from_env() -> Option<LogReaderRbacConfig> {
-    Some(LogReaderRbacConfig {
-        service_account_name: env_nonempty(CAP_LOG_READER_SERVICE_ACCOUNT_NAME_ENV)?,
-        service_account_namespace: env_nonempty(CAP_LOG_READER_SERVICE_ACCOUNT_NAMESPACE_ENV)?,
-        cluster_role_name: env_nonempty(CAP_LOG_READER_CLUSTER_ROLE_ENV)?,
-    })
-}
-
-fn generate_log_reader_role_binding(namespace: &str, config: &LogReaderRbacConfig) -> RoleBinding {
-    RoleBinding {
-        metadata: ObjectMeta {
-            name: Some(CAP_LOG_READER_DEFAULT_ROLE_BINDING_NAME.to_string()),
-            namespace: Some(namespace.to_string()),
-            ..ObjectMeta::default()
-        },
-        role_ref: RoleRef {
-            api_group: "rbac.authorization.k8s.io".to_string(),
-            kind: "ClusterRole".to_string(),
-            name: config.cluster_role_name.clone(),
-        },
-        subjects: Some(vec![Subject {
-            api_group: None,
-            kind: "ServiceAccount".to_string(),
-            name: config.service_account_name.clone(),
-            namespace: Some(config.service_account_namespace.clone()),
-        }]),
-    }
 }
 
 fn tenant_image_pull_allowed_repositories_from_env() -> Vec<ImagePullRepositoryScope> {
@@ -372,18 +330,6 @@ async fn apply_all_with_tenant_image_pull_secret(
 
     apply_standard_resources(engine, manifests).await?;
     tracing::info!(namespace = %ns_name, "step 2/5: standard resources applied");
-
-    if let Some(config) = log_reader_rbac_config_from_env() {
-        let role_binding = generate_log_reader_role_binding(ns_name, &config);
-        apply_namespaced_resource(engine, ns_name, &role_binding).await?;
-        tracing::info!(
-            namespace = %ns_name,
-            service_account = %config.service_account_name,
-            service_account_namespace = %config.service_account_namespace,
-            cluster_role = %config.cluster_role_name,
-            "tenant log-reader RoleBinding applied"
-        );
-    }
 
     apply_network_policy(engine, ns_name, &manifests.network_policy).await?;
     tracing::info!(namespace = %ns_name, "step 3/5: CiliumNetworkPolicy applied");
@@ -718,33 +664,6 @@ mod tests {
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
         }
-    }
-
-    #[test]
-    fn log_reader_role_binding_targets_central_reader_from_tenant_namespace() {
-        let config = LogReaderRbacConfig {
-            service_account_name: "cap-log-reader".to_string(),
-            service_account_namespace: "enclava-preprod".to_string(),
-            cluster_role_name: "cap-preprod-log-reader".to_string(),
-        };
-
-        let binding = generate_log_reader_role_binding("tenant-a", &config);
-
-        assert_eq!(
-            binding.metadata.name.as_deref(),
-            Some("cap-log-reader-pods-log")
-        );
-        assert_eq!(binding.metadata.namespace.as_deref(), Some("tenant-a"));
-        assert_eq!(binding.role_ref.kind, "ClusterRole");
-        assert_eq!(binding.role_ref.name, "cap-preprod-log-reader");
-        let subject = binding
-            .subjects
-            .as_ref()
-            .and_then(|subjects| subjects.first())
-            .expect("log reader subject");
-        assert_eq!(subject.kind, "ServiceAccount");
-        assert_eq!(subject.name, "cap-log-reader");
-        assert_eq!(subject.namespace.as_deref(), Some("enclava-preprod"));
     }
 
     #[test]

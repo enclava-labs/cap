@@ -1356,7 +1356,7 @@ async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_pre
 }
 
 #[tokio::test]
-async fn app_logs_returns_explicit_unavailable_until_log_proxy_exists() {
+async fn app_logs_fail_closed_until_encrypted_streaming_exists() {
     let (state, _pool) = setup_test_state().await;
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);
@@ -1383,13 +1383,15 @@ async fn app_logs_returns_explicit_unavailable_until_log_proxy_exists() {
         .authorization_bearer(&session_token)
         .await;
     logs.assert_status(StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(logs.headers()["cache-control"], "no-store");
     let body: Value = logs.json();
-    assert_eq!(body["error"], "logs_unavailable");
+    assert_eq!(body["error"], "encrypted_logs_required");
+    assert_eq!(body["code"], "encrypted_logs_required");
     assert!(
         body["message"]
             .as_str()
             .unwrap()
-            .contains("Live log streaming is not connected yet")
+            .contains("encrypted log streaming is required")
     );
     assert_eq!(body["status"], "creating");
 }

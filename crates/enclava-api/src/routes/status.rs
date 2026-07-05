@@ -3,8 +3,8 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
 };
 use enclava_engine::apply::watch::{pod_label_selector, pod_runtime_failure_message};
 use k8s_openapi::api::core::v1::Pod;
@@ -146,7 +146,7 @@ pub async fn app_logs(
     auth: AuthContext,
     State(state): State<AppState>,
     Path(app_name): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_read(&auth)?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
@@ -165,17 +165,23 @@ pub async fn app_logs(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    Ok((
+    let mut response = (
         StatusCode::NOT_IMPLEMENTED,
         Json(json!({
-            "error": "logs_unavailable",
+            "code": "encrypted_logs_required",
+            "error": "encrypted_logs_required",
             "message": format!(
-                "Live log streaming is not connected yet for {}; use `enclava status` for current state.",
+                "Tenant-controlled encrypted log streaming is required before workload logs can leave the confidential boundary for {}; use `enclava status` for current state.",
                 app.name
             ),
             "status": format!("{:?}", app.status).to_lowercase(),
         })),
-    ))
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 #[cfg(test)]
