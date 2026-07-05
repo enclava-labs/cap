@@ -486,6 +486,46 @@ pub struct LogLine {
     pub message: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RegisterLogEncryptionKeyRequest {
+    pub key_id: String,
+    pub algorithm: String,
+    pub public_key_base64url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub activate_for_app: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogEncryptionKey {
+    pub key_id: String,
+    pub algorithm: String,
+    pub public_key_base64url: String,
+    pub public_key_sha256: String,
+    pub label: Option<String>,
+    pub status: String,
+    pub active_for_app: bool,
+    pub selected_at: Option<String>,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogEncryptionKeyList {
+    pub app_name: String,
+    pub active_key_id: Option<String>,
+    pub keys: Vec<LogEncryptionKey>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeLogEncryptionKeyResponse {
+    pub key_id: String,
+    pub status: String,
+    pub active_for_app: bool,
+    pub revoked_at: Option<String>,
+    pub cleared_app_selections: Option<u64>,
+}
+
 // --- Config ---
 
 #[derive(Debug, Deserialize)]

@@ -423,6 +423,69 @@ impl ApiClient {
         Ok(resp)
     }
 
+    pub async fn list_log_keys(&self, app_name: &str) -> Result<LogEncryptionKeyList, ApiError> {
+        let app_name = path_segment(app_name);
+        let resp = self
+            .http
+            .get(self.url(&format!("/apps/{app_name}/logs/keys")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn register_log_key(
+        &self,
+        app_name: &str,
+        req: &RegisterLogEncryptionKeyRequest,
+    ) -> Result<LogEncryptionKey, ApiError> {
+        let app_name = path_segment(app_name);
+        let resp = self
+            .http
+            .post(self.url(&format!("/apps/{app_name}/logs/keys")))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn select_log_key(
+        &self,
+        app_name: &str,
+        key_id: &str,
+    ) -> Result<LogEncryptionKey, ApiError> {
+        let app_name = path_segment(app_name);
+        let key_id = path_segment(key_id);
+        let resp = self
+            .http
+            .put(self.url(&format!("/apps/{app_name}/logs/keys/{key_id}/active")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn revoke_log_key(
+        &self,
+        app_name: &str,
+        key_id: &str,
+    ) -> Result<RevokeLogEncryptionKeyResponse, ApiError> {
+        let app_name = path_segment(app_name);
+        let key_id = path_segment(key_id);
+        let resp = self
+            .http
+            .delete(self.url(&format!("/apps/{app_name}/logs/keys/{key_id}")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     // --- Config ---
 
     pub async fn get_config_token(&self, app_name: &str) -> Result<ConfigTokenResponse, ApiError> {
