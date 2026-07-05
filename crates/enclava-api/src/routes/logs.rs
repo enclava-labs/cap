@@ -174,7 +174,9 @@ async fn resolve_log_container(
     let [primary] = primary.as_slice() else {
         return Err(json_error(StatusCode::CONFLICT, "logs_pod_not_ready"));
     };
-    if let Some(requested) = requested && requested != *primary {
+    if let Some(requested) = requested
+        && requested != *primary
+    {
         return Err(json_error(StatusCode::NOT_FOUND, "container_not_available"));
     }
     Ok((*primary).to_string())
