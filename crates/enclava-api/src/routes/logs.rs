@@ -6,7 +6,7 @@ use axum::{
 };
 use serde::Deserialize;
 use sqlx::Row;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::{auth::middleware::AuthContext, models::Role, state::AppState};
 
@@ -259,8 +259,14 @@ async fn tenant_tee_logs_client(
     confidential_domain: &str,
 ) -> (reqwest::Client, String) {
     match internal_tee_socket(app_name, namespace).await {
-        Some(socket) => match build_internal_tenant_tee_http_client() {
-            Ok(client) => (client, internal_tee_logs_url(socket)),
+        Some(socket) => match build_resolved_tenant_tee_http_client(confidential_domain, socket) {
+            Ok(client) => (
+                client,
+                format!(
+                    "https://{confidential_domain}:{}/.well-known/confidential/logs",
+                    socket.port()
+                ),
+            ),
             Err(err) => {
                 tracing::warn!(
                     app = %app_name,
@@ -282,8 +288,8 @@ async fn tenant_tee_logs_client(
 }
 
 async fn internal_tee_socket(app_name: &str, namespace: &str) -> Option<SocketAddr> {
-    match crate::edge::resolve_pod_socket(app_name, namespace, 8081).await {
-        Ok(socket) => Some(socket),
+    let target = match crate::edge::resolve_backend_target(app_name, namespace, 8081).await {
+        Ok(target) => target,
         Err(err) => {
             tracing::warn!(
                 app = %app_name,
@@ -291,17 +297,64 @@ async fn internal_tee_socket(app_name: &str, namespace: &str) -> Option<SocketAd
                 error = %err,
                 "failed to resolve internal TEE log endpoint; falling back to public TEE DNS"
             );
-            None
+            return None;
+        }
+    };
+    parse_socket_addr(&target).or_else(|| {
+        tracing::warn!(
+            app = %app_name,
+            namespace = %namespace,
+            target = %target,
+            "internal TEE log endpoint did not resolve to an IP socket; falling back to public TEE DNS"
+        );
+        None
+    })
+}
+
+fn parse_socket_addr(target: &str) -> Option<SocketAddr> {
+    let (host, port) = target.rsplit_once(':')?;
+    let ip = host.parse::<IpAddr>().ok()?;
+    let port = port.parse::<u16>().ok()?;
+    Some(SocketAddr::new(ip, port))
+}
+
+fn build_resolved_tenant_tee_http_client(
+    confidential_domain: &str,
+    socket: SocketAddr,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = reqwest::Client::builder()
+        .https_only(true)
+        .resolve(confidential_domain, socket)
+        .danger_accept_invalid_certs(accepts_invalid_tenant_tee_certs());
+
+    if let Ok(cert_pem) = std::env::var("TENANT_TEE_CA_CERT_PEM") {
+        let cert_pem = cert_pem.replace("\\n", "\n");
+        if let Ok(certs) = reqwest::Certificate::from_pem_bundle(cert_pem.as_bytes()) {
+            for cert in certs {
+                builder = builder.add_root_certificate(cert);
+            }
         }
     }
+
+    if let Ok(cert_path) = std::env::var("TENANT_TEE_CA_CERT_PATH")
+        && let Ok(cert_pem) = std::fs::read(cert_path)
+        && let Ok(certs) = reqwest::Certificate::from_pem_bundle(&cert_pem)
+    {
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+
+    builder.build()
 }
 
-fn internal_tee_logs_url(socket: SocketAddr) -> String {
-    format!("http://{socket}/.well-known/confidential/logs")
-}
-
-fn build_internal_tenant_tee_http_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder().build()
+fn accepts_invalid_tenant_tee_certs() -> bool {
+    std::env::var("TENANT_TEE_TLS_MODE")
+        .map(|mode| matches!(mode.as_str(), "staging" | "insecure"))
+        .unwrap_or(false)
+        || std::env::var("TENANT_TEE_ACCEPT_INVALID_CERTS")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
 }
 
 fn json_error(status: StatusCode, error: impl Into<String>) -> RouteError {
@@ -377,12 +430,12 @@ mod tests {
     }
 
     #[test]
-    fn app_logs_uses_http_for_internal_tee_control_port() {
-        let socket = "10.43.13.109:8081".parse().unwrap();
-
+    fn app_logs_parses_internal_tee_ip_socket() {
         assert_eq!(
-            internal_tee_logs_url(socket),
-            "http://10.43.13.109:8081/.well-known/confidential/logs"
+            parse_socket_addr("10.43.13.109:8081").map(|socket| socket.to_string()),
+            Some("10.43.13.109:8081".to_string())
         );
+        assert!(parse_socket_addr("tenant-app.ns.svc.cluster.local:8081").is_none());
+        assert!(parse_socket_addr("10.43.13.109").is_none());
     }
 }
