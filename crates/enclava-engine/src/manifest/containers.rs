@@ -683,9 +683,9 @@ pub fn build_encrypted_log_relay_container(app: &ConfidentialApp) -> Option<Cont
         security_context: Some(SecurityContext {
             privileged: Some(false),
             allow_privilege_escalation: Some(false),
-            run_as_user: Some(0),
-            run_as_group: Some(0),
-            run_as_non_root: Some(false),
+            run_as_user: Some(10001),
+            run_as_group: Some(10001),
+            run_as_non_root: Some(true),
             read_only_root_filesystem: Some(false),
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".to_string()]),

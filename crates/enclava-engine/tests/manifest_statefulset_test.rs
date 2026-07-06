@@ -307,6 +307,18 @@ fn statefulset_adds_encrypted_log_relay_only_with_log_key_metadata() {
             .read_only_root_filesystem,
         Some(false)
     );
+    assert_eq!(
+        relay.security_context.as_ref().unwrap().run_as_user,
+        Some(10001)
+    );
+    assert_eq!(
+        relay.security_context.as_ref().unwrap().run_as_group,
+        Some(10001)
+    );
+    assert_eq!(
+        relay.security_context.as_ref().unwrap().run_as_non_root,
+        Some(true)
+    );
 }
 
 #[test]
