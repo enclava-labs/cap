@@ -274,7 +274,7 @@ fn cap_api_tee_ingress_rule(app: &ConfidentialApp) -> Option<Value> {
         "toPorts": [
             {
                 "ports": [
-                    { "port": "8081", "protocol": "TCP" }
+                    { "port": "8443", "protocol": "TCP" }
                 ]
             }
         ]

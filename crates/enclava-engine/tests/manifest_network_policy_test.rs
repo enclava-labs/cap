@@ -41,7 +41,7 @@ fn network_policy_ingress_allows_envoy_gateway() {
 }
 
 #[test]
-fn network_policy_ingress_allows_cap_api_to_tee_control_port() {
+fn network_policy_ingress_allows_cap_api_to_tee_tls_port() {
     let mut app = sample_app();
     app.attestation.tls_certificate_broker_url = Some(
         "http://cap-api.cap-test01.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
@@ -56,7 +56,7 @@ fn network_policy_ingress_allows_cap_api_to_tee_control_port() {
         "cap-test01"
     );
     assert_eq!(from[0]["matchLabels"]["app.kubernetes.io/name"], "cap-api");
-    assert_eq!(ingress["toPorts"][0]["ports"][0]["port"], "8081");
+    assert_eq!(ingress["toPorts"][0]["ports"][0]["port"], "8443");
     assert_eq!(ingress["toPorts"][0]["ports"][0]["protocol"], "TCP");
 }
 
