@@ -1,4 +1,8 @@
-use enclava_engine::manifest::cc_init_data::{build_toml, encode_cc_init_data, sha256_hex};
+use enclava_engine::manifest::cc_init_data::{
+    ALLOW_DEV_RUNTIME_CLASS_ENV, COCO_DEV_RUNTIME_CLASS, CcInitDataOptions, DEFAULT_RUNTIME_CLASS,
+    RUNTIME_CLASS_ENV, RuntimeClassConfigError, build_toml, build_toml_with_options,
+    encode_cc_init_data, resolve_runtime_class_with_env, sha256_hex,
+};
 use enclava_engine::testutil::sample_app;
 use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
 use sha2::{Digest, Sha256};
@@ -155,7 +159,10 @@ fn data_claims_include_required_rego_descriptor_anchors() {
         data["kbs_attestation_token_url"].as_str().unwrap(),
         "http://127.0.0.1:8006/aa/token?token_type=kbs"
     );
-    assert_eq!(data["runtime_class"].as_str().unwrap(), "kata-qemu-snp");
+    assert_eq!(
+        data["runtime_class"].as_str().unwrap(),
+        DEFAULT_RUNTIME_CLASS
+    );
 
     let sidecars: serde_json::Value = serde_json::from_str(
         data.get("sidecar_digests")
@@ -182,6 +189,14 @@ fn cm_argon2_salt_hex(app: &enclava_engine::types::ConfidentialApp) -> String {
         .and_then(toml::Value::as_str)
         .unwrap()
         .to_string()
+}
+
+fn options_with_runtime_class(runtime_class: &str) -> CcInitDataOptions {
+    CcInitDataOptions {
+        kbs_url: "https://kbs.example.test".to_string(),
+        kbs_ca_cert_pem: None,
+        runtime_class: runtime_class.to_string(),
+    }
 }
 
 #[test]
@@ -357,7 +372,14 @@ fn toml_structure_matches_python_template() {
 fn toml_binds_runtime_class() {
     let app = sample_app();
     let toml = build_toml(&app);
-    assert!(toml.contains("runtime_class = \"kata-qemu-snp\""));
+    assert!(toml.contains(&format!("runtime_class = \"{DEFAULT_RUNTIME_CLASS}\"")));
+}
+
+#[test]
+fn toml_binds_coco_dev_runtime_class_when_explicitly_selected() {
+    let app = sample_app();
+    let toml = build_toml_with_options(&app, &options_with_runtime_class(COCO_DEV_RUNTIME_CLASS));
+    assert!(toml.contains(&format!("runtime_class = \"{COCO_DEV_RUNTIME_CLASS}\"")));
 }
 
 #[test]
@@ -386,4 +408,54 @@ fn verify_runtime_class_binding_passes_for_default_render() {
     let manifests = enclava_engine::manifest::generate_all_manifests(&app);
     verify_runtime_class_binding(&manifests.statefulset)
         .expect("default app must bind runtime class");
+}
+
+#[test]
+fn runtime_class_defaults_to_snp() {
+    let resolved = resolve_runtime_class_with_env(true, |_| None).unwrap();
+    assert_eq!(resolved, DEFAULT_RUNTIME_CLASS);
+}
+
+#[test]
+fn runtime_class_accepts_coco_dev_in_debug_builds() {
+    let resolved = resolve_runtime_class_with_env(true, |name| match name {
+        RUNTIME_CLASS_ENV => Some(COCO_DEV_RUNTIME_CLASS.to_string()),
+        _ => None,
+    })
+    .unwrap();
+    assert_eq!(resolved, COCO_DEV_RUNTIME_CLASS);
+}
+
+#[test]
+fn runtime_class_requires_escape_hatch_for_coco_dev_in_release_builds() {
+    let err = resolve_runtime_class_with_env(false, |name| match name {
+        RUNTIME_CLASS_ENV => Some(COCO_DEV_RUNTIME_CLASS.to_string()),
+        _ => None,
+    })
+    .unwrap_err();
+    assert_eq!(err, RuntimeClassConfigError::DevRuntimeClassInRelease);
+}
+
+#[test]
+fn runtime_class_accepts_coco_dev_in_release_builds_with_escape_hatch() {
+    let resolved = resolve_runtime_class_with_env(false, |name| match name {
+        RUNTIME_CLASS_ENV => Some(COCO_DEV_RUNTIME_CLASS.to_string()),
+        ALLOW_DEV_RUNTIME_CLASS_ENV => Some("true".to_string()),
+        _ => None,
+    })
+    .unwrap();
+    assert_eq!(resolved, COCO_DEV_RUNTIME_CLASS);
+}
+
+#[test]
+fn runtime_class_rejects_unknown_values() {
+    let err = resolve_runtime_class_with_env(true, |name| match name {
+        RUNTIME_CLASS_ENV => Some("kata-qemu-tdx".to_string()),
+        _ => None,
+    })
+    .unwrap_err();
+    assert_eq!(
+        err,
+        RuntimeClassConfigError::Unsupported("kata-qemu-tdx".to_string())
+    );
 }

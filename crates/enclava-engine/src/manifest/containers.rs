@@ -805,7 +805,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env_field_ref("ATTESTATION_POD_NAME", "metadata.name"),
         env_field_ref("ATTESTATION_POD_NAMESPACE", "metadata.namespace"),
         env("ATTESTATION_PROFILE", "coco-sev-snp"),
-        env("ATTESTATION_RUNTIME_CLASS", "kata-qemu-snp"),
+        env("ATTESTATION_RUNTIME_CLASS", &cc_init_data::runtime_class()),
         env("ATTESTATION_WORKLOAD_IMAGE", &primary.image.digest_ref()),
         env("ATTESTATION_BIND", "127.0.0.1"),
         env("ATTESTATION_TLS_BIND", "0.0.0.0"),

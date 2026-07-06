@@ -35,6 +35,7 @@ pub fn trustee_kbs_resource_url() -> String {
 pub struct CcInitDataOptions {
     pub kbs_url: String,
     pub kbs_ca_cert_pem: Option<String>,
+    pub runtime_class: String,
 }
 
 impl CcInitDataOptions {
@@ -42,6 +43,7 @@ impl CcInitDataOptions {
         Self {
             kbs_url: trustee_kbs_url(),
             kbs_ca_cert_pem: trustee_kbs_ca_cert_pem(),
+            runtime_class: runtime_class(),
         }
     }
 }
@@ -62,6 +64,7 @@ pub fn build_toml(app: &ConfidentialApp) -> String {
 pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOptions) -> String {
     let kbs_url = options.kbs_url.clone();
     let kbs_ca_cert_pem = options.kbs_ca_cert_pem.clone();
+    let runtime_class = options.runtime_class.clone();
     let primary = app
         .primary_container()
         .expect("app must have a primary container");
@@ -78,7 +81,7 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     assert_non_empty("namespace", &app.namespace);
     assert_non_empty("service_account", &app.service_account);
     assert_non_empty("identity_hash", &app.tenant_instance_identity_hash);
-    assert_non_empty("runtime_class", DEFAULT_RUNTIME_CLASS);
+    assert_non_empty("runtime_class", &runtime_class);
     assert_non_empty(
         "sidecar_digests.attestation_proxy",
         app.attestation.proxy_image.digest(),
@@ -103,7 +106,7 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     toml.push('\n');
     toml.push_str("[data]\n");
     push_toml_string(&mut toml, "image_digest", &image_digest);
-    push_toml_string(&mut toml, "runtime_class", DEFAULT_RUNTIME_CLASS);
+    push_toml_string(&mut toml, "runtime_class", &runtime_class);
     push_toml_string(&mut toml, "namespace", &app.namespace);
     push_toml_string(&mut toml, "service_account", &app.service_account);
     push_toml_string(
@@ -248,9 +251,53 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     toml
 }
 
-/// The SNP runtime class CAP requires. enclava-init reads this from cc_init_data
-/// at boot and refuses to start if the rendered Pod's `runtimeClassName` differs.
+/// The SNP runtime class CAP requires by default. enclava-init reads this from
+/// cc_init_data at boot and refuses to start if the rendered Pod's
+/// `runtimeClassName` differs.
 pub const DEFAULT_RUNTIME_CLASS: &str = "kata-qemu-snp";
+pub const COCO_DEV_RUNTIME_CLASS: &str = "kata-qemu-coco-dev";
+pub const RUNTIME_CLASS_ENV: &str = "CAP_RUNTIME_CLASS";
+pub const ALLOW_DEV_RUNTIME_CLASS_ENV: &str = "CAP_ALLOW_DEV_RUNTIME_CLASS";
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RuntimeClassConfigError {
+    #[error("unsupported CAP_RUNTIME_CLASS `{0}`")]
+    Unsupported(String),
+    #[error(
+        "CAP_RUNTIME_CLASS=kata-qemu-coco-dev is for local simulated CoCo only; set CAP_ALLOW_DEV_RUNTIME_CLASS=true to use it in release builds"
+    )]
+    DevRuntimeClassInRelease,
+}
+
+pub fn try_runtime_class() -> Result<String, RuntimeClassConfigError> {
+    resolve_runtime_class_with_env(cfg!(debug_assertions), |name| std::env::var(name).ok())
+}
+
+pub fn runtime_class() -> String {
+    try_runtime_class().unwrap_or_else(|err| panic!("{err}"))
+}
+
+pub fn resolve_runtime_class_with_env(
+    debug_assertions: bool,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String, RuntimeClassConfigError> {
+    let Some(raw) = lookup(RUNTIME_CLASS_ENV) else {
+        return Ok(DEFAULT_RUNTIME_CLASS.to_string());
+    };
+    let requested = raw.trim();
+    if requested.is_empty() || requested == DEFAULT_RUNTIME_CLASS {
+        return Ok(DEFAULT_RUNTIME_CLASS.to_string());
+    }
+    if requested != COCO_DEV_RUNTIME_CLASS {
+        return Err(RuntimeClassConfigError::Unsupported(requested.to_string()));
+    }
+    let release_escape_hatch = lookup(ALLOW_DEV_RUNTIME_CLASS_ENV)
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"));
+    if debug_assertions || release_escape_hatch {
+        return Ok(COCO_DEV_RUNTIME_CLASS.to_string());
+    }
+    Err(RuntimeClassConfigError::DevRuntimeClassInRelease)
+}
 
 fn required_claim<'a>(name: &str, value: Option<&'a str>) -> &'a str {
     let value = value.unwrap_or_else(|| panic!("cc_init_data requires non-empty {name}"));
@@ -454,15 +501,17 @@ fn encode_and_hash_toml(toml: &str) -> (String, String) {
 pub fn verify_runtime_class_binding(
     sts: &k8s_openapi::api::apps::v1::StatefulSet,
 ) -> Result<(), String> {
+    let expected = runtime_class();
     let actual = sts
         .spec
         .as_ref()
         .and_then(|s| s.template.spec.as_ref())
         .and_then(|p| p.runtime_class_name.as_deref());
     match actual {
-        Some(name) if name == DEFAULT_RUNTIME_CLASS => Ok(()),
+        Some(name) if name == expected => Ok(()),
         Some(other) => Err(format!(
-            "rendered Pod runtimeClassName is `{other}`, expected `{DEFAULT_RUNTIME_CLASS}`"
+            "rendered Pod runtimeClassName is `{other}`, expected `{}`",
+            expected
         )),
         None => Err("rendered Pod has no runtimeClassName".to_string()),
     }

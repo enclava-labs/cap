@@ -17,8 +17,11 @@ use crate::manifest::volumes::{build_volume_claim_templates, build_volumes};
 use crate::types::ConfidentialApp;
 
 pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
-    let (cc_init_data_encoded, cc_init_data_hash) = cc_init_data::compute_cc_init_data(app);
-    let kbs_url = cc_init_data::trustee_kbs_url();
+    let cc_init_data_options = cc_init_data::CcInitDataOptions::from_env();
+    let runtime_class = cc_init_data_options.runtime_class.clone();
+    let kbs_url = cc_init_data_options.kbs_url.clone();
+    let (cc_init_data_encoded, cc_init_data_hash) =
+        cc_init_data::compute_cc_init_data_with_options(app, &cc_init_data_options);
 
     let mut pod_labels = BTreeMap::new();
     pod_labels.insert("app".to_string(), app.name.clone());
@@ -26,7 +29,7 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
     let mut annotations = BTreeMap::new();
     annotations.insert(
         "io.containerd.cri.runtime-handler".to_string(),
-        "kata-qemu-snp".to_string(),
+        runtime_class.clone(),
     );
     annotations.insert(
         "io.katacontainers.config.hypervisor.kernel_params".to_string(),
@@ -126,9 +129,7 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
-                    runtime_class_name: Some(
-                        super::cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
-                    ),
+                    runtime_class_name: Some(runtime_class),
                     service_account_name: Some(app.service_account.clone()),
                     automount_service_account_token: Some(false),
                     enable_service_links: Some(false),
