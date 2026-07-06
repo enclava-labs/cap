@@ -303,12 +303,8 @@ struct ParsedUrlAuthority<'a> {
 }
 
 fn parse_url_authority(url: &str) -> Option<ParsedUrlAuthority<'_>> {
-    let Some((scheme, rest)) = url.trim().split_once("://") else {
-        return None;
-    };
-    let Some(authority) = rest.split('/').next().map(str::trim) else {
-        return None;
-    };
+    let (scheme, rest) = url.trim().split_once("://")?;
+    let authority = rest.split('/').next().map(str::trim)?;
     if authority.is_empty() {
         return None;
     }
