@@ -109,6 +109,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
     artifacts: &crate::signing_service::DeploymentSigningArtifacts,
     provided_artifact: Option<String>,
     signing_service_pubkey_hex: Option<&str>,
+    log_encryption: Option<LogEncryptionConfig>,
 ) -> Result<crate::signing_service::SignedPolicyArtifact, (StatusCode, Json<serde_json::Value>)> {
     artifacts
         .validate_customer_authority(&state.db)
@@ -130,6 +131,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
     let generated = signing_service
         .agent_policy(&crate::signing_service::AgentPolicyRequest {
             descriptor: artifacts.descriptor.clone(),
+            log_encryption: log_encryption.clone(),
         })
         .await
         .map_err(signing_error_response)?;
@@ -158,7 +160,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
     }
 
     let mut artifact = signing_service
-        .sign(&artifacts.sign_request())
+        .sign(&artifacts.sign_request(log_encryption))
         .await
         .map_err(signing_error_response)?;
     artifacts
@@ -348,6 +350,8 @@ pub struct RollbackRequest {
 #[derive(Debug, Deserialize)]
 pub struct AgentPolicyRequest {
     pub descriptor: enclava_common::descriptor::DeploymentDescriptor,
+    #[serde(default)]
+    pub log_encryption: Option<LogEncryptionConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -355,6 +359,8 @@ pub struct AgentPolicyResponse {
     pub agent_policy_text: String,
     pub agent_policy_sha256: String,
     pub genpolicy_version_pin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_encryption: Option<LogEncryptionConfig>,
 }
 
 fn validate_log_encryption_config(
@@ -801,12 +807,14 @@ pub async fn deploy(
         })?;
         let binding = artifacts.binding();
         app_spec.workload_artifact_binding = Some(binding.clone());
+        app_spec.log_encryption = log_encryption.clone();
 
         let signed = resolve_signed_policy_artifact(
             &state,
             artifacts,
             body.signed_policy_artifact.clone(),
             signing_service_pubkey_hex,
+            log_encryption.clone(),
         )
         .await?;
         app_spec.generated_agent_policy = Some(

@@ -14,6 +14,7 @@ use base64::{
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use enclava_common::canonical::ce_v1_bytes;
+use enclava_engine::types::LogEncryptionConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -531,6 +532,32 @@ pub async fn update_unlock_mode(
         )
     })?
     .flatten();
+    let log_encryption: Option<LogEncryptionConfig> = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT spec_snapshot->'log_encryption'
+           FROM deployments
+          WHERE app_id = $1
+            AND spec_snapshot ? 'log_encryption'
+            AND spec_snapshot->'log_encryption' <> 'null'::jsonb
+          ORDER BY created_at DESC
+          LIMIT 1",
+    )
+    .bind(app.id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?
+    .map(serde_json::from_value)
+    .transpose()
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "stored log encryption metadata is invalid"})),
+        )
+    })?;
 
     let mut signed_app = app.clone();
     signed_app.unlock_mode = requested.model_value();
@@ -591,12 +618,14 @@ pub async fn update_unlock_mode(
         crate::deploy::set_primary_descriptor_runtime(&mut app_spec, &artifacts.descriptor);
         let binding = artifacts.binding();
         app_spec.workload_artifact_binding = Some(binding.clone());
+        app_spec.log_encryption = log_encryption.clone();
 
         let signed = crate::routes::deployments::resolve_signed_policy_artifact(
             &state,
             artifacts,
             body.signed_policy_artifact.clone(),
             signing_service_pubkey_hex,
+            log_encryption.clone(),
         )
         .await?;
         app_spec.generated_agent_policy = Some(
@@ -717,6 +746,7 @@ pub async fn update_unlock_mode(
         "signed_descriptor_core_hash": signing_artifacts
             .as_ref()
             .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
+        "log_encryption": &log_encryption,
     });
 
     sqlx::query(
@@ -819,7 +849,7 @@ pub async fn update_unlock_mode(
                 signed_policy_artifact,
                 local_workload_artifacts_json,
                 local_trustee_policy_json,
-                log_encryption: None,
+                log_encryption,
             },
         )
         .await

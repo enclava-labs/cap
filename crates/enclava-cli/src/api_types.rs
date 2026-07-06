@@ -2,6 +2,7 @@
 //! These mirror the API's JSON contract. They are CLI-local types,
 //! not shared with the API crate (the CLI does not depend on enclava-api).
 
+use enclava_engine::types::LogEncryptionConfig;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::IpAddr};
 
@@ -455,6 +456,8 @@ pub struct AgentPolicyResponse {
     pub agent_policy_text: String,
     pub agent_policy_sha256: String,
     pub genpolicy_version_pin: String,
+    #[serde(default)]
+    pub log_encryption: Option<LogEncryptionConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

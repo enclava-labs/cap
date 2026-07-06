@@ -1,5 +1,6 @@
 use enclava_engine::manifest::resource_quota::generate_resource_quota;
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::LogEncryptionConfig;
 
 #[test]
 fn resource_quota_name_and_namespace() {
@@ -28,6 +29,24 @@ fn resource_quota_has_memory_limits() {
     let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
     assert_eq!(hard.get("requests.memory").unwrap().0, "4928Mi");
     assert_eq!(hard.get("limits.memory").unwrap().0, "6Gi");
+}
+
+#[test]
+fn resource_quota_includes_encrypted_log_relay_resources() {
+    let mut app = sample_app();
+    app.log_encryption = Some(LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+    });
+
+    let rq = generate_resource_quota(&app);
+    let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
+    assert_eq!(hard.get("requests.cpu").unwrap().0, "1510m");
+    assert_eq!(hard.get("limits.cpu").unwrap().0, "3300m");
+    assert_eq!(hard.get("requests.memory").unwrap().0, "4944Mi");
+    assert_eq!(hard.get("limits.memory").unwrap().0, "6208Mi");
 }
 
 #[test]

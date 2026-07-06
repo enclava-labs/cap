@@ -114,6 +114,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
                 tenant_instance_identity_hash: [4; 32],
                 bootstrap_owner_pubkey_hash: "33".repeat(32),
                 workload_security_profile: WorkloadSecurityProfile::Restricted,
+                log_encryption: None,
             },
         )
         .unwrap();
@@ -124,6 +125,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
         &cc_init_data::CcInitDataOptions {
             kbs_url: "https://kbs.example.test:8080".to_string(),
             kbs_ca_cert_pem: None,
+            runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
         },
     );
 
@@ -176,6 +178,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
                 tenant_instance_identity_hash: [4; 32],
                 bootstrap_owner_pubkey_hash: "33".repeat(32),
                 workload_security_profile: WorkloadSecurityProfile::Restricted,
+                log_encryption: None,
             },
         )
         .unwrap();
@@ -186,6 +189,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
         &cc_init_data::CcInitDataOptions {
             kbs_url: "https://kbs.example.test:8080".to_string(),
             kbs_ca_cert_pem: None,
+            runtime_class: cc_init_data::DEFAULT_RUNTIME_CLASS.to_string(),
         },
     );
 

@@ -12,7 +12,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
 use enclava_common::descriptor::{DeploymentDescriptor, descriptor_core_hash};
 use enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH;
-use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
+use enclava_engine::types::{GeneratedAgentPolicy, LogEncryptionConfig, WorkloadArtifactBinding};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -183,6 +183,8 @@ fn parse_signing_service_timeout(raw: Option<String>) -> Result<Duration, Signin
 #[derive(Debug, Serialize)]
 pub struct AgentPolicyRequest {
     pub descriptor: DeploymentDescriptor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_encryption: Option<LogEncryptionConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +192,8 @@ pub struct AgentPolicyResponse {
     pub agent_policy_text: String,
     pub agent_policy_sha256: String,
     pub genpolicy_version_pin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_encryption: Option<LogEncryptionConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -212,6 +216,8 @@ pub struct SignRequest {
     pub platform_release_version: String,
     pub customer_descriptor_blob: String,
     pub org_keyring_blob: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_encryption: Option<LogEncryptionConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,13 +273,14 @@ impl DeploymentSigningArtifacts {
         }
     }
 
-    pub fn sign_request(&self) -> SignRequest {
+    pub fn sign_request(&self, log_encryption: Option<LogEncryptionConfig>) -> SignRequest {
         SignRequest {
             app_id: self.descriptor.app_id,
             deploy_id: self.descriptor.deploy_id,
             platform_release_version: self.descriptor.platform_release_version.clone(),
             customer_descriptor_blob: self.customer_descriptor_blob.clone(),
             org_keyring_blob: self.org_keyring_blob.clone(),
+            log_encryption,
         }
     }
 

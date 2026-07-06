@@ -36,8 +36,8 @@ use enclava_common::log_encryption::{
 use enclava_common::types::{ResourceLimits, UnlockMode};
 use enclava_engine::manifest::cc_init_data;
 use enclava_engine::types::{
-    AttestationConfig, ConfidentialApp, Container, DomainSpec, GeneratedAgentPolicy, StorageSpec,
-    WorkloadArtifactBinding, WorkloadSecurityProfile,
+    AttestationConfig, ConfidentialApp, Container, DomainSpec, GeneratedAgentPolicy,
+    LogEncryptionConfig, StorageSpec, WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
 use std::collections::HashMap;
 use uuid::Uuid;

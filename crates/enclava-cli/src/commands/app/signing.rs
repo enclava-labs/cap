@@ -209,6 +209,7 @@ pub(crate) struct ConfidentialAppForCcHash<'a> {
     pub(crate) tenant_instance_identity_hash: [u8; 32],
     pub(crate) bootstrap_owner_pubkey_hash: String,
     pub(crate) workload_security_profile: WorkloadSecurityProfile,
+    pub(crate) log_encryption: Option<LogEncryptionConfig>,
 }
 
 pub(crate) fn confidential_app_for_cc_hash(
@@ -228,6 +229,7 @@ pub(crate) fn confidential_app_for_cc_hash(
         tenant_instance_identity_hash,
         bootstrap_owner_pubkey_hash,
         workload_security_profile,
+        log_encryption,
     } = params;
     let api_signing_pubkey = deployment_context.api_signing_pubkey.trim().to_string();
     if api_signing_pubkey.is_empty() {
@@ -302,7 +304,7 @@ pub(crate) fn confidential_app_for_cc_hash(
         egress_mode: enclava_engine::types::EgressMode::Restricted,
         public_internet_egress_excluded_cidrs: Vec::new(),
         egress_allowlist: Vec::new(),
-        log_encryption: None,
+        log_encryption,
         workload_artifact_binding: Some(workload_artifact_binding),
         generated_agent_policy: Some(generated_agent_policy),
     })
@@ -333,7 +335,7 @@ async fn fetch_generated_agent_policy(
     api: &ApiClient,
     release: &PlatformRelease,
     descriptor: &enclava_cli::descriptor::DeploymentDescriptor,
-) -> Result<GeneratedAgentPolicy, Box<dyn std::error::Error>> {
+) -> Result<(GeneratedAgentPolicy, Option<LogEncryptionConfig>), Box<dyn std::error::Error>> {
     let response = api
         .generate_agent_policy(
             &descriptor.app_name,
@@ -358,11 +360,14 @@ async fn fetch_generated_agent_policy(
     if actual != policy_sha256 {
         return Err("policy signing service returned agent_policy_sha256 that does not match agent_policy_text".into());
     }
-    Ok(GeneratedAgentPolicy {
-        policy_text: response.agent_policy_text,
-        policy_sha256,
-        genpolicy_version_pin: response.genpolicy_version_pin,
-    })
+    Ok((
+        GeneratedAgentPolicy {
+            policy_text: response.agent_policy_text,
+            policy_sha256,
+            genpolicy_version_pin: response.genpolicy_version_pin,
+        },
+        response.log_encryption,
+    ))
 }
 
 fn bootstrap_identity_hash(
@@ -610,7 +615,8 @@ pub(crate) async fn build_signed_deploy_blobs(
         descriptor_signing_pubkey: deployer_key.public.to_bytes(),
         org_keyring_fingerprint,
     };
-    let generated_agent_policy = fetch_generated_agent_policy(api, &release, &descriptor).await?;
+    let (generated_agent_policy, log_encryption) =
+        fetch_generated_agent_policy(api, &release, &descriptor).await?;
     descriptor.expected_agent_policy_hash = generated_agent_policy.policy_sha256;
     let cc_app = confidential_app_for_cc_hash(
         app,
@@ -627,12 +633,14 @@ pub(crate) async fn build_signed_deploy_blobs(
             tenant_instance_identity_hash: identity_hash,
             bootstrap_owner_pubkey_hash: bootstrap_pubkey_hash,
             workload_security_profile,
+            log_encryption,
         },
     )?;
     let cc_init_options = cc_init_data::CcInitDataOptions {
         kbs_url: release.trustee_kbs_url.clone(),
         kbs_ca_cert_pem: (!release.trustee_kbs_ca_cert_pem.trim().is_empty())
             .then(|| release.trustee_kbs_ca_cert_pem.clone()),
+        runtime_class: cc_init_data::runtime_class(),
     };
     let cc_init_data_hash: [u8; 32] =
         Sha256::digest(cc_init_data::build_toml_with_options(&cc_app, &cc_init_options).as_bytes())

@@ -212,6 +212,7 @@ fn agent_policy_response_for(artifact: &SignedPolicyArtifact) -> AgentPolicyResp
         agent_policy_text: artifact.agent_policy_text.clone(),
         agent_policy_sha256: artifact.agent_policy_sha256.clone(),
         genpolicy_version_pin: artifact.metadata.genpolicy_version_pin.clone(),
+        log_encryption: None,
     }
 }
 
@@ -410,6 +411,7 @@ fn rejects_customer_artifact_when_descriptor_policy_hash_is_stale() {
         agent_policy_sha256: hex::encode(Sha256::digest(agent_policy_text.as_bytes())),
         agent_policy_text,
         genpolicy_version_pin: artifact.metadata.genpolicy_version_pin.clone(),
+        log_encryption: None,
     };
 
     let err = artifacts

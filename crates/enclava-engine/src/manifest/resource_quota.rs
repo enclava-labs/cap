@@ -12,48 +12,61 @@ use crate::types::ConfidentialApp;
 /// load balancers (0), node ports (0), secrets, configmaps.
 pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
     let mut hard = BTreeMap::new();
+    let encrypted_log_relay_enabled = app.log_encryption.is_some();
+
+    let mut request_cpu = vec![
+        "250m", // workload
+        "100m", // attestation-proxy
+        "100m", // tenant-ingress
+        "50m",  // enclava-init sidecar
+        "1",    // kata-qemu-snp overhead
+    ];
+    let mut limit_cpu = vec![
+        app.resources.cpu.as_str(), // workload
+        "500m",                     // attestation-proxy
+        "500m",                     // tenant-ingress
+        "250m",                     // enclava-init sidecar
+        "1",                        // kata-qemu-snp overhead
+    ];
+    let mut request_memory = vec![
+        "512Mi", // workload
+        "128Mi", // attestation-proxy
+        "128Mi", // tenant-ingress
+        "64Mi",  // enclava-init sidecar
+        "4Gi",   // kata-qemu-snp overhead
+    ];
+    let mut limit_memory = vec![
+        app.resources.memory.as_str(), // workload
+        "256Mi",                       // attestation-proxy
+        "256Mi",                       // tenant-ingress
+        "512Mi",                       // enclava-init sidecar
+        "4Gi",                         // kata-qemu-snp overhead
+    ];
+
+    if encrypted_log_relay_enabled {
+        request_cpu.push("10m");
+        limit_cpu.push("50m");
+        request_memory.push("16Mi");
+        limit_memory.push("64Mi");
+    }
 
     hard.insert(
         "requests.cpu".to_string(),
-        Quantity(sum_cpu_quantities(&[
-            "250m", // workload
-            "100m", // attestation-proxy
-            "100m", // tenant-ingress
-            "50m",  // enclava-init sidecar
-            "1",    // kata-qemu-snp overhead
-        ])),
+        Quantity(sum_cpu_quantities(&request_cpu)),
     );
     hard.insert(
         "limits.cpu".to_string(),
-        Quantity(sum_cpu_quantities(&[
-            &app.resources.cpu, // workload
-            "500m",             // attestation-proxy
-            "500m",             // tenant-ingress
-            "250m",             // enclava-init sidecar
-            "1",                // kata-qemu-snp overhead
-        ])),
+        Quantity(sum_cpu_quantities(&limit_cpu)),
     );
 
     // Memory. See CPU note above.
     hard.insert(
         "requests.memory".to_string(),
-        Quantity(sum_memory_quantities(&[
-            "512Mi", // workload
-            "128Mi", // attestation-proxy
-            "128Mi", // tenant-ingress
-            "64Mi",  // enclava-init sidecar
-            "4Gi",   // kata-qemu-snp overhead
-        ])),
+        Quantity(sum_memory_quantities(&request_memory)),
     );
     hard.insert(
         "limits.memory".to_string(),
-        Quantity(sum_memory_quantities(&[
-            &app.resources.memory, // workload
-            "256Mi",               // attestation-proxy
-            "256Mi",               // tenant-ingress
-            "512Mi",               // enclava-init sidecar
-            "4Gi",                 // kata-qemu-snp overhead
-        ])),
+        Quantity(sum_memory_quantities(&limit_memory)),
     );
 
     // Storage must cover both StatefulSet volumeClaimTemplates. If this is too
