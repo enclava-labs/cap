@@ -3,10 +3,18 @@ name: CI
 on:
   push:
     branches: ["main", "develop"]
+    tags: ["v*"]
   pull_request:
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -115,6 +123,7 @@ jobs:
         run: cargo build --workspace
 
       - name: Build release bins
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         run: |
           cargo build --release --bin enclava-api
           cargo build --release --bin enclava
@@ -122,6 +131,7 @@ jobs:
           ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
 
       - name: Build prod-strict release path
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         run: |
           cargo build --release -p enclava-common --features prod-strict
           cargo build --release -p enclava-engine --features prod-strict
@@ -132,6 +142,7 @@ jobs:
           ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
 
       - name: Verify prod-strict rejects debug-only features
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         run: |
           if cargo check --release -p enclava-engine --features prod-strict,testutil; then
             echo "enclava-engine prod-strict unexpectedly accepted testutil"

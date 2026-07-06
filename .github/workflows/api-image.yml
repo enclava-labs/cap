@@ -23,6 +23,10 @@ on:
     - 'crates/enclava-engine/**'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-push:
     name: Build and push Docker image
@@ -54,6 +58,15 @@ jobs:
             type=ref,event=tag
             type=sha,prefix=
 
+      - name: Select build profile
+        id: build_profile
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "profile=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "profile=debug" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v5
@@ -63,6 +76,8 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_PROFILE=${{ steps.build_profile.outputs.profile }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true

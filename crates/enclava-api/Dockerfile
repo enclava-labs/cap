@@ -4,6 +4,7 @@
 FROM rust:1.88-alpine AS builder
 
 ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+ARG BUILD_PROFILE=debug
 ENV ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX}
 
 # Install musl build dependencies
@@ -16,14 +17,22 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-# Build static binary. The cache mounts make local and GitHub rebuilds reuse
-# downloaded crates and incremental artifacts across small API/engine edits.
+# Build static binary. Main-branch images use debug profile for fast deploy
+# feedback; tagged releases pass BUILD_PROFILE=release.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --bin enclava-api && \
-    cp /build/target/release/enclava-api /usr/local/bin/enclava-api && \
-    strip /usr/local/bin/enclava-api
+    if [ "${BUILD_PROFILE}" = "release" ]; then \
+      cargo build --release --bin enclava-api && \
+      cp /build/target/release/enclava-api /usr/local/bin/enclava-api && \
+      strip /usr/local/bin/enclava-api; \
+    elif [ "${BUILD_PROFILE}" = "debug" ]; then \
+      cargo build --bin enclava-api && \
+      cp /build/target/debug/enclava-api /usr/local/bin/enclava-api; \
+    else \
+      echo "unsupported BUILD_PROFILE=${BUILD_PROFILE}; expected debug or release" >&2; \
+      exit 1; \
+    fi
 
 # Runtime stage
 FROM alpine:3.20
