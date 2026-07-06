@@ -4,15 +4,15 @@ use enclava_common::validate::{
 };
 use k8s_openapi::api::{
     apps::v1::DaemonSet,
-    core::v1::{ConfigMap, Service},
+    core::v1::{ConfigMap, Pod, Service},
 };
 use kube::{
     Api, Client,
-    api::{ApiResource, DynamicObject, Patch, PatchParams},
+    api::{ApiResource, DynamicObject, ListParams, Patch, PatchParams},
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// Fixed PostgreSQL advisory lock id for serialising HAProxy ConfigMap edits.
 ///
@@ -39,6 +39,12 @@ pub enum EdgeRouteError {
     InvalidHostname(#[from] ValidateError),
     #[error("invalid app name for HAProxy backend: {0}")]
     InvalidAppName(String),
+    #[error("backend target unavailable for {namespace}/{app_name}: {reason}")]
+    BackendTargetUnavailable {
+        namespace: String,
+        app_name: String,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -268,6 +274,67 @@ pub async fn resolve_backend_target(
     Ok(format!("{cluster_ip}:{port}"))
 }
 
+/// Resolve the tenant pod IP for internal-only sidecar endpoints that are not
+/// exposed by the tenant Service on the same target port.
+pub async fn resolve_pod_socket(
+    app_name: &str,
+    namespace: &str,
+    port: u16,
+) -> Result<SocketAddr, EdgeRouteError> {
+    validate_app_name(app_name)
+        .map_err(|_| EdgeRouteError::InvalidAppName(format!("invalid app name: {app_name}")))?;
+    let client = Client::try_default().await?;
+    let pods: Api<Pod> = Api::namespaced(client, namespace);
+    let list = pods
+        .list(&ListParams::default().labels(&format!("app={app_name}")))
+        .await?;
+    select_pod_socket(app_name, namespace, port, list.items)
+}
+
+fn select_pod_socket(
+    app_name: &str,
+    namespace: &str,
+    port: u16,
+    pods: Vec<Pod>,
+) -> Result<SocketAddr, EdgeRouteError> {
+    let mut pending_reason = None;
+    for pod in pods {
+        let status = pod.status.as_ref();
+        let phase = status.and_then(|status| status.phase.as_deref());
+        if !matches!(phase, Some("Running")) {
+            pending_reason.get_or_insert_with(|| {
+                format!(
+                    "pod {} is not running",
+                    pod.metadata.name.as_deref().unwrap_or("<unnamed>")
+                )
+            });
+            continue;
+        }
+        let Some(ip) = status.and_then(|status| status.pod_ip.as_deref()) else {
+            pending_reason.get_or_insert_with(|| {
+                format!(
+                    "pod {} has no pod IP",
+                    pod.metadata.name.as_deref().unwrap_or("<unnamed>")
+                )
+            });
+            continue;
+        };
+        let ip = ip
+            .parse::<IpAddr>()
+            .map_err(|err| EdgeRouteError::BackendTargetUnavailable {
+                namespace: namespace.to_string(),
+                app_name: app_name.to_string(),
+                reason: format!("pod IP {ip} is invalid: {err}"),
+            })?;
+        return Ok(SocketAddr::new(ip, port));
+    }
+    Err(EdgeRouteError::BackendTargetUnavailable {
+        namespace: namespace.to_string(),
+        app_name: app_name.to_string(),
+        reason: pending_reason.unwrap_or_else(|| "no app pod matched selector".to_string()),
+    })
+}
+
 fn gateway_api_resource() -> ApiResource {
     ApiResource {
         group: "gateway.networking.k8s.io".to_string(),
@@ -431,6 +498,7 @@ fn remove_backend_block(config: &str, backend_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::{api::core::v1::PodStatus, apimachinery::pkg::apis::meta::v1::ObjectMeta};
     use sha2::{Digest, Sha256};
 
     #[test]
@@ -506,6 +574,45 @@ mod tests {
         for bad in ["be cap", "be-cap", "be;evil", "be\nevil", ""] {
             assert!(SniRoute::new("a.b.c", bad, "10.0.0.1:443").is_err());
         }
+    }
+
+    #[test]
+    fn select_pod_socket_uses_running_pod_ip() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("app-0".to_string()),
+                ..ObjectMeta::default()
+            },
+            status: Some(PodStatus {
+                phase: Some("Running".to_string()),
+                pod_ip: Some("10.42.0.30".to_string()),
+                ..PodStatus::default()
+            }),
+            ..Pod::default()
+        };
+
+        let socket = select_pod_socket("app", "cap-org-app", 8081, vec![pod]).unwrap();
+
+        assert_eq!(socket, "10.42.0.30:8081".parse().unwrap());
+    }
+
+    #[test]
+    fn select_pod_socket_rejects_unready_pods() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("app-0".to_string()),
+                ..ObjectMeta::default()
+            },
+            status: Some(PodStatus {
+                phase: Some("Pending".to_string()),
+                ..PodStatus::default()
+            }),
+            ..Pod::default()
+        };
+
+        let err = select_pod_socket("app", "cap-org-app", 8081, vec![pod]).unwrap_err();
+
+        assert!(err.to_string().contains("is not running"));
     }
 
     #[test]
