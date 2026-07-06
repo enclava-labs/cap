@@ -311,6 +311,14 @@ fn statefulset_adds_encrypted_log_relay_only_with_log_key_metadata() {
             .iter()
             .any(|volume| volume.name == "log-relay-tmp")
     );
+    assert_eq!(
+        relay
+            .security_context
+            .as_ref()
+            .unwrap()
+            .read_only_root_filesystem,
+        Some(false)
+    );
 }
 
 #[test]

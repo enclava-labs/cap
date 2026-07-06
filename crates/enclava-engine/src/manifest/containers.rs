@@ -693,7 +693,7 @@ pub fn build_encrypted_log_relay_container(app: &ConfidentialApp) -> Option<Cont
             run_as_user: Some(0),
             run_as_group: Some(0),
             run_as_non_root: Some(false),
-            read_only_root_filesystem: Some(true),
+            read_only_root_filesystem: Some(false),
             capabilities: Some(Capabilities {
                 drop: Some(vec!["ALL".to_string()]),
                 add: None,
