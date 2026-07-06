@@ -61,6 +61,10 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
 fn internal_routes() -> Router<AppState> {
     Router::new()
         .route(
+            "/internal/paas/status",
+            axum::routing::get(routes::internal::list_paas_cluster_status),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}",
             axum::routing::put(routes::internal::upsert_paas_org),
         )
