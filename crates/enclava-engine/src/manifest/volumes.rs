@@ -44,6 +44,16 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             ..Default::default()
         },
     ];
+    if app.log_encryption.is_some() {
+        v.push(Volume {
+            name: "log-relay-tmp".to_string(),
+            empty_dir: Some(EmptyDirVolumeSource {
+                medium: Some("Memory".to_string()),
+                size_limit: Some(Quantity("1Mi".to_string())),
+            }),
+            ..Default::default()
+        });
+    }
 
     if legacy {
         v.push(Volume {

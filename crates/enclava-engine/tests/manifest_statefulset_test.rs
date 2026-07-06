@@ -287,6 +287,18 @@ fn statefulset_adds_encrypted_log_relay_only_with_log_key_metadata() {
             .iter()
             .any(|mount| { mount.name == "logs" && mount.read_only == Some(true) })
     );
+    assert!(relay.volume_mounts.as_ref().unwrap().iter().any(|mount| {
+        mount.name == "log-relay-tmp"
+            && mount.mount_path == "/tmp"
+            && mount.read_only == Some(false)
+    }));
+    assert!(
+        pod.volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|volume| volume.name == "log-relay-tmp")
+    );
 }
 
 #[test]

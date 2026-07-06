@@ -52,6 +52,7 @@ pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
 pub const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
+pub const ENCLAVA_LOG_RELAY_TMP_DIR: &str = "/tmp";
 pub const ENCLAVA_LOG_RELAY_PORT: i32 = 8082;
 const CADDY_DNS01_BROKER_TLS_HANDOFF_SCRIPT: &str = concat!(
     "trap 'exit 0' TERM INT\n",
@@ -665,12 +666,20 @@ pub fn build_encrypted_log_relay_container(app: &ConfidentialApp) -> Option<Cont
                 &format!("{ENCLAVA_LOG_SPOOL_DIR}/{}.jsonl", primary.name),
             ),
         ]),
-        volume_mounts: Some(vec![VolumeMount {
-            name: "logs".to_string(),
-            mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
-            read_only: Some(true),
-            ..Default::default()
-        }]),
+        volume_mounts: Some(vec![
+            VolumeMount {
+                name: "logs".to_string(),
+                mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            },
+            VolumeMount {
+                name: "log-relay-tmp".to_string(),
+                mount_path: ENCLAVA_LOG_RELAY_TMP_DIR.to_string(),
+                read_only: Some(false),
+                ..Default::default()
+            },
+        ]),
         security_context: Some(SecurityContext {
             privileged: Some(false),
             allow_privilege_escalation: Some(false),
