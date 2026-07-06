@@ -39,6 +39,44 @@ const PUBLIC_INTERNET_DEFAULT_EXCLUDED_CIDRS: &[&str] = &[
 /// The platform-default allowlist (DNS, KBS, ACME) is always present; per-app
 /// `egress_allowlist` adds on top.
 pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
+    let mut ingress = vec![
+        json!({
+            "fromEndpoints": [
+                {
+                    "matchLabels": {
+                        "io.kubernetes.pod.namespace": &app.namespace
+                    }
+                }
+            ]
+        }),
+        json!({
+            "fromEndpoints": [
+                {
+                    "matchLabels": {
+                        "io.kubernetes.pod.namespace": "tenant-envoy",
+                        "app.kubernetes.io/name": "envoy"
+                    }
+                }
+            ]
+        }),
+    ];
+
+    if let Some(rule) = cap_api_tee_ingress_rule(app) {
+        ingress.push(rule);
+    }
+
+    ingress.push(json!({
+        "fromEntities": ["host", "remote-node"],
+        "toPorts": [
+            {
+                "ports": [
+                    { "port": "10443", "protocol": "TCP" },
+                    { "port": "8443", "protocol": "TCP" }
+                ]
+            }
+        ]
+    }));
+
     let mut egress = vec![
         // Rule: DNS to kube-dns
         json!({
@@ -143,38 +181,7 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
         "spec": {
             "description": "Strict network isolation for confidential workload",
             "endpointSelector": {},
-            "ingress": [
-                {
-                    "fromEndpoints": [
-                        {
-                            "matchLabels": {
-                                "io.kubernetes.pod.namespace": &app.namespace
-                            }
-                        }
-                    ]
-                },
-                {
-                    "fromEndpoints": [
-                        {
-                            "matchLabels": {
-                                "io.kubernetes.pod.namespace": "tenant-envoy",
-                                "app.kubernetes.io/name": "envoy"
-                            }
-                        }
-                    ]
-                },
-                {
-                    "fromEntities": ["host", "remote-node"],
-                    "toPorts": [
-                        {
-                            "ports": [
-                                { "port": "10443", "protocol": "TCP" },
-                                { "port": "8443", "protocol": "TCP" }
-                            ]
-                        }
-                    ]
-                }
-            ],
+            "ingress": ingress,
             "egress": egress,
         }
     })
@@ -215,30 +222,11 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
     let Some(url) = app.attestation.tls_certificate_broker_url.as_deref() else {
         return Vec::new();
     };
-    let Some((scheme, rest)) = url.trim().split_once("://") else {
+    let Some(authority) = parse_url_authority(url) else {
         return Vec::new();
     };
-    let Some(authority) = rest.split('/').next().map(str::trim) else {
-        return Vec::new();
-    };
-    if authority.is_empty() {
-        return Vec::new();
-    }
-    let host = authority
-        .strip_prefix('[')
-        .and_then(|value| value.split_once(']').map(|(host, _)| host))
-        .unwrap_or_else(|| authority.split(':').next().unwrap_or(authority))
-        .trim();
-    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
-        return Vec::new();
-    }
-    let port = explicit_url_port(authority).unwrap_or(match scheme {
-        "http" => 80,
-        "https" => 443,
-        _ => return Vec::new(),
-    });
 
-    if let Some((service_name, namespace)) = kubernetes_service_name(host) {
+    if let Some((service_name, namespace)) = kubernetes_service_name(authority.host) {
         let mut rules = vec![json!({
             "toServices": [
                 {
@@ -248,7 +236,7 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
                     }
                 }
             ],
-            "toPorts": [{ "ports": [{ "port": port.to_string(), "protocol": "TCP" }] }],
+            "toPorts": [{ "ports": [{ "port": authority.port.to_string(), "protocol": "TCP" }] }],
         })];
         if service_name == "cap-api" {
             rules.push(json!({
@@ -267,9 +255,78 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
     }
 
     vec![json!({
-        "toFQDNs": [{ "matchName": host }],
-        "toPorts": [{ "ports": [{ "port": port.to_string(), "protocol": "TCP" }] }],
+        "toFQDNs": [{ "matchName": authority.host }],
+        "toPorts": [{ "ports": [{ "port": authority.port.to_string(), "protocol": "TCP" }] }],
     })]
+}
+
+fn cap_api_tee_ingress_rule(app: &ConfidentialApp) -> Option<Value> {
+    let namespace = cap_api_namespace_for_app(app)?;
+    Some(json!({
+        "fromEndpoints": [
+            {
+                "matchLabels": {
+                    "io.kubernetes.pod.namespace": namespace,
+                    "app.kubernetes.io/name": "cap-api"
+                }
+            }
+        ],
+        "toPorts": [
+            {
+                "ports": [
+                    { "port": "8081", "protocol": "TCP" }
+                ]
+            }
+        ]
+    }))
+}
+
+fn cap_api_namespace_for_app(app: &ConfidentialApp) -> Option<&str> {
+    [
+        app.attestation.tls_certificate_broker_url.as_deref(),
+        app.attestation.workload_artifacts_url.as_deref(),
+        app.attestation.trustee_policy_url.as_deref(),
+        Some(app.api_url.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|url| {
+        let authority = parse_url_authority(url)?;
+        let (service_name, namespace) = kubernetes_service_name(authority.host)?;
+        (service_name == "cap-api").then_some(namespace)
+    })
+}
+
+struct ParsedUrlAuthority<'a> {
+    host: &'a str,
+    port: u16,
+}
+
+fn parse_url_authority(url: &str) -> Option<ParsedUrlAuthority<'_>> {
+    let Some((scheme, rest)) = url.trim().split_once("://") else {
+        return None;
+    };
+    let Some(authority) = rest.split('/').next().map(str::trim) else {
+        return None;
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let host = authority
+        .strip_prefix('[')
+        .and_then(|value| value.split_once(']').map(|(host, _)| host))
+        .unwrap_or_else(|| authority.split(':').next().unwrap_or(authority))
+        .trim();
+    if host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let port = explicit_url_port(authority).unwrap_or(match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    });
+
+    Some(ParsedUrlAuthority { host, port })
 }
 
 fn explicit_url_port(authority: &str) -> Option<u16> {
