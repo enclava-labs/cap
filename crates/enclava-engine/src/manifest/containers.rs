@@ -52,6 +52,7 @@ pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
 pub const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
+pub const ENCLAVA_LOG_RELAY_RUN_DIR: &str = "/run";
 pub const ENCLAVA_LOG_RELAY_TMP_DIR: &str = "/tmp";
 pub const ENCLAVA_LOG_RELAY_PORT: i32 = 8082;
 const CADDY_DNS01_BROKER_TLS_HANDOFF_SCRIPT: &str = concat!(
@@ -667,6 +668,12 @@ pub fn build_encrypted_log_relay_container(app: &ConfidentialApp) -> Option<Cont
             ),
         ]),
         volume_mounts: Some(vec![
+            VolumeMount {
+                name: "log-relay-run".to_string(),
+                mount_path: ENCLAVA_LOG_RELAY_RUN_DIR.to_string(),
+                read_only: Some(false),
+                ..Default::default()
+            },
             VolumeMount {
                 name: "logs".to_string(),
                 mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),

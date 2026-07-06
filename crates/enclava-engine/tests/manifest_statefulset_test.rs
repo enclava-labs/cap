@@ -279,6 +279,11 @@ fn statefulset_adds_encrypted_log_relay_only_with_log_key_metadata() {
         relay.command.as_ref().unwrap(),
         &vec!["/usr/local/bin/enclava-log-relay".to_string()]
     );
+    assert!(relay.volume_mounts.as_ref().unwrap().iter().any(|mount| {
+        mount.name == "log-relay-run"
+            && mount.mount_path == "/run"
+            && mount.read_only == Some(false)
+    }));
     assert!(
         relay
             .volume_mounts
@@ -292,6 +297,13 @@ fn statefulset_adds_encrypted_log_relay_only_with_log_key_metadata() {
             && mount.mount_path == "/tmp"
             && mount.read_only == Some(false)
     }));
+    assert!(
+        pod.volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|volume| volume.name == "log-relay-run")
+    );
     assert!(
         pod.volumes
             .as_ref()
