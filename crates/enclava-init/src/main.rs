@@ -10,7 +10,7 @@ use enclava_init::chown::{self, ExecIdentity, IdentityKind};
 use enclava_init::config::{Config, Mode, VolumeConfig};
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
-    kbs_fetch, luks, seeds, socket, tls_certificate, trustee_verify, unlock, writes,
+    kbs_fetch, log_relay, luks, seeds, socket, tls_certificate, trustee_verify, unlock, writes,
 };
 
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
@@ -81,6 +81,7 @@ fn run() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/enclava-init/config.toml"));
     let cfg = Config::load(&cfg_path).with_context(|| format!("loading {}", cfg_path.display()))?;
+    let _log_relay = start_log_relay_if_configured().context("starting encrypted log relay")?;
     record_stage("validating signed config").ok();
     validate_configmap_transport_against_signed_cc_init_data(&cfg)?;
     let stay_alive = stay_alive_enabled();
@@ -147,6 +148,19 @@ fn stay_alive_enabled() -> bool {
     std::env::var("ENCLAVA_INIT_STAY_ALIVE")
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
         .unwrap_or(false)
+}
+
+fn start_log_relay_if_configured() -> Result<Option<std::thread::JoinHandle<()>>> {
+    let Some(config) = log_relay::LogRelayConfig::from_env_optional() else {
+        return Ok(None);
+    };
+    tracing::info!(
+        bind = %config.bind,
+        spool_path = %config.spool_path.display(),
+        container = %config.container,
+        "starting encrypted log relay"
+    );
+    Ok(Some(log_relay::spawn(config)?))
 }
 
 fn ready_file_path() -> PathBuf {

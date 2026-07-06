@@ -52,7 +52,6 @@ pub const CADDY_INTERNAL_TLS_PORT: i32 = 10443;
 pub const CADDY_INTERNAL_RUNTIME_PATH: &str = "/run/enclava/caddy-runtime";
 pub const UNLOCK_SOCKET_PATH: &str = "/run/enclava-unlock/unlock.sock";
 pub const ENCLAVA_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
-pub const ENCLAVA_LOG_RELAY_TMP_DIR: &str = "/tmp";
 pub const ENCLAVA_LOG_RELAY_PORT: i32 = 8082;
 const CADDY_DNS01_BROKER_TLS_HANDOFF_SCRIPT: &str = concat!(
     "trap 'exit 0' TERM INT\n",
@@ -355,6 +354,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
             volume_mounts.push(VolumeMount {
                 name: "logs".to_string(),
                 mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
+                read_only: Some(false),
                 ..Default::default()
             });
         }
@@ -491,55 +491,74 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
 /// The sidecar needs device-mapper and mount namespace rights. App and caddy
 /// remain unprivileged and only consume the decrypted mountpoints.
 pub fn build_enclava_init_container(app: &ConfidentialApp) -> Container {
-    let wait_containers = format!(
-        "{},tenant-ingress,attestation-proxy",
-        app.primary_container().unwrap().name
-    );
+    let primary = app.primary_container().unwrap();
+    let wait_containers = format!("{},tenant-ingress,attestation-proxy", primary.name);
+    let mut env_vars = vec![
+        env("ENCLAVA_INIT_CONFIG", "/etc/enclava-init/config.toml"),
+        env("ENCLAVA_INIT_STAY_ALIVE", "true"),
+        env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
+        env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
+        env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "10001"),
+        env("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", &wait_containers),
+        env("KBS_FETCH_RETRIES", "120"),
+        env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
+        env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
+    ];
+    if app.log_encryption.is_some() {
+        env_vars.push(env(
+            "ENCLAVA_LOG_RELAY_BIND",
+            &format!("127.0.0.1:{ENCLAVA_LOG_RELAY_PORT}"),
+        ));
+        env_vars.push(env("ENCLAVA_LOG_RELAY_CONTAINER", &primary.name));
+        env_vars.push(env(
+            "ENCLAVA_LOG_RELAY_SPOOL_PATH",
+            &format!("{ENCLAVA_LOG_SPOOL_DIR}/{}.jsonl", primary.name),
+        ));
+    }
+    let mut volume_mounts = vec![
+        VolumeMount {
+            name: "state-mount".to_string(),
+            mount_path: "/state".to_string(),
+            mount_propagation: Some("Bidirectional".to_string()),
+            ..Default::default()
+        },
+        VolumeMount {
+            name: "tls-state-mount".to_string(),
+            mount_path: "/state/tls-state".to_string(),
+            mount_propagation: Some("Bidirectional".to_string()),
+            ..Default::default()
+        },
+        VolumeMount {
+            name: "unlock-socket".to_string(),
+            mount_path: "/run/enclava".to_string(),
+            ..Default::default()
+        },
+        VolumeMount {
+            name: "unlock-channel".to_string(),
+            mount_path: "/run/enclava-unlock".to_string(),
+            ..Default::default()
+        },
+        VolumeMount {
+            name: "enclava-init-config".to_string(),
+            mount_path: "/etc/enclava-init".to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        },
+    ];
+    if app.log_encryption.is_some() {
+        volume_mounts.push(VolumeMount {
+            name: "logs".to_string(),
+            mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
+            read_only: Some(false),
+            ..Default::default()
+        });
+    }
     Container {
         name: "enclava-init".to_string(),
         image: Some(enclava_init_image()),
         command: Some(vec!["/usr/local/bin/enclava-init".to_string()]),
-        env: Some(vec![
-            env("ENCLAVA_INIT_CONFIG", "/etc/enclava-init/config.toml"),
-            env("ENCLAVA_INIT_STAY_ALIVE", "true"),
-            env("ENCLAVA_INIT_READY_FILE", "/run/enclava/init-ready"),
-            env("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers"),
-            env("ENCLAVA_INIT_UNLOCK_SOCKET_GID", "10001"),
-            env("ENCLAVA_INIT_WAIT_FOR_CONTAINERS", &wait_containers),
-            env("KBS_FETCH_RETRIES", "120"),
-            env("KBS_FETCH_RETRY_SLEEP_SECONDS", "2"),
-            env("KBS_FETCH_REQUEST_TIMEOUT_SECONDS", "10"),
-        ]),
-        volume_mounts: Some(vec![
-            VolumeMount {
-                name: "state-mount".to_string(),
-                mount_path: "/state".to_string(),
-                mount_propagation: Some("Bidirectional".to_string()),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "tls-state-mount".to_string(),
-                mount_path: "/state/tls-state".to_string(),
-                mount_propagation: Some("Bidirectional".to_string()),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "unlock-socket".to_string(),
-                mount_path: "/run/enclava".to_string(),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "unlock-channel".to_string(),
-                mount_path: "/run/enclava-unlock".to_string(),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "enclava-init-config".to_string(),
-                mount_path: "/etc/enclava-init".to_string(),
-                read_only: Some(true),
-                ..Default::default()
-            },
-        ]),
+        env: Some(env_vars),
+        volume_mounts: Some(volume_mounts),
         volume_devices: Some(vec![
             VolumeDevice {
                 name: "state".to_string(),
@@ -607,6 +626,7 @@ pub fn build_enclava_tools_init_container() -> Container {
             VolumeMount {
                 name: "logs".to_string(),
                 mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
+                read_only: Some(false),
                 ..Default::default()
             },
         ]),
@@ -639,89 +659,6 @@ pub fn build_enclava_tools_init_container() -> Container {
         }),
         ..Default::default()
     }
-}
-
-pub fn build_encrypted_log_relay_container(app: &ConfidentialApp) -> Option<Container> {
-    app.log_encryption.as_ref()?;
-    let primary = app
-        .primary_container()
-        .expect("app must have a primary container");
-    Some(Container {
-        name: "encrypted-log-relay".to_string(),
-        image: Some(enclava_init_image()),
-        command: Some(vec!["/usr/local/bin/enclava-log-relay".to_string()]),
-        ports: Some(vec![ContainerPort {
-            container_port: ENCLAVA_LOG_RELAY_PORT,
-            name: Some("log-relay".to_string()),
-            ..Default::default()
-        }]),
-        env: Some(vec![
-            env(
-                "ENCLAVA_LOG_RELAY_BIND",
-                &format!("127.0.0.1:{ENCLAVA_LOG_RELAY_PORT}"),
-            ),
-            env("ENCLAVA_LOG_RELAY_CONTAINER", &primary.name),
-            env(
-                "ENCLAVA_LOG_RELAY_SPOOL_PATH",
-                &format!("{ENCLAVA_LOG_SPOOL_DIR}/{}.jsonl", primary.name),
-            ),
-        ]),
-        volume_mounts: Some(vec![
-            VolumeMount {
-                name: "logs".to_string(),
-                mount_path: ENCLAVA_LOG_SPOOL_DIR.to_string(),
-                read_only: Some(false),
-                ..Default::default()
-            },
-            VolumeMount {
-                name: "log-relay-tmp".to_string(),
-                mount_path: ENCLAVA_LOG_RELAY_TMP_DIR.to_string(),
-                read_only: Some(false),
-                ..Default::default()
-            },
-        ]),
-        security_context: Some(SecurityContext {
-            privileged: Some(false),
-            allow_privilege_escalation: Some(false),
-            run_as_user: Some(10001),
-            run_as_group: Some(10001),
-            run_as_non_root: Some(true),
-            read_only_root_filesystem: Some(false),
-            capabilities: Some(Capabilities {
-                drop: Some(vec!["ALL".to_string()]),
-                add: None,
-            }),
-            ..Default::default()
-        }),
-        readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
-            http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
-                path: Some("/health".to_string()),
-                port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(
-                    ENCLAVA_LOG_RELAY_PORT,
-                ),
-                scheme: Some("HTTP".to_string()),
-                ..Default::default()
-            }),
-            period_seconds: Some(10),
-            ..Default::default()
-        }),
-        resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
-            requests: Some({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity("16Mi".to_string()));
-                m.insert("cpu".to_string(), Quantity("10m".to_string()));
-                m
-            }),
-            limits: Some({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity("64Mi".to_string()));
-                m.insert("cpu".to_string(), Quantity("50m".to_string()));
-                m
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    })
 }
 
 fn enclava_init_ready_probe() -> Probe {

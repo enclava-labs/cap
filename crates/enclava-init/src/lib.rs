@@ -16,6 +16,7 @@ pub mod chown;
 pub mod config;
 pub mod errors;
 pub mod kbs_fetch;
+pub mod log_relay;
 pub mod luks;
 pub mod secrets;
 pub mod seeds;

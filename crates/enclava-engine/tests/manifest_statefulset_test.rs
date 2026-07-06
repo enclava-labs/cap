@@ -220,7 +220,7 @@ fn statefulset_phase5_uses_only_steady_state_containers() {
 }
 
 #[test]
-fn statefulset_adds_encrypted_log_relay_only_with_log_key_metadata() {
+fn statefulset_configures_enclava_init_log_relay_only_with_log_key_metadata() {
     let without_logs = generate_statefulset(&sample_app());
     let without_logs_pod = without_logs
         .spec
@@ -236,6 +236,16 @@ fn statefulset_adds_encrypted_log_relay_only_with_log_key_metadata() {
             .iter()
             .any(|c| c.name == "encrypted-log-relay")
     );
+    let without_logs_init = without_logs_pod
+        .containers
+        .iter()
+        .find(|c| c.name == "enclava-init")
+        .unwrap();
+    assert!(!without_logs_init.env.as_ref().unwrap().iter().any(|env| {
+        env.name == "ENCLAVA_LOG_RELAY_SPOOL_PATH"
+            || env.name == "ENCLAVA_LOG_RELAY_BIND"
+            || env.name == "ENCLAVA_LOG_RELAY_CONTAINER"
+    }));
 
     let mut app = sample_app();
     app.log_encryption = Some(LogEncryptionConfig {
@@ -247,11 +257,16 @@ fn statefulset_adds_encrypted_log_relay_only_with_log_key_metadata() {
     let sts = generate_statefulset(&app);
     let pod = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
     let app_container = pod.containers.iter().find(|c| c.name == "web").unwrap();
-    let relay = pod
+    let enclava_init = pod
         .containers
         .iter()
-        .find(|c| c.name == "encrypted-log-relay")
-        .expect("encrypted log relay sidecar");
+        .find(|c| c.name == "enclava-init")
+        .expect("enclava-init sidecar");
+    assert!(
+        !pod.containers
+            .iter()
+            .any(|c| c.name == "encrypted-log-relay")
+    );
 
     assert!(app_container.env.as_ref().unwrap().iter().any(|env| {
         env.name == "ENCLAVA_LOG_ENCRYPTION_PUBLIC_KEY_BASE64URL"
@@ -273,51 +288,60 @@ fn statefulset_adds_encrypted_log_relay_only_with_log_key_metadata() {
             .as_ref()
             .unwrap()
             .iter()
-            .any(|mount| { mount.name == "logs" && mount.mount_path == "/run/enclava-logs" })
+            .any(|mount| {
+                mount.name == "logs"
+                    && mount.mount_path == "/run/enclava-logs"
+                    && mount.read_only == Some(false)
+            })
     );
     assert_eq!(
-        relay.command.as_ref().unwrap(),
-        &vec!["/usr/local/bin/enclava-log-relay".to_string()]
+        enclava_init
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|env| env.name == "ENCLAVA_LOG_RELAY_BIND")
+            .and_then(|env| env.value.as_deref()),
+        Some("127.0.0.1:8082")
+    );
+    assert_eq!(
+        enclava_init
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|env| env.name == "ENCLAVA_LOG_RELAY_CONTAINER")
+            .and_then(|env| env.value.as_deref()),
+        Some("web")
+    );
+    assert_eq!(
+        enclava_init
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|env| env.name == "ENCLAVA_LOG_RELAY_SPOOL_PATH")
+            .and_then(|env| env.value.as_deref()),
+        Some("/run/enclava-logs/web.jsonl")
     );
     assert!(
-        relay
+        enclava_init
             .volume_mounts
             .as_ref()
             .unwrap()
             .iter()
-            .any(|mount| { mount.name == "logs" && mount.read_only == Some(false) })
+            .any(|mount| {
+                mount.name == "logs"
+                    && mount.mount_path == "/run/enclava-logs"
+                    && mount.read_only == Some(false)
+            })
     );
-    assert!(relay.volume_mounts.as_ref().unwrap().iter().any(|mount| {
-        mount.name == "log-relay-tmp"
-            && mount.mount_path == "/tmp"
-            && mount.read_only == Some(false)
-    }));
     assert!(
-        pod.volumes
+        !pod.volumes
             .as_ref()
             .unwrap()
             .iter()
             .any(|volume| volume.name == "log-relay-tmp")
-    );
-    assert_eq!(
-        relay
-            .security_context
-            .as_ref()
-            .unwrap()
-            .read_only_root_filesystem,
-        Some(false)
-    );
-    assert_eq!(
-        relay.security_context.as_ref().unwrap().run_as_user,
-        Some(10001)
-    );
-    assert_eq!(
-        relay.security_context.as_ref().unwrap().run_as_group,
-        Some(10001)
-    );
-    assert_eq!(
-        relay.security_context.as_ref().unwrap().run_as_non_root,
-        Some(true)
     );
 }
 

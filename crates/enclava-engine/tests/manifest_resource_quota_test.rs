@@ -32,7 +32,7 @@ fn resource_quota_has_memory_limits() {
 }
 
 #[test]
-fn resource_quota_includes_encrypted_log_relay_resources() {
+fn resource_quota_is_unchanged_by_encrypted_log_relay() {
     let mut app = sample_app();
     app.log_encryption = Some(LogEncryptionConfig {
         algorithm: "x25519-hpke-v1".to_string(),
@@ -43,10 +43,10 @@ fn resource_quota_includes_encrypted_log_relay_resources() {
 
     let rq = generate_resource_quota(&app);
     let hard = rq.spec.as_ref().unwrap().hard.as_ref().unwrap();
-    assert_eq!(hard.get("requests.cpu").unwrap().0, "1510m");
-    assert_eq!(hard.get("limits.cpu").unwrap().0, "3300m");
-    assert_eq!(hard.get("requests.memory").unwrap().0, "4944Mi");
-    assert_eq!(hard.get("limits.memory").unwrap().0, "6208Mi");
+    assert_eq!(hard.get("requests.cpu").unwrap().0, "1500m");
+    assert_eq!(hard.get("limits.cpu").unwrap().0, "3250m");
+    assert_eq!(hard.get("requests.memory").unwrap().0, "4928Mi");
+    assert_eq!(hard.get("limits.memory").unwrap().0, "6Gi");
 }
 
 #[test]
