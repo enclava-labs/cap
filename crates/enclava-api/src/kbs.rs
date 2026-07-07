@@ -1,9 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::ConfigMap;
-use kube::api::{Api, Patch, PatchParams};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::api::{Api, DeleteParams, Patch, PatchParams};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use tokio::time::{Duration, Instant};
@@ -311,16 +312,78 @@ pub async fn reconcile_policy(
     Ok(())
 }
 
+/// Generates the per-app ConfigMap name from the shared base name and app ID.
+fn app_signed_policy_configmap_name(base: &str, app_id: Uuid) -> String {
+    let short = &app_id.to_string()[..8];
+    format!("{base}-app-{short}")
+}
+
+/// Write the deploying app's signed policy artifact to a dedicated per-app
+/// ConfigMap and then *best-effort* update the shared aggregate ConfigMap.
+///
+/// Per-app ConfigMaps are the scalable long-term store: each app gets its own
+/// `{configmap}-app-{id8}` ConfigMap containing only that app's retained
+/// artifacts, so there is no shared size budget.  The aggregate ConfigMap is
+/// still updated when all artifacts fit within `signed_policy_max_bytes` so
+/// that legacy KBS configurations continue to work during migration.  If the
+/// aggregate exceeds the budget it is left unchanged and only a warning is
+/// logged; deployments are never rejected on account of the shared budget
+/// because every signed deployment already carries its policy via local file
+/// mount.
 pub async fn reconcile_signed_policy_artifacts(
     db: &PgPool,
     config: Option<&KbsPolicyConfig>,
+    app_id: Uuid,
     extra_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
 ) -> Result<(), KbsPolicyError> {
     let Some(config) = config else {
         return Err(KbsPolicyError::NotConfigured);
     };
 
-    let rows: Vec<SignedPolicyArtifactRow> = sqlx::query_as(
+    // ── 1. Per-app ConfigMap (always written, no shared budget) ───────
+    if let Some(extra) = extra_artifact {
+        let app_rows: Vec<SignedPolicyArtifactRow> = sqlx::query_as(
+            r#"
+            SELECT signed_policy_artifact, app_artifact_rank
+            FROM (
+                SELECT
+                    wa.signed_policy_artifact,
+                    d.created_at AS deployment_created_at,
+                    wa.created_at AS artifact_created_at,
+                    ROW_NUMBER() OVER (
+                        ORDER BY d.created_at DESC, wa.created_at DESC
+                    ) AS app_artifact_rank
+                FROM workload_artifacts wa
+                JOIN deployments d ON d.id = wa.deploy_id AND d.app_id = wa.app_id
+                WHERE d.app_id = $1
+                  AND d.status::text IN ('pending', 'applying', 'watching', 'healthy')
+            ) ranked_active_artifacts
+            WHERE app_artifact_rank <= $2
+            ORDER BY app_artifact_rank ASC, deployment_created_at DESC, artifact_created_at DESC
+            "#,
+        )
+        .bind(app_id)
+        .bind(config.signed_policy_retention)
+        .fetch_all(db)
+        .await?;
+
+        let mut app_artifacts: Vec<crate::signing_service::SignedPolicyArtifact> =
+            vec![extra.clone()];
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(extra.metadata.descriptor_core_hash.clone());
+        for row in app_rows {
+            let artifact: crate::signing_service::SignedPolicyArtifact =
+                serde_json::from_value(row.signed_policy_artifact)?;
+            if seen.insert(artifact.metadata.descriptor_core_hash.clone()) {
+                app_artifacts.push(artifact);
+            }
+        }
+
+        write_app_signed_policy_configmap(config, app_id, &app_artifacts).await?;
+    }
+
+    // ── 2. Shared aggregate ConfigMap (best-effort, non-fatal) ────────
+    let all_rows: Vec<SignedPolicyArtifactRow> = sqlx::query_as(
         r#"
         SELECT signed_policy_artifact, app_artifact_rank
         FROM (
@@ -344,11 +407,11 @@ pub async fn reconcile_signed_policy_artifacts(
     .fetch_all(db)
     .await?;
 
-    if rows.is_empty() && extra_artifact.is_none() {
+    if all_rows.is_empty() && extra_artifact.is_none() {
         return Ok(());
     }
 
-    let mut candidates = Vec::with_capacity(rows.len() + usize::from(extra_artifact.is_some()));
+    let mut candidates = Vec::with_capacity(all_rows.len() + usize::from(extra_artifact.is_some()));
     if let Some(extra_artifact) = extra_artifact {
         candidates.push(SignedPolicyArtifactCandidate {
             artifact: extra_artifact.clone(),
@@ -356,7 +419,8 @@ pub async fn reconcile_signed_policy_artifacts(
         });
     }
     candidates.extend(
-        rows.into_iter()
+        all_rows
+            .into_iter()
             .map(|row| {
                 serde_json::from_value(row.signed_policy_artifact).map(|artifact| {
                     SignedPolicyArtifactCandidate {
@@ -369,40 +433,131 @@ pub async fn reconcile_signed_policy_artifacts(
     );
 
     let candidate_count = candidates.len();
-    let artifacts =
-        select_signed_policy_artifacts_for_policy_body(candidates, config.signed_policy_max_bytes)?;
+    match select_signed_policy_artifacts_for_policy_body(candidates, config.signed_policy_max_bytes)
+    {
+        Ok(artifacts) => {
+            let client = kube::Client::try_default().await?;
+            let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
+            let cm = cm_api.get(&config.configmap_name).await?;
+            let mut data = cm.data.unwrap_or_default();
+            let next_policy = signed_policy_artifact_policy_body(&artifacts)?;
+            tracing::info!(
+                candidate_artifacts = candidate_count,
+                selected_artifacts = artifacts.len(),
+                policy_bytes = next_policy.len(),
+                max_policy_bytes = config.signed_policy_max_bytes,
+                "reconciled bounded signed KBS policy artifacts (shared aggregate)"
+            );
 
-    let client = kube::Client::try_default().await?;
-    let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
-    let cm = cm_api.get(&config.configmap_name).await?;
-    let mut data = cm.data.unwrap_or_default();
-    let next_policy = signed_policy_artifact_policy_body(&artifacts)?;
-    tracing::info!(
-        candidate_artifacts = candidate_count,
-        selected_artifacts = artifacts.len(),
-        policy_bytes = next_policy.len(),
-        max_policy_bytes = config.signed_policy_max_bytes,
-        "reconciled bounded signed KBS policy artifacts"
-    );
-
-    if data.get(&config.policy_key) != Some(&next_policy) {
-        data.insert(config.policy_key.clone(), next_policy);
-        let patch = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "name": config.configmap_name,
-                "namespace": config.namespace,
-            },
-            "data": data,
-        });
-        let pp = PatchParams::apply("enclava-platform").force();
-        cm_api
-            .patch(&config.configmap_name, &pp, &Patch::Apply(&patch))
-            .await?;
-        restart_trustee_deployment(client, config).await?;
+            if data.get(&config.policy_key) != Some(&next_policy) {
+                data.insert(config.policy_key.clone(), next_policy);
+                let patch = serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": config.configmap_name,
+                        "namespace": config.namespace,
+                    },
+                    "data": data,
+                });
+                let pp = PatchParams::apply("enclava-platform").force();
+                cm_api
+                    .patch(&config.configmap_name, &pp, &Patch::Apply(&patch))
+                    .await?;
+                restart_trustee_deployment(client, config).await?;
+            }
+        }
+        Err(KbsPolicyError::SignedPolicyBudgetExceeded {
+            required_artifacts,
+            policy_bytes,
+            max_policy_bytes,
+        }) => {
+            tracing::warn!(
+                required_artifacts,
+                policy_bytes,
+                max_policy_bytes,
+                "shared signed-policy aggregate exceeds byte budget; \
+                 skipping shared ConfigMap update (per-app ConfigMaps are authoritative)"
+            );
+        }
+        Err(other) => return Err(other),
     }
 
+    Ok(())
+}
+
+async fn write_app_signed_policy_configmap(
+    config: &KbsPolicyConfig,
+    app_id: Uuid,
+    artifacts: &[crate::signing_service::SignedPolicyArtifact],
+) -> Result<(), KbsPolicyError> {
+    let cm_name = app_signed_policy_configmap_name(&config.configmap_name, app_id);
+    let next_policy = signed_policy_artifact_policy_body(artifacts)?;
+    let client = kube::Client::try_default().await?;
+    let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
+
+    let mut data = BTreeMap::new();
+    data.insert(config.policy_key.clone(), next_policy.clone());
+
+    let cm = ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(cm_name.clone()),
+            namespace: Some(config.namespace.clone()),
+            labels: Some(BTreeMap::from([
+                ("enclava.dev/managed-by".to_string(), "cap".to_string()),
+                (
+                    "enclava.dev/component".to_string(),
+                    "signed-policy".to_string(),
+                ),
+                ("enclava.dev/app-id".to_string(), app_id.to_string()),
+            ])),
+            ..Default::default()
+        },
+        data: Some(data),
+        ..Default::default()
+    };
+
+    let pp = PatchParams::apply("enclava-platform").force();
+    cm_api.patch(&cm_name, &pp, &Patch::Apply(&cm)).await?;
+
+    tracing::info!(
+        configmap = %cm_name,
+        app_id = %app_id,
+        policy_bytes = next_policy.len(),
+        artifacts = artifacts.len(),
+        "wrote per-app signed policy ConfigMap"
+    );
+    Ok(())
+}
+
+/// Remove the per-app signed-policy ConfigMap when an app is destroyed.
+pub async fn delete_app_signed_policy_configmap(
+    config: Option<&KbsPolicyConfig>,
+    app_id: Uuid,
+) -> Result<(), KbsPolicyError> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let cm_name = app_signed_policy_configmap_name(&config.configmap_name, app_id);
+    let client = kube::Client::try_default().await?;
+    let cm_api: Api<ConfigMap> = Api::namespaced(client, &config.namespace);
+    match cm_api.delete(&cm_name, &DeleteParams::default()).await {
+        Ok(_) => {
+            tracing::info!(
+                configmap = %cm_name,
+                app_id = %app_id,
+                "deleted per-app signed policy ConfigMap"
+            );
+        }
+        Err(kube::Error::Api(err)) if err.code == 404 => {
+            tracing::debug!(
+                configmap = %cm_name,
+                app_id = %app_id,
+                "per-app signed policy ConfigMap already absent"
+            );
+        }
+        Err(err) => return Err(KbsPolicyError::Kube(err)),
+    }
     Ok(())
 }
 
@@ -1056,5 +1211,12 @@ owner_resource_bindings := {}
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn app_configmap_name_uses_first_8_chars_of_uuid() {
+        let app_id = Uuid::parse_str("0dd1d0dd-1b9d-42b3-b3b9-d2f50260657f").unwrap();
+        let name = app_signed_policy_configmap_name("resource-policy", app_id);
+        assert_eq!(name, "resource-policy-app-0dd1d0dd");
     }
 }

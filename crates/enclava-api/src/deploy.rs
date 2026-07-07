@@ -1355,6 +1355,7 @@ pub async fn apply_deployment_manifests(
             crate::kbs::reconcile_signed_policy_artifacts(
                 &pool,
                 kbs_policy_config.as_ref(),
+                app.id,
                 Some(signed_policy_artifact),
             )
             .await?;

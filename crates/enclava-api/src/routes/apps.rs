@@ -912,6 +912,16 @@ pub async fn delete_app(
                 ),
             )
         })?;
+    crate::kbs::delete_app_signed_policy_configmap(state.kbs_policy.as_ref(), app.id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(
+                    serde_json::json!({"error": format!("failed to delete per-app signed policy ConfigMap: {}", e)}),
+                ),
+            )
+        })?;
 
     sqlx::query("DELETE FROM apps WHERE id = $1")
         .bind(app.id)
