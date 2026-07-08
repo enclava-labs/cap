@@ -65,6 +65,10 @@ fn internal_routes() -> Router<AppState> {
             axum::routing::get(routes::internal::list_paas_cluster_status),
         )
         .route(
+            "/internal/paas/platform/deployment-context",
+            axum::routing::get(routes::internal::paas_deployment_context),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}",
             axum::routing::put(routes::internal::upsert_paas_org),
         )
@@ -564,6 +568,7 @@ pub(crate) mod test_support {
                 platform_trustee_policy_pubkey_hex: Some("11".repeat(32)),
                 signing_service_pubkey_hex: Some("11".repeat(32)),
             }),
+            platform_release_envelope: None,
             dns: None,
             acme: None,
             kbs_policy: None,

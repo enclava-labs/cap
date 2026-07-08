@@ -87,6 +87,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
         }),
+        platform_release_envelope: None,
         dns: None,
         acme: None,
         kbs_policy: None,

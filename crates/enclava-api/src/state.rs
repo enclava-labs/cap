@@ -2,6 +2,7 @@ use crate::acme::AcmeConfig;
 use crate::clients::RegistryClient;
 use crate::dns::DnsConfig;
 use crate::kbs::KbsPolicyConfig;
+use crate::platform_release::PlatformReleaseEnvelope;
 use crate::signing_service::SigningServiceClient;
 use ed25519_dalek::SigningKey;
 use enclava_engine::types::AttestationConfig;
@@ -174,6 +175,9 @@ pub struct AppState {
     pub tee_http_client: reqwest::Client,
     /// Sidecar/runtime settings used when generating Kubernetes manifests.
     pub attestation: Option<AttestationConfig>,
+    /// Signed public platform release envelope used to derive
+    /// runtime-sensitive descriptor inputs for this API instance.
+    pub platform_release_envelope: Option<PlatformReleaseEnvelope>,
     /// Cloudflare DNS settings for CAP-managed tenant host records.
     pub dns: Option<DnsConfig>,
     /// ACME settings for the workload-attested DNS-01 certificate broker.

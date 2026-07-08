@@ -28,7 +28,7 @@ use enclava_cli::keyring::{
     store_trusted_owner, verify_keyring,
 };
 use enclava_cli::keys;
-use enclava_cli::platform_release::PlatformRelease;
+use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, verify_envelope};
 use enclava_cli::tee_client::TeeClient;
 use enclava_common::log_encryption::{
     EncryptedLogFrame, LOG_ENCRYPTION_ALGORITHM, decrypt_log_frame, generate_log_keypair,

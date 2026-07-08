@@ -14,6 +14,43 @@ fn env_hex32(name: &str) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>>
         .transpose()
 }
 
+pub(crate) fn platform_release_from_deployment_context(
+    deployment_context: &DeploymentContextResponse,
+) -> Result<Option<PlatformRelease>, Box<dyn std::error::Error>> {
+    platform_release_from_deployment_context_with_verifier(deployment_context, verify_envelope)
+}
+
+pub(crate) fn platform_release_from_deployment_context_with_verifier<Verify, Err>(
+    deployment_context: &DeploymentContextResponse,
+    verify: Verify,
+) -> Result<Option<PlatformRelease>, Box<dyn std::error::Error>>
+where
+    Verify: FnOnce(PlatformReleaseEnvelope) -> Result<PlatformRelease, Err>,
+    Err: std::fmt::Display,
+{
+    let Some(envelope) = deployment_context.platform_release_envelope.clone() else {
+        return Ok(None);
+    };
+    let release = verify(envelope).map_err(|err| {
+        format!("platform deployment context included an invalid platform_release_envelope: {err}")
+    })?;
+    if let Some(expected) = deployment_context
+        .current_platform_release_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if expected != release.platform_release_version {
+            return Err(format!(
+                "platform deployment context release id `{expected}` does not match signed release `{}`",
+                release.platform_release_version
+            )
+            .into());
+        }
+    }
+    Ok(Some(release))
+}
+
 fn parse_pubkey(hex_in: &str) -> Result<VerifyingKey, Box<dyn std::error::Error>> {
     let bytes = hex::decode(hex_in)?;
     let arr: [u8; 32] = bytes
@@ -480,7 +517,11 @@ pub(crate) async fn build_signed_deploy_blobs(
         );
     }
 
-    let release = PlatformRelease::load_verified()?;
+    let deployment_context = api.deployment_context().await?;
+    let release = match platform_release_from_deployment_context(&deployment_context)? {
+        Some(release) => release,
+        None => PlatformRelease::load_verified()?,
+    };
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
     let _signing_service_pubkey = release.signing_service_pubkey_bytes()?;
     let proxy_image = enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?;
@@ -488,7 +529,6 @@ pub(crate) async fn build_signed_deploy_blobs(
     if !proxy_image.has_digest() || !caddy_image.has_digest() {
         return Err("platform release sidecar anchors must be digest-pinned".into());
     }
-    let deployment_context = api.deployment_context().await?;
     let api_signing_pubkey = deployment_context.api_signing_pubkey.trim().to_string();
     if api_signing_pubkey.is_empty() {
         return Err("platform deployment context did not include api_signing_pubkey".into());
