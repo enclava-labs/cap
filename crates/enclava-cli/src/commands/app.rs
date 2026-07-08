@@ -869,9 +869,7 @@ pub(crate) async fn claim_initial_ownership(
     };
 
     if let Some(mnemonic) = result.and_then(|result| result.mnemonic) {
-        eprintln!();
-        eprintln!("IMPORTANT: Save your recovery mnemonic. This is shown ONCE.");
-        eprintln!("{mnemonic}");
+        crate::commands::ownership::present_recovery_mnemonic(&mnemonic)?;
     }
 
     Ok(())

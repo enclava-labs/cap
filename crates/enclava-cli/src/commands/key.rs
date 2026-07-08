@@ -216,6 +216,9 @@ async fn status() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Keyring trust: {state}");
                 }
             }
+            println!(
+                "Note: this backs up deploy keys only — the LUKS recovery mnemonic (shown once at deploy/claim) is separate and is NOT stored or backed up by the CLI."
+            );
         }
         None => {
             println!("Recovery seed: missing");
@@ -292,6 +295,9 @@ async fn backup(
     std::fs::rename(&tmp, &output)?;
     println!("Encrypted recovery backup written to {}", output.display());
     println!("Seed fingerprint: {}", keys::seed_fingerprint(&seed));
+    println!(
+        "Note: this backup covers deploy keys only — the LUKS recovery mnemonic (shown once at deploy/claim) is separate and is NOT stored or restored by the CLI."
+    );
     Ok(())
 }
 
@@ -341,5 +347,8 @@ async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::
     }
     println!("Seed fingerprint: {}", keys::seed_fingerprint(&seed));
     println!("Verified owner key for {org_name}: {owner_fingerprint}");
+    println!(
+        "Note: this restores deploy keys only — the LUKS recovery mnemonic (shown once at deploy/claim) is separate and is NOT stored or restored by the CLI."
+    );
     Ok(())
 }
