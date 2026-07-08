@@ -34,19 +34,19 @@ where
     let release = verify(envelope).map_err(|err| {
         format!("platform deployment context included an invalid platform_release_envelope: {err}")
     })?;
-    if let Some(expected) = deployment_context
+    let expected_release_id = deployment_context
         .current_platform_release_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty());
+    if let Some(expected) = expected_release_id
+        .filter(|expected| *expected != release.platform_release_version.as_str())
     {
-        if expected != release.platform_release_version {
-            return Err(format!(
-                "platform deployment context release id `{expected}` does not match signed release `{}`",
-                release.platform_release_version
-            )
-            .into());
-        }
+        return Err(format!(
+            "platform deployment context release id `{expected}` does not match signed release `{}`",
+            release.platform_release_version
+        )
+        .into());
     }
     Ok(Some(release))
 }
