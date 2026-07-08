@@ -11,7 +11,7 @@ use enclava_api::{
     auth::jwt,
     build_router,
     dns::DnsConfig,
-    platform_release::PlatformRelease,
+    platform_release::{PlatformRelease, PlatformReleaseEnvelope},
     state::{AppState, CapManagementMode, InternalAuthConfig},
 };
 
@@ -315,12 +315,13 @@ fn platform_release_enabled(trustee_policy_read_available: bool) -> bool {
         || env_nonempty("ENCLAVA_PLATFORM_RELEASE_PATH").is_some()
 }
 
-fn load_platform_release(enabled: bool) -> anyhow::Result<Option<PlatformRelease>> {
+fn load_platform_release(enabled: bool) -> anyhow::Result<Option<PlatformReleaseEnvelope>> {
     if !enabled {
         return Ok(None);
     }
-    let release = PlatformRelease::load_verified()
+    let envelope = PlatformReleaseEnvelope::load_verified()
         .map_err(|e| anyhow::anyhow!("failed to load signed platform release: {e}"))?;
+    let release = &envelope.payload;
     if release.expected_runtime_class
         != enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
     {
@@ -330,7 +331,7 @@ fn load_platform_release(enabled: bool) -> anyhow::Result<Option<PlatformRelease
             enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
         );
     }
-    Ok(Some(release))
+    Ok(Some(envelope))
 }
 
 fn release_env_value(
@@ -550,7 +551,7 @@ async fn main() {
     }
 
     let trustee_policy_read_available = env_flag("TRUSTEE_POLICY_READ_AVAILABLE");
-    let platform_release =
+    let platform_release_envelope =
         match load_platform_release(platform_release_enabled(trustee_policy_read_available)) {
             Ok(release) => release,
             Err(e) => {
@@ -558,7 +559,8 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-    if let Some(release) = &platform_release {
+    if let Some(envelope) = &platform_release_envelope {
+        let release = &envelope.payload;
         tracing::info!(
             platform_release_version = %release.platform_release_version,
             genpolicy_version = %release.genpolicy_version,
@@ -594,9 +596,9 @@ async fn main() {
 
     let startup_proxy_image = match release_env_value(
         "ATTESTATION_PROXY_IMAGE",
-        platform_release
+        platform_release_envelope
             .as_ref()
-            .map(|release| release.attestation_proxy_image.as_str()),
+            .map(|envelope| envelope.payload.attestation_proxy_image.as_str()),
         false,
     ) {
         Ok(value) => value,
@@ -607,9 +609,9 @@ async fn main() {
     };
     let startup_caddy_image = match release_env_value(
         "CADDY_INGRESS_IMAGE",
-        platform_release
+        platform_release_envelope
             .as_ref()
-            .map(|release| release.caddy_ingress_image.as_str()),
+            .map(|envelope| envelope.payload.caddy_ingress_image.as_str()),
         false,
     ) {
         Ok(value) => value,
@@ -667,8 +669,12 @@ async fn main() {
 
     let hmac_key = load_hmac_key().expect("failed to load session HMAC key");
     tracing::info!("Loaded session HMAC key");
-    let attestation = load_attestation_config(platform_release.as_ref())
-        .expect("failed to load attestation config");
+    let attestation = load_attestation_config(
+        platform_release_envelope
+            .as_ref()
+            .map(|envelope| &envelope.payload),
+    )
+    .expect("failed to load attestation config");
     let dns = load_dns_config().expect("failed to load DNS config");
     let acme = load_acme_config(attestation.as_ref()).expect("failed to load ACME config");
     let kbs_policy = enclava_api::kbs::config_from_env();
@@ -686,9 +692,9 @@ async fn main() {
         "PLATFORM_SIGNING_SERVICE_URL",
         release_env_value(
             "PLATFORM_SIGNING_SERVICE_URL",
-            platform_release
+            platform_release_envelope
                 .as_ref()
-                .map(|release| release.signing_service_url.as_str()),
+                .map(|envelope| envelope.payload.signing_service_url.as_str()),
             trustee_required,
         )
         .expect("failed to load platform signing service URL"),
@@ -757,6 +763,7 @@ async fn main() {
         trustee_http_client,
         tee_http_client,
         attestation,
+        platform_release_envelope,
         dns,
         acme,
         kbs_policy,

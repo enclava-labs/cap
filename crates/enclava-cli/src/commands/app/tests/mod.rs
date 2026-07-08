@@ -1,5 +1,7 @@
 use super::*;
+use crate::commands::app::signing::platform_release_from_deployment_context_with_verifier;
 use enclava_cli::app_config::{AppSection, ResourcesSection, StorageSection, UnlockSection};
+use enclava_cli::platform_release::PlatformReleaseEnvelope;
 
 fn test_release() -> PlatformRelease {
     PlatformRelease {
@@ -82,7 +84,61 @@ fn test_deployment_context() -> DeploymentContextResponse {
     DeploymentContextResponse {
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
         tls_certificate_broker_url: None,
+        current_platform_release_id: None,
+        platform_release_envelope: None,
     }
+}
+
+#[test]
+fn deployment_context_platform_release_is_verified_and_selected() {
+    let envelope = PlatformReleaseEnvelope {
+        payload: test_release(),
+        signature: "33".repeat(64),
+        signing_pubkey: "44".repeat(32),
+    };
+    let expected_release_id = envelope.payload.platform_release_version.clone();
+    let deployment_context = DeploymentContextResponse {
+        api_signing_pubkey: "test-api-signing-pubkey".to_string(),
+        tls_certificate_broker_url: None,
+        current_platform_release_id: Some(expected_release_id.clone()),
+        platform_release_envelope: Some(envelope),
+    };
+
+    let release =
+        platform_release_from_deployment_context_with_verifier(&deployment_context, |envelope| {
+            Ok::<_, &'static str>(envelope.payload)
+        })
+        .expect("context release verifies")
+        .expect("context release present");
+
+    assert_eq!(release.platform_release_version, expected_release_id);
+}
+
+#[test]
+fn deployment_context_platform_release_tampering_fails_closed() {
+    let envelope = PlatformReleaseEnvelope {
+        payload: test_release(),
+        signature: "33".repeat(64),
+        signing_pubkey: "44".repeat(32),
+    };
+    let deployment_context = DeploymentContextResponse {
+        api_signing_pubkey: "test-api-signing-pubkey".to_string(),
+        tls_certificate_broker_url: None,
+        current_platform_release_id: Some(envelope.payload.platform_release_version.clone()),
+        platform_release_envelope: Some(envelope),
+    };
+
+    let err =
+        platform_release_from_deployment_context_with_verifier(&deployment_context, |_envelope| {
+            Err::<PlatformRelease, _>("bad signature")
+        })
+        .expect_err("invalid context release must not fall back to bundled release")
+        .to_string();
+
+    assert!(
+        err.contains("invalid platform_release_envelope"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -149,6 +205,8 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
             "http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
                 .to_string(),
         ),
+        current_platform_release_id: None,
+        platform_release_envelope: None,
     };
 
     let app = confidential_app_for_cc_hash(

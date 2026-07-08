@@ -6,6 +6,8 @@ use enclava_engine::types::LogEncryptionConfig;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::IpAddr};
 
+use crate::platform_release::PlatformReleaseEnvelope;
+
 // --- Auth ---
 
 #[derive(Debug, Serialize)]
@@ -465,6 +467,10 @@ pub struct DeploymentContextResponse {
     pub api_signing_pubkey: String,
     #[serde(default)]
     pub tls_certificate_broker_url: Option<String>,
+    #[serde(default)]
+    pub current_platform_release_id: Option<String>,
+    #[serde(default)]
+    pub platform_release_envelope: Option<PlatformReleaseEnvelope>,
 }
 
 // --- Status ---

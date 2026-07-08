@@ -4,12 +4,17 @@ use axum::{Json, extract::State, http::StatusCode};
 use serde::Serialize;
 
 use crate::auth::{middleware::AuthContext, scopes};
+use crate::platform_release::PlatformReleaseEnvelope;
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
 pub struct DeploymentContextResponse {
     pub api_signing_pubkey: String,
     pub tls_certificate_broker_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_platform_release_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform_release_envelope: Option<PlatformReleaseEnvelope>,
 }
 
 /// GET /platform/deployment-context -- runtime values needed for descriptor signing.
@@ -19,13 +24,22 @@ pub async fn deployment_context(
 ) -> Result<Json<DeploymentContextResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
 
-    Ok(Json(DeploymentContextResponse {
+    Ok(Json(deployment_context_response(&state)))
+}
+
+pub(crate) fn deployment_context_response(state: &AppState) -> DeploymentContextResponse {
+    DeploymentContextResponse {
         api_signing_pubkey: crate::auth::jwt::public_key_base64(&state.signing_key),
         tls_certificate_broker_url: state
             .attestation
             .as_ref()
             .and_then(|cfg| cfg.tls_certificate_broker_url.clone()),
-    }))
+        current_platform_release_id: state
+            .platform_release_envelope
+            .as_ref()
+            .map(|envelope| envelope.payload.platform_release_version.clone()),
+        platform_release_envelope: state.platform_release_envelope.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -33,6 +47,7 @@ mod tests {
     use super::*;
     use crate::auth::jwt::public_key_base64;
     use crate::models::Role;
+    use crate::platform_release::PlatformReleaseEnvelope;
     use crate::test_support::{auth_context, lazy_state};
     use ed25519_dalek::SigningKey;
     use enclava_engine::types::CaddyTlsMode;
@@ -62,6 +77,8 @@ mod tests {
                 "http://cap-api.cap-test01.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
             )
         );
+        assert_eq!(response.current_platform_release_id, None);
+        assert!(response.platform_release_envelope.is_none());
     }
 
     #[tokio::test]
@@ -74,5 +91,26 @@ mod tests {
         .expect_err("apps:write scope should be required");
 
         assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn deployment_context_returns_signed_platform_release_envelope_when_loaded() {
+        let mut state = lazy_state();
+        state.platform_release_envelope =
+            Some(PlatformReleaseEnvelope::load_verified().expect("test platform release"));
+
+        let Json(response) = deployment_context(auth_context(Role::Admin, &[]), State(state))
+            .await
+            .expect("deployment context response");
+
+        let envelope = response
+            .platform_release_envelope
+            .expect("platform release envelope");
+        assert_eq!(
+            response.current_platform_release_id.as_deref(),
+            Some(envelope.payload.platform_release_version.as_str())
+        );
+        assert!(!envelope.signature.is_empty());
+        assert!(!envelope.signing_pubkey.is_empty());
     }
 }

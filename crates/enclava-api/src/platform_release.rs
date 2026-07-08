@@ -71,12 +71,7 @@ pub struct PlatformRelease {
 
 impl PlatformRelease {
     pub fn load_verified() -> Result<Self, PlatformReleaseError> {
-        let raw = match std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH") {
-            Ok(path) if !path.trim().is_empty() => std::fs::read_to_string(Path::new(&path))?,
-            _ => BUNDLED_PLATFORM_RELEASE.to_string(),
-        };
-        let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
-        verify_envelope(envelope)
+        Ok(PlatformReleaseEnvelope::load_verified()?.payload)
     }
 
     pub fn policy_template_sha256_bytes(&self) -> Result<[u8; 32], PlatformReleaseError> {
@@ -95,6 +90,18 @@ impl PlatformRelease {
             "signing_service_pubkey_hex",
             &self.signing_service_pubkey_hex,
         )
+    }
+}
+
+impl PlatformReleaseEnvelope {
+    pub fn load_verified() -> Result<Self, PlatformReleaseError> {
+        let raw = match std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH") {
+            Ok(path) if !path.trim().is_empty() => std::fs::read_to_string(Path::new(&path))?,
+            _ => BUNDLED_PLATFORM_RELEASE.to_string(),
+        };
+        let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
+        verify_envelope(envelope.clone())?;
+        Ok(envelope)
     }
 }
 

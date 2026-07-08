@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::auth::middleware::{AuthContext, ManagementOrigin};
 use crate::models::Role;
+use crate::routes::platform::{DeploymentContextResponse, deployment_context_response};
 use crate::routes::status::live_pod_failure_message;
 use crate::state::AppState;
 
@@ -103,6 +104,13 @@ impl FromRequestParts<AppState> for InternalAuth {
             client_san: client_san.to_string(),
         })
     }
+}
+
+pub async fn paas_deployment_context(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+) -> Json<DeploymentContextResponse> {
+    Json(deployment_context_response(&state))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
