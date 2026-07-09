@@ -1,0 +1,46 @@
+name: Start Copilot agent for new issues
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  start-copilot-agent:
+    if: github.event.issue.user.login == 'aljazceru'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install latest GitHub CLI
+        run: |
+          sudo mkdir -p -m 755 /etc/apt/keyrings
+          wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+          sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh
+          gh --version
+
+      - name: Start Copilot cloud agent
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_AGENT_PAT }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          cat > /tmp/copilot-agent-prompt.md <<EOF
+          Evaluate and work on GitHub issue #${ISSUE_NUMBER}: ${ISSUE_TITLE}
+
+          Issue URL: ${ISSUE_URL}
+          Repository: ${REPOSITORY}
+
+          First evaluate whether the issue is actionable enough for a focused implementation PR. If it is ambiguous, unsafe, out of scope, or lacks enough detail, leave a concise issue comment explaining what clarification is needed and do not make code changes.
+
+          If it is actionable, inspect the repository, implement a focused fix on a new branch, add or update tests when appropriate, run the relevant checks you can identify, and open a pull request against ${DEFAULT_BRANCH}. Link the pull request to issue #${ISSUE_NUMBER}, summarize the change, and report the checks run. Do not merge the pull request.
+          EOF
+
+          gh agent-task create --repo "${REPOSITORY}" --base "${DEFAULT_BRANCH}" "$(cat /tmp/copilot-agent-prompt.md)"
