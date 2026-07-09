@@ -364,7 +364,7 @@ fn resolve_app_identity_fields_repairs_missing_snapshot_identity_fields() {
     let mut app = test_app_response();
     app.namespace = "  ".to_string();
     app.instance_id = String::new();
-    app.service_account = Some(" ".to_string());
+    app.service_account = None;
 
     let app_id = uuid::Uuid::parse_str(&app.id).expect("valid app id");
     let resolved = resolve_app_identity_fields(&app, "org", app_id);

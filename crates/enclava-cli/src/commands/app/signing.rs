@@ -90,7 +90,8 @@ pub(crate) fn resolve_app_identity_fields(
         app.namespace.trim().to_string()
     };
     let instance_id = if app.instance_id.trim().is_empty() {
-        format!("{org_name}-{}", &app_id.to_string()[..8])
+        let app_id_short = app_id.as_simple().to_string();
+        format!("{org_name}-{}", &app_id_short[..8])
     } else {
         app.instance_id.trim().to_string()
     };
