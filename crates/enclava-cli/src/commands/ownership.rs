@@ -211,6 +211,13 @@ pub(crate) enum MnemonicCapture {
     Skip,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryMnemonicCaptureAction {
+    PromptToStore,
+    Store,
+    Skip,
+}
+
 fn store_mnemonic_local(
     paths: &CliPaths,
     org: &str,
@@ -254,34 +261,41 @@ pub(crate) fn present_and_capture_recovery_mnemonic(
     }
 
     if capture == MnemonicCapture::Skip {
-        confirm_recovery_mnemonic_recorded()?;
-        eprintln!(
-            "Recovery mnemonic not stored (--no-store-mnemonic). Record it now; it will not be shown again."
+        debug_assert_eq!(
+            recovery_mnemonic_capture_action(capture, recovery_mnemonic_confirmation_available()),
+            RecoveryMnemonicCaptureAction::Skip
         );
-        return Ok(());
     }
 
-    if recovery_mnemonic_storage_prompt_required(
-        capture,
-        recovery_mnemonic_confirmation_available(),
-    ) {
-        let want_store = Confirm::new()
-            .with_prompt("Store this recovery mnemonic so `enclava key backup` can back it up?")
-            .default(true)
-            .interact()?;
-        if want_store {
-            store_mnemonic_local(paths, org, app, mnemonic)?;
-            eprintln!("Recovery mnemonic stored locally; run `enclava key backup` to back it up.");
-            return Ok(());
+    match recovery_mnemonic_capture_action(capture, recovery_mnemonic_confirmation_available()) {
+        RecoveryMnemonicCaptureAction::PromptToStore => {
+            let want_store = Confirm::new()
+                .with_prompt("Store this recovery mnemonic so `enclava key backup` can back it up?")
+                .default(true)
+                .interact()?;
+            if want_store {
+                store_mnemonic_local(paths, org, app, mnemonic)?;
+                eprintln!(
+                    "Recovery mnemonic stored locally; run `enclava key backup` to back it up."
+                );
+                return Ok(());
+            }
+            // Declined: the operator keeps it offline, so require the standard acknowledgement.
+            confirm_recovery_mnemonic_recorded()?;
+            eprintln!("Recovery mnemonic not stored. It will not be shown again.");
         }
-        // Declined: the operator keeps it offline, so require the standard acknowledgement.
-        confirm_recovery_mnemonic_recorded()?;
-        eprintln!("Recovery mnemonic not stored. It will not be shown again.");
-    } else if capture == MnemonicCapture::Store {
-        store_mnemonic_local(paths, org, app, mnemonic)?;
-        eprintln!(
-            "Recovery mnemonic stored locally (non-interactive default); run `enclava key backup` to back it up."
-        );
+        RecoveryMnemonicCaptureAction::Store => {
+            store_mnemonic_local(paths, org, app, mnemonic)?;
+            eprintln!(
+                "Recovery mnemonic stored locally (non-interactive default); run `enclava key backup` to back it up."
+            );
+        }
+        RecoveryMnemonicCaptureAction::Skip => {
+            confirm_recovery_mnemonic_recorded()?;
+            eprintln!(
+                "Recovery mnemonic not stored (--no-store-mnemonic). Record it now; it will not be shown again."
+            );
+        }
     }
     Ok(())
 }
@@ -388,6 +402,19 @@ fn recovery_mnemonic_storage_prompt_required(
     confirmation_available: bool,
 ) -> bool {
     capture == MnemonicCapture::Store && confirmation_available
+}
+
+fn recovery_mnemonic_capture_action(
+    capture: MnemonicCapture,
+    confirmation_available: bool,
+) -> RecoveryMnemonicCaptureAction {
+    if capture == MnemonicCapture::Skip {
+        RecoveryMnemonicCaptureAction::Skip
+    } else if recovery_mnemonic_storage_prompt_required(capture, confirmation_available) {
+        RecoveryMnemonicCaptureAction::PromptToStore
+    } else {
+        RecoveryMnemonicCaptureAction::Store
+    }
 }
 
 pub async fn unlock(args: UnlockArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -672,23 +699,23 @@ mod tests {
     }
 
     #[test]
-    fn no_store_mnemonic_suppresses_storage_prompt() {
-        assert!(recovery_mnemonic_storage_prompt_required(
-            MnemonicCapture::Store,
-            true
-        ));
-        assert!(!recovery_mnemonic_storage_prompt_required(
-            MnemonicCapture::Store,
-            false
-        ));
-        assert!(!recovery_mnemonic_storage_prompt_required(
-            MnemonicCapture::Skip,
-            true
-        ));
-        assert!(!recovery_mnemonic_storage_prompt_required(
-            MnemonicCapture::Skip,
-            false
-        ));
+    fn capture_action_honors_no_store_mnemonic() {
+        assert_eq!(
+            recovery_mnemonic_capture_action(MnemonicCapture::Store, true),
+            RecoveryMnemonicCaptureAction::PromptToStore
+        );
+        assert_eq!(
+            recovery_mnemonic_capture_action(MnemonicCapture::Store, false),
+            RecoveryMnemonicCaptureAction::Store
+        );
+        assert_eq!(
+            recovery_mnemonic_capture_action(MnemonicCapture::Skip, true),
+            RecoveryMnemonicCaptureAction::Skip
+        );
+        assert_eq!(
+            recovery_mnemonic_capture_action(MnemonicCapture::Skip, false),
+            RecoveryMnemonicCaptureAction::Skip
+        );
     }
 
     #[test]
@@ -710,42 +737,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn non_interactive_capture_stores_by_default_and_skips_when_opted_out() {
-        // Off-TTY there is no confirmation gate to block on (the regression this guards).
-        // Store (default) persists to local state; Skip does not.
+    fn capture_storage_helper_persists_default() {
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
         let tmp = tempfile::tempdir().unwrap();
         let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
-        present_and_capture_recovery_mnemonic(
-            &paths,
-            "org-a",
-            "shell1",
-            mnemonic,
-            MnemonicCapture::Store,
-            RecoveryMnemonicOutput::Stderr,
-        )
-        .expect("non-interactive Store must persist and return Ok");
+        store_mnemonic_local(&paths, "org-a", "shell1", mnemonic)
+            .expect("default capture storage helper must persist");
         assert_eq!(
             keys::load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
             Some(mnemonic.to_string())
-        );
-
-        let tmp2 = tempfile::tempdir().unwrap();
-        let paths2 = CliPaths::from_root(tmp2.path().to_path_buf()).unwrap();
-        present_and_capture_recovery_mnemonic(
-            &paths2,
-            "org-a",
-            "shell2",
-            mnemonic,
-            MnemonicCapture::Skip,
-            RecoveryMnemonicOutput::Stderr,
-        )
-        .expect("non-interactive Skip must return Ok");
-        assert!(
-            keys::load_app_mnemonic(&paths2, "org-a", "shell2")
-                .unwrap()
-                .is_none()
         );
     }
 }

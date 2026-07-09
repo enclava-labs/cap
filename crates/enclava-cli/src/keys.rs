@@ -15,6 +15,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use enclava_common::validate::validate_app_name;
 use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -328,6 +329,12 @@ pub fn app_mnemonic_path(paths: &CliPaths, org: &str, app: &str) -> PathBuf {
     paths.keys_dir.join(org).join(format!("{app}.mnemonic"))
 }
 
+fn validate_app_mnemonic_name(app: &str) -> Result<(), KeysError> {
+    validate_app_name(app).map_err(|e| {
+        KeysError::InvalidBackup(format!("invalid recovery mnemonic app name `{app}`: {e}"))
+    })
+}
+
 /// Persist a recovery mnemonic to local state (mode 0600, atomic). Overwrites any
 /// existing entry for the app — a fresh redeploy mints a new mnemonic and voids the old.
 pub fn store_app_mnemonic(
@@ -336,6 +343,7 @@ pub fn store_app_mnemonic(
     app: &str,
     mnemonic: &str,
 ) -> Result<(), KeysError> {
+    validate_app_mnemonic_name(app)?;
     write_secret_atomic(&app_mnemonic_path(paths, org, app), mnemonic.as_bytes())
 }
 
@@ -345,6 +353,7 @@ pub fn load_app_mnemonic(
     org: &str,
     app: &str,
 ) -> Result<Option<String>, KeysError> {
+    validate_app_mnemonic_name(app)?;
     let path = app_mnemonic_path(paths, org, app);
     if !path.exists() {
         return Ok(None);
@@ -375,6 +384,7 @@ pub fn list_app_mnemonics(paths: &CliPaths, org: &str) -> Result<Vec<(String, St
         else {
             continue;
         };
+        validate_app_mnemonic_name(&app)?;
         if assert_mode_0600(&path).is_err() {
             return Err(KeysError::InsecurePermissions(path));
         }
@@ -771,6 +781,21 @@ mod tests {
                 .is_none()
         );
         assert!(list_app_mnemonics(&paths, "org-c").unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_mnemonic_store_rejects_invalid_app_name_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().join("state")).unwrap();
+
+        let err = store_app_mnemonic(&paths, "org-a", "../escape", "mnemonic")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("invalid recovery mnemonic app name"));
+        assert!(!tmp.path().join("state/keys/escape.mnemonic").exists());
+        assert!(!tmp.path().join("escape.mnemonic").exists());
     }
 
     #[test]

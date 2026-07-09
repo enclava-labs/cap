@@ -256,6 +256,43 @@ fn prompt_restore_passphrase() -> Result<String, Box<dyn std::error::Error>> {
         .interact()?)
 }
 
+fn logged_out_backup_metadata(
+    org: Option<String>,
+) -> (keys::RecoveryBackupMetadata, Option<String>) {
+    (
+        keys::RecoveryBackupMetadata {
+            org_name: org.clone(),
+            ..keys::RecoveryBackupMetadata::default()
+        },
+        org,
+    )
+}
+
+fn ensure_backup_org_matches_active_org(
+    backup_org_id: Option<&str>,
+    backup_org_name: Option<&str>,
+    active_org_id: &str,
+    active_org_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(backup_org_id) = backup_org_id
+        && backup_org_id != active_org_id
+    {
+        return Err(format!(
+            "backup is for org {backup_org_id}, but active org is {active_org_name} ({active_org_id})"
+        )
+        .into());
+    }
+    if let Some(backup_org_name) = backup_org_name
+        && backup_org_name != active_org_name
+    {
+        return Err(format!(
+            "backup is for org {backup_org_name}, but active org is {active_org_name} ({active_org_id})"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn ensure_mnemonic_restore_will_not_overwrite(
     paths: &CliPaths,
     org_name: &str,
@@ -341,7 +378,7 @@ async fn backup(
                 .into());
             }
         }
-        (keys::RecoveryBackupMetadata::default(), org)
+        logged_out_backup_metadata(org)
     };
     let mnemonics: Vec<keys::RecoveryBackupMnemonic> = match backup_org_name.as_deref() {
         Some(org_name) => keys::list_app_mnemonics(&paths, org_name)?
@@ -403,15 +440,12 @@ async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::
     let (api, me) = current_user(&paths)
         .await?
         .ok_or("restore requires an active platform session; run `enclava login` first")?;
-    if let Some(backup_org_id) = backup.org_id.as_deref()
-        && backup_org_id != me.active_org.id
-    {
-        return Err(format!(
-            "backup is for org {backup_org_id}, but active org is {} ({})",
-            me.active_org.name, me.active_org.id
-        )
-        .into());
-    }
+    ensure_backup_org_matches_active_org(
+        backup.org_id.as_deref(),
+        backup.org_name.as_deref(),
+        &me.active_org.id,
+        &me.active_org.name,
+    )?;
     let (_org_id, org_name, owner_fingerprint) =
         verify_or_initialize_remote_keyring(&api, &me, &seed).await?;
     ensure_mnemonic_restore_will_not_overwrite(&paths, &org_name, &mnemonics, force)?;
@@ -489,5 +523,49 @@ mod tests {
         }];
 
         ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, false).unwrap();
+    }
+
+    #[test]
+    fn logged_out_backup_metadata_records_requested_org_name() {
+        let (metadata, backup_org_name) = logged_out_backup_metadata(Some("org-a".to_string()));
+
+        assert_eq!(metadata.org_name.as_deref(), Some("org-a"));
+        assert_eq!(backup_org_name.as_deref(), Some("org-a"));
+        assert!(metadata.org_id.is_none());
+        assert!(metadata.owner_fingerprint.is_none());
+    }
+
+    #[test]
+    fn restore_rejects_backup_org_name_mismatch() {
+        let err = ensure_backup_org_matches_active_org(
+            None,
+            Some("org-a"),
+            "22222222-2222-2222-2222-222222222222",
+            "org-b",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("backup is for org org-a"));
+        assert!(err.contains("active org is org-b"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mnemonics_reject_invalid_app_name_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().join("state")).unwrap();
+        let mnemonics = vec![keys::RecoveryBackupMnemonic {
+            app: "../escape".to_string(),
+            mnemonic: "older mnemonic".to_string(),
+        }];
+
+        let err = restore_app_mnemonics(&paths, "org-a", &mnemonics)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("invalid recovery mnemonic app name"));
+        assert!(!tmp.path().join("state/keys/escape.mnemonic").exists());
+        assert!(!tmp.path().join("escape.mnemonic").exists());
     }
 }
