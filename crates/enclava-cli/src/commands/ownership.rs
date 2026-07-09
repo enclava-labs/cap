@@ -224,12 +224,10 @@ fn store_mnemonic_local(
 /// Present the one-time LUKS recovery mnemonic and, by default, persist it to local
 /// state so `enclava key backup` can bundle it with the deploy keys.
 ///
-/// On an interactive terminal the operator is asked whether to store it (default yes);
-/// declining runs the standard "I have recorded it" confirmation gate, since the mnemonic
-/// then exists nowhere except the screen and the app's storage becomes unrecoverable if
-/// lost. Off-TTY the `capture` flag decides (`Store` by default; `--no-store-mnemonic`
-/// opts out), because no prompt is possible — this mirrors the CLI's existing behaviour
-/// of writing deploy keys to disk without confirmation.
+/// The `capture` flag is authoritative: `--no-store-mnemonic` never prompts to store,
+/// even on an interactive terminal. Otherwise, interactive terminals ask whether to store
+/// (default yes); declining runs the standard "I have recorded it" confirmation gate.
+/// Off-TTY the `capture` flag decides (`Store` by default), because no prompt is possible.
 ///
 /// Returns an error only on write/prompt failure (e.g. EOF at the prompt); callers past
 /// an irreversible server-side action should use
@@ -255,7 +253,18 @@ pub(crate) fn present_and_capture_recovery_mnemonic(
         }
     }
 
-    if recovery_mnemonic_confirmation_available() {
+    if capture == MnemonicCapture::Skip {
+        confirm_recovery_mnemonic_recorded()?;
+        eprintln!(
+            "Recovery mnemonic not stored (--no-store-mnemonic). Record it now; it will not be shown again."
+        );
+        return Ok(());
+    }
+
+    if recovery_mnemonic_storage_prompt_required(
+        capture,
+        recovery_mnemonic_confirmation_available(),
+    ) {
         let want_store = Confirm::new()
             .with_prompt("Store this recovery mnemonic so `enclava key backup` can back it up?")
             .default(true)
@@ -268,20 +277,11 @@ pub(crate) fn present_and_capture_recovery_mnemonic(
         // Declined: the operator keeps it offline, so require the standard acknowledgement.
         confirm_recovery_mnemonic_recorded()?;
         eprintln!("Recovery mnemonic not stored. It will not be shown again.");
-    } else {
-        match capture {
-            MnemonicCapture::Store => {
-                store_mnemonic_local(paths, org, app, mnemonic)?;
-                eprintln!(
-                    "Recovery mnemonic stored locally (non-interactive default); run `enclava key backup` to back it up."
-                );
-            }
-            MnemonicCapture::Skip => {
-                eprintln!(
-                    "Recovery mnemonic not stored (--no-store-mnemonic). Record it now; it will not be shown again."
-                );
-            }
-        }
+    } else if capture == MnemonicCapture::Store {
+        store_mnemonic_local(paths, org, app, mnemonic)?;
+        eprintln!(
+            "Recovery mnemonic stored locally (non-interactive default); run `enclava key backup` to back it up."
+        );
     }
     Ok(())
 }
@@ -381,6 +381,13 @@ fn recovery_mnemonic_confirmation_required(
     prompt_is_terminal: bool,
 ) -> bool {
     stdin_is_terminal && prompt_is_terminal
+}
+
+fn recovery_mnemonic_storage_prompt_required(
+    capture: MnemonicCapture,
+    confirmation_available: bool,
+) -> bool {
+    capture == MnemonicCapture::Store && confirmation_available
 }
 
 pub async fn unlock(args: UnlockArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -662,6 +669,26 @@ mod tests {
         assert!(!recovery_mnemonic_confirmation_required(true, false));
         assert!(!recovery_mnemonic_confirmation_required(false, true));
         assert!(!recovery_mnemonic_confirmation_required(false, false));
+    }
+
+    #[test]
+    fn no_store_mnemonic_suppresses_storage_prompt() {
+        assert!(recovery_mnemonic_storage_prompt_required(
+            MnemonicCapture::Store,
+            true
+        ));
+        assert!(!recovery_mnemonic_storage_prompt_required(
+            MnemonicCapture::Store,
+            false
+        ));
+        assert!(!recovery_mnemonic_storage_prompt_required(
+            MnemonicCapture::Skip,
+            true
+        ));
+        assert!(!recovery_mnemonic_storage_prompt_required(
+            MnemonicCapture::Skip,
+            false
+        ));
     }
 
     #[test]

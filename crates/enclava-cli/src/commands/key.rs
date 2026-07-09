@@ -256,6 +256,43 @@ fn prompt_restore_passphrase() -> Result<String, Box<dyn std::error::Error>> {
         .interact()?)
 }
 
+fn ensure_mnemonic_restore_will_not_overwrite(
+    paths: &CliPaths,
+    org_name: &str,
+    mnemonics: &[keys::RecoveryBackupMnemonic],
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if force {
+        return Ok(());
+    }
+
+    for mnemonic in mnemonics {
+        if let Some(existing) = keys::load_app_mnemonic(paths, org_name, &mnemonic.app)?
+            && existing != mnemonic.mnemonic
+        {
+            let path = keys::app_mnemonic_path(paths, org_name, &mnemonic.app);
+            return Err(format!(
+                "{} already contains a different recovery mnemonic for {}; pass --force to overwrite it after verifying this backup is current",
+                path.display(),
+                mnemonic.app
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn restore_app_mnemonics(
+    paths: &CliPaths,
+    org_name: &str,
+    mnemonics: &[keys::RecoveryBackupMnemonic],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for mnemonic in mnemonics {
+        keys::store_app_mnemonic(paths, org_name, &mnemonic.app, &mnemonic.mnemonic)?;
+    }
+    Ok(())
+}
+
 async fn backup(
     output: PathBuf,
     org: Option<String>,
@@ -271,7 +308,7 @@ async fn backup(
     let paths = CliPaths::resolve()?;
     let seed = keys::load_or_create_recovery_seed(&paths)?;
     let (metadata, backup_org_name) = if let Some((_api, me)) = current_user(&paths).await? {
-        if let Some(requested_org) = org
+        if let Some(requested_org) = org.as_deref()
             && requested_org != me.active_org.name
             && requested_org != me.active_org.id
         {
@@ -294,6 +331,16 @@ async fn backup(
             Some(active_name),
         )
     } else {
+        if org.is_none() {
+            let mnemonic_orgs = keys::list_app_mnemonic_orgs(&paths)?;
+            if !mnemonic_orgs.is_empty() {
+                return Err(format!(
+                    "stored recovery mnemonics exist for org(s) {}; run `enclava key backup --org <org>` or login before backing up so they are not omitted",
+                    mnemonic_orgs.join(", ")
+                )
+                .into());
+            }
+        }
         (keys::RecoveryBackupMetadata::default(), org)
     };
     let mnemonics: Vec<keys::RecoveryBackupMnemonic> = match backup_org_name.as_deref() {
@@ -367,6 +414,7 @@ async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::
     }
     let (_org_id, org_name, owner_fingerprint) =
         verify_or_initialize_remote_keyring(&api, &me, &seed).await?;
+    ensure_mnemonic_restore_will_not_overwrite(&paths, &org_name, &mnemonics, force)?;
 
     if existing_seed == Some(seed) {
         println!(
@@ -385,9 +433,7 @@ async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::
     if mnemonics.is_empty() {
         println!("Note: this backup contained no stored recovery mnemonics (deploy keys only).");
     } else {
-        for m in &mnemonics {
-            keys::store_app_mnemonic(&paths, &org_name, &m.app, &m.mnemonic)?;
-        }
+        restore_app_mnemonics(&paths, &org_name, &mnemonics)?;
         let apps: Vec<&str> = mnemonics.iter().map(|m| m.app.as_str()).collect();
         println!(
             "Restored storage recovery mnemonic(s) for {} app(s): {}",
@@ -396,4 +442,52 @@ async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mnemonics_requires_force_before_overwriting_different_existing_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        keys::store_app_mnemonic(&paths, "org-a", "shell", "newer mnemonic").unwrap();
+        let mnemonics = vec![keys::RecoveryBackupMnemonic {
+            app: "shell".to_string(),
+            mnemonic: "older mnemonic".to_string(),
+        }];
+
+        let err = ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different recovery mnemonic"));
+        assert!(err.contains("--force"));
+        assert_eq!(
+            keys::load_app_mnemonic(&paths, "org-a", "shell").unwrap(),
+            Some("newer mnemonic".to_string())
+        );
+
+        ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, true).unwrap();
+        restore_app_mnemonics(&paths, "org-a", &mnemonics).unwrap();
+        assert_eq!(
+            keys::load_app_mnemonic(&paths, "org-a", "shell").unwrap(),
+            Some("older mnemonic".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mnemonics_allows_matching_existing_value_without_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        keys::store_app_mnemonic(&paths, "org-a", "shell", "same mnemonic").unwrap();
+        let mnemonics = vec![keys::RecoveryBackupMnemonic {
+            app: "shell".to_string(),
+            mnemonic: "same mnemonic".to_string(),
+        }];
+
+        ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, false).unwrap();
+    }
 }
