@@ -31,6 +31,7 @@ use crate::commands::app::{
     SignedDeployBlobParams, StoragePasswordInput, build_signed_deploy_blobs,
     claim_initial_ownership, ensure_manual_deploy_keyring,
 };
+use crate::commands::ownership::MnemonicCapture;
 
 const DEBIAN_SSH_NGROK_TEMPLATE: &str = "debian-ssh-ngrok";
 const DEBIAN_SSH_FRP_TEMPLATE: &str = "debian-ssh-frp";
@@ -84,6 +85,12 @@ pub struct TemplateDeployArgs {
     /// Print machine-readable JSON with deployment, stable SSH endpoint, and stable SSH endpoint command details.
     #[arg(long)]
     pub json: bool,
+    /// Persist the recovery mnemonic so `enclava key backup` can back it up (default).
+    #[arg(long, conflicts_with = "no_store_mnemonic")]
+    pub store_mnemonic: bool,
+    /// Do NOT persist the recovery mnemonic (shown once only; opt out of backup coverage).
+    #[arg(long, conflicts_with = "store_mnemonic")]
+    pub no_store_mnemonic: bool,
 }
 
 #[derive(Args)]
@@ -214,6 +221,11 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     if template.unlock_mode == "password" {
         storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
     }
+    let capture = if args.no_store_mnemonic {
+        MnemonicCapture::Skip
+    } else {
+        MnemonicCapture::Store
+    };
     let pb = if args.json {
         ProgressBar::hidden()
     } else {
@@ -299,6 +311,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
                 &ctx.cli_config,
                 &instance_name,
                 &storage_password,
+                capture,
             )
             .await?;
         }
@@ -2629,6 +2642,8 @@ mod tests {
             ssh_timeout_seconds: DEFAULT_SSH_TIMEOUT_SECONDS,
             storage_password_file: None,
             json: false,
+            store_mnemonic: false,
+            no_store_mnemonic: false,
         })
         .await
         .expect_err("unknown templates should fail before stable SSH endpoint validation");

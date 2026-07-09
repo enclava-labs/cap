@@ -38,7 +38,9 @@ fn clean_state_backup_restore_recreates_owner_and_app_keys() {
 
     let app_seed = keys::derive_app_bootstrap_seed(org_id, "demo", &seed).unwrap();
     let backup = keys::encrypt_recovery_backup(&seed, "passphrase").unwrap();
-    let restored_seed = keys::decrypt_recovery_backup(&backup, "passphrase").unwrap();
+    let restored_seed = keys::decrypt_recovery_backup(&backup, "passphrase")
+        .unwrap()
+        .seed;
     keys::store_seed_at(&restored.recovery_seed, &restored_seed, false).unwrap();
 
     let loaded = keys::load_recovery_seed(&restored).unwrap().unwrap();

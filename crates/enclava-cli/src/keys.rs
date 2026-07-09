@@ -15,6 +15,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use enclava_common::validate::validate_app_name;
 use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -29,6 +30,8 @@ use crate::config::CliPaths;
 const BACKUP_KDF_MEMORY_KIB: u32 = 19_456;
 const BACKUP_KDF_ITERATIONS: u32 = 2;
 const BACKUP_KDF_PARALLELISM: u32 = 1;
+const RECOVERY_BACKUP_VERSION_SEED_ONLY: u8 = 1;
+const RECOVERY_BACKUP_VERSION_WITH_MNEMONICS: u8 = 2;
 
 #[derive(Debug, Error)]
 pub enum KeysError {
@@ -104,6 +107,22 @@ pub struct RecoveryBackupMetadata {
     pub owner_fingerprint: Option<String>,
 }
 
+/// A per-app LUKS recovery mnemonic carried inside the encrypted backup payload.
+/// These are secret and live under the AEAD ciphertext, never in cleartext envelope fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryBackupMnemonic {
+    pub app: String,
+    pub mnemonic: String,
+}
+
+/// Plaintext result of decrypting a recovery backup: the org-wide deploy-key seed
+/// plus any captured per-app LUKS recovery mnemonics.
+#[derive(Debug, Clone)]
+pub struct DecryptedBackup {
+    pub seed: [u8; 32],
+    pub mnemonics: Vec<RecoveryBackupMnemonic>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryBackup {
     pub version: u8,
@@ -143,6 +162,10 @@ struct RecoveryBackupPayload {
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
+    /// Per-app LUKS recovery mnemonics (payload v2). `#[serde(default)]` keeps v1
+    /// backups (no mnemonics field) decryptable — they yield an empty map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mnemonics: Option<Vec<RecoveryBackupMnemonic>>,
 }
 
 impl Drop for UserSigningKey {
@@ -229,12 +252,18 @@ pub fn store_seed_at(path: &Path, seed: &[u8; 32], force: bool) -> Result<(), Ke
             path.display()
         )));
     }
+    write_secret_atomic(path, seed)
+}
+
+/// Atomically write secret bytes to `path` (file mode 0600, parent dir 0700) via a
+/// `.tmp` rename so a crash never leaves a partial secret on disk.
+fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         set_dir_perms_0700(parent)?;
     }
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, seed)?;
+    fs::write(&tmp, bytes)?;
     set_file_perms_0600(&tmp)?;
     fs::rename(&tmp, path)?;
     Ok(())
@@ -294,6 +323,117 @@ pub fn derive_app_bootstrap_seed(
     derive_ed25519_seed(recovery_seed, &format!("app-bootstrap/{org_id}/{app_name}"))
 }
 
+/// Path to the stored LUKS recovery mnemonic for a password-mode app.
+/// Scoped by org to match bootstrap keys: `~/.enclava/keys/{org}/{app}.mnemonic`.
+pub fn app_mnemonic_path(paths: &CliPaths, org: &str, app: &str) -> PathBuf {
+    paths.keys_dir.join(org).join(format!("{app}.mnemonic"))
+}
+
+fn validate_app_mnemonic_name(app: &str) -> Result<(), KeysError> {
+    validate_app_name(app).map_err(|e| {
+        KeysError::InvalidBackup(format!("invalid recovery mnemonic app name `{app}`: {e}"))
+    })
+}
+
+/// Persist a recovery mnemonic to local state (mode 0600, atomic). Overwrites any
+/// existing entry for the app — a fresh redeploy mints a new mnemonic and voids the old.
+pub fn store_app_mnemonic(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+    mnemonic: &str,
+) -> Result<(), KeysError> {
+    validate_app_mnemonic_name(app)?;
+    write_secret_atomic(&app_mnemonic_path(paths, org, app), mnemonic.as_bytes())
+}
+
+/// Load a stored recovery mnemonic for an app, if present. Refuses world-readable files.
+pub fn load_app_mnemonic(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+) -> Result<Option<String>, KeysError> {
+    validate_app_mnemonic_name(app)?;
+    let path = app_mnemonic_path(paths, org, app);
+    if !path.exists() {
+        return Ok(None);
+    }
+    assert_mode_0600(&path)?;
+    Ok(Some(fs::read_to_string(&path)?.trim().to_string()))
+}
+
+/// Enumerate `(app, mnemonic)` pairs stored for an org, sorted by app name.
+/// Used by `key backup` to bundle every captured mnemonic. A mnemonic file with
+/// insecure permissions is an error (propagated) rather than silently skipped, so a
+/// backup can never quietly drop an app's recovery material. Empty entries are skipped.
+pub fn list_app_mnemonics(paths: &CliPaths, org: &str) -> Result<Vec<(String, String)>, KeysError> {
+    let dir = paths.keys_dir.join(org);
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("mnemonic") {
+            continue;
+        }
+        let Some(app) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        validate_app_mnemonic_name(&app)?;
+        if assert_mode_0600(&path).is_err() {
+            return Err(KeysError::InsecurePermissions(path));
+        }
+        let mnemonic = fs::read_to_string(&path)?.trim().to_string();
+        if !mnemonic.is_empty() {
+            out.push((app, mnemonic));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+/// Enumerate org directories that contain at least one stored app mnemonic.
+/// Used by logged-out backup to fail loudly instead of creating a deploy-key-only
+/// backup while local storage recovery material exists.
+pub fn list_app_mnemonic_orgs(paths: &CliPaths) -> Result<Vec<String>, KeysError> {
+    let mut orgs = Vec::new();
+    if !paths.keys_dir.exists() {
+        return Ok(orgs);
+    }
+
+    for entry in fs::read_dir(&paths.keys_dir)? {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(org) = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let mut has_mnemonic = false;
+        for entry in fs::read_dir(&path)? {
+            if entry?.path().extension().and_then(|e| e.to_str()) == Some("mnemonic") {
+                has_mnemonic = true;
+                break;
+            }
+        }
+        if has_mnemonic {
+            orgs.push(org);
+        }
+    }
+
+    orgs.sort();
+    Ok(orgs)
+}
+
 fn backup_key(passphrase: &str, kdf: &RecoveryBackupKdf) -> Result<[u8; 32], KeysError> {
     if kdf.name != "argon2id" {
         return Err(KeysError::InvalidBackup(format!(
@@ -318,13 +458,14 @@ pub fn encrypt_recovery_backup(
     seed: &[u8; 32],
     passphrase: &str,
 ) -> Result<RecoveryBackup, KeysError> {
-    encrypt_recovery_backup_with_metadata(seed, passphrase, RecoveryBackupMetadata::default())
+    encrypt_recovery_backup_with_metadata(seed, passphrase, RecoveryBackupMetadata::default(), &[])
 }
 
 pub fn encrypt_recovery_backup_with_metadata(
     seed: &[u8; 32],
     passphrase: &str,
     metadata: RecoveryBackupMetadata,
+    mnemonics: &[RecoveryBackupMnemonic],
 ) -> Result<RecoveryBackup, KeysError> {
     if passphrase.is_empty() {
         return Err(KeysError::InvalidBackup(
@@ -347,11 +488,21 @@ pub fn encrypt_recovery_backup_with_metadata(
         nonce: STANDARD.encode(nonce),
     };
     let created_at = chrono::Utc::now().to_rfc3339();
+    let backup_version = if mnemonics.is_empty() {
+        RECOVERY_BACKUP_VERSION_SEED_ONLY
+    } else {
+        RECOVERY_BACKUP_VERSION_WITH_MNEMONICS
+    };
     let payload = RecoveryBackupPayload {
-        version: 1,
+        version: backup_version,
         recovery_seed: STANDARD.encode(seed),
         created_at: created_at.clone(),
         notes: None,
+        mnemonics: if mnemonics.is_empty() {
+            None
+        } else {
+            Some(mnemonics.to_vec())
+        },
     };
     let payload_bytes =
         serde_json::to_vec(&payload).map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
@@ -362,7 +513,7 @@ pub fn encrypt_recovery_backup_with_metadata(
         .encrypt(XNonce::from_slice(&nonce), payload_bytes.as_slice())
         .map_err(|e| KeysError::Crypto(e.to_string()))?;
     Ok(RecoveryBackup {
-        version: 1,
+        version: backup_version,
         kind: "enclava-recovery-backup".to_string(),
         created_at,
         org_id: metadata.org_id,
@@ -378,8 +529,11 @@ pub fn encrypt_recovery_backup_with_metadata(
 pub fn decrypt_recovery_backup(
     backup: &RecoveryBackup,
     passphrase: &str,
-) -> Result<[u8; 32], KeysError> {
-    if backup.version != 1 {
+) -> Result<DecryptedBackup, KeysError> {
+    if !matches!(
+        backup.version,
+        RECOVERY_BACKUP_VERSION_SEED_ONLY | RECOVERY_BACKUP_VERSION_WITH_MNEMONICS
+    ) {
         return Err(KeysError::InvalidBackup(format!(
             "unsupported version {}",
             backup.version
@@ -415,10 +569,19 @@ pub fn decrypt_recovery_backup(
         .map_err(|_| KeysError::InvalidBackup("wrong passphrase or corrupted backup".into()))?;
     let payload: RecoveryBackupPayload =
         serde_json::from_slice(&plaintext).map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
-    if payload.version != 1 {
+    if !matches!(
+        payload.version,
+        RECOVERY_BACKUP_VERSION_SEED_ONLY | RECOVERY_BACKUP_VERSION_WITH_MNEMONICS
+    ) {
         return Err(KeysError::InvalidBackup(format!(
             "unsupported payload version {}",
             payload.version
+        )));
+    }
+    if payload.version != backup.version {
+        return Err(KeysError::InvalidBackup(format!(
+            "backup envelope version {} does not match payload version {}",
+            backup.version, payload.version
         )));
     }
     let seed_bytes = STANDARD
@@ -437,7 +600,13 @@ pub fn decrypt_recovery_backup(
             "seed fingerprint mismatch".to_string(),
         ));
     }
-    Ok(seed)
+    let mnemonics = payload.mnemonics.unwrap_or_default();
+    if backup.version == RECOVERY_BACKUP_VERSION_SEED_ONLY && !mnemonics.is_empty() {
+        return Err(KeysError::InvalidBackup(
+            "v1 recovery backups cannot contain mnemonics".to_string(),
+        ));
+    }
+    Ok(DecryptedBackup { seed, mnemonics })
 }
 
 /// Load the stored keypair for `user_id`. Refuses to read files with insecure
@@ -527,8 +696,106 @@ mod tests {
         let backup = encrypt_recovery_backup(&seed, "correct horse battery staple").unwrap();
         let restored = decrypt_recovery_backup(&backup, "correct horse battery staple").unwrap();
 
-        assert_eq!(restored, seed);
+        assert_eq!(backup.version, RECOVERY_BACKUP_VERSION_SEED_ONLY);
+        assert_eq!(restored.seed, seed);
+        assert!(restored.mnemonics.is_empty());
         assert!(decrypt_recovery_backup(&backup, "wrong passphrase").is_err());
+    }
+
+    #[test]
+    fn encrypted_recovery_backup_round_trips_mnemonics() {
+        let seed = [7u8; 32];
+        let mnemonics = vec![
+            RecoveryBackupMnemonic {
+                app: "shell1".into(),
+                mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".into(),
+            },
+            RecoveryBackupMnemonic {
+                app: "shell2".into(),
+                mnemonic: "legal winner thank year wave sausage worth useful legal winner thank yellow".into(),
+            },
+        ];
+        let backup = encrypt_recovery_backup_with_metadata(
+            &seed,
+            "correct horse battery staple",
+            RecoveryBackupMetadata::default(),
+            &mnemonics,
+        )
+        .unwrap();
+        let restored = decrypt_recovery_backup(&backup, "correct horse battery staple").unwrap();
+
+        assert_eq!(backup.version, RECOVERY_BACKUP_VERSION_WITH_MNEMONICS);
+        assert_eq!(restored.seed, seed);
+        assert_eq!(restored.mnemonics, mnemonics);
+        // Mnemonics live inside the AEAD ciphertext, never in cleartext envelope fields.
+        let raw = serde_json::to_string(&backup).unwrap();
+        assert!(!raw.contains("abandon"));
+        assert!(!raw.contains("legal winner"));
+        assert!(decrypt_recovery_backup(&backup, "wrong passphrase").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_mnemonic_store_load_list_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+
+        store_app_mnemonic(
+            &paths,
+            "org-a",
+            "shell2",
+            "zone zone zone zone zone zone zone zone zone zone zone zone",
+        )
+        .unwrap();
+        store_app_mnemonic(&paths, "org-a", "shell1", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
+        // other org is excluded
+        store_app_mnemonic(
+            &paths,
+            "org-b",
+            "shell9",
+            "vote fence fence fence fence fence fence fence fence fence fence fence",
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
+            Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string())
+        );
+
+        let listed = list_app_mnemonics(&paths, "org-a").unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                ("shell1".to_string(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string()),
+                ("shell2".to_string(), "zone zone zone zone zone zone zone zone zone zone zone zone".to_string()),
+            ]
+        );
+        assert_eq!(
+            list_app_mnemonic_orgs(&paths).unwrap(),
+            vec!["org-a".to_string(), "org-b".to_string()]
+        );
+        // absent app / absent org return None / empty
+        assert!(
+            load_app_mnemonic(&paths, "org-a", "nope")
+                .unwrap()
+                .is_none()
+        );
+        assert!(list_app_mnemonics(&paths, "org-c").unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_mnemonic_store_rejects_invalid_app_name_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().join("state")).unwrap();
+
+        let err = store_app_mnemonic(&paths, "org-a", "../escape", "mnemonic")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("invalid recovery mnemonic app name"));
+        assert!(!tmp.path().join("state/keys/escape.mnemonic").exists());
+        assert!(!tmp.path().join("escape.mnemonic").exists());
     }
 
     #[test]
@@ -542,6 +809,7 @@ mod tests {
                 org_name: Some("demo".to_string()),
                 owner_fingerprint: Some("owner-fp".to_string()),
             },
+            &[],
         )
         .unwrap();
 
@@ -552,7 +820,9 @@ mod tests {
         assert_eq!(backup.cipher.name, "xchacha20-poly1305");
         assert_ne!(backup.ciphertext, hex::encode(seed));
         assert_eq!(
-            decrypt_recovery_backup(&backup, "correct horse battery staple").unwrap(),
+            decrypt_recovery_backup(&backup, "correct horse battery staple")
+                .unwrap()
+                .seed,
             seed
         );
     }

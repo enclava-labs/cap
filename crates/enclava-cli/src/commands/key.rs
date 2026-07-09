@@ -215,7 +215,23 @@ async fn status() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     println!("Keyring trust: {state}");
                 }
+                let stored_mnemonics =
+                    keys::list_app_mnemonics(&paths, &org_name).unwrap_or_default();
+                if stored_mnemonics.is_empty() {
+                    println!("Stored recovery mnemonics: none");
+                } else {
+                    let apps: Vec<&str> =
+                        stored_mnemonics.iter().map(|(a, _)| a.as_str()).collect();
+                    println!(
+                        "Stored recovery mnemonics: {} app(s) — {}",
+                        stored_mnemonics.len(),
+                        apps.join(", ")
+                    );
+                }
             }
+            println!(
+                "Note: `key backup` covers deploy keys plus any mnemonics stored at deploy/claim time (default). Apps whose mnemonic was not stored are not covered."
+            );
         }
         None => {
             println!("Recovery seed: missing");
@@ -240,6 +256,80 @@ fn prompt_restore_passphrase() -> Result<String, Box<dyn std::error::Error>> {
         .interact()?)
 }
 
+fn logged_out_backup_metadata(
+    org: Option<String>,
+) -> (keys::RecoveryBackupMetadata, Option<String>) {
+    (
+        keys::RecoveryBackupMetadata {
+            org_name: org.clone(),
+            ..keys::RecoveryBackupMetadata::default()
+        },
+        org,
+    )
+}
+
+fn ensure_backup_org_matches_active_org(
+    backup_org_id: Option<&str>,
+    backup_org_name: Option<&str>,
+    active_org_id: &str,
+    active_org_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(backup_org_id) = backup_org_id
+        && backup_org_id != active_org_id
+    {
+        return Err(format!(
+            "backup is for org {backup_org_id}, but active org is {active_org_name} ({active_org_id})"
+        )
+        .into());
+    }
+    if let Some(backup_org_name) = backup_org_name
+        && backup_org_name != active_org_name
+    {
+        return Err(format!(
+            "backup is for org {backup_org_name}, but active org is {active_org_name} ({active_org_id})"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn ensure_mnemonic_restore_will_not_overwrite(
+    paths: &CliPaths,
+    org_name: &str,
+    mnemonics: &[keys::RecoveryBackupMnemonic],
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if force {
+        return Ok(());
+    }
+
+    for mnemonic in mnemonics {
+        if let Some(existing) = keys::load_app_mnemonic(paths, org_name, &mnemonic.app)?
+            && existing != mnemonic.mnemonic
+        {
+            let path = keys::app_mnemonic_path(paths, org_name, &mnemonic.app);
+            return Err(format!(
+                "{} already contains a different recovery mnemonic for {}; pass --force to overwrite it after verifying this backup is current",
+                path.display(),
+                mnemonic.app
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn restore_app_mnemonics(
+    paths: &CliPaths,
+    org_name: &str,
+    mnemonics: &[keys::RecoveryBackupMnemonic],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for mnemonic in mnemonics {
+        keys::store_app_mnemonic(paths, org_name, &mnemonic.app, &mnemonic.mnemonic)?;
+    }
+    Ok(())
+}
+
 async fn backup(
     output: PathBuf,
     org: Option<String>,
@@ -254,8 +344,8 @@ async fn backup(
     }
     let paths = CliPaths::resolve()?;
     let seed = keys::load_or_create_recovery_seed(&paths)?;
-    let metadata = if let Some((_api, me)) = current_user(&paths).await? {
-        if let Some(requested_org) = org
+    let (metadata, backup_org_name) = if let Some((_api, me)) = current_user(&paths).await? {
+        if let Some(requested_org) = org.as_deref()
             && requested_org != me.active_org.name
             && requested_org != me.active_org.id
         {
@@ -268,16 +358,38 @@ async fn backup(
         let user_id = Uuid::parse_str(&me.user_id)?;
         let org_id = Uuid::parse_str(&me.active_org.id)?;
         let owner = keys::derive_org_owner_key(user_id, org_id, &seed)?;
-        keys::RecoveryBackupMetadata {
-            org_id: Some(me.active_org.id),
-            org_name: Some(me.active_org.name),
-            owner_fingerprint: Some(fingerprint(&owner.public)),
-        }
+        let active_name = me.active_org.name.clone();
+        (
+            keys::RecoveryBackupMetadata {
+                org_id: Some(me.active_org.id),
+                org_name: Some(active_name.clone()),
+                owner_fingerprint: Some(fingerprint(&owner.public)),
+            },
+            Some(active_name),
+        )
     } else {
-        keys::RecoveryBackupMetadata::default()
+        if org.is_none() {
+            let mnemonic_orgs = keys::list_app_mnemonic_orgs(&paths)?;
+            if !mnemonic_orgs.is_empty() {
+                return Err(format!(
+                    "stored recovery mnemonics exist for org(s) {}; run `enclava key backup --org <org>` or login before backing up so they are not omitted",
+                    mnemonic_orgs.join(", ")
+                )
+                .into());
+            }
+        }
+        logged_out_backup_metadata(org)
+    };
+    let mnemonics: Vec<keys::RecoveryBackupMnemonic> = match backup_org_name.as_deref() {
+        Some(org_name) => keys::list_app_mnemonics(&paths, org_name)?
+            .into_iter()
+            .map(|(app, mnemonic)| keys::RecoveryBackupMnemonic { app, mnemonic })
+            .collect(),
+        None => Vec::new(),
     };
     let passphrase = prompt_backup_passphrase()?;
-    let backup = keys::encrypt_recovery_backup_with_metadata(&seed, &passphrase, metadata)?;
+    let backup =
+        keys::encrypt_recovery_backup_with_metadata(&seed, &passphrase, metadata, &mnemonics)?;
     let raw = serde_json::to_vec_pretty(&backup)?;
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -292,6 +404,18 @@ async fn backup(
     std::fs::rename(&tmp, &output)?;
     println!("Encrypted recovery backup written to {}", output.display());
     println!("Seed fingerprint: {}", keys::seed_fingerprint(&seed));
+    if mnemonics.is_empty() {
+        println!(
+            "Note: no recovery mnemonics are stored locally; this backup covers deploy keys only. Store a mnemonic at deploy/claim time (default) to back it up too."
+        );
+    } else {
+        let apps: Vec<&str> = mnemonics.iter().map(|m| m.app.as_str()).collect();
+        println!(
+            "This backup covers deploy keys plus storage recovery for {} app(s): {}",
+            mnemonics.len(),
+            apps.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -300,7 +424,8 @@ async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::
     let raw = std::fs::read_to_string(&input)?;
     let backup: keys::RecoveryBackup = serde_json::from_str(&raw)?;
     let passphrase = prompt_restore_passphrase()?;
-    let seed = keys::decrypt_recovery_backup(&backup, &passphrase)?;
+    let keys::DecryptedBackup { seed, mnemonics } =
+        keys::decrypt_recovery_backup(&backup, &passphrase)?;
     let existing_seed = keys::load_recovery_seed(&paths)?;
     if let Some(existing) = existing_seed
         && existing != seed
@@ -315,17 +440,15 @@ async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::
     let (api, me) = current_user(&paths)
         .await?
         .ok_or("restore requires an active platform session; run `enclava login` first")?;
-    if let Some(backup_org_id) = backup.org_id.as_deref()
-        && backup_org_id != me.active_org.id
-    {
-        return Err(format!(
-            "backup is for org {backup_org_id}, but active org is {} ({})",
-            me.active_org.name, me.active_org.id
-        )
-        .into());
-    }
+    ensure_backup_org_matches_active_org(
+        backup.org_id.as_deref(),
+        backup.org_name.as_deref(),
+        &me.active_org.id,
+        &me.active_org.name,
+    )?;
     let (_org_id, org_name, owner_fingerprint) =
         verify_or_initialize_remote_keyring(&api, &me, &seed).await?;
+    ensure_mnemonic_restore_will_not_overwrite(&paths, &org_name, &mnemonics, force)?;
 
     if existing_seed == Some(seed) {
         println!(
@@ -341,5 +464,108 @@ async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::
     }
     println!("Seed fingerprint: {}", keys::seed_fingerprint(&seed));
     println!("Verified owner key for {org_name}: {owner_fingerprint}");
+    if mnemonics.is_empty() {
+        println!("Note: this backup contained no stored recovery mnemonics (deploy keys only).");
+    } else {
+        restore_app_mnemonics(&paths, &org_name, &mnemonics)?;
+        let apps: Vec<&str> = mnemonics.iter().map(|m| m.app.as_str()).collect();
+        println!(
+            "Restored storage recovery mnemonic(s) for {} app(s): {}",
+            mnemonics.len(),
+            apps.join(", ")
+        );
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mnemonics_requires_force_before_overwriting_different_existing_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        keys::store_app_mnemonic(&paths, "org-a", "shell", "newer mnemonic").unwrap();
+        let mnemonics = vec![keys::RecoveryBackupMnemonic {
+            app: "shell".to_string(),
+            mnemonic: "older mnemonic".to_string(),
+        }];
+
+        let err = ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different recovery mnemonic"));
+        assert!(err.contains("--force"));
+        assert_eq!(
+            keys::load_app_mnemonic(&paths, "org-a", "shell").unwrap(),
+            Some("newer mnemonic".to_string())
+        );
+
+        ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, true).unwrap();
+        restore_app_mnemonics(&paths, "org-a", &mnemonics).unwrap();
+        assert_eq!(
+            keys::load_app_mnemonic(&paths, "org-a", "shell").unwrap(),
+            Some("older mnemonic".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mnemonics_allows_matching_existing_value_without_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        keys::store_app_mnemonic(&paths, "org-a", "shell", "same mnemonic").unwrap();
+        let mnemonics = vec![keys::RecoveryBackupMnemonic {
+            app: "shell".to_string(),
+            mnemonic: "same mnemonic".to_string(),
+        }];
+
+        ensure_mnemonic_restore_will_not_overwrite(&paths, "org-a", &mnemonics, false).unwrap();
+    }
+
+    #[test]
+    fn logged_out_backup_metadata_records_requested_org_name() {
+        let (metadata, backup_org_name) = logged_out_backup_metadata(Some("org-a".to_string()));
+
+        assert_eq!(metadata.org_name.as_deref(), Some("org-a"));
+        assert_eq!(backup_org_name.as_deref(), Some("org-a"));
+        assert!(metadata.org_id.is_none());
+        assert!(metadata.owner_fingerprint.is_none());
+    }
+
+    #[test]
+    fn restore_rejects_backup_org_name_mismatch() {
+        let err = ensure_backup_org_matches_active_org(
+            None,
+            Some("org-a"),
+            "22222222-2222-2222-2222-222222222222",
+            "org-b",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("backup is for org org-a"));
+        assert!(err.contains("active org is org-b"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_mnemonics_reject_invalid_app_name_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().join("state")).unwrap();
+        let mnemonics = vec![keys::RecoveryBackupMnemonic {
+            app: "../escape".to_string(),
+            mnemonic: "older mnemonic".to_string(),
+        }];
+
+        let err = restore_app_mnemonics(&paths, "org-a", &mnemonics)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("invalid recovery mnemonic app name"));
+        assert!(!tmp.path().join("state/keys/escape.mnemonic").exists());
+        assert!(!tmp.path().join("escape.mnemonic").exists());
+    }
 }
