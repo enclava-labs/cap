@@ -72,6 +72,42 @@ fn keyring_envelope_from_response(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedAppIdentityFields {
+    pub namespace: String,
+    pub instance_id: String,
+    pub service_account: String,
+}
+
+pub(crate) fn resolve_app_identity_fields(
+    app: &AppResponse,
+    org_name: &str,
+    app_id: Uuid,
+) -> ResolvedAppIdentityFields {
+    let namespace = if app.namespace.trim().is_empty() {
+        format!("cap-{org_name}-{}", app.name)
+    } else {
+        app.namespace.trim().to_string()
+    };
+    let instance_id = if app.instance_id.trim().is_empty() {
+        format!("{org_name}-{}", &app_id.to_string()[..8])
+    } else {
+        app.instance_id.trim().to_string()
+    };
+    let service_account = app
+        .service_account
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("cap-{}-sa", app.name));
+    ResolvedAppIdentityFields {
+        namespace,
+        instance_id,
+        service_account,
+    }
+}
+
 pub(crate) struct ActiveUserOrg {
     pub(crate) user_id: Uuid,
     pub(crate) org_id: Uuid,
@@ -245,6 +281,9 @@ pub(crate) struct ConfidentialAppForCcHash<'a> {
     pub(crate) tenant_id: String,
     pub(crate) tenant_instance_identity_hash: [u8; 32],
     pub(crate) bootstrap_owner_pubkey_hash: String,
+    pub(crate) namespace: String,
+    pub(crate) instance_id: String,
+    pub(crate) service_account: String,
     pub(crate) workload_security_profile: WorkloadSecurityProfile,
     pub(crate) log_encryption: Option<LogEncryptionConfig>,
 }
@@ -265,6 +304,9 @@ pub(crate) fn confidential_app_for_cc_hash(
         tenant_id,
         tenant_instance_identity_hash,
         bootstrap_owner_pubkey_hash,
+        namespace,
+        instance_id,
+        service_account,
         workload_security_profile,
         log_encryption,
     } = params;
@@ -283,15 +325,12 @@ pub(crate) fn confidential_app_for_cc_hash(
         app_id: Uuid::parse_str(&app.id)?,
         deployment_id,
         name: app.name.clone(),
-        namespace: app.namespace.clone(),
-        instance_id: app.instance_id.clone(),
+        namespace,
+        instance_id,
         tenant_id,
         bootstrap_owner_pubkey_hash,
         tenant_instance_identity_hash: hex::encode(tenant_instance_identity_hash),
-        service_account: app
-            .service_account
-            .clone()
-            .unwrap_or_else(|| format!("cap-{}-sa", app.name)),
+        service_account,
         image_pull_secret_name: None,
         signer_identity_subject: app.signer_identity_subject.clone(),
         signer_identity_issuer: app.signer_identity_issuer.clone(),
@@ -534,9 +573,9 @@ pub(crate) async fn build_signed_deploy_blobs(
         return Err("platform deployment context did not include api_signing_pubkey".into());
     }
 
-    let (org_id, org_name, deployer_key) = ensure_manual_deploy_keyring(api, paths).await?;
-
     let app_id = Uuid::parse_str(&app.id)?;
+    let (org_id, org_name, deployer_key) = ensure_manual_deploy_keyring(api, paths).await?;
+    let app_identity = resolve_app_identity_fields(app, &org_name, app_id);
     let trusted_owner = load_trusted_owner(&org_id)?
         .ok_or("org owner pubkey is not trusted; run `enclava org keyring trust` or `enclava org keyring init`")?;
     let keyring_envelope = load_keyring_envelope(&org_id).map_err(|err| {
@@ -564,7 +603,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             org_id,
             &app.name,
             &tenant_id,
-            &app.instance_id,
+            &app_identity.instance_id,
         )? {
             Some(hash) => hash,
             None => {
@@ -611,11 +650,8 @@ pub(crate) async fn build_signed_deploy_blobs(
         app_domain: app.domain.clone(),
         tee_domain: app.tee_domain.clone().unwrap_or_else(|| app.domain.clone()),
         custom_domains: app.custom_domain.clone().into_iter().collect(),
-        namespace: app.namespace.clone(),
-        service_account: app
-            .service_account
-            .clone()
-            .unwrap_or_else(|| format!("cap-{}-sa", app.name)),
+        namespace: app_identity.namespace.clone(),
+        service_account: app_identity.service_account.clone(),
         identity_hash,
         image_ref: image_ref.digest_ref(),
         image_digest: image_ref.digest().to_string(),
@@ -638,7 +674,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         expected_runtime_class: release.expected_runtime_class.clone(),
         kbs_resource_path: format!(
             "default/{}-{}-owner/seed-encrypted",
-            app.namespace, app.name
+            app_identity.namespace, app.name
         ),
         unlock_mode: deploy_unlock_mode.to_string(),
         policy_template_id: release.policy_template_id.clone(),
@@ -672,6 +708,9 @@ pub(crate) async fn build_signed_deploy_blobs(
             tenant_id,
             tenant_instance_identity_hash: identity_hash,
             bootstrap_owner_pubkey_hash: bootstrap_pubkey_hash,
+            namespace: app_identity.namespace.clone(),
+            instance_id: app_identity.instance_id.clone(),
+            service_account: app_identity.service_account.clone(),
             workload_security_profile,
             log_encryption,
         },

@@ -1,5 +1,6 @@
 use super::*;
 use crate::commands::app::signing::platform_release_from_deployment_context_with_verifier;
+use crate::commands::app::signing::resolve_app_identity_fields;
 use enclava_cli::app_config::{AppSection, ResourcesSection, StorageSection, UnlockSection};
 use enclava_cli::platform_release::PlatformReleaseEnvelope;
 
@@ -169,6 +170,9 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
                 tenant_id: "org".to_string(),
                 tenant_instance_identity_hash: [4; 32],
                 bootstrap_owner_pubkey_hash: "33".repeat(32),
+                namespace: "cap-org-demo".to_string(),
+                instance_id: "org-22222222".to_string(),
+                service_account: "cap-demo-sa".to_string(),
                 workload_security_profile: WorkloadSecurityProfile::Restricted,
                 log_encryption: None,
             },
@@ -235,6 +239,9 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
                 tenant_id: "org".to_string(),
                 tenant_instance_identity_hash: [4; 32],
                 bootstrap_owner_pubkey_hash: "33".repeat(32),
+                namespace: "cap-org-demo".to_string(),
+                instance_id: "org-22222222".to_string(),
+                service_account: "cap-demo-sa".to_string(),
                 workload_security_profile: WorkloadSecurityProfile::Restricted,
                 log_encryption: None,
             },
@@ -350,6 +357,30 @@ fn deploy_preflights_password_input_before_remote_side_effects() {
         password_input < preflight && preflight < sign && deploy_end < remote_deploy,
         "password-mode deploy must verify password input before signing and before remote mutation"
     );
+}
+
+#[test]
+fn resolve_app_identity_fields_repairs_missing_snapshot_identity_fields() {
+    let mut app = test_app_response();
+    app.namespace = "  ".to_string();
+    app.instance_id = String::new();
+    app.service_account = Some(" ".to_string());
+
+    let app_id = uuid::Uuid::parse_str(&app.id).expect("valid app id");
+    let resolved = resolve_app_identity_fields(&app, "org", app_id);
+    assert_eq!(resolved.namespace, "cap-org-demo");
+    assert_eq!(resolved.instance_id, "org-22222222");
+    assert_eq!(resolved.service_account, "cap-demo-sa");
+}
+
+#[test]
+fn resolve_app_identity_fields_preserves_existing_values() {
+    let app = test_app_response();
+    let app_id = uuid::Uuid::parse_str(&app.id).expect("valid app id");
+    let resolved = resolve_app_identity_fields(&app, "org", app_id);
+    assert_eq!(resolved.namespace, "cap-org-demo");
+    assert_eq!(resolved.instance_id, "org-22222222");
+    assert_eq!(resolved.service_account, "cap-demo-sa");
 }
 
 #[test]
