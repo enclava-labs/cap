@@ -97,7 +97,9 @@ pub struct ChallengeResponse {
 #[derive(Debug, serde::Deserialize)]
 pub struct ClaimResponse {
     pub status: String,
-    /// BIP39 mnemonic backup (shown to user once, never stored by CLI)
+    /// BIP39 mnemonic backup (shown to user once, never stored by CLI).
+    /// The TEE emits this under the `owner_seed_mnemonic` key.
+    #[serde(rename = "owner_seed_mnemonic")]
     pub mnemonic: Option<String>,
 }
 
