@@ -19,6 +19,12 @@ pub struct ClaimArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
+    /// Persist the recovery mnemonic so `enclava key backup` can back it up (default).
+    #[arg(long, conflicts_with = "no_store_mnemonic")]
+    pub store_mnemonic: bool,
+    /// Do NOT persist the recovery mnemonic (shown once only; opt out of backup coverage).
+    #[arg(long, conflicts_with = "store_mnemonic")]
+    pub no_store_mnemonic: bool,
 }
 
 #[derive(Args)]
@@ -171,8 +177,20 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Ownership claimed.");
 
+    let capture = if args.no_store_mnemonic {
+        MnemonicCapture::Skip
+    } else {
+        MnemonicCapture::Store
+    };
     if let Some(mnemonic) = result.as_ref().and_then(|result| result.mnemonic.as_ref()) {
-        present_recovery_mnemonic_or_warn(mnemonic, RecoveryMnemonicOutput::Stdout);
+        present_and_capture_recovery_mnemonic_or_warn(
+            &paths,
+            &me.active_org.name,
+            &app_name,
+            mnemonic,
+            capture,
+            RecoveryMnemonicOutput::Stdout,
+        );
     }
 
     Ok(())
@@ -184,30 +202,44 @@ pub(crate) enum RecoveryMnemonicOutput {
     Stderr,
 }
 
-/// Present the one-time LUKS recovery mnemonic to the operator, downgrading any
-/// presentation failure to a loud stderr warning instead of an error.
-///
-/// Use this - not `present_recovery_mnemonic` - from flows that run *after* the TEE has
-/// already accepted ownership (`claim`, and `claim_initial_ownership` via `deploy` and
-/// template deploy). There the mnemonic presentation must never turn a successful claim
-/// into a reported failure: if stdout/stderr is closed or the operator sends EOF
-/// (Ctrl-D) at the confirmation prompt, ownership is already recorded server-side. We
-/// warn on stderr and re-print the mnemonic as a fallback (it is stored nowhere), so the
-/// command still exits successfully and the operator gets one more chance to record it.
-pub(crate) fn present_recovery_mnemonic_or_warn(mnemonic: &str, output: RecoveryMnemonicOutput) {
-    if let Err(err) = present_recovery_mnemonic(mnemonic, output) {
-        let mut stderr = io::stderr().lock();
-        emit_recovery_mnemonic_interrupted_warning(&mut stderr, mnemonic, &*err);
-    }
+/// Operator's choice on whether to persist a freshly-observed recovery mnemonic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MnemonicCapture {
+    /// Persist to local state so `key backup` can include it (default).
+    Store,
+    /// Do not persist; the mnemonic is shown once only.
+    Skip,
 }
 
-/// Write the recovery mnemonic to the chosen stream, then run the confirmation gate.
-///
-/// Returns an error only when writing/flushing fails or the confirmation prompt hits
-/// EOF; callers reached after an irreversible server-side action should use
-/// `present_recovery_mnemonic_or_warn` so such errors don't fail the command.
-fn present_recovery_mnemonic(
+fn store_mnemonic_local(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
     mnemonic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    keys::store_app_mnemonic(paths, org, app, mnemonic)
+        .map_err(|e| format!("failed to store recovery mnemonic: {e}").into())
+}
+
+/// Present the one-time LUKS recovery mnemonic and, by default, persist it to local
+/// state so `enclava key backup` can bundle it with the deploy keys.
+///
+/// On an interactive terminal the operator is asked whether to store it (default yes);
+/// declining runs the standard "I have recorded it" confirmation gate, since the mnemonic
+/// then exists nowhere except the screen and the app's storage becomes unrecoverable if
+/// lost. Off-TTY the `capture` flag decides (`Store` by default; `--no-store-mnemonic`
+/// opts out), because no prompt is possible — this mirrors the CLI's existing behaviour
+/// of writing deploy keys to disk without confirmation.
+///
+/// Returns an error only on write/prompt failure (e.g. EOF at the prompt); callers past
+/// an irreversible server-side action should use
+/// [`present_and_capture_recovery_mnemonic_or_warn`].
+pub(crate) fn present_and_capture_recovery_mnemonic(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+    mnemonic: &str,
+    capture: MnemonicCapture,
     output: RecoveryMnemonicOutput,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match output {
@@ -223,7 +255,57 @@ fn present_recovery_mnemonic(
         }
     }
 
-    confirm_recovery_mnemonic_recorded()
+    if recovery_mnemonic_confirmation_available() {
+        let want_store = Confirm::new()
+            .with_prompt("Store this recovery mnemonic so `enclava key backup` can back it up?")
+            .default(true)
+            .interact()?;
+        if want_store {
+            store_mnemonic_local(paths, org, app, mnemonic)?;
+            eprintln!("Recovery mnemonic stored locally; run `enclava key backup` to back it up.");
+            return Ok(());
+        }
+        // Declined: the operator keeps it offline, so require the standard acknowledgement.
+        confirm_recovery_mnemonic_recorded()?;
+        eprintln!("Recovery mnemonic not stored. It will not be shown again.");
+    } else {
+        match capture {
+            MnemonicCapture::Store => {
+                store_mnemonic_local(paths, org, app, mnemonic)?;
+                eprintln!(
+                    "Recovery mnemonic stored locally (non-interactive default); run `enclava key backup` to back it up."
+                );
+            }
+            MnemonicCapture::Skip => {
+                eprintln!(
+                    "Recovery mnemonic not stored (--no-store-mnemonic). Record it now; it will not be shown again."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Like [`present_and_capture_recovery_mnemonic`] but downgrades any presentation failure
+/// to a loud stderr warning instead of an error. Use this — not the fallible form — from
+/// flows that run *after* the TEE has accepted ownership (`claim`, `claim_initial_ownership`
+/// via `deploy`/template deploy): ownership is already recorded server-side, so mnemonic
+/// handling must never turn a successful claim into a reported failure. On failure the
+/// mnemonic is re-printed as a fallback.
+pub(crate) fn present_and_capture_recovery_mnemonic_or_warn(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+    mnemonic: &str,
+    capture: MnemonicCapture,
+    output: RecoveryMnemonicOutput,
+) {
+    if let Err(err) =
+        present_and_capture_recovery_mnemonic(paths, org, app, mnemonic, capture, output)
+    {
+        let mut stderr = io::stderr().lock();
+        emit_recovery_mnemonic_interrupted_warning(&mut stderr, mnemonic, &*err);
+    }
 }
 
 /// Best-effort warning for when recovery-mnemonic presentation is interrupted. This is
@@ -257,7 +339,11 @@ fn write_recovery_mnemonic(
     )?;
     writeln!(
         output,
-        "This is the ONLY recovery for your encrypted storage; `enclava key backup` does not back it up (deploy keys only)."
+        "This is the ONLY recovery for your encrypted storage."
+    )?;
+    writeln!(
+        output,
+        "Store it now (the default) and `enclava key backup` can bundle it with your deploy keys; if you skip, it is stored nowhere."
     )?;
     writeln!(
         output,
@@ -350,15 +436,36 @@ async fn wait_for_unlock_completion(tee: &TeeClient) -> Result<(), Box<dyn std::
 
 pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_name = resolve_app_name(&args.app)?;
-    let (api, _paths) = build_api_client()?;
+    let (api, paths) = build_api_client()?;
+    let me = api.get_current_user().await?;
     let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
     let tee =
         TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
-    let mnemonic: String = Input::new()
-        .with_prompt("Recovery mnemonic (BIP39)")
-        .interact_text()?;
+    // Prefer a mnemonic restored into local state (via `key restore`); fall back to an
+    // interactive prompt. Headless + no stored mnemonic is an error (can't prompt).
+    let mnemonic = match keys::load_app_mnemonic(&paths, &me.active_org.name, &app_name)? {
+        Some(stored) if io::stdin().is_terminal() => {
+            let use_stored = Confirm::new()
+                .with_prompt(format!("Use the stored recovery mnemonic for {app_name}?"))
+                .default(true)
+                .interact()?;
+            if use_stored {
+                stored
+            } else {
+                prompt_recovery_mnemonic()?
+            }
+        }
+        Some(stored) => stored,
+        None if io::stdin().is_terminal() => prompt_recovery_mnemonic()?,
+        None => {
+            return Err(format!(
+                "no stored recovery mnemonic for {app_name}; run `enclava key restore <backup>` first, or run this command in an interactive shell"
+            )
+            .into());
+        }
+    };
 
     let new_password = Password::new()
         .with_prompt("New unlock password")
@@ -369,6 +476,12 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
     tee.recover(&mnemonic, &new_password).await?;
     println!("Recovery complete. Use the new password to unlock.");
     Ok(())
+}
+
+fn prompt_recovery_mnemonic() -> Result<String, Box<dyn std::error::Error>> {
+    Ok(Input::new()
+        .with_prompt("Recovery mnemonic (BIP39)")
+        .interact_text()?)
 }
 
 pub async fn change_password(args: ChangePasswordArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -528,6 +641,7 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn recovery_mnemonic_writer_includes_scope_warning_and_secret() {
         let mut output = Vec::new();
@@ -538,7 +652,7 @@ mod tests {
 
         assert!(output.contains("RECOVERY MNEMONIC (shown ONCE)"));
         assert!(output.contains("enclava key backup"));
-        assert!(output.contains("deploy keys only"));
+        assert!(output.contains("stored nowhere"));
         assert!(output.contains(mnemonic));
     }
 
@@ -565,5 +679,46 @@ mod tests {
         assert!(output.contains("record it now"));
         assert!(output.contains(mnemonic));
         assert!(output.contains("stdin closed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_interactive_capture_stores_by_default_and_skips_when_opted_out() {
+        // Off-TTY there is no confirmation gate to block on (the regression this guards).
+        // Store (default) persists to local state; Skip does not.
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        present_and_capture_recovery_mnemonic(
+            &paths,
+            "org-a",
+            "shell1",
+            mnemonic,
+            MnemonicCapture::Store,
+            RecoveryMnemonicOutput::Stderr,
+        )
+        .expect("non-interactive Store must persist and return Ok");
+        assert_eq!(
+            keys::load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
+            Some(mnemonic.to_string())
+        );
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        let paths2 = CliPaths::from_root(tmp2.path().to_path_buf()).unwrap();
+        present_and_capture_recovery_mnemonic(
+            &paths2,
+            "org-a",
+            "shell2",
+            mnemonic,
+            MnemonicCapture::Skip,
+            RecoveryMnemonicOutput::Stderr,
+        )
+        .expect("non-interactive Skip must return Ok");
+        assert!(
+            keys::load_app_mnemonic(&paths2, "org-a", "shell2")
+                .unwrap()
+                .is_none()
+        );
     }
 }

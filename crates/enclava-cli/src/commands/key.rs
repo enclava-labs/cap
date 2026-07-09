@@ -215,9 +215,22 @@ async fn status() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     println!("Keyring trust: {state}");
                 }
+                let stored_mnemonics =
+                    keys::list_app_mnemonics(&paths, &org_name).unwrap_or_default();
+                if stored_mnemonics.is_empty() {
+                    println!("Stored recovery mnemonics: none");
+                } else {
+                    let apps: Vec<&str> =
+                        stored_mnemonics.iter().map(|(a, _)| a.as_str()).collect();
+                    println!(
+                        "Stored recovery mnemonics: {} app(s) — {}",
+                        stored_mnemonics.len(),
+                        apps.join(", ")
+                    );
+                }
             }
             println!(
-                "Note: this backs up deploy keys only — the LUKS recovery mnemonic (shown once at deploy/claim) is separate and is NOT stored or backed up by the CLI."
+                "Note: `key backup` covers deploy keys plus any mnemonics stored at deploy/claim time (default). Apps whose mnemonic was not stored are not covered."
             );
         }
         None => {
@@ -257,7 +270,7 @@ async fn backup(
     }
     let paths = CliPaths::resolve()?;
     let seed = keys::load_or_create_recovery_seed(&paths)?;
-    let metadata = if let Some((_api, me)) = current_user(&paths).await? {
+    let (metadata, backup_org_name) = if let Some((_api, me)) = current_user(&paths).await? {
         if let Some(requested_org) = org
             && requested_org != me.active_org.name
             && requested_org != me.active_org.id
@@ -271,16 +284,28 @@ async fn backup(
         let user_id = Uuid::parse_str(&me.user_id)?;
         let org_id = Uuid::parse_str(&me.active_org.id)?;
         let owner = keys::derive_org_owner_key(user_id, org_id, &seed)?;
-        keys::RecoveryBackupMetadata {
-            org_id: Some(me.active_org.id),
-            org_name: Some(me.active_org.name),
-            owner_fingerprint: Some(fingerprint(&owner.public)),
-        }
+        let active_name = me.active_org.name.clone();
+        (
+            keys::RecoveryBackupMetadata {
+                org_id: Some(me.active_org.id),
+                org_name: Some(active_name.clone()),
+                owner_fingerprint: Some(fingerprint(&owner.public)),
+            },
+            Some(active_name),
+        )
     } else {
-        keys::RecoveryBackupMetadata::default()
+        (keys::RecoveryBackupMetadata::default(), org)
+    };
+    let mnemonics: Vec<keys::RecoveryBackupMnemonic> = match backup_org_name.as_deref() {
+        Some(org_name) => keys::list_app_mnemonics(&paths, org_name)?
+            .into_iter()
+            .map(|(app, mnemonic)| keys::RecoveryBackupMnemonic { app, mnemonic })
+            .collect(),
+        None => Vec::new(),
     };
     let passphrase = prompt_backup_passphrase()?;
-    let backup = keys::encrypt_recovery_backup_with_metadata(&seed, &passphrase, metadata)?;
+    let backup =
+        keys::encrypt_recovery_backup_with_metadata(&seed, &passphrase, metadata, &mnemonics)?;
     let raw = serde_json::to_vec_pretty(&backup)?;
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -295,9 +320,18 @@ async fn backup(
     std::fs::rename(&tmp, &output)?;
     println!("Encrypted recovery backup written to {}", output.display());
     println!("Seed fingerprint: {}", keys::seed_fingerprint(&seed));
-    println!(
-        "Note: this backup covers deploy keys only — the LUKS recovery mnemonic (shown once at deploy/claim) is separate and is NOT stored or restored by the CLI."
-    );
+    if mnemonics.is_empty() {
+        println!(
+            "Note: no recovery mnemonics are stored locally; this backup covers deploy keys only. Store a mnemonic at deploy/claim time (default) to back it up too."
+        );
+    } else {
+        let apps: Vec<&str> = mnemonics.iter().map(|m| m.app.as_str()).collect();
+        println!(
+            "This backup covers deploy keys plus storage recovery for {} app(s): {}",
+            mnemonics.len(),
+            apps.join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -306,7 +340,8 @@ async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::
     let raw = std::fs::read_to_string(&input)?;
     let backup: keys::RecoveryBackup = serde_json::from_str(&raw)?;
     let passphrase = prompt_restore_passphrase()?;
-    let seed = keys::decrypt_recovery_backup(&backup, &passphrase)?;
+    let keys::DecryptedBackup { seed, mnemonics } =
+        keys::decrypt_recovery_backup(&backup, &passphrase)?;
     let existing_seed = keys::load_recovery_seed(&paths)?;
     if let Some(existing) = existing_seed
         && existing != seed
@@ -347,8 +382,18 @@ async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::
     }
     println!("Seed fingerprint: {}", keys::seed_fingerprint(&seed));
     println!("Verified owner key for {org_name}: {owner_fingerprint}");
-    println!(
-        "Note: this restores deploy keys only — the LUKS recovery mnemonic (shown once at deploy/claim) is separate and is NOT stored or restored by the CLI."
-    );
+    if mnemonics.is_empty() {
+        println!("Note: this backup contained no stored recovery mnemonics (deploy keys only).");
+    } else {
+        for m in &mnemonics {
+            keys::store_app_mnemonic(&paths, &org_name, &m.app, &m.mnemonic)?;
+        }
+        let apps: Vec<&str> = mnemonics.iter().map(|m| m.app.as_str()).collect();
+        println!(
+            "Restored storage recovery mnemonic(s) for {} app(s): {}",
+            mnemonics.len(),
+            apps.join(", ")
+        );
+    }
     Ok(())
 }

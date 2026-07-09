@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::commands::ownership::MnemonicCapture;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use clap::Subcommand;
@@ -340,6 +341,12 @@ pub struct DeployArgs {
     /// File containing the storage password for non-interactive password-mode deploys.
     #[arg(long = "storage-password-file", value_name = "PATH")]
     pub storage_password_file: Option<PathBuf>,
+    /// Persist the recovery mnemonic so `enclava key backup` can back it up (default).
+    #[arg(long, conflicts_with = "no_store_mnemonic")]
+    pub store_mnemonic: bool,
+    /// Do NOT persist the recovery mnemonic (shown once only; opt out of backup coverage).
+    #[arg(long, conflicts_with = "store_mnemonic")]
+    pub no_store_mnemonic: bool,
 }
 
 pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -361,6 +368,11 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     if is_password_mode {
         storage_password.ensure_available_for_password_mode("password-mode deploy")?;
     }
+    let capture = if args.no_store_mnemonic {
+        MnemonicCapture::Skip
+    } else {
+        MnemonicCapture::Store
+    };
     let signed_blobs = build_signed_deploy_blobs(SignedDeployBlobParams {
         api: &api,
         paths: &paths,
@@ -427,8 +439,15 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         pb.set_position(3);
         pb.set_message("Waiting for ownership claim endpoint...");
         if wait_for_bootstrap_endpoint(&api, &app_name, max_wait, poll_interval, &pb).await? {
-            claim_initial_ownership(&api, &paths, &cli_config, &app_name, &storage_password)
-                .await?;
+            claim_initial_ownership(
+                &api,
+                &paths,
+                &cli_config,
+                &app_name,
+                &storage_password,
+                capture,
+            )
+            .await?;
             pb.set_message("Ownership claimed");
         } else {
             let runtime_target = if deploy_should_unlock_before_config(
@@ -831,6 +850,7 @@ pub(crate) async fn claim_initial_ownership(
     _cli_config: &config::CliConfig,
     app_name: &str,
     storage_password: &StoragePasswordInput,
+    capture: MnemonicCapture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = api.get_unlock_endpoint(app_name).await?;
     let tee =
@@ -869,8 +889,12 @@ pub(crate) async fn claim_initial_ownership(
     };
 
     if let Some(mnemonic) = result.and_then(|result| result.mnemonic) {
-        crate::commands::ownership::present_recovery_mnemonic_or_warn(
+        crate::commands::ownership::present_and_capture_recovery_mnemonic_or_warn(
+            paths,
+            &active.org_name,
+            app_name,
             &mnemonic,
+            capture,
             crate::commands::ownership::RecoveryMnemonicOutput::Stderr,
         );
     }

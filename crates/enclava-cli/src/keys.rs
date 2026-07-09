@@ -104,6 +104,22 @@ pub struct RecoveryBackupMetadata {
     pub owner_fingerprint: Option<String>,
 }
 
+/// A per-app LUKS recovery mnemonic carried inside the encrypted backup payload.
+/// These are secret and live under the AEAD ciphertext, never in cleartext envelope fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryBackupMnemonic {
+    pub app: String,
+    pub mnemonic: String,
+}
+
+/// Plaintext result of decrypting a recovery backup: the org-wide deploy-key seed
+/// plus any captured per-app LUKS recovery mnemonics.
+#[derive(Debug, Clone)]
+pub struct DecryptedBackup {
+    pub seed: [u8; 32],
+    pub mnemonics: Vec<RecoveryBackupMnemonic>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryBackup {
     pub version: u8,
@@ -143,6 +159,10 @@ struct RecoveryBackupPayload {
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
+    /// Per-app LUKS recovery mnemonics (payload v2). `#[serde(default)]` keeps v1
+    /// backups (no mnemonics field) decryptable — they yield an empty map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mnemonics: Option<Vec<RecoveryBackupMnemonic>>,
 }
 
 impl Drop for UserSigningKey {
@@ -229,12 +249,18 @@ pub fn store_seed_at(path: &Path, seed: &[u8; 32], force: bool) -> Result<(), Ke
             path.display()
         )));
     }
+    write_secret_atomic(path, seed)
+}
+
+/// Atomically write secret bytes to `path` (file mode 0600, parent dir 0700) via a
+/// `.tmp` rename so a crash never leaves a partial secret on disk.
+fn write_secret_atomic(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
         set_dir_perms_0700(parent)?;
     }
     let tmp = path.with_extension("tmp");
-    fs::write(&tmp, seed)?;
+    fs::write(&tmp, bytes)?;
     set_file_perms_0600(&tmp)?;
     fs::rename(&tmp, path)?;
     Ok(())
@@ -294,6 +320,71 @@ pub fn derive_app_bootstrap_seed(
     derive_ed25519_seed(recovery_seed, &format!("app-bootstrap/{org_id}/{app_name}"))
 }
 
+/// Path to the stored LUKS recovery mnemonic for a password-mode app.
+/// Scoped by org to match bootstrap keys: `~/.enclava/keys/{org}/{app}.mnemonic`.
+pub fn app_mnemonic_path(paths: &CliPaths, org: &str, app: &str) -> PathBuf {
+    paths.keys_dir.join(org).join(format!("{app}.mnemonic"))
+}
+
+/// Persist a recovery mnemonic to local state (mode 0600, atomic). Overwrites any
+/// existing entry for the app — a fresh redeploy mints a new mnemonic and voids the old.
+pub fn store_app_mnemonic(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+    mnemonic: &str,
+) -> Result<(), KeysError> {
+    write_secret_atomic(&app_mnemonic_path(paths, org, app), mnemonic.as_bytes())
+}
+
+/// Load a stored recovery mnemonic for an app, if present. Refuses world-readable files.
+pub fn load_app_mnemonic(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+) -> Result<Option<String>, KeysError> {
+    let path = app_mnemonic_path(paths, org, app);
+    if !path.exists() {
+        return Ok(None);
+    }
+    assert_mode_0600(&path)?;
+    Ok(Some(fs::read_to_string(&path)?.trim().to_string()))
+}
+
+/// Enumerate `(app, mnemonic)` pairs stored for an org, sorted by app name.
+/// Used by `key backup` to bundle every captured mnemonic. A mnemonic file with
+/// insecure permissions is an error (propagated) rather than silently skipped, so a
+/// backup can never quietly drop an app's recovery material. Empty entries are skipped.
+pub fn list_app_mnemonics(paths: &CliPaths, org: &str) -> Result<Vec<(String, String)>, KeysError> {
+    let dir = paths.keys_dir.join(org);
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("mnemonic") {
+            continue;
+        }
+        let Some(app) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if assert_mode_0600(&path).is_err() {
+            return Err(KeysError::InsecurePermissions(path));
+        }
+        let mnemonic = fs::read_to_string(&path)?.trim().to_string();
+        if !mnemonic.is_empty() {
+            out.push((app, mnemonic));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
 fn backup_key(passphrase: &str, kdf: &RecoveryBackupKdf) -> Result<[u8; 32], KeysError> {
     if kdf.name != "argon2id" {
         return Err(KeysError::InvalidBackup(format!(
@@ -318,13 +409,14 @@ pub fn encrypt_recovery_backup(
     seed: &[u8; 32],
     passphrase: &str,
 ) -> Result<RecoveryBackup, KeysError> {
-    encrypt_recovery_backup_with_metadata(seed, passphrase, RecoveryBackupMetadata::default())
+    encrypt_recovery_backup_with_metadata(seed, passphrase, RecoveryBackupMetadata::default(), &[])
 }
 
 pub fn encrypt_recovery_backup_with_metadata(
     seed: &[u8; 32],
     passphrase: &str,
     metadata: RecoveryBackupMetadata,
+    mnemonics: &[RecoveryBackupMnemonic],
 ) -> Result<RecoveryBackup, KeysError> {
     if passphrase.is_empty() {
         return Err(KeysError::InvalidBackup(
@@ -352,6 +444,11 @@ pub fn encrypt_recovery_backup_with_metadata(
         recovery_seed: STANDARD.encode(seed),
         created_at: created_at.clone(),
         notes: None,
+        mnemonics: if mnemonics.is_empty() {
+            None
+        } else {
+            Some(mnemonics.to_vec())
+        },
     };
     let payload_bytes =
         serde_json::to_vec(&payload).map_err(|e| KeysError::InvalidBackup(e.to_string()))?;
@@ -378,7 +475,7 @@ pub fn encrypt_recovery_backup_with_metadata(
 pub fn decrypt_recovery_backup(
     backup: &RecoveryBackup,
     passphrase: &str,
-) -> Result<[u8; 32], KeysError> {
+) -> Result<DecryptedBackup, KeysError> {
     if backup.version != 1 {
         return Err(KeysError::InvalidBackup(format!(
             "unsupported version {}",
@@ -437,7 +534,10 @@ pub fn decrypt_recovery_backup(
             "seed fingerprint mismatch".to_string(),
         ));
     }
-    Ok(seed)
+    Ok(DecryptedBackup {
+        seed,
+        mnemonics: payload.mnemonics.unwrap_or_default(),
+    })
 }
 
 /// Load the stored keypair for `user_id`. Refuses to read files with insecure
@@ -527,8 +627,85 @@ mod tests {
         let backup = encrypt_recovery_backup(&seed, "correct horse battery staple").unwrap();
         let restored = decrypt_recovery_backup(&backup, "correct horse battery staple").unwrap();
 
-        assert_eq!(restored, seed);
+        assert_eq!(restored.seed, seed);
+        assert!(restored.mnemonics.is_empty());
         assert!(decrypt_recovery_backup(&backup, "wrong passphrase").is_err());
+    }
+
+    #[test]
+    fn encrypted_recovery_backup_round_trips_mnemonics() {
+        let seed = [7u8; 32];
+        let mnemonics = vec![
+            RecoveryBackupMnemonic {
+                app: "shell1".into(),
+                mnemonic: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".into(),
+            },
+            RecoveryBackupMnemonic {
+                app: "shell2".into(),
+                mnemonic: "legal winner thank year wave sausage worth useful legal winner thank yellow".into(),
+            },
+        ];
+        let backup = encrypt_recovery_backup_with_metadata(
+            &seed,
+            "correct horse battery staple",
+            RecoveryBackupMetadata::default(),
+            &mnemonics,
+        )
+        .unwrap();
+        let restored = decrypt_recovery_backup(&backup, "correct horse battery staple").unwrap();
+
+        assert_eq!(restored.seed, seed);
+        assert_eq!(restored.mnemonics, mnemonics);
+        // Mnemonics live inside the AEAD ciphertext, never in cleartext envelope fields.
+        let raw = serde_json::to_string(&backup).unwrap();
+        assert!(!raw.contains("abandon"));
+        assert!(!raw.contains("legal winner"));
+        assert!(decrypt_recovery_backup(&backup, "wrong passphrase").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn app_mnemonic_store_load_list_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+
+        store_app_mnemonic(
+            &paths,
+            "org-a",
+            "shell2",
+            "zone zone zone zone zone zone zone zone zone zone zone zone",
+        )
+        .unwrap();
+        store_app_mnemonic(&paths, "org-a", "shell1", "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
+        // other org is excluded
+        store_app_mnemonic(
+            &paths,
+            "org-b",
+            "shell9",
+            "vote fence fence fence fence fence fence fence fence fence fence fence",
+        )
+        .unwrap();
+
+        assert_eq!(
+            load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
+            Some("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string())
+        );
+
+        let listed = list_app_mnemonics(&paths, "org-a").unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                ("shell1".to_string(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".to_string()),
+                ("shell2".to_string(), "zone zone zone zone zone zone zone zone zone zone zone zone".to_string()),
+            ]
+        );
+        // absent app / absent org return None / empty
+        assert!(
+            load_app_mnemonic(&paths, "org-a", "nope")
+                .unwrap()
+                .is_none()
+        );
+        assert!(list_app_mnemonics(&paths, "org-c").unwrap().is_empty());
     }
 
     #[test]
@@ -542,6 +719,7 @@ mod tests {
                 org_name: Some("demo".to_string()),
                 owner_fingerprint: Some("owner-fp".to_string()),
             },
+            &[],
         )
         .unwrap();
 
@@ -552,7 +730,9 @@ mod tests {
         assert_eq!(backup.cipher.name, "xchacha20-poly1305");
         assert_ne!(backup.ciphertext, hex::encode(seed));
         assert_eq!(
-            decrypt_recovery_backup(&backup, "correct horse battery staple").unwrap(),
+            decrypt_recovery_backup(&backup, "correct horse battery staple")
+                .unwrap()
+                .seed,
             seed
         );
     }
