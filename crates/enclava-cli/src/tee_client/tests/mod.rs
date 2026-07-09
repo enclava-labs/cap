@@ -90,6 +90,30 @@ fn challenge_response_accepts_live_proxy_shape() {
 }
 
 #[test]
+fn claim_response_captures_owner_seed_mnemonic_from_live_proxy_shape() {
+    // Exact shape of the attestation-proxy claim-success (HTTP 200) body. The
+    // recovery mnemonic only ever leaves the TEE under the `owner_seed_mnemonic`
+    // key; if this parse stops populating `mnemonic`, `recover` becomes
+    // unsatisfiable for every app claimed while the mismatch exists.
+    let parsed: super::ClaimResponse = serde_json::from_value(serde_json::json!({
+        "status": "CLAIM_ACCEPTED",
+        "state": "unlocked",
+        "owner_public_key": "x",
+        "owner_seed_mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        "warning": null
+    }))
+    .expect("parse claim success");
+    assert_eq!(parsed.status, "CLAIM_ACCEPTED");
+    assert_eq!(
+        parsed.mnemonic.as_deref(),
+        Some(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        ),
+        "the one-time recovery mnemonic must survive claim-response deserialization"
+    );
+}
+
+#[test]
 fn only_claimed_ownership_state_means_owner_claim_succeeded() {
     assert!(super::claim_state_json_is_successful(
         &serde_json::json!({"ownership_state": "claimed", "unlock_state": "locked"})
