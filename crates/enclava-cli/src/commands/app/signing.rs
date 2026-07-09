@@ -84,21 +84,22 @@ pub(crate) fn resolve_app_identity_fields(
     org_name: &str,
     app_id: Uuid,
 ) -> ResolvedAppIdentityFields {
-    let namespace = if app.namespace.trim().is_empty() {
+    let namespace_value = app.namespace.trim();
+    let instance_id_value = app.instance_id.trim();
+    let service_account_value = app.service_account.as_deref().map(str::trim);
+
+    let namespace = if namespace_value.is_empty() {
         format!("cap-{org_name}-{}", app.name)
     } else {
-        app.namespace.trim().to_string()
+        namespace_value.to_string()
     };
-    let instance_id = if app.instance_id.trim().is_empty() {
-        let app_id_short = app_id.as_simple().to_string();
-        format!("{org_name}-{}", &app_id_short[..8])
+    let instance_id = if instance_id_value.is_empty() {
+        let app_id_short: String = app_id.as_simple().to_string().chars().take(8).collect();
+        format!("{org_name}-{app_id_short}")
     } else {
-        app.instance_id.trim().to_string()
+        instance_id_value.to_string()
     };
-    let service_account = app
-        .service_account
-        .as_deref()
-        .map(str::trim)
+    let service_account = service_account_value
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("cap-{}-sa", app.name));
