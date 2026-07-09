@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand};
 use dialoguer::{Confirm, Input, Password};
 use ed25519_dalek::{Signer, SigningKey};
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use enclava_cli::api_client::ApiClient;
@@ -172,46 +172,95 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("Ownership claimed.");
 
     if let Some(mnemonic) = result.as_ref().and_then(|result| result.mnemonic.as_ref()) {
-        present_recovery_mnemonic(mnemonic)?;
+        present_recovery_mnemonic(mnemonic, RecoveryMnemonicOutput::Stdout)?;
     }
 
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryMnemonicOutput {
+    Stdout,
+    Stderr,
+}
+
 /// Present the one-time LUKS recovery mnemonic to the operator.
 ///
 /// The mnemonic is the only recovery for encrypted storage and is NOT covered by
-/// `enclava key backup` (deploy keys only); the CLI never persists it. Output goes to
-/// stderr so it never corrupts machine-readable (`--json`) stdout. On an interactive
-/// terminal the operator must confirm they recorded it before the command proceeds — it
-/// cannot be shown again afterwards. The gate is skipped off-TTY so scripted/CI deploys
-/// (e.g. `--storage-password-file`) don't block.
-pub(crate) fn present_recovery_mnemonic(mnemonic: &str) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!();
-    eprintln!("==================== RECOVERY MNEMONIC (shown ONCE) ====================");
-    eprintln!(
-        "This is the ONLY recovery for your encrypted storage; `enclava key backup` does not back it up (deploy keys only)."
-    );
-    eprintln!("If you lose this AND your storage password, your data cannot be recovered.");
-    eprintln!();
-    eprintln!("    {mnemonic}");
-    eprintln!();
-
-    if io::stdin().is_terminal() {
-        loop {
-            let confirmed = Confirm::new()
-                .with_prompt("I have recorded my recovery mnemonic")
-                .default(false)
-                .interact()?;
-            if confirmed {
-                return Ok(());
-            }
-            eprintln!(
-                "Please record it now — it will not be shown again after this command exits."
-            );
+/// `enclava key backup` (deploy keys only); the CLI never persists it. Callers choose
+/// stdout or stderr based on whether stdout is human-readable or machine-readable. On an
+/// interactive terminal the operator must confirm they recorded it before the command
+/// proceeds. The gate is skipped off-TTY or when the prompt stream is redirected so
+/// scripted/CI deploys (e.g. `--storage-password-file`) don't block.
+pub(crate) fn present_recovery_mnemonic(
+    mnemonic: &str,
+    output: RecoveryMnemonicOutput,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match output {
+        RecoveryMnemonicOutput::Stdout => {
+            let mut stdout = io::stdout().lock();
+            write_recovery_mnemonic(&mut stdout, mnemonic)?;
+            stdout.flush()?;
+        }
+        RecoveryMnemonicOutput::Stderr => {
+            let mut stderr = io::stderr().lock();
+            write_recovery_mnemonic(&mut stderr, mnemonic)?;
+            stderr.flush()?;
         }
     }
+
+    confirm_recovery_mnemonic_recorded()
+}
+
+fn write_recovery_mnemonic(
+    output: &mut impl Write,
+    mnemonic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    writeln!(output)?;
+    writeln!(
+        output,
+        "==================== RECOVERY MNEMONIC (shown ONCE) ===================="
+    )?;
+    writeln!(
+        output,
+        "This is the ONLY recovery for your encrypted storage; `enclava key backup` does not back it up (deploy keys only)."
+    )?;
+    writeln!(
+        output,
+        "If you lose this AND your storage password, your data cannot be recovered."
+    )?;
+    writeln!(output)?;
+    writeln!(output, "    {mnemonic}")?;
+    writeln!(output)?;
     Ok(())
+}
+
+fn confirm_recovery_mnemonic_recorded() -> Result<(), Box<dyn std::error::Error>> {
+    if !recovery_mnemonic_confirmation_available() {
+        return Ok(());
+    }
+
+    loop {
+        let confirmed = Confirm::new()
+            .with_prompt("I have recorded my recovery mnemonic")
+            .default(false)
+            .interact()?;
+        if confirmed {
+            return Ok(());
+        }
+        eprintln!("Please record it now; it will not be shown again after this command exits.");
+    }
+}
+
+fn recovery_mnemonic_confirmation_available() -> bool {
+    recovery_mnemonic_confirmation_required(io::stdin().is_terminal(), io::stderr().is_terminal())
+}
+
+fn recovery_mnemonic_confirmation_required(
+    stdin_is_terminal: bool,
+    prompt_is_terminal: bool,
+) -> bool {
+    stdin_is_terminal && prompt_is_terminal
 }
 
 pub async fn unlock(args: UnlockArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -446,13 +495,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn non_interactive_present_does_not_block_on_confirmation_gate() {
-        // In a non-interactive test harness the confirmation gate must be skipped,
-        // otherwise scripted/CI deploys would block. dialoguer errors off-TTY, so if the
-        // is_terminal() guard were removed this would return Err instead of Ok.
-        present_recovery_mnemonic(
-            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon",
-        )
-        .expect("non-interactive path must skip the confirmation gate and return Ok");
+    fn recovery_mnemonic_writer_includes_scope_warning_and_secret() {
+        let mut output = Vec::new();
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon";
+
+        write_recovery_mnemonic(&mut output, mnemonic).expect("writer should succeed");
+        let output = String::from_utf8(output).expect("output should be utf-8");
+
+        assert!(output.contains("RECOVERY MNEMONIC (shown ONCE)"));
+        assert!(output.contains("enclava key backup"));
+        assert!(output.contains("deploy keys only"));
+        assert!(output.contains(mnemonic));
+    }
+
+    #[test]
+    fn confirmation_gate_requires_visible_prompt_terminal() {
+        assert!(recovery_mnemonic_confirmation_required(true, true));
+        assert!(!recovery_mnemonic_confirmation_required(true, false));
+        assert!(!recovery_mnemonic_confirmation_required(false, true));
+        assert!(!recovery_mnemonic_confirmation_required(false, false));
     }
 }
