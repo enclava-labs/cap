@@ -869,10 +869,10 @@ pub(crate) async fn claim_initial_ownership(
     };
 
     if let Some(mnemonic) = result.and_then(|result| result.mnemonic) {
-        crate::commands::ownership::present_recovery_mnemonic(
+        crate::commands::ownership::present_recovery_mnemonic_or_warn(
             &mnemonic,
             crate::commands::ownership::RecoveryMnemonicOutput::Stderr,
-        )?;
+        );
     }
 
     Ok(())

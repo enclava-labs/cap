@@ -172,7 +172,7 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("Ownership claimed.");
 
     if let Some(mnemonic) = result.as_ref().and_then(|result| result.mnemonic.as_ref()) {
-        present_recovery_mnemonic(mnemonic, RecoveryMnemonicOutput::Stdout)?;
+        present_recovery_mnemonic_or_warn(mnemonic, RecoveryMnemonicOutput::Stdout);
     }
 
     Ok(())
@@ -184,15 +184,29 @@ pub(crate) enum RecoveryMnemonicOutput {
     Stderr,
 }
 
-/// Present the one-time LUKS recovery mnemonic to the operator.
+/// Present the one-time LUKS recovery mnemonic to the operator, downgrading any
+/// presentation failure to a loud stderr warning instead of an error.
 ///
-/// The mnemonic is the only recovery for encrypted storage and is NOT covered by
-/// `enclava key backup` (deploy keys only); the CLI never persists it. Callers choose
-/// stdout or stderr based on whether stdout is human-readable or machine-readable. On an
-/// interactive terminal the operator must confirm they recorded it before the command
-/// proceeds. The gate is skipped off-TTY or when the prompt stream is redirected so
-/// scripted/CI deploys (e.g. `--storage-password-file`) don't block.
-pub(crate) fn present_recovery_mnemonic(
+/// Use this - not `present_recovery_mnemonic` - from flows that run *after* the TEE has
+/// already accepted ownership (`claim`, and `claim_initial_ownership` via `deploy` and
+/// template deploy). There the mnemonic presentation must never turn a successful claim
+/// into a reported failure: if stdout/stderr is closed or the operator sends EOF
+/// (Ctrl-D) at the confirmation prompt, ownership is already recorded server-side. We
+/// warn on stderr and re-print the mnemonic as a fallback (it is stored nowhere), so the
+/// command still exits successfully and the operator gets one more chance to record it.
+pub(crate) fn present_recovery_mnemonic_or_warn(mnemonic: &str, output: RecoveryMnemonicOutput) {
+    if let Err(err) = present_recovery_mnemonic(mnemonic, output) {
+        let mut stderr = io::stderr().lock();
+        emit_recovery_mnemonic_interrupted_warning(&mut stderr, mnemonic, &*err);
+    }
+}
+
+/// Write the recovery mnemonic to the chosen stream, then run the confirmation gate.
+///
+/// Returns an error only when writing/flushing fails or the confirmation prompt hits
+/// EOF; callers reached after an irreversible server-side action should use
+/// `present_recovery_mnemonic_or_warn` so such errors don't fail the command.
+fn present_recovery_mnemonic(
     mnemonic: &str,
     output: RecoveryMnemonicOutput,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -210,6 +224,26 @@ pub(crate) fn present_recovery_mnemonic(
     }
 
     confirm_recovery_mnemonic_recorded()
+}
+
+/// Best-effort warning for when recovery-mnemonic presentation is interrupted. This is
+/// a last-resort fallback (the claim already succeeded), so further IO errors are ignored.
+fn emit_recovery_mnemonic_interrupted_warning(
+    output: &mut impl Write,
+    mnemonic: &str,
+    err: &dyn std::error::Error,
+) {
+    let _ = writeln!(
+        output,
+        "WARNING: ownership was claimed, but the one-time recovery mnemonic could not be fully presented ({err})."
+    );
+    let _ = writeln!(
+        output,
+        "It is NOT stored anywhere by the CLI; re-printing it here as a fallback - record it now:"
+    );
+    let _ = writeln!(output);
+    let _ = writeln!(output, "    {mnemonic}");
+    let _ = writeln!(output);
 }
 
 fn write_recovery_mnemonic(
@@ -514,5 +548,22 @@ mod tests {
         assert!(!recovery_mnemonic_confirmation_required(true, false));
         assert!(!recovery_mnemonic_confirmation_required(false, true));
         assert!(!recovery_mnemonic_confirmation_required(false, false));
+    }
+
+    #[test]
+    fn interrupted_presentation_warning_reprints_mnemonic() {
+        let mut output = Vec::new();
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let err: Box<dyn std::error::Error> = "stdin closed".into();
+
+        emit_recovery_mnemonic_interrupted_warning(&mut output, mnemonic, &*err);
+
+        let output = String::from_utf8(output).expect("warning should be utf-8");
+        assert!(output.contains("WARNING"));
+        assert!(output.contains("ownership was claimed"));
+        assert!(output.contains("NOT stored"));
+        assert!(output.contains("record it now"));
+        assert!(output.contains(mnemonic));
+        assert!(output.contains("stdin closed"));
     }
 }
