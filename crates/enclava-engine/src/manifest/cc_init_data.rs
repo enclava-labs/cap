@@ -257,14 +257,13 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
 pub const DEFAULT_RUNTIME_CLASS: &str = "kata-qemu-snp";
 pub const COCO_DEV_RUNTIME_CLASS: &str = "kata-qemu-coco-dev";
 pub const RUNTIME_CLASS_ENV: &str = "CAP_RUNTIME_CLASS";
-pub const ALLOW_DEV_RUNTIME_CLASS_ENV: &str = "CAP_ALLOW_DEV_RUNTIME_CLASS";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RuntimeClassConfigError {
     #[error("unsupported CAP_RUNTIME_CLASS `{0}`")]
     Unsupported(String),
     #[error(
-        "CAP_RUNTIME_CLASS=kata-qemu-coco-dev is for local simulated CoCo only; set CAP_ALLOW_DEV_RUNTIME_CLASS=true to use it in release builds"
+        "CAP_RUNTIME_CLASS=kata-qemu-coco-dev is for local simulated CoCo only and cannot be used in release builds"
     )]
     DevRuntimeClassInRelease,
 }
@@ -291,9 +290,7 @@ pub fn resolve_runtime_class_with_env(
     if requested != COCO_DEV_RUNTIME_CLASS {
         return Err(RuntimeClassConfigError::Unsupported(requested.to_string()));
     }
-    let release_escape_hatch = lookup(ALLOW_DEV_RUNTIME_CLASS_ENV)
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"));
-    if debug_assertions || release_escape_hatch {
+    if debug_assertions {
         return Ok(COCO_DEV_RUNTIME_CLASS.to_string());
     }
     Err(RuntimeClassConfigError::DevRuntimeClassInRelease)

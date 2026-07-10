@@ -1,7 +1,7 @@
 use enclava_engine::manifest::cc_init_data::{
-    ALLOW_DEV_RUNTIME_CLASS_ENV, COCO_DEV_RUNTIME_CLASS, CcInitDataOptions, DEFAULT_RUNTIME_CLASS,
-    RUNTIME_CLASS_ENV, RuntimeClassConfigError, build_toml, build_toml_with_options,
-    encode_cc_init_data, resolve_runtime_class_with_env, sha256_hex,
+    COCO_DEV_RUNTIME_CLASS, CcInitDataOptions, DEFAULT_RUNTIME_CLASS, RUNTIME_CLASS_ENV,
+    RuntimeClassConfigError, build_toml, build_toml_with_options, encode_cc_init_data,
+    resolve_runtime_class_with_env, sha256_hex,
 };
 use enclava_engine::testutil::sample_app;
 use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
@@ -427,7 +427,7 @@ fn runtime_class_accepts_coco_dev_in_debug_builds() {
 }
 
 #[test]
-fn runtime_class_requires_escape_hatch_for_coco_dev_in_release_builds() {
+fn runtime_class_rejects_coco_dev_in_release_builds() {
     let err = resolve_runtime_class_with_env(false, |name| match name {
         RUNTIME_CLASS_ENV => Some(COCO_DEV_RUNTIME_CLASS.to_string()),
         _ => None,
@@ -437,14 +437,14 @@ fn runtime_class_requires_escape_hatch_for_coco_dev_in_release_builds() {
 }
 
 #[test]
-fn runtime_class_accepts_coco_dev_in_release_builds_with_escape_hatch() {
-    let resolved = resolve_runtime_class_with_env(false, |name| match name {
+fn runtime_class_rejects_coco_dev_in_release_builds_even_with_legacy_escape_hatch() {
+    let err = resolve_runtime_class_with_env(false, |name| match name {
         RUNTIME_CLASS_ENV => Some(COCO_DEV_RUNTIME_CLASS.to_string()),
-        ALLOW_DEV_RUNTIME_CLASS_ENV => Some("true".to_string()),
+        "CAP_ALLOW_DEV_RUNTIME_CLASS" => Some("true".to_string()),
         _ => None,
     })
-    .unwrap();
-    assert_eq!(resolved, COCO_DEV_RUNTIME_CLASS);
+    .unwrap_err();
+    assert_eq!(err, RuntimeClassConfigError::DevRuntimeClassInRelease);
 }
 
 #[test]
