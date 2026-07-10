@@ -1978,9 +1978,6 @@ fn deploy_response_output(
     }
     if let Some(command) = ssh_command {
         lines.push(format!("  Stable SSH endpoint command: {command}"));
-        if let Some(endpoint) = endpoint {
-            lines.push(format!("  Verified stable SSH endpoint: {endpoint}"));
-        }
     } else {
         lines.push(format!(
             "  Stable SSH endpoint command: pending via PaaS /apps/{instance_name}/ssh-command"
@@ -2020,9 +2017,6 @@ fn ssh_command_response_output(
     lines.push(format!("  Stable SSH endpoint: {stable_endpoint}"));
     if let Some(command) = response.command.as_deref() {
         lines.push(format!("  Stable SSH endpoint command: {command}"));
-        if let Some(endpoint) = endpoint {
-            lines.push(format!("  Verified stable SSH endpoint: {endpoint}"));
-        }
     } else {
         lines.push(format!(
             "  Stable SSH endpoint command: pending via PaaS /apps/{instance_name}/ssh-command"
@@ -3575,7 +3569,7 @@ mod tests {
         assert!(
             output.contains("  Stable SSH endpoint command: ssh -p 17958 user@6.tcp.eu.ngrok.io")
         );
-        assert!(output.contains("  Verified stable SSH endpoint: 6.tcp.eu.ngrok.io:17958"));
+        assert!(!output.contains("Verified stable SSH endpoint"));
     }
 
     #[test]
@@ -3745,7 +3739,7 @@ mod tests {
         assert!(
             output.contains("  Stable SSH endpoint command: ssh -p 17958 user@6.tcp.eu.ngrok.io")
         );
-        assert!(output.contains("  Verified stable SSH endpoint: 6.tcp.eu.ngrok.io:17958"));
+        assert!(!output.contains("Verified stable SSH endpoint"));
     }
 
     #[test]
