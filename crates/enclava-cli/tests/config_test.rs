@@ -41,6 +41,7 @@ fn save_and_load_config_round_trip() {
         api_url: "https://custom.api.dev".to_string(),
         org: Some("my-team".to_string()),
         org_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
+        ..Default::default()
     };
     enclava_cli::config::save_config(&paths, &config).unwrap();
     let loaded = enclava_cli::config::load_config(&paths).unwrap();

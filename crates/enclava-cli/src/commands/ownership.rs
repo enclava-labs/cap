@@ -3,6 +3,7 @@ use clap::{Args, Subcommand};
 use dialoguer::{Confirm, Input, Password};
 use ed25519_dalek::{Signer, SigningKey};
 use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use enclava_cli::api_client::ApiClient;
@@ -10,7 +11,7 @@ use enclava_cli::api_types::{UnlockEndpointResponse, UpdateUnlockModeRequest};
 use enclava_cli::app_config::AppConfig;
 use enclava_cli::config::{self, CliPaths};
 use enclava_cli::keys;
-use enclava_cli::tee_client::TeeClient;
+use enclava_cli::tee_client::{TeeClient, TeeError};
 use enclava_engine::types::WorkloadSecurityProfile;
 use uuid::Uuid;
 
@@ -39,6 +40,12 @@ pub struct RecoverArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
+    /// Read the recovery mnemonic from a file (non-interactive; BIP39, whitespace-trimmed).
+    #[arg(long)]
+    pub mnemonic_file: Option<PathBuf>,
+    /// Read the new unlock password from a file (non-interactive; trailing newline trimmed).
+    #[arg(long)]
+    pub new_password_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -276,7 +283,7 @@ pub(crate) fn present_and_capture_recovery_mnemonic(
             if want_store {
                 store_mnemonic_local(paths, org, app, mnemonic)?;
                 eprintln!(
-                    "Recovery mnemonic stored locally; run `enclava key backup` to back it up."
+                    "Recovery mnemonic stored locally. Run `enclava key backup` and keep that file OFF this machine — the local copy is lost if this machine is lost."
                 );
                 return Ok(());
             }
@@ -287,7 +294,7 @@ pub(crate) fn present_and_capture_recovery_mnemonic(
         RecoveryMnemonicCaptureAction::Store => {
             store_mnemonic_local(paths, org, app, mnemonic)?;
             eprintln!(
-                "Recovery mnemonic stored locally (non-interactive default); run `enclava key backup` to back it up."
+                "Recovery mnemonic stored locally (non-interactive default). Run `enclava key backup` and keep that file OFF this machine — the local copy is lost if this machine is lost."
             );
         }
         RecoveryMnemonicCaptureAction::Skip => {
@@ -477,10 +484,20 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
         TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
-    // Prefer a mnemonic restored into local state (via `key restore`); fall back to an
-    // interactive prompt. Headless + no stored mnemonic is an error (can't prompt).
-    let mnemonic = match keys::load_app_mnemonic(&paths, &me.active_org.name, &app_name)? {
-        Some(stored) if io::stdin().is_terminal() => {
+    let is_tty = io::stdin().is_terminal();
+
+    // Resolve the initial mnemonic. Priority: --mnemonic-file, then the local
+    // store (TTY confirms; headless uses it silently), then an interactive prompt.
+    let from_file = match args.mnemonic_file.as_ref() {
+        Some(path) => Some(read_mnemonic_file(path)?),
+        None => None,
+    };
+    let mut mnemonic = match (
+        from_file,
+        keys::load_app_mnemonic(&paths, &me.active_org.name, &app_name)?,
+    ) {
+        (Some(from_file), _) => from_file,
+        (None, Some(stored)) if is_tty => {
             let use_stored = Confirm::new()
                 .with_prompt(format!("Use the stored recovery mnemonic for {app_name}?"))
                 .default(true)
@@ -491,25 +508,82 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
                 prompt_recovery_mnemonic()?
             }
         }
-        Some(stored) => stored,
-        None if io::stdin().is_terminal() => prompt_recovery_mnemonic()?,
-        None => {
+        (None, Some(stored)) => stored,
+        (None, None) if is_tty => prompt_recovery_mnemonic()?,
+        (None, None) => {
             return Err(format!(
-                "no stored recovery mnemonic for {app_name}; run `enclava key restore <backup>` first, or run this command in an interactive shell"
+                "no stored recovery mnemonic for {app_name}; pass --mnemonic-file, run `enclava key restore <backup>` first, or run this command in an interactive shell"
             )
             .into());
         }
     };
 
-    let new_password = Password::new()
-        .with_prompt("New unlock password")
-        .with_confirmation("Confirm password", "Passwords don't match")
-        .interact()?;
+    let new_password = match args.new_password_file.as_ref() {
+        Some(path) => read_new_password_file(path)?,
+        None => Password::new()
+            .with_prompt("New unlock password")
+            .with_confirmation("Confirm password", "Passwords don't match")
+            .interact()?,
+    };
 
     println!("Recovering {app_name}...");
-    tee.recover(&mnemonic, &new_password).await?;
+    // A stored/provided mnemonic may be stale (e.g. the app was destroyed and
+    // redeployed, minting a fresh one). On mnemonic_invalid, retry from a fresh
+    // prompt on a TTY; headless gets a clear, actionable error.
+    loop {
+        match tee.recover(&mnemonic, &new_password).await {
+            Ok(()) => break,
+            Err(err) if is_mnemonic_invalid(&err) && is_tty => {
+                eprintln!(
+                    "The recovery mnemonic was rejected by the TEE (mnemonic_invalid). \
+                     It may be stale, e.g. if the app was destroyed and redeployed. \
+                     Enter the correct mnemonic, or Ctrl-C to abort."
+                );
+                mnemonic = prompt_recovery_mnemonic()?;
+            }
+            Err(err) if is_mnemonic_invalid(&err) => {
+                return Err(
+                    "recovery mnemonic rejected by the TEE (mnemonic_invalid); it may be stale \
+                     (e.g. after a destroy + redeploy). Provide the correct mnemonic via --mnemonic-file."
+                        .into(),
+                );
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
     println!("Recovery complete. Use the new password to unlock.");
     Ok(())
+}
+
+/// Read a BIP39 mnemonic from a file, trimming surrounding whitespace.
+fn read_mnemonic_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(path)?;
+    let trimmed = raw.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(format!("mnemonic file {} is empty", path.display()).into());
+    }
+    Ok(trimmed)
+}
+
+/// Read the new unlock password from a file, trimming a single trailing newline. Mirrors
+/// `--storage-password-file`: no confirmation prompt when read from a file, and interior
+/// whitespace is preserved (only `\r`/`\n` are stripped from the end).
+fn read_new_password_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let value = std::fs::read_to_string(path)?
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    if value.is_empty() {
+        return Err(format!("new password file {} is empty", path.display()).into());
+    }
+    Ok(value)
+}
+
+/// True when a TEE recover error indicates the mnemonic was wrong/stale.
+fn is_mnemonic_invalid(err: &TeeError) -> bool {
+    match err {
+        TeeError::Tee { message, .. } => message.contains("mnemonic_invalid"),
+        _ => false,
+    }
 }
 
 fn prompt_recovery_mnemonic() -> Result<String, Box<dyn std::error::Error>> {
@@ -748,5 +822,52 @@ mod tests {
             keys::load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
             Some(mnemonic.to_string())
         );
+    }
+
+    #[test]
+    fn read_mnemonic_file_trims_and_rejects_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.txt");
+        std::fs::write(&path, "  abandon abandon abandon  \n").unwrap();
+        assert_eq!(
+            read_mnemonic_file(&path).unwrap(),
+            "abandon abandon abandon"
+        );
+
+        let empty = tmp.path().join("empty.txt");
+        std::fs::write(&empty, "   \n").unwrap();
+        assert!(read_mnemonic_file(&empty).is_err());
+    }
+
+    #[test]
+    fn is_mnemonic_invalid_detects_tee_rejection() {
+        let yes = TeeError::Tee {
+            status: 400,
+            message: "{\"error\":\"mnemonic_invalid\"}".into(),
+        };
+        let no = TeeError::Tee {
+            status: 400,
+            message: "{\"error\":\"other\"}".into(),
+        };
+        let nottee = TeeError::Attestation("x".into());
+        assert!(is_mnemonic_invalid(&yes));
+        assert!(!is_mnemonic_invalid(&no));
+        assert!(!is_mnemonic_invalid(&nottee));
+    }
+
+    #[test]
+    fn read_new_password_file_trims_trailing_newline_and_rejects_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pw.txt");
+        std::fs::write(&path, "s3cret-pw\n").unwrap();
+        assert_eq!(read_new_password_file(&path).unwrap(), "s3cret-pw");
+
+        // interior/leading whitespace preserved; only trailing newline trimmed
+        std::fs::write(&path, "  lead keep \r\n").unwrap();
+        assert_eq!(read_new_password_file(&path).unwrap(), "  lead keep ");
+
+        let empty = tmp.path().join("empty.txt");
+        std::fs::write(&empty, "\n").unwrap();
+        assert!(read_new_password_file(&empty).is_err());
     }
 }

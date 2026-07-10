@@ -24,6 +24,7 @@ fn client_from_config() {
         api_url: "https://custom.api.dev".to_string(),
         org: None,
         org_id: None,
+        ..Default::default()
     };
     let creds = enclava_cli::config::Credentials {
         session_token: Some("jwt-test".to_string()),

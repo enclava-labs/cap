@@ -228,10 +228,24 @@ async fn status() -> Result<(), Box<dyn std::error::Error>> {
                         apps.join(", ")
                     );
                 }
+                let cli_config = config::load_config(&paths)?;
+                match cli_config.last_backup_at.as_deref() {
+                    None if !stored_mnemonics.is_empty() => println!(
+                        "Backup: none recorded. The mnemonic(s) above are LOCAL ONLY — run `enclava key backup` and keep that file off this machine, or they are lost if this machine is lost."
+                    ),
+                    None => {
+                        println!("Backup: none recorded (run `enclava key backup` to create one).");
+                    }
+                    Some(ts) => {
+                        let when = chrono::DateTime::parse_from_rfc3339(ts)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                            .unwrap_or_else(|_| ts.to_string());
+                        println!(
+                            "Last `key backup`: {when} (re-run it after each new claim to capture new mnemonics)."
+                        );
+                    }
+                }
             }
-            println!(
-                "Note: `key backup` covers deploy keys plus any mnemonics stored at deploy/claim time (default). Apps whose mnemonic was not stored are not covered."
-            );
         }
         None => {
             println!("Recovery seed: missing");
@@ -416,6 +430,12 @@ async fn backup(
             apps.join(", ")
         );
     }
+
+    // Record that a backup was made so `key status` can warn about mnemonics
+    // that exist only locally (lost if this machine is lost).
+    let mut cli_config = config::load_config(&paths)?;
+    cli_config.last_backup_at = Some(chrono::Utc::now().to_rfc3339());
+    config::save_config(&paths, &cli_config)?;
     Ok(())
 }
 
