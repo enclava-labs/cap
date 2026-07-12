@@ -486,31 +486,27 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
 
     let is_tty = io::stdin().is_terminal();
 
-    // Resolve the initial mnemonic. Priority: --mnemonic-file, then the local
-    // store (TTY confirms; headless uses it silently), then an interactive prompt.
-    let from_file = match args.mnemonic_file.as_ref() {
-        Some(path) => Some(read_mnemonic_file(path)?),
-        None => None,
-    };
-    let mut mnemonic = match (
-        from_file,
-        keys::load_app_mnemonic(&paths, &me.active_org.name, &app_name)?,
-    ) {
-        (Some(from_file), _) => from_file,
-        (None, Some(stored)) if is_tty => {
+    // An explicit file must take priority even when local state is unreadable.
+    let mnemonic = match load_recovery_mnemonic(
+        &paths,
+        &me.active_org.name,
+        &app_name,
+        args.mnemonic_file.as_deref(),
+    )? {
+        Some(stored_or_file) if is_tty && args.mnemonic_file.is_none() => {
             let use_stored = Confirm::new()
                 .with_prompt(format!("Use the stored recovery mnemonic for {app_name}?"))
                 .default(true)
                 .interact()?;
             if use_stored {
-                stored
+                stored_or_file
             } else {
                 prompt_recovery_mnemonic()?
             }
         }
-        (None, Some(stored)) => stored,
-        (None, None) if is_tty => prompt_recovery_mnemonic()?,
-        (None, None) => {
+        Some(stored_or_file) => stored_or_file,
+        None if is_tty => prompt_recovery_mnemonic()?,
+        None => {
             return Err(format!(
                 "no stored recovery mnemonic for {app_name}; pass --mnemonic-file, run `enclava key restore <backup>` first, or run this command in an interactive shell"
             )
@@ -527,32 +523,51 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
     };
 
     println!("Recovering {app_name}...");
-    // A stored/provided mnemonic may be stale (e.g. the app was destroyed and
-    // redeployed, minting a fresh one). On mnemonic_invalid, retry from a fresh
-    // prompt on a TTY; headless gets a clear, actionable error.
-    loop {
-        match tee.recover(&mnemonic, &new_password).await {
-            Ok(()) => break,
-            Err(err) if is_mnemonic_invalid(&err) && is_tty => {
-                eprintln!(
-                    "The recovery mnemonic was rejected by the TEE (mnemonic_invalid). \
-                     It may be stale, e.g. if the app was destroyed and redeployed. \
-                     Enter the correct mnemonic, or Ctrl-C to abort."
-                );
-                mnemonic = prompt_recovery_mnemonic()?;
-            }
-            Err(err) if is_mnemonic_invalid(&err) => {
-                return Err(
-                    "recovery mnemonic rejected by the TEE (mnemonic_invalid); it may be stale \
-                     (e.g. after a destroy + redeploy). Provide the correct mnemonic via --mnemonic-file."
-                        .into(),
-                );
-            }
-            Err(err) => return Err(err.into()),
+    if let Err(err) = tee.recover(&mnemonic, &new_password).await {
+        if recovery_requires_locked_restart(&err) {
+            return Err(format!(
+                "recovery requires the app to be locked so its storage can verify the mnemonic; restart the app, wait for the locked state, then run `enclava recover` again ({err})"
+            )
+            .into());
         }
+        return Err(err.into());
+    }
+
+    if let Err(err) =
+        persist_verified_recovery_mnemonic(&paths, &me.active_org.name, &app_name, &mnemonic)
+    {
+        eprintln!(
+            "WARNING: recovery succeeded, but the verified mnemonic could not be stored locally: {err}"
+        );
+    } else {
+        eprintln!(
+            "Verified recovery mnemonic stored locally. Run `enclava key backup` and keep that file off this machine."
+        );
     }
     println!("Recovery complete. Use the new password to unlock.");
     Ok(())
+}
+
+fn load_recovery_mnemonic(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+    mnemonic_file: Option<&Path>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if let Some(path) = mnemonic_file {
+        return Ok(Some(read_mnemonic_file(path)?));
+    }
+    Ok(keys::load_app_mnemonic(paths, org, app)?)
+}
+
+fn persist_verified_recovery_mnemonic(
+    paths: &CliPaths,
+    org: &str,
+    app: &str,
+    mnemonic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    keys::store_app_mnemonic(paths, org, app, mnemonic)
+        .map_err(|err| format!("failed to store recovery mnemonic: {err}").into())
 }
 
 /// Read a BIP39 mnemonic from a file, trimming surrounding whitespace.
@@ -578,12 +593,15 @@ fn read_new_password_file(path: &Path) -> Result<String, Box<dyn std::error::Err
     Ok(value)
 }
 
-/// True when a TEE recover error indicates the mnemonic was wrong/stale.
-fn is_mnemonic_invalid(err: &TeeError) -> bool {
-    match err {
-        TeeError::Tee { message, .. } => message.contains("mnemonic_invalid"),
-        _ => false,
-    }
+fn recovery_requires_locked_restart(err: &TeeError) -> bool {
+    matches!(
+        err,
+        TeeError::Tee {
+            status: 409,
+            message,
+        } if message.contains("recover_verification_unavailable")
+            || message.contains("recovery_requires_locked_init_verifier")
+    )
 }
 
 fn prompt_recovery_mnemonic() -> Result<String, Box<dyn std::error::Error>> {
@@ -839,20 +857,53 @@ mod tests {
         assert!(read_mnemonic_file(&empty).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn is_mnemonic_invalid_detects_tee_rejection() {
-        let yes = TeeError::Tee {
-            status: 400,
-            message: "{\"error\":\"mnemonic_invalid\"}".into(),
+    fn mnemonic_file_takes_priority_over_unreadable_local_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().join("state")).unwrap();
+        keys::store_app_mnemonic(&paths, "org-a", "shell1", "stale mnemonic").unwrap();
+        let local_path = keys::app_mnemonic_path(&paths, "org-a", "shell1");
+        std::fs::set_permissions(&local_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let supplied = tmp.path().join("mnemonic.txt");
+        std::fs::write(&supplied, "verified mnemonic\n").unwrap();
+        assert_eq!(
+            load_recovery_mnemonic(&paths, "org-a", "shell1", Some(&supplied)).unwrap(),
+            Some("verified mnemonic".to_string())
+        );
+        assert!(load_recovery_mnemonic(&paths, "org-a", "shell1", None).is_err());
+    }
+
+    #[test]
+    fn verified_recovery_mnemonic_replaces_stale_local_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(tmp.path().to_path_buf()).unwrap();
+        keys::store_app_mnemonic(&paths, "org-a", "shell1", "stale mnemonic").unwrap();
+
+        persist_verified_recovery_mnemonic(&paths, "org-a", "shell1", "verified mnemonic").unwrap();
+
+        assert_eq!(
+            keys::load_app_mnemonic(&paths, "org-a", "shell1").unwrap(),
+            Some("verified mnemonic".to_string())
+        );
+    }
+
+    #[test]
+    fn locked_recovery_conflict_gets_restart_guidance() {
+        let locked = TeeError::Tee {
+            status: 409,
+            message: "{\"error\":\"recover_verification_unavailable\",\"detail\":\"recovery_requires_locked_init_verifier\"}".into(),
         };
-        let no = TeeError::Tee {
-            status: 400,
+        let other_conflict = TeeError::Tee {
+            status: 409,
             message: "{\"error\":\"other\"}".into(),
         };
-        let nottee = TeeError::Attestation("x".into());
-        assert!(is_mnemonic_invalid(&yes));
-        assert!(!is_mnemonic_invalid(&no));
-        assert!(!is_mnemonic_invalid(&nottee));
+
+        assert!(recovery_requires_locked_restart(&locked));
+        assert!(!recovery_requires_locked_restart(&other_conflict));
     }
 
     #[test]

@@ -12,10 +12,6 @@ pub struct CliConfig {
     /// Active organization UUID, when known from browser/device login.
     #[serde(default)]
     pub org_id: Option<String>,
-    /// Timestamp of the last successful `key backup` (RFC3339), so `key status`
-    /// can flag mnemonics that exist only locally and would be lost with the machine.
-    #[serde(default)]
-    pub last_backup_at: Option<String>,
 }
 
 fn default_api_url() -> String {
@@ -28,7 +24,6 @@ impl Default for CliConfig {
             api_url: default_api_url(),
             org: None,
             org_id: None,
-            last_backup_at: None,
         }
     }
 }
