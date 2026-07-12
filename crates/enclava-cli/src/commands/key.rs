@@ -230,7 +230,7 @@ async fn status() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             println!(
-                "Note: `key backup` covers deploy keys plus any mnemonics stored at deploy/claim time (default). Apps whose mnemonic was not stored are not covered."
+                "Note: `key backup` covers deploy keys plus any mnemonics stored at deploy/claim time (default). Keep the backup off this machine and create a new one after each claim."
             );
         }
         None => {
