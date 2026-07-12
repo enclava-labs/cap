@@ -524,11 +524,8 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
 
     println!("Recovering {app_name}...");
     if let Err(err) = tee.recover(&mnemonic, &new_password).await {
-        if recovery_requires_locked_restart(&err) {
-            return Err(format!(
-                "recovery requires the app to be locked so its storage can verify the mnemonic; restart the app, wait for the locked state, then run `enclava recover` again ({err})"
-            )
-            .into());
+        if let Some(guidance) = recovery_restart_guidance(&err) {
+            return Err(format!("{guidance} ({err})").into());
         }
         return Err(err.into());
     }
@@ -593,15 +590,25 @@ fn read_new_password_file(path: &Path) -> Result<String, Box<dyn std::error::Err
     Ok(value)
 }
 
-fn recovery_requires_locked_restart(err: &TeeError) -> bool {
-    matches!(
+fn recovery_restart_guidance(err: &TeeError) -> Option<&'static str> {
+    if matches!(
         err,
         TeeError::Tee {
             status: 409,
             message,
         } if message.contains("recover_verification_unavailable")
             || message.contains("recovery_requires_locked_init_verifier")
-    )
+    ) {
+        return Some(
+            "recovery requires the app to be locked so its storage can verify the mnemonic; restart the app, wait for the locked state, then run `enclava recover` again",
+        );
+    }
+    if matches!(err, TeeError::Tee { message, .. } if message.contains("restart_required")) {
+        return Some(
+            "the mnemonic was verified, but the new password could not be saved; restart the app, wait for the locked state, then run `enclava recover` again",
+        );
+    }
+    None
 }
 
 fn prompt_recovery_mnemonic() -> Result<String, Box<dyn std::error::Error>> {
@@ -892,18 +899,31 @@ mod tests {
     }
 
     #[test]
-    fn locked_recovery_conflict_gets_restart_guidance() {
+    fn recovery_restart_guidance_covers_locked_and_persistence_failures() {
         let locked = TeeError::Tee {
             status: 409,
             message: "{\"error\":\"recover_verification_unavailable\",\"detail\":\"recovery_requires_locked_init_verifier\"}".into(),
+        };
+        let persistence = TeeError::Tee {
+            status: 500,
+            message: "{\"error\":\"recover_failed\",\"retry\":\"restart_required\"}".into(),
         };
         let other_conflict = TeeError::Tee {
             status: 409,
             message: "{\"error\":\"other\"}".into(),
         };
 
-        assert!(recovery_requires_locked_restart(&locked));
-        assert!(!recovery_requires_locked_restart(&other_conflict));
+        assert!(
+            recovery_restart_guidance(&locked)
+                .unwrap()
+                .contains("locked")
+        );
+        assert!(
+            recovery_restart_guidance(&persistence)
+                .unwrap()
+                .contains("could not be saved")
+        );
+        assert!(recovery_restart_guidance(&other_conflict).is_none());
     }
 
     #[test]
