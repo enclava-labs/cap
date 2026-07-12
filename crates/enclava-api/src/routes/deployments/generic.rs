@@ -69,6 +69,7 @@ pub struct GenericDeploymentSecurity {
 #[derive(Debug, Serialize)]
 pub struct GenericDeploymentResponse {
     pub deployment_id: Uuid,
+    pub app_id: Uuid,
     pub app_name: String,
     pub app_domain: String,
     pub tee_url: Option<String>,
@@ -110,6 +111,7 @@ impl GenericDeploymentResponse {
             .map(str::to_string);
         Self {
             deployment_id: deployment.id,
+            app_id: app.id,
             app_name: app.name.clone(),
             app_domain,
             tee_url,
