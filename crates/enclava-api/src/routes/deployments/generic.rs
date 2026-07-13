@@ -100,7 +100,7 @@ pub struct GenericConfigTokenResponse {
 }
 
 impl GenericDeploymentResponse {
-    fn from_deployment(deployment: Deployment, app: &App) -> Self {
+    pub(super) fn from_deployment(deployment: Deployment, app: &App) -> Self {
         let app_domain = app
             .custom_domain
             .clone()

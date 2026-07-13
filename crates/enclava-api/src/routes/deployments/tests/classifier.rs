@@ -70,6 +70,16 @@ fn idempotency_deployment(app: &App) -> Deployment {
     }
 }
 
+#[test]
+fn generic_deployment_response_reports_current_app_status_separately() {
+    let mut app = idempotency_app();
+    app.status = AppStatus::Running;
+    let response = GenericDeploymentResponse::from_deployment(idempotency_deployment(&app), &app);
+
+    assert_eq!(response.status, "pending");
+    assert_eq!(response.app_status, "running");
+}
+
 fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
     GenericDeploymentRequest {
             external_id: Some("deploy-123".to_string()),
