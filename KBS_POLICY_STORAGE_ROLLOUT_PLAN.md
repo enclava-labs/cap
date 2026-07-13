@@ -27,12 +27,12 @@ Every PR must carry the labels `coordinated-rollout`, `kbs-receipt-mode`, and
 
 | Component | Repository | PR | Purpose |
 |---|---|---|---|
-| CAP, CLI, and `enclava-init` | `enclava-labs/cap` | This PR | Receipt contract, persistence, lifecycle, strict verification, observability, and rollout authority |
-| Trustee/KBS | `enclava-labs/trustee` | TBD | Authorization resolver/storage, scoped publisher API, static policy enforcement, and KBS metrics |
-| Policy signing service | `enclava-labs/policy-templates` | TBD | Independent authorization issuance, owner registry validation, and static-policy artifact tooling |
-| Infrastructure | `enclava-labs/enclava-infra` | TBD | KBS PostgreSQL authority, policy pins, publisher secret, backup expectations, and PodMonitor |
-| Hosted PaaS | `enclava-labs/enclava-paas` | TBD | Safe propagation of structured CAP receipt-publication failures |
-| GitOps | `enclava-labs/enclava-ops-manifests` | TBD | Runtime configuration, scoped networking/RBAC, monitoring, secrets, images, and rollout ordering |
+| CAP, CLI, and `enclava-init` | `enclava-labs/cap` | [#33](https://github.com/enclava-labs/cap/pull/33) | Receipt contract, persistence, lifecycle, strict verification, observability, and rollout authority |
+| Trustee/KBS | `enclava-labs/trustee` | [#1](https://github.com/enclava-labs/trustee/pull/1) | Authorization resolver/storage, scoped publisher API, static policy enforcement, and KBS metrics |
+| Policy signing service | `enclava-labs/policy-templates` | [#1](https://github.com/enclava-labs/policy-templates/pull/1) | Independent authorization issuance, owner registry validation, and static-policy artifact tooling |
+| Infrastructure | `enclava-labs/enclava-infra` | [#13](https://github.com/enclava-labs/enclava-infra/pull/13) | KBS PostgreSQL authority, policy pins, publisher secret, backup expectations, and PodMonitor |
+| Hosted PaaS | `enclava-labs/enclava-paas` | [#13](https://github.com/enclava-labs/enclava-paas/pull/13) | Safe propagation of structured CAP receipt-publication failures |
+| GitOps | `enclava-labs/enclava-ops-manifests` | [#7](https://github.com/enclava-labs/enclava-ops-manifests/pull/7) | Runtime configuration, scoped networking/RBAC, monitoring, secrets, images, and rollout ordering |
 
 ## Current Preprod Baseline
 
