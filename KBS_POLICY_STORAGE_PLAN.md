@@ -57,6 +57,11 @@ can mutate Trustee's static policy.
 The current requirement-to-evidence matrix is maintained in
 `KBS_POLICY_STORAGE_IMPLEMENTATION_AUDIT.md`.
 
+The coordinated cross-repository deployment sequence, ownership gates,
+preprod baseline, rollback boundaries, and evidence ledger are maintained in
+`KBS_POLICY_STORAGE_ROLLOUT_PLAN.md`. That document is the release-control
+authority; implementation completion alone does not approve cutover.
+
 ## Executive Outcome
 
 The overall direction is sound: full workload artifacts belong in CAP
