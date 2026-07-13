@@ -1728,6 +1728,8 @@ async fn generic_deployment_external_id_is_idempotent_and_conflict_checked() {
         retry_body["deployment_id"].as_str(),
         Some(expected_deployment_id.as_str())
     );
+    assert_eq!(retry_body["status"], "pending");
+    assert_eq!(retry_body["app_status"], "creating");
 
     let conflict = server
         .post("/deployments")

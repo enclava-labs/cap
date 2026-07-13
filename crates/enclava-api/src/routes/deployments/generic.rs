@@ -78,6 +78,11 @@ pub struct GenericDeploymentResponse {
     pub source_provider: Option<String>,
     pub source_repository: Option<String>,
     pub status: String,
+    /// Current status of the app that owns this deployment.
+    ///
+    /// This is intentionally distinct from `status`, which describes the
+    /// requested deployment and may refer to an older deployment.
+    pub app_status: String,
     pub error_message: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -124,6 +129,7 @@ impl GenericDeploymentResponse {
                 .source_repository
                 .or_else(|| app.source_repository.clone()),
             status: format!("{:?}", deployment.status).to_lowercase(),
+            app_status: format!("{:?}", app.status).to_lowercase(),
             error_message: deployment.error_message,
             created_at: deployment.created_at,
             completed_at: deployment.completed_at,
