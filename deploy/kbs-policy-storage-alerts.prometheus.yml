@@ -1,0 +1,130 @@
+groups:
+  - name: enclava-kbs-policy-storage
+    rules:
+      - alert: EnclavaCAPAuthorizationMetricsMissing
+        expr: absent(kbs_authorization_outbox_pending)
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: CAP deployment-authorization metrics are missing
+          description: Verify the cap-api PodMonitor, monitoring NetworkPolicy, CAP health, and remote-write pipeline before allowing deploys.
+
+      - alert: EnclavaKBSAuthorizationMetricsMissing
+        expr: absent(kbs_static_resource_policy_bytes)
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: KBS receipt-mode metrics are missing
+          description: Verify the Trustee PodMonitor, KBS HTTPS certificate, monitoring NetworkPolicy, KBS health, and remote-write pipeline.
+
+      - alert: EnclavaLegacyKBSPolicyObserved
+        expr: increase(legacy_kbs_policy_format_seen_total[5m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: Receipt-mode CAP observed a legacy KBS policy format
+          description: Block deploys and investigate image/config drift; receipt mode must never fall back to a dynamic policy artifact set.
+
+      - alert: EnclavaKBSStaticPolicyCardinalityDrift
+        expr: count(kbs_static_resource_policy_digest_info == 1) != 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: KBS static-policy digest is missing or inconsistent
+          description: Compare the sha256 label with signed platform-release v2 metadata and stop writes until every KBS replica has the exact approved policy.
+
+      - alert: EnclavaKBSStaticPolicyBytesChanged
+        expr: changes(kbs_static_resource_policy_bytes[15m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: KBS static-policy byte size changed at runtime
+          description: Treat this as unapproved policy drift unless it is part of an approved signed platform release.
+
+      - alert: EnclavaKBSAuthorizationBacklog
+        expr: kbs_authorization_outbox_pending > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: CAP KBS authorization outbox is not draining
+          description: Inspect publication result counters and KBS availability; workload manifests must not be applied before receipt read-back succeeds.
+
+      - alert: EnclavaKBSAuthorizationPublicationSLOBreach
+        expr: kbs_authorization_publication_lag_seconds > 300
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: KBS authorization publication lag exceeded five minutes
+          description: Block new deploys and follow the publication/restore reconciliation runbook.
+
+      - alert: EnclavaKBSAuthorizationReadbackMismatch
+        expr: increase(kbs_authorization_publication_total{result="publisher_readback_mismatch"}[5m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: CAP read back different KBS authorization bytes
+          description: Block deploys, preserve CAP and KBS evidence, and reconcile the affected authorization before retrying.
+
+      - alert: EnclavaKBSAuthorizationReconciliationDrift
+        expr: sum(increase(kbs_authorization_reconciliation_total{result=~"missing|mismatch"}[5m])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: CAP found authoritative KBS authorization drift
+          description: CAP denied only the affected authorization and queued restore repair; preserve CAP/KBS evidence and follow the restore reconciliation runbook.
+
+      - alert: EnclavaKBSAuthorizationReconciliationInconclusive
+        expr: sum(increase(kbs_authorization_reconciliation_total{result=~"transport_error|body_error|retryable_status|upstream_error|unauthorized|unexpected_status"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CAP could not conclusively audit active KBS authorizations
+          description: Active CAP state was preserved. Check publisher TLS, credentials, rate limits, and KBS storage health; never treat an outage as authorization drift.
+
+      - alert: EnclavaKBSAuthorizationPublicationFailures
+        expr: sum(increase(kbs_authorization_publication_total{result!="success"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: CAP KBS authorization publication is failing
+          description: Use the result label and CAP structured logs to distinguish transport, storage, immutable-conflict, and state errors.
+
+      - alert: EnclavaKBSPublisherUnauthorized
+        expr: increase(kbs_deployment_authorization_publisher_request_total{operation="authenticate",result="unauthorized"}[5m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: KBS rejected a deployment-authorization publisher credential
+          description: Investigate unexpected callers or publisher-token drift; do not broaden KBS admin authorization.
+
+      - alert: EnclavaKBSAuthorizationVerificationDenied
+        expr: sum(increase(kbs_deployment_authorization_verify_total{result="deny"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: KBS rejected signed deployment authorization bytes
+          description: Correlate with lookup denies and stable KBS logs; malformed, expired, mismatched, or untrusted receipts must remain denied.
+
+      - alert: EnclavaKBSAttestationClaimConflict
+        expr: increase(attestation_claim_conflict_total[5m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: CAP observed conflicting attestation identity claims
+          description: Preserve the token metadata and investigate the attestation source; CAP intentionally rejects ambiguous recognized claims.
+
+      - alert: EnclavaArtifactBundleDigestMismatch
+        expr: increase(artifact_bundle_digest_mismatch_total[5m]) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: CAP detected an artifact bundle digest mismatch
+          description: Stop the affected workload and investigate CAP database integrity, receipt binding, and restore history.

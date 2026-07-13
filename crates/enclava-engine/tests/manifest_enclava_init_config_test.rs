@@ -182,11 +182,12 @@ fn config_toml_defaults_trustee_policy_read_to_false() {
 }
 
 #[test]
-fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
+fn config_toml_renders_receipt_verification_settings_when_enabled() {
     let mut app = sample_app();
     app.attestation.trustee_policy_read_available = true;
+    app.attestation.workload_artifacts_ca_cert_pem = Some("test-ca".to_string());
     app.attestation.workload_artifacts_url =
-        Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts".to_string());
+        Some("https://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts".to_string());
     app.attestation.tls_certificate_broker_url = Some(
         "http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate".to_string(),
     );
@@ -194,6 +195,8 @@ fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
         Some("http://kbs.trustee.svc/resource-policy/default/body".to_string());
     app.attestation.platform_trustee_policy_pubkey_hex = Some("11".repeat(32));
     app.attestation.signing_service_pubkey_hex = Some("11".repeat(32));
+    app.attestation.signing_service_trusted_pubkeys_json =
+        Some(format!(r#"{{"retiring-key":"{}"}}"#, "22".repeat(32)));
 
     let cm = generate_enclava_init_configmap(&app);
     let data = cm.data.as_ref().unwrap();
@@ -203,17 +206,13 @@ fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
     assert!(toml_text.contains("trustee-policy-read-available = true"));
     assert!(toml_text.contains("cc-init-data-path = \"/etc/enclava-init/cc-init-data.toml\""));
     assert!(toml_text.contains(
-        "workload-artifacts-url = \"http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts\""
+        "workload-artifacts-url = \"https://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts\""
     ));
     assert!(toml_text.contains(
         "tls-certificate-broker-url = \"http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate\""
     ));
     assert!(toml_text.contains("tls-certificate-hostnames = [\"test-app.abcd1234.enclava.dev\"]"));
-    assert!(
-        toml_text.contains(
-            "trustee-policy-url = \"http://kbs.trustee.svc/resource-policy/default/body\""
-        )
-    );
+    assert!(!toml_text.contains("trustee-policy-url"));
     assert!(
         toml_text.contains(
             "kbs-attestation-token-url = \"http://127.0.0.1:8006/aa/token?token_type=kbs\""
@@ -227,6 +226,8 @@ fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
         "signing-service-pubkey-hex = \"{}\"",
         "11".repeat(32)
     )));
+    assert!(toml_text.contains("signing-service-trusted-pubkeys-json"));
+    assert!(toml_text.contains("retiring-key"));
     assert_eq!(cc_toml, &cc_init_data::build_toml(&app));
 
     let parsed: toml::Value = toml::from_str(toml_text).expect("config.toml must parse");
@@ -239,7 +240,7 @@ fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
     assert_eq!(
         root.get("workload-artifacts-url")
             .and_then(toml::Value::as_str),
-        Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts")
+        Some("https://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts")
     );
     assert_eq!(
         root.get("tls-certificate-broker-url")
@@ -255,10 +256,7 @@ fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
                 .collect::<Vec<_>>()),
         Some(vec!["test-app.abcd1234.enclava.dev"])
     );
-    assert_eq!(
-        root.get("trustee-policy-url").and_then(toml::Value::as_str),
-        Some("http://kbs.trustee.svc/resource-policy/default/body")
-    );
+    assert!(root.get("trustee-policy-url").is_none());
     assert!(
         !root
             .get("tls-state")
@@ -269,9 +267,50 @@ fn config_toml_renders_trustee_policy_read_settings_when_enabled() {
 }
 
 #[test]
+fn config_toml_allows_loopback_http_artifacts_without_ca_pin() {
+    let mut app = sample_app();
+    app.attestation.trustee_policy_read_available = true;
+    app.attestation.workload_artifacts_url =
+        Some("http://127.0.0.1:8081/api/v1/workload/artifacts".to_string());
+    app.attestation.workload_artifacts_ca_cert_pem = None;
+
+    let cm = generate_enclava_init_configmap(&app);
+    let toml_text = cm.data.as_ref().unwrap().get("config.toml").unwrap();
+    let parsed: toml::Value = toml::from_str(toml_text).expect("config.toml must parse");
+
+    assert_eq!(
+        parsed
+            .get("workload-artifacts-url")
+            .and_then(toml::Value::as_str),
+        Some("http://127.0.0.1:8081/api/v1/workload/artifacts")
+    );
+    assert!(
+        !parsed
+            .as_table()
+            .unwrap()
+            .contains_key("workload-artifacts-ca-cert-pem")
+    );
+}
+
+#[test]
+#[should_panic(
+    expected = "missing required enclava-init config key workload-artifacts-ca-cert-pem"
+)]
+fn config_toml_still_requires_ca_pin_for_https_artifacts() {
+    let mut app = sample_app();
+    app.attestation.trustee_policy_read_available = true;
+    app.attestation.workload_artifacts_url =
+        Some("https://cap-api.cap.svc/api/v1/workload/artifacts".to_string());
+    app.attestation.workload_artifacts_ca_cert_pem = None;
+
+    let _ = generate_enclava_init_configmap(&app);
+}
+
+#[test]
 fn config_toml_prefers_local_verification_artifacts_when_present() {
     let mut app = sample_app();
     app.attestation.trustee_policy_read_available = true;
+    app.attestation.workload_artifacts_ca_cert_pem = Some("test-ca".to_string());
     app.attestation.workload_artifacts_url =
         Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts".to_string());
     app.attestation.trustee_policy_url =

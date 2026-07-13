@@ -158,6 +158,10 @@ pub struct PutOrgKeyringRequest {
     pub keyring_payload: serde_json::Value,
     pub signature: String,
     pub signing_pubkey: String,
+    /// Grace window for rollback receipts signed under the previous owner.
+    /// Omission is fail-safe immediate expiry; the maximum is 30 days.
+    #[serde(default)]
+    pub old_owner_authorization_grace_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -422,11 +426,12 @@ pub async fn put_keyring(
         )
     })?;
 
-    let latest: Option<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-        "SELECT version, keyring_payload, signature
-         FROM org_keyrings
+    let latest: Option<KeyringRow> = sqlx::query_as(
+        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey
+         FROM org_keyrings ok
+         JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
          WHERE org_id = $1
-         ORDER BY version DESC
+         ORDER BY ok.version DESC
          LIMIT 1",
     )
     .bind(org_id)
@@ -434,22 +439,44 @@ pub async fn put_keyring(
     .await
     .map_err(|_| db_error())?;
 
-    if let Some((latest_version, latest_payload, latest_signature)) = latest {
-        if body.version < latest_version {
+    if let Some((latest_version, latest_payload, latest_signature, _)) = latest.as_ref() {
+        if body.version < *latest_version {
             return Err(bad_request("keyring version is stale"));
         }
-        if body.version == latest_version
-            && (latest_payload != keyring_payload_bytes || latest_signature != signature)
+        if body.version == *latest_version
+            && (latest_payload.as_slice() != keyring_payload_bytes.as_slice()
+                || latest_signature.as_slice() != signature.as_slice())
         {
             return Err(bad_request(
                 "keyring version already exists with different content",
             ));
         }
-        if body.version > latest_version + 1 {
+        if body.version > *latest_version + 1 {
             return Err(bad_request("keyring version must increment by one"));
         }
     }
 
+    let rotation = latest
+        .as_ref()
+        .and_then(|(old_version, _, _, old_owner_pubkey)| {
+            (body.version > *old_version && old_owner_pubkey != &signing_pubkey).then(|| {
+                (
+                    *old_version,
+                    old_owner_pubkey.clone(),
+                    body.old_owner_authorization_grace_seconds.unwrap_or(0),
+                )
+            })
+        });
+    if rotation
+        .as_ref()
+        .is_some_and(|(_, _, grace_seconds)| *grace_seconds > 30 * 24 * 60 * 60)
+    {
+        return Err(bad_request(
+            "old_owner_authorization_grace_seconds cannot exceed 30 days",
+        ));
+    }
+
+    let mut tx = state.db.begin().await.map_err(|_| db_error())?;
     sqlx::query(
         "INSERT INTO org_keyrings
              (org_id, version, keyring_payload, signature, signing_key_id)
@@ -464,9 +491,28 @@ pub async fn put_keyring(
     .bind(&keyring_payload_bytes)
     .bind(&signature)
     .bind(signing_key_id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|_| db_error())?;
+
+    if let Some((old_version, old_owner_pubkey, grace_seconds)) = rotation {
+        sqlx::query(
+            "INSERT INTO org_owner_authorization_rotations (
+                 org_id, old_owner_version, old_owner_pubkey_sha256,
+                 replacement_owner_version, grace_expires_at
+             ) VALUES ($1, $2, $3, $4, now() + ($5 * interval '1 second'))
+             ON CONFLICT (org_id, replacement_owner_version) DO NOTHING",
+        )
+        .bind(org_id)
+        .bind(old_version)
+        .bind(Sha256::digest(&old_owner_pubkey).to_vec())
+        .bind(body.version)
+        .bind(i64::try_from(grace_seconds).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+    }
+    tx.commit().await.map_err(|_| db_error())?;
 
     let _ = sqlx::query(
         "INSERT INTO audit_log (org_id, user_id, action, detail)

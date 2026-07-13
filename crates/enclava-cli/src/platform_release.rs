@@ -57,6 +57,10 @@ pub struct PlatformRelease {
     pub policy_template_id: String,
     pub policy_template_sha256: String,
     pub policy_template_text: String,
+    #[serde(default)]
+    pub static_resource_policy_sha256: Option<String>,
+    #[serde(default)]
+    pub static_policy_issuer_key_id: Option<String>,
     pub attestation_proxy_image: String,
     pub caddy_ingress_image: String,
     pub trustee_kbs_url: String,
@@ -156,7 +160,7 @@ pub fn canonical_platform_release_bytes(
     )?;
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
     let expected_firmware_measurement = release.expected_firmware_measurement_bytes()?;
-    Ok(ce_v1_bytes(&[
+    let mut records: Vec<(&str, &[u8])> = vec![
         ("purpose", b"enclava-platform-release-v1"),
         ("schema_version", release.schema_version.as_bytes()),
         (
@@ -174,6 +178,31 @@ pub fn canonical_platform_release_bytes(
             "policy_template_text",
             release.policy_template_text.as_bytes(),
         ),
+    ];
+    let static_policy_sha256;
+    if release.schema_version == "v2" {
+        static_policy_sha256 = hex32(
+            "static_resource_policy_sha256",
+            release
+                .static_resource_policy_sha256
+                .as_deref()
+                .ok_or_else(|| PlatformReleaseError::InvalidField {
+                    field: "static_resource_policy_sha256",
+                    message: "required for v2".into(),
+                })?,
+        )?;
+        let key_id = release
+            .static_policy_issuer_key_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PlatformReleaseError::InvalidField {
+                field: "static_policy_issuer_key_id",
+                message: "required for v2".into(),
+            })?;
+        records.push(("static_resource_policy_sha256", &static_policy_sha256));
+        records.push(("static_policy_issuer_key_id", key_id.as_bytes()));
+    }
+    records.extend([
         (
             "attestation_proxy_image",
             release.attestation_proxy_image.as_bytes(),
@@ -205,7 +234,8 @@ pub fn canonical_platform_release_bytes(
         ),
         ("genpolicy_version", release.genpolicy_version.as_bytes()),
         ("created_at", release.created_at.as_bytes()),
-    ]))
+    ]);
+    Ok(ce_v1_bytes(&records))
 }
 
 fn hex32(field: &'static str, value: &str) -> Result<[u8; 32], PlatformReleaseError> {
@@ -219,11 +249,33 @@ fn hex32(field: &'static str, value: &str) -> Result<[u8; 32], PlatformReleaseEr
 }
 
 fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformReleaseError> {
-    if release.schema_version != "v1" {
+    if !matches!(release.schema_version.as_str(), "v1" | "v2") {
         return Err(PlatformReleaseError::InvalidField {
             field: "schema_version",
-            message: "expected v1".to_string(),
+            message: "expected v1 or v2".to_string(),
         });
+    }
+    if release.schema_version == "v2" {
+        hex32(
+            "static_resource_policy_sha256",
+            release
+                .static_resource_policy_sha256
+                .as_deref()
+                .ok_or_else(|| PlatformReleaseError::InvalidField {
+                    field: "static_resource_policy_sha256",
+                    message: "required for v2".into(),
+                })?,
+        )?;
+        if release
+            .static_policy_issuer_key_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            return Err(PlatformReleaseError::InvalidField {
+                field: "static_policy_issuer_key_id",
+                message: "required for v2".into(),
+            });
+        }
     }
     let kbs_url = reqwest::Url::parse(&release.trustee_kbs_url).map_err(|err| {
         PlatformReleaseError::InvalidField {

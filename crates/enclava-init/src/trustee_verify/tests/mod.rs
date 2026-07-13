@@ -1,4 +1,5 @@
 use super::*;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use tempfile::tempdir;
@@ -634,6 +635,131 @@ fn resolve_kbs_attestation_token_prefers_env_token() {
 fn parse_kbs_attestation_token_payload_rejects_missing_token() {
     let err = parse_kbs_attestation_token_payload(&serde_json::json!({})).unwrap_err();
     assert!(matches!(err, InitError::Kbs(msg) if msg.contains("missing token")));
+}
+
+fn signed_authorization_for_issuer(
+    issuer_key_id: &str,
+    signing_key: &SigningKey,
+) -> enclava_common::kbs_authorization::DeploymentAuthorizationV1 {
+    let descriptor_hash = [0x11; 32];
+    let receipt_path = enclava_common::kbs_authorization::receipt_resource_path(&descriptor_hash);
+    let mut authorization = enclava_common::kbs_authorization::DeploymentAuthorizationV1 {
+        schema_version: enclava_common::kbs_authorization::AUTHORIZATION_SCHEMA_V1.to_string(),
+        authorization_id: Uuid::from_u128(1),
+        org_id: Uuid::from_u128(2),
+        app_id: Uuid::from_u128(3),
+        descriptor_deploy_id: Uuid::from_u128(4),
+        descriptor_core_hash: descriptor_hash,
+        expected_init_data_hash: [0x22; 32],
+        namespace: "tenant-app".into(),
+        service_account: "workload".into(),
+        tenant_instance_identity_hash: [0x33; 32],
+        org_owner_version: 1,
+        org_owner_pubkey_sha256: [0x44; 32],
+        image_digest: format!("sha256:{}", "55".repeat(32)),
+        signer_identity: enclava_common::descriptor::SignerIdentity {
+            subject: "subject".into(),
+            issuer: "issuer".into(),
+        },
+        receipt_resource_path: receipt_path.clone(),
+        authorized_resource_paths: vec![receipt_path],
+        rego_sha256: [0x66; 32],
+        agent_policy_sha256: [0x77; 32],
+        artifact_bundle_digest: [0x88; 32],
+        issuer_key_id: issuer_key_id.into(),
+        issued_at: Utc::now(),
+        expires_at: None,
+        signature_alg: enclava_common::kbs_authorization::AUTHORIZATION_SIGNATURE_ALG.to_string(),
+        signature: URL_SAFE_NO_PAD.encode([0u8; 64]),
+    };
+    authorization.signature = URL_SAFE_NO_PAD.encode(
+        signing_key
+            .sign(&enclava_common::kbs_authorization::authorization_signing_bytes(&authorization))
+            .to_bytes(),
+    );
+    authorization
+}
+
+#[test]
+fn receipt_signature_rejects_unknown_issuer_even_when_scalar_key_would_match() {
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let trusted_keys = std::collections::BTreeMap::from([(
+        "current".to_string(),
+        signing_key.verifying_key().to_bytes(),
+    )]);
+    let unknown = signed_authorization_for_issuer("retired-or-unknown", &signing_key);
+
+    let error = verify_authorization_signature(&unknown, &trusted_keys).unwrap_err();
+    assert!(matches!(error, InitError::TrusteePolicy(message) if message.contains("not trusted")));
+
+    let current = signed_authorization_for_issuer("current", &signing_key);
+    assert_eq!(
+        verify_authorization_signature(&current, &trusted_keys).unwrap(),
+        signing_key.verifying_key().to_bytes()
+    );
+}
+
+#[test]
+fn receipt_claim_binding_rejects_identity_tampering() {
+    let descriptor_hash = [0x11; 32];
+    let receipt_path = enclava_common::kbs_authorization::receipt_resource_path(&descriptor_hash);
+    let authorization = enclava_common::kbs_authorization::DeploymentAuthorizationV1 {
+        schema_version: enclava_common::kbs_authorization::AUTHORIZATION_SCHEMA_V1.to_string(),
+        authorization_id: Uuid::from_u128(1),
+        org_id: Uuid::from_u128(2),
+        app_id: Uuid::from_u128(3),
+        descriptor_deploy_id: Uuid::from_u128(4),
+        descriptor_core_hash: descriptor_hash,
+        expected_init_data_hash: [0x22; 32],
+        namespace: "tenant-app".into(),
+        service_account: "workload".into(),
+        tenant_instance_identity_hash: [0x33; 32],
+        org_owner_version: 1,
+        org_owner_pubkey_sha256: [0x44; 32],
+        image_digest: format!("sha256:{}", "55".repeat(32)),
+        signer_identity: enclava_common::descriptor::SignerIdentity {
+            subject: "subject".into(),
+            issuer: "issuer".into(),
+        },
+        receipt_resource_path: receipt_path.clone(),
+        authorized_resource_paths: vec![receipt_path.clone()],
+        rego_sha256: [0x66; 32],
+        agent_policy_sha256: [0x77; 32],
+        artifact_bundle_digest: [0x88; 32],
+        issuer_key_id: "key-1".into(),
+        issued_at: Utc::now(),
+        expires_at: None,
+        signature_alg: "ed25519".into(),
+        signature: "unused".into(),
+    };
+    let claims = ReceiptClaims {
+        descriptor_core_hash: descriptor_hash,
+        expected_init_data_hash: [0x22; 32],
+        namespace: "tenant-app".into(),
+        service_account: "workload".into(),
+        tenant_instance_identity_hash: [0x33; 32],
+        image_digest: format!("sha256:{}", "55".repeat(32)),
+        signer_subject: "subject".into(),
+        signer_issuer: "issuer".into(),
+    };
+    verify_authorization_claims(&authorization, &claims, &receipt_path).unwrap();
+
+    let mut tampered = claims.clone();
+    tampered.namespace = "other-app".into();
+    assert!(verify_authorization_claims(&authorization, &tampered, &receipt_path).is_err());
+    let mut tampered = claims.clone();
+    tampered.expected_init_data_hash[0] ^= 1;
+    assert!(verify_authorization_claims(&authorization, &tampered, &receipt_path).is_err());
+    let mut tampered = claims;
+    tampered.signer_subject.push_str("-other");
+    assert!(verify_authorization_claims(&authorization, &tampered, &receipt_path).is_err());
+}
+
+#[test]
+fn non_loopback_artifact_transport_requires_https() {
+    assert!(validate_workload_artifacts_url("https://cap.example.test/artifacts").is_ok());
+    assert!(validate_workload_artifacts_url("http://127.0.0.1:3000/artifacts").is_ok());
+    assert!(validate_workload_artifacts_url("http://cap-api.svc/artifacts").is_err());
 }
 
 #[test]

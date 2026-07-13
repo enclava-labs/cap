@@ -9,6 +9,8 @@ pub mod edge;
 pub mod entitlements;
 pub mod env_gates;
 pub mod kbs;
+pub mod kbs_publisher;
+pub mod metrics;
 pub mod models;
 pub mod platform_release;
 pub mod ratelimit;
@@ -247,10 +249,12 @@ fn user_routes() -> Router<AppState> {
 }
 
 fn platform_routes() -> Router<AppState> {
-    Router::new().route(
-        "/platform/deployment-context",
-        axum::routing::get(routes::platform::deployment_context),
-    )
+    Router::new()
+        .route(
+            "/platform/deployment-context",
+            axum::routing::get(routes::platform::deployment_context),
+        )
+        .route("/metrics", axum::routing::get(metrics::handler))
 }
 
 fn org_routes() -> Router<AppState> {
@@ -295,6 +299,10 @@ fn app_routes() -> Router<AppState> {
         .route(
             "/apps/{name}/signer/rotation-token",
             axum::routing::post(routes::apps::issue_signer_rotation_token_route),
+        )
+        .route(
+            "/apps/{name}/deployment-authorizations/{descriptor_hash}/revoke",
+            axum::routing::post(routes::apps::revoke_deployment_authorization),
         )
 }
 
@@ -561,12 +569,14 @@ pub(crate) mod test_support {
                 caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
                 trustee_policy_read_available: true,
                 workload_artifacts_url: Some("https://api.example.test/workload/artifacts".into()),
+                workload_artifacts_ca_cert_pem: Some("test-ca".into()),
                 tls_certificate_broker_url: None,
                 trustee_policy_url: Some("https://kbs.example.test/policy".into()),
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,
                 platform_trustee_policy_pubkey_hex: Some("11".repeat(32)),
                 signing_service_pubkey_hex: Some("11".repeat(32)),
+                signing_service_trusted_pubkeys_json: None,
             }),
             platform_release_envelope: None,
             dns: None,

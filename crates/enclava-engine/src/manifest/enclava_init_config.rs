@@ -97,16 +97,28 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     if app.attestation.trustee_policy_read_available {
         out.push_str("trustee-policy-read-available = true\n");
         out.push_str("cc-init-data-path = \"/etc/enclava-init/cc-init-data.toml\"\n");
-        push_required_option(
-            &mut out,
-            "workload-artifacts-url",
-            app.attestation
-                .local_workload_artifacts_json
-                .as_ref()
-                .map(|_| format!("file://{LOCAL_WORKLOAD_ARTIFACTS_PATH}"))
-                .as_deref()
-                .or(app.attestation.workload_artifacts_url.as_deref()),
-        );
+        let local_artifact_url = app
+            .attestation
+            .local_workload_artifacts_json
+            .as_ref()
+            .map(|_| format!("file://{LOCAL_WORKLOAD_ARTIFACTS_PATH}"));
+        let artifact_url = local_artifact_url
+            .as_deref()
+            .or(app.attestation.workload_artifacts_url.as_deref());
+        push_required_option(&mut out, "workload-artifacts-url", artifact_url);
+        if artifact_url.is_some_and(|url| url.starts_with("https://")) {
+            push_required_option(
+                &mut out,
+                "workload-artifacts-ca-cert-pem",
+                app.attestation.workload_artifacts_ca_cert_pem.as_deref(),
+            );
+        } else {
+            push_optional_option(
+                &mut out,
+                "workload-artifacts-ca-cert-pem",
+                app.attestation.workload_artifacts_ca_cert_pem.as_deref(),
+            );
+        }
         if let Some(url) = app.attestation.tls_certificate_broker_url.as_deref() {
             push_optional_option(&mut out, "tls-certificate-broker-url", Some(url));
             push_string_array(
@@ -115,16 +127,13 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
                 &tls_certificate_hostnames(app),
             );
         }
-        push_required_option(
-            &mut out,
-            "trustee-policy-url",
-            app.attestation
-                .local_trustee_policy_json
-                .as_ref()
-                .map(|_| format!("file://{LOCAL_TRUSTEE_POLICY_PATH}"))
-                .as_deref()
-                .or(app.attestation.trustee_policy_url.as_deref()),
-        );
+        if app.attestation.local_trustee_policy_json.is_some() {
+            push_required_option(
+                &mut out,
+                "trustee-policy-url",
+                Some(&format!("file://{LOCAL_TRUSTEE_POLICY_PATH}")),
+            );
+        }
         out.push_str(&format!(
             "kbs-attestation-token-url = \"{LOCAL_KBS_ATTESTATION_TOKEN_URL}\"\n",
         ));
@@ -139,6 +148,13 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
             &mut out,
             "signing-service-pubkey-hex",
             app.attestation.signing_service_pubkey_hex.as_deref(),
+        );
+        push_optional_option(
+            &mut out,
+            "signing-service-trusted-pubkeys-json",
+            app.attestation
+                .signing_service_trusted_pubkeys_json
+                .as_deref(),
         );
     } else {
         out.push_str("\n# Phase 3 Trustee patches not yet deployed; in-TEE verification\n");

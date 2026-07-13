@@ -1,0 +1,93 @@
+{
+  "annotations": { "list": [] },
+  "editable": false,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Authorization outbox pending",
+      "targets": [{ "expr": "max(kbs_authorization_outbox_pending)", "refId": "A" }],
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Oldest publication lag (seconds)",
+      "targets": [{ "expr": "max(kbs_authorization_publication_lag_seconds)", "refId": "A" }],
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Static policy bytes",
+      "targets": [{ "expr": "max(kbs_static_resource_policy_bytes)", "refId": "A" }],
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Static policy digest series",
+      "targets": [{ "expr": "count(kbs_static_resource_policy_digest_info == 1)", "refId": "A" }],
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "CAP publication outcomes",
+      "targets": [{ "expr": "sum by (result) (rate(kbs_authorization_publication_total[5m]))", "legendFormat": "{{result}}", "refId": "A" }],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "KBS lookup and verification outcomes",
+      "targets": [
+        { "expr": "sum by (result) (rate(kbs_deployment_authorization_lookup_total[5m]))", "legendFormat": "lookup {{result}}", "refId": "A" },
+        { "expr": "sum by (result) (rate(kbs_deployment_authorization_verify_total[5m]))", "legendFormat": "verify {{result}}", "refId": "B" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Artifact fetch outcomes",
+      "targets": [{ "expr": "sum by (result) (rate(artifact_bundle_fetch_total[5m]))", "legendFormat": "{{result}}", "refId": "A" }],
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 13 }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Integrity and claim conflicts",
+      "targets": [
+        { "expr": "rate(artifact_bundle_digest_mismatch_total[5m])", "legendFormat": "bundle digest", "refId": "A" },
+        { "expr": "rate(attestation_claim_conflict_total[5m])", "legendFormat": "claim conflict", "refId": "B" },
+        { "expr": "rate(legacy_kbs_policy_format_seen_total[5m])", "legendFormat": "legacy policy", "refId": "C" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 13 }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "KBS publisher outcomes",
+      "targets": [{ "expr": "sum by (operation, result) (rate(kbs_deployment_authorization_publisher_request_total[5m]))", "legendFormat": "{{operation}} {{result}}", "refId": "A" }],
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 13 }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "CAP active authorization reconciliation",
+      "targets": [{ "expr": "sum by (result) (rate(kbs_authorization_reconciliation_total[5m]))", "legendFormat": "{{result}}", "refId": "A" }],
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 21 }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["enclava", "kbs", "receipt-mode"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "Enclava KBS policy storage",
+  "uid": "enclava-kbs-policy-storage",
+  "version": 2
+}

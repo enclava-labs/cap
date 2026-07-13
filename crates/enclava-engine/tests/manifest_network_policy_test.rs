@@ -313,6 +313,41 @@ fn empty_egress_allowlist_renders_zero_extra_rules() {
 }
 
 #[test]
+fn receipt_mode_allows_only_configured_cap_artifact_endpoint() {
+    let mut app = sample_app();
+    app.attestation.workload_artifacts_url =
+        Some("https://artifacts.cap.example/api/v1/workload/artifacts".to_string());
+
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    let rule = egress
+        .iter()
+        .find(|rule| rule["toFQDNs"][0]["matchName"].as_str() == Some("artifacts.cap.example"))
+        .expect("CAP artifact FQDN egress rule");
+    assert_eq!(rule["toPorts"][0]["ports"][0]["port"], "443");
+}
+
+#[test]
+fn receipt_mode_allows_cap_service_and_backing_endpoint() {
+    let mut app = sample_app();
+    app.attestation.workload_artifacts_url =
+        Some("https://cap-api.cap-preprod.svc.cluster.local/api/v1/workload/artifacts".to_string());
+
+    let val = generate_network_policy(&app);
+    let egress = val["spec"]["egress"].as_array().unwrap();
+    assert!(egress.iter().any(|rule| {
+        rule["toServices"][0]["k8sService"]["namespace"].as_str() == Some("cap-preprod")
+            && rule["toServices"][0]["k8sService"]["serviceName"].as_str() == Some("cap-api")
+            && rule["toPorts"][0]["ports"][0]["port"].as_str() == Some("443")
+    }));
+    assert!(egress.iter().any(|rule| {
+        rule["toEndpoints"][0]["matchLabels"]["io.kubernetes.pod.namespace"].as_str()
+            == Some("cap-preprod")
+            && rule["toPorts"][0]["ports"][0]["port"].as_str() == Some("3000")
+    }));
+}
+
+#[test]
 fn per_app_egress_extends_platform_default() {
     use enclava_engine::types::EgressRule;
     let mut app = sample_app();

@@ -160,6 +160,15 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
         egress.push(rule);
     }
 
+    // Receipt mode fetches the signed artifact bundle from CAP only after KBS
+    // has authorized the measured workload.  The guest-local CDH/KBS hop is
+    // loopback, but this CAP HTTPS fetch still needs an explicit egress rule.
+    for rule in workload_artifacts_egress_rules(app) {
+        if !egress.contains(&rule) {
+            egress.push(rule);
+        }
+    }
+
     if app.egress_mode == EgressMode::PublicInternet {
         egress.push(public_internet_egress_rule(app));
     }
@@ -222,6 +231,52 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
     let Some(url) = app.attestation.tls_certificate_broker_url.as_deref() else {
         return Vec::new();
     };
+    let Some(authority) = parse_url_authority(url) else {
+        return Vec::new();
+    };
+
+    if let Some((service_name, namespace)) = kubernetes_service_name(authority.host) {
+        let mut rules = vec![json!({
+            "toServices": [
+                {
+                    "k8sService": {
+                        "namespace": namespace,
+                        "serviceName": service_name
+                    }
+                }
+            ],
+            "toPorts": [{ "ports": [{ "port": authority.port.to_string(), "protocol": "TCP" }] }],
+        })];
+        if service_name == "cap-api" {
+            rules.push(json!({
+                "toEndpoints": [
+                    {
+                        "matchLabels": {
+                            "io.kubernetes.pod.namespace": namespace,
+                            "app.kubernetes.io/name": service_name
+                        }
+                    }
+                ],
+                "toPorts": [{ "ports": [{ "port": "3000", "protocol": "TCP" }] }],
+            }));
+        }
+        return rules;
+    }
+
+    vec![json!({
+        "toFQDNs": [{ "matchName": authority.host }],
+        "toPorts": [{ "ports": [{ "port": authority.port.to_string(), "protocol": "TCP" }] }],
+    })]
+}
+
+fn workload_artifacts_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
+    let Some(url) = app.attestation.workload_artifacts_url.as_deref() else {
+        return Vec::new();
+    };
+    platform_service_egress_rules(url)
+}
+
+fn platform_service_egress_rules(url: &str) -> Vec<Value> {
     let Some(authority) = parse_url_authority(url) else {
         return Vec::new();
     };

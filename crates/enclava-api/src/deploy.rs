@@ -671,12 +671,14 @@ mod tests {
             caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
             trustee_policy_read_available: true,
             workload_artifacts_url: None,
+            workload_artifacts_ca_cert_pem: None,
             tls_certificate_broker_url: None,
             trustee_policy_url: None,
             local_workload_artifacts_json: None,
             local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
+            signing_service_trusted_pubkeys_json: None,
         }
     }
 
@@ -1036,12 +1038,14 @@ mod tests {
                 caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
                 trustee_policy_read_available: true,
                 workload_artifacts_url: None,
+                workload_artifacts_ca_cert_pem: None,
             tls_certificate_broker_url: None,
                 trustee_policy_url: None,
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,
                 platform_trustee_policy_pubkey_hex: None,
                 signing_service_pubkey_hex: None,
+                signing_service_trusted_pubkeys_json: None,
             },
             egress_mode: EgressMode::Restricted,
             public_internet_egress_excluded_cidrs: Vec::new(),
@@ -1118,12 +1122,14 @@ mod tests {
                 caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
                 trustee_policy_read_available: true,
                 workload_artifacts_url: None,
+                workload_artifacts_ca_cert_pem: None,
             tls_certificate_broker_url: None,
                 trustee_policy_url: None,
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,
                 platform_trustee_policy_pubkey_hex: None,
                 signing_service_pubkey_hex: None,
+                signing_service_trusted_pubkeys_json: None,
             },
             egress_mode: EgressMode::Restricted,
             public_internet_egress_excluded_cidrs: Vec::new(),
@@ -1312,15 +1318,40 @@ pub async fn apply_deployment_manifests(
         &api_url,
     )
     .await?;
+    let receipt_descriptor_hash = workload_artifact_binding
+        .as_ref()
+        .map(|binding| binding.descriptor_core_hash.to_vec());
     app_spec.workload_artifact_binding = workload_artifact_binding;
     app_spec.log_encryption = log_encryption;
-    if let (Some(workload_artifacts), Some(trustee_policy)) =
-        (local_workload_artifacts_json, local_trustee_policy_json)
-    {
-        app_spec.attestation.local_workload_artifacts_json = Some(workload_artifacts);
-        app_spec.attestation.local_trustee_policy_json = Some(trustee_policy);
+    if local_workload_artifacts_json.is_some() || local_trustee_policy_json.is_some() {
+        crate::metrics::legacy_policy_seen();
+        return Err(DeployError::Validation(
+            "legacy local artifact delivery is disabled; a signed KBS deployment authorization is required"
+                .into(),
+        ));
     }
-    if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
+    let receipt_authorization_active = if let Some(descriptor_hash) = receipt_descriptor_hash {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM workload_artifact_authorizations
+                 WHERE descriptor_core_hash = $1 AND publication_state = 'active'
+                   AND terminally_revoked_at IS NULL
+             )",
+        )
+        .bind(descriptor_hash)
+        .fetch_one(&pool)
+        .await?
+    } else {
+        false
+    };
+
+    if receipt_authorization_active {
+        tracing::info!(
+            app_id = %app.id,
+            deployment_id = %deployment_id,
+            "KBS receipt is active; skipping legacy global signed-policy aggregation"
+        );
+    } else if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
         let policy_sha256: [u8; 32] = hex::decode(&signed_policy_artifact.agent_policy_sha256)
             .map_err(|err| DeployError::Validation(format!("agent_policy_sha256: {err}")))?
             .try_into()
@@ -1350,25 +1381,28 @@ pub async fn apply_deployment_manifests(
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
     set_app_status(&pool, app.id, "creating").await?;
 
-    if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
-        if should_reconcile_global_signed_policy_artifacts(true, &app_spec.attestation) {
-            crate::kbs::reconcile_signed_policy_artifacts(
-                &pool,
-                kbs_policy_config.as_ref(),
-                Some(signed_policy_artifact),
-            )
-            .await?;
+    if !receipt_authorization_active {
+        crate::metrics::legacy_policy_seen();
+        if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
+            if should_reconcile_global_signed_policy_artifacts(true, &app_spec.attestation) {
+                crate::kbs::reconcile_signed_policy_artifacts(
+                    &pool,
+                    kbs_policy_config.as_ref(),
+                    Some(signed_policy_artifact),
+                )
+                .await?;
+            } else {
+                tracing::info!(
+                    app_id = %app.id,
+                    deployment_id = %deployment_id,
+                    "signed deployment did not request global KBS policy aggregate reconciliation"
+                );
+            }
         } else {
-            tracing::info!(
-                app_id = %app.id,
-                deployment_id = %deployment_id,
-                "signed deployment did not request global KBS policy aggregate reconciliation"
-            );
+            crate::kbs::ensure_owner_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
+            crate::kbs::ensure_tls_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
+            crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref()).await?;
         }
-    } else {
-        crate::kbs::ensure_owner_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
-        crate::kbs::ensure_tls_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
-        crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref()).await?;
     }
 
     let engine = ApplyEngine::try_default().await?;
@@ -1415,6 +1449,25 @@ pub async fn apply_deployment_manifests(
             .await
             .map_err(|e| e.to_string());
         let outcome = classify_rollout_result(result, previous_app_status, unlock_mode);
+
+        if outcome.deploy_status == "healthy"
+            && let Err(e) =
+                crate::kbs_publisher::supersede_old_activations(&pool, app.id, deployment_id).await
+        {
+            let error_message = format!("failed to supersede old KBS authorization: {e}");
+            let _ = record_deployment_result(
+                &pool,
+                deployment_id,
+                "failed",
+                Some(&hash),
+                Some(&error_message),
+                true,
+            )
+            .await;
+            let _ = set_app_status(&pool, app.id, "failed").await;
+            tracing::error!(app_id = %app.id, deployment_id = %deployment_id, error = %e, "failed to supersede old workload authorization");
+            return;
+        }
 
         if let Err(e) = record_deployment_result(
             &pool,

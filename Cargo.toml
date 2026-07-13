@@ -61,6 +61,7 @@ zeroize = { version = "1", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }
 tokio-rustls = "0.26"
 x509-cert = "0.2"
+prometheus = "0.14"
 
 # Internal
 enclava-common = { path = "crates/enclava-common" }

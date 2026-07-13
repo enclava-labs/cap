@@ -41,6 +41,20 @@ fn deploy_blocked_response(
     )
 }
 
+pub(crate) fn kbs_publication_error_response(
+    status: StatusCode,
+    error: &crate::kbs_publisher::KbsPublisherError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": "kbs_authorization_publish_failed",
+            "reason": crate::kbs_publisher::stable_error_code(error),
+            "message": "KBS deployment authorization publication failed",
+        })),
+    )
+}
+
 fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
     let status = match &error {
         crate::dns::DnsError::OutsideManagedZone(_) => StatusCode::BAD_REQUEST,
@@ -68,6 +82,7 @@ pub(crate) fn signing_error_response(
         | SigningServiceError::Blob(_)
         | SigningServiceError::Mismatch(_)
         | SigningServiceError::InvalidSignature => StatusCode::BAD_REQUEST,
+        SigningServiceError::ImmutableArtifactConflict => StatusCode::CONFLICT,
         SigningServiceError::Upstream { .. } | SigningServiceError::Http(_) => {
             StatusCode::BAD_GATEWAY
         }
@@ -97,20 +112,13 @@ pub(crate) fn customer_signed_deploy_required(
             .unwrap_or(false)
 }
 
-pub(crate) fn select_local_signed_artifact_delivery(
-    attestation: &mut enclava_engine::types::AttestationConfig,
-) {
-    attestation.local_workload_artifacts_json = Some("{}".to_string());
-    attestation.local_trustee_policy_json = Some("{}".to_string());
-}
-
 pub(crate) async fn resolve_signed_policy_artifact(
     state: &AppState,
     artifacts: &crate::signing_service::DeploymentSigningArtifacts,
     provided_artifact: Option<String>,
     signing_service_pubkey_hex: Option<&str>,
     log_encryption: Option<LogEncryptionConfig>,
-) -> Result<crate::signing_service::SignedPolicyArtifact, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<crate::signing_service::SignedArtifactResponse, (StatusCode, Json<serde_json::Value>)> {
     artifacts
         .validate_customer_authority(&state.db)
         .await
@@ -155,24 +163,27 @@ pub(crate) async fn resolve_signed_policy_artifact(
             artifacts
                 .attach_customer_authority(&mut artifact)
                 .map_err(signing_error_response)?;
-            return Ok(artifact);
+            // The artifact remains useful as a compatibility/tamper check, but
+            // receipt mode still calls the signer to obtain its independently
+            // authorized exact receipt bytes.
         }
     }
 
-    let mut artifact = signing_service
+    let mut response = signing_service
         .sign(&artifacts.sign_request(log_encryption))
         .await
         .map_err(signing_error_response)?;
+    let artifact = &mut response.artifact;
     artifacts
-        .validate_signed_artifact(&artifact, signing_service_pubkey_hex)
+        .validate_signed_artifact(artifact, signing_service_pubkey_hex)
         .map_err(signing_error_response)?;
     artifacts
-        .validate_canonical_agent_policy(&artifact, &generated)
+        .validate_canonical_agent_policy(artifact, &generated)
         .map_err(signing_error_response)?;
     artifacts
-        .attach_customer_authority(&mut artifact)
+        .attach_customer_authority(artifact)
         .map_err(signing_error_response)?;
-    Ok(artifact)
+    Ok(response)
 }
 
 /// Pick the right cosign `VerificationPolicy` for a stored signer identity.
@@ -778,6 +789,7 @@ pub async fn deploy(
         .unwrap_or_else(Uuid::new_v4);
     let mut workload_artifact_binding = None;
     let mut signed_policy_artifact = None;
+    let mut deployment_authorization_bytes = None;
     if let Some(artifacts) = signing_artifacts.as_ref() {
         let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
         artifacts
@@ -809,7 +821,7 @@ pub async fn deploy(
         app_spec.workload_artifact_binding = Some(binding.clone());
         app_spec.log_encryption = log_encryption.clone();
 
-        let signed = resolve_signed_policy_artifact(
+        let signed_response = resolve_signed_policy_artifact(
             &state,
             artifacts,
             body.signed_policy_artifact.clone(),
@@ -817,12 +829,19 @@ pub async fn deploy(
             log_encryption.clone(),
         )
         .await?;
+        let signed = signed_response.artifact;
+        deployment_authorization_bytes = signed_response.authorization_bytes;
+        if deployment_authorization_bytes.is_none() {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "kbs_authorization_missing_from_signing_service",
+            ));
+        }
         app_spec.generated_agent_policy = Some(
             artifacts
                 .generated_agent_policy(&signed)
                 .map_err(signing_error_response)?,
         );
-        select_local_signed_artifact_delivery(&mut app_spec.attestation);
         let (_encoded, cc_init_data_hash) =
             enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
         let expected_cc_init_data_hash =
@@ -875,6 +894,11 @@ pub async fn deploy(
     // Create deployment record. cosign_verified is set from the actual
     // verification result, not hardcoded.
     let cosign_verified = true;
+    let mut deployment_tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     sqlx::query(
         "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest, cosign_verified, provenance_attestation, sbom, external_id, source_provider, source_repository)
          VALUES ($1, $2, $3, 'api', $4, $5, $6, $7, $8, $9, $10, $11)",
@@ -890,7 +914,7 @@ pub async fn deploy(
     .bind(body.external_id.as_deref())
     .bind(source_provider)
     .bind(body.source_repository.as_deref())
-    .execute(&state.db)
+    .execute(&mut *deployment_tx)
     .await
     .map_err(|e| {
         if e.to_string().contains("idx_deployments_org_external_id") {
@@ -907,10 +931,54 @@ pub async fn deploy(
         (signing_artifacts.as_ref(), signed_policy_artifact.as_ref())
     {
         crate::signing_service::persist_workload_artifacts(
-            &state.db, app.id, deploy_id, artifacts, signed,
+            &mut deployment_tx,
+            app.id,
+            deploy_id,
+            artifacts,
+            signed,
+            deployment_authorization_bytes.as_deref(),
+            state
+                .attestation
+                .as_ref()
+                .and_then(|config| config.signing_service_pubkey_hex.as_deref()),
         )
         .await
         .map_err(signing_error_response)?;
+    }
+    deployment_tx
+        .commit()
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+
+    if let Some(artifacts) = signing_artifacts.as_ref()
+        && deployment_authorization_bytes.is_some()
+    {
+        let publisher = crate::kbs_publisher::config_from_env().map_err(|error| {
+            kbs_publication_error_response(StatusCode::SERVICE_UNAVAILABLE, &error)
+        })?;
+        if let Err(error) = crate::kbs_publisher::publish_descriptor(
+            &state.db,
+            &state.trustee_http_client,
+            publisher.as_ref(),
+            &artifacts.descriptor_core_hash,
+        )
+        .await
+        {
+            let error_message = format!("kbs_authorization_publish_failed: {error}");
+            let _ = crate::deploy::set_deployment_status(
+                &state.db,
+                deploy_id,
+                "failed",
+                None,
+                Some(&error_message),
+                true,
+            )
+            .await;
+            return Err(kbs_publication_error_response(
+                StatusCode::BAD_GATEWAY,
+                &error,
+            ));
+        }
     }
 
     // Audit the image signer and, when present, the signed descriptor hash
@@ -953,24 +1021,12 @@ pub async fn deploy(
     }
 
     let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
-    let local_verification_artifacts =
-        match (signing_artifacts.as_ref(), signed_policy_artifact.as_ref()) {
-            (Some(artifacts), Some(signed)) => Some((
-                crate::signing_service::workload_artifacts_json(artifacts, signed)
-                    .map_err(signing_error_response)?,
-                crate::signing_service::trustee_policy_json(signed)
-                    .map_err(signing_error_response)?,
-            )),
-            _ => None,
-        };
     let db = state.db.clone();
     let attestation = state.attestation.clone();
     let kbs_policy = state.kbs_policy.clone();
     let api_url = state.api_url.clone();
     let apply_app = app.clone();
     let apply_permits = state.deployment_apply_permits.clone();
-    let (local_workload_artifacts_json, local_trustee_policy_json) =
-        local_verification_artifacts.unzip();
     tokio::spawn(async move {
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
@@ -1007,8 +1063,8 @@ pub async fn deploy(
                 api_url,
                 workload_artifact_binding,
                 signed_policy_artifact,
-                local_workload_artifacts_json,
-                local_trustee_policy_json,
+                local_workload_artifacts_json: None,
+                local_trustee_policy_json: None,
                 log_encryption,
             },
         )
@@ -1102,8 +1158,8 @@ pub use rollback::rollback;
 #[cfg(test)]
 mod tests {
     use super::{
-        LOG_ENCRYPTION_ALGORITHM_X25519_HPKE_V1, LogEncryptionConfig, StatusCode, parse_memory_gi,
-        validate_log_encryption_config,
+        LOG_ENCRYPTION_ALGORITHM_X25519_HPKE_V1, LogEncryptionConfig, StatusCode,
+        kbs_publication_error_response, parse_memory_gi, validate_log_encryption_config,
     };
 
     fn valid_log_encryption_config() -> LogEncryptionConfig {
@@ -1150,5 +1206,21 @@ mod tests {
             validate_log_encryption_config(Some(config)).expect_err("algorithm rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "unsupported log_encryption.algorithm");
+    }
+
+    #[test]
+    fn kbs_publication_errors_are_structured_and_safe_to_proxy() {
+        let (status, body) = kbs_publication_error_response(
+            StatusCode::BAD_GATEWAY,
+            &crate::kbs_publisher::KbsPublisherError::ReadbackMismatch,
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body.0["error"], "kbs_authorization_publish_failed");
+        assert_eq!(body.0["reason"], "publisher_readback_mismatch");
+        assert_eq!(
+            body.0["message"],
+            "KBS deployment authorization publication failed"
+        );
+        assert!(!body.0.to_string().contains("bearer"));
     }
 }

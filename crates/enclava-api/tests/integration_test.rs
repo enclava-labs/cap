@@ -1,6 +1,7 @@
 //! Integration tests for API routes using testcontainers.
 
 use axum::http::StatusCode;
+use base64::Engine as _;
 use chrono::{Duration, Utc};
 use ed25519_dalek::SigningKey;
 use enclava_api::{
@@ -80,12 +81,14 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
             caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
             trustee_policy_read_available: false,
             workload_artifacts_url: None,
+            workload_artifacts_ca_cert_pem: None,
             tls_certificate_broker_url: None,
             trustee_policy_url: None,
             local_workload_artifacts_json: None,
             local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
+            signing_service_trusted_pubkeys_json: None,
         }),
         platform_release_envelope: None,
         dns: None,
@@ -209,6 +212,69 @@ async fn persisted_app_egress(pool: &PgPool, org_id: Uuid, app_name: &str) -> Va
     .fetch_one(pool)
     .await
     .expect("persisted app egress allowlist")
+}
+
+#[tokio::test]
+async fn same_unlock_mode_retry_resumes_pending_transition() {
+    let (state, pool) = setup_test_state().await;
+    let server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(test_router(state));
+    let (session_token, org_id) = signup_owner(&server, "unlock-resume").await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_id = Uuid::new_v4();
+    let deployment_id = Uuid::new_v4();
+    let app_name = format!("unlock-resume-{}", &suffix[..12]);
+
+    sqlx::query(
+        "INSERT INTO apps (
+            id, org_id, name, namespace, instance_id, tenant_id, service_account,
+            bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, unlock_mode,
+            domain, tee_domain, status
+         ) VALUES ($1, $2, $3, $4, $5, 'test', $6, $7, $8,
+                   'auto'::unlock_enum, $9, $10, 'running'::app_status_enum)",
+    )
+    .bind(app_id)
+    .bind(org_id)
+    .bind(&app_name)
+    .bind(format!("cap-{app_name}"))
+    .bind(format!("instance-{suffix}"))
+    .bind(format!("cap-{app_name}-sa"))
+    .bind("11".repeat(32))
+    .bind("22".repeat(32))
+    .bind(format!("{app_name}.enclava.dev"))
+    .bind(format!("{app_name}.tee.enclava.dev"))
+    .execute(&pool)
+    .await
+    .expect("insert unlock retry app");
+    sqlx::query(
+        "INSERT INTO deployments
+            (id, org_id, app_id, trigger, status, spec_snapshot)
+         VALUES ($1, $2, $3, 'api'::trigger_enum, 'pending'::deploy_status_enum, $4)",
+    )
+    .bind(deployment_id)
+    .bind(org_id)
+    .bind(app_id)
+    .bind(serde_json::json!({
+        "app_name": app_name,
+        "unlock_mode": "auto",
+        "transition": {"from": "password", "to": "auto"},
+        "log_encryption": null,
+    }))
+    .execute(&pool)
+    .await
+    .expect("insert pending unlock transition");
+
+    let response = server
+        .put(&format!("/apps/{app_name}/unlock/mode"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(session_token)
+        .json(&serde_json::json!({"mode": "auto"}))
+        .await;
+    response.assert_status_ok();
+    let body: Value = response.json();
+    assert_eq!(body["status"], "deploying");
+    assert_eq!(body["deployment_id"], deployment_id.to_string());
 }
 
 async fn bootstrap_paas_internal_org(
@@ -1908,4 +1974,447 @@ async fn signer_rotation_token_rotates_signer_end_to_end() {
         rotated["signer_identity_issuer"].as_str(),
         Some(previous_issuer)
     );
+}
+
+#[tokio::test]
+async fn terminal_revocation_denies_locally_before_kbs_and_persists_retry() {
+    let (state, pool) = setup_test_state().await;
+    let server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(test_router(state));
+    let (_session_token, org_id) = signup_owner(&server, "revoke-ordering").await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_id = Uuid::new_v4();
+    let deployment_id = Uuid::new_v4();
+    let descriptor_hash: [u8; 32] = Sha256::digest(suffix.as_bytes()).into();
+
+    sqlx::query(
+        "INSERT INTO apps (
+             id, org_id, name, namespace, instance_id, tenant_id, service_account,
+             bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, domain, tee_domain
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'bootstrap', 'identity', $8, $9)",
+    )
+    .bind(app_id)
+    .bind(org_id)
+    .bind(format!("revoke-{suffix}"))
+    .bind(format!("cap-revoke-{suffix}"))
+    .bind(format!("instance-{suffix}"))
+    .bind(format!("tenant-{suffix}"))
+    .bind(format!("sa-{suffix}"))
+    .bind(format!("revoke-{suffix}.enclava.dev"))
+    .bind(format!("revoke-{suffix}.tee.enclava.dev"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let authorization_bytes = format!("exact-authorization-restore-fixture-{suffix}").into_bytes();
+    let authorization_digest = Sha256::digest(&authorization_bytes).to_vec();
+    sqlx::query(
+        "INSERT INTO deployments (id, app_id, org_id, status, spec_snapshot)
+         VALUES ($1, $2, $3, 'healthy', '{}'::jsonb)",
+    )
+    .bind(deployment_id)
+    .bind(app_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO workload_artifacts (
+             descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+             descriptor_signature, descriptor_signing_key_id, org_keyring_payload,
+             org_keyring_signature, signed_policy_artifact
+         ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'key', '{}'::jsonb, $4, '{}'::jsonb)",
+    )
+    .bind(descriptor_hash.to_vec())
+    .bind(app_id)
+    .bind(deployment_id)
+    .bind(vec![0u8; 64])
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO workload_artifact_authorizations (
+             descriptor_core_hash, authorization_id, receipt_resource_path,
+             authorization_bytes, authorization_digest, issuer_key_id, issued_at,
+             publication_state, published_at, publication_digest
+         ) VALUES ($1, $2, $3, $4, $5, 'issuer', now(), 'active', now(), $5)",
+    )
+    .bind(descriptor_hash.to_vec())
+    .bind(Uuid::new_v4())
+    .bind(format!(
+        "default/policy-receipts/{}",
+        hex::encode(descriptor_hash)
+    ))
+    .bind(&authorization_bytes)
+    .bind(&authorization_digest)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO deployment_artifact_activations (
+             management_deployment_id, descriptor_core_hash, activation_state, activated_at
+         ) VALUES ($1, $2, 'active', now())",
+    )
+    .bind(deployment_id)
+    .bind(descriptor_hash.to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    enclava_api::kbs_publisher::queue_restore_repair(
+        &pool,
+        &descriptor_hash,
+        &authorization_digest,
+        &authorization_bytes,
+    )
+    .await
+    .unwrap();
+    let restore_state: (String, String, bool) = sqlx::query_as(
+        "SELECT auth.publication_state, activation.activation_state,
+                EXISTS (
+                    SELECT 1 FROM kbs_authorization_outbox event
+                    WHERE event.descriptor_core_hash = auth.descriptor_core_hash
+                      AND event.operation = 'publish' AND event.state = 'pending'
+                )
+         FROM workload_artifact_authorizations auth
+         JOIN deployment_artifact_activations activation
+           ON activation.descriptor_core_hash = auth.descriptor_core_hash
+         WHERE auth.descriptor_core_hash = $1",
+    )
+    .bind(descriptor_hash.to_vec())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        restore_state,
+        ("pending".into(), "pending_publication".into(), true)
+    );
+    sqlx::query("DELETE FROM kbs_authorization_outbox WHERE descriptor_core_hash = $1")
+        .bind(descriptor_hash.to_vec())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE workload_artifact_authorizations
+         SET publication_state = 'active', deactivated_at = NULL
+         WHERE descriptor_core_hash = $1",
+    )
+    .bind(descriptor_hash.to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE deployment_artifact_activations
+         SET activation_state = 'active', deactivated_at = NULL
+         WHERE descriptor_core_hash = $1",
+    )
+    .bind(descriptor_hash.to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = enclava_api::kbs_publisher::terminally_revoke_descriptor(
+        &pool,
+        &reqwest::Client::new(),
+        None,
+        &descriptor_hash,
+        "incident-123",
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        enclava_api::kbs_publisher::KbsPublisherError::NotConfigured
+    ));
+
+    let state: (String, bool, String, String, Uuid) = sqlx::query_as(
+        "SELECT auth.publication_state, auth.kbs_tombstoned_at IS NULL,
+                activation.activation_state, event.state, event.event_id
+         FROM workload_artifact_authorizations auth
+         JOIN deployment_artifact_activations activation
+           ON activation.descriptor_core_hash = auth.descriptor_core_hash
+         JOIN kbs_authorization_outbox event
+           ON event.descriptor_core_hash = auth.descriptor_core_hash
+         WHERE auth.descriptor_core_hash = $1",
+    )
+    .bind(descriptor_hash.to_vec())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state.0, "tombstoned");
+    assert!(state.1);
+    assert_eq!(state.2, "terminally_revoked");
+    assert_eq!(state.3, "pending");
+    let revoke_event_id = state.4;
+
+    let conflict = enclava_api::kbs_publisher::terminally_revoke_descriptor(
+        &pool,
+        &reqwest::Client::new(),
+        None,
+        &descriptor_hash,
+        "different-reason",
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        conflict,
+        enclava_api::kbs_publisher::KbsPublisherError::StateConflict
+    ));
+
+    sqlx::query(
+        "UPDATE kbs_authorization_outbox
+         SET state = 'processing', updated_at = now() - interval '3 minutes',
+             created_at = now() - interval '1 day'
+         WHERE event_id = $1",
+    )
+    .bind(revoke_event_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let publisher = enclava_api::kbs_publisher::KbsPublisherConfig::new(
+        "https://127.0.0.1:1/".into(),
+        "publisher-test-token".into(),
+    )
+    .unwrap();
+    enclava_api::kbs_publisher::reconcile_event_by_id(
+        &pool,
+        &reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap(),
+        &publisher,
+        revoke_event_id,
+    )
+    .await
+    .unwrap_err();
+    let retry: (String, i32, Option<String>) = sqlx::query_as(
+        "SELECT state, attempt_count, last_error_code
+         FROM kbs_authorization_outbox WHERE event_id = $1",
+    )
+    .bind(revoke_event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retry.0, "failed");
+    assert_eq!(retry.1, 1);
+    assert_eq!(retry.2.as_deref(), Some("publisher_transport_error"));
+
+    let purge = enclava_api::kbs_publisher::purge_deactivated_app_artifacts(&pool, app_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        purge,
+        enclava_api::kbs_publisher::KbsPublisherError::StateConflict
+    ));
+
+    sqlx::query(
+        "UPDATE workload_artifact_authorizations
+         SET kbs_tombstoned_at = now() WHERE descriptor_core_hash = $1",
+    )
+    .bind(descriptor_hash.to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE kbs_authorization_outbox
+         SET state = 'succeeded', completed_at = now()
+         WHERE descriptor_core_hash = $1",
+    )
+    .bind(descriptor_hash.to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE kbs_authorization_tombstone_ledger
+         SET kbs_confirmed_at = now(), last_reconciled_at = now()
+         WHERE descriptor_core_hash = $1",
+    )
+    .bind(descriptor_hash.to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    enclava_api::kbs_publisher::purge_deactivated_app_artifacts(&pool, app_id)
+        .await
+        .unwrap();
+    let retained_tombstone: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM kbs_authorization_tombstone_ledger
+             WHERE descriptor_core_hash = $1 AND kbs_confirmed_at IS NOT NULL
+         )",
+    )
+    .bind(descriptor_hash.to_vec())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let artifact_retained: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM workload_artifacts WHERE descriptor_core_hash = $1
+         )",
+    )
+    .bind(descriptor_hash.to_vec())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(retained_tombstone);
+    assert!(!artifact_retained);
+}
+
+#[tokio::test]
+async fn owner_rotation_expiry_terminally_revokes_old_owner_receipts() {
+    let (state, pool) = setup_test_state().await;
+    let server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(test_router(state));
+    let (_session_token, org_id) = signup_owner(&server, "owner-rotation-expiry").await;
+    let app_id = Uuid::new_v4();
+    let deployment_id = Uuid::new_v4();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let descriptor_hash: [u8; 32] = Sha256::digest(suffix.as_bytes()).into();
+    let old_owner_hash = [0x44; 32];
+
+    sqlx::query(
+        "INSERT INTO apps (
+             id, org_id, name, namespace, instance_id, tenant_id, service_account,
+             bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, domain, tee_domain
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'bootstrap', 'identity', $8, $9)",
+    )
+    .bind(app_id)
+    .bind(org_id)
+    .bind(format!("rotate-{suffix}"))
+    .bind(format!("cap-rotate-{suffix}"))
+    .bind(format!("instance-{suffix}"))
+    .bind(format!("tenant-{suffix}"))
+    .bind(format!("sa-{suffix}"))
+    .bind(format!("rotate-{suffix}.enclava.dev"))
+    .bind(format!("rotate-{suffix}.tee.enclava.dev"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO deployments (id, app_id, org_id, status, spec_snapshot)
+         VALUES ($1, $2, $3, 'healthy', '{}'::jsonb)",
+    )
+    .bind(deployment_id)
+    .bind(app_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO workload_artifacts (
+             descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+             descriptor_signature, descriptor_signing_key_id, org_keyring_payload,
+             org_keyring_signature, signed_policy_artifact
+         ) VALUES ($1, $2, $3, '{}'::jsonb, $4, 'key', '{}'::jsonb, $4, '{}'::jsonb)",
+    )
+    .bind(descriptor_hash.to_vec())
+    .bind(app_id)
+    .bind(deployment_id)
+    .bind(vec![0u8; 64])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let receipt_path = enclava_common::kbs_authorization::receipt_resource_path(&descriptor_hash);
+    let mut authorized_resource_paths = vec![
+        "default/test-owner/seed-encrypted".into(),
+        "default/test-owner/seed-sealed".into(),
+        receipt_path.clone(),
+    ];
+    authorized_resource_paths.sort();
+    let authorization = enclava_common::kbs_authorization::DeploymentAuthorizationV1 {
+        schema_version: enclava_common::kbs_authorization::AUTHORIZATION_SCHEMA_V1.into(),
+        authorization_id: Uuid::new_v4(),
+        org_id,
+        app_id,
+        descriptor_deploy_id: deployment_id,
+        descriptor_core_hash: descriptor_hash,
+        expected_init_data_hash: [0x32; 32],
+        namespace: format!("cap-rotate-{suffix}"),
+        service_account: format!("sa-{suffix}"),
+        tenant_instance_identity_hash: [0x33; 32],
+        org_owner_version: 7,
+        org_owner_pubkey_sha256: old_owner_hash,
+        image_digest: format!("sha256:{}", "55".repeat(32)),
+        signer_identity: SignerIdentity {
+            subject: "subject".into(),
+            issuer: "issuer".into(),
+        },
+        receipt_resource_path: receipt_path.clone(),
+        authorized_resource_paths,
+        rego_sha256: [0x66; 32],
+        agent_policy_sha256: [0x77; 32],
+        artifact_bundle_digest: [0x88; 32],
+        issuer_key_id: "issuer".into(),
+        issued_at: Utc::now(),
+        expires_at: None,
+        signature_alg: enclava_common::kbs_authorization::AUTHORIZATION_SIGNATURE_ALG.into(),
+        signature: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 64]),
+    };
+    let authorization_bytes = serde_json::to_vec(&authorization).unwrap();
+    let authorization_digest = Sha256::digest(&authorization_bytes).to_vec();
+    sqlx::query(
+        "INSERT INTO workload_artifact_authorizations (
+             descriptor_core_hash, authorization_id, receipt_resource_path,
+             authorization_bytes, authorization_digest, issuer_key_id, issued_at,
+             publication_state, published_at, publication_digest
+         ) VALUES ($1, $2, $3, $4, $5, 'issuer', now(), 'active', now(), $5)",
+    )
+    .bind(descriptor_hash.to_vec())
+    .bind(authorization.authorization_id)
+    .bind(receipt_path)
+    .bind(authorization_bytes)
+    .bind(authorization_digest)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO deployment_artifact_activations (
+             management_deployment_id, descriptor_core_hash, activation_state, activated_at
+         ) VALUES ($1, $2, 'active', now())",
+    )
+    .bind(deployment_id)
+    .bind(descriptor_hash.to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO org_owner_authorization_rotations (
+             org_id, old_owner_version, old_owner_pubkey_sha256,
+             replacement_owner_version, grace_expires_at
+         ) VALUES ($1, 7, $2, 8, now() - interval '1 second')",
+    )
+    .bind(org_id)
+    .bind(old_owner_hash.to_vec())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        enclava_api::kbs_publisher::expire_due_owner_rotations(&pool, 10)
+            .await
+            .unwrap(),
+        1
+    );
+    let state: (String, String, Option<String>, bool) = sqlx::query_as(
+        "SELECT auth.publication_state, activation.activation_state,
+                event.operation_reason, rotation.completed_at IS NOT NULL
+         FROM workload_artifact_authorizations auth
+         JOIN deployment_artifact_activations activation
+           ON activation.descriptor_core_hash = auth.descriptor_core_hash
+         JOIN kbs_authorization_outbox event
+           ON event.descriptor_core_hash = auth.descriptor_core_hash
+         JOIN org_owner_authorization_rotations rotation ON rotation.org_id = $2
+         WHERE auth.descriptor_core_hash = $1 AND event.operation = 'revoke'",
+    )
+    .bind(descriptor_hash.to_vec())
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state.0, "tombstoned");
+    assert_eq!(state.1, "terminally_revoked");
+    assert_eq!(state.2.as_deref(), Some("org_owner_rotation_to_version_8"));
+    assert!(state.3);
 }

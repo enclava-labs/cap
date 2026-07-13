@@ -11,6 +11,9 @@ use crate::state::AppState;
 pub struct DeploymentContextResponse {
     pub api_signing_pubkey: String,
     pub tls_certificate_broker_url: Option<String>,
+    pub workload_artifacts_url: Option<String>,
+    pub workload_artifacts_ca_cert_pem: Option<String>,
+    pub signing_service_trusted_pubkeys_json: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_platform_release_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -34,6 +37,18 @@ pub(crate) fn deployment_context_response(state: &AppState) -> DeploymentContext
             .attestation
             .as_ref()
             .and_then(|cfg| cfg.tls_certificate_broker_url.clone()),
+        workload_artifacts_url: state
+            .attestation
+            .as_ref()
+            .and_then(|cfg| cfg.workload_artifacts_url.clone()),
+        workload_artifacts_ca_cert_pem: state
+            .attestation
+            .as_ref()
+            .and_then(|cfg| cfg.workload_artifacts_ca_cert_pem.clone()),
+        signing_service_trusted_pubkeys_json: state
+            .attestation
+            .as_ref()
+            .and_then(|cfg| cfg.signing_service_trusted_pubkeys_json.clone()),
         current_platform_release_id: state
             .platform_release_envelope
             .as_ref()

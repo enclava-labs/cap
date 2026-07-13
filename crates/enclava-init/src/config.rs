@@ -86,6 +86,9 @@ pub struct Config {
     pub workload_artifacts_url: Option<String>,
 
     #[serde(default)]
+    pub workload_artifacts_ca_cert_pem: Option<String>,
+
+    #[serde(default)]
     pub tls_certificate_broker_url: Option<String>,
 
     #[serde(default)]
@@ -105,6 +108,9 @@ pub struct Config {
 
     #[serde(default)]
     pub signing_service_pubkey_hex: Option<String>,
+
+    #[serde(default)]
+    pub signing_service_trusted_pubkeys_json: Option<String>,
 }
 
 fn default_unlock_socket() -> String {

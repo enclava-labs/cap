@@ -51,6 +51,7 @@ k8s-openapi = { workspace = true }
 kube = { workspace = true }
 instant-acme = "0.8"
 rustls = { workspace = true }
+prometheus = { workspace = true }
 
 [features]
 prod-strict = ["enclava-engine/prod-strict"]

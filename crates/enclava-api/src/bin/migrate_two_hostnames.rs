@@ -195,12 +195,14 @@ fn load_attestation_for_migration() -> Option<AttestationConfig> {
             .unwrap_or_default(),
         trustee_policy_read_available: false,
         workload_artifacts_url: None,
+        workload_artifacts_ca_cert_pem: None,
         tls_certificate_broker_url: None,
         trustee_policy_url: None,
         local_workload_artifacts_json: None,
         local_trustee_policy_json: None,
         platform_trustee_policy_pubkey_hex: None,
         signing_service_pubkey_hex: None,
+        signing_service_trusted_pubkeys_json: None,
     })
 }
 

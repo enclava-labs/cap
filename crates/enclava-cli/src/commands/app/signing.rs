@@ -327,16 +327,34 @@ pub(crate) fn confidential_app_for_cc_hash(
                 .parse::<enclava_engine::types::CaddyTlsMode>()
                 .map_err(|err| format!("platform release tenant_caddy_tls_mode: {err}"))?,
             trustee_policy_read_available: true,
-            workload_artifacts_url: None,
+            workload_artifacts_url: Some(
+                deployment_context
+                    .workload_artifacts_url
+                    .clone()
+                    .ok_or_else(|| {
+                        "deployment context missing receipt-mode workload_artifacts_url".to_string()
+                    })?,
+            ),
+            workload_artifacts_ca_cert_pem: Some(
+                deployment_context
+                    .workload_artifacts_ca_cert_pem
+                    .clone()
+                    .ok_or_else(|| {
+                        "deployment context missing workload artifact CA pin".to_string()
+                    })?,
+            ),
             tls_certificate_broker_url: tls_certificate_broker_url_for_cc_hash(
                 release,
                 &deployment_context,
             )?,
             trustee_policy_url: None,
-            local_workload_artifacts_json: Some("{}".to_string()),
-            local_trustee_policy_json: Some("{}".to_string()),
+            local_workload_artifacts_json: None,
+            local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
             signing_service_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
+            signing_service_trusted_pubkeys_json: deployment_context
+                .signing_service_trusted_pubkeys_json
+                .clone(),
         },
         egress_mode: enclava_engine::types::EgressMode::Restricted,
         public_internet_egress_excluded_cidrs: Vec::new(),

@@ -23,6 +23,125 @@ use crate::state::{AppState, CapManagementMode};
 use enclava_engine::types::{EgressMode, EgressRule};
 use sqlx::types::Json as SqlJson;
 
+#[derive(Debug, Deserialize)]
+pub struct RevokeAuthorizationRequest {
+    reason: String,
+}
+
+/// Emergency, irreversible revocation of one deployment authorization.
+pub async fn revoke_deployment_authorization(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path((app_name, descriptor_hash)): Path<(String, String)>,
+    Json(body): Json<RevokeAuthorizationRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_write(&auth)?;
+    // Security revocation remains available in PaaS-managed mode: it can only
+    // reduce access, is scoped to the caller's org/app, and is irreversible.
+    let hash = hex::decode(&descriptor_hash).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"error": "descriptor hash must be 64 lowercase hex characters"}),
+            ),
+        )
+    })?;
+    if descriptor_hash.len() != 64 || descriptor_hash != descriptor_hash.to_ascii_lowercase() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"error": "descriptor hash must be 64 lowercase hex characters"}),
+            ),
+        ));
+    }
+    let hash: [u8; 32] = hash.try_into().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({"error": "descriptor hash must be 64 lowercase hex characters"}),
+            ),
+        )
+    })?;
+    let namespace: Option<String> = sqlx::query_scalar(
+        "SELECT app.namespace
+         FROM workload_artifacts wa
+         JOIN apps app ON app.id = wa.app_id
+         WHERE app.org_id = $1 AND app.name = $2 AND wa.descriptor_core_hash = $3",
+    )
+    .bind(auth.org_id)
+    .bind(&app_name)
+    .bind(hash.to_vec())
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| internal_server_error())?;
+    let Some(namespace) = namespace else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "deployment authorization not found"})),
+        ));
+    };
+
+    // Emergency order is deliberately fail-closed: CAP deny + durable outbox,
+    // then stop/isolate the workload, then attempt the remote KBS tombstone.
+    let idempotency_key =
+        crate::kbs_publisher::enqueue_terminal_revoke_descriptor(&state.db, &hash, &body.reason)
+            .await
+            .map_err(|error| match error {
+                crate::kbs_publisher::KbsPublisherError::Db(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ),
+                _ => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": "revocation state conflict"})),
+                ),
+            })?;
+
+    delete_tenant_namespace(&namespace).await.map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": format!("authorization revoked locally but workload stop failed: {error}")
+            })),
+        )
+    })?;
+
+    let publisher = crate::kbs_publisher::config_from_env().map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })?;
+    match crate::kbs_publisher::publish_terminal_revoke_descriptor(
+        &state.db,
+        &state.trustee_http_client,
+        publisher.as_ref(),
+        &idempotency_key,
+    )
+    .await
+    {
+        Ok(()) => Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "revoked"})),
+        )),
+        Err(crate::kbs_publisher::KbsPublisherError::Db(error)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )),
+        Err(crate::kbs_publisher::KbsPublisherError::StateConflict) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "revocation state conflict"})),
+        )),
+        Err(error) => Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "revoked_locally_kbs_tombstone_pending",
+                "detail": error.to_string()
+            })),
+        )),
+    }
+}
+
 /// Helper function for consistent internal server error responses
 fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
     (
@@ -100,7 +219,7 @@ fn workload_teardown_instance_id(app: &App) -> String {
 }
 
 fn requires_workload_teardown(status: AppStatus) -> bool {
-    matches!(status, AppStatus::Running)
+    matches!(status, AppStatus::Running | AppStatus::Deleting)
 }
 
 async fn request_workload_teardown(
@@ -805,9 +924,9 @@ pub async fn delete_app(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    request_workload_teardown(&state, &auth, &app).await?;
-
-    // Mark as deleting after workload-owned KBS material has been removed.
+    // Draining starts before in-TEE teardown: the artifact endpoint rejects
+    // deleting apps, while the already-running measured workload retains KBS
+    // access long enough to remove its owner resources.
     sqlx::query("UPDATE apps SET status = 'deleting', updated_at = now() WHERE id = $1")
         .bind(app.id)
         .execute(&state.db)
@@ -818,6 +937,8 @@ pub async fn delete_app(
                 Json(serde_json::json!({"error": "database error"})),
             )
         })?;
+
+    request_workload_teardown(&state, &auth, &app).await?;
 
     crate::dns::delete_all_dns_records_for_app(
         &state.db,
@@ -886,30 +1007,66 @@ pub async fn delete_app(
         )
     })?;
 
-    crate::kbs::soft_delete_owner_binding(&state.db, app.id)
+    let publisher = crate::kbs_publisher::config_from_env().map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })?;
+    crate::kbs_publisher::terminally_revoke_app(
+        &state.db,
+        &state.trustee_http_client,
+        publisher.as_ref(),
+        app.id,
+        "graceful_app_destroy",
+    )
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": format!("failed to tombstone KBS authorizations: {error}")
+            })),
+        )
+    })?;
+
+    if state.kbs_policy.is_some() {
+        crate::kbs::soft_delete_owner_binding(&state.db, app.id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("failed to remove KBS owner binding: {}", e)})),
+                )
+            })?;
+        crate::kbs::soft_delete_tls_binding(&state.db, state.kbs_policy.as_ref(), app.id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("failed to remove KBS TLS binding: {}", e)})),
+                )
+            })?;
+        crate::kbs::reconcile_policy(&state.db, state.kbs_policy.as_ref())
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(
+                        serde_json::json!({"error": format!("failed to reconcile KBS policy: {}", e)}),
+                    ),
+                )
+            })?;
+    }
+
+    crate::kbs_publisher::purge_deactivated_app_artifacts(&state.db, app.id)
         .await
-        .map_err(|e| {
+        .map_err(|error| {
             (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("failed to remove KBS owner binding: {}", e)})),
-            )
-        })?;
-    crate::kbs::soft_delete_tls_binding(&state.db, state.kbs_policy.as_ref(), app.id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("failed to remove KBS TLS binding: {}", e)})),
-            )
-        })?;
-    crate::kbs::reconcile_policy(&state.db, state.kbs_policy.as_ref())
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(
-                    serde_json::json!({"error": format!("failed to reconcile KBS policy: {}", e)}),
-                ),
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("KBS authorization cleanup incomplete: {error}")
+                })),
             )
         })?;
 

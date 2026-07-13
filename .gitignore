@@ -4,6 +4,7 @@
 /tools
 /runbooks/audits
 /runbooks/*
+!/runbooks/kbs-policy-storage.md
 /design-proposals/*
 # Agent scratch (never commit)
 .claude/

@@ -3,25 +3,22 @@
 //! Runs entirely inside the SEV-SNP TEE before any seed material is released.
 //! Six steps; failure on any one refuses the seed write.
 //!
-//! Network fetch of the policy envelope from `GET /resource-policy/<id>/body`
-//! and the workload-attested artifact bundle from `GET
-//! /api/v1/workload/artifacts` is gated behind `Config.trustee_policy_read_available`.
-//! The flag defaults FALSE; while it's false the verifier emits a loud
-//! `tracing::error!` saying the Phase 3 Trustee patch hasn't shipped yet,
-//! and `verify_chain_or_skip` returns Ok(false) so the caller knows the
-//! release happened without policy verification. We do NOT fall back to a
-//! local descriptor file the way the earlier prototype did — that would be
-//! pretending to verify something we didn't.
+//! Production uses receipt mode: fetch the signed deployment authorization
+//! through direct guest CDH, fetch the claim-selected bundle from CAP over
+//! pinned HTTPS, and verify both before any seed or LUKS operation. The old
+//! active-policy fetch/parser remains compiled only into archival tests.
 //!
 //! Descriptor hashing uses `enclava_common::descriptor`, the same module the
 //! CLI signer uses, so signer + verifier agree byte-for-byte across crates.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
 use enclava_common::descriptor::{
     DeploymentDescriptor, descriptor_canonical_bytes, descriptor_core_hash,
 };
+#[cfg(test)]
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,6 +48,7 @@ pub struct PolicyEnvelope {
 /// the workload artifact bundle and is verified against the signed
 /// `agent_policy_sha256`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg(test)]
 pub struct ActivePolicyEnvelope {
     pub metadata: PolicyMetadata,
     pub rego_text: String,
@@ -63,6 +61,7 @@ pub struct ActivePolicyEnvelope {
     pub signature: [u8; 64],
 }
 
+#[cfg(test)]
 impl From<&PolicyEnvelope> for ActivePolicyEnvelope {
     fn from(env: &PolicyEnvelope) -> Self {
         Self {
@@ -115,10 +114,10 @@ pub struct VerifyInputs<'a> {
     pub artifacts: &'a ArtifactsBundle,
     pub cc_init_data_claims: &'a CcInitDataClaims,
     pub local_cc_init_data_toml: &'a [u8],
-    /// Preferred policy producer keys. When a signing-service key is pinned in
-    /// signed cc_init_data it is authoritative; descriptor-key policy signing is
-    /// only a legacy fallback for older releases with no configured platform
-    /// policy key.
+    /// Preferred policy producer keys. In receipt mode this is the key selected
+    /// by issuer ID from the authoritative trust map in signed cc_init_data;
+    /// descriptor-key policy signing is only a legacy fallback for older
+    /// releases with no configured platform policy key.
     pub platform_trustee_policy_pubkey: Option<&'a VerifyingKey>,
     pub signing_service_pubkey: Option<&'a VerifyingKey>,
 }
@@ -236,6 +235,7 @@ pub fn verify_chain_or_skip(inputs: Option<&VerifyInputs<'_>>) -> Result<bool> {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub struct ArtifactFetcher {
     pub workload_artifacts_url: String,
     pub trustee_policy_url: String,
@@ -243,12 +243,332 @@ pub struct ArtifactFetcher {
     pub timeout: Duration,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReceiptClaims {
+    pub descriptor_core_hash: [u8; 32],
+    pub expected_init_data_hash: [u8; 32],
+    pub namespace: String,
+    pub service_account: String,
+    pub tenant_instance_identity_hash: [u8; 32],
+    pub image_digest: String,
+    pub signer_subject: String,
+    pub signer_issuer: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiptArtifactFetcher {
+    pub workload_artifacts_url: String,
+    pub workload_artifacts_ca_cert_pem: Option<String>,
+    pub kbs_attestation_token: String,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptBundleTransport {
+    schema_version: String,
+    artifact_bundle_digest: String,
+    authorization_digest: String,
+    receipt_resource_path: String,
+    descriptor_payload: serde_json::Value,
+    #[serde(with = "hex::serde")]
+    descriptor_signature: [u8; 64],
+    descriptor_signing_key_id: String,
+    org_keyring_envelope: serde_json::Value,
+    signed_policy_artifact: serde_json::Value,
+}
+
+impl ReceiptArtifactFetcher {
+    pub fn fetch_and_verify(
+        &self,
+        claims: &ReceiptClaims,
+        trusted_authorization_keys: &std::collections::BTreeMap<String, [u8; 32]>,
+    ) -> Result<(
+        ArtifactsBundle,
+        enclava_common::kbs_authorization::DeploymentAuthorizationV1,
+        [u8; 32],
+    )> {
+        let mut client_builder = reqwest::blocking::Client::builder().timeout(self.timeout);
+        if let Some(ca_pem) = self.workload_artifacts_ca_cert_pem.as_deref() {
+            let certificate = reqwest::Certificate::from_pem(ca_pem.as_bytes())
+                .map_err(|e| InitError::Kbs(format!("artifact CA certificate: {e}")))?;
+            client_builder = client_builder
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(certificate);
+        }
+        let client = client_builder
+            .build()
+            .map_err(|e| InitError::Kbs(format!("client build: {e}")))?;
+        let receipt_path =
+            enclava_common::kbs_authorization::receipt_resource_path(&claims.descriptor_core_hash);
+        let receipt_url = format!("http://127.0.0.1:8006/cdh/resource/{receipt_path}");
+        let receipt_bytes = fetch_bounded_bytes(
+            &client,
+            &receipt_url,
+            None,
+            enclava_common::kbs_authorization::MAX_AUTHORIZATION_BYTES,
+            "fetch deployment authorization",
+        )?;
+        let authorization =
+            enclava_common::kbs_authorization::DeploymentAuthorizationV1::parse_exact_json(
+                &receipt_bytes,
+            )
+            .map_err(|e| InitError::TrusteePolicy(format!("authorization schema: {e}")))?;
+        let authorization_key =
+            verify_authorization_signature(&authorization, trusted_authorization_keys)?;
+        authorization
+            .validate_time(Utc::now())
+            .map_err(|e| InitError::TrusteePolicy(format!("authorization time: {e}")))?;
+        verify_authorization_claims(&authorization, claims, &receipt_path)?;
+
+        validate_workload_artifacts_url(&self.workload_artifacts_url)?;
+        let bundle_bytes = fetch_bounded_bytes(
+            &client,
+            &self.workload_artifacts_url,
+            Some(&self.kbs_attestation_token),
+            2 * 1024 * 1024,
+            "fetch workload artifact bundle",
+        )?;
+        let transport: ReceiptBundleTransport = serde_json::from_slice(&bundle_bytes)
+            .map_err(|e| InitError::Kbs(format!("artifact bundle schema: {e}")))?;
+        if transport.schema_version != "enclava-workload-artifact-bundle-v1"
+            || transport.receipt_resource_path != receipt_path
+            || decode_hex32("artifact_bundle_digest", &transport.artifact_bundle_digest)?
+                != authorization.artifact_bundle_digest
+            || decode_hex32("authorization_digest", &transport.authorization_digest)?
+                != enclava_common::kbs_authorization::authorization_digest(&receipt_bytes)
+        {
+            return Err(InitError::TrusteePolicy(
+                "artifact bundle receipt binding mismatch".into(),
+            ));
+        }
+        let recomputed = recompute_receipt_bundle_digest(&transport, &authorization)?;
+        if recomputed != authorization.artifact_bundle_digest {
+            return Err(InitError::TrusteePolicy(
+                "artifact bundle semantic digest mismatch".into(),
+            ));
+        }
+        let bundle = receipt_transport_to_legacy(&transport)?;
+        Ok((bundle, authorization, authorization_key))
+    }
+}
+
+fn verify_authorization_signature(
+    authorization: &enclava_common::kbs_authorization::DeploymentAuthorizationV1,
+    trusted_authorization_keys: &std::collections::BTreeMap<String, [u8; 32]>,
+) -> Result<[u8; 32]> {
+    let authorization_key = enclava_common::kbs_authorization::trusted_authorization_key(
+        trusted_authorization_keys,
+        &authorization.issuer_key_id,
+    )
+    .map_err(|e| InitError::TrusteePolicy(format!("authorization issuer trust: {e}")))?;
+    authorization
+        .verify_signature(authorization_key)
+        .map_err(|e| InitError::TrusteePolicy(format!("authorization signature: {e}")))?;
+    Ok(*authorization_key)
+}
+
+fn verify_authorization_claims(
+    authorization: &enclava_common::kbs_authorization::DeploymentAuthorizationV1,
+    claims: &ReceiptClaims,
+    receipt_path: &str,
+) -> Result<()> {
+    if authorization.descriptor_core_hash != claims.descriptor_core_hash
+        || authorization.expected_init_data_hash != claims.expected_init_data_hash
+        || authorization.namespace != claims.namespace
+        || authorization.service_account != claims.service_account
+        || authorization.tenant_instance_identity_hash != claims.tenant_instance_identity_hash
+        || authorization.image_digest != claims.image_digest
+        || authorization.signer_identity.subject != claims.signer_subject
+        || authorization.signer_identity.issuer != claims.signer_issuer
+        || authorization.receipt_resource_path != receipt_path
+    {
+        return Err(InitError::TrusteePolicy(
+            "authorization measured identity mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn fetch_bounded_bytes(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    attestation_token: Option<&str>,
+    max_bytes: usize,
+    context: &str,
+) -> Result<Vec<u8>> {
+    let mut request = client.get(url);
+    if let Some(token) = attestation_token {
+        request = request.header("Authorization", format!("Attestation {token}"));
+    }
+    let response = request
+        .send()
+        .map_err(|e| request_error(&format!("{context} send"), url, e))?
+        .error_for_status()
+        .map_err(|e| request_error(&format!("{context} status"), url, e))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(InitError::Kbs(format!("{context}: response too large")));
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|e| request_error(&format!("{context} body"), url, e))?;
+    if bytes.len() > max_bytes {
+        return Err(InitError::Kbs(format!("{context}: response too large")));
+    }
+    Ok(bytes.to_vec())
+}
+
+fn validate_workload_artifacts_url(value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|e| InitError::Kbs(format!("invalid workload artifact URL: {e}")))?;
+    if url.scheme() == "https" {
+        return Ok(());
+    }
+    let loopback_http = url.scheme() == "http"
+        && url
+            .host_str()
+            .is_some_and(|host| host == "127.0.0.1" || host == "::1" || host == "localhost");
+    if loopback_http {
+        return Ok(());
+    }
+    Err(InitError::Kbs(
+        "workload artifact URL must use HTTPS outside loopback".into(),
+    ))
+}
+
+fn recompute_receipt_bundle_digest(
+    transport: &ReceiptBundleTransport,
+    authorization: &enclava_common::kbs_authorization::DeploymentAuthorizationV1,
+) -> Result<[u8; 32]> {
+    let descriptor = parse_descriptor(&transport.descriptor_payload)?;
+    let descriptor_bytes = descriptor_canonical_bytes(&descriptor);
+    let envelope = transport
+        .org_keyring_envelope
+        .as_object()
+        .ok_or_else(|| InitError::TrusteePolicy("org keyring envelope must be an object".into()))?;
+    let keyring_value = envelope
+        .get("keyring")
+        .ok_or_else(|| InitError::TrusteePolicy("org keyring envelope missing keyring".into()))?;
+    let keyring: InitOrgKeyring = serde_json::from_value(keyring_value.clone())
+        .map_err(|e| InitError::TrusteePolicy(format!("keyring schema: {e}")))?;
+    let keyring_bytes = canonical_keyring_bytes(&keyring)?;
+    let keyring_signature = decode_hex64_value(envelope.get("signature"), "keyring signature")?;
+    let keyring_pubkey = decode_hex32_value(envelope.get("signing_pubkey"), "keyring pubkey")?;
+    if keyring.org_id != authorization.org_id
+        || keyring.version != authorization.org_owner_version
+        || sha256_bytes(&keyring_pubkey) != authorization.org_owner_pubkey_sha256
+    {
+        return Err(InitError::TrusteePolicy(
+            "org keyring authorization binding mismatch".into(),
+        ));
+    }
+    VerifyingKey::from_bytes(&keyring_pubkey)
+        .map_err(|e| InitError::TrusteePolicy(format!("owner pubkey: {e}")))?
+        .verify(&keyring_bytes, &Signature::from_bytes(&keyring_signature))
+        .map_err(|_| InitError::TrusteePolicy("org keyring owner signature invalid".into()))?;
+
+    let artifact: PolicyEnvelope = serde_json::from_value(transport.signed_policy_artifact.clone())
+        .map_err(|e| InitError::TrusteePolicy(format!("signed policy artifact schema: {e}")))?;
+    if transport.signed_policy_artifact.get("org_keyring") != Some(&transport.org_keyring_envelope)
+    {
+        return Err(InitError::TrusteePolicy(
+            "signed policy artifact keyring envelope mismatch".into(),
+        ));
+    }
+    let declared_rego = decode_hex32_value(
+        transport.signed_policy_artifact.get("rego_sha256"),
+        "rego_sha256",
+    )?;
+    let actual_rego: [u8; 32] = Sha256::digest(artifact.rego_text.as_bytes()).into();
+    let declared_agent = decode_hex32("agent_policy_sha256", &artifact.agent_policy_sha256)?;
+    let actual_agent: [u8; 32] = Sha256::digest(artifact.agent_policy_text.as_bytes()).into();
+    if declared_rego != actual_rego || declared_agent != actual_agent {
+        return Err(InitError::TrusteePolicy(
+            "signed policy artifact body hash mismatch".into(),
+        ));
+    }
+    let policy_pubkey: [u8; 32] = B64
+        .decode(
+            transport
+                .signed_policy_artifact
+                .get("verify_pubkey_b64")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    InitError::TrusteePolicy("artifact missing verify_pubkey_b64".into())
+                })?,
+        )
+        .map_err(|e| InitError::TrusteePolicy(format!("artifact verify pubkey: {e}")))?
+        .try_into()
+        .map_err(|bytes: Vec<u8>| {
+            InitError::TrusteePolicy(format!("artifact verify pubkey is {} bytes", bytes.len()))
+        })?;
+    let metadata_hash = canonical_policy_metadata_hash(&artifact.metadata)?;
+    Ok(enclava_common::kbs_authorization::artifact_bundle_digest(
+        &enclava_common::kbs_authorization::ArtifactBundleDigestInput {
+            descriptor_canonical_bytes: &descriptor_bytes,
+            descriptor_signature: &transport.descriptor_signature,
+            descriptor_signing_key_id: &transport.descriptor_signing_key_id,
+            org_keyring_canonical_bytes: &keyring_bytes,
+            org_keyring_signature: &keyring_signature,
+            org_keyring_signing_pubkey: &keyring_pubkey,
+            policy_metadata_hash: &metadata_hash,
+            rego_text: &artifact.rego_text,
+            agent_policy_text: &artifact.agent_policy_text,
+            policy_signature: &artifact.signature,
+            policy_verify_pubkey: &policy_pubkey,
+        },
+    ))
+}
+
+fn receipt_transport_to_legacy(transport: &ReceiptBundleTransport) -> Result<ArtifactsBundle> {
+    let envelope = transport
+        .org_keyring_envelope
+        .as_object()
+        .ok_or_else(|| InitError::TrusteePolicy("org keyring envelope must be an object".into()))?;
+    Ok(ArtifactsBundle {
+        descriptor_payload: transport.descriptor_payload.clone(),
+        descriptor_signature: transport.descriptor_signature,
+        descriptor_signing_key_id: transport.descriptor_signing_key_id.clone(),
+        org_keyring_payload: envelope
+            .get("keyring")
+            .cloned()
+            .ok_or_else(|| InitError::TrusteePolicy("keyring missing".into()))?,
+        org_keyring_signature: decode_hex64_value(envelope.get("signature"), "keyring signature")?,
+        signed_policy_artifact: serde_json::from_value(transport.signed_policy_artifact.clone())
+            .map_err(|e| InitError::TrusteePolicy(format!("policy artifact schema: {e}")))?,
+    })
+}
+
+fn decode_hex32_value(value: Option<&serde_json::Value>, name: &str) -> Result<[u8; 32]> {
+    let value = value
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| InitError::TrusteePolicy(format!("{name} missing")))?;
+    decode_hex32(name, value)
+}
+
+fn decode_hex64_value(value: Option<&serde_json::Value>, name: &str) -> Result<[u8; 64]> {
+    let value = value
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| InitError::TrusteePolicy(format!("{name} missing")))?;
+    hex::decode(value)
+        .map_err(|e| InitError::TrusteePolicy(format!("{name}: {e}")))?
+        .try_into()
+        .map_err(|bytes: Vec<u8>| {
+            InitError::TrusteePolicy(format!("{name} is {} bytes", bytes.len()))
+        })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(test)]
 struct SignedPolicyArtifactSet {
     schema_version: String,
     artifacts: Vec<ActivePolicyEnvelope>,
 }
 
+#[cfg(test)]
 impl ArtifactFetcher {
     pub fn fetch(&self) -> Result<(ArtifactsBundle, PolicyEnvelope)> {
         let client = reqwest::blocking::Client::builder()
@@ -274,6 +594,7 @@ impl ArtifactFetcher {
     }
 }
 
+#[cfg(test)]
 fn parse_trustee_policy_body(
     policy_body: serde_json::Value,
     bundle: &ArtifactsBundle,
@@ -307,6 +628,7 @@ fn parse_trustee_policy_body(
         })
 }
 
+#[cfg(test)]
 fn fetch_json<T: DeserializeOwned>(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -403,6 +725,7 @@ fn verify_policy_envelope_signature(
     ))
 }
 
+#[cfg(test)]
 fn verify_active_policy_matches_artifact(
     active: &ActivePolicyEnvelope,
     artifact: &PolicyEnvelope,

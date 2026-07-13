@@ -317,6 +317,184 @@ async fn reject_replayed_transition_receipt(
     Ok(())
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct PendingUnlockTransition {
+    deployment_id: Uuid,
+    log_encryption: Option<serde_json::Value>,
+}
+
+async fn pending_unlock_transition(
+    pool: &PgPool,
+    app_id: Uuid,
+    requested: RequestedUnlockMode,
+) -> Result<Option<(Uuid, Option<LogEncryptionConfig>)>, (StatusCode, Json<serde_json::Value>)> {
+    let pending = sqlx::query_as::<_, PendingUnlockTransition>(
+        "SELECT id AS deployment_id, spec_snapshot->'log_encryption' AS log_encryption
+         FROM deployments
+         WHERE app_id = $1 AND status = 'pending'
+           AND spec_snapshot->'transition'->>'to' = $2
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(app_id)
+    .bind(requested.db_value())
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+    let Some(pending) = pending else {
+        return Ok(None);
+    };
+    let log_encryption = pending
+        .log_encryption
+        .filter(|value| !value.is_null())
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "stored log encryption metadata is invalid"
+                })),
+            )
+        })?;
+    Ok(Some((pending.deployment_id, log_encryption)))
+}
+
+fn spawn_unlock_manifest_apply(
+    state: &AppState,
+    app: App,
+    deployment_id: Uuid,
+    workload_artifact_binding: Option<enclava_engine::types::WorkloadArtifactBinding>,
+    signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
+    log_encryption: Option<LogEncryptionConfig>,
+) {
+    let db = state.db.clone();
+    let attestation = state.attestation.clone();
+    let kbs_policy = state.kbs_policy.clone();
+    let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
+    let api_url = state.api_url.clone();
+    let apply_permits = state.deployment_apply_permits.clone();
+    tokio::spawn(async move {
+        let _apply_permit = match apply_permits.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(e) => {
+                let error_message = format!("deployment apply limiter closed: {e}");
+                let _ = crate::deploy::set_deployment_status(
+                    &db,
+                    deployment_id,
+                    "failed",
+                    None,
+                    Some(&error_message),
+                    true,
+                )
+                .await;
+                let _ = crate::deploy::set_app_status(&db, app.id, "failed").await;
+                tracing::error!(
+                    app_id = %app.id,
+                    deployment_id = %deployment_id,
+                    error = %error_message,
+                    "failed to acquire unlock-mode apply permit"
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = crate::deploy::apply_deployment_manifests(
+            crate::deploy::ApplyDeploymentManifestsRequest {
+                pool: db.clone(),
+                app: app.clone(),
+                deployment_id,
+                attestation_config: attestation,
+                kbs_policy_config: kbs_policy,
+                api_signing_pubkey,
+                api_url,
+                workload_artifact_binding,
+                signed_policy_artifact,
+                local_workload_artifacts_json: None,
+                local_trustee_policy_json: None,
+                log_encryption,
+            },
+        )
+        .await
+        {
+            let error_message = e.to_string();
+            let _ = crate::deploy::set_deployment_status(
+                &db,
+                deployment_id,
+                "failed",
+                None,
+                Some(&error_message),
+                true,
+            )
+            .await;
+            let _ = crate::deploy::set_app_status(&db, app.id, "failed").await;
+            tracing::error!(
+                app_id = %app.id,
+                deployment_id = %deployment_id,
+                error = %error_message,
+                "failed to apply unlock-mode manifests"
+            );
+        }
+    });
+}
+
+async fn resume_pending_unlock_transition(
+    state: &AppState,
+    app: &App,
+    requested: RequestedUnlockMode,
+) -> Result<Option<UpdateUnlockModeResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let Some((deployment_id, log_encryption)) =
+        pending_unlock_transition(&state.db, app.id, requested).await?
+    else {
+        return Ok(None);
+    };
+    let stored_artifact =
+        crate::signing_service::load_workload_artifact_binding(&state.db, app.id, deployment_id)
+            .await
+            .map_err(crate::routes::deployments::signing_error_response)?;
+    if let Some((binding, _)) = stored_artifact.as_ref() {
+        let publisher = crate::kbs_publisher::config_from_env().map_err(|error| {
+            crate::routes::deployments::kbs_publication_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &error,
+            )
+        })?;
+        crate::kbs_publisher::publish_descriptor(
+            &state.db,
+            &state.trustee_http_client,
+            publisher.as_ref(),
+            &binding.descriptor_core_hash,
+        )
+        .await
+        .map_err(|error| {
+            crate::routes::deployments::kbs_publication_error_response(
+                StatusCode::BAD_GATEWAY,
+                &error,
+            )
+        })?;
+    }
+    let (workload_artifact_binding, signed_policy_artifact) = stored_artifact.unzip();
+    spawn_unlock_manifest_apply(
+        state,
+        app.clone(),
+        deployment_id,
+        workload_artifact_binding,
+        signed_policy_artifact,
+        log_encryption,
+    );
+    Ok(Some(UpdateUnlockModeResponse {
+        app_name: app.name.clone(),
+        unlock_mode: requested.api_value().to_string(),
+        deployment_id: Some(deployment_id),
+        status: "deploying".to_string(),
+    }))
+}
+
 /// GET /apps/{name}/unlock/status -- ownership state (queried from TEE).
 pub async fn unlock_status(
     auth: AuthContext,
@@ -452,6 +630,9 @@ pub async fn update_unlock_mode(
     }
 
     if current == requested {
+        if let Some(response) = resume_pending_unlock_transition(&state, &app, requested).await? {
+            return Ok(Json(response));
+        }
         return Ok(Json(UpdateUnlockModeResponse {
             app_name: app.name,
             unlock_mode: requested.api_value().to_string(),
@@ -567,6 +748,7 @@ pub async fn update_unlock_mode(
         .unwrap_or_else(Uuid::new_v4);
     let mut workload_artifact_binding = None;
     let mut signed_policy_artifact = None;
+    let mut deployment_authorization_bytes = None;
     let mut signed_workload_command = None;
     let mut signed_container_port = None;
     let mut signed_storage_paths = None;
@@ -620,7 +802,7 @@ pub async fn update_unlock_mode(
         app_spec.workload_artifact_binding = Some(binding.clone());
         app_spec.log_encryption = log_encryption.clone();
 
-        let signed = crate::routes::deployments::resolve_signed_policy_artifact(
+        let signed_response = crate::routes::deployments::resolve_signed_policy_artifact(
             &state,
             artifacts,
             body.signed_policy_artifact.clone(),
@@ -628,13 +810,20 @@ pub async fn update_unlock_mode(
             log_encryption.clone(),
         )
         .await?;
+        let signed = signed_response.artifact;
+        deployment_authorization_bytes = signed_response.authorization_bytes;
+        if deployment_authorization_bytes.is_none() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "kbs_authorization_missing_from_signing_service"
+                })),
+            ));
+        }
         app_spec.generated_agent_policy = Some(
             artifacts
                 .generated_agent_policy(&signed)
                 .map_err(crate::routes::deployments::signing_error_response)?,
-        );
-        crate::routes::deployments::select_local_signed_artifact_delivery(
-            &mut app_spec.attestation,
         );
         let (_encoded, cc_init_data_hash) =
             enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
@@ -716,16 +905,9 @@ pub async fn update_unlock_mode(
         )
     })?;
 
-    tx.commit().await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?;
-
     let updated_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(app.id)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|_| {
             (
@@ -758,7 +940,7 @@ pub async fn update_unlock_mode(
     .bind(app.id)
     .bind(&spec_snapshot)
     .bind(&image_digest)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|_| {
         (
@@ -771,10 +953,49 @@ pub async fn update_unlock_mode(
         (signing_artifacts.as_ref(), signed_policy_artifact.as_ref())
     {
         crate::signing_service::persist_workload_artifacts(
-            &state.db, app.id, deploy_id, artifacts, signed,
+            &mut tx,
+            app.id,
+            deploy_id,
+            artifacts,
+            signed,
+            deployment_authorization_bytes.as_deref(),
+            state
+                .attestation
+                .as_ref()
+                .and_then(|config| config.signing_service_pubkey_hex.as_deref()),
         )
         .await
         .map_err(crate::routes::deployments::signing_error_response)?;
+    }
+    tx.commit().await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
+    if let Some(artifacts) = signing_artifacts.as_ref()
+        && deployment_authorization_bytes.is_some()
+    {
+        let publisher = crate::kbs_publisher::config_from_env().map_err(|error| {
+            crate::routes::deployments::kbs_publication_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &error,
+            )
+        })?;
+        crate::kbs_publisher::publish_descriptor(
+            &state.db,
+            &state.trustee_http_client,
+            publisher.as_ref(),
+            &artifacts.descriptor_core_hash,
+        )
+        .await
+        .map_err(|error| {
+            crate::routes::deployments::kbs_publication_error_response(
+                StatusCode::BAD_GATEWAY,
+                &error,
+            )
+        })?;
     }
 
     let _ = sqlx::query(
@@ -792,87 +1013,14 @@ pub async fn update_unlock_mode(
     .execute(&state.db)
     .await;
 
-    let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
-    let local_verification_artifacts =
-        match (signing_artifacts.as_ref(), signed_policy_artifact.as_ref()) {
-            (Some(artifacts), Some(signed)) => Some((
-                crate::signing_service::workload_artifacts_json(artifacts, signed)
-                    .map_err(crate::routes::deployments::signing_error_response)?,
-                crate::signing_service::trustee_policy_json(signed)
-                    .map_err(crate::routes::deployments::signing_error_response)?,
-            )),
-            _ => None,
-        };
-    let db = state.db.clone();
-    let attestation = state.attestation.clone();
-    let kbs_policy = state.kbs_policy.clone();
-    let api_url = state.api_url.clone();
-    let apply_app = updated_app.clone();
-    let apply_permits = state.deployment_apply_permits.clone();
-    let (local_workload_artifacts_json, local_trustee_policy_json) =
-        local_verification_artifacts.unzip();
-    tokio::spawn(async move {
-        let _apply_permit = match apply_permits.acquire_owned().await {
-            Ok(permit) => permit,
-            Err(e) => {
-                let error_message = format!("deployment apply limiter closed: {e}");
-                let _ = crate::deploy::set_deployment_status(
-                    &db,
-                    deploy_id,
-                    "failed",
-                    None,
-                    Some(&error_message),
-                    true,
-                )
-                .await;
-                let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
-                tracing::error!(
-                    app_id = %apply_app.id,
-                    deployment_id = %deploy_id,
-                    error = %error_message,
-                    "failed to acquire unlock-mode apply permit"
-                );
-                return;
-            }
-        };
-
-        if let Err(e) = crate::deploy::apply_deployment_manifests(
-            crate::deploy::ApplyDeploymentManifestsRequest {
-                pool: db.clone(),
-                app: apply_app.clone(),
-                deployment_id: deploy_id,
-                attestation_config: attestation,
-                kbs_policy_config: kbs_policy,
-                api_signing_pubkey,
-                api_url,
-                workload_artifact_binding,
-                signed_policy_artifact,
-                local_workload_artifacts_json,
-                local_trustee_policy_json,
-                log_encryption,
-            },
-        )
-        .await
-        {
-            let error_message = e.to_string();
-            let _ = crate::deploy::set_deployment_status(
-                &db,
-                deploy_id,
-                "failed",
-                None,
-                Some(&error_message),
-                true,
-            )
-            .await;
-            let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
-            tracing::error!(
-                app_id = %apply_app.id,
-                deployment_id = %deploy_id,
-                error = %error_message,
-                "failed to apply unlock-mode manifests"
-            );
-        }
-    });
+    spawn_unlock_manifest_apply(
+        &state,
+        updated_app.clone(),
+        deploy_id,
+        workload_artifact_binding,
+        signed_policy_artifact,
+        log_encryption,
+    );
 
     Ok(Json(UpdateUnlockModeResponse {
         app_name: updated_app.name,
@@ -1021,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn unlock_mode_hash_validation_uses_local_artifact_delivery_mode() {
+    fn unlock_mode_hash_validation_requires_receipt_before_measurement() {
         let source = include_str!("unlock.rs");
         let fn_start = source
             .find("pub async fn update_unlock_mode")
@@ -1032,15 +1180,15 @@ mod tests {
             + fn_start;
         let body = &source[fn_start..fn_end];
 
-        let select = body
-            .find("select_local_signed_artifact_delivery")
-            .expect("unlock-mode signing validation must use local artifact delivery mode");
+        let require_receipt = body
+            .find("kbs_authorization_missing_from_signing_service")
+            .expect("unlock-mode signing validation must require a KBS authorization");
         let compute = body
             .find("compute_cc_init_data")
             .expect("unlock-mode signing validation computes cc_init_data hash");
         assert!(
-            select < compute,
-            "unlock-mode redeploy hash validation must match normal deploy's signed-artifact delivery mode"
+            require_receipt < compute,
+            "unlock-mode redeploy must reject a missing receipt before measuring cc_init_data"
         );
     }
 

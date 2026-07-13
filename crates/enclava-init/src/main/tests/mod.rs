@@ -322,6 +322,7 @@ fn config_with_signed_cc(dir: &Path, cc_body: &str) -> Config {
         argon2_salt_hex: Some("aa".repeat(32)),
         trustee_policy_read_available: true,
         workload_artifacts_url: Some("file:///artifacts.json".to_string()),
+        workload_artifacts_ca_cert_pem: Some("test-ca".to_string()),
         tls_certificate_broker_url: None,
         tls_certificate_hostnames: Vec::new(),
         trustee_policy_url: Some("file:///policy.json".to_string()),
@@ -329,6 +330,7 @@ fn config_with_signed_cc(dir: &Path, cc_body: &str) -> Config {
         cc_init_data_path: Some(cc_path.display().to_string()),
         platform_trustee_policy_pubkey_hex: None,
         signing_service_pubkey_hex: None,
+        signing_service_trusted_pubkeys_json: None,
     }
 }
 
@@ -346,6 +348,7 @@ kbs_url = "http://127.0.0.1:8006/cdh/resource"
 kbs_resource_path = "default/app-owner/seed-encrypted"
 kbs_attestation_token_url = "http://127.0.0.1:8006/aa/token?token_type=kbs"
 workload_artifacts_url = "file:///artifacts.json"
+workload_artifacts_ca_cert_pem = "test-ca"
 trustee_policy_url = "file:///policy.json"
 "#,
         "aa".repeat(32)
@@ -369,6 +372,7 @@ kbs_url = "http://127.0.0.1:8006/cdh/resource"
 kbs_resource_path = "default/other-owner/seed-encrypted"
 kbs_attestation_token_url = "http://127.0.0.1:8006/aa/token?token_type=kbs"
 workload_artifacts_url = "file:///artifacts.json"
+workload_artifacts_ca_cert_pem = "test-ca"
 trustee_policy_url = "file:///policy.json"
 "#,
         "aa".repeat(32)
@@ -393,6 +397,24 @@ fn password_unlock_socket_is_reached_before_waiting_on_workload_namespaces() {
         owner_seed_stage < workload_wait_stage,
         "enclava-init must accept claim/unlock before waiting on workload sentinels"
     );
+}
+
+#[test]
+fn deployment_authorization_verification_precedes_seed_and_luks_use() {
+    let source = include_str!("../../main.rs");
+    let verify = source
+        .find("record_stage(\"verifying deployment authorization\")")
+        .unwrap();
+    let seed = source
+        .find("record_stage(\"waiting for owner seed\")")
+        .unwrap();
+    let luks = source
+        .find("record_stage(\"opening luks volumes\")")
+        .unwrap();
+    let components = source
+        .find("record_stage(\"writing component seeds\")")
+        .unwrap();
+    assert!(verify < seed && seed < luks && luks < components);
 }
 
 #[test]

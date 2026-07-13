@@ -12,6 +12,7 @@ use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
     kbs_fetch, log_relay, luks, seeds, socket, tls_certificate, trustee_verify, unlock, writes,
 };
+use sha2::{Digest as _, Sha256};
 
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
 const DEFAULT_ERROR_FILE: &str = "/run/enclava/init-error";
@@ -91,6 +92,13 @@ fn run() -> Result<()> {
             .with_context(|| format!("clearing stale ready file {}", ready_file.display()))?;
     }
 
+    record_stage("verifying deployment authorization").ok();
+    if !run_in_tee_verification(&cfg)? {
+        return Err(anyhow!(
+            "deployment authorization verification did not complete"
+        ));
+    }
+
     record_stage("waiting for owner seed").ok();
     let owner = match cfg.mode {
         Mode::Password => acquire_owner_seed_password(&cfg)?,
@@ -102,16 +110,6 @@ fn run() -> Result<()> {
     open_luks_volumes(&cfg, &owner)?;
     record_stage("preparing mount ownership").ok();
     prepare_mount_ownership(&cfg)?;
-
-    record_stage("verifying trustee policy").ok();
-    if !run_in_tee_verification(&cfg)? {
-        // Skipped because Phase 3 Trustee patch isn't deployed yet. The
-        // tracing::error above made this loud; we let the binary continue so
-        // staged rollout can proceed, but we log a final warning.
-        tracing::warn!(
-            "seeds released without in-TEE Trustee policy verification (TRUSTEE_POLICY_READ_AVAILABLE=false)"
-        );
-    }
 
     record_stage("provisioning static tls certificate").ok();
     provision_static_tls_certificate(&cfg).context("provisioning static TLS certificate")?;
@@ -369,6 +367,12 @@ fn validate_configmap_transport_against_signed_cc_init_data(cfg: &Config) -> Res
     )?;
     require_signed_config_match(
         data,
+        "workload_artifacts_ca_cert_pem",
+        cfg.workload_artifacts_ca_cert_pem.as_deref(),
+        "workload-artifacts-ca-cert-pem",
+    )?;
+    require_signed_config_match(
+        data,
         "kbs_attestation_token_url",
         Some(&cfg.kbs_attestation_token_url),
         "kbs-attestation-token-url",
@@ -399,12 +403,6 @@ fn validate_configmap_transport_against_signed_cc_init_data(cfg: &Config) -> Res
         "tls_certificate_hostnames",
         &cfg.tls_certificate_hostnames,
         "tls-certificate-hostnames",
-    )?;
-    require_signed_config_match(
-        data,
-        "trustee_policy_url",
-        cfg.trustee_policy_url.as_deref(),
-        "trustee-policy-url",
     )?;
     require_optional_signed_config_match(
         data,
@@ -943,10 +941,6 @@ fn run_in_tee_verification(cfg: &Config) -> Result<bool> {
     let workload_url = cfg.workload_artifacts_url.as_deref().ok_or_else(|| {
         anyhow!("trustee_policy_read_available=true requires workload_artifacts_url")
     })?;
-    let policy_url = cfg
-        .trustee_policy_url
-        .as_deref()
-        .ok_or_else(|| anyhow!("trustee_policy_read_available=true requires trustee_policy_url"))?;
     let cc_path = cfg
         .cc_init_data_path
         .as_deref()
@@ -954,16 +948,16 @@ fn run_in_tee_verification(cfg: &Config) -> Result<bool> {
     let cc_bytes =
         std::fs::read(cc_path).with_context(|| format!("reading cc_init_data from {cc_path}"))?;
     let cc_claims = parse_cc_init_data_claims(&cc_bytes)?;
-    let signer_pk = cfg
-        .platform_trustee_policy_pubkey_hex
+    let trusted_signing_keys = cfg
+        .signing_service_trusted_pubkeys_json
         .as_deref()
-        .map(parse_pubkey)
-        .transpose()?;
-    let signing_pk = cfg
-        .signing_service_pubkey_hex
-        .as_deref()
-        .map(parse_pubkey)
-        .transpose()?;
+        .ok_or_else(|| {
+            anyhow!("receipt verification requires signing_service_trusted_pubkeys_json")
+        })
+        .and_then(|raw| {
+            enclava_common::kbs_authorization::parse_authorization_trust_map(raw)
+                .context("parsing signing_service_trusted_pubkeys_json")
+        })?;
 
     let token = trustee_verify::resolve_kbs_attestation_token(
         std::env::var("KBS_ATTESTATION_TOKEN").ok().as_deref(),
@@ -971,30 +965,56 @@ fn run_in_tee_verification(cfg: &Config) -> Result<bool> {
         std::time::Duration::from_secs(15),
     )
     .context("resolving KBS attestation token")?;
-    let fetcher = trustee_verify::ArtifactFetcher {
+    let receipt_claims = parse_receipt_claims(&cc_bytes)?;
+    let fetcher = trustee_verify::ReceiptArtifactFetcher {
         workload_artifacts_url: workload_url.into(),
-        trustee_policy_url: policy_url.into(),
+        workload_artifacts_ca_cert_pem: cfg.workload_artifacts_ca_cert_pem.clone(),
         kbs_attestation_token: token,
         timeout: std::time::Duration::from_secs(15),
     };
-    let (bundle, envelope) = fetcher.fetch().context("fetching trustee artifacts")?;
+    let (bundle, _authorization, authorization_key) = fetcher
+        .fetch_and_verify(&receipt_claims, &trusted_signing_keys)
+        .context("fetching and verifying deployment authorization")?;
+    let signing_pk = ed25519_dalek::VerifyingKey::from_bytes(&authorization_key)
+        .context("parsing trusted authorization key")?;
+    let envelope = bundle.signed_policy_artifact.clone();
     let inputs = trustee_verify::VerifyInputs {
         policy_envelope: &envelope,
         artifacts: &bundle,
         cc_init_data_claims: &cc_claims,
         local_cc_init_data_toml: &cc_bytes,
-        platform_trustee_policy_pubkey: signer_pk.as_ref(),
-        signing_service_pubkey: signing_pk.as_ref(),
+        platform_trustee_policy_pubkey: None,
+        signing_service_pubkey: Some(&signing_pk),
     };
     trustee_verify::verify_chain_or_skip(Some(&inputs)).map_err(Into::into)
 }
 
-fn parse_pubkey(hex_str: &str) -> Result<ed25519_dalek::VerifyingKey> {
-    let raw = hex::decode(hex_str).context("decoding pubkey hex")?;
-    let arr: [u8; 32] = raw
-        .try_into()
-        .map_err(|_| anyhow!("pubkey must be 32 bytes"))?;
-    Ok(ed25519_dalek::VerifyingKey::from_bytes(&arr)?)
+fn parse_receipt_claims(toml_bytes: &[u8]) -> Result<trustee_verify::ReceiptClaims> {
+    let value: toml::Value =
+        toml::from_str(std::str::from_utf8(toml_bytes).context("cc_init_data not utf-8")?)
+            .context("cc_init_data parse")?;
+    let data = value
+        .get("data")
+        .ok_or_else(|| anyhow!("cc_init_data missing [data] section"))?;
+    Ok(trustee_verify::ReceiptClaims {
+        descriptor_core_hash: read_hex32(data, "descriptor_core_hash")?,
+        expected_init_data_hash: Sha256::digest(toml_bytes).into(),
+        namespace: read_string(data, "namespace")?,
+        service_account: read_string(data, "service_account")?,
+        tenant_instance_identity_hash: read_hex32(data, "identity_hash")?,
+        image_digest: read_string(data, "image_digest")?,
+        signer_subject: read_string(data, "signer_identity_subject")?,
+        signer_issuer: read_string(data, "signer_identity_issuer")?,
+    })
+}
+
+fn read_string(value: &toml::Value, key: &str) -> Result<String> {
+    value
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("cc_init_data.data.{key} missing or empty"))
 }
 
 fn parse_cc_init_data_claims(toml_bytes: &[u8]) -> Result<trustee_verify::CcInitDataClaims> {

@@ -135,6 +135,9 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         {
             push_toml_string(&mut toml, "workload_artifacts_url", url);
         }
+        if let Some(ca) = app.attestation.workload_artifacts_ca_cert_pem.as_deref() {
+            push_toml_string(&mut toml, "workload_artifacts_ca_cert_pem", ca);
+        }
         if let Some(url) = app.attestation.tls_certificate_broker_url.as_deref() {
             push_toml_string(&mut toml, "tls_certificate_broker_url", url);
             push_toml_string(
@@ -149,7 +152,6 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
             .local_trustee_policy_json
             .as_ref()
             .map(|_| "file:///etc/enclava-init/trustee-policy.json")
-            .or(app.attestation.trustee_policy_url.as_deref())
         {
             push_toml_string(&mut toml, "trustee_policy_url", url);
         }
@@ -158,6 +160,9 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         }
         if let Some(pubkey) = &app.attestation.signing_service_pubkey_hex {
             push_toml_string(&mut toml, "signing_service_pubkey_hex", pubkey);
+        }
+        if let Some(keys) = &app.attestation.signing_service_trusted_pubkeys_json {
+            push_toml_string(&mut toml, "signing_service_trusted_pubkeys_json", keys);
         }
     }
     push_toml_string(

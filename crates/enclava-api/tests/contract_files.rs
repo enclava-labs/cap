@@ -44,3 +44,51 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root")
         .to_path_buf()
 }
+
+#[test]
+fn kbs_policy_storage_observability_contract() {
+    let root = workspace_root();
+    let alerts = fs::read_to_string(root.join("deploy/kbs-policy-storage-alerts.prometheus.yml"))
+        .expect("read KBS policy storage alerts");
+    let dashboard = fs::read_to_string(root.join("deploy/kbs-policy-storage-dashboard.json"))
+        .expect("read KBS policy storage dashboard");
+    let runbook = fs::read_to_string(root.join("runbooks/kbs-policy-storage.md"))
+        .expect("read KBS policy storage runbook");
+
+    for required in [
+        "EnclavaLegacyKBSPolicyObserved",
+        "EnclavaKBSStaticPolicyCardinalityDrift",
+        "EnclavaKBSAuthorizationPublicationSLOBreach",
+        "EnclavaKBSAuthorizationReadbackMismatch",
+        "EnclavaKBSAuthorizationReconciliationDrift",
+        "EnclavaKBSAuthorizationReconciliationInconclusive",
+        "EnclavaKBSPublisherUnauthorized",
+        "EnclavaKBSAttestationClaimConflict",
+        "EnclavaArtifactBundleDigestMismatch",
+        "kbs_authorization_outbox_pending",
+        "kbs_authorization_reconciliation_total",
+        "kbs_deployment_authorization_publisher_request_total",
+    ] {
+        assert!(alerts.contains(required), "alerts missing `{required}`");
+    }
+
+    let dashboard: serde_json::Value =
+        serde_json::from_str(&dashboard).expect("dashboard is valid JSON");
+    assert_eq!(dashboard["uid"], "enclava-kbs-policy-storage");
+    assert!(
+        dashboard["panels"]
+            .as_array()
+            .is_some_and(|panels| panels.len() >= 9)
+    );
+
+    for required in [
+        "Never recover availability by enabling the legacy",
+        "publisher_readback_mismatch",
+        "an outage is not evidence of drift",
+        "Receipt verification never falls back",
+        "permanent CAP tombstone ledger",
+        "remote monitoring backend",
+    ] {
+        assert!(runbook.contains(required), "runbook missing `{required}`");
+    }
+}

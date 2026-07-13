@@ -309,6 +309,25 @@ fn load_pubkey_hex_value(
     Ok(Some(value.to_ascii_lowercase()))
 }
 
+fn validate_authorization_trust_map_config(
+    raw: Option<&str>,
+    required: bool,
+) -> anyhow::Result<()> {
+    let Some(raw) = raw else {
+        if required {
+            anyhow::bail!(
+                "SIGNING_SERVICE_TRUSTED_PUBKEYS_JSON is required when TRUSTEE_POLICY_READ_AVAILABLE=true"
+            );
+        }
+        return Ok(());
+    };
+    enclava_common::kbs_authorization::parse_authorization_trust_map(raw)
+        .map(|_| ())
+        .map_err(|error| {
+            anyhow::anyhow!("SIGNING_SERVICE_TRUSTED_PUBKEYS_JSON is invalid: {error}")
+        })
+}
+
 fn platform_release_enabled(trustee_policy_read_available: bool) -> bool {
     trustee_policy_read_available
         || env_flag("ENCLAVA_USE_PLATFORM_RELEASE")
@@ -406,6 +425,16 @@ fn load_attestation_config(
     };
     let workload_artifacts_url =
         load_url_env("WORKLOAD_ARTIFACTS_URL", trustee_policy_read_available)?;
+    let workload_artifacts_ca_cert_pem =
+        env_nonempty("WORKLOAD_ARTIFACTS_CA_CERT_PEM").map(|value| value.replace("\\n", "\n"));
+    if let Some(url) = workload_artifacts_url.as_deref() {
+        require_https_or_loopback("WORKLOAD_ARTIFACTS_URL", url)?;
+        if !is_loopback_http_url(url) && workload_artifacts_ca_cert_pem.is_none() {
+            anyhow::bail!(
+                "WORKLOAD_ARTIFACTS_CA_CERT_PEM is required for measured artifact TLS pinning"
+            );
+        }
+    }
     let tls_certificate_broker_url = load_url_env(
         "TLS_CERTIFICATE_BROKER_URL",
         trustee_policy_read_available && caddy_tls_mode == CaddyTlsMode::Dns01Broker,
@@ -423,6 +452,11 @@ fn load_attestation_config(
         release_env_value("SIGNING_SERVICE_PUBKEY_HEX", release_pubkey, false)?,
         false,
     )?;
+    let signing_service_trusted_pubkeys_json = env_nonempty("SIGNING_SERVICE_TRUSTED_PUBKEYS_JSON");
+    validate_authorization_trust_map_config(
+        signing_service_trusted_pubkeys_json.as_deref(),
+        trustee_policy_read_available,
+    )?;
 
     Ok(AttestationConfig {
         proxy_image: parse_image_ref("ATTESTATION_PROXY_IMAGE", &proxy_image_ref)?,
@@ -431,14 +465,38 @@ fn load_attestation_config(
         caddy_tls_mode,
         trustee_policy_read_available,
         workload_artifacts_url,
+        workload_artifacts_ca_cert_pem,
         tls_certificate_broker_url,
         trustee_policy_url,
         local_workload_artifacts_json: None,
         local_trustee_policy_json: None,
         platform_trustee_policy_pubkey_hex,
         signing_service_pubkey_hex,
+        signing_service_trusted_pubkeys_json,
     }
     .into())
+}
+
+fn require_https_or_loopback(name: &str, value: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(value).map_err(|err| anyhow::anyhow!("{name}: {err}"))?;
+    let loopback_http = url.scheme() == "http"
+        && url
+            .host_str()
+            .is_some_and(|host| host == "127.0.0.1" || host == "::1" || host == "localhost");
+    if url.scheme() == "https" || loopback_http {
+        Ok(())
+    } else {
+        anyhow::bail!("{name} must use HTTPS outside loopback")
+    }
+}
+
+fn is_loopback_http_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "http"
+            && url
+                .host_str()
+                .is_some_and(|host| host == "127.0.0.1" || host == "::1" || host == "localhost")
+    })
 }
 
 fn load_dns_config() -> anyhow::Result<Option<DnsConfig>> {
@@ -748,6 +806,13 @@ async fn main() {
         enclava_api::clients::RegistryClient::from_env().expect("failed to build registry client");
     let trustee_http_client =
         build_trustee_http_client().expect("failed to build Trustee HTTP client");
+    let kbs_publisher = enclava_api::kbs_publisher::config_from_env()
+        .expect("failed to configure KBS deployment-authorization publisher");
+    if signing_service.is_some() && kbs_publisher.is_none() {
+        panic!(
+            "a configured platform signing service requires KBS_AUTHORIZATION_PUBLISHER_URL and KBS_AUTHORIZATION_PUBLISHER_TOKEN"
+        );
+    }
 
     let state = AppState {
         db: pool,
@@ -774,6 +839,15 @@ async fn main() {
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_applies)),
         internal_auth,
     };
+
+    if let Some(config) = kbs_publisher {
+        enclava_api::kbs_publisher::spawn_reconciler(
+            state.db.clone(),
+            state.trustee_http_client.clone(),
+            config,
+        );
+        tracing::info!("KBS deployment-authorization reconciler started");
+    }
 
     let app = build_router(state);
 
@@ -822,5 +896,14 @@ mod tests {
             err.to_string().contains("TENANT_TEE_CA_CERT_PEM"),
             "error should name the invalid tenant TEE CA env var: {err}"
         );
+    }
+
+    #[test]
+    fn receipt_mode_requires_a_nonempty_authorization_trust_map() {
+        let valid = serde_json::json!({"current": "11".repeat(32)}).to_string();
+        assert!(validate_authorization_trust_map_config(Some(&valid), true).is_ok());
+        assert!(validate_authorization_trust_map_config(None, false).is_ok());
+        assert!(validate_authorization_trust_map_config(None, true).is_err());
+        assert!(validate_authorization_trust_map_config(Some("{}"), true).is_err());
     }
 }

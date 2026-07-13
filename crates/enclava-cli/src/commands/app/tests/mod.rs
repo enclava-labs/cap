@@ -10,7 +10,9 @@ fn test_release() -> PlatformRelease {
             signing_service_url: "https://signing.example.test".to_string(),
             signing_service_pubkey_hex: "11".repeat(32),
             policy_template_id: "trustee-resource-policy-v1".to_string(),
-            policy_template_sha256: "22".repeat(32),
+        policy_template_sha256: "22".repeat(32),
+        static_resource_policy_sha256: None,
+        static_policy_issuer_key_id: None,
             policy_template_text: "package policy\n".to_string(),
             attestation_proxy_image:
                 "ghcr.io/enclava-labs/attestation-proxy@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -84,6 +86,9 @@ fn test_deployment_context() -> DeploymentContextResponse {
     DeploymentContextResponse {
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
         tls_certificate_broker_url: None,
+        workload_artifacts_url: Some("https://api.example.test/api/v1/workload/artifacts".into()),
+        workload_artifacts_ca_cert_pem: Some("test-ca".into()),
+        signing_service_trusted_pubkeys_json: None,
         current_platform_release_id: None,
         platform_release_envelope: None,
     }
@@ -100,6 +105,9 @@ fn deployment_context_platform_release_is_verified_and_selected() {
     let deployment_context = DeploymentContextResponse {
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
         tls_certificate_broker_url: None,
+        workload_artifacts_url: Some("https://api.example.test/api/v1/workload/artifacts".into()),
+        workload_artifacts_ca_cert_pem: Some("test-ca".into()),
+        signing_service_trusted_pubkeys_json: None,
         current_platform_release_id: Some(expected_release_id.clone()),
         platform_release_envelope: Some(envelope),
     };
@@ -124,6 +132,9 @@ fn deployment_context_platform_release_tampering_fails_closed() {
     let deployment_context = DeploymentContextResponse {
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
         tls_certificate_broker_url: None,
+        workload_artifacts_url: Some("https://api.example.test/api/v1/workload/artifacts".into()),
+        workload_artifacts_ca_cert_pem: Some("test-ca".into()),
+        signing_service_trusted_pubkeys_json: None,
         current_platform_release_id: Some(envelope.payload.platform_release_version.clone()),
         platform_release_envelope: Some(envelope),
     };
@@ -142,7 +153,7 @@ fn deployment_context_platform_release_tampering_fails_closed() {
 }
 
 #[test]
-fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
+fn signed_cc_hash_app_uses_receipt_mode_artifact_transport() {
     let app = confidential_app_for_cc_hash(
             &test_app_response(),
             &test_app_config(),
@@ -185,14 +196,11 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
         },
     );
 
-    assert!(
-        cc_toml.contains(
-            "workload_artifacts_url = \"file:///etc/enclava-init/workload-artifacts.json\""
-        )
-    );
-    assert!(
-        cc_toml.contains("trustee_policy_url = \"file:///etc/enclava-init/trustee-policy.json\"")
-    );
+    assert!(cc_toml.contains(
+        "workload_artifacts_url = \"https://api.example.test/api/v1/workload/artifacts\""
+    ));
+    assert!(cc_toml.contains("workload_artifacts_ca_cert_pem = \"test-ca\""));
+    assert!(!cc_toml.contains("trustee_policy_url"));
 }
 
 #[test]
@@ -205,6 +213,11 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
             "http://cap-api.cap.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
                 .to_string(),
         ),
+        workload_artifacts_url: Some(
+            "https://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts".into(),
+        ),
+        workload_artifacts_ca_cert_pem: Some("test-ca".into()),
+        signing_service_trusted_pubkeys_json: None,
         current_platform_release_id: None,
         platform_release_envelope: None,
     };

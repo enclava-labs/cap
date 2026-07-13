@@ -183,6 +183,24 @@ pub async fn rollback(
         )
     })?;
 
+    let rollback_receipt_hash =
+        crate::kbs_publisher::prepare_rollback_activation(&state.db, deploy_id, app.id, prev.id)
+            .await
+            .map_err(|error| json_error(StatusCode::CONFLICT, error.to_string()))?;
+    if let Some(descriptor_hash) = rollback_receipt_hash {
+        let publisher = crate::kbs_publisher::config_from_env().map_err(|error| {
+            super::kbs_publication_error_response(StatusCode::SERVICE_UNAVAILABLE, &error)
+        })?;
+        crate::kbs_publisher::publish_descriptor(
+            &state.db,
+            &state.trustee_http_client,
+            publisher.as_ref(),
+            &descriptor_hash,
+        )
+        .await
+        .map_err(|error| super::kbs_publication_error_response(StatusCode::BAD_GATEWAY, &error))?;
+    }
+
     // Audit
     let _ = sqlx::query(
         "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.rollback', $4)",
@@ -195,10 +213,13 @@ pub async fn rollback(
     .await;
 
     let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
-    let local_verification_artifacts =
+    let local_verification_artifacts = if rollback_receipt_hash.is_some() {
+        None
+    } else {
         crate::signing_service::load_workload_artifacts_json(&state.db, app.id, prev.id)
             .await
-            .map_err(signing_error_response)?;
+            .map_err(signing_error_response)?
+    };
     let db = state.db.clone();
     let attestation = state.attestation.clone();
     let kbs_policy = state.kbs_policy.clone();

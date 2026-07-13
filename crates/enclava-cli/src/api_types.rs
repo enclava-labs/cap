@@ -468,6 +468,12 @@ pub struct DeploymentContextResponse {
     #[serde(default)]
     pub tls_certificate_broker_url: Option<String>,
     #[serde(default)]
+    pub workload_artifacts_url: Option<String>,
+    #[serde(default)]
+    pub workload_artifacts_ca_cert_pem: Option<String>,
+    #[serde(default)]
+    pub signing_service_trusted_pubkeys_json: Option<String>,
+    #[serde(default)]
     pub current_platform_release_id: Option<String>,
     #[serde(default)]
     pub platform_release_envelope: Option<PlatformReleaseEnvelope>,

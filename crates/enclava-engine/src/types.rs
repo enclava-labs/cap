@@ -223,6 +223,10 @@ pub struct AttestationConfig {
     /// CAP API workload-attested artifact endpoint reachable from the workload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_artifacts_url: Option<String>,
+    /// PEM trust anchor pinned into measured init-data for the CAP artifact
+    /// endpoint. Receipt mode does not inherit ambient host trust roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_artifacts_ca_cert_pem: Option<String>,
     /// CAP API workload-attested DNS-01 certificate broker endpoint. In
     /// broker mode, enclava-init generates the tenant TLS key inside the TEE,
     /// submits a CSR over this endpoint, and writes the returned chain into
@@ -243,10 +247,14 @@ pub struct AttestationConfig {
     /// Platform Ed25519 public key for Trustee policy artifacts, hex encoded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_trustee_policy_pubkey_hex: Option<String>,
-    /// Signing-service Ed25519 public key for descriptor/keyring authorization,
-    /// hex encoded.
+    /// Legacy scalar signing-service Ed25519 public key, hex encoded. Receipt
+    /// issuer selection never falls back to this key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_service_pubkey_hex: Option<String>,
+    /// Authoritative JSON map of every current or retiring receipt issuer key
+    /// ID to its Ed25519 public key. Required in receipt mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_service_trusted_pubkeys_json: Option<String>,
 }
 
 pub fn default_acme_ca_url() -> String {

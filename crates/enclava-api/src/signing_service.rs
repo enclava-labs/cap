@@ -10,7 +10,12 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
+use enclava_common::descriptor::descriptor_canonical_bytes;
 use enclava_common::descriptor::{DeploymentDescriptor, descriptor_core_hash};
+use enclava_common::kbs_authorization::{
+    ArtifactBundleDigestInput, DeploymentAuthorizationV1, artifact_bundle_digest,
+    authorization_digest,
+};
 use enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH;
 use enclava_engine::types::{GeneratedAgentPolicy, LogEncryptionConfig, WorkloadArtifactBinding};
 use reqwest::Url;
@@ -39,6 +44,8 @@ pub enum SigningServiceError {
     Mismatch(String),
     #[error("signed policy artifact signature verification failed")]
     InvalidSignature,
+    #[error("immutable workload artifact conflicts with stored descriptor hash")]
+    ImmutableArtifactConflict,
     #[error("signing service HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("signing service rejected request with status {status}: {body}")]
@@ -98,7 +105,7 @@ impl SigningServiceClient {
     pub async fn sign(
         &self,
         request: &SignRequest,
-    ) -> Result<SignedPolicyArtifact, SigningServiceError> {
+    ) -> Result<SignedArtifactResponse, SigningServiceError> {
         let url = self
             .base_url
             .join("sign")
@@ -113,7 +120,27 @@ impl SigningServiceClient {
             let body = response.text().await.unwrap_or_default();
             return Err(SigningServiceError::Upstream { status, body });
         }
-        Ok(response.json().await?)
+        let mut value: serde_json::Value = response.json().await?;
+        let authorization_bytes = value
+            .as_object_mut()
+            .and_then(|object| object.remove("deployment_authorization_b64"))
+            .map(|encoded| {
+                let encoded = encoded.as_str().ok_or_else(|| {
+                    SigningServiceError::Blob(
+                        "deployment_authorization_b64 must be a string".into(),
+                    )
+                })?;
+                B64.decode(encoded.as_bytes()).map_err(|err| {
+                    SigningServiceError::Blob(format!(
+                        "decoding deployment_authorization_b64: {err}"
+                    ))
+                })
+            })
+            .transpose()?;
+        Ok(SignedArtifactResponse {
+            artifact: serde_json::from_value(value)?,
+            authorization_bytes,
+        })
     }
 
     pub async fn agent_policy(
@@ -157,6 +184,12 @@ impl SigningServiceClient {
         }
         Ok(response.json().await?)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct SignedArtifactResponse {
+    pub artifact: SignedPolicyArtifact,
+    pub authorization_bytes: Option<Vec<u8>>,
 }
 
 fn signing_service_timeout_from_env() -> Result<Duration, SigningServiceError> {
@@ -803,32 +836,94 @@ pub fn decode_optional_policy_artifact(
 }
 
 pub async fn persist_workload_artifacts(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     app_id: Uuid,
     deploy_id: Uuid,
     artifacts: &DeploymentSigningArtifacts,
     signed_policy_artifact: &SignedPolicyArtifact,
+    deployment_authorization_bytes: Option<&[u8]>,
+    authorization_pubkey_hex: Option<&str>,
 ) -> Result<(), SigningServiceError> {
+    let declared_rego_hash =
+        decode_hex32("artifact.rego_sha256", &signed_policy_artifact.rego_sha256)?;
+    let actual_rego_hash: [u8; 32] =
+        Sha256::digest(signed_policy_artifact.rego_text.as_bytes()).into();
+    if declared_rego_hash != actual_rego_hash {
+        return Err(SigningServiceError::Mismatch("artifact.rego_sha256".into()));
+    }
+    let declared_agent_hash = decode_hex32(
+        "artifact.agent_policy_sha256",
+        &signed_policy_artifact.agent_policy_sha256,
+    )?;
+    let actual_agent_hash: [u8; 32] =
+        Sha256::digest(signed_policy_artifact.agent_policy_text.as_bytes()).into();
+    if declared_agent_hash != actual_agent_hash {
+        return Err(SigningServiceError::Mismatch(
+            "artifact.agent_policy_sha256".into(),
+        ));
+    }
+    let policy_signature = decode_signature(&signed_policy_artifact.signature)?;
+    let policy_verify_pubkey = decode_pubkey_b64(
+        "artifact.verify_pubkey_b64",
+        &signed_policy_artifact.verify_pubkey_b64,
+    )?;
+    let policy_metadata_hash = canonical_policy_metadata_hash(&signed_policy_artifact.metadata)?;
+    let descriptor_bytes = descriptor_canonical_bytes(&artifacts.descriptor);
+    let keyring_bytes = canonical_keyring_bytes(&artifacts.org_keyring);
+    let bundle_digest = artifact_bundle_digest(&ArtifactBundleDigestInput {
+        descriptor_canonical_bytes: &descriptor_bytes,
+        descriptor_signature: &artifacts.descriptor_signature,
+        descriptor_signing_key_id: &artifacts.descriptor_signing_key_id,
+        org_keyring_canonical_bytes: &keyring_bytes,
+        org_keyring_signature: &artifacts.org_keyring_signature,
+        org_keyring_signing_pubkey: &artifacts.org_keyring_signing_pubkey,
+        policy_metadata_hash: &policy_metadata_hash,
+        rego_text: &signed_policy_artifact.rego_text,
+        agent_policy_text: &signed_policy_artifact.agent_policy_text,
+        policy_signature: &policy_signature,
+        policy_verify_pubkey: &policy_verify_pubkey,
+    });
+    let authorization = match (deployment_authorization_bytes, authorization_pubkey_hex) {
+        (Some(bytes), Some(pubkey_hex)) => {
+            let authorization = DeploymentAuthorizationV1::parse_exact_json(bytes)
+                .map_err(|err| SigningServiceError::Blob(err.to_string()))?;
+            let pubkey = decode_hex32("authorization_pubkey_hex", pubkey_hex)?;
+            authorization
+                .verify_signature(&pubkey)
+                .map_err(|_| SigningServiceError::InvalidSignature)?;
+            authorization
+                .validate_time(Utc::now())
+                .map_err(|err| SigningServiceError::Mismatch(err.to_string()))?;
+            validate_authorization_binding(
+                &authorization,
+                artifacts,
+                signed_policy_artifact,
+                &bundle_digest,
+            )?;
+            Some((authorization, authorization_digest(bytes), bytes))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(SigningServiceError::Mismatch(
+                "deployment authorization and authorization public key must be configured together"
+                    .into(),
+            ));
+        }
+    };
     let descriptor_payload = serde_json::to_value(&artifacts.descriptor)?;
     let org_keyring_payload = serde_json::to_value(&artifacts.org_keyring)?;
     let signed_policy_artifact = serde_json::to_value(signed_policy_artifact)?;
 
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO workload_artifacts (
              descriptor_core_hash, app_id, deploy_id, descriptor_payload,
              descriptor_signature, descriptor_signing_key_id, org_keyring_payload,
-             org_keyring_signature, signed_policy_artifact
+             org_keyring_signature, signed_policy_artifact, namespace,
+             expected_init_data_hash, org_keyring_envelope,
+             bundle_schema_version, artifact_bundle_digest
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (descriptor_core_hash) DO UPDATE SET
-             app_id = EXCLUDED.app_id,
-             deploy_id = EXCLUDED.deploy_id,
-             descriptor_payload = EXCLUDED.descriptor_payload,
-             descriptor_signature = EXCLUDED.descriptor_signature,
-             descriptor_signing_key_id = EXCLUDED.descriptor_signing_key_id,
-             org_keyring_payload = EXCLUDED.org_keyring_payload,
-             org_keyring_signature = EXCLUDED.org_keyring_signature,
-             signed_policy_artifact = EXCLUDED.signed_policy_artifact",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+         ON CONFLICT (descriptor_core_hash) DO NOTHING",
     )
     .bind(artifacts.descriptor_core_hash.to_vec())
     .bind(app_id)
@@ -838,11 +933,304 @@ pub async fn persist_workload_artifacts(
     .bind(&artifacts.descriptor_signing_key_id)
     .bind(org_keyring_payload)
     .bind(artifacts.org_keyring_signature.to_vec())
-    .bind(signed_policy_artifact)
-    .execute(pool)
+    .bind(&signed_policy_artifact)
+    .bind(&artifacts.descriptor.namespace)
+    .bind(artifacts.descriptor.expected_cc_init_data_hash.to_vec())
+    .bind(&artifacts.org_keyring_envelope)
+    .bind("enclava-workload-artifact-bundle-v1")
+    .bind(bundle_digest.to_vec())
+    .execute(&mut *conn)
     .await?;
 
+    if inserted.rows_affected() == 0 {
+        let stored = sqlx::query_as::<_, StoredImmutableArtifactRow>(
+            "SELECT app_id, deploy_id, descriptor_payload, descriptor_signature,
+                    descriptor_signing_key_id, org_keyring_payload,
+                    org_keyring_signature, signed_policy_artifact, namespace,
+                    expected_init_data_hash, org_keyring_envelope,
+                    bundle_schema_version, artifact_bundle_digest
+             FROM workload_artifacts
+             WHERE descriptor_core_hash = $1",
+        )
+        .bind(artifacts.descriptor_core_hash.to_vec())
+        .fetch_one(&mut *conn)
+        .await?;
+
+        let expected = StoredImmutableArtifactRow {
+            app_id,
+            deploy_id,
+            descriptor_payload: serde_json::to_value(&artifacts.descriptor)?,
+            descriptor_signature: artifacts.descriptor_signature.to_vec(),
+            descriptor_signing_key_id: artifacts.descriptor_signing_key_id.clone(),
+            org_keyring_payload: serde_json::to_value(&artifacts.org_keyring)?,
+            org_keyring_signature: artifacts.org_keyring_signature.to_vec(),
+            signed_policy_artifact,
+            namespace: Some(artifacts.descriptor.namespace.clone()),
+            expected_init_data_hash: Some(artifacts.descriptor.expected_cc_init_data_hash.to_vec()),
+            org_keyring_envelope: Some(artifacts.org_keyring_envelope.clone()),
+            bundle_schema_version: Some("enclava-workload-artifact-bundle-v1".into()),
+            artifact_bundle_digest: Some(bundle_digest.to_vec()),
+        };
+        if !stored.signed_components_equal(&expected) {
+            return Err(SigningServiceError::ImmutableArtifactConflict);
+        }
+        if stored.has_no_bundle_metadata() {
+            let enriched = sqlx::query(
+                "UPDATE workload_artifacts
+                 SET namespace = $2,
+                     expected_init_data_hash = $3,
+                     org_keyring_envelope = $4,
+                     bundle_schema_version = $5,
+                     artifact_bundle_digest = $6
+                 WHERE descriptor_core_hash = $1
+                   AND namespace IS NULL
+                   AND expected_init_data_hash IS NULL
+                   AND org_keyring_envelope IS NULL
+                   AND bundle_schema_version IS NULL
+                   AND artifact_bundle_digest IS NULL",
+            )
+            .bind(artifacts.descriptor_core_hash.to_vec())
+            .bind(&artifacts.descriptor.namespace)
+            .bind(artifacts.descriptor.expected_cc_init_data_hash.to_vec())
+            .bind(&artifacts.org_keyring_envelope)
+            .bind("enclava-workload-artifact-bundle-v1")
+            .bind(bundle_digest.to_vec())
+            .execute(&mut *conn)
+            .await?;
+            if enriched.rows_affected() != 1 {
+                return Err(SigningServiceError::ImmutableArtifactConflict);
+            }
+        } else if stored != expected {
+            return Err(SigningServiceError::ImmutableArtifactConflict);
+        }
+    }
+
+    if let Some((authorization, digest, bytes)) = authorization {
+        let inserted = sqlx::query(
+            "INSERT INTO workload_artifact_authorizations (
+                 descriptor_core_hash, authorization_id, receipt_resource_path,
+                 authorization_bytes, authorization_digest, issuer_key_id,
+                 issued_at, expires_at, publication_state
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+             ON CONFLICT (descriptor_core_hash) DO NOTHING",
+        )
+        .bind(authorization.descriptor_core_hash.to_vec())
+        .bind(authorization.authorization_id)
+        .bind(&authorization.receipt_resource_path)
+        .bind(bytes)
+        .bind(digest.to_vec())
+        .bind(&authorization.issuer_key_id)
+        .bind(authorization.issued_at)
+        .bind(authorization.expires_at)
+        .execute(&mut *conn)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            let stored: Vec<u8> = sqlx::query_scalar(
+                "SELECT authorization_bytes
+                 FROM workload_artifact_authorizations
+                 WHERE descriptor_core_hash = $1",
+            )
+            .bind(authorization.descriptor_core_hash.to_vec())
+            .fetch_one(&mut *conn)
+            .await?;
+            if stored != bytes {
+                return Err(SigningServiceError::ImmutableArtifactConflict);
+            }
+        }
+
+        let activation = sqlx::query(
+            "INSERT INTO deployment_artifact_activations (
+                 management_deployment_id, descriptor_core_hash, activation_state
+             ) VALUES ($1, $2, 'pending_publication')
+             ON CONFLICT (management_deployment_id) DO NOTHING",
+        )
+        .bind(deploy_id)
+        .bind(authorization.descriptor_core_hash.to_vec())
+        .execute(&mut *conn)
+        .await?;
+        if activation.rows_affected() == 0 {
+            let stored_hash: Vec<u8> = sqlx::query_scalar(
+                "SELECT descriptor_core_hash FROM deployment_artifact_activations
+                 WHERE management_deployment_id = $1",
+            )
+            .bind(deploy_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            if stored_hash != authorization.descriptor_core_hash {
+                return Err(SigningServiceError::ImmutableArtifactConflict);
+            }
+        }
+
+        let idempotency_key = format!("publish:{}", hex::encode(digest));
+        let event = sqlx::query(
+            "INSERT INTO kbs_authorization_outbox (
+                 idempotency_key, descriptor_core_hash, operation,
+                 payload_digest, payload_bytes
+             ) VALUES ($1, $2, 'publish', $3, $4)
+             ON CONFLICT (idempotency_key) DO NOTHING",
+        )
+        .bind(&idempotency_key)
+        .bind(authorization.descriptor_core_hash.to_vec())
+        .bind(digest.to_vec())
+        .bind(bytes)
+        .execute(&mut *conn)
+        .await?;
+        if event.rows_affected() == 0 {
+            let stored: (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+                "SELECT payload_digest, payload_bytes FROM kbs_authorization_outbox
+                 WHERE idempotency_key = $1",
+            )
+            .bind(&idempotency_key)
+            .fetch_one(&mut *conn)
+            .await?;
+            if stored.0.as_deref() != Some(digest.as_slice()) || stored.1.as_deref() != Some(bytes)
+            {
+                return Err(SigningServiceError::ImmutableArtifactConflict);
+            }
+        }
+    }
+
     Ok(())
+}
+
+fn validate_authorization_binding(
+    authorization: &DeploymentAuthorizationV1,
+    artifacts: &DeploymentSigningArtifacts,
+    policy: &SignedPolicyArtifact,
+    bundle_digest: &[u8; 32],
+) -> Result<(), SigningServiceError> {
+    let descriptor = &artifacts.descriptor;
+    let rego_hash = decode_hex32("artifact.rego_sha256", &policy.rego_sha256)?;
+    let agent_hash = decode_hex32("artifact.agent_policy_sha256", &policy.agent_policy_sha256)?;
+    let owner_key_hash: [u8; 32] = Sha256::digest(artifacts.org_keyring_signing_pubkey).into();
+    let owner_prefix = descriptor
+        .kbs_resource_path
+        .rsplit_once('/')
+        .map(|(prefix, _)| prefix)
+        .ok_or_else(|| SigningServiceError::Mismatch("kbs_resource_path".into()))?;
+    let mut expected_paths = vec![
+        descriptor.kbs_resource_path.clone(),
+        format!("{owner_prefix}/seed-sealed"),
+        authorization.receipt_resource_path.clone(),
+    ];
+    expected_paths.sort();
+    expected_paths.dedup();
+
+    let matches = authorization.descriptor_core_hash == artifacts.descriptor_core_hash
+        && authorization.org_id == descriptor.org_id
+        && authorization.app_id == descriptor.app_id
+        && authorization.descriptor_deploy_id == descriptor.deploy_id
+        && authorization.expected_init_data_hash == descriptor.expected_cc_init_data_hash
+        && authorization.namespace == descriptor.namespace
+        && authorization.service_account == descriptor.service_account
+        && authorization.tenant_instance_identity_hash == descriptor.identity_hash
+        && authorization.org_owner_version == artifacts.org_keyring.version
+        && authorization.org_owner_pubkey_sha256 == owner_key_hash
+        && authorization.image_digest == descriptor.image_digest
+        && authorization.signer_identity == descriptor.signer_identity
+        && authorization.authorized_resource_paths == expected_paths
+        && authorization.rego_sha256 == rego_hash
+        && authorization.agent_policy_sha256 == agent_hash
+        && authorization.artifact_bundle_digest == *bundle_digest
+        && authorization.issuer_key_id == policy.metadata.key_id;
+    if !matches {
+        return Err(SigningServiceError::Mismatch(
+            "deployment authorization binding".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn recompute_stored_bundle_digest(
+    descriptor_payload: &serde_json::Value,
+    descriptor_signature: &[u8],
+    descriptor_signing_key_id: &str,
+    org_keyring_envelope: &serde_json::Value,
+    signed_policy_artifact: &serde_json::Value,
+) -> Result<[u8; 32], SigningServiceError> {
+    let descriptor: DeploymentDescriptor = serde_json::from_value(descriptor_payload.clone())?;
+    let descriptor_signature: [u8; 64] = descriptor_signature
+        .try_into()
+        .map_err(|_| SigningServiceError::Mismatch("stored descriptor signature length".into()))?;
+    let keyring: OrgKeyringEnvelope = serde_json::from_value(org_keyring_envelope.clone())?;
+    let artifact: SignedPolicyArtifact = serde_json::from_value(signed_policy_artifact.clone())?;
+    if artifact.org_keyring.as_ref() != Some(org_keyring_envelope) {
+        return Err(SigningServiceError::Mismatch(
+            "stored artifact org keyring envelope".into(),
+        ));
+    }
+    let declared_rego_hash = decode_hex32("artifact.rego_sha256", &artifact.rego_sha256)?;
+    let actual_rego_hash: [u8; 32] = Sha256::digest(artifact.rego_text.as_bytes()).into();
+    if declared_rego_hash != actual_rego_hash {
+        return Err(SigningServiceError::Mismatch("artifact.rego_sha256".into()));
+    }
+    let declared_agent_hash = decode_hex32(
+        "artifact.agent_policy_sha256",
+        &artifact.agent_policy_sha256,
+    )?;
+    let actual_agent_hash: [u8; 32] = Sha256::digest(artifact.agent_policy_text.as_bytes()).into();
+    if declared_agent_hash != actual_agent_hash {
+        return Err(SigningServiceError::Mismatch(
+            "artifact.agent_policy_sha256".into(),
+        ));
+    }
+    let policy_signature = decode_signature(&artifact.signature)?;
+    let policy_verify_pubkey =
+        decode_pubkey_b64("artifact.verify_pubkey_b64", &artifact.verify_pubkey_b64)?;
+    let policy_metadata_hash = canonical_policy_metadata_hash(&artifact.metadata)?;
+    let descriptor_bytes = descriptor_canonical_bytes(&descriptor);
+    let keyring_bytes = canonical_keyring_bytes(&keyring.keyring);
+    Ok(artifact_bundle_digest(&ArtifactBundleDigestInput {
+        descriptor_canonical_bytes: &descriptor_bytes,
+        descriptor_signature: &descriptor_signature,
+        descriptor_signing_key_id,
+        org_keyring_canonical_bytes: &keyring_bytes,
+        org_keyring_signature: &keyring.signature,
+        org_keyring_signing_pubkey: &keyring.signing_pubkey,
+        policy_metadata_hash: &policy_metadata_hash,
+        rego_text: &artifact.rego_text,
+        agent_policy_text: &artifact.agent_policy_text,
+        policy_signature: &policy_signature,
+        policy_verify_pubkey: &policy_verify_pubkey,
+    }))
+}
+
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct StoredImmutableArtifactRow {
+    app_id: Uuid,
+    deploy_id: Uuid,
+    descriptor_payload: serde_json::Value,
+    descriptor_signature: Vec<u8>,
+    descriptor_signing_key_id: String,
+    org_keyring_payload: serde_json::Value,
+    org_keyring_signature: Vec<u8>,
+    signed_policy_artifact: serde_json::Value,
+    namespace: Option<String>,
+    expected_init_data_hash: Option<Vec<u8>>,
+    org_keyring_envelope: Option<serde_json::Value>,
+    bundle_schema_version: Option<String>,
+    artifact_bundle_digest: Option<Vec<u8>>,
+}
+
+impl StoredImmutableArtifactRow {
+    fn signed_components_equal(&self, other: &Self) -> bool {
+        self.app_id == other.app_id
+            && self.deploy_id == other.deploy_id
+            && self.descriptor_payload == other.descriptor_payload
+            && self.descriptor_signature == other.descriptor_signature
+            && self.descriptor_signing_key_id == other.descriptor_signing_key_id
+            && self.org_keyring_payload == other.org_keyring_payload
+            && self.org_keyring_signature == other.org_keyring_signature
+            && self.signed_policy_artifact == other.signed_policy_artifact
+    }
+
+    fn has_no_bundle_metadata(&self) -> bool {
+        self.namespace.is_none()
+            && self.expected_init_data_hash.is_none()
+            && self.org_keyring_envelope.is_none()
+            && self.bundle_schema_version.is_none()
+            && self.artifact_bundle_digest.is_none()
+    }
 }
 
 pub fn workload_artifacts_json(
