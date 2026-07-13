@@ -53,15 +53,12 @@ This inventory must be refreshed at the start of the maintenance window.
 
 Do not publish release candidates until all of these are resolved:
 
-1. CAP release startup currently requires
-   `TRUSTEE_POLICY_READ_AVAILABLE=true`, while the draft GitOps receipt-mode
-   overlay removes it. Choose and test one contract:
-   - preferred: add an explicit receipt-mode startup gate that requires the
-     publisher, artifact endpoint, trust map, and platform-release v2 without
-     enabling legacy policy reconciliation; or
-   - compatibility path: retain `TRUSTEE_POLICY_READ_AVAILABLE=true` and the
-     read-only static-policy URL while removing all CAP policy mutation RBAC
-     and `KBS_POLICY_*` settings.
+1. CAP release startup requires `TRUSTEE_POLICY_READ_AVAILABLE=true`. This PR
+   stack selects the compatibility contract: retain that flag and the
+   read-only static-policy URL while removing all CAP policy mutation RBAC and
+   `KBS_POLICY_*` settings. A later explicit receipt-mode startup flag may
+   replace the overloaded read-availability flag, but is not part of this
+   cutover.
 2. CAP GitOps must provide a non-empty
    `SIGNING_SERVICE_TRUSTED_PUBKEYS_JSON`. Its issuer IDs and keys must exactly
    match KBS `deployment_authorization_public_keys` and include every current
