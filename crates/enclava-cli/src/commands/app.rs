@@ -1206,28 +1206,57 @@ pub async fn log_key(cmd: LogKeyCommand) -> Result<(), Box<dyn std::error::Error
 async fn generate_log_key(args: LogKeyGenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_name = resolve_app_name(&args.app)?;
     let (api, paths, _cli_config) = build_api_client()?;
+    let generated = generate_log_key_for_app(
+        &api,
+        &paths,
+        &app_name,
+        &args.key_id,
+        args.label,
+        args.private_key_file,
+        !args.no_activate,
+    )
+    .await?;
+    println!("Registered log key: {}", generated.key.key_id);
+    println!("Public key hash: {}", generated.key.public_key_sha256);
+    println!("Private key file: {}", generated.private_key_file.display());
+    Ok(())
+}
+
+pub(crate) struct GeneratedLogKey {
+    pub key: LogEncryptionKey,
+    pub private_key_file: PathBuf,
+}
+
+pub(crate) async fn generate_log_key_for_app(
+    api: &ApiClient,
+    paths: &CliPaths,
+    app_name: &str,
+    key_id: &str,
+    label: Option<String>,
+    private_key_file: Option<PathBuf>,
+    activate_for_app: bool,
+) -> Result<GeneratedLogKey, Box<dyn std::error::Error>> {
     paths.ensure_dirs()?;
     let keypair = generate_log_keypair();
-    let private_key_file = args
-        .private_key_file
-        .unwrap_or_else(|| default_log_private_key_path(&paths, &app_name, &args.key_id));
+    let private_key_file =
+        private_key_file.unwrap_or_else(|| default_log_private_key_path(paths, app_name, key_id));
     write_private_log_key(&private_key_file, &keypair.private_key_base64url)?;
     let key = api
         .register_log_key(
-            &app_name,
+            app_name,
             &RegisterLogEncryptionKeyRequest {
-                key_id: args.key_id,
+                key_id: key_id.to_string(),
                 algorithm: LOG_ENCRYPTION_ALGORITHM.to_string(),
                 public_key_base64url: keypair.public_key_base64url,
-                label: args.label,
-                activate_for_app: !args.no_activate,
+                label,
+                activate_for_app,
             },
         )
         .await?;
-    println!("Registered log key: {}", key.key_id);
-    println!("Public key hash: {}", key.public_key_sha256);
-    println!("Private key file: {}", private_key_file.display());
-    Ok(())
+    Ok(GeneratedLogKey {
+        key,
+        private_key_file,
+    })
 }
 
 async fn list_log_keys(args: LogKeyAppArgs) -> Result<(), Box<dyn std::error::Error>> {

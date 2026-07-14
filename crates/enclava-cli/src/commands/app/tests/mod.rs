@@ -595,6 +595,76 @@ fn default_log_private_key_path_sanitizes_components() {
     );
 }
 
+#[tokio::test]
+async fn generated_log_key_registration_keeps_private_material_local() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = serde_json::json!({
+            "key_id": "shell-logs",
+            "algorithm": "x25519-hpke-v1",
+            "public_key_base64url": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "public_key_sha256": "sha256:test",
+            "label": "Hosted template app shell",
+            "status": "active",
+            "active_for_app": true,
+            "selected_at": "2026-07-14T00:00:00Z",
+            "created_at": "2026-07-14T00:00:00Z",
+            "revoked_at": null
+        })
+        .to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let paths = CliPaths::from_root(temp.path().join("cli")).unwrap();
+    let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let generated = generate_log_key_for_app(
+        &api,
+        &paths,
+        "shell",
+        "shell-logs",
+        Some("Hosted template app shell".to_string()),
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    let private_key = std::fs::read_to_string(&generated.private_key_file).unwrap();
+    let request = handle.join().unwrap();
+
+    assert!(request.starts_with("POST /apps/shell/logs/keys "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert!(request.contains(r#""key_id":"shell-logs""#));
+    assert!(request.contains(r#""activate_for_app":true"#));
+    assert!(!request.contains(private_key.trim()));
+    assert_eq!(
+        std::fs::metadata(&generated.private_key_file)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
 #[test]
 fn attested_locked_state_overrides_only_running_status() {
     assert_eq!(
