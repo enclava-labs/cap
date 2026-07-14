@@ -114,24 +114,30 @@ fn claim_response_captures_owner_seed_mnemonic_from_live_proxy_shape() {
 }
 
 #[test]
-fn only_claimed_ownership_state_means_owner_claim_succeeded() {
-    assert!(super::claim_state_json_is_successful(
-        &serde_json::json!({"ownership_state": "claimed", "unlock_state": "locked"})
-    ));
-    assert!(super::claim_state_json_is_successful(
-        &serde_json::json!({"state": "claimed"})
-    ));
+fn post_claim_ownership_states_mean_owner_claim_succeeded() {
+    for field in ["ownership_state", "state"] {
+        for state in ["locked", "unlocking", "unlocked"] {
+            assert!(
+                super::claim_state_json_is_successful(&serde_json::json!({ (field): state })),
+                "{field}={state} should mean ownership was claimed"
+            );
+        }
+
+        for state in ["unclaimed", "error"] {
+            assert!(
+                !super::claim_state_json_is_successful(&serde_json::json!({ (field): state })),
+                "{field}={state} should not mean a successful claim"
+            );
+        }
+    }
+
+    // `ownership_state` takes precedence over a legacy `state` field
     assert!(!super::claim_state_json_is_successful(
-        &serde_json::json!({"state": "locked"})
+        &serde_json::json!({"ownership_state": "unclaimed", "state": "unlocked"})
     ));
-    assert!(!super::claim_state_json_is_successful(
-        &serde_json::json!({"ownership_state": "locked"})
-    ));
+    // neither recognized field present
     assert!(!super::claim_state_json_is_successful(
         &serde_json::json!({"unlock_state": "unlocked"})
-    ));
-    assert!(!super::claim_state_json_is_successful(
-        &serde_json::json!({"state": "unclaimed"})
     ));
 }
 
