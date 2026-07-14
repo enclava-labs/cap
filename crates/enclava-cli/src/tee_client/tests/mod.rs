@@ -115,36 +115,22 @@ fn claim_response_captures_owner_seed_mnemonic_from_live_proxy_shape() {
 
 #[test]
 fn post_claim_ownership_states_mean_owner_claim_succeeded() {
-    // The attestation-proxy emits "unclaimed"/"locked"/"unlocking"/"unlocked"/"error"
-    // (its OwnershipState enum has no "claimed" variant), so the already-claimed fast-path
-    // must treat the post-claim states as claimed. Matching only "claimed" (the prior
-    // behavior) left the fast-path dead and already-claimed password-mode redeploys looped
-    // to the ~10-minute claim-wait timeout -- notably via `template deploy`, which lacks
-    // the `deploy_needs_initial_claim` pre-check the standalone `deploy` path uses.
-    assert!(super::claim_state_json_is_successful(
-        &serde_json::json!({"ownership_state": "locked"})
-    ));
-    assert!(super::claim_state_json_is_successful(
-        &serde_json::json!({"ownership_state": "unlocking"})
-    ));
-    assert!(super::claim_state_json_is_successful(
-        &serde_json::json!({"ownership_state": "unlocked"})
-    ));
-    // legacy `state` fallback when `ownership_state` is absent
-    assert!(super::claim_state_json_is_successful(
-        &serde_json::json!({"state": "unlocked"})
-    ));
-    // not claimed
-    assert!(!super::claim_state_json_is_successful(
-        &serde_json::json!({"ownership_state": "unclaimed"})
-    ));
-    assert!(!super::claim_state_json_is_successful(
-        &serde_json::json!({"state": "unclaimed"})
-    ));
-    // an error state is not a successful claim
-    assert!(!super::claim_state_json_is_successful(
-        &serde_json::json!({"ownership_state": "error"})
-    ));
+    for field in ["ownership_state", "state"] {
+        for state in ["locked", "unlocking", "unlocked"] {
+            assert!(
+                super::claim_state_json_is_successful(&serde_json::json!({ (field): state })),
+                "{field}={state} should mean ownership was claimed"
+            );
+        }
+
+        for state in ["unclaimed", "error"] {
+            assert!(
+                !super::claim_state_json_is_successful(&serde_json::json!({ (field): state })),
+                "{field}={state} should not mean a successful claim"
+            );
+        }
+    }
+
     // `ownership_state` takes precedence over a legacy `state` field
     assert!(!super::claim_state_json_is_successful(
         &serde_json::json!({"ownership_state": "unclaimed", "state": "unlocked"})
