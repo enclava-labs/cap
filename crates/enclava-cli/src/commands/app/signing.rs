@@ -486,6 +486,7 @@ pub(crate) struct SignedDeployBlobs {
     pub customer_descriptor_blob: String,
     pub org_keyring_blob: String,
     pub signed_policy_artifact: String,
+    pub log_encryption: Option<LogEncryptionConfig>,
 }
 
 pub(crate) async fn build_signed_deploy_blobs(
@@ -673,7 +674,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             tenant_instance_identity_hash: identity_hash,
             bootstrap_owner_pubkey_hash: bootstrap_pubkey_hash,
             workload_security_profile,
-            log_encryption,
+            log_encryption: log_encryption.clone(),
         },
     )?;
     let cc_init_options = cc_init_data::CcInitDataOptions {
@@ -706,5 +707,6 @@ pub(crate) async fn build_signed_deploy_blobs(
         customer_descriptor_blob: serde_json::to_string(&descriptor_envelope)?,
         org_keyring_blob: serde_json::to_string(&keyring_envelope)?,
         signed_policy_artifact: serde_json::to_string(&signed_policy_artifact)?,
+        log_encryption,
     })
 }

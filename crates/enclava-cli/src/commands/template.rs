@@ -291,6 +291,10 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         workload_security_profile,
     })
     .await?;
+    verify_signed_template_log_key(
+        prepared_log_key.as_ref(),
+        signed_blobs.log_encryption.as_ref(),
+    )?;
     pb.set_position(2);
     pb.set_message("Creating template instance...");
 
@@ -434,7 +438,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             ssh_endpoint: ssh_endpoint.as_deref(),
             log_key_id: prepared_log_key
                 .as_ref()
-                .map(|prepared| prepared.key_id.as_str()),
+                .map(|prepared| prepared.config.key_id.as_str()),
             log_private_key_file: prepared_log_key
                 .as_ref()
                 .and_then(|prepared| prepared.private_key_file.as_deref()),
@@ -445,8 +449,25 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
 }
 
 struct PreparedTemplateLogKey {
-    key_id: String,
+    config: enclava_engine::types::LogEncryptionConfig,
     private_key_file: Option<PathBuf>,
+}
+
+impl PreparedTemplateLogKey {
+    fn from_api_key(
+        key: enclava_cli::api_types::LogEncryptionKey,
+        private_key_file: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            config: enclava_engine::types::LogEncryptionConfig {
+                algorithm: key.algorithm,
+                key_id: key.key_id,
+                public_key_base64url: key.public_key_base64url,
+                public_key_sha256: key.public_key_sha256,
+            },
+            private_key_file,
+        }
+    }
 }
 
 async fn prepare_template_log_key(
@@ -465,10 +486,7 @@ async fn prepare_template_log_key(
         (Some(key_id), None) => {
             pb.set_message("Selecting tenant log-encryption key...");
             let key = api.select_log_key(instance_name, key_id).await?;
-            Ok(Some(PreparedTemplateLogKey {
-                key_id: key.key_id,
-                private_key_file: None,
-            }))
+            Ok(Some(PreparedTemplateLogKey::from_api_key(key, None)))
         }
         (None, Some(key_id)) => {
             pb.set_message("Generating tenant log-encryption key...");
@@ -482,12 +500,34 @@ async fn prepare_template_log_key(
                 true,
             )
             .await?;
-            Ok(Some(PreparedTemplateLogKey {
-                key_id: generated.key.key_id,
-                private_key_file: Some(generated.private_key_file),
-            }))
+            Ok(Some(PreparedTemplateLogKey::from_api_key(
+                generated.key,
+                Some(generated.private_key_file),
+            )))
         }
         (None, None) => Ok(None),
+    }
+}
+
+fn verify_signed_template_log_key(
+    prepared: Option<&PreparedTemplateLogKey>,
+    signed: Option<&enclava_engine::types::LogEncryptionConfig>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    match signed {
+        Some(signed) if signed == &prepared.config => Ok(()),
+        Some(signed) => Err(format!(
+            "signed deployment log-encryption key `{}` does not match requested key `{}`; retry after the platform key selection is consistent",
+            signed.key_id, prepared.config.key_id
+        )
+        .into()),
+        None => Err(format!(
+            "signed deployment omitted requested log-encryption key `{}`; retry after the platform supports pre-deploy key selection",
+            prepared.config.key_id
+        )
+        .into()),
     }
 }
 
@@ -2736,6 +2776,35 @@ mod tests {
             .is_err(),
             "a private-key path without key generation must be rejected"
         );
+    }
+
+    #[test]
+    fn template_deploy_requires_requested_log_key_in_signed_policy() {
+        let config = enclava_engine::types::LogEncryptionConfig {
+            algorithm: "x25519-hpke-v1".to_string(),
+            key_id: "shell-logs".to_string(),
+            public_key_base64url: "public-key".to_string(),
+            public_key_sha256: "sha256:public-key".to_string(),
+        };
+        let prepared = PreparedTemplateLogKey {
+            config: config.clone(),
+            private_key_file: None,
+        };
+
+        verify_signed_template_log_key(Some(&prepared), Some(&config)).unwrap();
+        verify_signed_template_log_key(None, None).unwrap();
+
+        let mut different = config.clone();
+        different.key_id = "other-key".to_string();
+        let mismatch = verify_signed_template_log_key(Some(&prepared), Some(&different))
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("does not match requested key `shell-logs`"));
+
+        let missing = verify_signed_template_log_key(Some(&prepared), None)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("omitted requested log-encryption key `shell-logs`"));
     }
 
     #[test]

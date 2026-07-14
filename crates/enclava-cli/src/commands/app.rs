@@ -33,6 +33,7 @@ use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, ve
 use enclava_cli::tee_client::TeeClient;
 use enclava_common::log_encryption::{
     EncryptedLogFrame, LOG_ENCRYPTION_ALGORITHM, decrypt_log_frame, generate_log_keypair,
+    log_keypair_from_private_key,
 };
 use enclava_common::types::{ResourceLimits, UnlockMode};
 use enclava_engine::manifest::cc_init_data;
@@ -1237,26 +1238,102 @@ pub(crate) async fn generate_log_key_for_app(
     activate_for_app: bool,
 ) -> Result<GeneratedLogKey, Box<dyn std::error::Error>> {
     paths.ensure_dirs()?;
-    let keypair = generate_log_keypair();
     let private_key_file =
         private_key_file.unwrap_or_else(|| default_log_private_key_path(paths, app_name, key_id));
+    if private_key_file.exists() {
+        let private_key = std::fs::read_to_string(&private_key_file).map_err(|err| {
+            format!(
+                "failed to read existing log private key {}: {err}",
+                private_key_file.display()
+            )
+        })?;
+        let keypair = log_keypair_from_private_key(private_key.trim()).map_err(|err| {
+            format!(
+                "existing log private key {} is invalid: {err}",
+                private_key_file.display()
+            )
+        })?;
+        let registered = api
+            .list_log_keys(app_name)
+            .await?
+            .keys
+            .into_iter()
+            .find(|key| key.key_id == key_id);
+        let key = match registered {
+            Some(key) => {
+                verify_registered_log_key_matches_private(&key, &keypair, &private_key_file)?;
+                if activate_for_app && !key.active_for_app {
+                    api.select_log_key(app_name, key_id).await?
+                } else {
+                    key
+                }
+            }
+            None => {
+                register_log_keypair(api, app_name, key_id, label, activate_for_app, &keypair)
+                    .await?
+            }
+        };
+        return Ok(GeneratedLogKey {
+            key,
+            private_key_file,
+        });
+    }
+
+    let keypair = generate_log_keypair();
     write_private_log_key(&private_key_file, &keypair.private_key_base64url)?;
-    let key = api
-        .register_log_key(
-            app_name,
-            &RegisterLogEncryptionKeyRequest {
-                key_id: key_id.to_string(),
-                algorithm: LOG_ENCRYPTION_ALGORITHM.to_string(),
-                public_key_base64url: keypair.public_key_base64url,
-                label,
-                activate_for_app,
-            },
-        )
-        .await?;
+    let key =
+        register_log_keypair(api, app_name, key_id, label, activate_for_app, &keypair).await?;
     Ok(GeneratedLogKey {
         key,
         private_key_file,
     })
+}
+
+async fn register_log_keypair(
+    api: &ApiClient,
+    app_name: &str,
+    key_id: &str,
+    label: Option<String>,
+    activate_for_app: bool,
+    keypair: &enclava_common::log_encryption::LogEncryptionKeyPair,
+) -> Result<LogEncryptionKey, ApiError> {
+    api.register_log_key(
+        app_name,
+        &RegisterLogEncryptionKeyRequest {
+            key_id: key_id.to_string(),
+            algorithm: LOG_ENCRYPTION_ALGORITHM.to_string(),
+            public_key_base64url: keypair.public_key_base64url.clone(),
+            label,
+            activate_for_app,
+        },
+    )
+    .await
+}
+
+fn verify_registered_log_key_matches_private(
+    key: &LogEncryptionKey,
+    keypair: &enclava_common::log_encryption::LogEncryptionKeyPair,
+    private_key_file: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if key.status == "revoked" {
+        return Err(format!(
+            "log key `{}` is revoked; choose a new --generate-log-key id",
+            key.key_id
+        )
+        .into());
+    }
+    if key.algorithm != LOG_ENCRYPTION_ALGORITHM
+        || key.public_key_base64url != keypair.public_key_base64url
+        || key.public_key_sha256 != keypair.public_key_sha256
+    {
+        return Err(format!(
+            "existing log private key {} does not match registered log key `{}`; choose a new key id or restore the matching private key",
+            private_key_file.display(),
+            key.key_id
+        )
+        .into());
+    }
+    Ok(())
 }
 
 async fn list_log_keys(args: LogKeyAppArgs) -> Result<(), Box<dyn std::error::Error>> {
