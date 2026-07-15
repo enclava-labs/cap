@@ -198,12 +198,24 @@ pub(crate) async fn observe_app_status_fields(
     domain: &str,
     tee_domain: Option<&str>,
 ) -> ObservedAppStatus {
+    observe_app_status_fields_for_deployment(state, namespace, app_name, domain, tee_domain, None)
+        .await
+}
+
+pub(crate) async fn observe_app_status_fields_for_deployment(
+    state: &AppState,
+    namespace: &str,
+    app_name: &str,
+    domain: &str,
+    tee_domain: Option<&str>,
+    expected_deployment_id: Option<Uuid>,
+) -> ObservedAppStatus {
     let tee_status_url = confidential_status_url(domain, tee_domain);
     let (kubernetes, tee) = tokio::join!(
         probe_kubernetes(namespace, app_name),
         probe_tee(state, &tee_status_url)
     );
-    classify_live_observation(kubernetes, tee, Utc::now())
+    classify_live_observation_for_deployment(kubernetes, tee, Utc::now(), expected_deployment_id)
 }
 
 async fn probe_kubernetes(namespace: &str, app_name: &str) -> KubernetesEvidence {
@@ -309,10 +321,20 @@ fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
     }
 }
 
+#[cfg(test)]
 fn classify_live_observation(
     kubernetes: KubernetesEvidence,
     tee: TeeEvidence,
     observed_at: DateTime<Utc>,
+) -> ObservedAppStatus {
+    classify_live_observation_for_deployment(kubernetes, tee, observed_at, None)
+}
+
+fn classify_live_observation_for_deployment(
+    kubernetes: KubernetesEvidence,
+    tee: TeeEvidence,
+    observed_at: DateTime<Utc>,
+    expected_deployment_id: Option<Uuid>,
 ) -> ObservedAppStatus {
     let KubernetesEvidence::Available(pod) = kubernetes else {
         return incomplete_observation(
@@ -361,6 +383,22 @@ fn classify_live_observation(
         return incomplete_observation(
             LiveObservationState::Partial,
             LiveObservationReason::PodEvidenceIncomplete,
+            observed_at,
+            pod.deployment_id,
+            pod.phase,
+            None,
+            None,
+            None,
+            pod.runtime_failure,
+        );
+    }
+    if expected_deployment_id.is_some()
+        && pod.deployment_id.is_some()
+        && pod.deployment_id != expected_deployment_id
+    {
+        return incomplete_observation(
+            LiveObservationState::Partial,
+            LiveObservationReason::EvidenceMismatch,
             observed_at,
             pod.deployment_id,
             pod.phase,
@@ -516,23 +554,21 @@ fn effective_app_status(
     if runtime_failure {
         return "failed".to_string();
     }
-    if !matches!(recorded_status, "running" | "healthy") {
+    if recorded_status != "running" {
         return recorded_status.to_string();
     }
     match observation_state {
         LiveObservationState::Unavailable => "unavailable".to_string(),
-        LiveObservationState::Partial if recorded_status == "running" => match live_state {
+        LiveObservationState::Partial => match live_state {
             Some("unlocked") => "running".to_string(),
             Some("locked") => "locked".to_string(),
             _ => "partial".to_string(),
         },
-        LiveObservationState::Partial => "partial".to_string(),
-        LiveObservationState::Fresh if recorded_status == "running" => match live_state {
+        LiveObservationState::Fresh => match live_state {
             Some("unlocked") => "running".to_string(),
             Some("locked") => "locked".to_string(),
             _ => recorded_status.to_string(),
         },
-        LiveObservationState::Fresh => recorded_status.to_string(),
     }
 }
 
@@ -592,8 +628,8 @@ mod tests {
 
     use super::{
         KubernetesEvidence, LiveObservationReason, LiveObservationState, PodEvidence, TeeEvidence,
-        classify_live_observation, confidential_status_url, effective_app_status,
-        tee_evidence_fields,
+        classify_live_observation, classify_live_observation_for_deployment,
+        confidential_status_url, effective_app_status, tee_evidence_fields,
     };
 
     fn observed_at() -> chrono::DateTime<Utc> {
@@ -790,24 +826,21 @@ mod tests {
     }
 
     #[test]
-    fn healthy_deployment_fails_closed_without_fresh_evidence() {
-        assert_eq!(
-            effective_app_status("healthy", LiveObservationState::Unavailable, None, false),
-            "unavailable"
+    fn deployment_identity_mismatch_is_not_fresh() {
+        let observed = classify_live_observation_for_deployment(
+            complete_pod(Uuid::new_v4()),
+            complete_tee(),
+            observed_at(),
+            Some(Uuid::new_v4()),
         );
+
+        assert_eq!(observed.observation.state, LiveObservationState::Partial);
         assert_eq!(
-            effective_app_status("healthy", LiveObservationState::Partial, None, false),
-            "partial"
+            observed.observation.reason,
+            Some(LiveObservationReason::EvidenceMismatch)
         );
-        assert_eq!(
-            effective_app_status(
-                "healthy",
-                LiveObservationState::Fresh,
-                Some("unlocked"),
-                false
-            ),
-            "healthy"
-        );
+        assert!(observed.observation.deployment_id.is_some());
+        assert_eq!(observed.effective_status("running"), "partial");
     }
 
     #[test]

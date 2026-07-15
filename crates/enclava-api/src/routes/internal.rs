@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::auth::middleware::{AuthContext, ManagementOrigin};
 use crate::models::Role;
 use crate::routes::platform::{DeploymentContextResponse, deployment_context_response};
-use crate::routes::status::observe_app_status_fields;
+use crate::routes::status::observe_app_status_fields_for_deployment;
 use crate::state::AppState;
 
 const STATUS_OBSERVATION_CONCURRENCY: usize = 16;
@@ -1173,13 +1173,17 @@ async fn observed_internal_status_item(
     image_digest: Option<String>,
     recorded_error_message: Option<String>,
 ) -> serde_json::Value {
-    let observed =
-        observe_app_status_fields(state, &namespace, &app_name, &domain, tee_domain.as_deref())
-            .await;
+    let observed = observe_app_status_fields_for_deployment(
+        state,
+        &namespace,
+        &app_name,
+        &domain,
+        tee_domain.as_deref(),
+        cap_deployment_id,
+    )
+    .await;
     let app_status = observed.effective_status(&recorded_app_status);
-    let deployment_status = recorded_deployment_status
-        .as_deref()
-        .map(|status| observed.effective_status(status));
+    let deployment_status = recorded_deployment_status.clone();
     let error_message = if observed.runtime_failed() {
         Some("runtime_failure".to_string())
     } else if recorded_error_message.is_some() {
