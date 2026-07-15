@@ -180,26 +180,24 @@ pub async fn app_status(
 }
 
 pub(crate) async fn observe_app_status(state: &AppState, app: &App) -> ObservedAppStatus {
+    observe_app_status_for_deployment(state, app, None).await
+}
+
+pub(crate) async fn observe_app_status_for_deployment(
+    state: &AppState,
+    app: &App,
+    expected_deployment_id: Option<Uuid>,
+) -> ObservedAppStatus {
     let domain = app.custom_domain.as_deref().unwrap_or(&app.domain);
-    observe_app_status_fields(
+    observe_app_status_fields_for_deployment(
         state,
         &app.namespace,
         &app.name,
         domain,
         app.tee_domain.as_deref(),
+        expected_deployment_id,
     )
     .await
-}
-
-pub(crate) async fn observe_app_status_fields(
-    state: &AppState,
-    namespace: &str,
-    app_name: &str,
-    domain: &str,
-    tee_domain: Option<&str>,
-) -> ObservedAppStatus {
-    observe_app_status_fields_for_deployment(state, namespace, app_name, domain, tee_domain, None)
-        .await
 }
 
 pub(crate) async fn observe_app_status_fields_for_deployment(

@@ -1,5 +1,5 @@
 use super::*;
-use crate::routes::status::{LiveObservation, observe_app_status};
+use crate::routes::status::{LiveObservation, observe_app_status_for_deployment};
 
 #[derive(Debug, Deserialize)]
 pub struct GenericDeploymentRequest {
@@ -342,7 +342,9 @@ pub async fn get_generic_deployment(
         .await?
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "deployment not found"))?;
 
-    let observation = observe_app_status(&state, &app).await.observation;
+    let observation = observe_app_status_for_deployment(&state, &app, Some(deployment.id))
+        .await
+        .observation;
     Ok(Json(
         GenericDeploymentResponse::from_deployment(deployment, &app).with_observation(observation),
     ))

@@ -2230,13 +2230,15 @@ async fn observed_internal_status_item(
     )
     .await;
     let app_status = observed.effective_status(&recorded_app_status);
-    let deployment_status = recorded_deployment_status.clone();
+    let deployment_status = if observed.runtime_failed() {
+        Some("failed".to_string())
+    } else {
+        recorded_deployment_status.clone()
+    };
     let error_message = if observed.runtime_failed() {
         Some("runtime_failure".to_string())
-    } else if recorded_error_message.is_some() {
-        Some("deployment_failed".to_string())
     } else {
-        None
+        recorded_error_message
     };
     let latest_deployment = cap_deployment_id.map(|id| {
         serde_json::json!({
