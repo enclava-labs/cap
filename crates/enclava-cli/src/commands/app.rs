@@ -630,7 +630,11 @@ async fn wait_for_deploy_runtime(
 
         match api.get_status(app_name).await {
             Ok(status) => {
-                if target.accepts_api_status(status.status.as_str()) {
+                let observation_is_fresh = status
+                    .observation
+                    .as_ref()
+                    .is_some_and(|observation| observation.state == "fresh");
+                if observation_is_fresh && target.accepts_api_status(status.status.as_str()) {
                     pb.set_position(3);
                     pb.set_message(match status.status.as_str() {
                         "locked" => "TEE running, storage locked",
@@ -639,11 +643,7 @@ async fn wait_for_deploy_runtime(
                     return Ok(());
                 }
 
-                let pod_phase_is_verified = status
-                    .observation
-                    .as_ref()
-                    .is_none_or(|observation| observation.state == "fresh")
-                    && status.status != "failed";
+                let pod_phase_is_verified = observation_is_fresh && status.status != "failed";
                 match status.pod_phase.as_deref() {
                     Some("Running")
                         if pod_phase_is_verified && target.accepts_running_pod_phase() =>

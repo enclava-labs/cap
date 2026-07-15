@@ -85,6 +85,7 @@ struct PodEvidence {
     found: bool,
     phase: Option<String>,
     deployment_id: Option<Uuid>,
+    deployment_id_malformed: bool,
     runtime_failure: bool,
 }
 
@@ -233,16 +234,23 @@ async fn probe_kubernetes(namespace: &str, app_name: &str) -> KubernetesEvidence
     }
     let pod = active[0];
     let phase = pod.status.as_ref().and_then(|status| status.phase.clone());
-    let deployment_id = pod
+    let deployment_id_label = pod
         .metadata
         .labels
         .as_ref()
-        .and_then(|labels| labels.get(DEPLOYMENT_ID_LABEL))
-        .and_then(|value| Uuid::parse_str(value).ok());
+        .and_then(|labels| labels.get(DEPLOYMENT_ID_LABEL));
+    let (deployment_id, deployment_id_malformed) = match deployment_id_label {
+        Some(value) => match Uuid::parse_str(value) {
+            Ok(deployment_id) => (Some(deployment_id), false),
+            Err(_) => (None, true),
+        },
+        None => (None, false),
+    };
     KubernetesEvidence::Available(PodEvidence {
         found: true,
         phase,
         deployment_id,
+        deployment_id_malformed,
         runtime_failure,
     })
 }
@@ -345,6 +353,23 @@ fn classify_live_observation(
             pod.runtime_failure,
         );
     }
+    if !pod
+        .phase
+        .as_deref()
+        .is_some_and(|phase| phase.eq_ignore_ascii_case("running"))
+    {
+        return incomplete_observation(
+            LiveObservationState::Partial,
+            LiveObservationReason::PodEvidenceIncomplete,
+            observed_at,
+            pod.deployment_id,
+            pod.phase,
+            None,
+            None,
+            None,
+            pod.runtime_failure,
+        );
+    }
     let fields = match tee {
         TeeEvidence::Unavailable => {
             return incomplete_observation(
@@ -397,6 +422,19 @@ fn classify_live_observation(
             LiveObservationReason::EvidenceMismatch,
             observed_at,
             pod.deployment_id,
+            pod.phase,
+            fields.pod_status,
+            fields.tee_status,
+            fields.storage_status,
+            pod.runtime_failure,
+        );
+    }
+    if pod.deployment_id_malformed {
+        return incomplete_observation(
+            LiveObservationState::Partial,
+            LiveObservationReason::PodEvidenceIncomplete,
+            observed_at,
+            None,
             pod.phase,
             fields.pod_status,
             fields.tee_status,
@@ -478,21 +516,23 @@ fn effective_app_status(
     if runtime_failure {
         return "failed".to_string();
     }
-    if recorded_status != "running" {
+    if !matches!(recorded_status, "running" | "healthy") {
         return recorded_status.to_string();
     }
     match observation_state {
         LiveObservationState::Unavailable => "unavailable".to_string(),
-        LiveObservationState::Partial => match live_state {
+        LiveObservationState::Partial if recorded_status == "running" => match live_state {
             Some("unlocked") => "running".to_string(),
             Some("locked") => "locked".to_string(),
             _ => "partial".to_string(),
         },
-        LiveObservationState::Fresh => match live_state {
+        LiveObservationState::Partial => "partial".to_string(),
+        LiveObservationState::Fresh if recorded_status == "running" => match live_state {
             Some("unlocked") => "running".to_string(),
             Some("locked") => "locked".to_string(),
             _ => recorded_status.to_string(),
         },
+        LiveObservationState::Fresh => recorded_status.to_string(),
     }
 }
 
@@ -567,6 +607,7 @@ mod tests {
             found: true,
             phase: Some("Running".to_string()),
             deployment_id: Some(deployment_id),
+            deployment_id_malformed: false,
             runtime_failure: false,
         })
     }
@@ -673,6 +714,7 @@ mod tests {
             found: true,
             phase: Some("Running".to_string()),
             deployment_id: None,
+            deployment_id_malformed: false,
             runtime_failure: false,
         });
         let observed = classify_live_observation(pod, complete_tee(), observed_at());
@@ -714,12 +756,68 @@ mod tests {
     }
 
     #[test]
+    fn non_running_pod_cannot_be_fresh_from_unlocked_tee_evidence() {
+        let pod = KubernetesEvidence::Available(PodEvidence {
+            found: true,
+            phase: Some("Pending".to_string()),
+            deployment_id: Some(Uuid::new_v4()),
+            deployment_id_malformed: false,
+            runtime_failure: false,
+        });
+        let observed = classify_live_observation(pod, complete_tee(), observed_at());
+
+        assert_eq!(observed.observation.state, LiveObservationState::Partial);
+        assert_eq!(
+            observed.observation.reason,
+            Some(LiveObservationReason::PodEvidenceIncomplete)
+        );
+        assert_eq!(observed.effective_status("running"), "partial");
+    }
+
+    #[test]
+    fn malformed_deployment_identity_cannot_use_legacy_compatibility() {
+        let pod = KubernetesEvidence::Available(PodEvidence {
+            found: true,
+            phase: Some("Running".to_string()),
+            deployment_id: None,
+            deployment_id_malformed: true,
+            runtime_failure: false,
+        });
+        let observed = classify_live_observation(pod, complete_tee(), observed_at());
+
+        assert_eq!(observed.observation.state, LiveObservationState::Partial);
+        assert_eq!(observed.effective_status("running"), "partial");
+    }
+
+    #[test]
+    fn healthy_deployment_fails_closed_without_fresh_evidence() {
+        assert_eq!(
+            effective_app_status("healthy", LiveObservationState::Unavailable, None, false),
+            "unavailable"
+        );
+        assert_eq!(
+            effective_app_status("healthy", LiveObservationState::Partial, None, false),
+            "partial"
+        );
+        assert_eq!(
+            effective_app_status(
+                "healthy",
+                LiveObservationState::Fresh,
+                Some("unlocked"),
+                false
+            ),
+            "healthy"
+        );
+    }
+
+    #[test]
     fn ambiguous_pods_with_runtime_failure_fail_closed() {
         let observed = classify_live_observation(
             KubernetesEvidence::Available(PodEvidence {
                 found: true,
                 phase: None,
                 deployment_id: None,
+                deployment_id_malformed: false,
                 runtime_failure: true,
             }),
             complete_tee(),
