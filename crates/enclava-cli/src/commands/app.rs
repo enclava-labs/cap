@@ -463,6 +463,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             wait_for_deploy_runtime(
                 &api,
                 &app_name,
+                &resp.deployment_id,
                 max_wait,
                 poll_interval,
                 &pb,
@@ -493,6 +494,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         wait_for_deploy_runtime(
             &api,
             &app_name,
+            &resp.deployment_id,
             max_wait,
             poll_interval,
             &pb,
@@ -608,6 +610,7 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
 async fn wait_for_deploy_runtime(
     api: &ApiClient,
     app_name: &str,
+    expected_deployment_id: &str,
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
@@ -628,12 +631,12 @@ async fn wait_for_deploy_runtime(
             return Err("deploy timed out waiting for TEE to boot".into());
         }
 
-        match api.get_status(app_name).await {
+        let direct_tee_allowed = match api.get_status(app_name).await {
             Ok(status) => {
-                let observation_is_fresh = status
-                    .observation
-                    .as_ref()
-                    .is_none_or(|observation| observation.state == "fresh");
+                let observation_is_fresh = status.observation.as_ref().is_none_or(|observation| {
+                    observation.state == "fresh"
+                        && observation.deployment_id.as_deref() == Some(expected_deployment_id)
+                });
                 if observation_is_fresh && target.accepts_api_status(status.status.as_str()) {
                     pb.set_position(3);
                     pb.set_message(match status.status.as_str() {
@@ -657,13 +660,16 @@ async fn wait_for_deploy_runtime(
                     }
                     None => {}
                 }
+                observation_is_fresh
             }
             Err(_) => {
                 // Status endpoint may not be ready yet.
+                false
             }
-        }
+        };
 
-        if let Some(tee) = direct_tee.as_ref()
+        if direct_tee_allowed
+            && let Some(tee) = direct_tee.as_ref()
             && let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
             && let Ok(status) = attested_tee.status_json().await
         {

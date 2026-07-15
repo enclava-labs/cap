@@ -449,10 +449,12 @@ fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
         body.contains("observation_is_fresh")
             && body.contains("if observation_is_fresh && target.accepts_api_status")
             && body.contains("pod_phase_is_verified")
-            && body.contains(".is_none_or(|observation| observation.state == \"fresh\")")
+            && body
+                .contains("observation.deployment_id.as_deref() == Some(expected_deployment_id)")
             && body.contains("observation.state == \"fresh\"")
+            && body.contains("direct_tee_allowed")
             && body.contains("status.status != \"failed\""),
-        "new observations must be fresh while legacy responses without observation remain compatible"
+        "new observations must be fresh and deployment-bound while legacy responses without observation remain compatible"
     );
 }
 

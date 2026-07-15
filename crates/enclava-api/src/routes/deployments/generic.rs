@@ -343,12 +343,24 @@ pub async fn get_generic_deployment(
         .await?
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "deployment not found"))?;
 
-    let observation = observe_app_status_for_deployment(&state, &app, Some(deployment.id))
-        .await
-        .observation;
-    Ok(Json(
-        GenericDeploymentResponse::from_deployment(deployment, &app).with_observation(observation),
-    ))
+    let observed = observe_app_status_for_deployment(&state, &app, Some(deployment.id)).await;
+    let runtime_failure = (observed.runtime_failed()
+        && observed.observation.deployment_id == Some(deployment.id))
+    .then(|| {
+        observed
+            .runtime_failure_message()
+            .unwrap_or("runtime_failure")
+            .to_string()
+    });
+    let observation = observed.observation;
+    let mut response =
+        GenericDeploymentResponse::from_deployment(deployment, &app).with_observation(observation);
+    if let Some(runtime_failure) = runtime_failure {
+        response.status = "failed".to_string();
+        response.app_status = "failed".to_string();
+        response.error_message = Some(runtime_failure);
+    }
+    Ok(Json(response))
 }
 
 /// POST /deployments/{deployment_id}/config-token -- generic config-token bridge.

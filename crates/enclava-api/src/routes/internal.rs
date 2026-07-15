@@ -1183,13 +1183,16 @@ async fn observed_internal_status_item(
     )
     .await;
     let app_status = observed.effective_status(&recorded_app_status);
-    let deployment_status = if observed.runtime_failed() {
+    let runtime_failure_applies = observed.runtime_failed()
+        && observed.observation.deployment_id.is_some()
+        && observed.observation.deployment_id == cap_deployment_id;
+    let deployment_status = if runtime_failure_applies {
         Some("failed".to_string())
     } else {
         recorded_deployment_status.clone()
     };
-    let error_message = if observed.runtime_failed() {
-        Some("runtime_failure".to_string())
+    let error_message = if runtime_failure_applies {
+        observed.runtime_failure_message().map(str::to_string)
     } else {
         recorded_error_message
     };
