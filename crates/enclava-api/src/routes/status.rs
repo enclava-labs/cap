@@ -86,7 +86,14 @@ struct PodEvidence {
     phase: Option<String>,
     deployment_id: Option<Uuid>,
     deployment_id_malformed: bool,
-    runtime_failure: Option<String>,
+    runtime_failure: Option<RuntimeFailureEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RuntimeFailureEvidence {
+    message: String,
+    deployment_id: Option<Uuid>,
+    deployment_id_malformed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,7 +125,7 @@ pub(crate) struct ObservedAppStatus {
     tee_status: Option<String>,
     storage_status: Option<String>,
     live_state: Option<String>,
-    runtime_failure: Option<String>,
+    runtime_failure: Option<RuntimeFailureEvidence>,
 }
 
 impl ObservedAppStatus {
@@ -131,12 +138,26 @@ impl ObservedAppStatus {
         )
     }
 
-    pub(crate) fn runtime_failed(&self) -> bool {
-        self.runtime_failure.is_some()
+    pub(crate) fn runtime_failure_message(&self) -> Option<&str> {
+        self.runtime_failure
+            .as_ref()
+            .map(|failure| failure.message.as_str())
     }
 
-    pub(crate) fn runtime_failure_message(&self) -> Option<&str> {
-        self.runtime_failure.as_deref()
+    pub(crate) fn runtime_failure_matches_deployment(&self, expected_deployment_id: Uuid) -> bool {
+        self.runtime_failure.as_ref().is_some_and(|failure| {
+            !failure.deployment_id_malformed
+                && failure.deployment_id == Some(expected_deployment_id)
+        })
+    }
+
+    pub(crate) fn runtime_failure_applies_to_latest(&self, expected_deployment_id: Uuid) -> bool {
+        self.runtime_failure.as_ref().is_some_and(|failure| {
+            !failure.deployment_id_malformed
+                && failure
+                    .deployment_id
+                    .is_none_or(|deployment_id| deployment_id == expected_deployment_id)
+        })
     }
 }
 
@@ -214,13 +235,17 @@ pub(crate) async fn observe_app_status_fields_for_deployment(
 ) -> ObservedAppStatus {
     let tee_status_url = confidential_status_url(domain, tee_domain);
     let (kubernetes, tee) = tokio::join!(
-        probe_kubernetes(namespace, app_name),
+        probe_kubernetes(namespace, app_name, expected_deployment_id),
         probe_tee(state, &tee_status_url)
     );
     classify_live_observation_for_deployment(kubernetes, tee, Utc::now(), expected_deployment_id)
 }
 
-async fn probe_kubernetes(namespace: &str, app_name: &str) -> KubernetesEvidence {
+async fn probe_kubernetes(
+    namespace: &str,
+    app_name: &str,
+    expected_deployment_id: Option<Uuid>,
+) -> KubernetesEvidence {
     let Ok(client) = kube::Client::try_default().await else {
         return KubernetesEvidence::Unavailable;
     };
@@ -236,30 +261,29 @@ async fn probe_kubernetes(namespace: &str, app_name: &str) -> KubernetesEvidence
         .iter()
         .filter(|pod| pod.metadata.deletion_timestamp.is_none())
         .collect::<Vec<_>>();
-    let runtime_failure = active
-        .iter()
-        .find_map(|pod| pod_runtime_failure_message(pod));
+    let runtime_failure = select_runtime_failure(
+        active
+            .iter()
+            .filter_map(|pod| runtime_failure_evidence(pod))
+            .collect(),
+        expected_deployment_id,
+    );
     if active.len() != 1 {
         return KubernetesEvidence::Available(PodEvidence {
             found: !active.is_empty(),
+            deployment_id: runtime_failure
+                .as_ref()
+                .and_then(|failure| failure.deployment_id),
+            deployment_id_malformed: runtime_failure
+                .as_ref()
+                .is_some_and(|failure| failure.deployment_id_malformed),
             runtime_failure,
             ..PodEvidence::default()
         });
     }
     let pod = active[0];
     let phase = pod.status.as_ref().and_then(|status| status.phase.clone());
-    let deployment_id_label = pod
-        .metadata
-        .labels
-        .as_ref()
-        .and_then(|labels| labels.get(DEPLOYMENT_ID_LABEL));
-    let (deployment_id, deployment_id_malformed) = match deployment_id_label {
-        Some(value) => match Uuid::parse_str(value) {
-            Ok(deployment_id) => (Some(deployment_id), false),
-            Err(_) => (None, true),
-        },
-        None => (None, false),
-    };
+    let (deployment_id, deployment_id_malformed) = pod_deployment_identity(pod);
     KubernetesEvidence::Available(PodEvidence {
         found: true,
         phase,
@@ -267,6 +291,45 @@ async fn probe_kubernetes(namespace: &str, app_name: &str) -> KubernetesEvidence
         deployment_id_malformed,
         runtime_failure,
     })
+}
+
+fn pod_deployment_identity(pod: &Pod) -> (Option<Uuid>, bool) {
+    let deployment_id_label = pod
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(DEPLOYMENT_ID_LABEL));
+    match deployment_id_label {
+        Some(value) => match Uuid::parse_str(value) {
+            Ok(deployment_id) => (Some(deployment_id), false),
+            Err(_) => (None, true),
+        },
+        None => (None, false),
+    }
+}
+
+fn runtime_failure_evidence(pod: &Pod) -> Option<RuntimeFailureEvidence> {
+    let message = pod_runtime_failure_message(pod)?;
+    let (deployment_id, deployment_id_malformed) = pod_deployment_identity(pod);
+    Some(RuntimeFailureEvidence {
+        message,
+        deployment_id,
+        deployment_id_malformed,
+    })
+}
+
+fn select_runtime_failure(
+    failures: Vec<RuntimeFailureEvidence>,
+    expected_deployment_id: Option<Uuid>,
+) -> Option<RuntimeFailureEvidence> {
+    if let Some(expected_deployment_id) = expected_deployment_id
+        && let Some(index) = failures
+            .iter()
+            .position(|failure| failure.deployment_id == Some(expected_deployment_id))
+    {
+        return failures.into_iter().nth(index);
+    }
+    failures.into_iter().next()
 }
 
 /// Compatibility helper for the existing operator inventory. Errors remain
@@ -531,7 +594,7 @@ fn incomplete_observation(
     pod_status: Option<String>,
     tee_status: Option<String>,
     storage_status: Option<String>,
-    runtime_failure: Option<String>,
+    runtime_failure: Option<RuntimeFailureEvidence>,
 ) -> ObservedAppStatus {
     ObservedAppStatus {
         observation: LiveObservation {
@@ -631,9 +694,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        KubernetesEvidence, LiveObservationReason, LiveObservationState, PodEvidence, TeeEvidence,
-        classify_live_observation, classify_live_observation_for_deployment,
-        confidential_status_url, effective_app_status, tee_evidence_fields,
+        KubernetesEvidence, LiveObservationReason, LiveObservationState, PodEvidence,
+        RuntimeFailureEvidence, TeeEvidence, classify_live_observation,
+        classify_live_observation_for_deployment, confidential_status_url, effective_app_status,
+        select_runtime_failure, tee_evidence_fields,
     };
 
     fn observed_at() -> chrono::DateTime<Utc> {
@@ -659,6 +723,17 @@ mod tests {
             "storage_status": "unlocked",
             "state": "unlocked"
         })))
+    }
+
+    fn runtime_failure(
+        deployment_id: Option<Uuid>,
+        deployment_id_malformed: bool,
+    ) -> RuntimeFailureEvidence {
+        RuntimeFailureEvidence {
+            message: "container 'app' is CrashLoopBackOff".to_string(),
+            deployment_id,
+            deployment_id_malformed,
+        }
     }
 
     #[test]
@@ -867,19 +942,77 @@ mod tests {
 
     #[test]
     fn ambiguous_pods_with_runtime_failure_fail_closed() {
+        let deployment_id = Uuid::new_v4();
         let observed = classify_live_observation(
             KubernetesEvidence::Available(PodEvidence {
                 found: true,
                 phase: None,
-                deployment_id: None,
+                deployment_id: Some(deployment_id),
                 deployment_id_malformed: false,
-                runtime_failure: Some("container 'app' is CrashLoopBackOff".to_string()),
+                runtime_failure: Some(runtime_failure(Some(deployment_id), false)),
             }),
             complete_tee(),
             observed_at(),
         );
 
         assert_eq!(observed.effective_status("running"), "failed");
+        assert!(observed.runtime_failure_matches_deployment(deployment_id));
+    }
+
+    #[test]
+    fn overlapping_pod_failure_prefers_the_expected_deployment_identity() {
+        let previous_deployment_id = Uuid::new_v4();
+        let expected_deployment_id = Uuid::new_v4();
+        let selected = select_runtime_failure(
+            vec![
+                runtime_failure(Some(previous_deployment_id), false),
+                runtime_failure(Some(expected_deployment_id), false),
+            ],
+            Some(expected_deployment_id),
+        )
+        .expect("runtime failure");
+
+        assert_eq!(selected.deployment_id, Some(expected_deployment_id));
+    }
+
+    #[test]
+    fn legacy_unlabelled_runtime_failure_applies_to_current_deployment() {
+        let expected_deployment_id = Uuid::new_v4();
+        let observed = classify_live_observation_for_deployment(
+            KubernetesEvidence::Available(PodEvidence {
+                found: true,
+                phase: Some("Running".to_string()),
+                deployment_id: None,
+                deployment_id_malformed: false,
+                runtime_failure: Some(runtime_failure(None, false)),
+            }),
+            complete_tee(),
+            observed_at(),
+            Some(expected_deployment_id),
+        );
+
+        assert!(observed.runtime_failure_applies_to_latest(expected_deployment_id));
+        assert!(!observed.runtime_failure_matches_deployment(expected_deployment_id));
+    }
+
+    #[test]
+    fn malformed_runtime_failure_identity_never_applies_to_a_deployment() {
+        let expected_deployment_id = Uuid::new_v4();
+        let observed = classify_live_observation_for_deployment(
+            KubernetesEvidence::Available(PodEvidence {
+                found: true,
+                phase: Some("Running".to_string()),
+                deployment_id: None,
+                deployment_id_malformed: true,
+                runtime_failure: Some(runtime_failure(None, true)),
+            }),
+            complete_tee(),
+            observed_at(),
+            Some(expected_deployment_id),
+        );
+
+        assert!(!observed.runtime_failure_applies_to_latest(expected_deployment_id));
+        assert!(!observed.runtime_failure_matches_deployment(expected_deployment_id));
     }
 
     #[test]

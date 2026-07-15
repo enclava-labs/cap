@@ -343,14 +343,14 @@ pub async fn get_generic_deployment(
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "deployment not found"))?;
 
     let observed = observe_app_status_for_deployment(&state, &app, Some(deployment.id)).await;
-    let runtime_failure = (observed.runtime_failed()
-        && observed.observation.deployment_id == Some(deployment.id))
-    .then(|| {
-        observed
-            .runtime_failure_message()
-            .unwrap_or("runtime_failure")
-            .to_string()
-    });
+    let runtime_failure = observed
+        .runtime_failure_matches_deployment(deployment.id)
+        .then(|| {
+            observed
+                .runtime_failure_message()
+                .unwrap_or("runtime_failure")
+                .to_string()
+        });
     let observation = observed.observation;
     let mut response =
         GenericDeploymentResponse::from_deployment(deployment, &app).with_observation(observation);

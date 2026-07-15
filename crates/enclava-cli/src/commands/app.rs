@@ -663,10 +663,15 @@ async fn wait_for_deploy_runtime(
 
         let direct_tee_allowed = match api.get_status(app_name).await {
             Ok(status) => {
-                let observation_is_fresh = status.observation.as_ref().is_none_or(|observation| {
-                    observation.state == "fresh"
-                        && observation.deployment_id.as_deref() == Some(expected_deployment_id)
-                });
+                let observation_is_fresh = observation_is_fresh_for_deployment(
+                    status.observation.as_ref(),
+                    expected_deployment_id,
+                );
+                let direct_tee_allowed = status.status != "failed"
+                    && observation_allows_direct_tee_fallback(
+                        status.observation.as_ref(),
+                        expected_deployment_id,
+                    );
                 if observation_is_fresh && target.accepts_api_status(status.status.as_str()) {
                     pb.set_position(3);
                     pb.set_message(match status.status.as_str() {
@@ -690,7 +695,7 @@ async fn wait_for_deploy_runtime(
                     }
                     None => {}
                 }
-                observation_is_fresh
+                direct_tee_allowed
             }
             Err(_) => {
                 // Status endpoint may not be ready yet.
@@ -723,6 +728,28 @@ async fn wait_for_deploy_runtime(
 
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+fn observation_is_fresh_for_deployment(
+    observation: Option<&AppStatusObservation>,
+    expected_deployment_id: &str,
+) -> bool {
+    observation.is_none_or(|observation| {
+        observation.state == "fresh"
+            && !observation.drifted
+            && observation.deployment_id.as_deref() == Some(expected_deployment_id)
+    })
+}
+
+fn observation_allows_direct_tee_fallback(
+    observation: Option<&AppStatusObservation>,
+    expected_deployment_id: &str,
+) -> bool {
+    observation.is_none_or(|observation| {
+        matches!(observation.state.as_str(), "fresh" | "partial")
+            && !observation.drifted
+            && observation.deployment_id.as_deref() == Some(expected_deployment_id)
+    })
 }
 
 async fn find_deployment_entry(

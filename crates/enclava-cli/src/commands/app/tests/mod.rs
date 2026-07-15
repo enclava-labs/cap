@@ -496,6 +496,58 @@ fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
     );
 }
 
+fn deploy_observation(
+    state: &str,
+    deployment_id: Option<&str>,
+    drifted: bool,
+) -> AppStatusObservation {
+    AppStatusObservation {
+        state: state.to_string(),
+        reason: None,
+        observed_at: None,
+        last_reconciliation_attempted_at: None,
+        last_successful_reconciled_at: None,
+        deployment_id: deployment_id.map(str::to_string),
+        status: None,
+        drifted,
+    }
+}
+
+#[test]
+fn deploy_runtime_direct_tee_fallback_accepts_matching_partial_observation() {
+    let expected_deployment_id = "22222222-2222-2222-2222-222222222222";
+    let observation = deploy_observation("partial", Some(expected_deployment_id), false);
+
+    assert!(observation_allows_direct_tee_fallback(
+        Some(&observation),
+        expected_deployment_id
+    ));
+    assert!(!observation_is_fresh_for_deployment(
+        Some(&observation),
+        expected_deployment_id
+    ));
+}
+
+#[test]
+fn deploy_runtime_direct_tee_fallback_rejects_wrong_or_drifted_deployment() {
+    let expected_deployment_id = "22222222-2222-2222-2222-222222222222";
+    let wrong = deploy_observation(
+        "partial",
+        Some("33333333-3333-3333-3333-333333333333"),
+        false,
+    );
+    let drifted = deploy_observation("partial", Some(expected_deployment_id), true);
+
+    assert!(!observation_allows_direct_tee_fallback(
+        Some(&wrong),
+        expected_deployment_id
+    ));
+    assert!(!observation_allows_direct_tee_fallback(
+        Some(&drifted),
+        expected_deployment_id
+    ));
+}
+
 #[test]
 fn status_command_falls_back_to_attested_tee_status() {
     let source = include_str!("../../app.rs");
