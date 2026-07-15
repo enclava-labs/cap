@@ -509,8 +509,36 @@ pub async fn build_confidential_app(
         .fetch_one(pool)
         .await?;
 
+    build_confidential_app_from_rows(
+        app,
+        deployment_id,
+        attestation_config,
+        api_signing_pubkey,
+        api_url,
+        &containers_rows,
+        &resources,
+    )
+}
+
+/// Build a `ConfidentialApp` from an immutable snapshot of database rows.
+///
+/// Deployment request validation uses this helper to render a candidate spec
+/// before any requested app or container changes are persisted.
+pub(crate) fn build_confidential_app_from_rows(
+    app: &App,
+    deployment_id: Uuid,
+    attestation_config: &AttestationConfig,
+    api_signing_pubkey: &str,
+    api_url: &str,
+    containers_rows: &[AppContainer],
+    resources: &AppResources,
+) -> Result<ConfidentialApp, DeployError> {
+    if containers_rows.is_empty() {
+        return Err(DeployError::NoContainers);
+    }
+
     let mut containers = Vec::new();
-    for row in &containers_rows {
+    for row in containers_rows {
         let image_str = row
             .image_digest
             .as_ref()
@@ -596,8 +624,8 @@ pub async fn build_confidential_app(
         api_signing_pubkey: api_signing_pubkey.to_string(),
         api_url: api_url.to_string(),
         resources: ResourceLimits {
-            cpu: resources.cpu_limit,
-            memory: resources.memory_limit,
+            cpu: resources.cpu_limit.clone(),
+            memory: resources.memory_limit.clone(),
         },
         attestation: attestation_config.clone(),
         egress_mode,

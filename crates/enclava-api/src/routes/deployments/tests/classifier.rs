@@ -349,6 +349,46 @@ fn signed_deploy_path_ensures_app_and_tee_dns_pair() {
 }
 
 #[test]
+fn signed_deploy_validation_precedes_atomic_candidate_commit() {
+    let source = include_str!("../../deployments.rs");
+    let deploy_body = source
+        .split("async fn deploy_app_candidate")
+        .nth(1)
+        .expect("deployment candidate function exists")
+        .split("/// GET /apps/{name}/deployments")
+        .next()
+        .expect("deployment candidate function body");
+
+    let transaction = deploy_body
+        .find("let mut tx = state.db.begin()")
+        .expect("accepted deployment transaction");
+    for validation in [
+        "validate_deployment_inputs",
+        "resolve_signed_policy_artifact",
+        "validate_rendered_cc_init_data_hash",
+    ] {
+        assert!(
+            deploy_body
+                .find(validation)
+                .expect("signed validation exists")
+                < transaction,
+            "{validation} must run before the accepted deployment transaction"
+        );
+    }
+    assert!(
+        transaction
+            < deploy_body
+                .find("INSERT INTO app_containers")
+                .expect("container candidate commit"),
+        "container rows must only change inside the accepted deployment transaction"
+    );
+    assert!(
+        deploy_body.contains("persist_workload_artifacts(\n            &mut *tx"),
+        "signed artifacts must commit in the same transaction"
+    );
+}
+
+#[test]
 fn idempotent_retry_requires_same_deployment_payload() {
     let app = idempotency_app();
     let deployment = idempotency_deployment(&app);

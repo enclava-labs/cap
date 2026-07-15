@@ -495,19 +495,20 @@ pub(crate) fn derive_identity(
     ))
 }
 
-/// POST /apps -- create a new app.
-pub async fn create_app(
-    auth: AuthContext,
-    State(state): State<AppState>,
-    Json(body): Json<CreateAppRequest>,
-) -> Result<(StatusCode, Json<AppResponse>), (StatusCode, Json<serde_json::Value>)> {
-    scopes::require_app_write(&auth)?;
-    ensure_management_write_allowed(&state, &auth).await?;
-
-    validate_app_name(&body.name).map_err(|e| {
+/// Validate an app creation request and construct the row that would be
+/// inserted, without mutating persistent state.
+///
+/// Generic deployment uses this candidate while validating signed artifacts;
+/// the row is inserted only when the deployment itself is ready to commit.
+pub(crate) async fn prepare_app_candidate(
+    state: &AppState,
+    auth: &AuthContext,
+    body: &CreateAppRequest,
+) -> Result<App, (StatusCode, Json<serde_json::Value>)> {
+    validate_app_name(&body.name).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e})),
+            Json(serde_json::json!({"error": error})),
         )
     })?;
     validate_source_metadata(
@@ -516,33 +517,31 @@ pub async fn create_app(
         body.signer_identity_subject.as_deref(),
         body.signer_identity_issuer.as_deref(),
     )
-    .map_err(|e| {
+    .map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e})),
+            Json(serde_json::json!({"error": error})),
         )
     })?;
-    let egress_allowlist = validate_egress_allowlist(&body.egress_allowlist).map_err(|e| {
+    let egress_allowlist = validate_egress_allowlist(&body.egress_allowlist).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e})),
+            Json(serde_json::json!({"error": error})),
         )
     })?;
-    let egress_mode = validate_egress_mode(&body.egress_mode).map_err(|e| {
+    let egress_mode = validate_egress_mode(&body.egress_mode).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": e})),
+            Json(serde_json::json!({"error": error})),
         )
     })?;
 
-    // Enforce core entitlement app limit.
     let org: crate::models::Organization =
         sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
             .bind(auth.org_id)
             .fetch_one(&state.db)
             .await
             .map_err(|_| internal_server_error())?;
-
     let entitlement_class = org.entitlement_class.clone();
     let decision = crate::entitlements::entitlement_decision_for_org(
         &state.db,
@@ -564,18 +563,11 @@ pub async fn create_app(
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({"error": "unknown entitlement class"})),
     ))?;
-
     let app_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps WHERE org_id = $1")
         .bind(auth.org_id)
         .fetch_one(&state.db)
         .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-        })?;
-
+        .map_err(|_| internal_server_error())?;
     if app_count >= limits.max_apps as i64 {
         return Err(deploy_blocked_response(
             "entitlement_app_limit",
@@ -595,19 +587,20 @@ pub async fn create_app(
             &body.unlock_mode,
             body.bootstrap_pubkey_hash.as_deref(),
         )
-        .map_err(|e| {
+        .map_err(|error| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": e})),
+                Json(serde_json::json!({"error": error})),
             )
         })?;
-
     let app_host =
         enclava_common::hostnames::app_hostname(&body.name, &org.cust_slug, &state.platform_domain)
-            .map_err(|e| {
+            .map_err(|error| {
                 (
                     StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": format!("invalid app hostname: {e}")})),
+                    Json(serde_json::json!({
+                        "error": format!("invalid app hostname: {error}")
+                    })),
                 )
             })?;
     let tee_host = enclava_common::hostnames::tee_hostname(
@@ -615,19 +608,64 @@ pub async fn create_app(
         &org.cust_slug,
         &state.tee_domain_suffix,
     )
-    .map_err(|e| {
+    .map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("invalid tee hostname: {e}")})),
+            Json(serde_json::json!({
+                "error": format!("invalid tee hostname: {error}")
+            })),
         )
     })?;
+    let unlock_mode = match body.unlock_mode.as_str() {
+        "auto" => crate::models::UnlockMode::Auto,
+        "password" => crate::models::UnlockMode::Password,
+        _ => unreachable!("derive_identity validates unlock_mode"),
+    };
+    let now = chrono::Utc::now();
 
-    let signer_set_at =
-        if body.signer_identity_subject.is_some() || body.signer_identity_issuer.is_some() {
-            Some(chrono::Utc::now())
-        } else {
-            None
-        };
+    Ok(App {
+        id: app_id,
+        org_id: auth.org_id,
+        name: body.name.clone(),
+        namespace,
+        instance_id,
+        tenant_id,
+        service_account,
+        bootstrap_owner_pubkey_hash: pubkey_hash,
+        tenant_instance_identity_hash: identity_hash,
+        unlock_mode,
+        domain: app_host,
+        tee_domain: Some(tee_host),
+        custom_domain: None,
+        status: AppStatus::Creating,
+        signer_identity_subject: body.signer_identity_subject.clone(),
+        signer_identity_issuer: body.signer_identity_issuer.clone(),
+        signer_identity_set_at: (body.signer_identity_subject.is_some()
+            || body.signer_identity_issuer.is_some())
+        .then_some(now),
+        source_provider: body
+            .source_provider
+            .map(SourceProvider::as_str)
+            .map(str::to_string),
+        source_repository: body.source_repository.clone(),
+        egress_allowlist: SqlJson(egress_allowlist),
+        egress_mode: egress_mode.as_str().to_string(),
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+/// POST /apps -- create a new app.
+pub async fn create_app(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Json(body): Json<CreateAppRequest>,
+) -> Result<(StatusCode, Json<AppResponse>), (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_app_write(&auth)?;
+    ensure_management_write_allowed(&state, &auth).await?;
+
+    let app_candidate = prepare_app_candidate(&state, &auth, &body).await?;
+    let app_id = app_candidate.id;
 
     let result = sqlx::query(
         "INSERT INTO apps (id, org_id, name, namespace, instance_id, tenant_id,
@@ -638,24 +676,24 @@ pub async fn create_app(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
     )
     .bind(app_id)
-    .bind(auth.org_id)
-    .bind(&body.name)
-    .bind(&namespace)
-    .bind(&instance_id)
-    .bind(&tenant_id)
-    .bind(&service_account)
-    .bind(&pubkey_hash)
-    .bind(&identity_hash)
-    .bind(&body.unlock_mode)
-    .bind(&app_host)
-    .bind(&tee_host)
-    .bind(body.signer_identity_subject.as_deref())
-    .bind(body.signer_identity_issuer.as_deref())
-    .bind(signer_set_at)
-    .bind(body.source_provider.map(SourceProvider::as_str))
-    .bind(body.source_repository.as_deref())
-    .bind(SqlJson(egress_allowlist.clone()))
-    .bind(egress_mode.as_str())
+    .bind(app_candidate.org_id)
+    .bind(&app_candidate.name)
+    .bind(&app_candidate.namespace)
+    .bind(&app_candidate.instance_id)
+    .bind(&app_candidate.tenant_id)
+    .bind(&app_candidate.service_account)
+    .bind(&app_candidate.bootstrap_owner_pubkey_hash)
+    .bind(&app_candidate.tenant_instance_identity_hash)
+    .bind(app_candidate.unlock_mode)
+    .bind(&app_candidate.domain)
+    .bind(app_candidate.tee_domain.as_deref())
+    .bind(app_candidate.signer_identity_subject.as_deref())
+    .bind(app_candidate.signer_identity_issuer.as_deref())
+    .bind(app_candidate.signer_identity_set_at)
+    .bind(app_candidate.source_provider.as_deref())
+    .bind(app_candidate.source_repository.as_deref())
+    .bind(&app_candidate.egress_allowlist)
+    .bind(&app_candidate.egress_mode)
     .execute(&state.db)
     .await;
 
@@ -689,8 +727,11 @@ pub async fn create_app(
         &state.http_client,
         state.dns.as_ref(),
         app_id,
-        &app_host,
-        &tee_host,
+        &app_candidate.domain,
+        app_candidate
+            .tee_domain
+            .as_deref()
+            .unwrap_or(&app_candidate.domain),
     )
     .await
     {
@@ -711,8 +752,8 @@ pub async fn create_app(
     .bind(serde_json::json!({
         "name": &body.name,
         "unlock_mode": &body.unlock_mode,
-        "egress_allowlist": egress_allowlist,
-        "egress_mode": egress_mode.as_str()
+        "egress_allowlist": &app_candidate.egress_allowlist.0,
+        "egress_mode": &app_candidate.egress_mode
     }))
     .execute(&state.db)
     .await;
