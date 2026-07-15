@@ -484,10 +484,12 @@ fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
         "deploy runtime wait must not depend only on API status when the direct TEE status is available"
     );
     assert!(
-        body.contains("pod_phase_is_verified")
+        body.contains("observation_is_fresh")
+            && body.contains("if observation_is_fresh && target.accepts_api_status")
+            && body.contains("pod_phase_is_verified")
             && body.contains("observation.state == \"fresh\"")
             && body.contains("status.status != \"failed\""),
-        "a partial CAP observation must not promote a Kubernetes Running phase to TEE readiness"
+        "only a fresh CAP observation may promote API status or Kubernetes phase to readiness"
     );
 }
 
