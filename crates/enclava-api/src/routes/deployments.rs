@@ -1117,7 +1117,7 @@ async fn deploy_app_candidate(
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
     let tee_domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
-    crate::dns::ensure_dns_pair(
+    if let Err(error) = crate::dns::ensure_dns_pair(
         &state.db,
         &state.http_client,
         state.dns.as_ref(),
@@ -1126,7 +1126,28 @@ async fn deploy_app_candidate(
         tee_domain,
     )
     .await
-    .map_err(dns_error_response)?;
+    {
+        // A first generic deployment creates the app as part of the accepted
+        // deployment transaction. Compensate that insert if the external DNS
+        // step fails so its deployment/external_id cannot be mistaken for an
+        // idempotent success even though apply was never started. The app FK
+        // cascades remove resources, containers, deployment, artifacts, DNS
+        // tracking, and audit rows together.
+        if app_mutation == AppMutation::Insert
+            && let Err(cleanup_error) = sqlx::query("DELETE FROM apps WHERE id = $1")
+                .bind(app.id)
+                .execute(&state.db)
+                .await
+        {
+            tracing::error!(
+                app_id = %app.id,
+                deployment_id = %deploy_id,
+                error = %cleanup_error,
+                "failed to compensate first generic deployment after DNS failure"
+            );
+        }
+        return Err(dns_error_response(error));
+    }
 
     if let Some(custom_domain) = app.custom_domain.as_ref() {
         crate::dns::record_custom_domain(&state.db, app.id, custom_domain)

@@ -389,6 +389,37 @@ fn signed_deploy_validation_precedes_atomic_candidate_commit() {
 }
 
 #[test]
+fn first_generic_deployment_is_compensated_before_dns_error_returns() {
+    let source = include_str!("../../deployments.rs");
+    let deploy_body = source
+        .split("async fn deploy_app_candidate")
+        .nth(1)
+        .expect("deployment candidate function exists")
+        .split("/// GET /apps/{name}/deployments")
+        .next()
+        .expect("deployment candidate function body");
+    let dns = deploy_body
+        .find("crate::dns::ensure_dns_pair")
+        .expect("deployment DNS provisioning");
+    let compensation = deploy_body
+        .find("DELETE FROM apps WHERE id = $1")
+        .expect("new generic app compensation");
+    let apply = deploy_body
+        .find("tokio::spawn")
+        .expect("accepted deployment apply task");
+
+    assert!(dns < compensation, "compensation must follow DNS failure");
+    assert!(
+        compensation < apply,
+        "a failed first generic deployment must be removed before apply can start"
+    );
+    assert!(
+        deploy_body[..compensation].contains("app_mutation == AppMutation::Insert"),
+        "only first generic deployments should delete the newly inserted app"
+    );
+}
+
+#[test]
 fn idempotent_retry_requires_same_deployment_payload() {
     let app = idempotency_app();
     let deployment = idempotency_deployment(&app);
