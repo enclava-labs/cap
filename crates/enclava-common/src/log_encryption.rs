@@ -90,7 +90,22 @@ struct FrameAad<'a> {
 
 pub fn generate_log_keypair() -> LogEncryptionKeyPair {
     let private = StaticSecret::random_from_rng(OsRng);
-    let public = PublicKey::from(&private);
+    log_keypair_from_private(&private)
+}
+
+pub fn log_keypair_from_private_key(
+    private_key_base64url: &str,
+) -> Result<LogEncryptionKeyPair, LogEncryptionError> {
+    let private_bytes = decode_fixed::<32>(private_key_base64url)
+        .map_err(|_| LogEncryptionError::InvalidPrivateKey)?;
+    if URL_SAFE_NO_PAD.encode(private_bytes) != private_key_base64url {
+        return Err(LogEncryptionError::InvalidPrivateKey);
+    }
+    Ok(log_keypair_from_private(&StaticSecret::from(private_bytes)))
+}
+
+fn log_keypair_from_private(private: &StaticSecret) -> LogEncryptionKeyPair {
+    let public = PublicKey::from(private);
     let private_bytes = private.to_bytes();
     let public_bytes = public.to_bytes();
     LogEncryptionKeyPair {
@@ -357,6 +372,19 @@ mod tests {
         assert_eq!(frame.deployment_id, "deploy-123");
         let plaintext = decrypt_log_frame(&keypair.private_key_base64url, &frame).unwrap();
         assert_eq!(plaintext, b"tenant secret");
+    }
+
+    #[test]
+    fn private_key_reconstructs_matching_public_keypair() {
+        let generated = generate_log_keypair();
+
+        let reconstructed = log_keypair_from_private_key(&generated.private_key_base64url).unwrap();
+
+        assert_eq!(reconstructed, generated);
+        assert!(matches!(
+            log_keypair_from_private_key("not-a-private-key"),
+            Err(LogEncryptionError::InvalidPrivateKey)
+        ));
     }
 
     #[test]

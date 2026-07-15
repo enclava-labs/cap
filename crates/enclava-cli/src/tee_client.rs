@@ -543,8 +543,15 @@ fn claim_state_json_is_successful(body: &serde_json::Value) -> bool {
     let ownership_state = body.get("ownership_state").and_then(|value| value.as_str());
     let legacy_state = body.get("state").and_then(|value| value.as_str());
 
-    matches!(ownership_state, Some("claimed"))
-        || (ownership_state.is_none() && matches!(legacy_state, Some("claimed")))
+    // The attestation-proxy's OwnershipState enum has no "claimed" variant -- it emits
+    // "unclaimed"/"locked"/"unlocking"/"unlocked"/"error". Treat the post-claim states as
+    // claimed; the prior match on "claimed" was dead code, so already-claimed password-mode
+    // redeploys looped to the claim-wait timeout (notably via `template deploy`, which lacks
+    // the `deploy_needs_initial_claim` pre-check the standalone `deploy` path has).
+    fn is_claimed(state: Option<&str>) -> bool {
+        matches!(state, Some("locked" | "unlocking" | "unlocked"))
+    }
+    is_claimed(ownership_state) || (ownership_state.is_none() && is_claimed(legacy_state))
 }
 
 fn change_password_body(current_password: &str, new_password: &str) -> serde_json::Value {

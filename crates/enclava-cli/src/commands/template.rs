@@ -29,7 +29,7 @@ use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
     SignedDeployBlobParams, StoragePasswordInput, build_signed_deploy_blobs,
-    claim_initial_ownership, ensure_manual_deploy_keyring,
+    claim_initial_ownership, ensure_manual_deploy_keyring, generate_log_key_for_app,
 };
 use crate::commands::ownership::MnemonicCapture;
 
@@ -82,6 +82,23 @@ pub struct TemplateDeployArgs {
     /// File containing the initial storage password for non-interactive password-mode template deploys.
     #[arg(long = "storage-password-file", value_name = "PATH")]
     pub storage_password_file: Option<PathBuf>,
+    /// Select an existing organization log-encryption key before the first deployment.
+    #[arg(
+        long = "log-key",
+        value_name = "KEY_ID",
+        conflicts_with = "generate_log_key"
+    )]
+    pub log_key: Option<String>,
+    /// Generate, register, and select a tenant-held log-encryption key before the first deployment.
+    #[arg(long = "generate-log-key", value_name = "KEY_ID")]
+    pub generate_log_key: Option<String>,
+    /// Where to write the generated tenant-held log private key.
+    #[arg(
+        long = "log-private-key-file",
+        value_name = "PATH",
+        requires = "generate_log_key"
+    )]
+    pub log_private_key_file: Option<PathBuf>,
     /// Print machine-readable JSON with deployment, stable SSH endpoint, and stable SSH endpoint command details.
     #[arg(long)]
     pub json: bool,
@@ -247,6 +264,16 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         bootstrap_pubkey_hash.as_deref(),
     )
     .await?;
+    let prepared_log_key = prepare_template_log_key(
+        api,
+        &ctx.paths,
+        &instance_name,
+        args.log_key.as_deref(),
+        args.generate_log_key.as_deref(),
+        args.log_private_key_file.clone(),
+        &pb,
+    )
+    .await?;
     pb.set_position(1);
     pb.set_message("Signing deployment descriptor...");
 
@@ -264,6 +291,10 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         workload_security_profile,
     })
     .await?;
+    verify_signed_template_log_key(
+        prepared_log_key.as_ref(),
+        signed_blobs.log_encryption.as_ref(),
+    )?;
     pb.set_position(2);
     pb.set_message("Creating template instance...");
 
@@ -405,10 +436,120 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             stable_endpoint: Some(stable_endpoint.as_str()),
             ssh_command: ssh_command.as_deref(),
             ssh_endpoint: ssh_endpoint.as_deref(),
+            log_key_id: prepared_log_key
+                .as_ref()
+                .map(|prepared| prepared.config.key_id.as_str()),
+            log_private_key_file: prepared_log_key
+                .as_ref()
+                .and_then(|prepared| prepared.private_key_file.as_deref()),
             json: args.json,
         })?
     );
     Ok(())
+}
+
+struct PreparedTemplateLogKey {
+    config: enclava_engine::types::LogEncryptionConfig,
+    private_key_file: Option<PathBuf>,
+}
+
+impl PreparedTemplateLogKey {
+    fn from_api_key(
+        key: enclava_cli::api_types::LogEncryptionKey,
+        private_key_file: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            config: enclava_engine::types::LogEncryptionConfig {
+                algorithm: key.algorithm,
+                key_id: key.key_id,
+                public_key_base64url: key.public_key_base64url,
+                public_key_sha256: key.public_key_sha256,
+            },
+            private_key_file,
+        }
+    }
+}
+
+async fn prepare_template_log_key(
+    api: &ApiClient,
+    paths: &CliPaths,
+    instance_name: &str,
+    existing_key_id: Option<&str>,
+    generated_key_id: Option<&str>,
+    private_key_file: Option<PathBuf>,
+    pb: &ProgressBar,
+) -> Result<Option<PreparedTemplateLogKey>, Box<dyn std::error::Error>> {
+    match (existing_key_id, generated_key_id) {
+        (Some(_), Some(_)) => {
+            Err("--log-key and --generate-log-key cannot be used together".into())
+        }
+        (Some(key_id), None) => {
+            pb.set_message("Selecting tenant log-encryption key...");
+            let key = api.select_log_key(instance_name, key_id).await?;
+            verify_selected_template_log_key(key_id, &key)?;
+            Ok(Some(PreparedTemplateLogKey::from_api_key(key, None)))
+        }
+        (None, Some(key_id)) => {
+            pb.set_message("Generating tenant log-encryption key...");
+            let generated = generate_log_key_for_app(
+                api,
+                paths,
+                instance_name,
+                key_id,
+                Some(format!("Hosted template app {instance_name}")),
+                private_key_file,
+                true,
+            )
+            .await?;
+            Ok(Some(PreparedTemplateLogKey::from_api_key(
+                generated.key,
+                Some(generated.private_key_file),
+            )))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn verify_selected_template_log_key(
+    requested_key_id: &str,
+    selected: &enclava_cli::api_types::LogEncryptionKey,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if selected.key_id != requested_key_id {
+        return Err(format!(
+            "log-key selection returned key `{}` instead of requested key `{requested_key_id}`",
+            selected.key_id
+        )
+        .into());
+    }
+    if selected.status != "active" || !selected.active_for_app {
+        return Err(format!(
+            "log-key selection did not confirm requested key `{requested_key_id}` as active for the app"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_signed_template_log_key(
+    prepared: Option<&PreparedTemplateLogKey>,
+    signed: Option<&enclava_engine::types::LogEncryptionConfig>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    match signed {
+        Some(signed) if signed == &prepared.config => Ok(()),
+        Some(signed) => Err(format!(
+            "signed deployment log-encryption key `{}` does not match requested key `{}`; retry after the platform key selection is consistent",
+            signed.key_id, prepared.config.key_id
+        )
+        .into()),
+        None => Err(format!(
+            "signed deployment omitted requested log-encryption key `{}`; retry after the platform supports pre-deploy key selection",
+            prepared.config.key_id
+        )
+        .into()),
+    }
 }
 
 async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1928,6 +2069,8 @@ struct DeployResponseOutput<'a> {
     stable_endpoint: Option<&'a str>,
     ssh_command: Option<&'a str>,
     ssh_endpoint: Option<&'a str>,
+    log_key_id: Option<&'a str>,
+    log_private_key_file: Option<&'a std::path::Path>,
     json: bool,
 }
 
@@ -1942,6 +2085,8 @@ fn deploy_response_output(
         stable_endpoint,
         ssh_command,
         ssh_endpoint,
+        log_key_id,
+        log_private_key_file,
         json,
     } = output;
     let app_url = normalize_paas_ssh_command_app_url(app_url)?;
@@ -1962,6 +2107,8 @@ fn deploy_response_output(
             "command": ssh_command,
             "endpoint": endpoint,
             "ssh_command_path": format!("/apps/{instance_name}/ssh-command"),
+            "log_key_id": log_key_id,
+            "log_private_key_file": log_private_key_file.map(|path| path.display().to_string()),
         });
         return Ok(format!("{}\n", serde_json::to_string_pretty(&output)?));
     }
@@ -1982,6 +2129,12 @@ fn deploy_response_output(
         lines.push(format!(
             "  Stable SSH endpoint command: pending via PaaS /apps/{instance_name}/ssh-command"
         ));
+    }
+    if let Some(key_id) = log_key_id {
+        lines.push(format!("  Log key:    {key_id}"));
+    }
+    if let Some(path) = log_private_key_file {
+        lines.push(format!("  Log private key: {}", path.display()));
     }
     Ok(format!("{}\n", lines.join("\n")))
 }
@@ -2561,11 +2714,159 @@ mod tests {
             help.contains("--storage-password-file <PATH>"),
             "template deploy help should expose non-interactive password-mode deploy support: {help}"
         );
+        assert!(
+            help.contains("--log-key <KEY_ID>")
+                && help.contains("--generate-log-key <KEY_ID>")
+                && help.contains("--log-private-key-file <PATH>"),
+            "template deploy help should expose pre-deploy tenant log-encryption setup: {help}"
+        );
         let command_centric_hint = ["for a stable SSH", " command"].concat();
         assert!(
             !help.contains(&command_centric_hint),
             "template deploy help should not frame the reserved endpoint as merely command-oriented: {help}"
         );
+    }
+
+    #[test]
+    fn deploy_cli_accepts_predeploy_log_encryption_options() {
+        use clap::Parser as _;
+
+        let cli = crate::commands::Cli::try_parse_from([
+            "enclava",
+            "template",
+            "deploy",
+            "--name",
+            "shell",
+            "--log-key",
+            "team-logs",
+        ])
+        .expect("template deploy should accept an existing log key");
+        let crate::commands::Command::Template(TemplateCommand::Deploy(args)) = cli.command else {
+            panic!("expected template deploy command");
+        };
+        assert_eq!(args.log_key.as_deref(), Some("team-logs"));
+        assert_eq!(args.generate_log_key, None);
+
+        let cli = crate::commands::Cli::try_parse_from([
+            "enclava",
+            "template",
+            "deploy",
+            "--name",
+            "shell",
+            "--generate-log-key",
+            "shell-logs",
+            "--log-private-key-file",
+            "/tmp/shell-logs.x25519",
+        ])
+        .expect("template deploy should generate and store a new log key");
+        let crate::commands::Command::Template(TemplateCommand::Deploy(args)) = cli.command else {
+            panic!("expected template deploy command");
+        };
+        assert_eq!(args.generate_log_key.as_deref(), Some("shell-logs"));
+        assert_eq!(args.log_key, None);
+        assert_eq!(
+            args.log_private_key_file.as_deref(),
+            Some(std::path::Path::new("/tmp/shell-logs.x25519"))
+        );
+
+        assert!(
+            crate::commands::Cli::try_parse_from([
+                "enclava",
+                "template",
+                "deploy",
+                "--name",
+                "shell",
+                "--log-key",
+                "team-logs",
+                "--generate-log-key",
+                "shell-logs",
+            ])
+            .is_err(),
+            "existing and generated log-key choices must conflict"
+        );
+        assert!(
+            crate::commands::Cli::try_parse_from([
+                "enclava",
+                "template",
+                "deploy",
+                "--name",
+                "shell",
+                "--log-private-key-file",
+                "/tmp/shell-logs.x25519",
+            ])
+            .is_err(),
+            "a private-key path without key generation must be rejected"
+        );
+    }
+
+    #[test]
+    fn template_deploy_requires_requested_log_key_in_signed_policy() {
+        let config = enclava_engine::types::LogEncryptionConfig {
+            algorithm: "x25519-hpke-v1".to_string(),
+            key_id: "shell-logs".to_string(),
+            public_key_base64url: "public-key".to_string(),
+            public_key_sha256: "sha256:public-key".to_string(),
+        };
+        let prepared = PreparedTemplateLogKey {
+            config: config.clone(),
+            private_key_file: None,
+        };
+
+        verify_signed_template_log_key(Some(&prepared), Some(&config)).unwrap();
+        verify_signed_template_log_key(None, None).unwrap();
+
+        let mut different = config.clone();
+        different.key_id = "other-key".to_string();
+        let mismatch = verify_signed_template_log_key(Some(&prepared), Some(&different))
+            .unwrap_err()
+            .to_string();
+        assert!(mismatch.contains("does not match requested key `shell-logs`"));
+
+        let missing = verify_signed_template_log_key(Some(&prepared), None)
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("omitted requested log-encryption key `shell-logs`"));
+    }
+
+    #[test]
+    fn template_deploy_validates_log_key_selection_response() {
+        let selected = enclava_cli::api_types::LogEncryptionKey {
+            key_id: "shell-logs".to_string(),
+            algorithm: "x25519-hpke-v1".to_string(),
+            public_key_base64url: "public-key".to_string(),
+            public_key_sha256: "sha256:public-key".to_string(),
+            label: None,
+            status: "active".to_string(),
+            active_for_app: true,
+            selected_at: Some("2026-07-15T00:00:00Z".to_string()),
+            created_at: "2026-07-15T00:00:00Z".to_string(),
+            revoked_at: None,
+        };
+
+        verify_selected_template_log_key("shell-logs", &selected).unwrap();
+
+        let mut stale = selected;
+        stale.key_id = "stale-key".to_string();
+        let mismatch = verify_selected_template_log_key("shell-logs", &stale)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            mismatch.contains("returned key `stale-key` instead of requested key `shell-logs`")
+        );
+
+        stale.key_id = "shell-logs".to_string();
+        stale.active_for_app = false;
+        let inactive = verify_selected_template_log_key("shell-logs", &stale)
+            .unwrap_err()
+            .to_string();
+        assert!(inactive.contains("did not confirm requested key `shell-logs` as active"));
+
+        stale.active_for_app = true;
+        stale.status = "revoked".to_string();
+        let revoked = verify_selected_template_log_key("shell-logs", &stale)
+            .unwrap_err()
+            .to_string();
+        assert!(revoked.contains("did not confirm requested key `shell-logs` as active"));
     }
 
     #[test]
@@ -2635,6 +2936,9 @@ mod tests {
             no_wait: false,
             ssh_timeout_seconds: DEFAULT_SSH_TIMEOUT_SECONDS,
             storage_password_file: None,
+            log_key: None,
+            generate_log_key: None,
+            log_private_key_file: None,
             json: false,
             store_mnemonic: false,
             no_store_mnemonic: false,
@@ -2847,6 +3151,9 @@ mod tests {
         let ensure_app = body
             .find("ensure_template_app")
             .expect("template deploy creates app");
+        let prepare_log_key = body
+            .find("prepare_template_log_key")
+            .expect("template deploy prepares tenant log encryption");
         let create_instance = body
             .find("create_template_instance")
             .expect("template deploy creates template instance");
@@ -2869,13 +3176,14 @@ mod tests {
         assert!(
             password_preflight < bootstrap_hash
                 && bootstrap_hash < ensure_app
-                && ensure_app < create_instance
+                && ensure_app < prepare_log_key
+                && prepare_log_key < create_instance
                 && create_instance < wait_claim
                 && wait_claim < claim
                 && claim < managed_config
                 && managed_config < wait_managed_config
                 && wait_managed_config < config,
-            "password-mode template deploy must make the config store writable and wait for PaaS-managed config before writing customer config"
+            "template deploy must prepare tenant log encryption before deployment, then make the config store writable before writing customer config"
         );
     }
 
@@ -3557,6 +3865,8 @@ mod tests {
             stable_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
             ssh_command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
             ssh_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            log_key_id: Some("shell-logs"),
+            log_private_key_file: Some(std::path::Path::new("/tmp/shell-logs.x25519")),
             json: false,
         })
         .unwrap();
@@ -3569,6 +3879,8 @@ mod tests {
         assert!(
             output.contains("  Stable SSH endpoint command: ssh -p 17958 user@6.tcp.eu.ngrok.io")
         );
+        assert!(output.contains("  Log key:    shell-logs"));
+        assert!(output.contains("  Log private key: /tmp/shell-logs.x25519"));
         assert!(!output.contains("Verified stable SSH endpoint"));
     }
 
@@ -3582,6 +3894,8 @@ mod tests {
             stable_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
             ssh_command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
             ssh_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            log_key_id: Some("shell-logs"),
+            log_private_key_file: Some(std::path::Path::new("/tmp/shell-logs.x25519")),
             json: true,
         })
         .unwrap();
@@ -3599,7 +3913,9 @@ mod tests {
                 "ssh_command_status": "ready",
                 "command": "ssh -p 17958 user@6.tcp.eu.ngrok.io",
                 "endpoint": "6.tcp.eu.ngrok.io:17958",
-                "ssh_command_path": "/apps/shell/ssh-command"
+                "ssh_command_path": "/apps/shell/ssh-command",
+                "log_key_id": "shell-logs",
+                "log_private_key_file": "/tmp/shell-logs.x25519"
             })
         );
     }
@@ -3636,6 +3952,8 @@ mod tests {
             stable_endpoint: Some("tcp://6.TCP.EU.NGROK.IO.:00123"),
             ssh_command: None,
             ssh_endpoint: None,
+            log_key_id: None,
+            log_private_key_file: None,
             json: true,
         })
         .unwrap();
@@ -3653,6 +3971,8 @@ mod tests {
             stable_endpoint: Some("example.com:22"),
             ssh_command: None,
             ssh_endpoint: None,
+            log_key_id: None,
+            log_private_key_file: None,
             json: true,
         })
         .unwrap_err();
@@ -3672,6 +3992,8 @@ mod tests {
             stable_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
             ssh_command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
             ssh_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            log_key_id: None,
+            log_private_key_file: None,
             json: false,
         })
         .unwrap();
@@ -3687,6 +4009,8 @@ mod tests {
             stable_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
             ssh_command: Some("ssh -p 17958 user@6.tcp.eu.ngrok.io"),
             ssh_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            log_key_id: None,
+            log_private_key_file: None,
             json: true,
         })
         .unwrap();
@@ -3704,6 +4028,8 @@ mod tests {
             stable_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
             ssh_command: Some("ssh -p 17959 user@6.tcp.eu.ngrok.io"),
             ssh_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+            log_key_id: None,
+            log_private_key_file: None,
             json: false,
         })
         .unwrap_err();

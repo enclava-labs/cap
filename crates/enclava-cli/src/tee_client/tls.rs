@@ -186,3 +186,40 @@ pub(super) fn leaf_spki_der(cert_der: &[u8]) -> Result<Vec<u8>, TeeError> {
         .to_der()
         .map_err(|err| TeeError::Attestation(format!("certificate SPKI encode failed: {err}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_accepts_https_with_explicit_port() {
+        let p = EndpointParts::parse("https://Example.COM:8443/path").unwrap();
+        assert_eq!(p.host, "example.com");
+        assert_eq!(p.port, 8443);
+    }
+
+    #[test]
+    fn parse_accepts_https_default_port() {
+        let p = EndpointParts::parse("https://tee.example.dev").unwrap();
+        assert_eq!(p.host, "tee.example.dev");
+        assert_eq!(p.port, 443);
+    }
+
+    #[test]
+    fn parse_rejects_non_https_scheme() {
+        match EndpointParts::parse("http://tee.example.dev:8443") {
+            Err(e) => assert!(e.to_string().contains("https")),
+            Ok(_) => panic!("expected non-https scheme to be rejected"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_empty_host() {
+        assert!(EndpointParts::parse("https://:8443/").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_invalid_url() {
+        assert!(EndpointParts::parse("not a url at all").is_err());
+    }
+}
