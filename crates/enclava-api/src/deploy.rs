@@ -500,6 +500,33 @@ pub async fn build_confidential_app(
             .fetch_all(pool)
             .await?;
 
+    build_confidential_app_from_containers(
+        pool,
+        app,
+        deployment_id,
+        attestation_config,
+        api_signing_pubkey,
+        api_url,
+        &containers_rows,
+    )
+    .await
+}
+
+/// Build a ConfidentialApp spec from an explicit set of app container rows.
+///
+/// Unlike [`build_confidential_app`], this does not query `app_containers`
+/// itself, so callers can validate a *candidate* container set (e.g. a pending
+/// deploy) against the signed-artifact integrity checks before persisting it.
+/// `containers_rows` must already reflect the intended post-deploy state.
+pub async fn build_confidential_app_from_containers(
+    pool: &PgPool,
+    app: &App,
+    deployment_id: Uuid,
+    attestation_config: &AttestationConfig,
+    api_signing_pubkey: &str,
+    api_url: &str,
+    containers_rows: &[AppContainer],
+) -> Result<ConfidentialApp, DeployError> {
     if containers_rows.is_empty() {
         return Err(DeployError::NoContainers);
     }
@@ -510,7 +537,7 @@ pub async fn build_confidential_app(
         .await?;
 
     let mut containers = Vec::new();
-    for row in &containers_rows {
+    for row in containers_rows {
         let image_str = row
             .image_digest
             .as_ref()

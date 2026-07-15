@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::{middleware::AuthContext, scopes};
-use crate::models::{App, Deployment};
+use crate::models::{App, AppContainer, Deployment};
 use crate::source_provider::{SourceProvider, validate_source_context};
 use crate::state::AppState;
 
@@ -707,70 +707,47 @@ pub async fn deploy(
     let signed_storage_paths = signing_artifacts
         .as_ref()
         .map(|artifacts| crate::deploy::descriptor_storage_paths(&artifacts.descriptor));
-    let container_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM app_containers WHERE app_id = $1 AND name = $2)",
-    )
-    .bind(app.id)
-    .bind(container_name)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?;
-
-    if container_exists {
-        sqlx::query(
-            "UPDATE app_containers
-             SET image_ref = $1,
-                 image_digest = $2,
-                 command = COALESCE($3, command),
-                 port = COALESCE($4, port),
-                 storage_paths = COALESCE($5, storage_paths),
-                 workload_security_profile = $6
-             WHERE app_id = $7 AND name = $8",
-        )
-        .bind(&body.image)
-        .bind(Some(&image_digest))
-        .bind(signed_workload_command.as_ref())
-        .bind(signed_container_port)
-        .bind(signed_storage_paths.as_ref())
-        .bind(workload_security_profile.as_str())
-        .bind(app.id)
-        .bind(container_name)
-        .execute(&state.db)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-        })?;
-    } else {
-        sqlx::query(
-            "INSERT INTO app_containers (id, app_id, name, image_ref, image_digest, command, port, storage_paths, workload_security_profile, is_primary)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(app.id)
-        .bind(container_name)
-        .bind(&body.image)
-        .bind(Some(&image_digest))
-        .bind(signed_workload_command.as_ref())
-        .bind(signed_container_port)
-        .bind(signed_storage_paths.as_ref())
-        .bind(workload_security_profile.as_str())
-        .execute(&state.db)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-        })?;
-    }
+    // Fetch the app's current containers into memory and compute the candidate
+    // container state that this deploy *would* persist. We validate the signed
+    // artifacts against this candidate before writing it to the database, so a
+    // rejected deploy cannot mutate app_containers (image/command/port/storage
+    // paths/workload security profile) for the app.
+    let existing_containers: Vec<AppContainer> =
+        sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC")
+            .bind(app.id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+            })?;
+    let existing_container = existing_containers
+        .iter()
+        .find(|c| c.name == container_name)
+        .cloned();
+    let (candidate_container, is_new_container) = compute_candidate_container(
+        &CandidateContainerInputs {
+            app_id: app.id,
+            container_name,
+            image: &body.image,
+            image_digest: &image_digest,
+            workload_security_profile: workload_security_profile.as_str(),
+            signed_workload_command: signed_workload_command.clone(),
+            signed_container_port,
+            signed_storage_paths: signed_storage_paths.clone(),
+        },
+        existing_container.as_ref(),
+    );
+    // Candidate row set for validation: drop the stale same-named container and
+    // splice in the candidate, keeping the is_primary DESC ordering used by
+    // build_confidential_app_from_containers' primary lookup.
+    let candidate_containers = splice_candidate_containers(
+        existing_containers,
+        candidate_container.clone(),
+        container_name,
+    );
 
     let deploy_id = signing_artifacts
         .as_ref()
@@ -790,13 +767,14 @@ pub async fn deploy(
             })),
         ))?;
         let signing_service_pubkey_hex = attestation.signing_service_pubkey_hex.as_deref();
-        let mut app_spec = crate::deploy::build_confidential_app(
+        let mut app_spec = crate::deploy::build_confidential_app_from_containers(
             &state.db,
             &app,
             deploy_id,
             attestation,
             &api_signing_pubkey,
             &state.api_url,
+            &candidate_containers,
         )
         .await
         .map_err(|e| {
@@ -851,6 +829,60 @@ pub async fn deploy(
             .map_err(signing_error_response)?;
         workload_artifact_binding = Some(binding);
         signed_policy_artifact = Some(signed);
+    }
+
+    // Persist the validated container state only after signed-artifact
+    // validation has passed, so a rejected deploy cannot mutate app_containers.
+    if !is_new_container {
+        sqlx::query(
+            "UPDATE app_containers
+             SET image_ref = $1,
+                 image_digest = $2,
+                 command = $3,
+                 port = $4,
+                 storage_paths = $5,
+                 workload_security_profile = $6
+             WHERE app_id = $7 AND name = $8",
+        )
+        .bind(&candidate_container.image_ref)
+        .bind(&candidate_container.image_digest)
+        .bind(&candidate_container.command)
+        .bind(candidate_container.port)
+        .bind(&candidate_container.storage_paths)
+        .bind(candidate_container.workload_security_profile.as_deref())
+        .bind(app.id)
+        .bind(container_name)
+        .execute(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
+    } else {
+        sqlx::query(
+            "INSERT INTO app_containers (id, app_id, name, image_ref, image_digest, command, port, storage_paths, workload_security_profile, is_primary)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        )
+        .bind(candidate_container.id)
+        .bind(app.id)
+        .bind(&candidate_container.name)
+        .bind(&candidate_container.image_ref)
+        .bind(&candidate_container.image_digest)
+        .bind(&candidate_container.command)
+        .bind(candidate_container.port)
+        .bind(&candidate_container.storage_paths)
+        .bind(candidate_container.workload_security_profile.as_deref())
+        .bind(candidate_container.is_primary)
+        .execute(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+        })?;
     }
 
     let source_provider = body.source_provider.map(SourceProvider::as_str);
@@ -1099,12 +1131,126 @@ pub async fn deployment_history(
 mod rollback;
 pub use rollback::rollback;
 
+/// Build the candidate `app_containers` row a deploy *would* persist, without
+/// touching the database.
+///
+/// Returns `(candidate, is_new)`. When `existing` is `Some` the candidate
+/// mirrors the previous `UPDATE ... COALESCE` semantics: signed-descriptor
+/// fields override the stored value, and any field the descriptor leaves unset
+/// is retained from the existing row. When `existing` is `None` the candidate
+/// is a fresh primary container matching the prior `INSERT`.
+///
+/// Computing this in memory lets the deploy handler run signed-artifact
+/// validation against the post-deploy container state *before* persisting it,
+/// so a rejected deploy cannot mutate `app_containers`.
+fn compute_candidate_container(
+    inputs: &CandidateContainerInputs,
+    existing: Option<&AppContainer>,
+) -> (AppContainer, bool) {
+    match existing {
+        Some(existing) => {
+            let candidate = AppContainer {
+                image_ref: inputs.image.to_string(),
+                image_digest: Some(inputs.image_digest.to_string()),
+                // COALESCE semantics: a signed descriptor overrides, otherwise
+                // keep the existing value (mirrors the prior UPDATE query).
+                command: inputs
+                    .signed_workload_command
+                    .clone()
+                    .or_else(|| existing.command.clone()),
+                port: inputs.signed_container_port.or(existing.port),
+                storage_paths: inputs
+                    .signed_storage_paths
+                    .clone()
+                    .or_else(|| existing.storage_paths.clone()),
+                workload_security_profile: Some(inputs.workload_security_profile.to_string()),
+                ..existing.clone()
+            };
+            (candidate, false)
+        }
+        None => {
+            let candidate = AppContainer {
+                id: Uuid::new_v4(),
+                app_id: inputs.app_id,
+                name: inputs.container_name.to_string(),
+                image_ref: inputs.image.to_string(),
+                image_digest: Some(inputs.image_digest.to_string()),
+                command: inputs.signed_workload_command.clone(),
+                port: inputs.signed_container_port,
+                storage_paths: inputs.signed_storage_paths.clone(),
+                workload_security_profile: Some(inputs.workload_security_profile.to_string()),
+                is_primary: true,
+            };
+            (candidate, true)
+        }
+    }
+}
+
+/// Deploy-supplied values used to compute a candidate `app_containers` row.
+struct CandidateContainerInputs<'a> {
+    app_id: Uuid,
+    container_name: &'a str,
+    image: &'a str,
+    image_digest: &'a str,
+    workload_security_profile: &'a str,
+    signed_workload_command: Option<String>,
+    signed_container_port: Option<i32>,
+    signed_storage_paths: Option<Vec<String>>,
+}
+
+/// Replace the same-named container in `existing` with `candidate` and return
+/// the resulting row set ordered by `is_primary` descending, matching the
+/// ordering `build_confidential_app_from_containers` relies on for its primary
+/// lookup.
+fn splice_candidate_containers(
+    mut existing: Vec<AppContainer>,
+    candidate: AppContainer,
+    container_name: &str,
+) -> Vec<AppContainer> {
+    existing.retain(|c| c.name != container_name);
+    existing.insert(0, candidate);
+    existing.sort_by_key(|c| std::cmp::Reverse(c.is_primary));
+    existing
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        LOG_ENCRYPTION_ALGORITHM_X25519_HPKE_V1, LogEncryptionConfig, StatusCode, parse_memory_gi,
+        CandidateContainerInputs, LOG_ENCRYPTION_ALGORITHM_X25519_HPKE_V1, LogEncryptionConfig,
+        StatusCode, compute_candidate_container, parse_memory_gi, splice_candidate_containers,
         validate_log_encryption_config,
     };
+    use crate::models::AppContainer;
+    use uuid::Uuid;
+
+    fn existing_primary_container() -> AppContainer {
+        AppContainer {
+            id: Uuid::nil(),
+            app_id: Uuid::nil(),
+            name: "web".to_string(),
+            image_ref: "registry/old:tag".to_string(),
+            image_digest: None,
+            port: Some(8080),
+            command: Some(r#"["/old-start"]"#.to_string()),
+            storage_paths: Some(vec!["/old-data".to_string()]),
+            workload_security_profile: Some("baseline".to_string()),
+            is_primary: true,
+        }
+    }
+
+    /// Build candidate inputs for a deploy of the given container name.
+    fn candidate_inputs(name: &str) -> CandidateContainerInputs<'_> {
+        CandidateContainerInputs {
+            app_id: Uuid::nil(),
+            container_name: name,
+            image: "registry/new:tag",
+            image_digest: "sha256:deadbeef",
+            workload_security_profile: "baseline",
+            signed_workload_command: None,
+            signed_container_port: None,
+            signed_storage_paths: None,
+        }
+    }
 
     fn valid_log_encryption_config() -> LogEncryptionConfig {
         LogEncryptionConfig {
@@ -1150,5 +1296,148 @@ mod tests {
             validate_log_encryption_config(Some(config)).expect_err("algorithm rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "unsupported log_encryption.algorithm");
+    }
+
+    #[test]
+    fn candidate_container_marks_new_rows_and_sets_primary() {
+        let inputs = candidate_inputs("web");
+        let (candidate, is_new) = compute_candidate_container(&inputs, None);
+        assert!(is_new);
+        assert!(candidate.is_primary);
+        assert_eq!(candidate.image_ref, "registry/new:tag");
+        assert_eq!(candidate.image_digest.as_deref(), Some("sha256:deadbeef"));
+        assert_eq!(
+            candidate.workload_security_profile.as_deref(),
+            Some("baseline")
+        );
+        // No signed descriptor and no existing row: remaining optional fields are unset.
+        assert!(candidate.command.is_none());
+        assert!(candidate.port.is_none());
+        assert!(candidate.storage_paths.is_none());
+    }
+
+    #[test]
+    fn candidate_container_for_existing_row_is_not_new_and_keeps_identity() {
+        let existing = existing_primary_container();
+        let mut inputs = candidate_inputs(&existing.name);
+        inputs.workload_security_profile = "restricted";
+        let (candidate, is_new) = compute_candidate_container(&inputs, Some(&existing));
+        // Updating an existing row is not a new insert.
+        assert!(!is_new);
+        // Identity fields are carried over from the existing row.
+        assert_eq!(candidate.id, existing.id);
+        assert_eq!(candidate.app_id, existing.app_id);
+        assert_eq!(candidate.name, existing.name);
+        assert_eq!(candidate.is_primary, existing.is_primary);
+        // The deploy always supplies the image + digest and the security profile.
+        assert_eq!(candidate.image_ref, "registry/new:tag");
+        assert_eq!(candidate.image_digest.as_deref(), Some("sha256:deadbeef"));
+        assert_eq!(
+            candidate.workload_security_profile.as_deref(),
+            Some("restricted")
+        );
+    }
+
+    #[test]
+    fn candidate_container_coalesces_signed_descriptor_over_existing_values() {
+        let existing = existing_primary_container();
+        let mut inputs = candidate_inputs(&existing.name);
+        inputs.workload_security_profile = "restricted";
+        inputs.signed_workload_command = Some(r#"["/new-start","--flag"]"#.to_string());
+        inputs.signed_container_port = Some(9000);
+        inputs.signed_storage_paths = Some(vec!["/new-data".to_string()]);
+        let (candidate, _) = compute_candidate_container(&inputs, Some(&existing));
+        // A signed descriptor overrides every field it sets.
+        assert_eq!(
+            candidate.command.as_deref(),
+            Some(r#"["/new-start","--flag"]"#)
+        );
+        assert_eq!(candidate.port, Some(9000));
+        assert_eq!(
+            candidate.storage_paths.as_deref(),
+            Some(&["/new-data".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn candidate_container_retains_existing_values_without_signed_descriptor() {
+        // Regression guard for the bug: a deploy that carries no signed
+        // descriptor must compute a candidate whose command/port/storage paths
+        // fall back to the existing stored values (COALESCE semantics). Because
+        // validation now runs against this candidate *before* the write, a
+        // rejected deploy leaves app_containers untouched.
+        let existing = existing_primary_container();
+        let inputs = candidate_inputs(&existing.name);
+        let (candidate, _) = compute_candidate_container(&inputs, Some(&existing));
+        assert_eq!(candidate.command, existing.command);
+        assert_eq!(candidate.port, existing.port);
+        assert_eq!(candidate.storage_paths, existing.storage_paths);
+    }
+
+    #[test]
+    fn splice_candidate_replaces_same_named_container_and_orders_primary_first() {
+        let mut sidecar = existing_primary_container();
+        sidecar.name = "worker".to_string();
+        sidecar.is_primary = false;
+        let existing = vec![sidecar.clone(), existing_primary_container()];
+
+        let inputs = candidate_inputs("web");
+        let (candidate, _) =
+            compute_candidate_container(&inputs, existing.iter().find(|c| c.name == "web"));
+        let spliced = splice_candidate_containers(existing, candidate, "web");
+
+        // Both containers present, no duplication of the deployed name.
+        assert_eq!(spliced.len(), 2);
+        assert_eq!(spliced.iter().filter(|c| c.name == "web").count(), 1);
+        assert_eq!(spliced.iter().filter(|c| c.name == "worker").count(), 1);
+        // The replaced primary container is the new candidate (new image).
+        let deployed = spliced.iter().find(|c| c.name == "web").unwrap();
+        assert_eq!(deployed.image_ref, "registry/new:tag");
+        // is_primary DESC ordering: primary container sorts first.
+        assert!(spliced[0].is_primary);
+        assert!(!spliced[1].is_primary);
+    }
+
+    #[test]
+    fn splice_candidate_appends_new_container_preserving_ordering() {
+        // Deploying a brand-new container name keeps any existing rows. A new
+        // container is always marked primary (matching the original INSERT),
+        // so the sort orders both primary rows ahead of any non-primary row.
+        let existing = vec![existing_primary_container()];
+        let inputs = candidate_inputs("worker");
+        let (candidate, _) = compute_candidate_container(&inputs, None);
+        assert!(candidate.is_primary);
+        let spliced = splice_candidate_containers(existing, candidate, "worker");
+
+        assert_eq!(spliced.len(), 2);
+        // Both containers are primary; the candidate is spliced in first.
+        assert!(spliced.iter().all(|c| c.is_primary));
+        assert!(spliced.iter().any(|c| c.name == "web"));
+        assert!(spliced.iter().any(|c| c.name == "worker"));
+    }
+
+    #[test]
+    fn splice_candidate_orders_non_primary_after_primary() {
+        // A non-primary candidate (e.g. an existing sidecar being re-deployed)
+        // sorts after any primary container.
+        let mut sidecar = existing_primary_container();
+        sidecar.id = Uuid::new_v4();
+        sidecar.name = "worker".to_string();
+        sidecar.is_primary = false;
+        let existing = vec![existing_primary_container(), sidecar.clone()];
+
+        let inputs = candidate_inputs("worker");
+        let mut candidate =
+            compute_candidate_container(&inputs, existing.iter().find(|c| c.name == "worker")).0;
+        candidate.is_primary = false;
+        let spliced = splice_candidate_containers(existing, candidate, "worker");
+
+        assert_eq!(spliced.len(), 2);
+        // Primary container sorts first.
+        assert!(spliced[0].is_primary);
+        assert_eq!(spliced[0].name, "web");
+        // Non-primary candidate sorts after.
+        assert!(!spliced[1].is_primary);
+        assert_eq!(spliced[1].name, "worker");
     }
 }
