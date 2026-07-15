@@ -78,6 +78,10 @@ fn generic_deployment_response_reports_current_app_status_separately() {
 
     assert_eq!(response.status, "pending");
     assert_eq!(response.app_status, "running");
+    let observation = serde_json::to_value(&response.observation).expect("serialize observation");
+    assert_eq!(observation["state"], "partial");
+    assert_eq!(observation["reason"], "not_observed");
+    assert!(observation["deployment_id"].is_null());
 }
 
 fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {

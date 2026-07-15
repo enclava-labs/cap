@@ -1,4 +1,5 @@
 use super::*;
+use crate::routes::status::{LiveObservation, observe_app_status};
 
 #[derive(Debug, Deserialize)]
 pub struct GenericDeploymentRequest {
@@ -86,6 +87,10 @@ pub struct GenericDeploymentResponse {
     pub error_message: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Explicit live evidence. The lifecycle fields above remain database
+    /// projections; consumers must use this observation to decide whether a
+    /// healthy/running projection is current.
+    pub observation: LiveObservation,
 }
 
 #[derive(Debug, Serialize)]
@@ -133,7 +138,13 @@ impl GenericDeploymentResponse {
             error_message: deployment.error_message,
             created_at: deployment.created_at,
             completed_at: deployment.completed_at,
+            observation: LiveObservation::not_observed(),
         }
+    }
+
+    fn with_observation(mut self, observation: LiveObservation) -> Self {
+        self.observation = observation;
+        self
     }
 }
 
@@ -332,9 +343,10 @@ pub async fn get_generic_deployment(
         .await?
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "deployment not found"))?;
 
-    Ok(Json(GenericDeploymentResponse::from_deployment(
-        deployment, &app,
-    )))
+    let observation = observe_app_status(&state, &app).await.observation;
+    Ok(Json(
+        GenericDeploymentResponse::from_deployment(deployment, &app).with_observation(observation),
+    ))
 }
 
 /// POST /deployments/{deployment_id}/config-token -- generic config-token bridge.

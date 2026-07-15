@@ -24,6 +24,10 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
 
     let mut pod_labels = BTreeMap::new();
     pod_labels.insert("app".to_string(), app.name.clone());
+    pod_labels.insert(
+        "enclava.dev/deployment-id".to_string(),
+        app.deployment_id.to_string(),
+    );
 
     let mut annotations = BTreeMap::new();
     annotations.insert(

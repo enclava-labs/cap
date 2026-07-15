@@ -510,8 +510,7 @@ pub fn verify_runtime_class_binding(
     match actual {
         Some(name) if name == expected => Ok(()),
         Some(other) => Err(format!(
-            "rendered Pod runtimeClassName is `{other}`, expected `{}`",
-            expected
+            "rendered Pod runtimeClassName is `{other}`, expected `{expected}`"
         )),
         None => Err("rendered Pod has no runtimeClassName".to_string()),
     }
