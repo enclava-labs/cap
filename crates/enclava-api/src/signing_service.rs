@@ -16,7 +16,7 @@ use enclava_engine::types::{GeneratedAgentPolicy, LogEncryptionConfig, WorkloadA
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Postgres};
 use uuid::Uuid;
 
 use crate::models::App;
@@ -802,13 +802,16 @@ pub fn decode_optional_policy_artifact(
         .transpose()
 }
 
-pub async fn persist_workload_artifacts(
-    pool: &PgPool,
+pub async fn persist_workload_artifacts<'e, E>(
+    executor: E,
     app_id: Uuid,
     deploy_id: Uuid,
     artifacts: &DeploymentSigningArtifacts,
     signed_policy_artifact: &SignedPolicyArtifact,
-) -> Result<(), SigningServiceError> {
+) -> Result<(), SigningServiceError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let descriptor_payload = serde_json::to_value(&artifacts.descriptor)?;
     let org_keyring_payload = serde_json::to_value(&artifacts.org_keyring)?;
     let signed_policy_artifact = serde_json::to_value(signed_policy_artifact)?;
@@ -839,7 +842,7 @@ pub async fn persist_workload_artifacts(
     .bind(org_keyring_payload)
     .bind(artifacts.org_keyring_signature.to_vec())
     .bind(signed_policy_artifact)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())

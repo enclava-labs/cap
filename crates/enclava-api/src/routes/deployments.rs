@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::{middleware::AuthContext, scopes};
-use crate::models::{App, Deployment};
+use crate::models::{App, AppContainer, AppResources, Deployment};
 use crate::source_provider::{SourceProvider, validate_source_context};
 use crate::state::AppState;
 
@@ -458,6 +458,14 @@ pub use generic::{
 };
 #[cfg(test)]
 use generic::{ensure_idempotent_retry_matches, validate_external_id};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMutation {
+    None,
+    UpdateGenericMetadata,
+    Insert,
+}
+
 /// POST /apps/{name}/deploy -- deploy or update an app.
 pub async fn deploy(
     auth: AuthContext,
@@ -467,10 +475,6 @@ pub async fn deploy(
 ) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
-    let workload_security_profile =
-        validate_workload_security_profile(body.workload_security_profile.as_deref())?;
-    let log_encryption = validate_log_encryption_config(body.log_encryption.clone())?;
-
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -486,6 +490,20 @@ pub async fn deploy(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
+
+    deploy_app_candidate(auth, state, app, body, AppMutation::None).await
+}
+
+async fn deploy_app_candidate(
+    auth: AuthContext,
+    state: AppState,
+    app: App,
+    body: DeployRequest,
+    app_mutation: AppMutation,
+) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
+    let workload_security_profile =
+        validate_workload_security_profile(body.workload_security_profile.as_deref())?;
+    let log_encryption = validate_log_encryption_config(body.log_encryption.clone())?;
 
     if let (Some(provider), Some(repository)) =
         (body.source_provider, body.source_repository.as_deref())
@@ -571,34 +589,6 @@ pub async fn deploy(
             })?
     };
 
-    // Build the per-app verification policy from the app's pinned signer
-    // identity. Apps without a pinned identity cannot deploy.
-    let policy = match (
-        app.signer_identity_subject.as_deref(),
-        app.signer_identity_issuer.as_deref(),
-    ) {
-        (Some(subject), Some(issuer)) if !subject.is_empty() && !issuer.is_empty() => {
-            classify_signer_identity(subject, issuer)
-        }
-        _ => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "app has no pinned signer identity; set one before deploying"
-                })),
-            ));
-        }
-    };
-
-    let verified = crate::cosign::verify_image(&body.image, &image_digest, &policy)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("cosign verification failed: {}", e)})),
-            )
-        })?;
-
     // Enforce core entitlement resource limits.
     if let Some(ref resources) = body.resources {
         let org: crate::models::Organization =
@@ -682,12 +672,6 @@ pub async fn deploy(
         }
     }
 
-    // Fetch provenance attestation and SBOM if available (non-fatal if missing)
-    let (provenance, sbom) =
-        crate::cosign::fetch_attestations(&state.http_client, &body.image, &image_digest)
-            .await
-            .unwrap_or((None, None));
-
     let container_name = body.container_name.as_deref().unwrap_or("web");
     let signed_workload_command = match signing_artifacts.as_ref() {
         Some(artifacts) => {
@@ -707,70 +691,74 @@ pub async fn deploy(
     let signed_storage_paths = signing_artifacts
         .as_ref()
         .map(|artifacts| crate::deploy::descriptor_storage_paths(&artifacts.descriptor));
-    let container_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM app_containers WHERE app_id = $1 AND name = $2)",
-    )
-    .bind(app.id)
-    .bind(container_name)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?;
 
-    if container_exists {
-        sqlx::query(
-            "UPDATE app_containers
-             SET image_ref = $1,
-                 image_digest = $2,
-                 command = COALESCE($3, command),
-                 port = COALESCE($4, port),
-                 storage_paths = COALESCE($5, storage_paths),
-                 workload_security_profile = $6
-             WHERE app_id = $7 AND name = $8",
-        )
-        .bind(&body.image)
-        .bind(Some(&image_digest))
-        .bind(signed_workload_command.as_ref())
-        .bind(signed_container_port)
-        .bind(signed_storage_paths.as_ref())
-        .bind(workload_security_profile.as_str())
-        .bind(app.id)
-        .bind(container_name)
-        .execute(&state.db)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-        })?;
+    let mut candidate_containers: Vec<AppContainer> = if app_mutation == AppMutation::Insert {
+        Vec::new()
     } else {
-        sqlx::query(
-            "INSERT INTO app_containers (id, app_id, name, image_ref, image_digest, command, port, storage_paths, workload_security_profile, is_primary)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(app.id)
-        .bind(container_name)
-        .bind(&body.image)
-        .bind(Some(&image_digest))
-        .bind(signed_workload_command.as_ref())
-        .bind(signed_container_port)
-        .bind(signed_storage_paths.as_ref())
-        .bind(workload_security_profile.as_str())
-        .execute(&state.db)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-        })?;
-    }
+        sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC")
+            .bind(app.id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+            })?
+    };
+    let app_resources: AppResources = if app_mutation == AppMutation::Insert {
+        AppResources {
+            app_id: app.id,
+            cpu_limit: "1".to_string(),
+            memory_limit: "1Gi".to_string(),
+            app_data_size: "5Gi".to_string(),
+            tls_data_size: "2Gi".to_string(),
+        }
+    } else {
+        sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+            .bind(app.id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+            })?
+    };
+    let candidate_container = if let Some(container) = candidate_containers
+        .iter_mut()
+        .find(|row| row.name == container_name)
+    {
+        container.image_ref = body.image.clone();
+        container.image_digest = Some(image_digest.clone());
+        if signed_workload_command.is_some() {
+            container.command = signed_workload_command.clone();
+        }
+        if signed_container_port.is_some() {
+            container.port = signed_container_port;
+        }
+        if signed_storage_paths.is_some() {
+            container.storage_paths = signed_storage_paths.clone();
+        }
+        container.workload_security_profile = Some(workload_security_profile.as_str().to_string());
+        container.clone()
+    } else {
+        let container = AppContainer {
+            id: Uuid::new_v4(),
+            app_id: app.id,
+            name: container_name.to_string(),
+            image_ref: body.image.clone(),
+            image_digest: Some(image_digest.clone()),
+            port: signed_container_port,
+            command: signed_workload_command.clone(),
+            storage_paths: signed_storage_paths.clone(),
+            workload_security_profile: Some(workload_security_profile.as_str().to_string()),
+            is_primary: true,
+        };
+        candidate_containers.push(container.clone());
+        container
+    };
 
     let deploy_id = signing_artifacts
         .as_ref()
@@ -790,15 +778,15 @@ pub async fn deploy(
             })),
         ))?;
         let signing_service_pubkey_hex = attestation.signing_service_pubkey_hex.as_deref();
-        let mut app_spec = crate::deploy::build_confidential_app(
-            &state.db,
+        let mut app_spec = crate::deploy::build_confidential_app_from_rows(
             &app,
             deploy_id,
             attestation,
             &api_signing_pubkey,
             &state.api_url,
+            &candidate_containers,
+            &app_resources,
         )
-        .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -853,6 +841,39 @@ pub async fn deploy(
         signed_policy_artifact = Some(signed);
     }
 
+    // Signed inputs and their rendered cc-init hash are now validated against
+    // the immutable candidate. Only then perform external image verification.
+    let policy = match (
+        app.signer_identity_subject.as_deref(),
+        app.signer_identity_issuer.as_deref(),
+    ) {
+        (Some(subject), Some(issuer)) if !subject.is_empty() && !issuer.is_empty() => {
+            classify_signer_identity(subject, issuer)
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "app has no pinned signer identity; set one before deploying"
+                })),
+            ));
+        }
+    };
+    let verified = crate::cosign::verify_image(&body.image, &image_digest, &policy)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("cosign verification failed: {}", e)})),
+            )
+        })?;
+
+    // Fetch provenance attestation and SBOM if available (non-fatal if missing).
+    let (provenance, sbom) =
+        crate::cosign::fetch_attestations(&state.http_client, &body.image, &image_digest)
+            .await
+            .unwrap_or((None, None));
+
     let source_provider = body.source_provider.map(SourceProvider::as_str);
     let spec_snapshot = serde_json::json!({
         "app_name": app.name,
@@ -872,6 +893,163 @@ pub async fn deploy(
         "log_encryption": &log_encryption,
     });
 
+    let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
+    let local_verification_artifacts =
+        match (signing_artifacts.as_ref(), signed_policy_artifact.as_ref()) {
+            (Some(artifacts), Some(signed)) => Some((
+                crate::signing_service::workload_artifacts_json(artifacts, signed)
+                    .map_err(signing_error_response)?,
+                crate::signing_service::trustee_policy_json(signed)
+                    .map_err(signing_error_response)?,
+            )),
+            _ => None,
+        };
+
+    // No requested app/container state has been persisted before this point.
+    // Commit every accepted deployment row and its app/container changes as a
+    // single unit so any database error rolls the candidate back completely.
+    let mut tx = state.db.begin().await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
+    match app_mutation {
+        AppMutation::None => {}
+        AppMutation::UpdateGenericMetadata => {
+            let result = sqlx::query(
+                "UPDATE apps
+                    SET source_provider = $1,
+                        source_repository = $2,
+                        signer_identity_subject = $3,
+                        signer_identity_issuer = $4,
+                        signer_identity_set_at = COALESCE(signer_identity_set_at, now()),
+                        egress_allowlist = $5,
+                        egress_mode = $6,
+                        updated_at = now()
+                  WHERE id = $7
+                    AND updated_at = $8",
+            )
+            .bind(app.source_provider.as_deref())
+            .bind(app.source_repository.as_deref())
+            .bind(app.signer_identity_subject.as_deref())
+            .bind(app.signer_identity_issuer.as_deref())
+            .bind(&app.egress_allowlist)
+            .bind(&app.egress_mode)
+            .bind(app.id)
+            .bind(app.updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+            if result.rows_affected() != 1 {
+                return Err(json_error(
+                    StatusCode::CONFLICT,
+                    "app metadata changed while deployment was validating; retry the deployment",
+                ));
+            }
+        }
+        AppMutation::Insert => {
+            sqlx::query(
+                "INSERT INTO apps (
+                    id, org_id, name, namespace, instance_id, tenant_id, service_account,
+                    bootstrap_owner_pubkey_hash, tenant_instance_identity_hash, unlock_mode,
+                    domain, tee_domain, custom_domain, status, signer_identity_subject,
+                    signer_identity_issuer, signer_identity_set_at, source_provider,
+                    source_repository, egress_allowlist, egress_mode, created_at, updated_at
+                 )
+                 VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10::unlock_enum,
+                    $11, $12, $13, $14::app_status_enum, $15, $16, $17, $18,
+                    $19, $20, $21, $22, $23
+                 )",
+            )
+            .bind(app.id)
+            .bind(app.org_id)
+            .bind(&app.name)
+            .bind(&app.namespace)
+            .bind(&app.instance_id)
+            .bind(&app.tenant_id)
+            .bind(&app.service_account)
+            .bind(&app.bootstrap_owner_pubkey_hash)
+            .bind(&app.tenant_instance_identity_hash)
+            .bind(app.unlock_mode)
+            .bind(&app.domain)
+            .bind(app.tee_domain.as_deref())
+            .bind(app.custom_domain.as_deref())
+            .bind(app.status)
+            .bind(app.signer_identity_subject.as_deref())
+            .bind(app.signer_identity_issuer.as_deref())
+            .bind(app.signer_identity_set_at)
+            .bind(app.source_provider.as_deref())
+            .bind(app.source_repository.as_deref())
+            .bind(&app.egress_allowlist)
+            .bind(&app.egress_mode)
+            .bind(app.created_at)
+            .bind(app.updated_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("duplicate key")
+                    || error.to_string().contains("unique")
+                {
+                    json_error(StatusCode::CONFLICT, "app name already taken in this org")
+                } else {
+                    json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+                }
+            })?;
+            sqlx::query("INSERT INTO app_resources (app_id) VALUES ($1)")
+                .bind(app.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+
+            let _ = sqlx::query(
+                "INSERT INTO audit_log (org_id, app_id, user_id, action, detail)
+                 VALUES ($1, $2, $3, 'app.create', $4)",
+            )
+            .bind(auth.org_id)
+            .bind(app.id)
+            .bind(auth.user_id)
+            .bind(serde_json::json!({
+                "name": &app.name,
+                "unlock_mode": format!("{:?}", app.unlock_mode).to_lowercase(),
+                "egress_allowlist": &app.egress_allowlist.0,
+                "egress_mode": &app.egress_mode,
+            }))
+            .execute(&mut *tx)
+            .await;
+        }
+    }
+
+    sqlx::query(
+        "INSERT INTO app_containers (
+            id, app_id, name, image_ref, image_digest, command, port,
+            storage_paths, workload_security_profile, is_primary
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (app_id, name) DO UPDATE SET
+            image_ref = EXCLUDED.image_ref,
+            image_digest = EXCLUDED.image_digest,
+            command = EXCLUDED.command,
+            port = EXCLUDED.port,
+            storage_paths = EXCLUDED.storage_paths,
+            workload_security_profile = EXCLUDED.workload_security_profile",
+    )
+    .bind(candidate_container.id)
+    .bind(candidate_container.app_id)
+    .bind(&candidate_container.name)
+    .bind(&candidate_container.image_ref)
+    .bind(candidate_container.image_digest.as_deref())
+    .bind(candidate_container.command.as_deref())
+    .bind(candidate_container.port)
+    .bind(candidate_container.storage_paths.as_ref())
+    .bind(candidate_container.workload_security_profile.as_deref())
+    .bind(candidate_container.is_primary)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+
     // Create deployment record. cosign_verified is set from the actual
     // verification result, not hardcoded.
     let cosign_verified = true;
@@ -890,7 +1068,7 @@ pub async fn deploy(
     .bind(body.external_id.as_deref())
     .bind(source_provider)
     .bind(body.source_repository.as_deref())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|e| {
         if e.to_string().contains("idx_deployments_org_external_id") {
@@ -907,7 +1085,7 @@ pub async fn deploy(
         (signing_artifacts.as_ref(), signed_policy_artifact.as_ref())
     {
         crate::signing_service::persist_workload_artifacts(
-            &state.db, app.id, deploy_id, artifacts, signed,
+            &mut *tx, app.id, deploy_id, artifacts, signed,
         )
         .await
         .map_err(signing_error_response)?;
@@ -931,8 +1109,12 @@ pub async fn deploy(
             .as_ref()
             .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
     }))
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await;
+
+    tx.commit()
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
     let tee_domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
     crate::dns::ensure_dns_pair(
@@ -952,17 +1134,6 @@ pub async fn deploy(
             .map_err(dns_error_response)?;
     }
 
-    let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
-    let local_verification_artifacts =
-        match (signing_artifacts.as_ref(), signed_policy_artifact.as_ref()) {
-            (Some(artifacts), Some(signed)) => Some((
-                crate::signing_service::workload_artifacts_json(artifacts, signed)
-                    .map_err(signing_error_response)?,
-                crate::signing_service::trustee_policy_json(signed)
-                    .map_err(signing_error_response)?,
-            )),
-            _ => None,
-        };
     let db = state.db.clone();
     let attestation = state.attestation.clone();
     let kbs_policy = state.kbs_policy.clone();
