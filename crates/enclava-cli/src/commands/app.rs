@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions,
     io::IsTerminal,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -1241,6 +1241,7 @@ pub(crate) async fn generate_log_key_for_app(
     let private_key_file =
         private_key_file.unwrap_or_else(|| default_log_private_key_path(paths, app_name, key_id));
     if private_key_file.exists() {
+        verify_private_log_key_permissions(&private_key_file)?;
         let private_key = std::fs::read_to_string(&private_key_file).map_err(|err| {
             format!(
                 "failed to read existing log private key {}: {err}",
@@ -1261,16 +1262,39 @@ pub(crate) async fn generate_log_key_for_app(
             .find(|key| key.key_id == key_id);
         let key = match registered {
             Some(key) => {
-                verify_registered_log_key_matches_private(&key, &keypair, &private_key_file)?;
+                verify_registered_log_key_matches_private(
+                    &key,
+                    key_id,
+                    &keypair,
+                    &private_key_file,
+                    false,
+                )?;
                 if activate_for_app && !key.active_for_app {
-                    api.select_log_key(app_name, key_id).await?
+                    let selected = api.select_log_key(app_name, key_id).await?;
+                    verify_registered_log_key_matches_private(
+                        &selected,
+                        key_id,
+                        &keypair,
+                        &private_key_file,
+                        true,
+                    )?;
+                    selected
                 } else {
                     key
                 }
             }
             None => {
-                register_log_keypair(api, app_name, key_id, label, activate_for_app, &keypair)
-                    .await?
+                let registered =
+                    register_log_keypair(api, app_name, key_id, label, activate_for_app, &keypair)
+                        .await?;
+                verify_registered_log_key_matches_private(
+                    &registered,
+                    key_id,
+                    &keypair,
+                    &private_key_file,
+                    activate_for_app,
+                )?;
+                registered
             }
         };
         return Ok(GeneratedLogKey {
@@ -1283,6 +1307,13 @@ pub(crate) async fn generate_log_key_for_app(
     write_private_log_key(&private_key_file, &keypair.private_key_base64url)?;
     let key =
         register_log_keypair(api, app_name, key_id, label, activate_for_app, &keypair).await?;
+    verify_registered_log_key_matches_private(
+        &key,
+        key_id,
+        &keypair,
+        &private_key_file,
+        activate_for_app,
+    )?;
     Ok(GeneratedLogKey {
         key,
         private_key_file,
@@ -1312,13 +1343,21 @@ async fn register_log_keypair(
 
 fn verify_registered_log_key_matches_private(
     key: &LogEncryptionKey,
+    expected_key_id: &str,
     keypair: &enclava_common::log_encryption::LogEncryptionKeyPair,
     private_key_file: &Path,
+    require_active_for_app: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if key.status == "revoked" {
+    if key.key_id != expected_key_id {
         return Err(format!(
-            "log key `{}` is revoked; choose a new --generate-log-key id",
+            "log-key API returned key `{}` instead of requested key `{expected_key_id}`",
             key.key_id
+        )
+        .into());
+    }
+    if key.status != "active" {
+        return Err(format!(
+            "log key `{expected_key_id}` is not active; choose a new --generate-log-key id"
         )
         .into());
     }
@@ -1327,9 +1366,39 @@ fn verify_registered_log_key_matches_private(
         || key.public_key_sha256 != keypair.public_key_sha256
     {
         return Err(format!(
-            "existing log private key {} does not match registered log key `{}`; choose a new key id or restore the matching private key",
+            "log private key {} does not match API log key `{expected_key_id}`; choose a new key id or restore the matching private key",
             private_key_file.display(),
-            key.key_id
+        )
+        .into());
+    }
+    if require_active_for_app && !key.active_for_app {
+        return Err(format!(
+            "log-key API did not confirm requested key `{expected_key_id}` as active for the app"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_private_log_key_permissions(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let metadata = std::fs::metadata(path).map_err(|err| {
+        format!(
+            "failed to inspect existing log private key {}: {err}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "existing log private key {} is not a regular file",
+            path.display()
+        )
+        .into());
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "existing log private key {} has insecure permissions {mode:04o}; restrict it to owner-only access (for example, chmod 600)",
+            path.display()
         )
         .into());
     }

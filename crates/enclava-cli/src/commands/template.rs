@@ -486,6 +486,7 @@ async fn prepare_template_log_key(
         (Some(key_id), None) => {
             pb.set_message("Selecting tenant log-encryption key...");
             let key = api.select_log_key(instance_name, key_id).await?;
+            verify_selected_template_log_key(key_id, &key)?;
             Ok(Some(PreparedTemplateLogKey::from_api_key(key, None)))
         }
         (None, Some(key_id)) => {
@@ -507,6 +508,26 @@ async fn prepare_template_log_key(
         }
         (None, None) => Ok(None),
     }
+}
+
+fn verify_selected_template_log_key(
+    requested_key_id: &str,
+    selected: &enclava_cli::api_types::LogEncryptionKey,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if selected.key_id != requested_key_id {
+        return Err(format!(
+            "log-key selection returned key `{}` instead of requested key `{requested_key_id}`",
+            selected.key_id
+        )
+        .into());
+    }
+    if selected.status != "active" || !selected.active_for_app {
+        return Err(format!(
+            "log-key selection did not confirm requested key `{requested_key_id}` as active for the app"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn verify_signed_template_log_key(
@@ -2805,6 +2826,47 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(missing.contains("omitted requested log-encryption key `shell-logs`"));
+    }
+
+    #[test]
+    fn template_deploy_validates_log_key_selection_response() {
+        let selected = enclava_cli::api_types::LogEncryptionKey {
+            key_id: "shell-logs".to_string(),
+            algorithm: "x25519-hpke-v1".to_string(),
+            public_key_base64url: "public-key".to_string(),
+            public_key_sha256: "sha256:public-key".to_string(),
+            label: None,
+            status: "active".to_string(),
+            active_for_app: true,
+            selected_at: Some("2026-07-15T00:00:00Z".to_string()),
+            created_at: "2026-07-15T00:00:00Z".to_string(),
+            revoked_at: None,
+        };
+
+        verify_selected_template_log_key("shell-logs", &selected).unwrap();
+
+        let mut stale = selected;
+        stale.key_id = "stale-key".to_string();
+        let mismatch = verify_selected_template_log_key("shell-logs", &stale)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            mismatch.contains("returned key `stale-key` instead of requested key `shell-logs`")
+        );
+
+        stale.key_id = "shell-logs".to_string();
+        stale.active_for_app = false;
+        let inactive = verify_selected_template_log_key("shell-logs", &stale)
+            .unwrap_err()
+            .to_string();
+        assert!(inactive.contains("did not confirm requested key `shell-logs` as active"));
+
+        stale.active_for_app = true;
+        stale.status = "revoked".to_string();
+        let revoked = verify_selected_template_log_key("shell-logs", &stale)
+            .unwrap_err()
+            .to_string();
+        assert!(revoked.contains("did not confirm requested key `shell-logs` as active"));
     }
 
     #[test]
