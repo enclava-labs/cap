@@ -11,6 +11,7 @@ use kube::{
     api::{ApiResource, DynamicObject, Patch, PatchParams},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::net::IpAddr;
 
@@ -39,7 +40,31 @@ pub enum EdgeRouteError {
     InvalidHostname(#[from] ValidateError),
     #[error("invalid app name for HAProxy backend: {0}")]
     InvalidAppName(String),
+    #[error(
+        "haproxy ConfigMap {namespace}/{name} exceeds byte budget: bytes={bytes}, max_bytes={max_bytes}"
+    )]
+    ConfigTooLarge {
+        namespace: String,
+        name: String,
+        bytes: usize,
+        max_bytes: usize,
+    },
 }
+
+/// Maximum serialized size of the shared HAProxy ConfigMap entry CAP is
+/// willing to write. Kubernetes rejects objects over its own limit, but failing
+/// early on CAP's side keeps the failure observable, avoids rendering a config
+/// that the cluster will reject, and guards the shared object's growth (the
+/// lesson from #18). 1 MiB leaves substantial headroom under Kubernetes' default
+/// etcd request limit while catching unbounded route growth in tests.
+pub const HAPROXY_CONFIGMAP_MAX_BYTES: usize = 1024 * 1024;
+
+/// Pod-template annotation recording the generation (SHA-256 of the config
+/// text) that the DaemonSet was last asked to load. Reconciliation compares the
+/// desired generation against this value, not against the ConfigMap text, so a
+/// retry after a partial failure (ConfigMap written, reload lost) redoes the
+/// missing reload instead of returning early.
+pub const HAPROXY_LOADED_HASH_ANNOTATION: &str = "cap.enclava.dev/haproxy-loaded-hash";
 
 #[derive(Clone, Debug)]
 pub struct EdgeRouteConfig {
@@ -146,6 +171,94 @@ pub async fn remove_haproxy_routes(
     Ok(())
 }
 
+/// Kubernetes operations performed while reconciling HAProxy routing.
+///
+/// This is a seam, not an abstraction over all of `kube`: it exposes exactly
+/// the reads and writes `reconcile_haproxy` needs so that the reconciliation
+/// logic is independently testable against a fake that simulates partial
+/// failures and lost responses (the failure mode described in #42).
+trait HaproxyKubeOps {
+    /// Read the current `haproxy.cfg` entry from the shared ConfigMap.
+    async fn read_configmap(&self) -> Result<String, EdgeRouteError>;
+
+    /// Write the `haproxy.cfg` entry. Idempotent: writing identical text is a
+    /// no-op that still succeeds.
+    async fn write_configmap(&self, cfg: &str) -> Result<(), EdgeRouteError>;
+
+    /// Read the pod-template `haproxy-loaded-hash` annotation, recording the
+    /// generation the DaemonSet was last asked to load. `None` means no reload
+    /// has ever been recorded.
+    async fn read_loaded_hash(&self) -> Result<Option<String>, EdgeRouteError>;
+
+    /// Restart the DaemonSet so it loads the new config, stamping both the
+    /// `haproxy-restarted-at` trigger and the `haproxy-loaded-hash` generation.
+    /// Idempotent: stamping the same hash repeatedly converges.
+    async fn restart_with_hash(&self, hash: &str) -> Result<(), EdgeRouteError>;
+}
+
+/// Stable generation of a rendered HAProxy config: the hex SHA-256 of its text.
+/// Used to compare desired against applied state independently of the ConfigMap
+/// text itself, so a missing reload after a partial failure is detectable.
+fn config_generation(cfg: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(cfg.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Reconcile desired HAProxy config against applied state as generations, not
+/// as a two-call request side effect. Returns `true` when any Kubernetes object
+/// was actually mutated.
+///
+/// Convergence rules (make retries idempotent after any individual call fails):
+/// - `config_dirty = desired != current` -- ConfigMap text changed.
+/// - `reload_needed = loaded != Some(desired_gen)` -- the live proxy has not
+///   been told to load this generation yet.
+/// - If neither, the system has converged; nothing is written.
+/// - If the config is dirty, the ConfigMap is written. If a reload is still
+///   needed, the DaemonSet is restarted and stamped with `desired_gen`.
+///
+/// Because the reload decision keys on the DaemonSet's stamped generation
+/// rather than on the ConfigMap text, a retry after "ConfigMap patch succeeded,
+/// reload patch failed/lost" sees `reload_needed` still true and redoes only the
+/// reload -- instead of the old behaviour of returning success because the
+/// ConfigMap text already matched.
+async fn reconcile_haproxy<K: HaproxyKubeOps>(
+    ops: &K,
+    config: &EdgeRouteConfig,
+    mutate: impl FnOnce(&str) -> String,
+) -> Result<bool, EdgeRouteError> {
+    let current = ops.read_configmap().await?;
+    let desired = mutate(&current);
+
+    if desired.len() > HAPROXY_CONFIGMAP_MAX_BYTES {
+        return Err(EdgeRouteError::ConfigTooLarge {
+            namespace: config.namespace.clone(),
+            name: config.configmap_name.clone(),
+            bytes: desired.len(),
+            max_bytes: HAPROXY_CONFIGMAP_MAX_BYTES,
+        });
+    }
+
+    let desired_gen = config_generation(&desired);
+    let config_dirty = desired != current;
+    let loaded = ops.read_loaded_hash().await?;
+    let reload_needed = loaded.as_deref() != Some(desired_gen.as_str());
+
+    if !config_dirty && !reload_needed {
+        return Ok(false);
+    }
+
+    if config_dirty {
+        ops.write_configmap(&desired).await?;
+    }
+
+    if reload_needed {
+        ops.restart_with_hash(&desired_gen).await?;
+    }
+
+    Ok(true)
+}
+
 async fn mutate_haproxy_config<F>(
     pool: &PgPool,
     config: &EdgeRouteConfig,
@@ -163,60 +276,100 @@ where
         .execute(&mut *tx)
         .await?;
 
-    let client = Client::try_default().await?;
-    let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
-    let cm = cm_api.get(&config.configmap_name).await?;
-    let current = cm
-        .data
-        .as_ref()
-        .and_then(|data| data.get("haproxy.cfg"))
-        .ok_or_else(|| EdgeRouteError::MissingConfig {
-            namespace: config.namespace.clone(),
-            name: config.configmap_name.clone(),
-        })?;
+    let ops = KubeHaproxyOps::new(config).await?;
+    let changed = reconcile_haproxy(&ops, config, mutate).await?;
 
-    let updated = mutate(current);
-    if updated == *current {
-        // Nothing to write; still commit to release the lock cleanly.
-        tx.commit().await?;
-        return Ok(false);
+    tx.commit().await?;
+    Ok(changed)
+}
+
+/// Production [`HaproxyKubeOps`] backed by a live Kubernetes client.
+struct KubeHaproxyOps {
+    namespace: String,
+    configmap_name: String,
+    daemonset_name: String,
+    cm_api: Api<ConfigMap>,
+    ds_api: Api<DaemonSet>,
+}
+
+impl KubeHaproxyOps {
+    async fn new(config: &EdgeRouteConfig) -> Result<Self, EdgeRouteError> {
+        let client = Client::try_default().await?;
+        Ok(Self {
+            namespace: config.namespace.clone(),
+            configmap_name: config.configmap_name.clone(),
+            daemonset_name: config.daemonset_name.clone(),
+            cm_api: Api::namespaced(client.clone(), &config.namespace),
+            ds_api: Api::namespaced(client, &config.namespace),
+        })
     }
 
-    let patch = json!({
-        "data": {
-            "haproxy.cfg": updated,
+    fn missing_config(&self) -> EdgeRouteError {
+        EdgeRouteError::MissingConfig {
+            namespace: self.namespace.clone(),
+            name: self.configmap_name.clone(),
         }
-    });
-    cm_api
-        .patch(
-            &config.configmap_name,
-            &PatchParams::default(),
-            &Patch::Merge(&patch),
-        )
-        .await?;
+    }
+}
 
-    let ds_api: Api<DaemonSet> = Api::namespaced(client, &config.namespace);
-    let restart_patch = json!({
-        "spec": {
-            "template": {
-                "metadata": {
-                    "annotations": {
-                        "cap.enclava.dev/haproxy-restarted-at": Utc::now().to_rfc3339(),
+impl HaproxyKubeOps for KubeHaproxyOps {
+    async fn read_configmap(&self) -> Result<String, EdgeRouteError> {
+        let cm = self.cm_api.get(&self.configmap_name).await?;
+        cm.data
+            .as_ref()
+            .and_then(|data| data.get("haproxy.cfg"))
+            .cloned()
+            .ok_or_else(|| self.missing_config())
+    }
+
+    async fn write_configmap(&self, cfg: &str) -> Result<(), EdgeRouteError> {
+        let patch = json!({
+            "data": {
+                "haproxy.cfg": cfg,
+            }
+        });
+        self.cm_api
+            .patch(
+                &self.configmap_name,
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn read_loaded_hash(&self) -> Result<Option<String>, EdgeRouteError> {
+        let ds = self.ds_api.get(&self.daemonset_name).await?;
+        Ok(ds
+            .spec
+            .map(|spec| spec.template)
+            .and_then(|template| template.metadata)
+            .and_then(|meta| meta.annotations)
+            .and_then(|annotations| annotations.get(HAPROXY_LOADED_HASH_ANNOTATION).cloned()))
+    }
+
+    async fn restart_with_hash(&self, hash: &str) -> Result<(), EdgeRouteError> {
+        let restart_patch = json!({
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "cap.enclava.dev/haproxy-restarted-at": Utc::now().to_rfc3339(),
+                            HAPROXY_LOADED_HASH_ANNOTATION: hash,
+                        }
                     }
                 }
             }
-        }
-    });
-    ds_api
-        .patch(
-            &config.daemonset_name,
-            &PatchParams::default(),
-            &Patch::Merge(&restart_patch),
-        )
-        .await?;
-
-    tx.commit().await?;
-    Ok(true)
+        });
+        self.ds_api
+            .patch(
+                &self.daemonset_name,
+                &PatchParams::default(),
+                &Patch::Merge(&restart_patch),
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 /// Build a backend identifier scoped by tenant `org_slug` and tagged by the
@@ -649,5 +802,241 @@ mod tests {
         ] {
             assert_eq!(gateway_resolve_ip_from_value(&gateway), None);
         }
+    }
+
+    // -- reconcile_haproxy: convergence after partial failure (#42) --
+
+    /// Mutable in-memory state behind [`OpsRecorder`]: the rendered config, the
+    /// DaemonSet's stamped loaded-hash, which (if any) operation should "lose
+    /// its response" by applying its side effect before erroring, and call
+    /// counters for assertions.
+    #[derive(Default, Clone)]
+    struct FakeOpsState {
+        configmap: String,
+        loaded_hash: Option<String>,
+        /// Operation whose response is lost: the side effect is applied, then
+        /// an error is returned. Set to `Some("restart")` to model "ConfigMap
+        /// patch succeeded, reload patch failed".
+        lose_response: Option<&'static str>,
+        write_calls: usize,
+        restart_calls: usize,
+    }
+
+    fn test_config() -> EdgeRouteConfig {
+        EdgeRouteConfig {
+            namespace: "cap-edge".to_string(),
+            configmap_name: "haproxy-config".to_string(),
+            daemonset_name: "haproxy".to_string(),
+        }
+    }
+
+    fn base_cfg() -> String {
+        "frontend fe_443\n  bind :443\n  default_backend be_reject\n\nbackend be_reject\n"
+            .to_string()
+    }
+
+    /// Mutate fn for reconcile tests: append a route block if absent, mirroring
+    /// the idempotency of the production `render_route_into`. Convergence logic
+    /// only holds when the mutate fn returns identical text for already-applied
+    /// input, so `config_dirty` can be false once the desired config is live.
+    fn append_route(cfg: &str) -> String {
+        const BLOCK: &str = "\nbackend be_cap_new_app\n  server tenant 10.0.0.9:443 check\n";
+        if cfg.contains("backend be_cap_new_app") {
+            cfg.to_string()
+        } else {
+            format!("{cfg}{BLOCK}")
+        }
+    }
+
+    fn generation(cfg: &str) -> String {
+        config_generation(cfg)
+    }
+
+    #[tokio::test]
+    async fn reconcile_writes_config_and_restarts_on_first_apply() {
+        // Fresh DaemonSet: no config ever loaded.
+        let ops = OpsRecorder::new(FakeOpsState {
+            configmap: base_cfg(),
+            loaded_hash: None,
+            ..Default::default()
+        });
+
+        let changed = reconcile_haproxy(&ops, &test_config(), append_route)
+            .await
+            .unwrap();
+
+        assert!(changed, "first apply should mutate objects");
+        assert_eq!(ops.write_calls(), 1, "ConfigMap written once");
+        assert_eq!(ops.restart_calls(), 1, "DaemonSet restarted once");
+        assert_eq!(
+            ops.loaded_hash(),
+            Some(generation(&append_route(&base_cfg()))),
+            "loaded-hash stamped with the desired generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_converges_when_config_and_loaded_hash_match() {
+        // ConfigMap already holds the desired text and the DaemonSet already
+        // loaded exactly that generation: nothing to do.
+        let desired = append_route(&base_cfg());
+        let ops = OpsRecorder::new(FakeOpsState {
+            configmap: desired.clone(),
+            loaded_hash: Some(generation(&desired)),
+            ..Default::default()
+        });
+
+        let changed = reconcile_haproxy(&ops, &test_config(), append_route)
+            .await
+            .unwrap();
+
+        assert!(!changed, "converged state needs no writes");
+        assert_eq!(ops.write_calls(), 0);
+        assert_eq!(ops.restart_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_redoes_reload_when_config_written_but_reload_lost() {
+        // #42 regression: ConfigMap patch succeeded (desired text is live) but
+        // the reload patch failed. The OLD code saw desired==current and
+        // returned Ok(false) without reloading. The new code must see that the
+        // DaemonSet never loaded this generation and redo the reload.
+        let desired = append_route(&base_cfg());
+        let ops = OpsRecorder::new(FakeOpsState {
+            configmap: desired.clone(),
+            loaded_hash: Some(generation(&base_cfg())), // stale: never reloaded
+            ..Default::default()
+        });
+
+        let changed = reconcile_haproxy(&ops, &test_config(), append_route)
+            .await
+            .unwrap();
+
+        assert!(changed, "a missing reload must still report a change");
+        assert_eq!(
+            ops.write_calls(),
+            0,
+            "ConfigMap already matches desired text; no rewrite needed"
+        );
+        assert_eq!(ops.restart_calls(), 1, "the missing reload is redone");
+        assert_eq!(ops.loaded_hash(), Some(generation(&desired)));
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_safe_after_lost_reload_response() {
+        // The reload's side effect (hash stamped) applies but the response is
+        // lost, so the caller retries. The retry must converge (not restart
+        // again) and not error.
+        let desired = append_route(&base_cfg());
+        let ops = OpsRecorder::new(FakeOpsState {
+            configmap: desired.clone(),
+            loaded_hash: Some(generation(&base_cfg())),
+            // First reconcile: lose the reload response AFTER stamping the hash.
+            lose_response: Some("restart"),
+            ..Default::default()
+        });
+
+        let first = reconcile_haproxy(&ops, &test_config(), append_route).await;
+        assert!(
+            first.is_err(),
+            "lost reload response must surface as an error on the failed attempt"
+        );
+        assert_eq!(ops.restart_calls(), 1);
+        // Side effect was applied before the response was lost:
+        assert_eq!(ops.loaded_hash(), Some(generation(&desired)));
+
+        // Caller retries; lose_response now cleared.
+        ops.clear_lose_response();
+        let changed = reconcile_haproxy(&ops, &test_config(), append_route)
+            .await
+            .unwrap();
+        assert!(
+            !changed,
+            "retry must converge with no further mutation once the hash is stamped"
+        );
+        assert_eq!(ops.restart_calls(), 1, "no duplicate restart on retry");
+        assert_eq!(ops.write_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_rejects_oversized_config_before_any_write() {
+        // Guard the shared object's size budget (lesson from #18) and fail
+        // before touching the cluster.
+        let ops = OpsRecorder::new(FakeOpsState {
+            configmap: base_cfg(),
+            loaded_hash: None,
+            ..Default::default()
+        });
+
+        let err = reconcile_haproxy(&ops, &test_config(), |cfg| {
+            format!("{cfg}{}", "x".repeat(HAPROXY_CONFIGMAP_MAX_BYTES + 1))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, EdgeRouteError::ConfigTooLarge { .. }));
+        assert_eq!(ops.write_calls(), 0, "no write on size failure");
+        assert_eq!(ops.restart_calls(), 0, "no restart on size failure");
+    }
+
+    /// [`HaproxyKubeOps`] test double holding [`FakeOpsState`] behind interior
+    /// mutability, mirroring how the real kube `Api` calls take `&self` but
+    /// mutate server-side state. Records call counts for assertions.
+    struct OpsRecorder {
+        inner: std::cell::RefCell<FakeOpsState>,
+    }
+
+    impl OpsRecorder {
+        fn new(state: FakeOpsState) -> Self {
+            Self {
+                inner: std::cell::RefCell::new(state),
+            }
+        }
+        fn clear_lose_response(&self) {
+            self.inner.borrow_mut().lose_response = None;
+        }
+        fn write_calls(&self) -> usize {
+            self.inner.borrow().write_calls
+        }
+        fn restart_calls(&self) -> usize {
+            self.inner.borrow().restart_calls
+        }
+        fn loaded_hash(&self) -> Option<String> {
+            self.inner.borrow().loaded_hash.clone()
+        }
+    }
+
+    impl HaproxyKubeOps for OpsRecorder {
+        async fn read_configmap(&self) -> Result<String, EdgeRouteError> {
+            Ok(self.inner.borrow().configmap.clone())
+        }
+        async fn write_configmap(&self, cfg: &str) -> Result<(), EdgeRouteError> {
+            let mut ops = self.inner.borrow_mut();
+            ops.configmap = cfg.to_string();
+            ops.write_calls += 1;
+            Ok(())
+        }
+        async fn read_loaded_hash(&self) -> Result<Option<String>, EdgeRouteError> {
+            Ok(self.inner.borrow().loaded_hash.clone())
+        }
+        async fn restart_with_hash(&self, hash: &str) -> Result<(), EdgeRouteError> {
+            let mut ops = self.inner.borrow_mut();
+            ops.restart_calls += 1;
+            let lose = ops.lose_response;
+            ops.loaded_hash = Some(hash.to_string());
+            match lose {
+                Some("restart") => Err(fake_kube_error()),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    fn fake_kube_error() -> EdgeRouteError {
+        // A representative non-fatal error the caller would surface and retry on
+        // (e.g. a dropped apiserver response surfaced as a deserialization
+        // failure). SerdeError is the cheapest kube::Error variant to
+        // construct without a live cluster.
+        let serde_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        EdgeRouteError::Kube(kube::Error::SerdeError(serde_err))
     }
 }
