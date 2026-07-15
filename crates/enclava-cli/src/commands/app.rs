@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions,
     io::IsTerminal,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -33,6 +33,7 @@ use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, ve
 use enclava_cli::tee_client::TeeClient;
 use enclava_common::log_encryption::{
     EncryptedLogFrame, LOG_ENCRYPTION_ALGORITHM, decrypt_log_frame, generate_log_keypair,
+    log_keypair_from_private_key,
 };
 use enclava_common::types::{ResourceLimits, UnlockMode};
 use enclava_engine::manifest::cc_init_data;
@@ -1206,27 +1207,201 @@ pub async fn log_key(cmd: LogKeyCommand) -> Result<(), Box<dyn std::error::Error
 async fn generate_log_key(args: LogKeyGenerateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_name = resolve_app_name(&args.app)?;
     let (api, paths, _cli_config) = build_api_client()?;
+    let generated = generate_log_key_for_app(
+        &api,
+        &paths,
+        &app_name,
+        &args.key_id,
+        args.label,
+        args.private_key_file,
+        !args.no_activate,
+    )
+    .await?;
+    println!("Registered log key: {}", generated.key.key_id);
+    println!("Public key hash: {}", generated.key.public_key_sha256);
+    println!("Private key file: {}", generated.private_key_file.display());
+    Ok(())
+}
+
+pub(crate) struct GeneratedLogKey {
+    pub key: LogEncryptionKey,
+    pub private_key_file: PathBuf,
+}
+
+pub(crate) async fn generate_log_key_for_app(
+    api: &ApiClient,
+    paths: &CliPaths,
+    app_name: &str,
+    key_id: &str,
+    label: Option<String>,
+    private_key_file: Option<PathBuf>,
+    activate_for_app: bool,
+) -> Result<GeneratedLogKey, Box<dyn std::error::Error>> {
     paths.ensure_dirs()?;
+    let private_key_file =
+        private_key_file.unwrap_or_else(|| default_log_private_key_path(paths, app_name, key_id));
+    if private_key_file.exists() {
+        verify_private_log_key_permissions(&private_key_file)?;
+        let private_key = std::fs::read_to_string(&private_key_file).map_err(|err| {
+            format!(
+                "failed to read existing log private key {}: {err}",
+                private_key_file.display()
+            )
+        })?;
+        let keypair = log_keypair_from_private_key(private_key.trim()).map_err(|err| {
+            format!(
+                "existing log private key {} is invalid: {err}",
+                private_key_file.display()
+            )
+        })?;
+        let registered = api
+            .list_log_keys(app_name)
+            .await?
+            .keys
+            .into_iter()
+            .find(|key| key.key_id == key_id);
+        let key = match registered {
+            Some(key) => {
+                verify_registered_log_key_matches_private(
+                    &key,
+                    key_id,
+                    &keypair,
+                    &private_key_file,
+                    false,
+                )?;
+                if activate_for_app && !key.active_for_app {
+                    let selected = api.select_log_key(app_name, key_id).await?;
+                    verify_registered_log_key_matches_private(
+                        &selected,
+                        key_id,
+                        &keypair,
+                        &private_key_file,
+                        true,
+                    )?;
+                    selected
+                } else {
+                    key
+                }
+            }
+            None => {
+                let registered =
+                    register_log_keypair(api, app_name, key_id, label, activate_for_app, &keypair)
+                        .await?;
+                verify_registered_log_key_matches_private(
+                    &registered,
+                    key_id,
+                    &keypair,
+                    &private_key_file,
+                    activate_for_app,
+                )?;
+                registered
+            }
+        };
+        return Ok(GeneratedLogKey {
+            key,
+            private_key_file,
+        });
+    }
+
     let keypair = generate_log_keypair();
-    let private_key_file = args
-        .private_key_file
-        .unwrap_or_else(|| default_log_private_key_path(&paths, &app_name, &args.key_id));
     write_private_log_key(&private_key_file, &keypair.private_key_base64url)?;
-    let key = api
-        .register_log_key(
-            &app_name,
-            &RegisterLogEncryptionKeyRequest {
-                key_id: args.key_id,
-                algorithm: LOG_ENCRYPTION_ALGORITHM.to_string(),
-                public_key_base64url: keypair.public_key_base64url,
-                label: args.label,
-                activate_for_app: !args.no_activate,
-            },
+    let key =
+        register_log_keypair(api, app_name, key_id, label, activate_for_app, &keypair).await?;
+    verify_registered_log_key_matches_private(
+        &key,
+        key_id,
+        &keypair,
+        &private_key_file,
+        activate_for_app,
+    )?;
+    Ok(GeneratedLogKey {
+        key,
+        private_key_file,
+    })
+}
+
+async fn register_log_keypair(
+    api: &ApiClient,
+    app_name: &str,
+    key_id: &str,
+    label: Option<String>,
+    activate_for_app: bool,
+    keypair: &enclava_common::log_encryption::LogEncryptionKeyPair,
+) -> Result<LogEncryptionKey, ApiError> {
+    api.register_log_key(
+        app_name,
+        &RegisterLogEncryptionKeyRequest {
+            key_id: key_id.to_string(),
+            algorithm: LOG_ENCRYPTION_ALGORITHM.to_string(),
+            public_key_base64url: keypair.public_key_base64url.clone(),
+            label,
+            activate_for_app,
+        },
+    )
+    .await
+}
+
+fn verify_registered_log_key_matches_private(
+    key: &LogEncryptionKey,
+    expected_key_id: &str,
+    keypair: &enclava_common::log_encryption::LogEncryptionKeyPair,
+    private_key_file: &Path,
+    require_active_for_app: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if key.key_id != expected_key_id {
+        return Err(format!(
+            "log-key API returned key `{}` instead of requested key `{expected_key_id}`",
+            key.key_id
         )
-        .await?;
-    println!("Registered log key: {}", key.key_id);
-    println!("Public key hash: {}", key.public_key_sha256);
-    println!("Private key file: {}", private_key_file.display());
+        .into());
+    }
+    if key.status != "active" {
+        return Err(format!(
+            "log key `{expected_key_id}` is not active; choose a new --generate-log-key id"
+        )
+        .into());
+    }
+    if key.algorithm != LOG_ENCRYPTION_ALGORITHM
+        || key.public_key_base64url != keypair.public_key_base64url
+        || key.public_key_sha256 != keypair.public_key_sha256
+    {
+        return Err(format!(
+            "log private key {} does not match API log key `{expected_key_id}`; choose a new key id or restore the matching private key",
+            private_key_file.display(),
+        )
+        .into());
+    }
+    if require_active_for_app && !key.active_for_app {
+        return Err(format!(
+            "log-key API did not confirm requested key `{expected_key_id}` as active for the app"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_private_log_key_permissions(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let metadata = std::fs::metadata(path).map_err(|err| {
+        format!(
+            "failed to inspect existing log private key {}: {err}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "existing log private key {} is not a regular file",
+            path.display()
+        )
+        .into());
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "existing log private key {} has insecure permissions {mode:04o}; restrict it to owner-only access (for example, chmod 600)",
+            path.display()
+        )
+        .into());
+    }
     Ok(())
 }
 
