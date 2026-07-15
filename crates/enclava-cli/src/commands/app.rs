@@ -663,7 +663,7 @@ async fn wait_for_deploy_runtime(
                 let observation_is_fresh = status
                     .observation
                     .as_ref()
-                    .is_some_and(|observation| observation.state == "fresh");
+                    .is_none_or(|observation| observation.state == "fresh");
                 if observation_is_fresh && target.accepts_api_status(status.status.as_str()) {
                     pb.set_position(3);
                     pb.set_message(match status.status.as_str() {
