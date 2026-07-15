@@ -13,6 +13,7 @@ use kube::Api;
 use kube::api::ListParams;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::auth::{middleware::AuthContext, scopes};
@@ -20,6 +21,7 @@ use crate::models::App;
 use crate::state::AppState;
 
 const DEPLOYMENT_ID_LABEL: &str = "enclava.dev/deployment-id";
+const TEE_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -255,7 +257,13 @@ pub async fn live_pod_failure_message(namespace: &str, app_name: &str) -> Option
 }
 
 async fn probe_tee(state: &AppState, tee_status_url: &str) -> TeeEvidence {
-    let Ok(response) = state.tee_http_client.get(tee_status_url).send().await else {
+    let Ok(response) = state
+        .tee_http_client
+        .get(tee_status_url)
+        .timeout(TEE_STATUS_PROBE_TIMEOUT)
+        .send()
+        .await
+    else {
         return TeeEvidence::Unavailable;
     };
     if !response.status().is_success() {
@@ -319,7 +327,7 @@ fn classify_live_observation(
             false,
         );
     }
-    if pod.phase.is_none() || pod.deployment_id.is_none() {
+    if pod.phase.is_none() {
         return incomplete_observation(
             LiveObservationState::Partial,
             LiveObservationReason::PodEvidenceIncomplete,
@@ -391,6 +399,27 @@ fn classify_live_observation(
             pod.runtime_failure,
         );
     }
+    if pod.deployment_id.is_none() {
+        // Pods created before deployment identity was added to the pod
+        // template can still provide current, complete TEE health. Preserve
+        // that live health while explicitly marking identity evidence as
+        // partial; consumers that require exact deployment identity continue
+        // to fail closed until the workload is rolled forward.
+        return ObservedAppStatus {
+            observation: LiveObservation {
+                state: LiveObservationState::Partial,
+                observed_at,
+                deployment_id: None,
+                reason: Some(LiveObservationReason::PodEvidenceIncomplete),
+            },
+            pod_phase: pod.phase,
+            pod_status: fields.pod_status,
+            tee_status: fields.tee_status,
+            storage_status: fields.storage_status,
+            live_state: fields.live_state,
+            runtime_failure: pod.runtime_failure,
+        };
+    }
     ObservedAppStatus {
         observation: LiveObservation {
             state: LiveObservationState::Fresh,
@@ -441,19 +470,22 @@ fn effective_app_status(
     live_state: Option<&str>,
     runtime_failure: bool,
 ) -> String {
-    if runtime_failure || matches!(recorded_status, "failed" | "deleting" | "stopped") {
-        return if runtime_failure {
-            "failed".to_string()
-        } else {
-            recorded_status.to_string()
-        };
+    if runtime_failure {
+        return "failed".to_string();
+    }
+    if recorded_status != "running" {
+        return recorded_status.to_string();
     }
     match observation_state {
         LiveObservationState::Unavailable => "unavailable".to_string(),
-        LiveObservationState::Partial => "partial".to_string(),
+        LiveObservationState::Partial => match live_state {
+            Some("unlocked") => "running".to_string(),
+            Some("locked") => "locked".to_string(),
+            _ => "partial".to_string(),
+        },
         LiveObservationState::Fresh => match live_state {
-            Some("unlocked") if recorded_status == "running" => "running".to_string(),
-            Some("locked") if recorded_status == "running" => "locked".to_string(),
+            Some("unlocked") => "running".to_string(),
+            Some("locked") => "locked".to_string(),
             _ => recorded_status.to_string(),
         },
     }
@@ -627,6 +659,41 @@ mod tests {
                 false
             ),
             "running"
+        );
+    }
+
+    #[test]
+    fn complete_legacy_pod_health_stays_live_without_claiming_identity() {
+        let pod = KubernetesEvidence::Available(PodEvidence {
+            found: true,
+            phase: Some("Running".to_string()),
+            deployment_id: None,
+            runtime_failure: false,
+        });
+        let observed = classify_live_observation(pod, complete_tee(), observed_at());
+
+        assert_eq!(observed.observation.state, LiveObservationState::Partial);
+        assert_eq!(
+            observed.observation.reason,
+            Some(LiveObservationReason::PodEvidenceIncomplete)
+        );
+        assert_eq!(observed.observation.deployment_id, None);
+        assert_eq!(observed.effective_status("running"), "running");
+    }
+
+    #[test]
+    fn incomplete_evidence_preserves_in_progress_lifecycle_state() {
+        assert_eq!(
+            effective_app_status("pending", LiveObservationState::Unavailable, None, false),
+            "pending"
+        );
+        assert_eq!(
+            effective_app_status("applying", LiveObservationState::Partial, None, false),
+            "applying"
+        );
+        assert_eq!(
+            effective_app_status("watching", LiveObservationState::Unavailable, None, false),
+            "watching"
         );
     }
 

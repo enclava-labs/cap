@@ -639,8 +639,14 @@ async fn wait_for_deploy_runtime(
                     return Ok(());
                 }
 
+                let pod_phase_is_verified = status
+                    .observation
+                    .as_ref()
+                    .is_none_or(|observation| observation.state == "fresh");
                 match status.pod_phase.as_deref() {
-                    Some("Running") if target.accepts_running_pod_phase() => {
+                    Some("Running")
+                        if pod_phase_is_verified && target.accepts_running_pod_phase() =>
+                    {
                         pb.set_position(3);
                         pb.set_message("TEE running, attestation complete");
                         return Ok(());
