@@ -672,7 +672,8 @@ async fn wait_for_deploy_runtime(
                 let pod_phase_is_verified = status
                     .observation
                     .as_ref()
-                    .is_none_or(|observation| observation.state == "fresh");
+                    .is_none_or(|observation| observation.state == "fresh")
+                    && status.status != "failed";
                 match status.pod_phase.as_deref() {
                     Some("Running")
                         if pod_phase_is_verified && target.accepts_running_pod_phase() =>

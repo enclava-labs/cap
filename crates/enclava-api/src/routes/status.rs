@@ -221,9 +221,13 @@ async fn probe_kubernetes(namespace: &str, app_name: &str) -> KubernetesEvidence
         .iter()
         .filter(|pod| pod.metadata.deletion_timestamp.is_none())
         .collect::<Vec<_>>();
+    let runtime_failure = active
+        .iter()
+        .any(|pod| pod_runtime_failure_message(pod).is_some());
     if active.len() != 1 {
         return KubernetesEvidence::Available(PodEvidence {
             found: !active.is_empty(),
+            runtime_failure,
             ..PodEvidence::default()
         });
     }
@@ -239,7 +243,7 @@ async fn probe_kubernetes(namespace: &str, app_name: &str) -> KubernetesEvidence
         found: true,
         phase,
         deployment_id,
-        runtime_failure: pod_runtime_failure_message(pod).is_some(),
+        runtime_failure,
     })
 }
 
@@ -290,7 +294,8 @@ fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
             .and_then(Value::as_str)
             .map(str::to_string),
         live_state: body
-            .get("state")
+            .get("unlock_state")
+            .or_else(|| body.get("state"))
             .and_then(Value::as_str)
             .map(str::to_string),
     }
@@ -695,6 +700,33 @@ mod tests {
             effective_app_status("watching", LiveObservationState::Unavailable, None, false),
             "watching"
         );
+    }
+
+    #[test]
+    fn current_unlock_state_field_is_live_tee_evidence() {
+        let fields = tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "tee_status": "ready",
+            "storage_status": "unlocked",
+            "unlock_state": "unlocked"
+        }));
+        assert_eq!(fields.live_state.as_deref(), Some("unlocked"));
+    }
+
+    #[test]
+    fn ambiguous_pods_with_runtime_failure_fail_closed() {
+        let observed = classify_live_observation(
+            KubernetesEvidence::Available(PodEvidence {
+                found: true,
+                phase: None,
+                deployment_id: None,
+                runtime_failure: true,
+            }),
+            complete_tee(),
+            observed_at(),
+        );
+
+        assert_eq!(observed.effective_status("running"), "failed");
     }
 
     #[test]

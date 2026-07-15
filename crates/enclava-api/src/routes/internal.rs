@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -147,6 +148,8 @@ impl Drop for IdempotencyLease {
         self.stop_heartbeat();
     }
 }
+
+const STATUS_OBSERVATION_CONCURRENCY: usize = 16;
 
 pub struct InternalAuth {
     pub client_san: String,
@@ -2203,6 +2206,56 @@ pub async fn list_paas_deployments(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn observed_internal_status_item(
+    state: &AppState,
+    cap_app_id: Uuid,
+    app_name: String,
+    namespace: String,
+    recorded_app_status: String,
+    domain: String,
+    tee_domain: Option<String>,
+    cap_deployment_id: Option<Uuid>,
+    recorded_deployment_status: Option<String>,
+    image_digest: Option<String>,
+    recorded_error_message: Option<String>,
+) -> serde_json::Value {
+    let observed =
+        observe_app_status_fields(state, &namespace, &app_name, &domain, tee_domain.as_deref())
+            .await;
+    let app_status = observed.effective_status(&recorded_app_status);
+    let deployment_status = recorded_deployment_status
+        .as_deref()
+        .map(|status| observed.effective_status(status));
+    let error_message = if observed.runtime_failed() {
+        Some("runtime_failure".to_string())
+    } else if recorded_error_message.is_some() {
+        Some("deployment_failed".to_string())
+    } else {
+        None
+    };
+    let latest_deployment = cap_deployment_id.map(|id| {
+        serde_json::json!({
+            "cap_deployment_id": id,
+            "status": deployment_status,
+            "recorded_status": recorded_deployment_status,
+            "image_digest": image_digest,
+            "error_message": error_message,
+            "observation": &observed.observation,
+        })
+    });
+    serde_json::json!({
+        "cap_app_id": cap_app_id,
+        "app_name": app_name,
+        "status": app_status,
+        "recorded_status": recorded_app_status,
+        "domain": domain,
+        "tee_domain": tee_domain,
+        "latest_deployment": latest_deployment,
+        "observation": observed.observation,
+    })
+}
+
 pub async fn list_paas_status(
     _auth: InternalAuth,
     State(state): State<AppState>,
@@ -2258,62 +2311,41 @@ pub async fn list_paas_status(
     .fetch_all(&state.db)
     .await
     .map_err(|_| db_error())?;
-    let mut items = Vec::with_capacity(rows.len());
-    for (
-        cap_app_id,
-        app_name,
-        namespace,
-        app_status,
-        domain,
-        tee_domain,
-        cap_deployment_id,
-        deployment_status,
-        image_digest,
-        error_message,
-    ) in rows
-    {
-        let observed = observe_app_status_fields(
-            &state,
-            &namespace,
-            &app_name,
-            &domain,
-            tee_domain.as_deref(),
-        )
-        .await;
-        let recorded_app_status = app_status;
-        let app_status = observed.effective_status(&recorded_app_status);
-        let recorded_deployment_status = deployment_status;
-        let deployment_status = recorded_deployment_status
-            .as_deref()
-            .map(|status| observed.effective_status(status));
-        let error_message = if observed.runtime_failed() {
-            Some("runtime_failure".to_string())
-        } else if error_message.is_some() {
-            Some("deployment_failed".to_string())
-        } else {
-            None
-        };
-        let latest_deployment = cap_deployment_id.map(|id| {
-            serde_json::json!({
-                "cap_deployment_id": id,
-                "status": deployment_status,
-                "recorded_status": recorded_deployment_status,
-                "image_digest": image_digest,
-                "error_message": error_message,
-                "observation": &observed.observation,
-            })
-        });
-        items.push(serde_json::json!({
-            "cap_app_id": cap_app_id,
-            "app_name": app_name,
-            "status": app_status,
-            "recorded_status": recorded_app_status,
-            "domain": domain,
-            "tee_domain": tee_domain,
-            "latest_deployment": latest_deployment,
-            "observation": observed.observation,
-        }));
-    }
+    let items = stream::iter(rows.into_iter().map(
+        |(
+            cap_app_id,
+            app_name,
+            namespace,
+            app_status,
+            domain,
+            tee_domain,
+            cap_deployment_id,
+            deployment_status,
+            image_digest,
+            error_message,
+        )| {
+            let state = state.clone();
+            async move {
+                observed_internal_status_item(
+                    &state,
+                    cap_app_id,
+                    app_name,
+                    namespace,
+                    app_status,
+                    domain,
+                    tee_domain,
+                    cap_deployment_id,
+                    deployment_status,
+                    image_digest,
+                    error_message,
+                )
+                .await
+            }
+        },
+    ))
+    .buffered(STATUS_OBSERVATION_CONCURRENCY)
+    .collect()
+    .await;
     Ok(Json(InternalListResponse { items }))
 }
 
@@ -2380,70 +2412,56 @@ pub async fn list_paas_cluster_status(
     .await
     .map_err(|_| db_error())?;
 
-    let mut items = Vec::with_capacity(rows.len());
-    for (
-        paas_org_id,
-        cap_org_id,
-        cap_org_name,
-        cap_org_display_name,
-        cap_app_id,
-        app_name,
-        namespace,
-        app_status,
-        domain,
-        tee_domain,
-        cap_deployment_id,
-        deployment_status,
-        image_digest,
-        error_message,
-    ) in rows
-    {
-        let observed = observe_app_status_fields(
-            &state,
-            &namespace,
-            &app_name,
-            &domain,
-            tee_domain.as_deref(),
-        )
-        .await;
-        let recorded_app_status = app_status;
-        let app_status = observed.effective_status(&recorded_app_status);
-        let recorded_deployment_status = deployment_status;
-        let deployment_status = recorded_deployment_status
-            .as_deref()
-            .map(|status| observed.effective_status(status));
-        let error_message = if observed.runtime_failed() {
-            Some("runtime_failure".to_string())
-        } else if error_message.is_some() {
-            Some("deployment_failed".to_string())
-        } else {
-            None
-        };
-        let latest_deployment = cap_deployment_id.map(|id| {
-            serde_json::json!({
-                "cap_deployment_id": id,
-                "status": deployment_status,
-                "recorded_status": recorded_deployment_status,
-                "image_digest": image_digest,
-                "error_message": error_message,
-                "observation": &observed.observation,
-            })
-        });
-        items.push(serde_json::json!({
-            "paas_org_id": paas_org_id,
-            "cap_org_id": cap_org_id,
-            "cap_org_name": cap_org_name,
-            "cap_org_display_name": cap_org_display_name,
-            "cap_app_id": cap_app_id,
-            "app_name": app_name,
-            "status": app_status,
-            "recorded_status": recorded_app_status,
-            "domain": domain,
-            "tee_domain": tee_domain,
-            "latest_deployment": latest_deployment,
-            "observation": observed.observation,
-        }));
-    }
+    let items = stream::iter(rows.into_iter().map(
+        |(
+            paas_org_id,
+            cap_org_id,
+            cap_org_name,
+            cap_org_display_name,
+            cap_app_id,
+            app_name,
+            namespace,
+            app_status,
+            domain,
+            tee_domain,
+            cap_deployment_id,
+            deployment_status,
+            image_digest,
+            error_message,
+        )| {
+            let state = state.clone();
+            async move {
+                let mut item = observed_internal_status_item(
+                    &state,
+                    cap_app_id,
+                    app_name,
+                    namespace,
+                    app_status,
+                    domain,
+                    tee_domain,
+                    cap_deployment_id,
+                    deployment_status,
+                    image_digest,
+                    error_message,
+                )
+                .await;
+                let object = item
+                    .as_object_mut()
+                    .expect("internal status item is always an object");
+                object.insert("paas_org_id".to_string(), serde_json::json!(paas_org_id));
+                object.insert("cap_org_id".to_string(), serde_json::json!(cap_org_id));
+                object.insert("cap_org_name".to_string(), serde_json::json!(cap_org_name));
+                object.insert(
+                    "cap_org_display_name".to_string(),
+                    serde_json::json!(cap_org_display_name),
+                );
+                item
+            }
+        },
+    ))
+    .buffered(STATUS_OBSERVATION_CONCURRENCY)
+    .collect()
+    .await;
     Ok(Json(InternalListResponse { items }))
 }
 
