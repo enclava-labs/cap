@@ -1183,9 +1183,8 @@ async fn observed_internal_status_item(
     )
     .await;
     let app_status = observed.effective_status(&recorded_app_status);
-    let runtime_failure_applies = observed.runtime_failed()
-        && observed.observation.deployment_id.is_some()
-        && observed.observation.deployment_id == cap_deployment_id;
+    let runtime_failure_applies = cap_deployment_id
+        .is_some_and(|deployment_id| observed.runtime_failure_applies_to_latest(deployment_id));
     let deployment_status = if runtime_failure_applies {
         Some("failed".to_string())
     } else {
