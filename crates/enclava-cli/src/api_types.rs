@@ -535,6 +535,32 @@ pub struct RevokeLogEncryptionKeyResponse {
     pub cleared_app_selections: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct OrgLogEncryptionKey {
+    pub key_id: String,
+    pub algorithm: String,
+    pub public_key_base64url: String,
+    pub public_key_sha256: String,
+    pub label: Option<String>,
+    pub status: String,
+    pub selected_by_count: i64,
+    pub created_at: String,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OrgLogEncryptionKeyList {
+    pub keys: Vec<OrgLogEncryptionKey>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeOrgLogEncryptionKeyResponse {
+    pub key_id: String,
+    pub status: String,
+    pub revoked_at: Option<String>,
+    pub cleared_app_selections: Option<u64>,
+}
+
 // --- Config ---
 
 #[derive(Debug, Deserialize)]

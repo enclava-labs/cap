@@ -57,6 +57,20 @@ fn resolve_app_name(explicit: &Option<String>) -> Result<String, Box<dyn std::er
     Ok(config.app.name)
 }
 
+/// Like `resolve_app_name`, but returns `Ok(None)` when neither `--app` nor an
+/// `enclava.toml` is present, so org-level `list`/`revoke` can fall back to the
+/// org-scoped endpoints. `select`/`generate` keep using `resolve_app_name`.
+fn resolve_optional_app_name(
+    explicit: &Option<String>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if let Some(name) = explicit {
+        return Ok(Some(name.clone()));
+    }
+    Ok(AppConfig::find_and_load()
+        .ok()
+        .map(|config| config.app.name))
+}
+
 /// Build an authenticated API client from stored config/credentials.
 fn build_api_client() -> Result<(ApiClient, CliPaths, config::CliConfig), Box<dyn std::error::Error>>
 {
@@ -1406,20 +1420,32 @@ fn verify_private_log_key_permissions(path: &Path) -> Result<(), Box<dyn std::er
 }
 
 async fn list_log_keys(args: LogKeyAppArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let app_name = resolve_app_name(&args.app)?;
     let (api, _paths, _cli_config) = build_api_client()?;
-    let list = api.list_log_keys(&app_name).await?;
-    println!("App: {}", list.app_name);
-    println!(
-        "Active key: {}",
-        list.active_key_id.as_deref().unwrap_or("-")
-    );
-    for key in list.keys {
-        let active = if key.active_for_app { "active" } else { "-" };
-        println!(
-            "{} {} {} {}",
-            key.key_id, key.status, active, key.public_key_sha256
-        );
+    match resolve_optional_app_name(&args.app)? {
+        Some(app_name) => {
+            let list = api.list_log_keys(&app_name).await?;
+            println!("App: {}", list.app_name);
+            println!(
+                "Active key: {}",
+                list.active_key_id.as_deref().unwrap_or("-")
+            );
+            for key in list.keys {
+                let active = if key.active_for_app { "active" } else { "-" };
+                println!(
+                    "{} {} {} {}",
+                    key.key_id, key.status, active, key.public_key_sha256
+                );
+            }
+        }
+        None => {
+            let list = api.list_org_log_keys().await?;
+            for key in list.keys {
+                println!(
+                    "{} {} selected-by={} {}",
+                    key.key_id, key.status, key.selected_by_count, key.public_key_sha256
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1433,10 +1459,14 @@ async fn select_log_key(args: LogKeySelectArgs) -> Result<(), Box<dyn std::error
 }
 
 async fn revoke_log_key(args: LogKeySelectArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let app_name = resolve_app_name(&args.app)?;
     let (api, _paths, _cli_config) = build_api_client()?;
-    let key = api.revoke_log_key(&app_name, &args.key_id).await?;
-    println!("Revoked log key: {}", key.key_id);
+    if let Some(app_name) = resolve_optional_app_name(&args.app)? {
+        let key = api.revoke_log_key(&app_name, &args.key_id).await?;
+        println!("Revoked log key: {}", key.key_id);
+    } else {
+        let key = api.revoke_org_log_key(&args.key_id).await?;
+        println!("Revoked log key (org): {}", key.key_id);
+    }
     Ok(())
 }
 

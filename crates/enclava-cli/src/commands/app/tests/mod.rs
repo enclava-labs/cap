@@ -1035,3 +1035,79 @@ fn storage_password_file_trims_newlines_and_rejects_empty() {
             .contains("is empty")
     );
 }
+
+#[tokio::test]
+async fn list_org_log_keys_hits_org_endpoint() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = serde_json::json!({ "keys": [] }).to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let list = api.list_org_log_keys().await.unwrap();
+    let request = handle.join().unwrap();
+
+    assert!(request.starts_with("GET /log-keys "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert!(list.keys.is_empty());
+}
+
+#[tokio::test]
+async fn revoke_org_log_key_hits_org_endpoint() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = serde_json::json!({
+            "key_id": "team-logs",
+            "status": "revoked",
+            "revoked_at": "2026-07-15T00:00:00Z",
+            "cleared_app_selections": 2
+        })
+        .to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let resp = api.revoke_org_log_key("team-logs").await.unwrap();
+    let request = handle.join().unwrap();
+
+    assert!(request.starts_with("DELETE /log-keys/team-logs "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert_eq!(resp.key_id, "team-logs");
+    assert_eq!(resp.status, "revoked");
+    assert_eq!(resp.cleared_app_selections, Some(2));
+}
