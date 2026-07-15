@@ -200,6 +200,16 @@ fn statefulset_phase5_uses_only_steady_state_containers() {
     // and enclava-init is the long-running mounter sidecar.
     let app = sample_app();
     let sts = generate_statefulset(&app);
+    assert_eq!(
+        sts.spec
+            .as_ref()
+            .and_then(|spec| spec.template.metadata.as_ref())
+            .and_then(|metadata| metadata.labels.as_ref())
+            .and_then(|labels| labels.get("enclava.dev/deployment-id"))
+            .map(String::as_str),
+        Some("11111111-2222-3333-4444-555555555555"),
+        "pods must carry the exact deployment identity used by live status observations"
+    );
     let pod = sts.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
 
     assert_eq!(pod.init_containers.as_ref().map(|v| v.len()), Some(1));

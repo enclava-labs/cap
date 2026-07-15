@@ -1025,6 +1025,18 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     if let Some(deployed) = &status.last_deployed {
         println!("Deployed: {deployed}");
     }
+    if let Some(observation) = &status.observation {
+        println!("Freshness: {}", observation.state);
+        if observation.drifted {
+            println!("Drift:    deployment identity mismatch");
+        }
+        if let Some(observed_at) = &observation.observed_at {
+            println!("Observed: {observed_at}");
+        }
+        if let Some(reason) = &observation.reason {
+            println!("Evidence: {reason}");
+        }
+    }
 
     Ok(())
 }

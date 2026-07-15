@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::auth::middleware::{AuthContext, ManagementOrigin};
 use crate::models::Role;
 use crate::routes::platform::{DeploymentContextResponse, deployment_context_response};
-use crate::routes::status::live_pod_failure_message;
+use crate::routes::status::observe_app_status_fields;
 use crate::state::AppState;
 
 type InternalRouteError = (StatusCode, Json<serde_json::Value>);
@@ -2272,33 +2272,46 @@ pub async fn list_paas_status(
         error_message,
     ) in rows
     {
-        let runtime_failure = live_pod_failure_message(&namespace, &app_name).await;
-        let app_status = if runtime_failure.is_some() {
-            "failed".to_string()
+        let observed = observe_app_status_fields(
+            &state,
+            &namespace,
+            &app_name,
+            &domain,
+            tee_domain.as_deref(),
+        )
+        .await;
+        let recorded_app_status = app_status;
+        let app_status = observed.effective_status(&recorded_app_status);
+        let recorded_deployment_status = deployment_status;
+        let deployment_status = recorded_deployment_status
+            .as_deref()
+            .map(|status| observed.effective_status(status));
+        let error_message = if observed.runtime_failed() {
+            Some("runtime_failure".to_string())
+        } else if error_message.is_some() {
+            Some("deployment_failed".to_string())
         } else {
-            app_status
+            None
         };
-        let deployment_status = if runtime_failure.is_some() && cap_deployment_id.is_some() {
-            Some("failed".to_string())
-        } else {
-            deployment_status
-        };
-        let error_message = runtime_failure.or(error_message);
         let latest_deployment = cap_deployment_id.map(|id| {
             serde_json::json!({
                 "cap_deployment_id": id,
                 "status": deployment_status,
+                "recorded_status": recorded_deployment_status,
                 "image_digest": image_digest,
                 "error_message": error_message,
+                "observation": &observed.observation,
             })
         });
         items.push(serde_json::json!({
             "cap_app_id": cap_app_id,
             "app_name": app_name,
             "status": app_status,
+            "recorded_status": recorded_app_status,
             "domain": domain,
             "tee_domain": tee_domain,
             "latest_deployment": latest_deployment,
+            "observation": observed.observation,
         }));
     }
     Ok(Json(InternalListResponse { items }))
@@ -2385,24 +2398,35 @@ pub async fn list_paas_cluster_status(
         error_message,
     ) in rows
     {
-        let runtime_failure = live_pod_failure_message(&namespace, &app_name).await;
-        let app_status = if runtime_failure.is_some() {
-            "failed".to_string()
+        let observed = observe_app_status_fields(
+            &state,
+            &namespace,
+            &app_name,
+            &domain,
+            tee_domain.as_deref(),
+        )
+        .await;
+        let recorded_app_status = app_status;
+        let app_status = observed.effective_status(&recorded_app_status);
+        let recorded_deployment_status = deployment_status;
+        let deployment_status = recorded_deployment_status
+            .as_deref()
+            .map(|status| observed.effective_status(status));
+        let error_message = if observed.runtime_failed() {
+            Some("runtime_failure".to_string())
+        } else if error_message.is_some() {
+            Some("deployment_failed".to_string())
         } else {
-            app_status
+            None
         };
-        let deployment_status = if runtime_failure.is_some() && cap_deployment_id.is_some() {
-            Some("failed".to_string())
-        } else {
-            deployment_status
-        };
-        let error_message = runtime_failure.or(error_message);
         let latest_deployment = cap_deployment_id.map(|id| {
             serde_json::json!({
                 "cap_deployment_id": id,
                 "status": deployment_status,
+                "recorded_status": recorded_deployment_status,
                 "image_digest": image_digest,
                 "error_message": error_message,
+                "observation": &observed.observation,
             })
         });
         items.push(serde_json::json!({
@@ -2413,9 +2437,11 @@ pub async fn list_paas_cluster_status(
             "cap_app_id": cap_app_id,
             "app_name": app_name,
             "status": app_status,
+            "recorded_status": recorded_app_status,
             "domain": domain,
             "tee_domain": tee_domain,
             "latest_deployment": latest_deployment,
+            "observation": observed.observation,
         }));
     }
     Ok(Json(InternalListResponse { items }))
