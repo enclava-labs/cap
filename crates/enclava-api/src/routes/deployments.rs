@@ -481,6 +481,23 @@ fn deployment_setup_incomplete(deployment: &Deployment) -> bool {
     )
 }
 
+async fn app_has_incomplete_deployment_setup(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM deployments
+             WHERE app_id = $1
+               AND spec_snapshot ->> 'setup_state' IN ('dns_pending', 'cleanup_pending')
+         )",
+    )
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 async fn insert_transaction_audit(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     org_id: Uuid,
@@ -903,6 +920,13 @@ async fn deploy_app_candidate(
                 )
             })?
     };
+    let existing_authority_snapshot = (app_mutation != AppMutation::Insert).then(|| {
+        crate::deploy::ExistingAppAuthoritySnapshot::new(
+            app.updated_at,
+            candidate_containers.clone(),
+            app_resources.clone(),
+        )
+    });
     let candidate_container = if let Some(container) = candidate_containers
         .iter_mut()
         .find(|row| row.name == container_name)
@@ -1092,6 +1116,28 @@ async fn deploy_app_candidate(
             Json(serde_json::json!({"error": "database error"})),
         )
     })?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    if let Some(expected) = existing_authority_snapshot.as_ref()
+        && !crate::deploy::lock_and_verify_existing_app_authority(&mut tx, app.id, expected)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+    {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "app deployment inputs changed while deployment was validating; retry the deployment",
+        ));
+    }
+    if app_has_incomplete_deployment_setup(&mut tx, app.id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+    {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "an earlier deployment is still completing setup; retry after setup is reconciled",
+        ));
+    }
 
     match app_mutation {
         AppMutation::None => {}
@@ -1228,6 +1274,10 @@ async fn deploy_app_candidate(
     .await
     .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
+    crate::deploy::supersede_incomplete_deployments(&mut tx, app.id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+
     // Create deployment record. cosign_verified is set from the actual
     // verification result, not hardcoded.
     let cosign_verified = true;
@@ -1359,29 +1409,20 @@ async fn deploy_app_candidate(
     tokio::spawn(async move {
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
-            Err(e) => {
-                let error_message = format!("deployment apply limiter closed: {e}");
-                let _ = crate::deploy::set_deployment_status(
-                    &db,
-                    deploy_id,
-                    "failed",
-                    None,
-                    Some(&error_message),
-                    true,
-                )
-                .await;
-                let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
+            Err(_) => {
+                let _ =
+                    crate::deploy::fail_deployment_if_active(&db, apply_app.id, deploy_id).await;
                 tracing::error!(
                     app_id = %apply_app.id,
                     deployment_id = %deploy_id,
-                    error = %error_message,
+                    error_code = crate::deploy::DEPLOYMENT_APPLY_FAILED_ERROR,
                     "failed to acquire deployment apply permit"
                 );
                 return;
             }
         };
 
-        if let Err(e) = crate::deploy::apply_deployment_manifests(
+        if crate::deploy::apply_deployment_manifests(
             crate::deploy::ApplyDeploymentManifestsRequest {
                 pool: db.clone(),
                 app: apply_app.clone(),
@@ -1399,22 +1440,13 @@ async fn deploy_app_candidate(
             },
         )
         .await
+        .is_err()
         {
-            let error_message = e.to_string();
-            let _ = crate::deploy::set_deployment_status(
-                &db,
-                deploy_id,
-                "failed",
-                None,
-                Some(&error_message),
-                true,
-            )
-            .await;
-            let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
+            let _ = crate::deploy::fail_deployment_if_active(&db, apply_app.id, deploy_id).await;
             tracing::error!(
                 app_id = %apply_app.id,
                 deployment_id = %deploy_id,
-                error = %error_message,
+                error_code = crate::deploy::DEPLOYMENT_APPLY_FAILED_ERROR,
                 "failed to apply deployment manifests"
             );
         }
@@ -1546,6 +1578,84 @@ mod tests {
             .expect("load setup test app")
     }
 
+    async fn insert_authority_rows(
+        pool: &sqlx::PgPool,
+        app: &App,
+    ) -> crate::deploy::ExistingAppAuthoritySnapshot {
+        sqlx::query(
+            "INSERT INTO app_containers (
+                id, app_id, name, image_ref, image_digest, port,
+                workload_security_profile, is_primary
+             )
+             VALUES ($1, $2, 'web', $3, $4, 8080, 'restricted', true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.id)
+        .bind("ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .bind("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .execute(pool)
+        .await
+        .expect("insert authority test container");
+        sqlx::query(
+            "INSERT INTO app_resources (
+                app_id, cpu_limit, memory_limit, app_data_size, tls_data_size
+             )
+             VALUES ($1, '1', '1Gi', '5Gi', '2Gi')",
+        )
+        .bind(app.id)
+        .execute(pool)
+        .await
+        .expect("insert authority test resources");
+        load_authority_snapshot(pool, app.id).await
+    }
+
+    async fn load_authority_snapshot(
+        pool: &sqlx::PgPool,
+        app_id: Uuid,
+    ) -> crate::deploy::ExistingAppAuthoritySnapshot {
+        let app_updated_at = sqlx::query_scalar("SELECT updated_at FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(pool)
+            .await
+            .expect("load authority app timestamp");
+        let containers =
+            sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 ORDER BY id")
+                .bind(app_id)
+                .fetch_all(pool)
+                .await
+                .expect("load authority containers");
+        let resources = sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_one(pool)
+            .await
+            .expect("load authority resources");
+        crate::deploy::ExistingAppAuthoritySnapshot::new(app_updated_at, containers, resources)
+    }
+
+    async fn wait_for_backend_lock(pool: &sqlx::PgPool, backend_pid: i32) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting_on_lock: bool = sqlx::query_scalar(
+                    "SELECT COALESCE((
+                         SELECT wait_event_type = 'Lock'
+                         FROM pg_stat_activity
+                         WHERE pid = $1
+                     ), false)",
+                )
+                .bind(backend_pid)
+                .fetch_one(pool)
+                .await
+                .expect("inspect validator backend lock state");
+                if waiting_on_lock {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("validator did not block on the concurrent authority mutation");
+    }
+
     async fn delete_setup_test_org(pool: &sqlx::PgPool, org_id: Uuid) {
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(org_id)
@@ -1598,6 +1708,257 @@ mod tests {
             validate_log_encryption_config(Some(config)).expect_err("algorithm rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "unsupported log_encryption.algorithm");
+    }
+
+    #[tokio::test]
+    async fn existing_app_acceptance_waits_for_and_rejects_concurrent_authority_change() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        let expected = insert_authority_rows(&pool, &app).await;
+
+        let mut mutation = pool.begin().await.expect("begin authority mutation");
+        sqlx::query(
+            "UPDATE apps
+             SET signer_identity_subject = 'https://github.com/attacker/repo',
+                 signer_identity_issuer = 'https://issuer.example.test',
+                 egress_allowlist = '[{\"host\":\"race.example.test\",\"ports\":[443]}]'::jsonb,
+                 updated_at = clock_timestamp()
+             WHERE id = $1",
+        )
+        .bind(app.id)
+        .execute(&mut *mutation)
+        .await
+        .expect("hold concurrent app authority mutation");
+
+        let app_id = app.id;
+        let validation_pool = pool.clone();
+        let (pid_sender, pid_receiver) = tokio::sync::oneshot::channel();
+        let validation = tokio::spawn(async move {
+            let mut tx = validation_pool
+                .begin()
+                .await
+                .expect("begin acceptance validation");
+            let backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("validator backend pid");
+            pid_sender.send(backend_pid).expect("send validator pid");
+            crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+                .await
+                .expect("lock app deployment lane");
+            let unchanged =
+                crate::deploy::lock_and_verify_existing_app_authority(&mut tx, app_id, &expected)
+                    .await
+                    .expect("verify authority snapshot");
+            tx.rollback()
+                .await
+                .expect("roll back validation transaction");
+            unchanged
+        });
+
+        let backend_pid = pid_receiver.await.expect("receive validator pid");
+        wait_for_backend_lock(&pool, backend_pid).await;
+        mutation.commit().await.expect("commit authority mutation");
+
+        assert!(
+            !validation.await.expect("join acceptance validation"),
+            "a signer/egress change committed during validation must reject acceptance"
+        );
+        delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn existing_app_acceptance_rejects_stale_container_and_resource_rows() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        let expected = insert_authority_rows(&pool, &app).await;
+
+        let original_updated_at: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load unchanged app timestamp");
+        sqlx::query(
+            "UPDATE app_containers
+             SET image_ref = $1, image_digest = $2
+             WHERE app_id = $3 AND name = 'web'",
+        )
+        .bind("ghcr.io/acme/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .bind("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("mutate container authority");
+        sqlx::query("UPDATE app_resources SET cpu_limit = '2' WHERE app_id = $1")
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("mutate resource authority");
+        let current_updated_at: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("reload unchanged app timestamp");
+        assert_eq!(current_updated_at, original_updated_at);
+
+        let mut tx = pool.begin().await.expect("begin stale snapshot validation");
+        crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
+            .await
+            .expect("lock app deployment lane");
+        assert!(
+            !crate::deploy::lock_and_verify_existing_app_authority(&mut tx, app.id, &expected)
+                .await
+                .expect("verify stale child rows"),
+            "child-row changes must be detected without relying on apps.updated_at"
+        );
+        tx.rollback()
+            .await
+            .expect("roll back validation transaction");
+        delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn superseded_watcher_cannot_publish_over_new_manifest() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        let old_deployment_id = Uuid::new_v4();
+        let new_deployment_id = Uuid::new_v4();
+        let old_hash = "old-manifest-hash";
+        let new_hash = "new-manifest-hash";
+
+        sqlx::query(
+            "INSERT INTO deployments (
+                id, org_id, app_id, trigger, status, spec_snapshot, manifest_hash
+             )
+             VALUES ($1, $2, $3, 'api', 'watching', '{}'::jsonb, $4)",
+        )
+        .bind(old_deployment_id)
+        .bind(app.org_id)
+        .bind(app.id)
+        .bind(old_hash)
+        .execute(&pool)
+        .await
+        .expect("insert old watching deployment");
+
+        let mut acceptance = pool.begin().await.expect("begin newer acceptance");
+        crate::deploy::lock_app_deployment_lane(&mut acceptance, app.id)
+            .await
+            .expect("lock app deployment lane");
+        assert_eq!(
+            crate::deploy::supersede_incomplete_deployments(&mut acceptance, app.id)
+                .await
+                .expect("supersede old deployment"),
+            1
+        );
+        sqlx::query(
+            "INSERT INTO deployments (
+                id, org_id, app_id, trigger, status, spec_snapshot, manifest_hash
+             )
+             VALUES ($1, $2, $3, 'api', 'watching', '{}'::jsonb, $4)",
+        )
+        .bind(new_deployment_id)
+        .bind(app.org_id)
+        .bind(app.id)
+        .bind(new_hash)
+        .execute(&mut *acceptance)
+        .await
+        .expect("insert new watching deployment");
+        acceptance.commit().await.expect("commit newer acceptance");
+
+        assert!(
+            !crate::deploy::record_deployment_result_if_current(
+                &pool,
+                crate::deploy::DeploymentResultUpdate {
+                    app_id: app.id,
+                    deployment_id: old_deployment_id,
+                    deploy_status: "healthy",
+                    expected_manifest_hash: old_hash,
+                    app_status: "running",
+                    error_code: None,
+                    terminal: true,
+                },
+            )
+            .await
+            .expect("discard old watcher"),
+            "superseded watcher must not publish a terminal result"
+        );
+        assert!(
+            !crate::deploy::record_deployment_result_if_current(
+                &pool,
+                crate::deploy::DeploymentResultUpdate {
+                    app_id: app.id,
+                    deployment_id: new_deployment_id,
+                    deploy_status: "healthy",
+                    expected_manifest_hash: old_hash,
+                    app_status: "running",
+                    error_code: None,
+                    terminal: true,
+                },
+            )
+            .await
+            .expect("discard wrong manifest watcher"),
+            "a watcher for the wrong manifest must not publish"
+        );
+
+        let app_status_before: String =
+            sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load app status before current watcher");
+        assert_eq!(app_status_before, "creating");
+        assert!(
+            crate::deploy::record_deployment_result_if_current(
+                &pool,
+                crate::deploy::DeploymentResultUpdate {
+                    app_id: app.id,
+                    deployment_id: new_deployment_id,
+                    deploy_status: "healthy",
+                    expected_manifest_hash: new_hash,
+                    app_status: "running",
+                    error_code: None,
+                    terminal: true,
+                },
+            )
+            .await
+            .expect("record current watcher")
+        );
+
+        let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, status::text, error_message
+             FROM deployments
+             WHERE app_id = $1
+             ORDER BY id",
+        )
+        .bind(app.id)
+        .fetch_all(&pool)
+        .await
+        .expect("load fenced deployment results");
+        let old = rows
+            .iter()
+            .find(|(id, _, _)| *id == old_deployment_id)
+            .expect("old deployment row");
+        assert_eq!(old.1, "failed");
+        assert_eq!(
+            old.2.as_deref(),
+            Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR)
+        );
+        let new = rows
+            .iter()
+            .find(|(id, _, _)| *id == new_deployment_id)
+            .expect("new deployment row");
+        assert_eq!(new.1, "healthy");
+        assert_eq!(new.2, None);
+        let app_status: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+            .bind(app.id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app status after current watcher");
+        assert_eq!(app_status, "running");
+
+        delete_setup_test_org(&pool, app.org_id).await;
     }
 
     #[tokio::test]
