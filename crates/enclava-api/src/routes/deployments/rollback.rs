@@ -83,19 +83,28 @@ pub async fn rollback(
         Json(serde_json::json!({"error": "rollback target is missing image digest"})),
     ))?;
 
-    let rollback_artifact =
-        crate::signing_service::load_workload_artifact_binding(&state.db, app.id, prev.id)
+    // Load and validate the unique authoritative row once before mutating the
+    // app. The durable worker later reloads this exact hash/app/deployment
+    // binding from its immutable payload.
+    let rollback_artifacts =
+        crate::signing_service::load_workload_artifacts_for_deployment(&state.db, app.id, prev.id)
             .await
             .map_err(signing_error_response)?;
-    let rollback_descriptor =
-        crate::signing_service::load_workload_descriptor(&state.db, app.id, prev.id)
-            .await
-            .map_err(signing_error_response)?;
+    if rollback_artifacts
+        .as_ref()
+        .is_some_and(|artifacts| artifacts.descriptor.org_id != app.org_id)
+    {
+        return Err(signing_error_response(
+            crate::signing_service::SigningServiceError::Mismatch(
+                "stored descriptor org_id".into(),
+            ),
+        ));
+    }
 
     if customer_signed_deploy_required(
         state.attestation.as_ref(),
         state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
-    ) && rollback_artifact.is_none()
+    ) && rollback_artifacts.is_none()
     {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -104,25 +113,24 @@ pub async fn rollback(
             })),
         ));
     }
-
-    let rollback_workload_command = match rollback_descriptor.as_ref() {
-        Some(descriptor) => crate::deploy::serialize_workload_command(
-            &descriptor.oci_runtime_spec.args,
-        )
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "command serialization error"})),
-            )
-        })?,
+    let rollback_workload_command = match rollback_artifacts.as_ref() {
+        Some(artifacts) => {
+            crate::deploy::serialize_workload_command(&artifacts.descriptor.oci_runtime_spec.args)
+                .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "command serialization error"})),
+                )
+            })?
+        }
         None => None,
     };
-    let rollback_container_port = rollback_descriptor
+    let rollback_container_port = rollback_artifacts
         .as_ref()
-        .and_then(crate::deploy::descriptor_primary_port);
-    let rollback_storage_paths = rollback_descriptor
+        .and_then(|artifacts| crate::deploy::descriptor_primary_port(&artifacts.descriptor));
+    let rollback_storage_paths = rollback_artifacts
         .as_ref()
-        .map(crate::deploy::descriptor_storage_paths);
+        .map(|artifacts| crate::deploy::descriptor_storage_paths(&artifacts.descriptor));
     if customer_signed_deploy_required(
         state.attestation.as_ref(),
         state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
@@ -135,6 +143,20 @@ pub async fn rollback(
             })),
         ));
     }
+
+    let rollback_log_encryption = serde_json::from_value::<Option<LogEncryptionConfig>>(
+        prev.spec_snapshot
+            .get("log_encryption")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|_| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            "rollback target has invalid log encryption snapshot",
+        )
+    })?;
+    let rollback_log_encryption = validate_log_encryption_config(rollback_log_encryption)?;
 
     let container_name = "web";
     let mut tx = state.db.begin().await.map_err(|_| {
@@ -169,6 +191,10 @@ pub async fn rollback(
     })?;
 
     let deploy_id = Uuid::new_v4();
+    let mut rollback_spec_snapshot = prev.spec_snapshot.clone();
+    rollback_spec_snapshot[DEPLOYMENT_SETUP_STATE] =
+        serde_json::json!(crate::deployment_jobs::DEPLOYMENT_SETUP_ACCEPTED);
+    rollback_spec_snapshot["rollback_to"] = serde_json::json!(prev.id);
     sqlx::query(
         "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest, source_provider, source_repository)
          VALUES ($1, $2, $3, 'rollback', $4, $5, $6, $7)",
@@ -176,7 +202,7 @@ pub async fn rollback(
     .bind(deploy_id)
     .bind(auth.org_id)
     .bind(app.id)
-    .bind(&prev.spec_snapshot)
+    .bind(&rollback_spec_snapshot)
     .bind(&prev.image_digest)
     .bind(prev.source_provider.as_deref())
     .bind(prev.source_repository.as_deref())
@@ -229,92 +255,28 @@ pub async fn rollback(
                     Json(serde_json::json!({"error": "database error"})),
                 )
             })?;
+    let apply_payload = crate::deployment_jobs::DeploymentApplyJobPayload::new(
+        app.clone(),
+        crate::deploy::DeploymentApplySnapshot::new(apply_containers, apply_resources),
+        state.attestation.clone(),
+        crate::auth::jwt::public_key_base64(&state.signing_key),
+        state.api_url.clone(),
+        rollback_artifacts.as_ref().map(|_| prev.id),
+        rollback_artifacts
+            .as_ref()
+            .map(|artifacts| artifacts.descriptor_core_hash),
+        rollback_log_encryption,
+        false,
+    );
+    crate::deployment_jobs::insert_ready_job(&mut tx, deploy_id, &apply_payload)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     tx.commit().await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "database error"})),
         )
     })?;
-
-    let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
-    let local_verification_artifacts =
-        crate::signing_service::load_workload_artifacts_json(&state.db, app.id, prev.id)
-            .await
-            .map_err(signing_error_response)?;
-    let db = state.db.clone();
-    let attestation = state.attestation.clone();
-    let kbs_policy = state.kbs_policy.clone();
-    let api_url = state.api_url.clone();
-    let apply_app = app.clone();
-    let apply_snapshot =
-        crate::deploy::DeploymentApplySnapshot::new(apply_containers, apply_resources);
-    let apply_permits = state.deployment_apply_permits.clone();
-    let (workload_artifact_binding, signed_policy_artifact) = rollback_artifact.unzip();
-    let (local_workload_artifacts_json, local_trustee_policy_json) =
-        local_verification_artifacts.unzip();
-    tokio::spawn(async move {
-        let _apply_permit = match apply_permits.acquire_owned().await {
-            Ok(permit) => permit,
-            Err(e) => {
-                let error_message = format!("deployment apply limiter closed: {e}");
-                let _ = crate::deploy::set_deployment_status(
-                    &db,
-                    deploy_id,
-                    "failed",
-                    None,
-                    Some(&error_message),
-                    true,
-                )
-                .await;
-                let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
-                tracing::error!(
-                    app_id = %apply_app.id,
-                    deployment_id = %deploy_id,
-                    error = %error_message,
-                    "failed to acquire rollback apply permit"
-                );
-                return;
-            }
-        };
-
-        if let Err(e) = crate::deploy::apply_deployment_manifests(
-            crate::deploy::ApplyDeploymentManifestsRequest {
-                pool: db.clone(),
-                app: apply_app.clone(),
-                snapshot: apply_snapshot,
-                deployment_id: deploy_id,
-                attestation_config: attestation,
-                kbs_policy_config: kbs_policy,
-                api_signing_pubkey,
-                api_url,
-                workload_artifact_binding,
-                signed_policy_artifact,
-                local_workload_artifacts_json,
-                local_trustee_policy_json,
-                log_encryption: None,
-            },
-        )
-        .await
-        {
-            let error_message = e.to_string();
-            let _ = crate::deploy::set_deployment_status(
-                &db,
-                deploy_id,
-                "failed",
-                None,
-                Some(&error_message),
-                true,
-            )
-            .await;
-            let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
-            tracing::error!(
-                app_id = %apply_app.id,
-                deployment_id = %deploy_id,
-                error = %error_message,
-                "failed to apply rollback manifests"
-            );
-        }
-    });
 
     Ok((
         StatusCode::CREATED,

@@ -95,6 +95,11 @@ fn incomplete_setup_marker_blocks_idempotent_success() {
     assert!(deployment_setup_incomplete(&deployment));
     deployment.spec_snapshot["setup_state"] = serde_json::json!("accepted");
     assert!(!deployment_setup_incomplete(&deployment));
+    deployment.spec_snapshot["setup_state"] = serde_json::json!("failed");
+    assert!(
+        !deployment_setup_incomplete(&deployment),
+        "a terminal setup failure on an existing app must not block future deploys"
+    );
 }
 
 fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
@@ -353,15 +358,20 @@ fn signed_deploy_hash_validation_uses_local_artifact_delivery_mode() {
 
 #[test]
 fn signed_deploy_path_ensures_app_and_tee_dns_pair() {
-    let source = include_str!("../../deployments.rs");
-    let deploy_body = source
+    let route_source = include_str!("../../deployments.rs");
+    let deploy_body = route_source
         .split("pub async fn deploy")
         .nth(1)
         .expect("deploy route exists");
+    let job_source = include_str!("../../../deployment_jobs.rs");
 
     assert!(
-        deploy_body.contains("crate::dns::ensure_dns_pair"),
-        "signed deploy must ensure both app and TEE DNS hostnames"
+        deploy_body.contains("insert_setup_job") && deploy_body.contains("process_setup_job"),
+        "signed deploy must durably hand off DNS setup"
+    );
+    assert!(
+        job_source.contains("crate::dns::ensure_dns_pair"),
+        "durable setup worker must ensure both app and TEE DNS hostnames"
     );
 }
 
@@ -406,49 +416,57 @@ fn signed_deploy_validation_precedes_atomic_candidate_commit() {
 }
 
 #[test]
-fn first_generic_deployment_is_compensated_before_dns_error_returns() {
-    let source = include_str!("../../deployments.rs");
-    let deploy_body = source
+fn first_generic_deployment_setup_is_durable_and_compensated_before_error_returns() {
+    let route_source = include_str!("../../deployments.rs");
+    let deploy_body = route_source
         .split("async fn deploy_app_candidate")
         .nth(1)
         .expect("deployment candidate function exists")
         .split("/// GET /apps/{name}/deployments")
         .next()
         .expect("deployment candidate function body");
-    let dns = deploy_body
-        .find("crate::dns::ensure_dns_pair")
-        .expect("deployment DNS provisioning");
-    let compensation = deploy_body
-        .find("compensate_deployment_setup_failure(")
-        .expect("durable deployment setup compensation");
-    let apply = deploy_body
-        .find("tokio::spawn")
-        .expect("accepted deployment apply task");
-
-    assert!(dns < compensation, "compensation must follow DNS failure");
+    let job_insert = deploy_body
+        .find("insert_setup_job")
+        .expect("durable deployment setup job");
+    let commit = deploy_body.find("tx.commit()").expect("candidate commit");
+    let setup = deploy_body
+        .find("process_setup_job")
+        .expect("recoverable DNS setup");
     assert!(
-        compensation < apply,
-        "a failed first generic deployment must be removed before apply can start"
+        job_insert < commit && commit < setup,
+        "setup job must commit with the candidate before external DNS work"
     );
-    assert!(deploy_body[compensation..].contains("app_mutation"));
 
-    let compensation_body = source
-        .split("async fn compensate_deployment_setup_failure")
+    let job_source = include_str!("../../../deployment_jobs.rs");
+    let setup_body = job_source
+        .split("pub async fn process_setup_job")
+        .nth(1)
+        .expect("durable setup worker exists")
+        .split("async fn load_leased_payload")
+        .next()
+        .expect("durable setup worker body");
+    let durable_failure = setup_body
+        .find("mark_setup_failed")
+        .expect("durable failure marker");
+    let compensation = setup_body
+        .find("process_cleanup_job")
+        .expect("setup compensation");
+    assert!(durable_failure < compensation);
+
+    let compensation_body = job_source
+        .split("async fn attempt_setup_cleanup")
         .nth(1)
         .expect("setup compensation helper exists")
-        .split("/// POST /apps/{name}/deploy")
+        .split("/// Start the durable dispatcher")
         .next()
         .expect("setup compensation helper body");
-    let durable_failure = compensation_body
-        .find("mark_deployment_setup_failed")
-        .expect("durable failure marker");
     let dns_cleanup = compensation_body
         .find("delete_all_dns_records_for_app")
         .expect("DNS cleanup");
     let app_cleanup = compensation_body
         .find("DELETE FROM apps WHERE id = $1")
         .expect("new generic app cleanup");
-    assert!(durable_failure < dns_cleanup && dns_cleanup < app_cleanup);
+    assert!(dns_cleanup < app_cleanup);
 }
 
 #[test]

@@ -4,6 +4,7 @@ pub mod clients;
 pub mod cosign;
 pub mod db;
 pub mod deploy;
+pub mod deployment_jobs;
 pub mod dns;
 pub mod edge;
 pub mod entitlements;

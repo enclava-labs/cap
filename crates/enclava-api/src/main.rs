@@ -775,6 +775,7 @@ async fn main() {
         internal_auth,
     };
 
+    enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
     let app = build_router(state);
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());

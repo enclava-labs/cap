@@ -863,7 +863,7 @@ pub async fn update_unlock_mode(
             }
         };
 
-        if let Err(e) = crate::deploy::apply_deployment_manifests(
+        let rollout = crate::deploy::apply_deployment_manifests(
             crate::deploy::ApplyDeploymentManifestsRequest {
                 pool: db.clone(),
                 app: apply_app.clone(),
@@ -880,8 +880,30 @@ pub async fn update_unlock_mode(
                 log_encryption,
             },
         )
-        .await
-        {
+        .await;
+        drop(_apply_permit);
+        let result = match rollout {
+            Ok(rollout) => {
+                let outcome = rollout.watch().await;
+                match crate::deploy::record_deployment_result(
+                    &db,
+                    deploy_id,
+                    outcome.deploy_status,
+                    Some(&outcome.manifest_hash),
+                    outcome.error_code,
+                    outcome.terminal,
+                )
+                .await
+                {
+                    Ok(()) => crate::deploy::set_app_status(&db, apply_app.id, outcome.app_status)
+                        .await
+                        .map_err(crate::deploy::DeployError::Db),
+                    Err(error) => Err(crate::deploy::DeployError::Db(error)),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(e) = result {
             let error_message = e.to_string();
             let _ = crate::deploy::set_deployment_status(
                 &db,
