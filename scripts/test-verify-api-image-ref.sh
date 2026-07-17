@@ -34,6 +34,9 @@ expect_fail() {
 
 artifact="$work_dir/enclava-api-image.txt"
 printf '%s\n' "$VALID_REF" >"$artifact"
+printf '%s\n' \
+  "https://github.com/enclava-labs/cap/.github/workflows/api-image.yml@refs/heads/main" \
+  >"$work_dir/enclava-api-signer-identity.txt"
 assert_output "$EXPECTED_OUTPUT" "$VERIFY_SCRIPT" "$artifact"
 assert_output "$EXPECTED_OUTPUT" "$VERIFY_SCRIPT" "$VALID_REF"
 assert_output "$EXPECTED_OUTPUT" "$VERIFY_SCRIPT" "$EXPECTED_OUTPUT"
@@ -78,7 +81,8 @@ grep -Fq -- "--certificate-oidc-issuer https://token.actions.githubusercontent.c
 grep -Fq -- "$VALID_REF" "$work_dir/cosign.args"
 
 ambient_bash_env="$work_dir/ambient.sh"
-: >"$ambient_bash_env"
+startup_marker="$work_dir/bash-env-was-sourced"
+printf 'printf sourced >%q\n' "$startup_marker" >"$ambient_bash_env"
 COSIGN_ARGS_FILE="$work_dir/cosign-scrub.args" \
   COSIGN_ENV_FILE="$work_dir/cosign.env" \
   BASH_ENV="$ambient_bash_env" \
@@ -89,6 +93,10 @@ COSIGN_ARGS_FILE="$work_dir/cosign-scrub.args" \
   NODE_OPTIONS="--no-warnings" \
   PATH="$stub_dir:$PATH" \
   assert_output "$EXPECTED_OUTPUT" "$VERIFY_SCRIPT" --cosign "$VALID_REF"
+[[ ! -e "$startup_marker" ]] || {
+  echo "BASH_ENV executed before the verifier could scrub it" >&2
+  exit 1
+}
 for expected in "BASH_ENV=" "ENV=" "CDPATH=" "GLOBIGNORE=" "PYTHONPATH=" "NODE_OPTIONS="; do
   grep -Fxq "$expected" "$work_dir/cosign.env" || {
     cat "$work_dir/cosign.env" >&2
@@ -96,6 +104,22 @@ for expected in "BASH_ENV=" "ENV=" "CDPATH=" "GLOBIGNORE=" "PYTHONPATH=" "NODE_O
     exit 1
   }
 done
+
+tag_identity="https://github.com/enclava-labs/cap/.github/workflows/api-image.yml@refs/tags/v1.2.3"
+printf '%s\n' "$tag_identity" >"$work_dir/enclava-api-signer-identity.txt"
+COSIGN_ARGS_FILE="$work_dir/tag.args" \
+  PATH="$stub_dir:$PATH" \
+  assert_output "$EXPECTED_OUTPUT" "$VERIFY_SCRIPT" --cosign "$artifact"
+grep -Fq -- "--certificate-identity $tag_identity" "$work_dir/tag.args"
+COSIGN_ARGS_FILE="$work_dir/tag-raw.args" \
+  PATH="$stub_dir:$PATH" \
+  assert_output "$EXPECTED_OUTPUT" "$VERIFY_SCRIPT" --cosign \
+    --certificate-identity "$tag_identity" "$VALID_REF"
+grep -Fq -- "--certificate-identity $tag_identity" "$work_dir/tag-raw.args"
+
+expect_fail invalid_identity "$VERIFY_SCRIPT" --certificate-identity \
+  "https://github.com/other/cap/.github/workflows/api-image.yml@refs/tags/v1.2.3" "$VALID_REF"
+grep -q "official CAP API workflow" "$work_dir/invalid_identity.err"
 
 custom_cosign="$work_dir/custom-cosign"
 cp "$stub_dir/cosign" "$custom_cosign"

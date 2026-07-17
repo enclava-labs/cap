@@ -65,6 +65,8 @@ for required in \
   "target=runtime-debug" \
   "ghcr.io/enclava-labs/enclava-api" \
   "dist/enclava-api-image.txt" \
+  "dist/enclava-api-signer-identity.txt" \
+  'signer_subject="https://github.com/${{ github.workflow_ref }}"' \
   "cosign sign --yes" \
   "scripts/verify-api-image-ref.sh --cosign dist/enclava-api-image.txt" \
   "name: enclava-api-release-manifest" \
@@ -84,7 +86,7 @@ grep -Fq "id-token: write" <<<"$publish_block" \
 assert_order "- name: Build and push" "- name: Render digest-pinned release artifact"
 assert_order "- name: Render digest-pinned release artifact" "- name: Install cosign"
 assert_order "- name: Install cosign" "- name: Sign pushed digest"
-assert_order "- name: Sign pushed digest" "- name: Verify main-branch signed digest"
-assert_order "- name: Verify main-branch signed digest" "- name: Upload release manifest artifact"
+assert_order "- name: Sign pushed digest" "- name: Verify signed digest"
+assert_order "- name: Verify signed digest" "- name: Upload release manifest artifact"
 
 echo "CAP API image workflow tests passed"
