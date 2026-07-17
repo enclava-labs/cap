@@ -214,6 +214,54 @@ impl ClaimedJob {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StoredDeploymentApplyAuthority {
+    pub payload: DeploymentApplyJobPayload,
+    pub source_deployment_id: Uuid,
+    pub signed_required: bool,
+    pub artifact_deployment_id: Option<Uuid>,
+    pub artifact_descriptor_core_hash: Option<[u8; 32]>,
+}
+
+/// Load an accepted deployment's exact immutable worker snapshot. Rollback
+/// uses this instead of reconstructing historical runtime state from the
+/// partial human-facing deployment spec snapshot.
+pub(crate) async fn load_stored_deployment_apply_authority(
+    pool: &PgPool,
+    deployment_id: Uuid,
+    app_id: Uuid,
+    org_id: Uuid,
+) -> Result<StoredDeploymentApplyAuthority, DeploymentJobError> {
+    let job = sqlx::query_as::<_, ClaimedJob>(
+        "SELECT deployment_id, app_id, org_id, source_deployment_id,
+                payload_version,
+                COALESCE(lock_token, '00000000-0000-0000-0000-000000000000'::uuid)
+                    AS lock_token,
+                payload, payload_sha256, cleanup_app_on_setup_failure,
+                signed_required, artifact_deployment_id,
+                artifact_descriptor_core_hash, log_encryption
+           FROM deployment_apply_jobs
+          WHERE deployment_id = $1
+            AND app_id = $2
+            AND org_id = $3",
+    )
+    .bind(deployment_id)
+    .bind(app_id)
+    .bind(org_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(DeploymentJobError::InvalidPayload)?;
+    let payload = job.decode_payload()?;
+    validate_canonical_source_snapshot(pool, &job, &payload).await?;
+    Ok(StoredDeploymentApplyAuthority {
+        payload,
+        source_deployment_id: job.source_deployment_id,
+        signed_required: job.signed_required,
+        artifact_deployment_id: job.artifact_deployment_id,
+        artifact_descriptor_core_hash: job.artifact_descriptor_core_hash()?,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DeploymentJobError {
     #[error("database error: {0}")]
@@ -230,6 +278,8 @@ pub enum DeploymentJobError {
     Artifact,
     #[error("deployment job lease was lost")]
     LeaseLost,
+    #[error("deployment authority changed before apply")]
+    Authority,
     #[error("deployment apply failed: {0}")]
     Apply(#[from] crate::deploy::DeployError),
     #[error("deployment apply limiter closed")]
@@ -248,6 +298,7 @@ impl DeploymentJobError {
             Self::SetupFailed => "deployment_setup_failed",
             Self::Artifact => "artifact_invalid",
             Self::LeaseLost => "lease_lost",
+            Self::Authority => "deployment_authority_changed",
             Self::Apply(_) => "deployment_apply_error",
             Self::ApplyLimiterClosed => "apply_limiter_closed",
         }
@@ -451,6 +502,50 @@ pub async fn process_setup_job(
     }
 }
 
+/// Hold the app generation lane across an external setup/cleanup side effect.
+/// No application or child row is locked while the external provider writes
+/// its own CAP bookkeeping, avoiding a self-deadlock. The relational lease,
+/// deployment generation and durable deleting phase are rechecked only after
+/// the advisory lane has been acquired.
+async fn acquire_job_side_effect_lane(
+    pool: &PgPool,
+    job: &ClaimedJob,
+    expected_state: &'static str,
+) -> Result<Transaction<'static, Postgres>, DeploymentJobError> {
+    let mut lane = pool.begin().await?;
+    crate::deploy::lock_app_deployment_lane(&mut lane, job.app_id).await?;
+    let current: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployment_apply_jobs AS apply_job
+               JOIN deployments AS deployment
+                 ON deployment.id = apply_job.deployment_id
+                AND deployment.app_id = apply_job.app_id
+                AND deployment.org_id = apply_job.org_id
+               JOIN apps AS app
+                 ON app.id = apply_job.app_id
+                AND app.org_id = apply_job.org_id
+              WHERE apply_job.deployment_id = $1
+                AND apply_job.app_id = $2
+                AND apply_job.org_id = $3
+                AND apply_job.state = $4
+                AND apply_job.lock_token = $5
+                AND app.status <> 'deleting'::app_status_enum
+         )",
+    )
+    .bind(job.deployment_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
+    .bind(expected_state)
+    .bind(job.lock_token)
+    .fetch_one(&mut *lane)
+    .await?;
+    if !current {
+        return Err(DeploymentJobError::LeaseLost);
+    }
+    Ok(lane)
+}
+
 async fn process_claimed_setup_job(
     state: &AppState,
     job: ClaimedJob,
@@ -463,6 +558,7 @@ async fn process_claimed_setup_job(
         }
         Err(error) => return Err(error),
     };
+    let side_effect_lane = acquire_job_side_effect_lane(&state.db, &job, "setting_up").await?;
 
     let setup = async {
         let tee_domain = payload
@@ -485,27 +581,35 @@ async fn process_claimed_setup_job(
         Ok::<(), crate::dns::DnsError>(())
     };
 
-    match with_lease_heartbeat(
+    let outcome = with_lease_heartbeat(
         &state.db,
         job.deployment_id,
         job.lock_token,
         "setting_up",
         setup,
     )
-    .await?
-    {
-        Ok(()) => mark_setup_accepted(&state.db, job.deployment_id, job.lock_token).await,
+    .await?;
+    match outcome {
+        Ok(()) => {
+            let result = mark_setup_accepted(&state.db, job.deployment_id, job.lock_token).await;
+            side_effect_lane.commit().await?;
+            result
+        }
         Err(error) => {
             mark_setup_failed(&state.db, &job).await?;
-            if job.cleanup_app_on_setup_failure
-                && let Some(cleanup_job) = claim_job(
+            let cleanup_job = if job.cleanup_app_on_setup_failure {
+                claim_job(
                     &state.db,
                     "cleanup_pending",
                     "cleaning_up",
                     Some(job.deployment_id),
                 )
                 .await?
-            {
+            } else {
+                None
+            };
+            side_effect_lane.commit().await?;
+            if let Some(cleanup_job) = cleanup_job {
                 process_cleanup_job(state, cleanup_job).await;
             }
             Err(DeploymentJobError::Dns(error))
@@ -704,6 +808,18 @@ async fn process_cleanup_job(state: &AppState, job: ClaimedJob) {
         );
         return;
     }
+    let side_effect_lane = match acquire_job_side_effect_lane(&state.db, &job, "cleaning_up").await
+    {
+        Ok(lane) => lane,
+        Err(error) => {
+            tracing::info!(
+                deployment_id = %job.deployment_id,
+                error_code = error.code(),
+                "skipped stale durable deployment cleanup"
+            );
+            return;
+        }
+    };
     let outcome = with_lease_heartbeat(
         &state.db,
         job.deployment_id,
@@ -712,6 +828,15 @@ async fn process_cleanup_job(state: &AppState, job: ClaimedJob) {
         attempt_setup_cleanup(state, job.app_id, job.org_id),
     )
     .await;
+    if let Err(error) = side_effect_lane.commit().await {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = "database_error",
+            "failed to release durable deployment cleanup lane"
+        );
+        let _ = error;
+        return;
+    }
     match outcome {
         Ok(true) => {
             // Deleting the first-deployment app cascades the deployment and
@@ -1064,10 +1189,10 @@ async fn fail_unreadable_job(pool: &PgPool, claimed: &ClaimedJob, claimed_state:
                 AND app.id = $2
                 AND app.org_id = $3
                 AND deployment.id = (
-                    SELECT latest.id
-                      FROM deployments AS latest
+                    SELECT latest.deployment_id
+                      FROM deployment_apply_jobs AS latest
                      WHERE latest.app_id = deployment.app_id
-                     ORDER BY latest.created_at DESC, latest.id DESC
+                     ORDER BY latest.generation DESC
                      LIMIT 1
                 )",
         )
@@ -1116,7 +1241,7 @@ async fn apply_claimed_job(
     // granted. The latest org keyring can change while this future waits.
     validate_apply_artifacts(state, job, payload, &primary_image_digest).await?;
 
-    let Some((apply_permit, validated)) =
+    let Some((apply_permit, authority_lane, validated)) =
         acquire_apply_permit_and_revalidate(state, job, payload).await?
     else {
         return Ok(JobApplyOutcome::AlreadyTerminal);
@@ -1141,6 +1266,7 @@ async fn apply_claimed_job(
         log_encryption: payload.log_encryption.clone(),
     })
     .await?;
+    authority_lane.commit().await?;
     drop(apply_permit);
     let Some(rollout) = rollout else {
         return Ok(JobApplyOutcome::AlreadyTerminal);
@@ -1152,8 +1278,14 @@ async fn acquire_apply_permit_and_revalidate(
     state: &AppState,
     job: &ClaimedJob,
     payload: &DeploymentApplyJobPayload,
-) -> Result<Option<(tokio::sync::OwnedSemaphorePermit, ValidatedApplyArtifacts)>, DeploymentJobError>
-{
+) -> Result<
+    Option<(
+        tokio::sync::OwnedSemaphorePermit,
+        Transaction<'static, Postgres>,
+        ValidatedApplyArtifacts,
+    )>,
+    DeploymentJobError,
+> {
     let apply_permit = state
         .deployment_apply_permits
         .clone()
@@ -1161,17 +1293,73 @@ async fn acquire_apply_permit_and_revalidate(
         .await
         .map_err(|_| DeploymentJobError::ApplyLimiterClosed)?;
 
-    // A newer accepted deployment may have superseded this row while it was
-    // waiting for apply capacity. Never render a terminal/superseded job.
-    if deployment_is_terminal(&state.db, job.deployment_id).await? {
+    // Revalidate every mutable authority immediately before external side
+    // effects while holding the global authority order. Keyring rotation,
+    // entitlement revocation, app mutation, deletion and generation
+    // supersession all take one of these lanes and therefore cannot commit
+    // between validation and manifest/KBS application.
+    let mut authority_lane = state.db.begin().await?;
+    crate::entitlements::lock_org_entitlement_lane(&mut authority_lane, job.org_id).await?;
+    crate::signing_service::lock_org_signing_authority_lane(&mut authority_lane, job.org_id)
+        .await?;
+    crate::deploy::lock_app_deployment_lane(&mut authority_lane, job.app_id).await?;
+    let current_job: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1
+                AND app_id = $2
+                AND org_id = $3
+                AND state = 'running'
+                AND lock_token = $4
+         )",
+    )
+    .bind(job.deployment_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
+    .bind(job.lock_token)
+    .fetch_one(&mut *authority_lane)
+    .await?;
+    if !current_job
+        || !crate::deploy::deployment_is_active_for_apply(
+            &mut authority_lane,
+            job.app_id,
+            job.deployment_id,
+        )
+        .await?
+    {
         drop(apply_permit);
         return Ok(None);
     }
+
+    let expected_authority = crate::deploy::ExistingAppAuthoritySnapshot::new(
+        payload.app.updated_at,
+        payload.snapshot.containers.clone(),
+        payload.snapshot.resources.clone(),
+    );
+    if !crate::deploy::verify_existing_app_authority(
+        &mut authority_lane,
+        job.app_id,
+        &expected_authority,
+    )
+    .await?
+    {
+        return Err(DeploymentJobError::Authority);
+    }
+    crate::routes::deployments::enforce_authoritative_entitlement(
+        &mut authority_lane,
+        job.org_id,
+        &payload.snapshot.resources,
+        false,
+    )
+    .await
+    .map_err(|_| DeploymentJobError::Authority)?;
     let primary_image_digest = validate_canonical_source_snapshot(&state.db, job, payload).await?;
     let validated = validate_apply_artifacts(state, job, payload, &primary_image_digest).await?;
-    Ok(Some((apply_permit, validated)))
+    Ok(Some((apply_permit, authority_lane, validated)))
 }
 
+#[derive(Debug)]
 struct ValidatedApplyArtifacts {
     workload_artifact_binding: Option<enclava_engine::types::WorkloadArtifactBinding>,
     signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
@@ -1786,8 +1974,8 @@ mod tests {
         let org_id = Uuid::new_v4();
         let app_id = Uuid::new_v4();
         let deployment_id = Uuid::new_v4();
-        let app = test_app(org_id, app_id);
-        let payload = test_payload(&app);
+        let mut app = test_app(org_id, app_id);
+        let mut payload = test_payload(&app);
         let mut tx = pool.begin().await.expect("begin deployment job fixture");
         sqlx::query(
             "INSERT INTO organizations (id, name, cust_slug)
@@ -1831,6 +2019,46 @@ mod tests {
         .execute(&mut *tx)
         .await
         .expect("insert deployment job app");
+        app = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+            .bind(app.id)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("reload exact deployment job app");
+        payload.app = app.clone();
+        for container in &payload.snapshot.containers {
+            sqlx::query(
+                "INSERT INTO app_containers (
+                     id, app_id, name, image_ref, image_digest, port, command,
+                     storage_paths, workload_security_profile, is_primary
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            )
+            .bind(container.id)
+            .bind(container.app_id)
+            .bind(&container.name)
+            .bind(&container.image_ref)
+            .bind(container.image_digest.as_deref())
+            .bind(container.port)
+            .bind(container.command.as_deref())
+            .bind(container.storage_paths.as_ref())
+            .bind(container.workload_security_profile.as_deref())
+            .bind(container.is_primary)
+            .execute(&mut *tx)
+            .await
+            .expect("insert deployment job container");
+        }
+        sqlx::query(
+            "INSERT INTO app_resources (
+                 app_id, cpu_limit, memory_limit, app_data_size, tls_data_size
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(payload.snapshot.resources.app_id)
+        .bind(&payload.snapshot.resources.cpu_limit)
+        .bind(&payload.snapshot.resources.memory_limit)
+        .bind(&payload.snapshot.resources.app_data_size)
+        .bind(&payload.snapshot.resources.tls_data_size)
+        .execute(&mut *tx)
+        .await
+        .expect("insert deployment job resources");
         let image_digest = format!("sha256:{}", "aa".repeat(32));
         sqlx::query(
             "INSERT INTO deployments (
@@ -2568,6 +2796,175 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_watching_lease_is_reclaimed_and_publishes_terminal_result() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let first_apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim first apply")
+            .expect("apply exists");
+        let manifest_hash = "reclaimed-watching-manifest";
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = $2
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(manifest_hash)
+        .execute(&pool)
+        .await
+        .expect("stage worker crash during watch");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET locked_until = clock_timestamp() - interval '1 second'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("expire watching worker lease");
+        let recovered = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("reclaim watching apply")
+            .expect("watching apply is reclaimable");
+        assert_ne!(recovered.lock_token, first_apply.lock_token);
+
+        let mut lane = pool.begin().await.expect("begin reclaimed app lane");
+        crate::deploy::lock_app_deployment_lane(&mut lane, app.id)
+            .await
+            .expect("lock reclaimed app lane");
+        assert!(
+            crate::deploy::deployment_is_active_for_apply(&mut lane, app.id, deployment_id,)
+                .await
+                .expect("check reclaimed watching generation"),
+            "watching remains an active, idempotently re-applicable generation"
+        );
+        lane.rollback().await.expect("release reclaimed app lane");
+
+        publish_rollout_outcome(
+            &pool,
+            &recovered,
+            &DeploymentRolloutOutcome {
+                deploy_status: "healthy",
+                app_status: "running",
+                error_code: None,
+                terminal: true,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect("publish recovered rollout result");
+        let (deployment_status, app_status, job_state): (String, String, String) = sqlx::query_as(
+            "SELECT deployment.status::text, app.status::text, job.state
+                   FROM deployments AS deployment
+                   JOIN apps AS app ON app.id = deployment.app_id
+                   JOIN deployment_apply_jobs AS job
+                     ON job.deployment_id = deployment.id
+                  WHERE deployment.id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load recovered terminal state");
+        assert_eq!(deployment_status, "healthy");
+        assert_eq!(app_status, "running");
+        assert_eq!(job_state, "completed");
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete watching recovery fixture");
+    }
+
+    #[tokio::test]
+    async fn superseded_watching_lease_cannot_publish_after_reclaim_window() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim apply")
+            .expect("apply exists");
+        let manifest_hash = "superseded-watching-manifest";
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = $2
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(manifest_hash)
+        .execute(&pool)
+        .await
+        .expect("stage watching generation");
+        let mut supersede = pool.begin().await.expect("begin supersession");
+        crate::deploy::lock_app_deployment_lane(&mut supersede, app.id)
+            .await
+            .expect("lock supersession app lane");
+        crate::deploy::supersede_incomplete_deployments(&mut supersede, app.id)
+            .await
+            .expect("supersede watching generation");
+        supersede.commit().await.expect("commit supersession");
+
+        let error = publish_rollout_outcome(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "healthy",
+                app_status: "running",
+                error_code: None,
+                terminal: true,
+                manifest_hash: manifest_hash.to_string(),
+            },
+        )
+        .await
+        .expect_err("superseded watcher publication must be fenced");
+        assert!(matches!(error, DeploymentJobError::LeaseLost));
+        let (deployment_status, deployment_error, job_state, job_error): (
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT deployment.status::text, deployment.error_message,
+                    job.state, job.last_error_code
+               FROM deployments AS deployment
+               JOIN deployment_apply_jobs AS job
+                 ON job.deployment_id = deployment.id
+              WHERE deployment.id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load superseded watching state");
+        assert_eq!(deployment_status, "failed");
+        assert_eq!(deployment_error.as_deref(), Some("deployment_superseded"));
+        assert_eq!(job_state, "failed");
+        assert_eq!(job_error.as_deref(), Some("deployment_superseded"));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete superseded watching fixture");
+    }
+
+    #[tokio::test]
     async fn stale_setup_token_cannot_publish_false_acceptance() {
         let pool = database_test_pool().await;
         let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
@@ -3236,7 +3633,10 @@ mod tests {
             .await
             .expect("post-permit validation completes")
             .expect("post-permit validation task joins");
-        assert!(matches!(result, Err(DeploymentJobError::Artifact)));
+        assert!(
+            matches!(result, Err(DeploymentJobError::Artifact)),
+            "rotated keyring must reject the queued apply, got {result:?}"
+        );
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)

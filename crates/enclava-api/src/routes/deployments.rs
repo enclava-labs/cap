@@ -122,19 +122,20 @@ pub(crate) async fn enforce_authoritative_entitlement(
 }
 
 fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
-    let status = match &error {
-        crate::dns::DnsError::OutsideManagedZone(_) => StatusCode::BAD_REQUEST,
-        crate::dns::DnsError::HostnameInUse { .. } => StatusCode::CONFLICT,
-        crate::dns::DnsError::NotConfigured => StatusCode::INTERNAL_SERVER_ERROR,
+    let (status, code) = match &error {
+        crate::dns::DnsError::OutsideManagedZone(_) => {
+            (StatusCode::BAD_REQUEST, "dns_outside_managed_zone")
+        }
+        crate::dns::DnsError::HostnameInUse { .. } => (StatusCode::CONFLICT, "dns_hostname_in_use"),
+        crate::dns::DnsError::NotConfigured => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "dns_not_configured")
+        }
         crate::dns::DnsError::Cloudflare(_)
         | crate::dns::DnsError::Http(_)
-        | crate::dns::DnsError::Db(_) => StatusCode::BAD_GATEWAY,
+        | crate::dns::DnsError::Db(_) => (StatusCode::BAD_GATEWAY, "dns_unavailable"),
     };
 
-    (
-        status,
-        Json(serde_json::json!({"error": error.to_string()})),
-    )
+    (status, Json(serde_json::json!({"error": code})))
 }
 
 pub(crate) fn signing_error_response(
@@ -142,25 +143,29 @@ pub(crate) fn signing_error_response(
 ) -> (StatusCode, Json<serde_json::Value>) {
     use crate::signing_service::SigningServiceError;
 
-    let status = match &error {
-        SigningServiceError::PartialBlobs
-        | SigningServiceError::ArtifactWithoutBlobs
-        | SigningServiceError::Blob(_)
-        | SigningServiceError::Mismatch(_)
-        | SigningServiceError::InvalidSignature => StatusCode::BAD_REQUEST,
-        SigningServiceError::Upstream { .. } | SigningServiceError::Http(_) => {
-            StatusCode::BAD_GATEWAY
+    let (status, code) = match &error {
+        SigningServiceError::PartialBlobs | SigningServiceError::ArtifactWithoutBlobs => {
+            (StatusCode::BAD_REQUEST, "signed_artifacts_incomplete")
         }
-        SigningServiceError::InvalidUrl(_)
-        | SigningServiceError::InvalidTimeout(_)
-        | SigningServiceError::Db(_)
-        | SigningServiceError::Serde(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        SigningServiceError::Blob(_) => (StatusCode::BAD_REQUEST, "signed_artifact_invalid"),
+        SigningServiceError::Mismatch(_) => (StatusCode::BAD_REQUEST, "signed_artifact_mismatch"),
+        SigningServiceError::InvalidSignature => {
+            (StatusCode::BAD_REQUEST, "signed_artifact_signature_invalid")
+        }
+        SigningServiceError::Upstream { .. } | SigningServiceError::Http(_) => {
+            (StatusCode::BAD_GATEWAY, "signing_service_unavailable")
+        }
+        SigningServiceError::InvalidUrl(_) | SigningServiceError::InvalidTimeout(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "signing_service_configuration_invalid",
+        ),
+        SigningServiceError::Db(_) => (StatusCode::INTERNAL_SERVER_ERROR, "database_error"),
+        SigningServiceError::Serde(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "signed_artifact_invalid")
+        }
     };
 
-    (
-        status,
-        Json(serde_json::json!({"error": error.to_string()})),
-    )
+    (status, Json(serde_json::json!({"error": code})))
 }
 
 pub(crate) fn customer_signed_deploy_required(
@@ -533,6 +538,46 @@ async fn app_has_incomplete_deployment_setup(
     .bind(app_id)
     .fetch_one(&mut **tx)
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_accepted_apply_payload(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app_id: Uuid,
+    attestation_config: Option<enclava_engine::types::AttestationConfig>,
+    api_signing_pubkey: String,
+    api_url: String,
+    artifact_deployment_id: Option<Uuid>,
+    artifact_descriptor_core_hash: Option<[u8; 32]>,
+    log_encryption: Option<LogEncryptionConfig>,
+    delete_app_on_setup_failure: bool,
+) -> Result<DeploymentApplyJobPayload, sqlx::Error> {
+    let accepted_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let accepted_containers: Vec<AppContainer> = sqlx::query_as(
+        "SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC, id",
+    )
+    .bind(app_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let accepted_resources: AppResources =
+        sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    Ok(DeploymentApplyJobPayload::new(
+        accepted_app,
+        crate::deploy::DeploymentApplySnapshot::new(accepted_containers, accepted_resources),
+        attestation_config,
+        api_signing_pubkey,
+        api_url,
+        artifact_deployment_id,
+        artifact_descriptor_core_hash,
+        log_encryption,
+        delete_app_on_setup_failure,
+    ))
 }
 
 async fn insert_transaction_audit(
@@ -921,10 +966,10 @@ async fn deploy_app_candidate(
     };
     let verified = crate::cosign::verify_image(&body.image, &image_digest, &policy)
         .await
-        .map_err(|e| {
+        .map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("cosign verification failed: {}", e)})),
+                Json(serde_json::json!({"error": "cosign_verification_failed"})),
             )
         })?;
 
@@ -959,24 +1004,6 @@ async fn deploy_app_candidate(
         "log_encryption": &log_encryption,
         "setup_state": DEPLOYMENT_SETUP_DNS_PENDING,
     });
-
-    let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
-    let apply_payload = DeploymentApplyJobPayload::new(
-        app.clone(),
-        crate::deploy::DeploymentApplySnapshot::new(
-            candidate_containers.clone(),
-            candidate_resources.clone(),
-        ),
-        state.attestation.clone(),
-        api_signing_pubkey,
-        state.api_url.clone(),
-        signing_artifacts.as_ref().map(|_| deploy_id),
-        signing_artifacts
-            .as_ref()
-            .map(|artifacts| artifacts.descriptor_core_hash),
-        log_encryption,
-        app_mutation == AppMutation::Insert,
-    );
 
     // No requested app/container state has been persisted before this point.
     // Commit every accepted deployment row and its app/container changes as a
@@ -1014,6 +1041,24 @@ async fn deploy_app_candidate(
             .validate_customer_authority_in_tx(&mut tx)
             .await
             .map_err(signing_error_response)?;
+        let signed = signed_policy_artifact.as_ref().ok_or_else(|| {
+            signing_error_response(
+                crate::signing_service::SigningServiceError::ArtifactWithoutBlobs,
+            )
+        })?;
+        let signing_service_pubkey_hex = state
+            .attestation
+            .as_ref()
+            .and_then(|config| config.signing_service_pubkey_hex.as_deref())
+            .ok_or_else(|| {
+                json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "platform signing-service pubkey required for signed deployment verification",
+                )
+            })?;
+        artifacts
+            .validate_signed_artifact(signed, signing_service_pubkey_hex)
+            .map_err(signing_error_response)?;
     }
     if let Some(expected) = existing_authority_snapshot.as_ref()
         && !crate::deploy::lock_and_verify_existing_app_authority(&mut tx, app.id, expected)
@@ -1024,6 +1069,20 @@ async fn deploy_app_candidate(
             StatusCode::CONFLICT,
             "app deployment inputs changed while deployment was validating; retry the deployment",
         ));
+    }
+    if app_mutation != AppMutation::Insert {
+        let current_status: crate::models::AppStatus =
+            sqlx::query_scalar("SELECT status FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+        if current_status == crate::models::AppStatus::Deleting {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "app deletion is in progress",
+            ));
+        }
     }
     if app_has_incomplete_deployment_setup(&mut tx, app.id)
         .await
@@ -1181,6 +1240,26 @@ async fn deploy_app_candidate(
     .bind(candidate_container.workload_security_profile.as_deref())
     .bind(candidate_container.is_primary)
     .execute(&mut *tx)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+
+    // Build the immutable worker payload from the rows actually accepted by
+    // this transaction. Generic metadata updates advance apps.updated_at; a
+    // payload built from the pre-transaction candidate would be rejected by
+    // the worker's exact authority revalidation every time.
+    let apply_payload = build_accepted_apply_payload(
+        &mut tx,
+        app.id,
+        state.attestation.clone(),
+        crate::auth::jwt::public_key_base64(&state.signing_key),
+        state.api_url.clone(),
+        signing_artifacts.as_ref().map(|_| deploy_id),
+        signing_artifacts
+            .as_ref()
+            .map(|artifacts| artifacts.descriptor_core_hash),
+        log_encryption,
+        app_mutation == AppMutation::Insert,
+    )
     .await
     .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
@@ -1736,27 +1815,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_metadata_acceptance_persists_dispatchable_post_mutation_payload() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        insert_authority_rows(&pool, &app).await;
+        let deployment_id = Uuid::new_v4();
+
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin generic metadata acceptance");
+        crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
+            .await
+            .expect("lock generic metadata app lane");
+        sqlx::query(
+            "UPDATE apps
+                SET source_provider = 'github',
+                    source_repository = 'enclava-labs/example',
+                    updated_at = updated_at + interval '1 second'
+              WHERE id = $1",
+        )
+        .bind(app.id)
+        .execute(&mut *tx)
+        .await
+        .expect("persist generic metadata mutation");
+        let payload = build_accepted_apply_payload(
+            &mut tx,
+            app.id,
+            None,
+            "test-api-key".to_string(),
+            "https://api.example.test".to_string(),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("build payload from accepted rows");
+        assert_ne!(payload.app.updated_at, app.updated_at);
+        assert_eq!(payload.app.source_provider.as_deref(), Some("github"));
+        assert_eq!(
+            payload.app.source_repository.as_deref(),
+            Some("enclava-labs/example")
+        );
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, spec_snapshot, image_digest
+             ) VALUES (
+                 $1, $2, $3, 'api',
+                 jsonb_build_object('setup_state', $4::text),
+                 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+             )",
+        )
+        .bind(deployment_id)
+        .bind(app.org_id)
+        .bind(app.id)
+        .bind(DEPLOYMENT_SETUP_DNS_PENDING)
+        .execute(&mut *tx)
+        .await
+        .expect("insert accepted deployment");
+        crate::deployment_jobs::insert_setup_job(
+            &mut tx,
+            deployment_id,
+            deployment_id,
+            &payload,
+            false,
+        )
+        .await
+        .expect("persist accepted setup job");
+        tx.commit()
+            .await
+            .expect("commit generic metadata acceptance");
+
+        let stored_payload: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load persisted apply payload");
+        let stored_payload: DeploymentApplyJobPayload =
+            serde_json::from_value(stored_payload).expect("decode persisted apply payload");
+        let database_updated_at: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load accepted app timestamp");
+        assert_eq!(stored_payload.app.updated_at, database_updated_at);
+
+        let expected = crate::deploy::ExistingAppAuthoritySnapshot::new(
+            stored_payload.app.updated_at,
+            stored_payload.snapshot.containers.clone(),
+            stored_payload.snapshot.resources.clone(),
+        );
+        let mut worker_lane = pool.begin().await.expect("begin worker authority lane");
+        crate::deploy::lock_app_deployment_lane(&mut worker_lane, app.id)
+            .await
+            .expect("lock worker app lane");
+        assert!(
+            crate::deploy::verify_existing_app_authority(&mut worker_lane, app.id, &expected)
+                .await
+                .expect("verify exact post-mutation payload"),
+            "the payload accepted after generic metadata mutation must be dispatchable"
+        );
+
+        // The nonterminal status projection uses another pooled connection
+        // during apply. It must neither self-deadlock on worker row locks nor
+        // invalidate the immutable authority timestamp for crash recovery.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            crate::deploy::set_app_status(&pool, app.id, "creating"),
+        )
+        .await
+        .expect("worker status projection self-deadlocked")
+        .expect("project worker status");
+        let after_projection: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load timestamp after worker status projection");
+        assert_eq!(after_projection, database_updated_at);
+        worker_lane
+            .rollback()
+            .await
+            .expect("release worker authority lane");
+
+        delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
     async fn superseded_watcher_cannot_publish_over_new_manifest() {
         let pool = database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
+        insert_authority_rows(&pool, &app).await;
+        let containers: Vec<AppContainer> =
+            sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 ORDER BY id")
+                .bind(app.id)
+                .fetch_all(&pool)
+                .await
+                .expect("load watcher fixture containers");
+        let resources: AppResources =
+            sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load watcher fixture resources");
+        let payload = DeploymentApplyJobPayload::new(
+            app.clone(),
+            crate::deploy::DeploymentApplySnapshot::new(containers.clone(), resources),
+            None,
+            "test-api-key".to_string(),
+            "https://api.example.test".to_string(),
+            None,
+            None,
+            None,
+            false,
+        );
         let old_deployment_id = Uuid::new_v4();
         let new_deployment_id = Uuid::new_v4();
         let old_hash = "old-manifest-hash";
         let new_hash = "new-manifest-hash";
+        let image_digest = containers[0]
+            .image_digest
+            .clone()
+            .expect("watcher fixture image digest");
+        let deployment_snapshot = serde_json::json!({
+            "setup_state": crate::deployment_jobs::DEPLOYMENT_SETUP_ACCEPTED,
+            "image": &containers[0].image_ref,
+            "image_digest": &image_digest,
+            "signed_descriptor_core_hash": null,
+            "log_encryption": null,
+        });
 
+        let mut old_acceptance = pool.begin().await.expect("begin old acceptance");
         sqlx::query(
             "INSERT INTO deployments (
-                id, org_id, app_id, trigger, status, spec_snapshot, manifest_hash
+                id, org_id, app_id, trigger, status, spec_snapshot,
+                image_digest, manifest_hash
              )
-             VALUES ($1, $2, $3, 'api', 'watching', '{}'::jsonb, $4)",
+             VALUES ($1, $2, $3, 'api', 'watching', $4, $5, $6)",
         )
         .bind(old_deployment_id)
         .bind(app.org_id)
         .bind(app.id)
+        .bind(&deployment_snapshot)
+        .bind(&image_digest)
         .bind(old_hash)
-        .execute(&pool)
+        .execute(&mut *old_acceptance)
         .await
         .expect("insert old watching deployment");
+        crate::deployment_jobs::insert_ready_job(
+            &mut old_acceptance,
+            old_deployment_id,
+            old_deployment_id,
+            &payload,
+            false,
+        )
+        .await
+        .expect("insert old watcher job");
+        old_acceptance
+            .commit()
+            .await
+            .expect("commit old watching deployment");
 
         let mut acceptance = pool.begin().await.expect("begin newer acceptance");
         crate::deploy::lock_app_deployment_lane(&mut acceptance, app.id)
@@ -1770,17 +2032,29 @@ mod tests {
         );
         sqlx::query(
             "INSERT INTO deployments (
-                id, org_id, app_id, trigger, status, spec_snapshot, manifest_hash
+                id, org_id, app_id, trigger, status, spec_snapshot,
+                image_digest, manifest_hash
              )
-             VALUES ($1, $2, $3, 'api', 'watching', '{}'::jsonb, $4)",
+             VALUES ($1, $2, $3, 'api', 'watching', $4, $5, $6)",
         )
         .bind(new_deployment_id)
         .bind(app.org_id)
         .bind(app.id)
+        .bind(&deployment_snapshot)
+        .bind(&image_digest)
         .bind(new_hash)
         .execute(&mut *acceptance)
         .await
         .expect("insert new watching deployment");
+        crate::deployment_jobs::insert_ready_job(
+            &mut acceptance,
+            new_deployment_id,
+            new_deployment_id,
+            &payload,
+            false,
+        )
+        .await
+        .expect("insert new watcher job");
         acceptance.commit().await.expect("commit newer acceptance");
 
         assert!(
@@ -1958,7 +2232,7 @@ mod tests {
         )
         .await
         .expect_err("malformed rollback artifact rejected");
-        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.0, StatusCode::CONFLICT);
 
         let persisted_image: String = sqlx::query_scalar(
             "SELECT image_ref FROM app_containers WHERE app_id = $1 AND name = 'web'",

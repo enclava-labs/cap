@@ -423,6 +423,10 @@ impl ExistingAppAuthoritySnapshot {
             resources,
         }
     }
+
+    pub(crate) fn app_id(&self) -> Uuid {
+        self.resources.app_id
+    }
 }
 
 pub(crate) async fn lock_and_verify_existing_app_authority(
@@ -430,31 +434,65 @@ pub(crate) async fn lock_and_verify_existing_app_authority(
     app_id: Uuid,
     expected: &ExistingAppAuthoritySnapshot,
 ) -> Result<bool, sqlx::Error> {
-    let current_updated_at: Option<chrono::DateTime<chrono::Utc>> =
-        sqlx::query_scalar("SELECT updated_at FROM apps WHERE id = $1 FOR UPDATE")
-            .bind(app_id)
-            .fetch_optional(&mut **tx)
-            .await?;
+    verify_existing_app_authority_rows(tx, app_id, expected, true).await
+}
+
+/// Compare the accepted app/runtime rows while the caller holds the app
+/// advisory lane, without taking row locks. Durable workers use this form
+/// because manifest application updates app/deployment status through other
+/// pooled connections while the advisory lane remains held. Taking a row lock
+/// here would make the worker wait on itself.
+pub(crate) async fn verify_existing_app_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    expected: &ExistingAppAuthoritySnapshot,
+) -> Result<bool, sqlx::Error> {
+    verify_existing_app_authority_rows(tx, app_id, expected, false).await
+}
+
+async fn verify_existing_app_authority_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    expected: &ExistingAppAuthoritySnapshot,
+    lock_rows: bool,
+) -> Result<bool, sqlx::Error> {
+    let app_query = if lock_rows {
+        "SELECT updated_at FROM apps WHERE id = $1 FOR UPDATE"
+    } else {
+        "SELECT updated_at FROM apps WHERE id = $1"
+    };
+    let current_updated_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(app_query)
+        .bind(app_id)
+        .fetch_optional(&mut **tx)
+        .await?;
     if current_updated_at != Some(expected.app_updated_at) {
         return Ok(false);
     }
 
-    let current_containers: Vec<AppContainer> =
-        sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 ORDER BY id FOR UPDATE")
-            .bind(app_id)
-            .fetch_all(&mut **tx)
-            .await?;
+    let containers_query = if lock_rows {
+        "SELECT * FROM app_containers WHERE app_id = $1 ORDER BY id FOR UPDATE"
+    } else {
+        "SELECT * FROM app_containers WHERE app_id = $1 ORDER BY id"
+    };
+    let current_containers: Vec<AppContainer> = sqlx::query_as(containers_query)
+        .bind(app_id)
+        .fetch_all(&mut **tx)
+        .await?;
     let mut expected_containers = expected.containers.clone();
     expected_containers.sort_by_key(|container| container.id);
     if current_containers != expected_containers {
         return Ok(false);
     }
 
-    let current_resources: Option<AppResources> =
-        sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1 FOR UPDATE")
-            .bind(app_id)
-            .fetch_optional(&mut **tx)
-            .await?;
+    let resources_query = if lock_rows {
+        "SELECT * FROM app_resources WHERE app_id = $1 FOR UPDATE"
+    } else {
+        "SELECT * FROM app_resources WHERE app_id = $1"
+    };
+    let current_resources: Option<AppResources> = sqlx::query_as(resources_query)
+        .bind(app_id)
+        .fetch_optional(&mut **tx)
+        .await?;
     Ok(current_resources.as_ref() == Some(&expected.resources))
 }
 
@@ -717,7 +755,13 @@ pub(crate) fn build_confidential_app_from_rows(
 
 async fn latest_deployment_id_for_app(pool: &PgPool, app_id: Uuid) -> Result<Uuid, sqlx::Error> {
     let deployment_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM deployments WHERE app_id = $1 ORDER BY created_at DESC LIMIT 1",
+        "SELECT deployment.id
+           FROM deployments AS deployment
+           JOIN deployment_apply_jobs AS apply_job
+             ON apply_job.deployment_id = deployment.id
+          WHERE deployment.app_id = $1
+          ORDER BY apply_job.generation DESC
+          LIMIT 1",
     )
     .bind(app_id)
     .fetch_optional(pool)
@@ -726,8 +770,6 @@ async fn latest_deployment_id_for_app(pool: &PgPool, app_id: Uuid) -> Result<Uui
 }
 
 pub(crate) const DEPLOYMENT_SUPERSEDED_ERROR: &str = "deployment_superseded";
-pub(crate) const DEPLOYMENT_APPLY_FAILED_ERROR: &str = "deployment_apply_failed";
-pub(crate) const DEPLOYMENT_ROLLOUT_FAILED_ERROR: &str = "deployment_rollout_failed";
 
 fn app_deployment_lane_key(app_id: Uuid) -> i64 {
     let (high, low) = app_id.as_u64_pair();
@@ -757,6 +799,30 @@ pub(crate) async fn supersede_incomplete_deployments(
     tx: &mut Transaction<'_, Postgres>,
     app_id: Uuid,
 ) -> Result<u64, sqlx::Error> {
+    // Stop every queued or leased operation before terminalizing its
+    // deployment. A worker that already holds a lease must acquire the same
+    // app lane before any setup/apply/cleanup side effect, so once this update
+    // commits it can only observe a lost lease / terminal generation.
+    sqlx::query(
+        "UPDATE deployment_apply_jobs
+         SET state = 'failed',
+             lock_token = NULL,
+             locked_until = NULL,
+             next_attempt_at = clock_timestamp(),
+             last_error_code = $1,
+             updated_at = clock_timestamp()
+         WHERE app_id = $2
+           AND state IN (
+               'setup_pending', 'setting_up',
+               'cleanup_pending', 'cleaning_up',
+               'pending', 'running'
+           )",
+    )
+    .bind(DEPLOYMENT_SUPERSEDED_ERROR)
+    .bind(app_id)
+    .execute(&mut **tx)
+    .await?;
+
     let result = sqlx::query(
         "UPDATE deployments
          SET status = 'failed'::deploy_status_enum,
@@ -772,7 +838,7 @@ pub(crate) async fn supersede_incomplete_deployments(
     Ok(result.rows_affected())
 }
 
-async fn deployment_is_active_for_apply(
+pub(crate) async fn deployment_is_active_for_apply(
     tx: &mut Transaction<'_, Postgres>,
     app_id: Uuid,
     deployment_id: Uuid,
@@ -780,10 +846,17 @@ async fn deployment_is_active_for_apply(
     sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
-             FROM deployments
-             WHERE id = $1
-               AND app_id = $2
-               AND status::text IN ('pending', 'applying')
+             FROM deployments AS deployment
+             JOIN apps AS app ON app.id = deployment.app_id
+             WHERE deployment.id = $1
+               AND deployment.app_id = $2
+               -- A worker can die after idempotent SSA apply and before its
+               -- rollout watcher publishes a terminal result. Reclaiming a
+               -- watching generation must re-apply and re-watch it; treating
+               -- it as inactive would complete the job while stranding the
+               -- deployment forever in watching.
+               AND deployment.status::text IN ('pending', 'applying', 'watching')
+               AND app.status <> 'deleting'::app_status_enum
          )",
     )
     .bind(deployment_id)
@@ -796,6 +869,7 @@ async fn deployment_is_active_for_apply(
 /// watching deployment and exact manifest hash. A newer acceptance first
 /// supersedes the old row under the same app deployment lane, so a late old
 /// watcher becomes a no-op for both deployment and app status.
+#[cfg(test)]
 pub(crate) struct DeploymentResultUpdate<'a> {
     pub app_id: Uuid,
     pub deployment_id: Uuid,
@@ -806,6 +880,7 @@ pub(crate) struct DeploymentResultUpdate<'a> {
     pub terminal: bool,
 }
 
+#[cfg(test)]
 pub(crate) async fn record_deployment_result_if_current(
     pool: &PgPool,
     update: DeploymentResultUpdate<'_>,
@@ -842,49 +917,6 @@ pub(crate) async fn record_deployment_result_if_current(
         )
         .bind(update.app_status)
         .bind(update.app_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    tx.commit().await?;
-    Ok(recorded)
-}
-
-/// Fail an asynchronous deployment task only if the deployment has not
-/// already completed or been superseded. App status changes in the same
-/// serialized transaction, preventing an old task from failing a newer one.
-pub(crate) async fn fail_deployment_if_active(
-    pool: &PgPool,
-    app_id: Uuid,
-    deployment_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    lock_app_deployment_lane(&mut tx, app_id).await?;
-
-    let result = sqlx::query(
-        "UPDATE deployments
-         SET status = 'failed'::deploy_status_enum,
-             error_message = $1,
-             completed_at = clock_timestamp()
-         WHERE id = $2
-           AND app_id = $3
-           AND status::text IN ('pending', 'applying', 'watching')",
-    )
-    .bind(DEPLOYMENT_APPLY_FAILED_ERROR)
-    .bind(deployment_id)
-    .bind(app_id)
-    .execute(&mut *tx)
-    .await?;
-
-    let recorded = result.rows_affected() == 1;
-    if recorded {
-        sqlx::query(
-            "UPDATE apps
-             SET status = 'failed'::app_status_enum,
-                 updated_at = clock_timestamp()
-             WHERE id = $1",
-        )
-        .bind(app_id)
         .execute(&mut *tx)
         .await?;
     }
@@ -1515,7 +1547,10 @@ pub async fn set_deployment_status(
 }
 
 pub async fn set_app_status(pool: &PgPool, app_id: Uuid, status: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE apps SET status = $1::app_status_enum, updated_at = now() WHERE id = $2")
+    // This is a nonterminal worker projection, not a change to accepted app
+    // authority. Advancing updated_at here would make a reclaimed durable job
+    // reject its own immutable payload after a crash between apply phases.
+    sqlx::query("UPDATE apps SET status = $1::app_status_enum WHERE id = $2")
         .bind(status)
         .bind(app_id)
         .execute(pool)
@@ -1691,17 +1726,6 @@ pub async fn apply_deployment_manifests(
         log_encryption,
     } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
-    let mut apply_lane = pool.begin().await?;
-    lock_app_deployment_lane(&mut apply_lane, app.id).await?;
-    if !deployment_is_active_for_apply(&mut apply_lane, app.id, deployment_id).await? {
-        apply_lane.commit().await?;
-        tracing::info!(
-            app_id = %app.id,
-            deployment_id = %deployment_id,
-            "skipping manifest apply for completed or superseded deployment"
-        );
-        return Ok(None);
-    }
 
     let mut app_spec = build_confidential_app_from_rows(
         &app,
@@ -1807,7 +1831,6 @@ pub async fn apply_deployment_manifests(
     }
     crate::edge::ensure_haproxy_routes(&pool, &edge_config, &routes).await?;
     set_deployment_status(&pool, deployment_id, "watching", Some(&hash), None, false).await?;
-    apply_lane.commit().await?;
 
     Ok(Some(DeploymentRollout {
         app,

@@ -108,6 +108,7 @@ EXECUTE FUNCTION reject_live_workload_artifact_delete();
 
 CREATE TABLE deployment_apply_jobs (
     deployment_id uuid PRIMARY KEY,
+    generation    bigint GENERATED ALWAYS AS IDENTITY UNIQUE NOT NULL,
     app_id        uuid NOT NULL,
     org_id        uuid NOT NULL,
     source_deployment_id uuid NOT NULL,
@@ -131,7 +132,11 @@ CREATE TABLE deployment_apply_jobs (
     next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     last_error_code text CHECK (
         last_error_code IS NULL
-        OR last_error_code IN ('deployment_setup_failed', 'deployment_apply_failed')
+        OR last_error_code IN (
+            'deployment_setup_failed',
+            'deployment_apply_failed',
+            'deployment_superseded'
+        )
     ),
     created_at    timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at    timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -191,6 +196,9 @@ CREATE INDEX idx_deployment_apply_jobs_dispatch
 CREATE INDEX idx_deployment_apply_jobs_source
     ON deployment_apply_jobs (source_deployment_id);
 
+CREATE INDEX idx_deployment_apply_jobs_app_generation
+    ON deployment_apply_jobs (app_id, generation DESC);
+
 CREATE INDEX idx_deployment_apply_jobs_artifact
     ON deployment_apply_jobs
        (artifact_deployment_id, artifact_descriptor_core_hash)
@@ -203,6 +211,7 @@ AS $$
 BEGIN
     IF ROW(
         OLD.deployment_id,
+        OLD.generation,
         OLD.app_id,
         OLD.org_id,
         OLD.source_deployment_id,
@@ -216,6 +225,7 @@ BEGIN
         OLD.log_encryption
     ) IS DISTINCT FROM ROW(
         NEW.deployment_id,
+        NEW.generation,
         NEW.app_id,
         NEW.org_id,
         NEW.source_deployment_id,

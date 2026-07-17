@@ -326,18 +326,20 @@ pub async fn reconcile_signed_policy_artifacts(
         FROM (
             SELECT
                 wa.signed_policy_artifact,
-                d.created_at AS deployment_created_at,
+                apply_job.generation AS deployment_generation,
                 wa.created_at AS artifact_created_at,
                 ROW_NUMBER() OVER (
                     PARTITION BY d.app_id
-                    ORDER BY d.created_at DESC, wa.created_at DESC
+                    ORDER BY apply_job.generation DESC, wa.created_at DESC
                 ) AS app_artifact_rank
             FROM workload_artifacts wa
             JOIN deployments d ON d.id = wa.deploy_id AND d.app_id = wa.app_id
+            JOIN deployment_apply_jobs apply_job
+              ON apply_job.deployment_id = d.id
             WHERE d.status::text IN ('pending', 'applying', 'watching', 'healthy')
         ) ranked_active_artifacts
         WHERE app_artifact_rank <= $1
-        ORDER BY app_artifact_rank ASC, deployment_created_at DESC, artifact_created_at DESC
+        ORDER BY app_artifact_rank ASC, deployment_generation DESC, artifact_created_at DESC
         "#,
     )
     .bind(config.signed_policy_retention)
