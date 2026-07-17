@@ -90,6 +90,44 @@ fn test_deployment_context() -> DeploymentContextResponse {
 }
 
 #[test]
+fn optional_app_name_uses_loaded_config() {
+    let app_name = optional_app_name_from_config_result(Ok(test_app_config()))
+        .expect("valid config")
+        .expect("app name");
+    assert_eq!(app_name, "demo");
+}
+
+#[test]
+fn optional_app_name_suppresses_only_missing_enclava_toml() {
+    let app_name = optional_app_name_from_config_result(Err(AppConfigError::ReadFile {
+        path: "/tmp/project/enclava.toml".to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+    }))
+    .expect("a genuinely missing enclava.toml enables org scope");
+    assert_eq!(app_name, None);
+
+    let current_dir_error = optional_app_name_from_config_result(Err(AppConfigError::ReadFile {
+        path: ".".to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "cwd unavailable"),
+    }))
+    .expect_err("current-directory errors must not be hidden");
+    assert!(matches!(current_dir_error, AppConfigError::ReadFile { .. }));
+}
+
+#[test]
+fn optional_app_name_propagates_malformed_and_invalid_config() {
+    let parse_error = optional_app_name_from_config_result(AppConfig::parse("["))
+        .expect_err("malformed enclava.toml must fail closed");
+    assert!(matches!(parse_error, AppConfigError::Parse(_)));
+
+    let validation_error = optional_app_name_from_config_result(Err(AppConfigError::Validation(
+        "invalid app config".to_string(),
+    )))
+    .expect_err("invalid enclava.toml must fail closed");
+    assert!(matches!(validation_error, AppConfigError::Validation(_)));
+}
+
+#[test]
 fn deployment_context_platform_release_is_verified_and_selected() {
     let envelope = PlatformReleaseEnvelope {
         payload: test_release(),

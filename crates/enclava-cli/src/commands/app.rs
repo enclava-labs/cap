@@ -17,7 +17,7 @@ use chrono::Utc;
 use clap::Subcommand;
 use enclava_cli::api_client::{ApiClient, ApiError};
 use enclava_cli::api_types::*;
-use enclava_cli::app_config::AppConfig;
+use enclava_cli::app_config::{AppConfig, AppConfigError};
 use enclava_cli::config::{self, CliPaths};
 use enclava_cli::descriptor::{
     CapAppOciRuntimeSpecInput, DeploymentDescriptorBuildInput, Sidecars, SignerIdentity,
@@ -66,9 +66,25 @@ fn resolve_optional_app_name(
     if let Some(name) = explicit {
         return Ok(Some(name.clone()));
     }
-    Ok(AppConfig::find_and_load()
-        .ok()
-        .map(|config| config.app.name))
+    Ok(optional_app_name_from_config_result(
+        AppConfig::find_and_load(),
+    )?)
+}
+
+fn optional_app_name_from_config_result(
+    result: Result<AppConfig, AppConfigError>,
+) -> Result<Option<String>, AppConfigError> {
+    match result {
+        Ok(config) => Ok(Some(config.app.name)),
+        Err(AppConfigError::ReadFile { path, source })
+            if source.kind() == std::io::ErrorKind::NotFound
+                && Path::new(&path).file_name().and_then(|name| name.to_str())
+                    == Some("enclava.toml") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Build an authenticated API client from stored config/credentials.
