@@ -1,4 +1,3 @@
-use chrono::Utc;
 use enclava_common::validate::{
     ValidateError, validate_app_name, validate_fqdn, validate_org_slug,
 };
@@ -11,6 +10,7 @@ use kube::{
     api::{ApiResource, DynamicObject, Patch, PatchParams},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::net::IpAddr;
 
@@ -22,6 +22,9 @@ use std::net::IpAddr;
 /// advisory lock used elsewhere in the platform. See `haproxy_lock_id` for
 /// the derivation.
 pub const HAPROXY_LOCK_ID: i64 = haproxy_lock_id();
+
+const HAPROXY_CONFIG_GENERATION_ANNOTATION: &str = "config.enclava.dev/haproxy-sha256";
+const HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES: usize = 900 * 1024;
 
 const fn haproxy_lock_id() -> i64 {
     0xe9_d6_37_8a_9d_46_b5_88u64 as i64
@@ -39,6 +42,21 @@ pub enum EdgeRouteError {
     InvalidHostname(#[from] ValidateError),
     #[error("invalid app name for HAProxy backend: {0}")]
     InvalidAppName(String),
+    #[error("failed to serialize the HAProxy ConfigMap for its size check: {0}")]
+    ConfigSerialization(serde_json::Error),
+    #[error(
+        "HAProxy ConfigMap serialized size {actual} bytes exceeds the {limit}-byte safety budget"
+    )]
+    ConfigTooLarge { actual: usize, limit: usize },
+    #[error("Kubernetes accepted the HAProxy ConfigMap patch without returning the desired config")]
+    ConfigNotApplied,
+    #[error(
+        "Kubernetes accepted the HAProxy DaemonSet patch without applying generation {expected} (found {actual:?})"
+    )]
+    GenerationNotApplied {
+        expected: String,
+        actual: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -164,59 +182,133 @@ where
         .await?;
 
     let client = Client::try_default().await?;
+    let changed = reconcile_haproxy_config(client, config, mutate).await?;
+
+    tx.commit().await?;
+    Ok(changed)
+}
+
+async fn reconcile_haproxy_config<F>(
+    client: Client,
+    config: &EdgeRouteConfig,
+    mutate: F,
+) -> Result<bool, EdgeRouteError>
+where
+    F: FnOnce(&str) -> String,
+{
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     let cm = cm_api.get(&config.configmap_name).await?;
     let current = cm
         .data
         .as_ref()
         .and_then(|data| data.get("haproxy.cfg"))
+        .cloned()
         .ok_or_else(|| EdgeRouteError::MissingConfig {
             namespace: config.namespace.clone(),
             name: config.configmap_name.clone(),
         })?;
 
-    let updated = mutate(current);
-    if updated == *current {
-        // Nothing to write; still commit to release the lock cleanly.
-        tx.commit().await?;
-        return Ok(false);
+    let updated = mutate(&current);
+    let generation = haproxy_config_generation(&updated);
+    let config_changed = updated != current;
+
+    if config_changed {
+        let serialized_size = serialized_configmap_size_with_config(&cm, &updated)
+            .map_err(EdgeRouteError::ConfigSerialization)?;
+        if serialized_size > HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES
+            && updated.len() >= current.len()
+        {
+            return Err(EdgeRouteError::ConfigTooLarge {
+                actual: serialized_size,
+                limit: HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES,
+            });
+        }
+
+        let patch = json!({
+            "data": {
+                "haproxy.cfg": &updated,
+            }
+        });
+        let patched = cm_api
+            .patch(
+                &config.configmap_name,
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
+            )
+            .await?;
+        if patched
+            .data
+            .as_ref()
+            .and_then(|data| data.get("haproxy.cfg"))
+            .map(String::as_str)
+            != Some(updated.as_str())
+        {
+            return Err(EdgeRouteError::ConfigNotApplied);
+        }
     }
 
-    let patch = json!({
-        "data": {
-            "haproxy.cfg": updated,
-        }
-    });
-    cm_api
-        .patch(
-            &config.configmap_name,
-            &PatchParams::default(),
-            &Patch::Merge(&patch),
-        )
-        .await?;
-
     let ds_api: Api<DaemonSet> = Api::namespaced(client, &config.namespace);
-    let restart_patch = json!({
-        "spec": {
-            "template": {
-                "metadata": {
-                    "annotations": {
-                        "cap.enclava.dev/haproxy-restarted-at": Utc::now().to_rfc3339(),
+    let daemonset = ds_api.get(&config.daemonset_name).await?;
+    let generation_changed = daemonset_config_generation(&daemonset) != Some(&generation);
+
+    if generation_changed {
+        let generation_patch = json!({
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            HAPROXY_CONFIG_GENERATION_ANNOTATION: &generation,
+                        }
                     }
                 }
             }
+        });
+        let patched = ds_api
+            .patch(
+                &config.daemonset_name,
+                &PatchParams::default(),
+                &Patch::Merge(&generation_patch),
+            )
+            .await?;
+        let applied = daemonset_config_generation(&patched);
+        if applied != Some(generation.as_str()) {
+            return Err(EdgeRouteError::GenerationNotApplied {
+                expected: generation,
+                actual: applied.map(str::to_string),
+            });
         }
-    });
-    ds_api
-        .patch(
-            &config.daemonset_name,
-            &PatchParams::default(),
-            &Patch::Merge(&restart_patch),
-        )
-        .await?;
+    }
 
-    tx.commit().await?;
-    Ok(true)
+    Ok(config_changed || generation_changed)
+}
+
+fn haproxy_config_generation(config: &str) -> String {
+    hex::encode(Sha256::digest(config.as_bytes()))
+}
+
+fn daemonset_config_generation(daemonset: &DaemonSet) -> Option<&str> {
+    daemonset
+        .spec
+        .as_ref()?
+        .template
+        .metadata
+        .as_ref()?
+        .annotations
+        .as_ref()?
+        .get(HAPROXY_CONFIG_GENERATION_ANNOTATION)
+        .map(String::as_str)
+}
+
+fn serialized_configmap_size_with_config(
+    configmap: &ConfigMap,
+    updated: &str,
+) -> Result<usize, serde_json::Error> {
+    let mut prospective = configmap.clone();
+    prospective
+        .data
+        .get_or_insert_default()
+        .insert("haproxy.cfg".to_string(), updated.to_string());
+    serde_json::to_vec(&prospective).map(|serialized| serialized.len())
 }
 
 /// Build a backend identifier scoped by tenant `org_slug` and tagged by the
@@ -431,7 +523,298 @@ fn remove_backend_block(config: &str, backend_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sha2::{Digest, Sha256};
+    use axum::http::{Method, Request, Response};
+    use http_body_util::BodyExt;
+    use kube::client::Body;
+    use std::{
+        collections::VecDeque,
+        io,
+        sync::{Arc, Mutex},
+    };
+    use tower::service_fn;
+
+    const CONFIGMAP_PATH: &str = "/api/v1/namespaces/tenant-envoy/configmaps/haproxy-tenant";
+    const DAEMONSET_PATH: &str = "/apis/apps/v1/namespaces/tenant-envoy/daemonsets/haproxy-tenant";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FakePatchOutcome {
+        Success,
+        FailBeforeApply,
+        LoseResponseAfterApply,
+    }
+
+    #[derive(Debug)]
+    struct FakeKubeState {
+        config: String,
+        generation: Option<String>,
+        configmap_patch_outcomes: VecDeque<FakePatchOutcome>,
+        daemonset_patch_outcomes: VecDeque<FakePatchOutcome>,
+        configmap_patch_attempts: usize,
+        daemonset_patch_attempts: usize,
+    }
+
+    impl FakeKubeState {
+        fn new(config: &str) -> Self {
+            Self {
+                config: config.to_string(),
+                generation: Some(haproxy_config_generation(config)),
+                configmap_patch_outcomes: VecDeque::new(),
+                daemonset_patch_outcomes: VecDeque::new(),
+                configmap_patch_attempts: 0,
+                daemonset_patch_attempts: 0,
+            }
+        }
+
+        fn configmap(&self) -> Value {
+            json!({
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "haproxy-tenant",
+                    "namespace": "tenant-envoy",
+                },
+                "data": {
+                    "haproxy.cfg": self.config,
+                },
+            })
+        }
+
+        fn daemonset(&self) -> Value {
+            let annotations = self
+                .generation
+                .as_ref()
+                .map(|generation| json!({ HAPROXY_CONFIG_GENERATION_ANNOTATION: generation }));
+            json!({
+                "apiVersion": "apps/v1",
+                "kind": "DaemonSet",
+                "metadata": {
+                    "name": "haproxy-tenant",
+                    "namespace": "tenant-envoy",
+                },
+                "spec": {
+                    "selector": { "matchLabels": { "app": "haproxy-tenant" } },
+                    "template": {
+                        "metadata": {
+                            "labels": { "app": "haproxy-tenant" },
+                            "annotations": annotations,
+                        },
+                        "spec": {
+                            "containers": [{ "name": "haproxy", "image": "haproxy:3" }],
+                        },
+                    },
+                },
+            })
+        }
+    }
+
+    fn fake_kube_client(state: Arc<Mutex<FakeKubeState>>) -> Client {
+        let service =
+            service_fn(move |request| handle_fake_kube_request(request, Arc::clone(&state)));
+        Client::new(service, "default")
+    }
+
+    async fn handle_fake_kube_request(
+        request: Request<Body>,
+        state: Arc<Mutex<FakeKubeState>>,
+    ) -> Result<Response<Body>, io::Error> {
+        let method = request.method().clone();
+        let path = request.uri().path().to_string();
+        let body = request
+            .into_body()
+            .collect()
+            .await
+            .map_err(io::Error::other)?
+            .to_bytes();
+        let mut state = state.lock().expect("fake Kubernetes state poisoned");
+
+        match (method, path.as_str()) {
+            (Method::GET, CONFIGMAP_PATH) => Ok(json_response(state.configmap())),
+            (Method::GET, DAEMONSET_PATH) => Ok(json_response(state.daemonset())),
+            (Method::PATCH, CONFIGMAP_PATH) => {
+                state.configmap_patch_attempts += 1;
+                let outcome = state
+                    .configmap_patch_outcomes
+                    .pop_front()
+                    .unwrap_or(FakePatchOutcome::Success);
+                if outcome == FakePatchOutcome::FailBeforeApply {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "ConfigMap patch failed before apply",
+                    ));
+                }
+
+                let patch: Value = serde_json::from_slice(&body).expect("valid ConfigMap patch");
+                state.config = patch
+                    .pointer("/data/haproxy.cfg")
+                    .and_then(Value::as_str)
+                    .expect("ConfigMap patch includes haproxy.cfg")
+                    .to_string();
+                if outcome == FakePatchOutcome::LoseResponseAfterApply {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "ConfigMap patch response timed out after apply",
+                    ));
+                }
+                Ok(json_response(state.configmap()))
+            }
+            (Method::PATCH, DAEMONSET_PATH) => {
+                state.daemonset_patch_attempts += 1;
+                let outcome = state
+                    .daemonset_patch_outcomes
+                    .pop_front()
+                    .unwrap_or(FakePatchOutcome::Success);
+                if outcome == FakePatchOutcome::FailBeforeApply {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "DaemonSet patch failed before apply",
+                    ));
+                }
+
+                let patch: Value = serde_json::from_slice(&body).expect("valid DaemonSet patch");
+                state.generation = Some(
+                    patch
+                        .pointer(&format!(
+                            "/spec/template/metadata/annotations/{}",
+                            HAPROXY_CONFIG_GENERATION_ANNOTATION
+                                .replace('~', "~0")
+                                .replace('/', "~1")
+                        ))
+                        .and_then(Value::as_str)
+                        .expect("DaemonSet patch includes the HAProxy generation")
+                        .to_string(),
+                );
+                if outcome == FakePatchOutcome::LoseResponseAfterApply {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "DaemonSet patch response timed out after apply",
+                    ));
+                }
+                Ok(json_response(state.daemonset()))
+            }
+            (method, path) => Err(io::Error::other(format!(
+                "unexpected fake Kubernetes request: {method} {path}"
+            ))),
+        }
+    }
+
+    fn json_response(value: Value) -> Response<Body> {
+        Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&value).expect("serialize response"),
+            ))
+            .expect("build fake Kubernetes response")
+    }
+
+    fn edge_config() -> EdgeRouteConfig {
+        EdgeRouteConfig {
+            namespace: "tenant-envoy".to_string(),
+            configmap_name: "haproxy-tenant".to_string(),
+            daemonset_name: "haproxy-tenant".to_string(),
+        }
+    }
+
+    async fn reconcile_to(client: Client, desired: &str) -> Result<bool, EdgeRouteError> {
+        reconcile_haproxy_config(client, &edge_config(), |_| desired.to_string()).await
+    }
+
+    #[tokio::test]
+    async fn retry_reconciles_reload_after_configmap_success_and_daemonset_failure() {
+        let desired = "global\n  maxconn 4096\n";
+        let state = Arc::new(Mutex::new(FakeKubeState::new("global\n")));
+        state
+            .lock()
+            .unwrap()
+            .daemonset_patch_outcomes
+            .push_back(FakePatchOutcome::FailBeforeApply);
+        let client = fake_kube_client(Arc::clone(&state));
+
+        assert!(reconcile_to(client.clone(), desired).await.is_err());
+        {
+            let after_failure = state.lock().unwrap();
+            assert_eq!(after_failure.config, desired);
+            assert_ne!(
+                after_failure.generation.as_deref(),
+                Some(haproxy_config_generation(desired).as_str())
+            );
+        }
+
+        assert!(reconcile_to(client, desired).await.unwrap());
+        let converged = state.lock().unwrap();
+        assert_eq!(
+            converged.generation.as_deref(),
+            Some(haproxy_config_generation(desired).as_str())
+        );
+        assert_eq!(converged.configmap_patch_attempts, 1);
+        assert_eq!(converged.daemonset_patch_attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn retry_converges_after_configmap_patch_response_is_lost() {
+        let desired = "global\n  maxconn 4096\n";
+        let state = Arc::new(Mutex::new(FakeKubeState::new("global\n")));
+        state
+            .lock()
+            .unwrap()
+            .configmap_patch_outcomes
+            .push_back(FakePatchOutcome::LoseResponseAfterApply);
+        let client = fake_kube_client(Arc::clone(&state));
+
+        assert!(reconcile_to(client.clone(), desired).await.is_err());
+        assert!(reconcile_to(client, desired).await.unwrap());
+
+        let converged = state.lock().unwrap();
+        assert_eq!(converged.config, desired);
+        assert_eq!(
+            converged.generation.as_deref(),
+            Some(haproxy_config_generation(desired).as_str())
+        );
+        assert_eq!(converged.configmap_patch_attempts, 1);
+        assert_eq!(converged.daemonset_patch_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_converges_after_daemonset_patch_response_is_lost() {
+        let desired = "global\n  maxconn 4096\n";
+        let state = Arc::new(Mutex::new(FakeKubeState::new("global\n")));
+        state
+            .lock()
+            .unwrap()
+            .daemonset_patch_outcomes
+            .push_back(FakePatchOutcome::LoseResponseAfterApply);
+        let client = fake_kube_client(Arc::clone(&state));
+
+        assert!(reconcile_to(client.clone(), desired).await.is_err());
+        assert!(!reconcile_to(client, desired).await.unwrap());
+
+        let converged = state.lock().unwrap();
+        assert_eq!(converged.configmap_patch_attempts, 1);
+        assert_eq!(converged.daemonset_patch_attempts, 1);
+        assert_eq!(
+            converged.generation.as_deref(),
+            Some(haproxy_config_generation(desired).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn configmap_growth_over_serialized_budget_is_rejected_before_patch() {
+        let state = Arc::new(Mutex::new(FakeKubeState::new("global\n")));
+        let client = fake_kube_client(Arc::clone(&state));
+        let oversized = "x".repeat(HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES);
+
+        let error = reconcile_to(client, &oversized).await.unwrap_err();
+        assert!(matches!(
+            error,
+            EdgeRouteError::ConfigTooLarge {
+                actual,
+                limit: HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES,
+            } if actual > HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES
+        ));
+        let unchanged = state.lock().unwrap();
+        assert_eq!(unchanged.config, "global\n");
+        assert_eq!(unchanged.configmap_patch_attempts, 0);
+        assert_eq!(unchanged.daemonset_patch_attempts, 0);
+    }
 
     #[test]
     fn lock_id_matches_label_hash() {
