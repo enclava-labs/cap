@@ -486,6 +486,32 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn list_org_log_keys(&self) -> Result<OrgLogEncryptionKeyList, ApiError> {
+        let resp = self
+            .http
+            .get(self.url("/log-keys"))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub async fn revoke_org_log_key(
+        &self,
+        key_id: &str,
+    ) -> Result<RevokeOrgLogEncryptionKeyResponse, ApiError> {
+        let key_id = path_segment(key_id);
+        let resp = self
+            .http
+            .delete(self.url(&format!("/log-keys/{key_id}")))
+            .headers(self.auth_headers()?)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     // --- Config ---
 
     pub async fn get_config_token(&self, app_name: &str) -> Result<ConfigTokenResponse, ApiError> {

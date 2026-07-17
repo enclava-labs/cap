@@ -90,6 +90,44 @@ fn test_deployment_context() -> DeploymentContextResponse {
 }
 
 #[test]
+fn optional_app_name_uses_loaded_config() {
+    let app_name = optional_app_name_from_config_result(Ok(test_app_config()))
+        .expect("valid config")
+        .expect("app name");
+    assert_eq!(app_name, "demo");
+}
+
+#[test]
+fn optional_app_name_suppresses_only_missing_enclava_toml() {
+    let app_name = optional_app_name_from_config_result(Err(AppConfigError::ReadFile {
+        path: "/tmp/project/enclava.toml".to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+    }))
+    .expect("a genuinely missing enclava.toml enables org scope");
+    assert_eq!(app_name, None);
+
+    let current_dir_error = optional_app_name_from_config_result(Err(AppConfigError::ReadFile {
+        path: ".".to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "cwd unavailable"),
+    }))
+    .expect_err("current-directory errors must not be hidden");
+    assert!(matches!(current_dir_error, AppConfigError::ReadFile { .. }));
+}
+
+#[test]
+fn optional_app_name_propagates_malformed_and_invalid_config() {
+    let parse_error = optional_app_name_from_config_result(AppConfig::parse("["))
+        .expect_err("malformed enclava.toml must fail closed");
+    assert!(matches!(parse_error, AppConfigError::Parse(_)));
+
+    let validation_error = optional_app_name_from_config_result(Err(AppConfigError::Validation(
+        "invalid app config".to_string(),
+    )))
+    .expect_err("invalid enclava.toml must fail closed");
+    assert!(matches!(validation_error, AppConfigError::Validation(_)));
+}
+
+#[test]
 fn deployment_context_platform_release_is_verified_and_selected() {
     let envelope = PlatformReleaseEnvelope {
         payload: test_release(),
@@ -1034,4 +1072,80 @@ fn storage_password_file_trims_newlines_and_rejects_empty() {
             .to_string()
             .contains("is empty")
     );
+}
+
+#[tokio::test]
+async fn list_org_log_keys_hits_org_endpoint() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = serde_json::json!({ "keys": [] }).to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let list = api.list_org_log_keys().await.unwrap();
+    let request = handle.join().unwrap();
+
+    assert!(request.starts_with("GET /log-keys "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert!(list.keys.is_empty());
+}
+
+#[tokio::test]
+async fn revoke_org_log_key_hits_org_endpoint() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = serde_json::json!({
+            "key_id": "team-logs",
+            "status": "revoked",
+            "revoked_at": "2026-07-15T00:00:00Z",
+            "cleared_app_selections": 2
+        })
+        .to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let resp = api.revoke_org_log_key("team-logs").await.unwrap();
+    let request = handle.join().unwrap();
+
+    assert!(request.starts_with("DELETE /log-keys/team-logs "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert_eq!(resp.key_id, "team-logs");
+    assert_eq!(resp.status, "revoked");
+    assert_eq!(resp.cleared_app_selections, Some(2));
 }
