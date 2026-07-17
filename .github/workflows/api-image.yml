@@ -2,47 +2,116 @@ name: Build API Image
 
 on:
   push:
-    branches: ['main']
-    tags: ['v*']
+    branches: ["main"]
+    tags: ["v*"]
     paths:
-    - '.github/workflows/api-image.yml'
-    - 'Cargo.toml'
-    - 'Cargo.lock'
-    - 'crates/enclava-api/**'
-    - 'crates/enclava-cli/platform-release.json'
-    - 'crates/enclava-common/**'
-    - 'crates/enclava-engine/**'
+      - ".github/workflows/api-image.yml"
+      - "scripts/render-api-release-manifest.sh"
+      - "scripts/test-api-image-workflow.sh"
+      - "scripts/test-verify-api-image-ref.sh"
+      - "scripts/verify-api-image-ref.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/enclava-api/**"
+      - "crates/enclava-cli/platform-release.json"
+      - "crates/enclava-common/**"
+      - "crates/enclava-engine/**"
   pull_request:
     paths:
-    - '.github/workflows/api-image.yml'
-    - 'Cargo.toml'
-    - 'Cargo.lock'
-    - 'crates/enclava-api/**'
-    - 'crates/enclava-cli/platform-release.json'
-    - 'crates/enclava-common/**'
-    - 'crates/enclava-engine/**'
+      - ".github/workflows/api-image.yml"
+      - "scripts/render-api-release-manifest.sh"
+      - "scripts/test-api-image-workflow.sh"
+      - "scripts/test-verify-api-image-ref.sh"
+      - "scripts/verify-api-image-ref.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/enclava-api/**"
+      - "crates/enclava-cli/platform-release.json"
+      - "crates/enclava-common/**"
+      - "crates/enclava-engine/**"
   workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Optional additional image tag. Manual tags must start with manual-."
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-and-push:
-    name: Build and push Docker image
+  validate:
+    name: Validate API image
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: API image workflow tests
+        run: |
+          bash -n scripts/test-api-image-workflow.sh
+          scripts/test-api-image-workflow.sh
+
+      - name: API image reference verifier tests
+        run: |
+          bash -n scripts/verify-api-image-ref.sh
+          bash -n scripts/test-verify-api-image-ref.sh
+          scripts/test-verify-api-image-ref.sh
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./crates/enclava-api/Dockerfile
+          target: runtime-debug
+          push: false
+          provenance: false
+
+  publish:
+    name: Publish signed API image
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
       packages: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: API image workflow tests
+        run: |
+          bash -n scripts/test-api-image-workflow.sh
+          scripts/test-api-image-workflow.sh
+
+      - name: API image reference verifier tests
+        run: |
+          bash -n scripts/verify-api-image-ref.sh
+          bash -n scripts/test-verify-api-image-ref.sh
+          scripts/test-verify-api-image-ref.sh
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Validate manual image tag
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != ''
+        env:
+          VERSION_TAG: ${{ github.event.inputs.version_tag }}
+        run: |
+          if [[ ! "$VERSION_TAG" =~ ^manual-[a-z0-9][a-z0-9_.-]{0,119}$ ]]; then
+            echo "::error::Manual image tags must match ^manual-[a-z0-9][a-z0-9_.-]{0,119}$."
+            exit 1
+          fi
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -50,18 +119,21 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ghcr.io/enclava-labs/enclava-api
           tags: |
             type=ref,event=branch
             type=ref,event=tag
             type=sha,prefix=
+            type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
 
       - name: Select build profile
         id: build_profile
+        env:
+          RELEASE_BUILD: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          if [[ "$RELEASE_BUILD" = "true" ]]; then
             echo "profile=release" >> "$GITHUB_OUTPUT"
             echo "target=runtime-release" >> "$GITHUB_OUTPUT"
           else
@@ -71,12 +143,12 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: ./crates/enclava-api/Dockerfile
           target: ${{ steps.build_profile.outputs.target }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -86,20 +158,41 @@ jobs:
           provenance: true
 
       - name: Set up Kustomize
-        if: github.event_name != 'pull_request'
-        uses: imranismail/setup-kustomize@v2
+        uses: imranismail/setup-kustomize@2ba527d4d055ab63514ba50a99456fc35684947f # v2
 
-      - name: Render digest-pinned deploy manifest
-        if: github.event_name != 'pull_request'
+      - name: Render digest-pinned release artifact
         run: |
           mkdir -p dist
           image_ref="ghcr.io/enclava-labs/enclava-api@${{ steps.build.outputs.digest }}"
-          scripts/render-api-release-manifest.sh "${image_ref}" dist/enclava-api-deploy.yaml
-          printf '%s\n' "${image_ref}" > dist/enclava-api-image.txt
+          scripts/render-api-release-manifest.sh "$image_ref" dist/enclava-api-deploy.yaml
+          printf '%s\n' "$image_ref" > dist/enclava-api-image.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign pushed digest
+        env:
+          IMAGE: ghcr.io/enclava-labs/enclava-api
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+
+      - name: Verify main-branch signed digest
+        if: github.ref == 'refs/heads/main'
+        run: scripts/verify-api-image-ref.sh --cosign dist/enclava-api-image.txt
+
+      - name: Verify tag signed digest
+        if: github.ref_type == 'tag'
+        env:
+          IMAGE_REF: ghcr.io/enclava-labs/enclava-api@${{ steps.build.outputs.digest }}
+          SIGNER_SUBJECT: https://github.com/${{ github.workflow_ref }}
+        run: |
+          cosign verify \
+            --certificate-identity "$SIGNER_SUBJECT" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$IMAGE_REF" >/dev/null
 
       - name: Upload release manifest artifact
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: enclava-api-release-manifest
           path: |
