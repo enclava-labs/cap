@@ -468,8 +468,29 @@ pub async fn put_keyring(
         if body.version == latest_version {
             insert_new_version = false;
         }
-        if body.version > latest_version + 1 {
+        let next_version = latest_version
+            .checked_add(1)
+            .ok_or_else(|| bad_request("keyring version cannot be incremented"))?;
+        if body.version > next_version {
             return Err(bad_request("keyring version must increment by one"));
+        }
+        if body.version == next_version {
+            if latest_signing_pubkey != signing_pubkey {
+                return Err(bad_request(
+                    "keyring signing owner does not match the current pinned owner",
+                ));
+            }
+            let latest_signing_pubkey: [u8; 32] = latest_signing_pubkey
+                .as_slice()
+                .try_into()
+                .map_err(|_| db_error())?;
+            let latest_owner =
+                VerifyingKey::from_bytes(&latest_signing_pubkey).map_err(|_| db_error())?;
+            latest_owner
+                .verify(&canonical_bytes, &signature_obj)
+                .map_err(|_| {
+                    bad_request("keyring signature verification failed under current pinned owner")
+                })?;
         }
     } else if body.version != 1 {
         return Err(bad_request("first keyring version must be one"));
@@ -925,33 +946,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_distinct_v2_keyrings_have_one_immutable_winner() {
+    async fn keyring_rotation_preserves_pinned_owner_and_one_immutable_v2_winner() {
         let pool = database_test_pool().await;
         let org_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
+        let attacker_user_id = Uuid::new_v4();
         let suffix = org_id.simple().to_string();
         let org_name = format!("keyring-race-{suffix}");
         crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
             .await
             .expect("insert keyring race org");
-        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Owner')")
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .expect("insert keyring owner");
-        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
-            .bind(user_id)
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("insert owner membership");
+        sqlx::query(
+            "INSERT INTO users (id, display_name)
+             VALUES ($1, 'Keyring Owner'), ($2, 'Unpinned Owner')",
+        )
+        .bind(user_id)
+        .bind(attacker_user_id)
+        .execute(&pool)
+        .await
+        .expect("insert keyring owners");
+        sqlx::query(
+            "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $3, 'owner'), ($2, $3, 'owner')",
+        )
+        .bind(user_id)
+        .bind(attacker_user_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert owner memberships");
         let key = SigningKey::generate(&mut OsRng);
-        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
-            .bind(user_id)
-            .bind(key.verifying_key().to_bytes().to_vec())
-            .execute(&pool)
-            .await
-            .expect("insert owner signing key");
+        let attacker_key = SigningKey::generate(&mut OsRng);
+        sqlx::query(
+            "INSERT INTO user_signing_keys (user_id, pubkey)
+             VALUES ($1, $3), ($2, $4)",
+        )
+        .bind(user_id)
+        .bind(attacker_user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .bind(attacker_key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("insert owner signing keys");
 
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -971,6 +1007,49 @@ mod tests {
         )
         .await
         .expect("insert v1 keyring");
+
+        let attacker_auth = AuthContext {
+            user_id: attacker_user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let takeover = put_keyring(
+            attacker_auth,
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(
+                org_id,
+                attacker_user_id,
+                &attacker_key,
+                2,
+                2,
+            )),
+        )
+        .await
+        .expect_err("an unpinned CAP owner cannot self-authorize keyring v2");
+        assert_eq!(takeover.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            takeover.1.0["error"],
+            "keyring signing owner does not match the current pinned owner"
+        );
+        let post_takeover_counts: (i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put')",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows after rejected owner takeover");
+        assert_eq!(
+            post_takeover_counts,
+            (1, 1),
+            "rejected owner takeover must not mutate keyring or audit authority"
+        );
 
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
         let spawn_writer = |request: PutOrgKeyringRequest| {
@@ -1018,6 +1097,41 @@ mod tests {
         assert!(
             matches!(v2_payload["updated_at"].as_str(), Some(value) if value.ends_with("02Z") || value.ends_with("03Z"))
         );
+        let winning_second = if v2_payload["updated_at"]
+            .as_str()
+            .is_some_and(|value| value.ends_with("02Z"))
+        {
+            2
+        } else {
+            3
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(
+                org_id,
+                user_id,
+                &key,
+                2,
+                winning_second,
+            )),
+        )
+        .await
+        .expect("exact same-owner v2 replay is idempotent");
+        let latest_signing_pubkey: Vec<u8> = sqlx::query_scalar(
+            "SELECT usk.pubkey
+               FROM org_keyrings ok
+               JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
+              WHERE ok.org_id = $1
+              ORDER BY ok.version DESC
+              LIMIT 1",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load pinned v2 signing owner");
+        assert_eq!(latest_signing_pubkey, key.verifying_key().to_bytes());
         let audit_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM audit_log
              WHERE org_id = $1 AND action = 'org.keyring.put'",
@@ -1026,7 +1140,10 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("count mandatory keyring audit rows");
-        assert_eq!(audit_count, 2, "v1 and the single winning v2 are audited");
+        assert_eq!(
+            audit_count, 2,
+            "only v1 and the single winning same-owner v2 are audited"
+        );
 
         sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
             .bind(org_id)
@@ -1038,10 +1155,11 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete keyring race org");
-        sqlx::query("DELETE FROM users WHERE id = $1")
+        sqlx::query("DELETE FROM users WHERE id IN ($1, $2)")
             .bind(user_id)
+            .bind(attacker_user_id)
             .execute(&pool)
             .await
-            .expect("delete keyring race user");
+            .expect("delete keyring race users");
     }
 }
