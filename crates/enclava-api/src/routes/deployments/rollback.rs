@@ -137,12 +137,60 @@ pub async fn rollback(
     }
 
     let container_name = "web";
+    let authority_containers: Vec<crate::models::AppContainer> =
+        sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC")
+            .bind(app.id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+            })?;
+    let authority_resources: crate::models::AppResources =
+        sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+            .bind(app.id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+            })?;
+    let authority_snapshot = crate::deploy::ExistingAppAuthoritySnapshot::new(
+        app.updated_at,
+        authority_containers,
+        authority_resources,
+    );
     let mut tx = state.db.begin().await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "database error"})),
         )
     })?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    if !crate::deploy::lock_and_verify_existing_app_authority(&mut tx, app.id, &authority_snapshot)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+    {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "app deployment inputs changed while rollback was validating; retry the rollback",
+        ));
+    }
+    if super::app_has_incomplete_deployment_setup(&mut tx, app.id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+    {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "an earlier deployment is still completing setup; retry after setup is reconciled",
+        ));
+    }
     sqlx::query(
         "UPDATE app_containers
          SET image_ref = $1,
@@ -169,6 +217,9 @@ pub async fn rollback(
     })?;
 
     let deploy_id = Uuid::new_v4();
+    crate::deploy::supersede_incomplete_deployments(&mut tx, app.id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     sqlx::query(
         "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest, source_provider, source_repository)
          VALUES ($1, $2, $3, 'rollback', $4, $5, $6, $7)",
@@ -255,29 +306,20 @@ pub async fn rollback(
     tokio::spawn(async move {
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
-            Err(e) => {
-                let error_message = format!("deployment apply limiter closed: {e}");
-                let _ = crate::deploy::set_deployment_status(
-                    &db,
-                    deploy_id,
-                    "failed",
-                    None,
-                    Some(&error_message),
-                    true,
-                )
-                .await;
-                let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
+            Err(_) => {
+                let _ =
+                    crate::deploy::fail_deployment_if_active(&db, apply_app.id, deploy_id).await;
                 tracing::error!(
                     app_id = %apply_app.id,
                     deployment_id = %deploy_id,
-                    error = %error_message,
+                    error_code = crate::deploy::DEPLOYMENT_APPLY_FAILED_ERROR,
                     "failed to acquire rollback apply permit"
                 );
                 return;
             }
         };
 
-        if let Err(e) = crate::deploy::apply_deployment_manifests(
+        if crate::deploy::apply_deployment_manifests(
             crate::deploy::ApplyDeploymentManifestsRequest {
                 pool: db.clone(),
                 app: apply_app.clone(),
@@ -295,22 +337,13 @@ pub async fn rollback(
             },
         )
         .await
+        .is_err()
         {
-            let error_message = e.to_string();
-            let _ = crate::deploy::set_deployment_status(
-                &db,
-                deploy_id,
-                "failed",
-                None,
-                Some(&error_message),
-                true,
-            )
-            .await;
-            let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
+            let _ = crate::deploy::fail_deployment_if_active(&db, apply_app.id, deploy_id).await;
             tracing::error!(
                 app_id = %apply_app.id,
                 deployment_id = %deploy_id,
-                error = %error_message,
+                error_code = crate::deploy::DEPLOYMENT_APPLY_FAILED_ERROR,
                 "failed to apply rollback manifests"
             );
         }

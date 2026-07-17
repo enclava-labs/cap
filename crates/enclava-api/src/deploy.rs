@@ -20,7 +20,7 @@ use enclava_engine::types::{
 };
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::net::IpAddr;
 use uuid::Uuid;
 
@@ -401,6 +401,63 @@ impl DeploymentApplySnapshot {
     }
 }
 
+/// Authoritative database rows used while validating an existing app
+/// deployment. Acceptance locks and compares this snapshot before committing
+/// any candidate changes.
+#[derive(Debug, Clone)]
+pub(crate) struct ExistingAppAuthoritySnapshot {
+    app_updated_at: chrono::DateTime<chrono::Utc>,
+    containers: Vec<AppContainer>,
+    resources: AppResources,
+}
+
+impl ExistingAppAuthoritySnapshot {
+    pub(crate) fn new(
+        app_updated_at: chrono::DateTime<chrono::Utc>,
+        containers: Vec<AppContainer>,
+        resources: AppResources,
+    ) -> Self {
+        Self {
+            app_updated_at,
+            containers,
+            resources,
+        }
+    }
+}
+
+pub(crate) async fn lock_and_verify_existing_app_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    expected: &ExistingAppAuthoritySnapshot,
+) -> Result<bool, sqlx::Error> {
+    let current_updated_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT updated_at FROM apps WHERE id = $1 FOR UPDATE")
+            .bind(app_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if current_updated_at != Some(expected.app_updated_at) {
+        return Ok(false);
+    }
+
+    let current_containers: Vec<AppContainer> =
+        sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 ORDER BY id FOR UPDATE")
+            .bind(app_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    let mut expected_containers = expected.containers.clone();
+    expected_containers.sort_by_key(|container| container.id);
+    if current_containers != expected_containers {
+        return Ok(false);
+    }
+
+    let current_resources: Option<AppResources> =
+        sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1 FOR UPDATE")
+            .bind(app_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(current_resources.as_ref() == Some(&expected.resources))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
     #[error("database error: {0}")]
@@ -668,32 +725,172 @@ async fn latest_deployment_id_for_app(pool: &PgPool, app_id: Uuid) -> Result<Uui
     Ok(deployment_id.unwrap_or_else(Uuid::nil))
 }
 
-/// Record a deployment result in the database.
-pub async fn record_deployment_result(
-    pool: &PgPool,
-    deployment_id: Uuid,
-    status: &str,
-    manifest_hash: Option<&str>,
-    error_message: Option<&str>,
-    terminal: bool,
+pub(crate) const DEPLOYMENT_SUPERSEDED_ERROR: &str = "deployment_superseded";
+pub(crate) const DEPLOYMENT_APPLY_FAILED_ERROR: &str = "deployment_apply_failed";
+pub(crate) const DEPLOYMENT_ROLLOUT_FAILED_ERROR: &str = "deployment_rollout_failed";
+
+fn app_deployment_lane_key(app_id: Uuid) -> i64 {
+    let (high, low) = app_id.as_u64_pair();
+    (high ^ low) as i64
+}
+
+/// Serialize deployment acceptance, manifest application, and terminal result
+/// publication for one app across every API replica.
+///
+/// A 64-bit advisory key collision can only serialize unrelated apps; it
+/// cannot allow two operations for the same app to overlap.
+pub(crate) async fn lock_app_deployment_lane(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(app_deployment_lane_key(app_id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Mark accepted-but-incomplete deployments as superseded before inserting a
+/// newer deployment for the same app. The caller must hold the app deployment
+/// lane for the surrounding transaction.
+pub(crate) async fn supersede_incomplete_deployments(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE deployments
+         SET status = 'failed'::deploy_status_enum,
+             error_message = $1,
+             completed_at = clock_timestamp()
+         WHERE app_id = $2
+           AND status::text IN ('pending', 'applying', 'watching')",
+    )
+    .bind(DEPLOYMENT_SUPERSEDED_ERROR)
+    .bind(app_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+async fn deployment_is_active_for_apply(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM deployments
+             WHERE id = $1
+               AND app_id = $2
+               AND status::text IN ('pending', 'applying')
+         )",
+    )
+    .bind(deployment_id)
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// Publish a rollout observation only while it still belongs to the active
+/// watching deployment and exact manifest hash. A newer acceptance first
+/// supersedes the old row under the same app deployment lane, so a late old
+/// watcher becomes a no-op for both deployment and app status.
+pub(crate) struct DeploymentResultUpdate<'a> {
+    pub app_id: Uuid,
+    pub deployment_id: Uuid,
+    pub deploy_status: &'a str,
+    pub expected_manifest_hash: &'a str,
+    pub app_status: &'a str,
+    pub error_code: Option<&'a str>,
+    pub terminal: bool,
+}
+
+pub(crate) async fn record_deployment_result_if_current(
+    pool: &PgPool,
+    update: DeploymentResultUpdate<'_>,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_app_deployment_lane(&mut tx, update.app_id).await?;
+
+    let result = sqlx::query(
         "UPDATE deployments
          SET status = $1::deploy_status_enum,
-             manifest_hash = $2,
-             error_message = $3,
-             completed_at = CASE WHEN $4 THEN now() ELSE completed_at END
-         WHERE id = $5",
+             error_message = $2,
+             completed_at = CASE WHEN $3 THEN clock_timestamp() ELSE completed_at END
+         WHERE id = $4
+           AND app_id = $5
+           AND status = 'watching'::deploy_status_enum
+           AND manifest_hash = $6",
     )
-    .bind(status)
-    .bind(manifest_hash)
-    .bind(error_message)
-    .bind(terminal)
-    .bind(deployment_id)
-    .execute(pool)
+    .bind(update.deploy_status)
+    .bind(update.error_code)
+    .bind(update.terminal)
+    .bind(update.deployment_id)
+    .bind(update.app_id)
+    .bind(update.expected_manifest_hash)
+    .execute(&mut *tx)
     .await?;
 
-    Ok(())
+    let recorded = result.rows_affected() == 1;
+    if recorded {
+        sqlx::query(
+            "UPDATE apps
+             SET status = $1::app_status_enum,
+                 updated_at = clock_timestamp()
+             WHERE id = $2",
+        )
+        .bind(update.app_status)
+        .bind(update.app_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(recorded)
+}
+
+/// Fail an asynchronous deployment task only if the deployment has not
+/// already completed or been superseded. App status changes in the same
+/// serialized transaction, preventing an old task from failing a newer one.
+pub(crate) async fn fail_deployment_if_active(
+    pool: &PgPool,
+    app_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_app_deployment_lane(&mut tx, app_id).await?;
+
+    let result = sqlx::query(
+        "UPDATE deployments
+         SET status = 'failed'::deploy_status_enum,
+             error_message = $1,
+             completed_at = clock_timestamp()
+         WHERE id = $2
+           AND app_id = $3
+           AND status::text IN ('pending', 'applying', 'watching')",
+    )
+    .bind(DEPLOYMENT_APPLY_FAILED_ERROR)
+    .bind(deployment_id)
+    .bind(app_id)
+    .execute(&mut *tx)
+    .await?;
+
+    let recorded = result.rows_affected() == 1;
+    if recorded {
+        sqlx::query(
+            "UPDATE apps
+             SET status = 'failed'::app_status_enum,
+                 updated_at = clock_timestamp()
+             WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(recorded)
 }
 
 #[cfg(test)]
@@ -1454,6 +1651,18 @@ pub async fn apply_deployment_manifests(
         log_encryption,
     } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
+    let mut apply_lane = pool.begin().await?;
+    lock_app_deployment_lane(&mut apply_lane, app.id).await?;
+    if !deployment_is_active_for_apply(&mut apply_lane, app.id, deployment_id).await? {
+        apply_lane.commit().await?;
+        tracing::info!(
+            app_id = %app.id,
+            deployment_id = %deployment_id,
+            "skipping manifest apply for completed or superseded deployment"
+        );
+        return Ok(());
+    }
+
     let mut app_spec = build_confidential_app_from_rows(
         &app,
         deployment_id,
@@ -1558,6 +1767,7 @@ pub async fn apply_deployment_manifests(
     }
     crate::edge::ensure_haproxy_routes(&pool, &edge_config, &routes).await?;
     set_deployment_status(&pool, deployment_id, "watching", Some(&hash), None, false).await?;
+    apply_lane.commit().await?;
 
     tokio::spawn(async move {
         let previous_app_status = app.status;
@@ -1566,22 +1776,38 @@ pub async fn apply_deployment_manifests(
             .await
             .map_err(|e| e.to_string());
         let outcome = classify_rollout_result(result, previous_app_status, unlock_mode);
+        let rollout_error_code = outcome
+            .error_message
+            .as_ref()
+            .map(|_| DEPLOYMENT_ROLLOUT_FAILED_ERROR);
 
-        if let Err(e) = record_deployment_result(
+        match record_deployment_result_if_current(
             &pool,
-            deployment_id,
-            outcome.deploy_status,
-            Some(&hash),
-            outcome.error_message.as_deref(),
-            outcome.terminal,
+            DeploymentResultUpdate {
+                app_id: app.id,
+                deployment_id,
+                deploy_status: outcome.deploy_status,
+                expected_manifest_hash: &hash,
+                app_status: outcome.app_status,
+                error_code: rollout_error_code,
+                terminal: outcome.terminal,
+            },
         )
         .await
         {
-            tracing::error!(deployment_id = %deployment_id, error = %e, "failed to record deployment result");
-        }
-
-        if let Err(e) = set_app_status(&pool, app.id, outcome.app_status).await {
-            tracing::error!(app_id = %app.id, error = %e, "failed to update app status");
+            Ok(true) => {}
+            Ok(false) => tracing::info!(
+                app_id = %app.id,
+                deployment_id = %deployment_id,
+                manifest_hash = %hash,
+                "discarded stale rollout result"
+            ),
+            Err(_) => tracing::error!(
+                app_id = %app.id,
+                deployment_id = %deployment_id,
+                error_code = "deployment_result_persistence_failed",
+                "failed to record deployment result"
+            ),
         }
     });
 
