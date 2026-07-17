@@ -8,6 +8,9 @@ use chrono::{Duration, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use enclava_api::{
     auth::jwt::issue_session_token,
+    deploy::DeploymentApplySnapshot,
+    deployment_jobs::{DeploymentApplyJobPayload, insert_setup_job},
+    models::{App, AppContainer, AppResources},
     signing_service::{AgentPolicyResponse, PolicyMetadata, SignedPolicyArtifact},
     state::{AppState, CapManagementMode, InternalAuthConfig},
     test_router,
@@ -2139,6 +2142,46 @@ async fn generic_deployment_external_id_is_idempotent_and_conflict_checked() {
     .await
     .expect("insert idempotency app");
 
+    let accepted_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load idempotency app snapshot");
+    let payload = DeploymentApplyJobPayload::new(
+        accepted_app,
+        DeploymentApplySnapshot::new(
+            vec![AppContainer {
+                id: Uuid::new_v4(),
+                app_id,
+                name: "app".to_string(),
+                image_ref: image.to_string(),
+                image_digest: Some(
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+                port: None,
+                command: None,
+                storage_paths: None,
+                workload_security_profile: Some("restricted".to_string()),
+                is_primary: true,
+            }],
+            AppResources {
+                app_id,
+                cpu_limit: "1".to_string(),
+                memory_limit: "1Gi".to_string(),
+                app_data_size: "5Gi".to_string(),
+                tls_data_size: "2Gi".to_string(),
+            },
+        ),
+        None,
+        "integration-test-api-pubkey".to_string(),
+        "https://api.example.test".to_string(),
+        None,
+        None,
+        None,
+        false,
+    );
+    let mut deployment_tx = pool.begin().await.expect("begin idempotency deployment");
     sqlx::query(
         "INSERT INTO deployments (
             id, org_id, app_id, trigger, status, spec_snapshot, image_digest,
@@ -2165,9 +2208,22 @@ async fn generic_deployment_external_id_is_idempotent_and_conflict_checked() {
     .bind(&external_id)
     .bind("github")
     .bind("acme/confidential-app")
-    .execute(&pool)
+    .execute(&mut *deployment_tx)
     .await
     .expect("insert idempotency deployment");
+    insert_setup_job(
+        &mut deployment_tx,
+        deployment_id,
+        deployment_id,
+        &payload,
+        false,
+    )
+    .await
+    .expect("insert idempotency deployment durable job");
+    deployment_tx
+        .commit()
+        .await
+        .expect("commit idempotency deployment and durable job");
 
     let retry = server
         .post("/deployments")
@@ -2214,6 +2270,10 @@ async fn generic_deployment_external_id_is_idempotent_and_conflict_checked() {
         Some("external_id already exists with different app.name")
     );
 
+    let mut incomplete_tx = pool
+        .begin()
+        .await
+        .expect("begin incomplete setup transition");
     sqlx::query(
         "UPDATE deployments
             SET status = 'failed'::deploy_status_enum,
@@ -2222,9 +2282,22 @@ async fn generic_deployment_external_id_is_idempotent_and_conflict_checked() {
           WHERE id = $1",
     )
     .bind(deployment_id)
-    .execute(&pool)
+    .execute(&mut *incomplete_tx)
     .await
     .expect("mark deployment setup incomplete");
+    sqlx::query(
+        "UPDATE deployment_apply_jobs
+            SET state = 'failed', next_attempt_at = clock_timestamp()
+          WHERE deployment_id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&mut *incomplete_tx)
+    .await
+    .expect("terminalize incomplete setup job");
+    incomplete_tx
+        .commit()
+        .await
+        .expect("commit incomplete setup transition");
 
     let incomplete_retry = server
         .post("/deployments")

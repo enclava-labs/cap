@@ -589,11 +589,11 @@ async fn deploy_app_candidate(
             ));
         }
     }
-    if customer_signed_deploy_required(
+    let signed_required = customer_signed_deploy_required(
         state.attestation.as_ref(),
         state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
-    ) && signing_artifacts.is_none()
-    {
+    );
+    if signed_required && signing_artifacts.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -1132,9 +1132,15 @@ async fn deploy_app_candidate(
         .map_err(signing_error_response)?;
     }
 
-    let setup_job = crate::deployment_jobs::insert_setup_job(&mut tx, deploy_id, &apply_payload)
-        .await
-        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let setup_job = crate::deployment_jobs::insert_setup_job(
+        &mut tx,
+        deploy_id,
+        deploy_id,
+        &apply_payload,
+        signed_required,
+    )
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
     // Audit the image signer and, when present, the signed descriptor hash
     // persisted for workload-attested artifact fetches.
