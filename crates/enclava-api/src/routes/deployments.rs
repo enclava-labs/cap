@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::{middleware::AuthContext, scopes};
+use crate::deployment_jobs::{
+    DEPLOYMENT_SETUP_CLEANUP_PENDING, DEPLOYMENT_SETUP_DNS_PENDING, DEPLOYMENT_SETUP_STATE,
+    DeploymentApplyJobPayload,
+};
 use crate::models::{App, AppContainer, AppResources, Deployment};
 use crate::source_provider::{SourceProvider, validate_source_context};
 use crate::state::AppState;
@@ -504,11 +508,6 @@ enum AppMutation {
     Insert,
 }
 
-const DEPLOYMENT_SETUP_STATE: &str = "setup_state";
-const DEPLOYMENT_SETUP_DNS_PENDING: &str = "dns_pending";
-const DEPLOYMENT_SETUP_CLEANUP_PENDING: &str = "cleanup_pending";
-const DEPLOYMENT_SETUP_FAILED_MESSAGE: &str = "deployment_setup_failed";
-
 fn deployment_setup_incomplete(deployment: &Deployment) -> bool {
     matches!(
         deployment
@@ -556,146 +555,6 @@ async fn insert_transaction_audit(
     .execute(&mut **tx)
     .await?;
     Ok(())
-}
-
-async fn mark_deployment_setup_accepted(
-    pool: &sqlx::PgPool,
-    deployment_id: Uuid,
-) -> Result<(), sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE deployments
-            SET spec_snapshot = jsonb_set(spec_snapshot, '{setup_state}', '\"accepted\"'::jsonb, true)
-          WHERE id = $1",
-    )
-    .bind(deployment_id)
-    .execute(pool)
-    .await?;
-    if result.rows_affected() != 1 {
-        return Err(sqlx::Error::RowNotFound);
-    }
-    Ok(())
-}
-
-async fn mark_deployment_setup_failed(
-    pool: &sqlx::PgPool,
-    app_id: Uuid,
-    deployment_id: Uuid,
-    mark_app_failed: bool,
-) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    let result = sqlx::query(
-        "UPDATE deployments
-            SET status = 'failed'::deploy_status_enum,
-                spec_snapshot = jsonb_set(spec_snapshot, '{setup_state}', '\"cleanup_pending\"'::jsonb, true),
-                error_message = $1,
-                completed_at = now()
-          WHERE id = $2",
-    )
-    .bind(DEPLOYMENT_SETUP_FAILED_MESSAGE)
-    .bind(deployment_id)
-    .execute(&mut *tx)
-    .await?;
-    if result.rows_affected() != 1 {
-        return Err(sqlx::Error::RowNotFound);
-    }
-    if mark_app_failed {
-        sqlx::query(
-            "UPDATE apps
-                SET status = 'failed'::app_status_enum,
-                    updated_at = now()
-              WHERE id = $1",
-        )
-        .bind(app_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await
-}
-
-async fn compensate_deployment_setup_failure(
-    pool: &sqlx::PgPool,
-    http_client: &reqwest::Client,
-    dns: Option<&crate::dns::DnsConfig>,
-    app: &App,
-    deployment_id: Uuid,
-    app_mutation: AppMutation,
-) {
-    if let Err(error) = mark_deployment_setup_failed(
-        pool,
-        app.id,
-        deployment_id,
-        app_mutation == AppMutation::Insert,
-    )
-    .await
-    {
-        // The original dns_pending marker still makes idempotent retries fail
-        // closed even if this status update cannot be persisted.
-        tracing::error!(
-            app_id = %app.id,
-            deployment_id = %deployment_id,
-            error = %error,
-            "failed to persist deployment setup failure"
-        );
-    }
-
-    if app_mutation != AppMutation::Insert {
-        return;
-    }
-
-    // Keep the app and its DNS tracking rows when external cleanup fails. The
-    // durable cleanup_pending deployment can then be reconciled without losing
-    // the Cloudflare record handles.
-    if let Err(error) =
-        crate::dns::delete_all_dns_records_for_app(pool, http_client, dns, app.id).await
-    {
-        tracing::error!(
-            app_id = %app.id,
-            deployment_id = %deployment_id,
-            error = %error,
-            "failed to clean up DNS after deployment setup failure"
-        );
-        return;
-    }
-
-    let dns_records_remain = match sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM dns_records WHERE app_id = $1)",
-    )
-    .bind(app.id)
-    .fetch_one(pool)
-    .await
-    {
-        Ok(remaining) => remaining,
-        Err(error) => {
-            tracing::error!(
-                app_id = %app.id,
-                deployment_id = %deployment_id,
-                error = %error,
-                "failed to verify DNS cleanup after deployment setup failure"
-            );
-            return;
-        }
-    };
-    if dns_records_remain {
-        tracing::error!(
-            app_id = %app.id,
-            deployment_id = %deployment_id,
-            "DNS cleanup left tracked records; retaining app for reconciliation"
-        );
-        return;
-    }
-
-    if let Err(error) = sqlx::query("DELETE FROM apps WHERE id = $1")
-        .bind(app.id)
-        .execute(pool)
-        .await
-    {
-        tracing::error!(
-            app_id = %app.id,
-            deployment_id = %deployment_id,
-            error = %error,
-            "failed to compensate first generic deployment after setup failure"
-        );
-    }
 }
 
 /// POST /apps/{name}/deploy -- deploy or update an app.
@@ -967,7 +826,6 @@ async fn deploy_app_candidate(
         .as_ref()
         .map(|artifacts| artifacts.descriptor.deploy_id)
         .unwrap_or_else(Uuid::new_v4);
-    let mut workload_artifact_binding = None;
     let mut signed_policy_artifact = None;
     if let Some(artifacts) = signing_artifacts.as_ref() {
         let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
@@ -1040,7 +898,6 @@ async fn deploy_app_candidate(
         artifacts
             .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
             .map_err(signing_error_response)?;
-        workload_artifact_binding = Some(binding);
         signed_policy_artifact = Some(signed);
     }
 
@@ -1104,16 +961,22 @@ async fn deploy_app_candidate(
     });
 
     let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
-    let local_verification_artifacts =
-        match (signing_artifacts.as_ref(), signed_policy_artifact.as_ref()) {
-            (Some(artifacts), Some(signed)) => Some((
-                crate::signing_service::workload_artifacts_json(artifacts, signed)
-                    .map_err(signing_error_response)?,
-                crate::signing_service::trustee_policy_json(signed)
-                    .map_err(signing_error_response)?,
-            )),
-            _ => None,
-        };
+    let apply_payload = DeploymentApplyJobPayload::new(
+        app.clone(),
+        crate::deploy::DeploymentApplySnapshot::new(
+            candidate_containers.clone(),
+            app_resources.clone(),
+        ),
+        state.attestation.clone(),
+        api_signing_pubkey,
+        state.api_url.clone(),
+        signing_artifacts.as_ref().map(|_| deploy_id),
+        signing_artifacts
+            .as_ref()
+            .map(|artifacts| artifacts.descriptor_core_hash),
+        log_encryption,
+        app_mutation == AppMutation::Insert,
+    );
 
     // No requested app/container state has been persisted before this point.
     // Commit every accepted deployment row and its app/container changes as a
@@ -1366,6 +1229,10 @@ async fn deploy_app_candidate(
         .map_err(signing_error_response)?;
     }
 
+    let setup_job = crate::deployment_jobs::insert_setup_job(&mut tx, deploy_id, &apply_payload)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+
     // Audit the image signer and, when present, the signed descriptor hash
     // persisted for workload-attested artifact fetches.
     insert_transaction_audit(
@@ -1392,112 +1259,24 @@ async fn deploy_app_candidate(
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
-    let setup_result = async {
-        let tee_domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
-        crate::dns::ensure_dns_pair(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            app.id,
-            &app.domain,
-            tee_domain,
-        )
-        .await?;
-        if let Some(custom_domain) = app.custom_domain.as_ref() {
-            crate::dns::record_custom_domain(&state.db, app.id, custom_domain).await?;
+    match crate::deployment_jobs::process_setup_job(&state, setup_job).await {
+        Ok(()) => {}
+        Err(crate::deployment_jobs::DeploymentJobError::Dns(error)) => {
+            return Err(dns_error_response(error));
         }
-        Ok::<(), crate::dns::DnsError>(())
-    }
-    .await;
-    if let Err(error) = setup_result {
-        compensate_deployment_setup_failure(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            &app,
-            deploy_id,
-            app_mutation,
-        )
-        .await;
-        return Err(dns_error_response(error));
-    }
-    if let Err(error) = mark_deployment_setup_accepted(&state.db, deploy_id).await {
-        tracing::error!(
-            app_id = %app.id,
-            deployment_id = %deploy_id,
-            error = %error,
-            "failed to persist completed deployment setup"
-        );
-        compensate_deployment_setup_failure(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            &app,
-            deploy_id,
-            app_mutation,
-        )
-        .await;
-        return Err(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "database error",
-        ));
-    }
-
-    let db = state.db.clone();
-    let attestation = state.attestation.clone();
-    let kbs_policy = state.kbs_policy.clone();
-    let api_url = state.api_url.clone();
-    let apply_app = app.clone();
-    let apply_snapshot =
-        crate::deploy::DeploymentApplySnapshot::new(candidate_containers, candidate_resources);
-    let apply_permits = state.deployment_apply_permits.clone();
-    let (local_workload_artifacts_json, local_trustee_policy_json) =
-        local_verification_artifacts.unzip();
-    tokio::spawn(async move {
-        let _apply_permit = match apply_permits.acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                let _ =
-                    crate::deploy::fail_deployment_if_active(&db, apply_app.id, deploy_id).await;
-                tracing::error!(
-                    app_id = %apply_app.id,
-                    deployment_id = %deploy_id,
-                    error_code = crate::deploy::DEPLOYMENT_APPLY_FAILED_ERROR,
-                    "failed to acquire deployment apply permit"
-                );
-                return;
-            }
-        };
-
-        if crate::deploy::apply_deployment_manifests(
-            crate::deploy::ApplyDeploymentManifestsRequest {
-                pool: db.clone(),
-                app: apply_app.clone(),
-                snapshot: apply_snapshot,
-                deployment_id: deploy_id,
-                attestation_config: attestation,
-                kbs_policy_config: kbs_policy,
-                api_signing_pubkey,
-                api_url,
-                workload_artifact_binding,
-                signed_policy_artifact,
-                local_workload_artifacts_json,
-                local_trustee_policy_json,
-                log_encryption,
-            },
-        )
-        .await
-        .is_err()
-        {
-            let _ = crate::deploy::fail_deployment_if_active(&db, apply_app.id, deploy_id).await;
+        Err(error) => {
             tracing::error!(
-                app_id = %apply_app.id,
+                app_id = %app.id,
                 deployment_id = %deploy_id,
-                error_code = crate::deploy::DEPLOYMENT_APPLY_FAILED_ERROR,
-                "failed to apply deployment manifests"
+                error_code = error.code(),
+                "durable deployment setup did not complete"
             );
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "database error",
+            ));
         }
-    });
+    }
 
     let deployment: Deployment = sqlx::query_as("SELECT * FROM deployments WHERE id = $1")
         .bind(deploy_id)
@@ -2093,94 +1872,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_app_delete_leaves_durable_cleanup_pending_deployment() {
+    async fn malformed_rollback_artifact_fails_before_container_or_deployment_commit() {
         let pool = database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
-        let deployment_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        let original_image = format!("ghcr.io/acme/original@sha256:{}", "aa".repeat(32));
+        sqlx::query("INSERT INTO app_resources (app_id) VALUES ($1)")
+            .bind(app.id)
+            .execute(&pool)
+            .await
+            .expect("insert rollback test resources");
+        sqlx::query(
+            "INSERT INTO app_containers (
+                id, app_id, name, image_ref, image_digest,
+                workload_security_profile, is_primary
+             )
+             VALUES ($1, $2, 'web', $3, $4, 'restricted', true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app.id)
+        .bind(&original_image)
+        .bind(format!("sha256:{}", "aa".repeat(32)))
+        .execute(&pool)
+        .await
+        .expect("insert rollback test container");
         sqlx::query(
             "INSERT INTO deployments (
-                id, org_id, app_id, trigger, spec_snapshot, external_id
+                id, org_id, app_id, trigger, status, spec_snapshot, image_digest
              )
-             VALUES ($1, $2, $3, 'api', $4, $5)",
+             VALUES ($1, $2, $3, 'api', 'healthy', $4, $5)",
         )
-        .bind(deployment_id)
+        .bind(target_id)
         .bind(app.org_id)
         .bind(app.id)
         .bind(serde_json::json!({
-            "setup_state": DEPLOYMENT_SETUP_DNS_PENDING,
-            "image": "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "image": &original_image,
+            "setup_state": crate::deployment_jobs::DEPLOYMENT_SETUP_ACCEPTED,
         }))
-        .bind(format!("external-{deployment_id}"))
+        .bind(format!("sha256:{}", "aa".repeat(32)))
         .execute(&pool)
         .await
-        .expect("insert pending setup deployment");
-
-        let suffix = app.id.simple().to_string();
-        let function_name = format!("cap_test_block_app_delete_{suffix}");
-        let trigger_name = format!("cap_test_block_app_delete_trigger_{suffix}");
-        sqlx::query(&format!(
-            "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
-             BEGIN
-               IF OLD.id = '{}'::uuid THEN
-                 RAISE EXCEPTION 'forced app cleanup failure';
-               END IF;
-               RETURN OLD;
-             END
-             $$",
-            app.id
-        ))
-        .execute(&pool)
-        .await
-        .expect("create app delete failure function");
-        sqlx::query(&format!(
-            "CREATE TRIGGER {trigger_name}
-             BEFORE DELETE ON apps
-             FOR EACH ROW EXECUTE FUNCTION {function_name}()"
-        ))
-        .execute(&pool)
-        .await
-        .expect("create app delete failure trigger");
-
-        compensate_deployment_setup_failure(
-            &pool,
-            &reqwest::Client::new(),
-            None,
-            &app,
-            deployment_id,
-            AppMutation::Insert,
+        .expect("insert healthy rollback target");
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                descriptor_signature, descriptor_signing_key_id,
+                org_keyring_payload, org_keyring_signature, signed_policy_artifact
+             )
+             VALUES ($1, $2, $3, '{}'::jsonb, $4, 'malformed', '{}'::jsonb, $5, '{}'::jsonb)",
         )
-        .await;
+        .bind(app.id.as_bytes().repeat(2))
+        .bind(app.id)
+        .bind(target_id)
+        .bind(vec![0u8; 64])
+        .bind(vec![0u8; 64])
+        .execute(&pool)
+        .await
+        .expect("insert malformed rollback artifact");
 
-        let persisted: Deployment = sqlx::query_as("SELECT * FROM deployments WHERE id = $1")
-            .bind(deployment_id)
-            .fetch_one(&pool)
-            .await
-            .expect("cleanup-pending deployment remains");
-        assert_eq!(persisted.status, crate::models::DeployStatus::Failed);
-        assert_eq!(
-            persisted.spec_snapshot[DEPLOYMENT_SETUP_STATE],
-            DEPLOYMENT_SETUP_CLEANUP_PENDING
-        );
-        assert!(deployment_setup_incomplete(&persisted));
-        assert_eq!(
-            persisted.error_message.as_deref(),
-            Some(DEPLOYMENT_SETUP_FAILED_MESSAGE)
-        );
-        let app_status: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
-            .bind(app.id)
-            .fetch_one(&pool)
-            .await
-            .expect("failed app remains for cleanup");
-        assert_eq!(app_status, "failed");
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.attestation = None;
+        state.require_customer_signed_policy_artifact = false;
+        let auth = crate::auth::middleware::AuthContext {
+            user_id: Uuid::new_v4(),
+            org_id: app.org_id,
+            org_name: "rollback-test".to_string(),
+            role: crate::models::Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let error = rollback(
+            auth,
+            State(state),
+            Path(app.name.clone()),
+            Json(RollbackRequest {
+                deployment_id: Some(target_id),
+            }),
+        )
+        .await
+        .expect_err("malformed rollback artifact rejected");
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
 
-        sqlx::query(&format!("DROP TRIGGER {trigger_name} ON apps"))
-            .execute(&pool)
-            .await
-            .expect("drop app delete failure trigger");
-        sqlx::query(&format!("DROP FUNCTION {function_name}()"))
-            .execute(&pool)
-            .await
-            .expect("drop app delete failure function");
+        let persisted_image: String = sqlx::query_scalar(
+            "SELECT image_ref FROM app_containers WHERE app_id = $1 AND name = 'web'",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load unchanged rollback container");
+        assert_eq!(persisted_image, original_image);
+        let deployment_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deployments WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count rollback deployments");
+        assert_eq!(deployment_count, 1);
+        let job_count: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+               FROM deployment_apply_jobs j
+               JOIN deployments d ON d.id = j.deployment_id
+              WHERE d.app_id = $1",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rollback apply jobs");
+        assert_eq!(job_count, 0);
+
         delete_setup_test_org(&pool, app.org_id).await;
     }
 

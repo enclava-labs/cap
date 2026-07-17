@@ -985,16 +985,7 @@ where
              descriptor_signature, descriptor_signing_key_id, org_keyring_payload,
              org_keyring_signature, signed_policy_artifact
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (descriptor_core_hash) DO UPDATE SET
-             app_id = EXCLUDED.app_id,
-             deploy_id = EXCLUDED.deploy_id,
-             descriptor_payload = EXCLUDED.descriptor_payload,
-             descriptor_signature = EXCLUDED.descriptor_signature,
-             descriptor_signing_key_id = EXCLUDED.descriptor_signing_key_id,
-             org_keyring_payload = EXCLUDED.org_keyring_payload,
-             org_keyring_signature = EXCLUDED.org_keyring_signature,
-             signed_policy_artifact = EXCLUDED.signed_policy_artifact",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(artifacts.descriptor_core_hash.to_vec())
     .bind(app_id)
@@ -1040,6 +1031,138 @@ struct StoredWorkloadArtifactsJsonRow {
     org_keyring_payload: serde_json::Value,
     org_keyring_signature: Vec<u8>,
     signed_policy_artifact: serde_json::Value,
+}
+
+#[derive(Debug)]
+pub struct LoadedWorkloadArtifacts {
+    pub descriptor_core_hash: [u8; 32],
+    pub descriptor: DeploymentDescriptor,
+    pub binding: WorkloadArtifactBinding,
+    pub signed_policy_artifact: SignedPolicyArtifact,
+    pub workload_artifacts_json: String,
+    pub trustee_policy_json: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct LoadedWorkloadArtifactsRow {
+    descriptor_core_hash: Vec<u8>,
+    descriptor_payload: serde_json::Value,
+    descriptor_signature: Vec<u8>,
+    descriptor_signing_key_id: String,
+    org_keyring_payload: serde_json::Value,
+    org_keyring_signature: Vec<u8>,
+    signed_policy_artifact: serde_json::Value,
+}
+
+fn decode_loaded_workload_artifacts(
+    row: LoadedWorkloadArtifactsRow,
+    app_id: Uuid,
+    deploy_id: Uuid,
+) -> Result<LoadedWorkloadArtifacts, SigningServiceError> {
+    let stored_descriptor_core_hash: [u8; 32] =
+        row.descriptor_core_hash
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                SigningServiceError::Blob(format!(
+                    "descriptor_core_hash must be 32 bytes, got {}",
+                    bytes.len()
+                ))
+            })?;
+    let descriptor: DeploymentDescriptor = serde_json::from_value(row.descriptor_payload.clone())?;
+    if descriptor.app_id != app_id {
+        return Err(SigningServiceError::Mismatch(
+            "stored descriptor app_id".into(),
+        ));
+    }
+    if descriptor.deploy_id != deploy_id {
+        return Err(SigningServiceError::Mismatch(
+            "stored descriptor deploy_id".into(),
+        ));
+    }
+    if descriptor_core_hash(&descriptor) != stored_descriptor_core_hash {
+        return Err(SigningServiceError::Mismatch(
+            "stored descriptor_core_hash".into(),
+        ));
+    }
+
+    let org_keyring: OrgKeyring = serde_json::from_value(row.org_keyring_payload.clone())?;
+    let signed_policy_artifact: SignedPolicyArtifact =
+        serde_json::from_value(row.signed_policy_artifact.clone())?;
+    let descriptor_signing_pubkey = decode_hex32(
+        "artifact.metadata.descriptor_signing_pubkey",
+        &signed_policy_artifact.metadata.descriptor_signing_pubkey,
+    )?;
+    let artifacts_json = serde_json::json!({
+        "descriptor_payload": row.descriptor_payload,
+        "descriptor_signature": hex::encode(row.descriptor_signature),
+        "descriptor_signing_key_id": row.descriptor_signing_key_id,
+        "org_keyring_payload": row.org_keyring_payload,
+        "org_keyring_signature": hex::encode(row.org_keyring_signature),
+        "signed_policy_artifact": row.signed_policy_artifact,
+    });
+
+    Ok(LoadedWorkloadArtifacts {
+        descriptor_core_hash: stored_descriptor_core_hash,
+        descriptor,
+        binding: WorkloadArtifactBinding {
+            descriptor_core_hash: stored_descriptor_core_hash,
+            descriptor_signing_pubkey,
+            org_keyring_fingerprint: keyring_fingerprint(&org_keyring),
+        },
+        trustee_policy_json: serde_json::to_string(&signed_policy_artifact)?,
+        workload_artifacts_json: serde_json::to_string(&artifacts_json)?,
+        signed_policy_artifact,
+    })
+}
+
+/// Load the single authoritative artifact row for a deployment. The unique
+/// `(app_id, deploy_id)` constraint makes absence or malformed content
+/// unambiguous during rollback preparation.
+pub async fn load_workload_artifacts_for_deployment(
+    pool: &PgPool,
+    app_id: Uuid,
+    deploy_id: Uuid,
+) -> Result<Option<LoadedWorkloadArtifacts>, SigningServiceError> {
+    let row = sqlx::query_as::<_, LoadedWorkloadArtifactsRow>(
+        "SELECT descriptor_core_hash, descriptor_payload, descriptor_signature,
+                descriptor_signing_key_id, org_keyring_payload,
+                org_keyring_signature, signed_policy_artifact
+           FROM workload_artifacts
+          WHERE app_id = $1 AND deploy_id = $2",
+    )
+    .bind(app_id)
+    .bind(deploy_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| decode_loaded_workload_artifacts(row, app_id, deploy_id))
+        .transpose()
+}
+
+/// Reload an accepted job's exact immutable artifact row. All three identity
+/// components are required so neither a colliding core hash nor a repointed
+/// app/deployment binding can be mixed into the apply payload.
+pub async fn load_workload_artifacts_exact(
+    pool: &PgPool,
+    app_id: Uuid,
+    deploy_id: Uuid,
+    expected_descriptor_core_hash: [u8; 32],
+) -> Result<Option<LoadedWorkloadArtifacts>, SigningServiceError> {
+    let row = sqlx::query_as::<_, LoadedWorkloadArtifactsRow>(
+        "SELECT descriptor_core_hash, descriptor_payload, descriptor_signature,
+                descriptor_signing_key_id, org_keyring_payload,
+                org_keyring_signature, signed_policy_artifact
+           FROM workload_artifacts
+          WHERE descriptor_core_hash = $1
+            AND app_id = $2
+            AND deploy_id = $3",
+    )
+    .bind(expected_descriptor_core_hash.to_vec())
+    .bind(app_id)
+    .bind(deploy_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| decode_loaded_workload_artifacts(row, app_id, deploy_id))
+        .transpose()
 }
 
 pub async fn load_workload_artifacts_json(

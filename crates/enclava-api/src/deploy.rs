@@ -386,7 +386,7 @@ pub struct ApplyDeploymentManifestsRequest {
 /// The API can accept another deployment while this one waits for the apply
 /// semaphore. Keeping these rows on the queued request prevents a later
 /// deployment from changing the manifest rendered for this deployment ID.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DeploymentApplySnapshot {
     pub containers: Vec<AppContainer>,
     pub resources: AppResources,
@@ -1630,11 +1630,51 @@ async fn restart_statefulset_for_ingress(
     Ok(())
 }
 
-/// Apply manifests before returning the deploy response, then continue rollout
-/// monitoring in the background so CLI/API calls are not held for TEE boot.
+/// A rollout handle returned after Kubernetes accepted the rendered manifests.
+///
+/// Callers must await [`DeploymentRollout::watch`]. Durable deployment workers
+/// keep their database lease alive while doing so, allowing a replacement API
+/// process to re-apply and resume observation after a crash.
+pub struct DeploymentRollout {
+    app: App,
+    engine: ApplyEngine,
+    app_spec: ConfidentialApp,
+    manifest_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentRolloutOutcome {
+    pub deploy_status: &'static str,
+    pub app_status: &'static str,
+    pub error_code: Option<&'static str>,
+    pub terminal: bool,
+    pub manifest_hash: String,
+}
+
+impl DeploymentRollout {
+    /// Observe Kubernetes only. The durable job owner publishes this bounded
+    /// outcome after atomically revalidating its database lease.
+    pub async fn watch(self) -> DeploymentRolloutOutcome {
+        let previous_app_status = self.app.status;
+        let unlock_mode = self.app.unlock_mode;
+        let result = watch_rollout(&self.engine, &self.app_spec.namespace, &self.app_spec.name)
+            .await
+            .map_err(|error| error.to_string());
+        let outcome = classify_rollout_result(result, previous_app_status, unlock_mode);
+        DeploymentRolloutOutcome {
+            deploy_status: outcome.deploy_status,
+            app_status: outcome.app_status,
+            error_code: (outcome.deploy_status == "failed").then_some("deployment_rollout_failed"),
+            terminal: outcome.terminal,
+            manifest_hash: self.manifest_hash,
+        }
+    }
+}
+
+/// Apply manifests and return durable rollout-observation context.
 pub async fn apply_deployment_manifests(
     request: ApplyDeploymentManifestsRequest,
-) -> Result<(), DeployError> {
+) -> Result<DeploymentRollout, DeployError> {
     let ApplyDeploymentManifestsRequest {
         pool,
         app,
@@ -1769,47 +1809,10 @@ pub async fn apply_deployment_manifests(
     set_deployment_status(&pool, deployment_id, "watching", Some(&hash), None, false).await?;
     apply_lane.commit().await?;
 
-    tokio::spawn(async move {
-        let previous_app_status = app.status;
-        let unlock_mode = app.unlock_mode;
-        let result = watch_rollout(&engine, &app_spec.namespace, &app_spec.name)
-            .await
-            .map_err(|e| e.to_string());
-        let outcome = classify_rollout_result(result, previous_app_status, unlock_mode);
-        let rollout_error_code = outcome
-            .error_message
-            .as_ref()
-            .map(|_| DEPLOYMENT_ROLLOUT_FAILED_ERROR);
-
-        match record_deployment_result_if_current(
-            &pool,
-            DeploymentResultUpdate {
-                app_id: app.id,
-                deployment_id,
-                deploy_status: outcome.deploy_status,
-                expected_manifest_hash: &hash,
-                app_status: outcome.app_status,
-                error_code: rollout_error_code,
-                terminal: outcome.terminal,
-            },
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => tracing::info!(
-                app_id = %app.id,
-                deployment_id = %deployment_id,
-                manifest_hash = %hash,
-                "discarded stale rollout result"
-            ),
-            Err(_) => tracing::error!(
-                app_id = %app.id,
-                deployment_id = %deployment_id,
-                error_code = "deployment_result_persistence_failed",
-                "failed to record deployment result"
-            ),
-        }
-    });
-
-    Ok(())
+    Ok(DeploymentRollout {
+        app,
+        engine,
+        app_spec,
+        manifest_hash: hash,
+    })
 }
