@@ -1142,6 +1142,9 @@ async fn apply_claimed_job(
     })
     .await?;
     drop(apply_permit);
+    let Some(rollout) = rollout else {
+        return Ok(JobApplyOutcome::AlreadyTerminal);
+    };
     Ok(JobApplyOutcome::Applied(rollout.watch().await))
 }
 

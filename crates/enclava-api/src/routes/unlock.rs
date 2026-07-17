@@ -883,24 +883,27 @@ pub async fn update_unlock_mode(
         .await;
         drop(_apply_permit);
         let result = match rollout {
-            Ok(rollout) => {
+            Ok(Some(rollout)) => {
                 let outcome = rollout.watch().await;
-                match crate::deploy::record_deployment_result(
+                match crate::deploy::record_deployment_result_if_current(
                     &db,
-                    deploy_id,
-                    outcome.deploy_status,
-                    Some(&outcome.manifest_hash),
-                    outcome.error_code,
-                    outcome.terminal,
+                    crate::deploy::DeploymentResultUpdate {
+                        app_id: apply_app.id,
+                        deployment_id: deploy_id,
+                        deploy_status: outcome.deploy_status,
+                        expected_manifest_hash: &outcome.manifest_hash,
+                        app_status: outcome.app_status,
+                        error_code: outcome.error_code,
+                        terminal: outcome.terminal,
+                    },
                 )
                 .await
                 {
-                    Ok(()) => crate::deploy::set_app_status(&db, apply_app.id, outcome.app_status)
-                        .await
-                        .map_err(crate::deploy::DeployError::Db),
+                    Ok(_) => Ok(()),
                     Err(error) => Err(crate::deploy::DeployError::Db(error)),
                 }
             }
+            Ok(None) => Ok(()),
             Err(error) => Err(error),
         };
         if let Err(e) = result {

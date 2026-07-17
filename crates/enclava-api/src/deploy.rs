@@ -1674,7 +1674,7 @@ impl DeploymentRollout {
 /// Apply manifests and return durable rollout-observation context.
 pub async fn apply_deployment_manifests(
     request: ApplyDeploymentManifestsRequest,
-) -> Result<DeploymentRollout, DeployError> {
+) -> Result<Option<DeploymentRollout>, DeployError> {
     let ApplyDeploymentManifestsRequest {
         pool,
         app,
@@ -1700,7 +1700,7 @@ pub async fn apply_deployment_manifests(
             deployment_id = %deployment_id,
             "skipping manifest apply for completed or superseded deployment"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     let mut app_spec = build_confidential_app_from_rows(
@@ -1809,10 +1809,10 @@ pub async fn apply_deployment_manifests(
     set_deployment_status(&pool, deployment_id, "watching", Some(&hash), None, false).await?;
     apply_lane.commit().await?;
 
-    Ok(DeploymentRollout {
+    Ok(Some(DeploymentRollout {
         app,
         engine,
         app_spec,
         manifest_hash: hash,
-    })
+    }))
 }

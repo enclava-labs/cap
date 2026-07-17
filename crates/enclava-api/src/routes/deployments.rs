@@ -965,7 +965,7 @@ async fn deploy_app_candidate(
         app.clone(),
         crate::deploy::DeploymentApplySnapshot::new(
             candidate_containers.clone(),
-            app_resources.clone(),
+            candidate_resources.clone(),
         ),
         state.attestation.clone(),
         api_signing_pubkey,

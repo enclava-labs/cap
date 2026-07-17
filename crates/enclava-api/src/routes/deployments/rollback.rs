@@ -230,7 +230,7 @@ pub async fn rollback(
     crate::entitlements::lock_org_entitlement_lane(&mut tx, auth.org_id)
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-    if rollback_artifact.is_some() {
+    if rollback_artifacts.is_some() {
         crate::signing_service::lock_org_signing_authority_lane(&mut tx, auth.org_id)
             .await
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
@@ -244,7 +244,7 @@ pub async fn rollback(
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     super::enforce_authoritative_entitlement(&mut tx, auth.org_id, &target_resources, false)
         .await?;
-    if rollback_artifact.is_some() {
+    if rollback_artifacts.is_some() {
         let artifacts =
             crate::signing_service::load_stored_customer_authority_in_tx(&mut tx, app.id, prev.id)
                 .await
