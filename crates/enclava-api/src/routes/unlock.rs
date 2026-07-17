@@ -716,16 +716,12 @@ pub async fn update_unlock_mode(
         )
     })?;
 
-    tx.commit().await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?;
-
+    // Capture the exact rows changed by this transition before releasing the
+    // transaction lock. A later deployment may update the shared app rows
+    // while this apply waits on the global semaphore.
     let updated_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(app.id)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|_| {
             (
@@ -733,6 +729,35 @@ pub async fn update_unlock_mode(
                 Json(serde_json::json!({"error": "database error"})),
             )
         })?;
+    let apply_containers: Vec<crate::models::AppContainer> =
+        sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC")
+            .bind(app.id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+            })?;
+    let apply_resources: crate::models::AppResources =
+        sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+            .bind(app.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+            })?;
+
+    tx.commit().await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
 
     let spec_snapshot = serde_json::json!({
         "app_name": updated_app.name,
@@ -808,6 +833,8 @@ pub async fn update_unlock_mode(
     let kbs_policy = state.kbs_policy.clone();
     let api_url = state.api_url.clone();
     let apply_app = updated_app.clone();
+    let apply_snapshot =
+        crate::deploy::DeploymentApplySnapshot::new(apply_containers, apply_resources);
     let apply_permits = state.deployment_apply_permits.clone();
     let (local_workload_artifacts_json, local_trustee_policy_json) =
         local_verification_artifacts.unzip();
@@ -840,6 +867,7 @@ pub async fn update_unlock_mode(
             crate::deploy::ApplyDeploymentManifestsRequest {
                 pool: db.clone(),
                 app: apply_app.clone(),
+                snapshot: apply_snapshot,
                 deployment_id: deploy_id,
                 attestation_config: attestation,
                 kbs_policy_config: kbs_policy,

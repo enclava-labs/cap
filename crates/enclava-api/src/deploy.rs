@@ -368,6 +368,7 @@ async fn apply_all_with_tenant_image_pull_secret(
 pub struct ApplyDeploymentManifestsRequest {
     pub pool: PgPool,
     pub app: App,
+    pub snapshot: DeploymentApplySnapshot,
     pub deployment_id: Uuid,
     pub attestation_config: Option<AttestationConfig>,
     pub kbs_policy_config: Option<crate::kbs::KbsPolicyConfig>,
@@ -378,6 +379,26 @@ pub struct ApplyDeploymentManifestsRequest {
     pub local_workload_artifacts_json: Option<String>,
     pub local_trustee_policy_json: Option<String>,
     pub log_encryption: Option<LogEncryptionConfig>,
+}
+
+/// Immutable database-row inputs captured for one queued deployment apply.
+///
+/// The API can accept another deployment while this one waits for the apply
+/// semaphore. Keeping these rows on the queued request prevents a later
+/// deployment from changing the manifest rendered for this deployment ID.
+#[derive(Debug, Clone)]
+pub struct DeploymentApplySnapshot {
+    pub containers: Vec<AppContainer>,
+    pub resources: AppResources,
+}
+
+impl DeploymentApplySnapshot {
+    pub fn new(containers: Vec<AppContainer>, resources: AppResources) -> Self {
+        Self {
+            containers,
+            resources,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -706,6 +727,107 @@ mod tests {
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
         }
+    }
+
+    fn queued_apply_app() -> App {
+        let now = chrono::Utc::now();
+        App {
+            id: uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            org_id: uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            name: "queued-app".to_string(),
+            namespace: "cap-queued-app".to_string(),
+            instance_id: "queued-app-instance".to_string(),
+            tenant_id: "8f346820".to_string(),
+            service_account: "cap-queued-app-sa".to_string(),
+            bootstrap_owner_pubkey_hash: "11".repeat(32),
+            tenant_instance_identity_hash: "22".repeat(32),
+            unlock_mode: crate::models::UnlockMode::Password,
+            domain: "queued-app.8f346820.enclava.dev".to_string(),
+            tee_domain: Some("queued-app.8f346820.tee.enclava.dev".to_string()),
+            custom_domain: None,
+            status: AppStatus::Creating,
+            signer_identity_subject: Some("https://github.com/acme/app".to_string()),
+            signer_identity_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
+            signer_identity_set_at: Some(now),
+            source_provider: Some("github".to_string()),
+            source_repository: Some("acme/app".to_string()),
+            egress_allowlist: sqlx::types::Json(Vec::new()),
+            egress_mode: "restricted".to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn queued_apply_snapshot(digest_byte: char) -> DeploymentApplySnapshot {
+        let app = queued_apply_app();
+        let digest = format!("sha256:{}", digest_byte.to_string().repeat(64));
+        DeploymentApplySnapshot::new(
+            vec![AppContainer {
+                id: uuid::Uuid::new_v4(),
+                app_id: app.id,
+                name: "web".to_string(),
+                image_ref: "ghcr.io/acme/app:latest".to_string(),
+                image_digest: Some(digest),
+                port: Some(8080),
+                command: None,
+                storage_paths: Some(vec!["/data".to_string()]),
+                workload_security_profile: Some("restricted".to_string()),
+                is_primary: true,
+            }],
+            AppResources {
+                app_id: app.id,
+                cpu_limit: "1".to_string(),
+                memory_limit: "1Gi".to_string(),
+                app_data_size: "5Gi".to_string(),
+                tls_data_size: "2Gi".to_string(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn queued_apply_renders_its_captured_rows_after_later_state_changes() {
+        let app = queued_apply_app();
+        let first_snapshot = queued_apply_snapshot('a');
+        let later_snapshot = queued_apply_snapshot('b');
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let queued_gate = gate.clone();
+        let queued_app = app.clone();
+        let queued = tokio::spawn(async move {
+            let _permit = queued_gate.acquire().await.expect("queue remains open");
+            build_confidential_app_from_rows(
+                &queued_app,
+                uuid::Uuid::new_v4(),
+                &test_attestation_config(),
+                "api-signing-key",
+                "https://api.enclava.dev",
+                &first_snapshot.containers,
+                &first_snapshot.resources,
+            )
+            .expect("captured apply snapshot")
+        });
+
+        tokio::task::yield_now().await;
+        let later = build_confidential_app_from_rows(
+            &app,
+            uuid::Uuid::new_v4(),
+            &test_attestation_config(),
+            "api-signing-key",
+            "https://api.enclava.dev",
+            &later_snapshot.containers,
+            &later_snapshot.resources,
+        )
+        .expect("later apply snapshot");
+        gate.add_permits(1);
+        let first = queued.await.expect("queued renderer");
+
+        assert_eq!(
+            first.containers[0].image.digest(),
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(
+            later.containers[0].image.digest(),
+            format!("sha256:{}", "b".repeat(64))
+        );
     }
 
     #[test]
@@ -1319,6 +1441,7 @@ pub async fn apply_deployment_manifests(
     let ApplyDeploymentManifestsRequest {
         pool,
         app,
+        snapshot,
         deployment_id,
         attestation_config,
         kbs_policy_config,
@@ -1331,15 +1454,15 @@ pub async fn apply_deployment_manifests(
         log_encryption,
     } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
-    let mut app_spec = build_confidential_app(
-        &pool,
+    let mut app_spec = build_confidential_app_from_rows(
         &app,
         deployment_id,
         &attestation_config,
         &api_signing_pubkey,
         &api_url,
-    )
-    .await?;
+        &snapshot.containers,
+        &snapshot.resources,
+    )?;
     app_spec.workload_artifact_binding = workload_artifact_binding;
     app_spec.log_encryption = log_encryption;
     if let (Some(workload_artifacts), Some(trustee_policy)) =

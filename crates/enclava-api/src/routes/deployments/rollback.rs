@@ -137,6 +137,12 @@ pub async fn rollback(
     }
 
     let container_name = "web";
+    let mut tx = state.db.begin().await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
     sqlx::query(
         "UPDATE app_containers
          SET image_ref = $1,
@@ -153,7 +159,7 @@ pub async fn rollback(
     .bind(rollback_storage_paths.as_ref())
     .bind(app.id)
     .bind(container_name)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|_| {
         (
@@ -174,7 +180,7 @@ pub async fn rollback(
     .bind(&prev.image_digest)
     .bind(prev.source_provider.as_deref())
     .bind(prev.source_repository.as_deref())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|_| {
         (
@@ -183,16 +189,52 @@ pub async fn rollback(
         )
     })?;
 
-    // Audit
-    let _ = sqlx::query(
-        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.rollback', $4)",
+    super::insert_transaction_audit(
+        &mut tx,
+        auth.org_id,
+        app.id,
+        auth.user_id,
+        "app.rollback",
+        serde_json::json!({"rollback_to": prev.id, "deployment_id": deploy_id}),
     )
-    .bind(auth.org_id)
-    .bind(app.id)
-    .bind(auth.user_id)
-    .bind(serde_json::json!({"rollback_to": prev.id, "deployment_id": deploy_id}))
-    .execute(&state.db)
-    .await;
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
+
+    // Capture the rollback rows while this transaction still owns the target
+    // container lock; later deploys cannot alter this queued apply snapshot.
+    let apply_containers: Vec<crate::models::AppContainer> =
+        sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC")
+            .bind(app.id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+            })?;
+    let apply_resources: crate::models::AppResources =
+        sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+            .bind(app.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+            })?;
+    tx.commit().await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "database error"})),
+        )
+    })?;
 
     let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
     let local_verification_artifacts =
@@ -204,6 +246,8 @@ pub async fn rollback(
     let kbs_policy = state.kbs_policy.clone();
     let api_url = state.api_url.clone();
     let apply_app = app.clone();
+    let apply_snapshot =
+        crate::deploy::DeploymentApplySnapshot::new(apply_containers, apply_resources);
     let apply_permits = state.deployment_apply_permits.clone();
     let (workload_artifact_binding, signed_policy_artifact) = rollback_artifact.unzip();
     let (local_workload_artifacts_json, local_trustee_policy_json) =
@@ -237,6 +281,7 @@ pub async fn rollback(
             crate::deploy::ApplyDeploymentManifestsRequest {
                 pool: db.clone(),
                 app: apply_app.clone(),
+                snapshot: apply_snapshot,
                 deployment_id: deploy_id,
                 attestation_config: attestation,
                 kbs_policy_config: kbs_policy,

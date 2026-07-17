@@ -2213,6 +2213,39 @@ async fn generic_deployment_external_id_is_idempotent_and_conflict_checked() {
         conflict_body["error"].as_str(),
         Some("external_id already exists with different app.name")
     );
+
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'failed'::deploy_status_enum,
+                spec_snapshot = jsonb_set(spec_snapshot, '{setup_state}', '\"cleanup_pending\"'::jsonb, true),
+                error_message = 'deployment DNS setup failed'
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&pool)
+    .await
+    .expect("mark deployment setup incomplete");
+
+    let incomplete_retry = server
+        .post("/deployments")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&generic_deployment_body(
+            &external_id,
+            &app_name,
+            "github",
+            "acme/confidential-app",
+            image,
+            subject,
+            issuer,
+        ))
+        .await;
+    incomplete_retry.assert_status(StatusCode::CONFLICT);
+    let incomplete_body: Value = incomplete_retry.json();
+    assert_eq!(
+        incomplete_body["error"].as_str(),
+        Some("external_id belongs to a deployment whose setup did not complete")
+    );
 }
 
 #[tokio::test]

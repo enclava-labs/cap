@@ -235,6 +235,12 @@ pub async fn create_generic_deployment(
         && let Some((deployment, app)) =
             fetch_deployment_by_external_id(&state, auth.org_id, external_id).await?
     {
+        if super::deployment_setup_incomplete(&deployment) {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "external_id belongs to a deployment whose setup did not complete",
+            ));
+        }
         ensure_idempotent_retry_matches(&deployment, &app, &body)?;
         return Ok((
             StatusCode::OK,

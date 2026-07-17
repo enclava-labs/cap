@@ -466,6 +466,183 @@ enum AppMutation {
     Insert,
 }
 
+const DEPLOYMENT_SETUP_STATE: &str = "setup_state";
+const DEPLOYMENT_SETUP_DNS_PENDING: &str = "dns_pending";
+const DEPLOYMENT_SETUP_CLEANUP_PENDING: &str = "cleanup_pending";
+const DEPLOYMENT_SETUP_FAILED_MESSAGE: &str = "deployment_setup_failed";
+
+fn deployment_setup_incomplete(deployment: &Deployment) -> bool {
+    matches!(
+        deployment
+            .spec_snapshot
+            .get(DEPLOYMENT_SETUP_STATE)
+            .and_then(serde_json::Value::as_str),
+        Some(DEPLOYMENT_SETUP_DNS_PENDING | DEPLOYMENT_SETUP_CLEANUP_PENDING)
+    )
+}
+
+async fn insert_transaction_audit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org_id: Uuid,
+    app_id: Uuid,
+    user_id: Uuid,
+    action: &str,
+    detail: serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(org_id)
+    .bind(app_id)
+    .bind(user_id)
+    .bind(action)
+    .bind(detail)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn mark_deployment_setup_accepted(
+    pool: &sqlx::PgPool,
+    deployment_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE deployments
+            SET spec_snapshot = jsonb_set(spec_snapshot, '{setup_state}', '\"accepted\"'::jsonb, true)
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    Ok(())
+}
+
+async fn mark_deployment_setup_failed(
+    pool: &sqlx::PgPool,
+    app_id: Uuid,
+    deployment_id: Uuid,
+    mark_app_failed: bool,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let result = sqlx::query(
+        "UPDATE deployments
+            SET status = 'failed'::deploy_status_enum,
+                spec_snapshot = jsonb_set(spec_snapshot, '{setup_state}', '\"cleanup_pending\"'::jsonb, true),
+                error_message = $1,
+                completed_at = now()
+          WHERE id = $2",
+    )
+    .bind(DEPLOYMENT_SETUP_FAILED_MESSAGE)
+    .bind(deployment_id)
+    .execute(&mut *tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    if mark_app_failed {
+        sqlx::query(
+            "UPDATE apps
+                SET status = 'failed'::app_status_enum,
+                    updated_at = now()
+              WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
+async fn compensate_deployment_setup_failure(
+    pool: &sqlx::PgPool,
+    http_client: &reqwest::Client,
+    dns: Option<&crate::dns::DnsConfig>,
+    app: &App,
+    deployment_id: Uuid,
+    app_mutation: AppMutation,
+) {
+    if let Err(error) = mark_deployment_setup_failed(
+        pool,
+        app.id,
+        deployment_id,
+        app_mutation == AppMutation::Insert,
+    )
+    .await
+    {
+        // The original dns_pending marker still makes idempotent retries fail
+        // closed even if this status update cannot be persisted.
+        tracing::error!(
+            app_id = %app.id,
+            deployment_id = %deployment_id,
+            error = %error,
+            "failed to persist deployment setup failure"
+        );
+    }
+
+    if app_mutation != AppMutation::Insert {
+        return;
+    }
+
+    // Keep the app and its DNS tracking rows when external cleanup fails. The
+    // durable cleanup_pending deployment can then be reconciled without losing
+    // the Cloudflare record handles.
+    if let Err(error) =
+        crate::dns::delete_all_dns_records_for_app(pool, http_client, dns, app.id).await
+    {
+        tracing::error!(
+            app_id = %app.id,
+            deployment_id = %deployment_id,
+            error = %error,
+            "failed to clean up DNS after deployment setup failure"
+        );
+        return;
+    }
+
+    let dns_records_remain = match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM dns_records WHERE app_id = $1)",
+    )
+    .bind(app.id)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(remaining) => remaining,
+        Err(error) => {
+            tracing::error!(
+                app_id = %app.id,
+                deployment_id = %deployment_id,
+                error = %error,
+                "failed to verify DNS cleanup after deployment setup failure"
+            );
+            return;
+        }
+    };
+    if dns_records_remain {
+        tracing::error!(
+            app_id = %app.id,
+            deployment_id = %deployment_id,
+            "DNS cleanup left tracked records; retaining app for reconciliation"
+        );
+        return;
+    }
+
+    if let Err(error) = sqlx::query("DELETE FROM apps WHERE id = $1")
+        .bind(app.id)
+        .execute(pool)
+        .await
+    {
+        tracing::error!(
+            app_id = %app.id,
+            deployment_id = %deployment_id,
+            error = %error,
+            "failed to compensate first generic deployment after setup failure"
+        );
+    }
+}
+
 /// POST /apps/{name}/deploy -- deploy or update an app.
 pub async fn deploy(
     auth: AuthContext,
@@ -891,6 +1068,7 @@ async fn deploy_app_candidate(
             .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
         "workload_security_profile": workload_security_profile.as_str(),
         "log_encryption": &log_encryption,
+        "setup_state": DEPLOYMENT_SETUP_DNS_PENDING,
     });
 
     let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
@@ -1004,21 +1182,21 @@ async fn deploy_app_candidate(
                 .await
                 .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
-            let _ = sqlx::query(
-                "INSERT INTO audit_log (org_id, app_id, user_id, action, detail)
-                 VALUES ($1, $2, $3, 'app.create', $4)",
-            )
-            .bind(auth.org_id)
-            .bind(app.id)
-            .bind(auth.user_id)
-            .bind(serde_json::json!({
+            insert_transaction_audit(
+                &mut tx,
+                auth.org_id,
+                app.id,
+                auth.user_id,
+                "app.create",
+                serde_json::json!({
                 "name": &app.name,
                 "unlock_mode": format!("{:?}", app.unlock_mode).to_lowercase(),
                 "egress_allowlist": &app.egress_allowlist.0,
                 "egress_mode": &app.egress_mode,
-            }))
-            .execute(&mut *tx)
-            .await;
+                }),
+            )
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
         }
     }
 
@@ -1093,66 +1271,79 @@ async fn deploy_app_candidate(
 
     // Audit the image signer and, when present, the signed descriptor hash
     // persisted for workload-attested artifact fetches.
-    let _ = sqlx::query(
-        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.deploy', $4)",
+    insert_transaction_audit(
+        &mut tx,
+        auth.org_id,
+        app.id,
+        auth.user_id,
+        "app.deploy",
+        serde_json::json!({
+            "image": &body.image,
+            "deployment_id": deploy_id,
+            "signer_subject": verified.signer_subject,
+            "signer_issuer": verified.signer_issuer,
+            "rekor_log_index": verified.rekor_log_index,
+            "descriptor_core_hash": signing_artifacts
+                .as_ref()
+                .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
+        }),
     )
-    .bind(auth.org_id)
-    .bind(app.id)
-    .bind(auth.user_id)
-    .bind(serde_json::json!({
-        "image": &body.image,
-        "deployment_id": deploy_id,
-        "signer_subject": verified.signer_subject,
-        "signer_issuer": verified.signer_issuer,
-        "rekor_log_index": verified.rekor_log_index,
-        "descriptor_core_hash": signing_artifacts
-            .as_ref()
-            .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
-    }))
-    .execute(&mut *tx)
-    .await;
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
     tx.commit()
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
-    let tee_domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
-    if let Err(error) = crate::dns::ensure_dns_pair(
-        &state.db,
-        &state.http_client,
-        state.dns.as_ref(),
-        app.id,
-        &app.domain,
-        tee_domain,
-    )
-    .await
-    {
-        // A first generic deployment creates the app as part of the accepted
-        // deployment transaction. Compensate that insert if the external DNS
-        // step fails so its deployment/external_id cannot be mistaken for an
-        // idempotent success even though apply was never started. The app FK
-        // cascades remove resources, containers, deployment, artifacts, DNS
-        // tracking, and audit rows together.
-        if app_mutation == AppMutation::Insert
-            && let Err(cleanup_error) = sqlx::query("DELETE FROM apps WHERE id = $1")
-                .bind(app.id)
-                .execute(&state.db)
-                .await
-        {
-            tracing::error!(
-                app_id = %app.id,
-                deployment_id = %deploy_id,
-                error = %cleanup_error,
-                "failed to compensate first generic deployment after DNS failure"
-            );
+    let setup_result = async {
+        let tee_domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
+        crate::dns::ensure_dns_pair(
+            &state.db,
+            &state.http_client,
+            state.dns.as_ref(),
+            app.id,
+            &app.domain,
+            tee_domain,
+        )
+        .await?;
+        if let Some(custom_domain) = app.custom_domain.as_ref() {
+            crate::dns::record_custom_domain(&state.db, app.id, custom_domain).await?;
         }
+        Ok::<(), crate::dns::DnsError>(())
+    }
+    .await;
+    if let Err(error) = setup_result {
+        compensate_deployment_setup_failure(
+            &state.db,
+            &state.http_client,
+            state.dns.as_ref(),
+            &app,
+            deploy_id,
+            app_mutation,
+        )
+        .await;
         return Err(dns_error_response(error));
     }
-
-    if let Some(custom_domain) = app.custom_domain.as_ref() {
-        crate::dns::record_custom_domain(&state.db, app.id, custom_domain)
-            .await
-            .map_err(dns_error_response)?;
+    if let Err(error) = mark_deployment_setup_accepted(&state.db, deploy_id).await {
+        tracing::error!(
+            app_id = %app.id,
+            deployment_id = %deploy_id,
+            error = %error,
+            "failed to persist completed deployment setup"
+        );
+        compensate_deployment_setup_failure(
+            &state.db,
+            &state.http_client,
+            state.dns.as_ref(),
+            &app,
+            deploy_id,
+            app_mutation,
+        )
+        .await;
+        return Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "database error",
+        ));
     }
 
     let db = state.db.clone();
@@ -1160,6 +1351,8 @@ async fn deploy_app_candidate(
     let kbs_policy = state.kbs_policy.clone();
     let api_url = state.api_url.clone();
     let apply_app = app.clone();
+    let apply_snapshot =
+        crate::deploy::DeploymentApplySnapshot::new(candidate_containers, app_resources);
     let apply_permits = state.deployment_apply_permits.clone();
     let (local_workload_artifacts_json, local_trustee_policy_json) =
         local_verification_artifacts.unzip();
@@ -1192,6 +1385,7 @@ async fn deploy_app_candidate(
             crate::deploy::ApplyDeploymentManifestsRequest {
                 pool: db.clone(),
                 app: apply_app.clone(),
+                snapshot: apply_snapshot,
                 deployment_id: deploy_id,
                 attestation_config: attestation,
                 kbs_policy_config: kbs_policy,
@@ -1293,10 +1487,72 @@ pub use rollback::rollback;
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LOG_ENCRYPTION_ALGORITHM_X25519_HPKE_V1, LogEncryptionConfig, StatusCode, parse_memory_gi,
-        validate_log_encryption_config,
-    };
+    use super::*;
+
+    async fn database_test_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect deployment regression database");
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate deployment regression database");
+        pool
+    }
+
+    async fn insert_setup_test_app(pool: &sqlx::PgPool) -> App {
+        let org_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("setup-test-{suffix}");
+        let app_name = format!("app-{}", &suffix[..12]);
+        sqlx::query(
+            "INSERT INTO organizations (id, name, cust_slug)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(org_id)
+        .bind(org_name)
+        .bind(&suffix[..8])
+        .execute(pool)
+        .await
+        .expect("insert setup test organization");
+        sqlx::query(
+            "INSERT INTO apps (
+                id, org_id, name, namespace, instance_id, tenant_id,
+                service_account, bootstrap_owner_pubkey_hash,
+                tenant_instance_identity_hash, domain, tee_domain
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .bind(&app_name)
+        .bind(format!("cap-{app_name}"))
+        .bind(format!("instance-{suffix}"))
+        .bind(&suffix[..8])
+        .bind(format!("cap-{app_name}-sa"))
+        .bind("11".repeat(32))
+        .bind("22".repeat(32))
+        .bind(format!("{app_name}.{}.enclava.dev", &suffix[..8]))
+        .bind(format!("{app_name}.{}.tee.enclava.dev", &suffix[..8]))
+        .execute(pool)
+        .await
+        .expect("insert setup test app");
+        sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(pool)
+            .await
+            .expect("load setup test app")
+    }
+
+    async fn delete_setup_test_org(pool: &sqlx::PgPool, org_id: Uuid) {
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(pool)
+            .await
+            .expect("delete setup test organization");
+    }
 
     fn valid_log_encryption_config() -> LogEncryptionConfig {
         LogEncryptionConfig {
@@ -1342,5 +1598,165 @@ mod tests {
             validate_log_encryption_config(Some(config)).expect_err("algorithm rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "unsupported log_encryption.algorithm");
+    }
+
+    #[tokio::test]
+    async fn failed_app_delete_leaves_durable_cleanup_pending_deployment() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        let deployment_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO deployments (
+                id, org_id, app_id, trigger, spec_snapshot, external_id
+             )
+             VALUES ($1, $2, $3, 'api', $4, $5)",
+        )
+        .bind(deployment_id)
+        .bind(app.org_id)
+        .bind(app.id)
+        .bind(serde_json::json!({
+            "setup_state": DEPLOYMENT_SETUP_DNS_PENDING,
+            "image": "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }))
+        .bind(format!("external-{deployment_id}"))
+        .execute(&pool)
+        .await
+        .expect("insert pending setup deployment");
+
+        let suffix = app.id.simple().to_string();
+        let function_name = format!("cap_test_block_app_delete_{suffix}");
+        let trigger_name = format!("cap_test_block_app_delete_trigger_{suffix}");
+        sqlx::query(&format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF OLD.id = '{}'::uuid THEN
+                 RAISE EXCEPTION 'forced app cleanup failure';
+               END IF;
+               RETURN OLD;
+             END
+             $$",
+            app.id
+        ))
+        .execute(&pool)
+        .await
+        .expect("create app delete failure function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger_name}
+             BEFORE DELETE ON apps
+             FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create app delete failure trigger");
+
+        compensate_deployment_setup_failure(
+            &pool,
+            &reqwest::Client::new(),
+            None,
+            &app,
+            deployment_id,
+            AppMutation::Insert,
+        )
+        .await;
+
+        let persisted: Deployment = sqlx::query_as("SELECT * FROM deployments WHERE id = $1")
+            .bind(deployment_id)
+            .fetch_one(&pool)
+            .await
+            .expect("cleanup-pending deployment remains");
+        assert_eq!(persisted.status, crate::models::DeployStatus::Failed);
+        assert_eq!(
+            persisted.spec_snapshot[DEPLOYMENT_SETUP_STATE],
+            DEPLOYMENT_SETUP_CLEANUP_PENDING
+        );
+        assert!(deployment_setup_incomplete(&persisted));
+        assert_eq!(
+            persisted.error_message.as_deref(),
+            Some(DEPLOYMENT_SETUP_FAILED_MESSAGE)
+        );
+        let app_status: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+            .bind(app.id)
+            .fetch_one(&pool)
+            .await
+            .expect("failed app remains for cleanup");
+        assert_eq!(app_status, "failed");
+
+        sqlx::query(&format!("DROP TRIGGER {trigger_name} ON apps"))
+            .execute(&pool)
+            .await
+            .expect("drop app delete failure trigger");
+        sqlx::query(&format!("DROP FUNCTION {function_name}()"))
+            .execute(&pool)
+            .await
+            .expect("drop app delete failure function");
+        delete_setup_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn audit_insert_failure_aborts_the_candidate_transaction() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        let suffix = app.id.simple().to_string();
+        let function_name = format!("cap_test_block_audit_{suffix}");
+        let trigger_name = format!("cap_test_block_audit_trigger_{suffix}");
+        sqlx::query(&format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF NEW.app_id = '{}'::uuid THEN
+                 RAISE EXCEPTION 'forced audit failure';
+               END IF;
+               RETURN NEW;
+             END
+             $$",
+            app.id
+        ))
+        .execute(&pool)
+        .await
+        .expect("create audit failure function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger_name}
+             BEFORE INSERT ON audit_log
+             FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create audit failure trigger");
+
+        let mut tx = pool.begin().await.expect("begin candidate transaction");
+        sqlx::query("UPDATE organizations SET display_name = 'must-roll-back' WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&mut *tx)
+            .await
+            .expect("mutate candidate transaction");
+        let audit_error = insert_transaction_audit(
+            &mut tx,
+            app.org_id,
+            app.id,
+            Uuid::new_v4(),
+            "app.deploy",
+            serde_json::json!({"deployment_id": Uuid::new_v4()}),
+        )
+        .await
+        .expect_err("audit failure must propagate");
+        assert!(audit_error.to_string().contains("forced audit failure"));
+        tx.rollback().await.expect("roll back rejected candidate");
+
+        let display_name: Option<String> =
+            sqlx::query_scalar("SELECT display_name FROM organizations WHERE id = $1")
+                .bind(app.org_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load rolled-back organization");
+        assert_eq!(display_name, None);
+
+        sqlx::query(&format!("DROP TRIGGER {trigger_name} ON audit_log"))
+            .execute(&pool)
+            .await
+            .expect("drop audit failure trigger");
+        sqlx::query(&format!("DROP FUNCTION {function_name}()"))
+            .execute(&pool)
+            .await
+            .expect("drop audit failure function");
+        delete_setup_test_org(&pool, app.org_id).await;
     }
 }

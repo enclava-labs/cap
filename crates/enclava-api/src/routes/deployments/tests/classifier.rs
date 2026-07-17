@@ -80,6 +80,23 @@ fn generic_deployment_response_reports_current_app_status_separately() {
     assert_eq!(response.app_status, "running");
 }
 
+#[test]
+fn incomplete_setup_marker_blocks_idempotent_success() {
+    let app = idempotency_app();
+    let mut deployment = idempotency_deployment(&app);
+
+    assert!(
+        !deployment_setup_incomplete(&deployment),
+        "legacy accepted deployments without a setup marker remain retryable"
+    );
+    deployment.spec_snapshot["setup_state"] = serde_json::json!("dns_pending");
+    assert!(deployment_setup_incomplete(&deployment));
+    deployment.spec_snapshot["setup_state"] = serde_json::json!("cleanup_pending");
+    assert!(deployment_setup_incomplete(&deployment));
+    deployment.spec_snapshot["setup_state"] = serde_json::json!("accepted");
+    assert!(!deployment_setup_incomplete(&deployment));
+}
+
 fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
     GenericDeploymentRequest {
             external_id: Some("deploy-123".to_string()),
@@ -402,8 +419,8 @@ fn first_generic_deployment_is_compensated_before_dns_error_returns() {
         .find("crate::dns::ensure_dns_pair")
         .expect("deployment DNS provisioning");
     let compensation = deploy_body
-        .find("DELETE FROM apps WHERE id = $1")
-        .expect("new generic app compensation");
+        .find("compensate_deployment_setup_failure(")
+        .expect("durable deployment setup compensation");
     let apply = deploy_body
         .find("tokio::spawn")
         .expect("accepted deployment apply task");
@@ -413,10 +430,25 @@ fn first_generic_deployment_is_compensated_before_dns_error_returns() {
         compensation < apply,
         "a failed first generic deployment must be removed before apply can start"
     );
-    assert!(
-        deploy_body[..compensation].contains("app_mutation == AppMutation::Insert"),
-        "only first generic deployments should delete the newly inserted app"
-    );
+    assert!(deploy_body[compensation..].contains("app_mutation"));
+
+    let compensation_body = source
+        .split("async fn compensate_deployment_setup_failure")
+        .nth(1)
+        .expect("setup compensation helper exists")
+        .split("/// POST /apps/{name}/deploy")
+        .next()
+        .expect("setup compensation helper body");
+    let durable_failure = compensation_body
+        .find("mark_deployment_setup_failed")
+        .expect("durable failure marker");
+    let dns_cleanup = compensation_body
+        .find("delete_all_dns_records_for_app")
+        .expect("DNS cleanup");
+    let app_cleanup = compensation_body
+        .find("DELETE FROM apps WHERE id = $1")
+        .expect("new generic app cleanup");
+    assert!(durable_failure < dns_cleanup && dns_cleanup < app_cleanup);
 }
 
 #[test]
