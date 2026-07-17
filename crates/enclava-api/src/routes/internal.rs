@@ -391,7 +391,17 @@ pub async fn upsert_paas_org(
     .await
     .map_err(|_| db_error())?;
 
-    let (cap_org_id, response_status) = if let Some(org_id) = existing_org_id {
+    let cap_org_id = existing_org_id.unwrap_or_else(Uuid::new_v4);
+    let response_status = if existing_org_id.is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, cap_org_id)
+        .await
+        .map_err(|_| db_error())?;
+    if existing_org_id.is_some() {
         sqlx::query(
             "UPDATE organizations
                 SET name = $2,
@@ -399,18 +409,16 @@ pub async fn upsert_paas_org(
                     updated_at = now()
               WHERE id = $1",
         )
-        .bind(org_id)
+        .bind(cap_org_id)
         .bind(&body.name)
         .bind(body.display_name.as_deref())
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
         .map_err(|_| db_error())?;
-        (org_id, StatusCode::OK)
     } else {
-        let org_id = Uuid::new_v4();
-        crate::db::orgs::insert_org_pool(
-            &state.db,
-            org_id,
+        crate::db::orgs::insert_org_conn(
+            &mut tx,
+            cap_org_id,
             &body.name,
             body.display_name.as_deref(),
             false,
@@ -423,8 +431,7 @@ pub async fn upsert_paas_org(
                 db_error()
             }
         })?;
-        (org_id, StatusCode::CREATED)
-    };
+    }
 
     sqlx::query(
         "INSERT INTO organization_management
@@ -440,7 +447,7 @@ pub async fn upsert_paas_org(
     .bind(cap_org_id)
     .bind(&paas_org_id)
     .bind(status)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|_| db_error())?;
 
@@ -457,9 +464,10 @@ pub async fn upsert_paas_org(
     .bind(&paas_org_id)
     .bind(cap_org_id)
     .bind(serde_json::json!({"client_san": auth.client_san}))
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|_| db_error())?;
+    tx.commit().await.map_err(|_| db_error())?;
 
     let response = serde_json::json!({
         "cap_org_id": cap_org_id,
@@ -641,27 +649,65 @@ pub async fn sync_paas_entitlement(
             "failed to serialize entitlement limits",
         )
     })?;
-    sqlx::query(
-        "INSERT INTO organization_entitlements
-             (org_id, version, deploy_allowed, block_reason, limits, source, updated_at)
-         VALUES ($1, $2, $3, $4, $5, 'paas', now())
-         ON CONFLICT (org_id) DO UPDATE
-            SET version = EXCLUDED.version,
-                deploy_allowed = EXCLUDED.deploy_allowed,
-                block_reason = EXCLUDED.block_reason,
-                limits = EXCLUDED.limits,
-                source = EXCLUDED.source,
-                updated_at = now()
-          WHERE organization_entitlements.version <= EXCLUDED.version",
+    let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, cap_org_id)
+        .await
+        .map_err(|_| db_error())?;
+    let existing: Option<(i64, bool, Option<String>, serde_json::Value)> = sqlx::query_as(
+        "SELECT version, deploy_allowed, block_reason, limits
+           FROM organization_entitlements
+          WHERE org_id = $1",
     )
     .bind(cap_org_id)
-    .bind(body.version)
-    .bind(body.deploy_allowed)
-    .bind(body.block_reason.as_deref())
-    .bind(&limits)
-    .execute(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|_| db_error())?;
+    let write_entitlement = match existing {
+        Some((version, _, _, _)) if body.version < version => {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "entitlement version is stale",
+            ));
+        }
+        Some((version, deploy_allowed, block_reason, existing_limits))
+            if body.version == version =>
+        {
+            if deploy_allowed != body.deploy_allowed
+                || block_reason != body.block_reason
+                || existing_limits != limits
+            {
+                return Err(json_error(
+                    StatusCode::CONFLICT,
+                    "entitlement version already exists with different content",
+                ));
+            }
+            false
+        }
+        _ => true,
+    };
+    if write_entitlement {
+        sqlx::query(
+            "INSERT INTO organization_entitlements
+                 (org_id, version, deploy_allowed, block_reason, limits, source, updated_at)
+             VALUES ($1, $2, $3, $4, $5, 'paas', now())
+             ON CONFLICT (org_id) DO UPDATE
+                SET version = EXCLUDED.version,
+                    deploy_allowed = EXCLUDED.deploy_allowed,
+                    block_reason = EXCLUDED.block_reason,
+                    limits = EXCLUDED.limits,
+                    source = EXCLUDED.source,
+                    updated_at = now()",
+        )
+        .bind(cap_org_id)
+        .bind(body.version)
+        .bind(body.deploy_allowed)
+        .bind(body.block_reason.as_deref())
+        .bind(&limits)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+    }
+    tx.commit().await.map_err(|_| db_error())?;
 
     let response = serde_json::json!({
         "cap_org_id": cap_org_id,
@@ -910,6 +956,25 @@ pub async fn create_paas_app(
     let egress_mode = crate::routes::apps::validate_egress_mode(&body.egress_mode)
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
 
+    let resources = crate::models::AppResources {
+        app_id,
+        cpu_limit: "1".to_string(),
+        memory_limit: "1Gi".to_string(),
+        app_data_size: "5Gi".to_string(),
+        tls_data_size: "2Gi".to_string(),
+    };
+    let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, cap_org_id)
+        .await
+        .map_err(|_| db_error())?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+        .await
+        .map_err(|_| db_error())?;
+    crate::routes::deployments::enforce_authoritative_entitlement(
+        &mut tx, cap_org_id, &resources, true,
+    )
+    .await?;
+
     sqlx::query(
         "INSERT INTO apps (
             id, org_id, name, namespace, instance_id, tenant_id, service_account,
@@ -937,7 +1002,7 @@ pub async fn create_paas_app(
     .bind(signer_set_at)
     .bind(sqlx::types::Json(egress_allowlist.clone()))
     .bind(egress_mode.as_str())
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|error| {
         if error.to_string().contains("duplicate key") || error.to_string().contains("unique") {
@@ -946,11 +1011,20 @@ pub async fn create_paas_app(
             db_error()
         }
     })?;
-    sqlx::query("INSERT INTO app_resources (app_id) VALUES ($1)")
-        .bind(app_id)
-        .execute(&state.db)
-        .await
-        .map_err(|_| db_error())?;
+    sqlx::query(
+        "INSERT INTO app_resources (
+             app_id, cpu_limit, memory_limit, app_data_size, tls_data_size
+         ) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(resources.app_id)
+    .bind(&resources.cpu_limit)
+    .bind(&resources.memory_limit)
+    .bind(&resources.app_data_size)
+    .bind(&resources.tls_data_size)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| db_error())?;
+    tx.commit().await.map_err(|_| db_error())?;
 
     let response = serde_json::json!({
         "cap_org_id": cap_org_id,

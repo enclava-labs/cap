@@ -41,6 +41,82 @@ fn deploy_blocked_response(
     )
 }
 
+fn resource_limit_error_response(
+    error: crate::entitlements::ResourceLimitError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        crate::entitlements::ResourceLimitError::Invalid { field, message: _ }
+            if field.starts_with("entitlement.") =>
+        {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid entitlement resource limit",
+            )
+        }
+        crate::entitlements::ResourceLimitError::Invalid { message, .. } => {
+            json_error(StatusCode::BAD_REQUEST, message)
+        }
+        crate::entitlements::ResourceLimitError::Exceeded {
+            code,
+            field,
+            requested,
+            allowed,
+        } => deploy_blocked_response(
+            StatusCode::FORBIDDEN,
+            code,
+            format!("requested {field} {requested} exceeds authoritative limit {allowed}"),
+        ),
+    }
+}
+
+pub(crate) async fn enforce_authoritative_entitlement(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    org_id: Uuid,
+    resources: &AppResources,
+    creating_app: bool,
+) -> Result<crate::entitlements::AuthoritativeEntitlement, (StatusCode, Json<serde_json::Value>)> {
+    let authority = crate::entitlements::authoritative_entitlement_in_tx(tx, org_id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    if !authority.decision.deploy_allowed {
+        return Err(deploy_blocked_response(
+            StatusCode::FORBIDDEN,
+            authority
+                .decision
+                .deploy_block_reason
+                .as_deref()
+                .unwrap_or("entitlement_blocked"),
+            "organization authority does not allow workload mutation".to_string(),
+        ));
+    }
+    let limits = authority.decision.limits.as_ref().ok_or_else(|| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authoritative entitlement limits are missing",
+        )
+    })?;
+    crate::entitlements::validate_resource_limits(resources, limits)
+        .map_err(resource_limit_error_response)?;
+    if creating_app {
+        let app_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+        if app_count >= limits.max_apps as i64 {
+            return Err(deploy_blocked_response(
+                StatusCode::FORBIDDEN,
+                "entitlement_app_limit",
+                format!(
+                    "organization allows max {} apps and already has {app_count}",
+                    limits.max_apps
+                ),
+            ));
+        }
+    }
+    Ok(authority)
+}
+
 fn dns_error_response(error: crate::dns::DnsError) -> (StatusCode, Json<serde_json::Value>) {
     let status = match &error {
         crate::dns::DnsError::OutsideManagedZone(_) => StatusCode::BAD_REQUEST,
@@ -203,44 +279,6 @@ fn classify_signer_identity(subject: &str, issuer: &str) -> crate::cosign::Verif
 #[path = "deployments/tests/classifier.rs"]
 mod classifier_tests;
 
-/// Parse memory string like "1Gi", "8Gi" to f64 in GiB with validation.
-fn parse_memory_gi(s: &str) -> Result<f64, String> {
-    if s.is_empty() {
-        return Err("memory value cannot be empty".to_string());
-    }
-
-    let (value_str, unit) = if let Some(stripped) = s.strip_suffix("Gi") {
-        (stripped, "Gi")
-    } else if let Some(stripped) = s.strip_suffix("Mi") {
-        (stripped, "Mi")
-    } else if let Some(stripped) = s.strip_suffix("GiB") {
-        (stripped, "GiB")
-    } else if let Some(stripped) = s.strip_suffix("MiB") {
-        (stripped, "MiB")
-    } else {
-        // No unit suffix, assume GiB
-        (s, "GiB")
-    };
-
-    let value: f64 = value_str
-        .parse()
-        .map_err(|_| format!("invalid memory value: {value_str}"))?;
-
-    if value <= 0.0 {
-        return Err("memory value must be positive".to_string());
-    }
-
-    let gib = match unit {
-        "Gi" | "GiB" => Ok(value),
-        "Mi" | "MiB" => Ok(value / 1024.0),
-        _ => Err(format!("unsupported memory unit: {unit}")),
-    }?;
-    if gib > 1024.0 {
-        return Err("memory value too large (max 1024Gi)".to_string());
-    }
-    Ok(gib)
-}
-
 fn validate_workload_security_profile(
     value: Option<&str>,
 ) -> Result<WorkloadSecurityProfile, (StatusCode, Json<serde_json::Value>)> {
@@ -250,7 +288,7 @@ fn validate_workload_security_profile(
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))
 }
 
-fn signed_descriptor_profile(
+pub(crate) fn signed_descriptor_profile(
     descriptor: &enclava_common::descriptor::DeploymentDescriptor,
 ) -> Option<WorkloadSecurityProfile> {
     let sec = &descriptor.oci_runtime_spec.security_context;
@@ -783,89 +821,6 @@ async fn deploy_app_candidate(
             })?
     };
 
-    // Enforce core entitlement resource limits.
-    if let Some(ref resources) = body.resources {
-        let org: crate::models::Organization =
-            sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
-                .bind(auth.org_id)
-                .fetch_one(&state.db)
-                .await
-                .map_err(|_| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "database error"})),
-                    )
-                })?;
-
-        let entitlement_class = org.entitlement_class.clone();
-        let decision = crate::entitlements::entitlement_decision_for_org(
-            &state.db,
-            auth.org_id,
-            &entitlement_class,
-        )
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-        })?;
-        if !decision.deploy_allowed {
-            return Err(deploy_blocked_response(
-                StatusCode::FORBIDDEN,
-                decision
-                    .deploy_block_reason
-                    .as_deref()
-                    .unwrap_or("entitlement_blocked"),
-                format!("Org entitlement class {entitlement_class} does not allow deploys"),
-            ));
-        }
-        let limits = decision.limits.ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "unknown entitlement class"})),
-        ))?;
-
-        if let Some(ref cpu) = resources.cpu {
-            let requested: f64 = cpu.parse().unwrap_or(0.0);
-            let allowed: f64 = limits.max_cpu.parse().unwrap_or(0.0);
-            if requested > allowed {
-                return Err(deploy_blocked_response(
-                    StatusCode::FORBIDDEN,
-                    "entitlement_cpu_limit",
-                    format!(
-                        "Org entitlement class {entitlement_class} allows max {} CPU, requested {cpu}. Increase the entitlement class or lower the requested CPU.",
-                        limits.max_cpu
-                    ),
-                ));
-            }
-        }
-
-        if let Some(ref memory) = resources.memory {
-            let requested = parse_memory_gi(memory).map_err(|e| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"error": e})),
-                )
-            })?;
-            let allowed = parse_memory_gi(&limits.max_memory).map_err(|_| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "invalid entitlement memory limit"})),
-                )
-            })?;
-            if requested > allowed {
-                return Err(deploy_blocked_response(
-                    StatusCode::FORBIDDEN,
-                    "entitlement_memory_limit",
-                    format!(
-                        "Org entitlement class {entitlement_class} allows max {} memory, requested {memory}. Increase the entitlement class or lower the requested memory.",
-                        limits.max_memory
-                    ),
-                ));
-            }
-        }
-    }
-
     let container_name = body.container_name.as_deref().unwrap_or("web");
     let signed_workload_command = match signing_artifacts.as_ref() {
         Some(artifacts) => {
@@ -900,7 +855,7 @@ async fn deploy_app_candidate(
                 )
             })?
     };
-    let app_resources: AppResources = if app_mutation == AppMutation::Insert {
+    let base_resources: AppResources = if app_mutation == AppMutation::Insert {
         AppResources {
             app_id: app.id,
             cpu_limit: "1".to_string(),
@@ -924,9 +879,56 @@ async fn deploy_app_candidate(
         crate::deploy::ExistingAppAuthoritySnapshot::new(
             app.updated_at,
             candidate_containers.clone(),
-            app_resources.clone(),
+            base_resources.clone(),
         )
     });
+    let mut candidate_resources = base_resources;
+    if let Some(resources) = body.resources.as_ref() {
+        if let Some(cpu) = resources.cpu.as_ref() {
+            candidate_resources.cpu_limit = cpu.clone();
+        }
+        if let Some(memory) = resources.memory.as_ref() {
+            candidate_resources.memory_limit = memory.clone();
+        }
+        if let Some(storage) = resources.storage.as_ref() {
+            candidate_resources.app_data_size = storage.clone();
+        }
+    }
+
+    // Fail fast on malformed or over-limit candidate values. Acceptance
+    // repeats this check under the entitlement lane against the latest
+    // management/entitlement generation.
+    let org: crate::models::Organization =
+        sqlx::query_as("SELECT * FROM organizations WHERE id = $1")
+            .bind(auth.org_id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let early_entitlement = crate::entitlements::entitlement_decision_for_org(
+        &state.db,
+        auth.org_id,
+        &org.entitlement_class,
+    )
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    if !early_entitlement.deploy_allowed {
+        return Err(deploy_blocked_response(
+            StatusCode::FORBIDDEN,
+            early_entitlement
+                .deploy_block_reason
+                .as_deref()
+                .unwrap_or("entitlement_blocked"),
+            "organization authority does not allow deploys".to_string(),
+        ));
+    }
+    let early_limits = early_entitlement.limits.as_ref().ok_or_else(|| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authoritative entitlement limits are missing",
+        )
+    })?;
+    crate::entitlements::validate_resource_limits(&candidate_resources, early_limits)
+        .map_err(resource_limit_error_response)?;
     let candidate_container = if let Some(container) = candidate_containers
         .iter_mut()
         .find(|row| row.name == container_name)
@@ -986,7 +988,7 @@ async fn deploy_app_candidate(
             &api_signing_pubkey,
             &state.api_url,
             &candidate_containers,
-            &app_resources,
+            &candidate_resources,
         )
         .map_err(|e| {
             (
@@ -1084,6 +1086,12 @@ async fn deploy_app_candidate(
         "image_digest": &image_digest,
         "container_name": container_name,
         "resources": body.resources,
+        "resolved_resources": {
+            "cpu": &candidate_resources.cpu_limit,
+            "memory": &candidate_resources.memory_limit,
+            "storage": &candidate_resources.app_data_size,
+            "tls_storage": &candidate_resources.tls_data_size,
+        },
         "external_id": &body.external_id,
         "source_provider": source_provider,
         "source_repository": &body.source_repository,
@@ -1116,9 +1124,30 @@ async fn deploy_app_candidate(
             Json(serde_json::json!({"error": "database error"})),
         )
     })?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, auth.org_id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    if signing_artifacts.is_some() {
+        crate::signing_service::lock_org_signing_authority_lane(&mut tx, auth.org_id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    }
     crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    enforce_authoritative_entitlement(
+        &mut tx,
+        auth.org_id,
+        &candidate_resources,
+        app_mutation == AppMutation::Insert,
+    )
+    .await?;
+    if let Some(artifacts) = signing_artifacts.as_ref() {
+        artifacts
+            .validate_customer_authority_in_tx(&mut tx)
+            .await
+            .map_err(signing_error_response)?;
+    }
     if let Some(expected) = existing_authority_snapshot.as_ref()
         && !crate::deploy::lock_and_verify_existing_app_authority(&mut tx, app.id, expected)
             .await
@@ -1222,12 +1251,6 @@ async fn deploy_app_candidate(
                     json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
                 }
             })?;
-            sqlx::query("INSERT INTO app_resources (app_id) VALUES ($1)")
-                .bind(app.id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-
             insert_transaction_audit(
                 &mut tx,
                 auth.org_id,
@@ -1245,6 +1268,26 @@ async fn deploy_app_candidate(
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
         }
     }
+
+    sqlx::query(
+        "INSERT INTO app_resources (
+             app_id, cpu_limit, memory_limit, app_data_size, tls_data_size
+         )
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (app_id) DO UPDATE SET
+             cpu_limit = EXCLUDED.cpu_limit,
+             memory_limit = EXCLUDED.memory_limit,
+             app_data_size = EXCLUDED.app_data_size,
+             tls_data_size = EXCLUDED.tls_data_size",
+    )
+    .bind(candidate_resources.app_id)
+    .bind(&candidate_resources.cpu_limit)
+    .bind(&candidate_resources.memory_limit)
+    .bind(&candidate_resources.app_data_size)
+    .bind(&candidate_resources.tls_data_size)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
     sqlx::query(
         "INSERT INTO app_containers (
@@ -1402,7 +1445,7 @@ async fn deploy_app_candidate(
     let api_url = state.api_url.clone();
     let apply_app = app.clone();
     let apply_snapshot =
-        crate::deploy::DeploymentApplySnapshot::new(candidate_containers, app_resources);
+        crate::deploy::DeploymentApplySnapshot::new(candidate_containers, candidate_resources);
     let apply_permits = state.deployment_apply_permits.clone();
     let (local_workload_artifacts_json, local_trustee_policy_json) =
         local_verification_artifacts.unzip();
@@ -1671,14 +1714,6 @@ mod tests {
             public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
             public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
         }
-    }
-
-    #[test]
-    fn parse_memory_gi_validates_after_unit_conversion() {
-        assert_eq!(parse_memory_gi("8Gi").expect("8Gi"), 8.0);
-        assert_eq!(parse_memory_gi("8192Mi").expect("8192Mi"), 8.0);
-        assert_eq!(parse_memory_gi("1048576Mi").expect("1024Gi in Mi"), 1024.0);
-        assert!(parse_memory_gi("1048577Mi").is_err());
     }
 
     #[test]
@@ -2057,6 +2092,7 @@ mod tests {
     async fn audit_insert_failure_aborts_the_candidate_transaction() {
         let pool = database_test_pool().await;
         let app = insert_setup_test_app(&pool).await;
+        insert_authority_rows(&pool, &app).await;
         let suffix = app.id.simple().to_string();
         let function_name = format!("cap_test_block_audit_{suffix}");
         let trigger_name = format!("cap_test_block_audit_trigger_{suffix}");
@@ -2089,6 +2125,17 @@ mod tests {
             .execute(&mut *tx)
             .await
             .expect("mutate candidate transaction");
+        sqlx::query(
+            "UPDATE app_resources
+                SET cpu_limit = '2.0000000000000000001',
+                    memory_limit = '3Gi',
+                    app_data_size = '7Gi'
+              WHERE app_id = $1",
+        )
+        .bind(app.id)
+        .execute(&mut *tx)
+        .await
+        .expect("mutate exact candidate resources");
         let audit_error = insert_transaction_audit(
             &mut tx,
             app.org_id,
@@ -2109,6 +2156,15 @@ mod tests {
                 .await
                 .expect("load rolled-back organization");
         assert_eq!(display_name, None);
+        let persisted_resources: AppResources =
+            sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load rolled-back resources");
+        assert_eq!(persisted_resources.cpu_limit, "1");
+        assert_eq!(persisted_resources.memory_limit, "1Gi");
+        assert_eq!(persisted_resources.app_data_size, "5Gi");
 
         sqlx::query(&format!("DROP TRIGGER {trigger_name} ON audit_log"))
             .execute(&pool)
