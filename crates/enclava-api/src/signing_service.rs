@@ -1041,6 +1041,44 @@ pub struct LoadedWorkloadArtifacts {
     pub signed_policy_artifact: SignedPolicyArtifact,
     pub workload_artifacts_json: String,
     pub trustee_policy_json: String,
+    signing_artifacts: DeploymentSigningArtifacts,
+}
+
+impl LoadedWorkloadArtifacts {
+    /// Revalidate every stored cryptographic relationship at dispatch time.
+    /// Acceptance-time checks are not enough for a durable queue: the org's
+    /// latest keyring and the platform signing key may have changed while a
+    /// job waited or a stored JSON value may have been corrupted.
+    pub async fn validate_stored_authority(
+        &self,
+        pool: &PgPool,
+        app: &App,
+        image_digest: &str,
+        api_signing_pubkey: &str,
+        signing_service_pubkey_hex: &str,
+    ) -> Result<(), SigningServiceError> {
+        self.signing_artifacts
+            .validate_deployment_inputs(app, image_digest, api_signing_pubkey)?;
+        self.signing_artifacts
+            .validate_customer_authority(pool)
+            .await?;
+        self.signing_artifacts
+            .validate_signed_artifact(&self.signed_policy_artifact, signing_service_pubkey_hex)?;
+        // This also ensures the stored policy's attached keyring, signature,
+        // and signing key are the authority used for descriptor verification.
+        let mut artifact = self.signed_policy_artifact.clone();
+        self.signing_artifacts
+            .attach_customer_authority(&mut artifact)?;
+        Ok(())
+    }
+
+    pub fn validate_rendered_cc_init_data_hash(
+        &self,
+        actual_hash_hex: &str,
+    ) -> Result<(), SigningServiceError> {
+        self.signing_artifacts
+            .validate_rendered_cc_init_data_hash(actual_hash_hex)
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1092,6 +1130,53 @@ fn decode_loaded_workload_artifacts(
         "artifact.metadata.descriptor_signing_pubkey",
         &signed_policy_artifact.metadata.descriptor_signing_pubkey,
     )?;
+    let attached_keyring: OrgKeyringEnvelope =
+        serde_json::from_value(signed_policy_artifact.org_keyring.clone().ok_or_else(|| {
+            SigningServiceError::Mismatch("artifact.org_keyring missing".into())
+        })?)?;
+    let descriptor_signature: [u8; 64] =
+        row.descriptor_signature
+            .clone()
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                SigningServiceError::Blob(format!(
+                    "descriptor_signature must be 64 bytes, got {}",
+                    bytes.len()
+                ))
+            })?;
+    let org_keyring_signature: [u8; 64] =
+        row.org_keyring_signature
+            .clone()
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                SigningServiceError::Blob(format!(
+                    "org_keyring_signature must be 64 bytes, got {}",
+                    bytes.len()
+                ))
+            })?;
+    if keyring_fingerprint(&attached_keyring.keyring) != keyring_fingerprint(&org_keyring)
+        || attached_keyring.signature != org_keyring_signature
+    {
+        return Err(SigningServiceError::Mismatch(
+            "artifact.org_keyring does not match stored authority".into(),
+        ));
+    }
+    let org_keyring_fingerprint = keyring_fingerprint(&org_keyring);
+    let org_keyring_envelope = serde_json::to_value(&attached_keyring)?;
+    let signing_artifacts = DeploymentSigningArtifacts {
+        customer_descriptor_blob: String::new(),
+        org_keyring_blob: String::new(),
+        org_keyring_envelope,
+        descriptor: descriptor.clone(),
+        descriptor_signature,
+        descriptor_signing_key_id: row.descriptor_signing_key_id.clone(),
+        descriptor_signing_pubkey,
+        descriptor_core_hash: stored_descriptor_core_hash,
+        org_keyring: org_keyring.clone(),
+        org_keyring_signature,
+        org_keyring_signing_pubkey: attached_keyring.signing_pubkey,
+        org_keyring_fingerprint,
+    };
     let artifacts_json = serde_json::json!({
         "descriptor_payload": row.descriptor_payload,
         "descriptor_signature": hex::encode(row.descriptor_signature),
@@ -1107,11 +1192,12 @@ fn decode_loaded_workload_artifacts(
         binding: WorkloadArtifactBinding {
             descriptor_core_hash: stored_descriptor_core_hash,
             descriptor_signing_pubkey,
-            org_keyring_fingerprint: keyring_fingerprint(&org_keyring),
+            org_keyring_fingerprint,
         },
         trustee_policy_json: serde_json::to_string(&signed_policy_artifact)?,
         workload_artifacts_json: serde_json::to_string(&artifacts_json)?,
         signed_policy_artifact,
+        signing_artifacts,
     })
 }
 

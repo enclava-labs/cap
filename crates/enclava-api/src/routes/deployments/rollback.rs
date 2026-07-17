@@ -133,11 +133,11 @@ pub async fn rollback(
         ));
     }
 
-    if customer_signed_deploy_required(
+    let signed_required = customer_signed_deploy_required(
         state.attestation.as_ref(),
         state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
-    ) && rollback_artifacts.is_none()
-    {
+    );
+    if signed_required && rollback_artifacts.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -163,11 +163,7 @@ pub async fn rollback(
     let rollback_storage_paths = rollback_artifacts
         .as_ref()
         .map(|artifacts| crate::deploy::descriptor_storage_paths(&artifacts.descriptor));
-    if customer_signed_deploy_required(
-        state.attestation.as_ref(),
-        state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
-    ) && rollback_workload_command.is_none()
-    {
+    if signed_required && rollback_workload_command.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -430,9 +426,15 @@ pub async fn rollback(
         rollback_log_encryption,
         false,
     );
-    crate::deployment_jobs::insert_ready_job(&mut tx, deploy_id, &apply_payload)
-        .await
-        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    crate::deployment_jobs::insert_ready_job(
+        &mut tx,
+        deploy_id,
+        prev.id,
+        &apply_payload,
+        signed_required,
+    )
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     tx.commit().await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

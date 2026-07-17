@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use sqlx::types::Json;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
@@ -29,8 +29,11 @@ pub const DEPLOYMENT_SETUP_ACCEPTED: &str = "accepted";
 pub const DEPLOYMENT_SETUP_FAILED: &str = "failed";
 pub const DEPLOYMENT_SETUP_FAILED_MESSAGE: &str = "deployment_setup_failed";
 const DEPLOYMENT_APPLY_FAILED_MESSAGE: &str = "deployment_apply_failed";
-const JOB_PAYLOAD_VERSION: u32 = 1;
+const JOB_PAYLOAD_VERSION: i32 = 1;
+const MIN_SUPPORTED_JOB_PAYLOAD_VERSION: i32 = 1;
+const MAX_SUPPORTED_JOB_PAYLOAD_VERSION: i32 = JOB_PAYLOAD_VERSION;
 const LEASE_INTERVAL_SQL: &str = "90 seconds";
+const SETUP_RECOVERY_DELAY_SQL: &str = "5 seconds";
 const CLEANUP_RETRY_INTERVAL_SQL: &str = "30 seconds";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -46,7 +49,7 @@ fn apply_worker_limit(configured_apply_concurrency: usize) -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentApplyJobPayload {
-    version: u32,
+    version: i32,
     pub app: App,
     pub snapshot: DeploymentApplySnapshot,
     pub attestation_config: Option<AttestationConfig>,
@@ -87,8 +90,11 @@ impl DeploymentApplyJobPayload {
         }
     }
 
-    fn validate(&self) -> Result<(), DeploymentJobError> {
+    fn validate_for_app(&self, app_id: Uuid, org_id: Uuid) -> Result<(), DeploymentJobError> {
         if self.version != JOB_PAYLOAD_VERSION {
+            return Err(DeploymentJobError::InvalidPayload);
+        }
+        if self.app.id != app_id || self.app.org_id != org_id {
             return Err(DeploymentJobError::InvalidPayload);
         }
         if self.snapshot.containers.is_empty() {
@@ -108,19 +114,104 @@ impl DeploymentApplyJobPayload {
         }
         Ok(())
     }
+
+    fn canonical_value_and_hash(
+        &self,
+    ) -> Result<(serde_json::Value, [u8; 32]), DeploymentJobError> {
+        let value = canonicalize_json(
+            serde_json::to_value(self).map_err(|_| DeploymentJobError::InvalidPayload)?,
+        );
+        Ok((value.clone(), canonical_payload_hash(&value)?))
+    }
+}
+
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let mut entries: Vec<_> = values.into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in entries {
+                canonical.insert(key, canonicalize_json(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        scalar => scalar,
+    }
+}
+
+fn canonical_payload_hash(value: &serde_json::Value) -> Result<[u8; 32], DeploymentJobError> {
+    let canonical = canonicalize_json(value.clone());
+    let bytes = serde_json::to_vec(&canonical).map_err(|_| DeploymentJobError::InvalidPayload)?;
+    Ok(Sha256::digest(bytes).into())
 }
 
 #[derive(Debug, Clone)]
 pub struct SetupJobLease {
     pub deployment_id: Uuid,
-    pub lock_token: Uuid,
 }
 
 #[derive(Debug, sqlx::FromRow)]
 struct ClaimedJob {
     deployment_id: Uuid,
+    app_id: Uuid,
+    org_id: Uuid,
+    source_deployment_id: Uuid,
+    payload_version: i32,
     lock_token: Uuid,
     payload: serde_json::Value,
+    payload_sha256: Vec<u8>,
+    cleanup_app_on_setup_failure: bool,
+    signed_required: bool,
+    artifact_deployment_id: Option<Uuid>,
+    artifact_descriptor_core_hash: Option<Vec<u8>>,
+    log_encryption: Option<serde_json::Value>,
+}
+
+impl ClaimedJob {
+    fn artifact_descriptor_core_hash(&self) -> Result<Option<[u8; 32]>, DeploymentJobError> {
+        self.artifact_descriptor_core_hash
+            .as_ref()
+            .map(|bytes| {
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| DeploymentJobError::InvalidPayload)
+            })
+            .transpose()
+    }
+
+    fn decode_payload(&self) -> Result<DeploymentApplyJobPayload, DeploymentJobError> {
+        if !(MIN_SUPPORTED_JOB_PAYLOAD_VERSION..=MAX_SUPPORTED_JOB_PAYLOAD_VERSION)
+            .contains(&self.payload_version)
+        {
+            return Err(DeploymentJobError::UnsupportedPayloadVersion);
+        }
+        let actual_hash = canonical_payload_hash(&self.payload)?;
+        if actual_hash.as_slice() != self.payload_sha256.as_slice() {
+            return Err(DeploymentJobError::InvalidPayload);
+        }
+        let payload: DeploymentApplyJobPayload = serde_json::from_value(self.payload.clone())
+            .map_err(|_| DeploymentJobError::InvalidPayload)?;
+        payload.validate_for_app(self.app_id, self.org_id)?;
+        if payload.version != self.payload_version
+            || payload.delete_app_on_setup_failure != self.cleanup_app_on_setup_failure
+            || payload.artifact_deployment_id != self.artifact_deployment_id
+            || payload.artifact_descriptor_core_hash != self.artifact_descriptor_core_hash()?
+            || serde_json::to_value(&payload.log_encryption)
+                .map_err(|_| DeploymentJobError::InvalidPayload)?
+                != self
+                    .log_encryption
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null)
+        {
+            return Err(DeploymentJobError::InvalidPayload);
+        }
+        Ok(payload)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -131,6 +222,10 @@ pub enum DeploymentJobError {
     Dns(#[from] crate::dns::DnsError),
     #[error("invalid durable deployment payload")]
     InvalidPayload,
+    #[error("unsupported durable deployment payload version")]
+    UnsupportedPayloadVersion,
+    #[error("durable deployment setup failed")]
+    SetupFailed,
     #[error("stored deployment artifact is unavailable or malformed")]
     Artifact,
     #[error("deployment job lease was lost")]
@@ -149,6 +244,8 @@ impl DeploymentJobError {
             Self::Db(_) => "database_error",
             Self::Dns(_) => "dns_setup_error",
             Self::InvalidPayload => "invalid_job_payload",
+            Self::UnsupportedPayloadVersion => "unsupported_job_payload_version",
+            Self::SetupFailed => "deployment_setup_failed",
             Self::Artifact => "artifact_invalid",
             Self::LeaseLost => "lease_lost",
             Self::Apply(_) => "deployment_apply_error",
@@ -168,48 +265,116 @@ fn dns_error_code(error: &crate::dns::DnsError) -> &'static str {
     }
 }
 
-/// Insert a setup-owned job in the same transaction as the deployment.
+/// Insert an unowned setup job in the same transaction as the deployment.
 ///
-/// The returned token belongs to the request handler.  If that process exits,
-/// another API replica can reclaim the lease after `locked_until`.
+/// A request cannot safely own a lease until its transaction commits: the
+/// transaction timestamp may be arbitrarily old and the worker cannot renew a
+/// row that is not visible yet. The request claims this handle after commit,
+/// immediately renews it with `clock_timestamp()`, and only then performs DNS
+/// side effects.
 pub async fn insert_setup_job(
     tx: &mut Transaction<'_, Postgres>,
     deployment_id: Uuid,
+    source_deployment_id: Uuid,
     payload: &DeploymentApplyJobPayload,
+    signed_required: bool,
 ) -> Result<SetupJobLease, DeploymentJobError> {
-    payload.validate()?;
-    let lock_token = Uuid::new_v4();
+    let (app_id, org_id) =
+        sqlx::query_as::<_, (Uuid, Uuid)>("SELECT app_id, org_id FROM deployments WHERE id = $1")
+            .bind(deployment_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(DeploymentJobError::InvalidPayload)?;
+    payload.validate_for_app(app_id, org_id)?;
+    let (payload_value, payload_sha256) = payload.canonical_value_and_hash()?;
+    let log_encryption = payload
+        .log_encryption
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|_| DeploymentJobError::InvalidPayload)?;
     sqlx::query(
         "INSERT INTO deployment_apply_jobs (
-             deployment_id, payload, state, lock_token, locked_until
+             deployment_id, app_id, org_id, source_deployment_id,
+             payload_version, payload, payload_sha256,
+             cleanup_app_on_setup_failure, signed_required,
+             artifact_deployment_id, artifact_descriptor_core_hash,
+             log_encryption, state, next_attempt_at
          )
-         VALUES ($1, $2, 'setting_up', $3, now() + $4::interval)",
+         VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+             'setup_pending', clock_timestamp() + $13::interval
+         )",
     )
     .bind(deployment_id)
-    .bind(Json(payload))
-    .bind(lock_token)
-    .bind(LEASE_INTERVAL_SQL)
+    .bind(app_id)
+    .bind(org_id)
+    .bind(source_deployment_id)
+    .bind(JOB_PAYLOAD_VERSION)
+    .bind(payload_value)
+    .bind(payload_sha256.to_vec())
+    .bind(payload.delete_app_on_setup_failure)
+    .bind(signed_required)
+    .bind(payload.artifact_deployment_id)
+    .bind(
+        payload
+            .artifact_descriptor_core_hash
+            .map(|hash| hash.to_vec()),
+    )
+    .bind(log_encryption)
+    .bind(SETUP_RECOVERY_DELAY_SQL)
     .execute(&mut **tx)
     .await?;
-    Ok(SetupJobLease {
-        deployment_id,
-        lock_token,
-    })
+    Ok(SetupJobLease { deployment_id })
 }
 
 /// Insert a job whose setup was already satisfied (for example rollback).
 pub async fn insert_ready_job(
     tx: &mut Transaction<'_, Postgres>,
     deployment_id: Uuid,
+    source_deployment_id: Uuid,
     payload: &DeploymentApplyJobPayload,
+    signed_required: bool,
 ) -> Result<(), DeploymentJobError> {
-    payload.validate()?;
+    let (app_id, org_id) =
+        sqlx::query_as::<_, (Uuid, Uuid)>("SELECT app_id, org_id FROM deployments WHERE id = $1")
+            .bind(deployment_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(DeploymentJobError::InvalidPayload)?;
+    payload.validate_for_app(app_id, org_id)?;
+    let (payload_value, payload_sha256) = payload.canonical_value_and_hash()?;
+    let log_encryption = payload
+        .log_encryption
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|_| DeploymentJobError::InvalidPayload)?;
     sqlx::query(
-        "INSERT INTO deployment_apply_jobs (deployment_id, payload, state)
-         VALUES ($1, $2, 'pending')",
+        "INSERT INTO deployment_apply_jobs (
+             deployment_id, app_id, org_id, source_deployment_id,
+             payload_version, payload, payload_sha256,
+             cleanup_app_on_setup_failure, signed_required,
+             artifact_deployment_id, artifact_descriptor_core_hash,
+             log_encryption, state
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending')",
     )
     .bind(deployment_id)
-    .bind(Json(payload))
+    .bind(app_id)
+    .bind(org_id)
+    .bind(source_deployment_id)
+    .bind(JOB_PAYLOAD_VERSION)
+    .bind(payload_value)
+    .bind(payload_sha256.to_vec())
+    .bind(payload.delete_app_on_setup_failure)
+    .bind(signed_required)
+    .bind(payload.artifact_deployment_id)
+    .bind(
+        payload
+            .artifact_descriptor_core_hash
+            .map(|hash| hash.to_vec()),
+    )
+    .bind(log_encryption)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -220,37 +385,84 @@ pub async fn process_setup_job(
     state: &AppState,
     lease: SetupJobLease,
 ) -> Result<(), DeploymentJobError> {
-    let payload = match load_leased_payload(
+    if let Some(job) = claim_job(
         &state.db,
-        lease.deployment_id,
-        lease.lock_token,
+        "setup_pending",
         "setting_up",
+        Some(lease.deployment_id),
     )
-    .await
+    .await?
     {
+        return process_claimed_setup_job(state, job).await;
+    }
+
+    // A dispatcher may have claimed the durable row in the small interval
+    // between request commit and this call. Never return a false 500 or start
+    // duplicate DNS work. Observe that owner; if its lease expires, reclaim by
+    // ID, otherwise return once setup reaches an accepted/terminal state.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2 * 90 + 5);
+    loop {
+        let row = sqlx::query_as::<_, (String, bool)>(
+            "SELECT state,
+                    COALESCE(locked_until < clock_timestamp(), false)
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1",
+        )
+        .bind(lease.deployment_id)
+        .fetch_optional(&state.db)
+        .await?;
+        match row {
+            Some((job_state, _))
+                if matches!(job_state.as_str(), "pending" | "running" | "completed") =>
+            {
+                return Ok(());
+            }
+            Some((job_state, _))
+                if matches!(
+                    job_state.as_str(),
+                    "failed" | "cleanup_pending" | "cleaning_up"
+                ) =>
+            {
+                return Err(DeploymentJobError::SetupFailed);
+            }
+            Some((job_state, expired))
+                if job_state == "setup_pending" || (job_state == "setting_up" && expired) =>
+            {
+                if let Some(job) = claim_job(
+                    &state.db,
+                    "setup_pending",
+                    "setting_up",
+                    Some(lease.deployment_id),
+                )
+                .await?
+                {
+                    return process_claimed_setup_job(state, job).await;
+                }
+            }
+            Some(_) => {}
+            None => return Err(DeploymentJobError::SetupFailed),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // The job remains durable and owned. Returning success here means
+            // "accepted for asynchronous setup", not that DNS succeeded.
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn process_claimed_setup_job(
+    state: &AppState,
+    job: ClaimedJob,
+) -> Result<(), DeploymentJobError> {
+    let payload = match job.decode_payload() {
         Ok(payload) => payload,
         Err(error @ DeploymentJobError::InvalidPayload) => {
-            fail_unreadable_job(
-                &state.db,
-                lease.deployment_id,
-                lease.lock_token,
-                "setting_up",
-            )
-            .await;
+            fail_unreadable_job(&state.db, &job, "setting_up").await;
             return Err(error);
         }
         Err(error) => return Err(error),
     };
-    if let Err(error) = payload.validate() {
-        fail_unreadable_job(
-            &state.db,
-            lease.deployment_id,
-            lease.lock_token,
-            "setting_up",
-        )
-        .await;
-        return Err(error);
-    }
 
     let setup = async {
         let tee_domain = payload
@@ -262,70 +474,43 @@ pub async fn process_setup_job(
             &state.db,
             &state.http_client,
             state.dns.as_ref(),
-            payload.app.id,
+            job.app_id,
             &payload.app.domain,
             tee_domain,
         )
         .await?;
         if let Some(custom_domain) = payload.app.custom_domain.as_ref() {
-            crate::dns::record_custom_domain(&state.db, payload.app.id, custom_domain).await?;
+            crate::dns::record_custom_domain(&state.db, job.app_id, custom_domain).await?;
         }
         Ok::<(), crate::dns::DnsError>(())
     };
 
     match with_lease_heartbeat(
         &state.db,
-        lease.deployment_id,
-        lease.lock_token,
+        job.deployment_id,
+        job.lock_token,
         "setting_up",
         setup,
     )
     .await?
     {
-        Ok(()) => mark_setup_accepted(&state.db, lease.deployment_id, lease.lock_token).await,
+        Ok(()) => mark_setup_accepted(&state.db, job.deployment_id, job.lock_token).await,
         Err(error) => {
-            mark_setup_failed(
-                &state.db,
-                &payload.app,
-                lease.deployment_id,
-                lease.lock_token,
-                payload.delete_app_on_setup_failure,
-            )
-            .await?;
-            if payload.delete_app_on_setup_failure {
-                process_cleanup_job(
-                    state,
-                    lease.deployment_id,
-                    lease.lock_token,
-                    payload.clone(),
+            mark_setup_failed(&state.db, &job).await?;
+            if job.cleanup_app_on_setup_failure
+                && let Some(cleanup_job) = claim_job(
+                    &state.db,
+                    "cleanup_pending",
+                    "cleaning_up",
+                    Some(job.deployment_id),
                 )
-                .await;
+                .await?
+            {
+                process_cleanup_job(state, cleanup_job).await;
             }
             Err(DeploymentJobError::Dns(error))
         }
     }
-}
-
-async fn load_leased_payload(
-    pool: &PgPool,
-    deployment_id: Uuid,
-    lock_token: Uuid,
-    state: &str,
-) -> Result<DeploymentApplyJobPayload, DeploymentJobError> {
-    let payload = sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT payload
-           FROM deployment_apply_jobs
-          WHERE deployment_id = $1
-            AND lock_token = $2
-            AND state = $3",
-    )
-    .bind(deployment_id)
-    .bind(lock_token)
-    .bind(state)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(DeploymentJobError::LeaseLost)?;
-    serde_json::from_value(payload).map_err(|_| DeploymentJobError::InvalidPayload)
 }
 
 async fn mark_setup_accepted(
@@ -358,7 +543,7 @@ async fn mark_setup_accepted(
                 lock_token = NULL,
                 locked_until = NULL,
                 last_error_code = NULL,
-                updated_at = now()
+                updated_at = clock_timestamp()
           WHERE deployment_id = $1
             AND state = 'setting_up'
             AND lock_token = $2",
@@ -374,19 +559,43 @@ async fn mark_setup_accepted(
     Ok(())
 }
 
-async fn mark_setup_failed(
-    pool: &PgPool,
-    app: &App,
-    deployment_id: Uuid,
-    lock_token: Uuid,
-    mark_app_failed: bool,
-) -> Result<(), DeploymentJobError> {
+async fn mark_setup_failed(pool: &PgPool, claimed: &ClaimedJob) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
-    let next_setup_state = if mark_app_failed {
+    let next_setup_state = if claimed.cleanup_app_on_setup_failure {
         DEPLOYMENT_SETUP_CLEANUP_PENDING
     } else {
         DEPLOYMENT_SETUP_FAILED
     };
+    let next_job_state = if claimed.cleanup_app_on_setup_failure {
+        "cleanup_pending"
+    } else {
+        "failed"
+    };
+    let job = sqlx::query(
+        "UPDATE deployment_apply_jobs
+            SET state = $1,
+                lock_token = NULL,
+                locked_until = NULL,
+                next_attempt_at = clock_timestamp(),
+                last_error_code = $2,
+                updated_at = clock_timestamp()
+          WHERE deployment_id = $3
+            AND app_id = $4
+            AND org_id = $5
+            AND state = 'setting_up'
+            AND lock_token = $6",
+    )
+    .bind(next_job_state)
+    .bind(DEPLOYMENT_SETUP_FAILED_MESSAGE)
+    .bind(claimed.deployment_id)
+    .bind(claimed.app_id)
+    .bind(claimed.org_id)
+    .bind(claimed.lock_token)
+    .execute(&mut *tx)
+    .await?;
+    if job.rows_affected() != 1 {
+        return Err(DeploymentJobError::LeaseLost);
+    }
     let deployment = sqlx::query(
         "UPDATE deployments
             SET status = 'failed'::deploy_status_enum,
@@ -397,54 +606,30 @@ async fn mark_setup_failed(
                     true
                 ),
                 error_message = $1,
-                completed_at = now()
-          WHERE id = $2",
+                completed_at = clock_timestamp()
+          WHERE id = $2
+            AND app_id = $4
+            AND org_id = $5",
     )
     .bind(DEPLOYMENT_SETUP_FAILED_MESSAGE)
-    .bind(deployment_id)
+    .bind(claimed.deployment_id)
     .bind(next_setup_state)
+    .bind(claimed.app_id)
+    .bind(claimed.org_id)
     .execute(&mut *tx)
     .await?;
     if deployment.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
     }
-    let next_job_state = if mark_app_failed {
-        "cleaning_up"
-    } else {
-        "failed"
-    };
-    let job = sqlx::query(
-        "UPDATE deployment_apply_jobs
-            SET state = $1,
-                lock_token = CASE WHEN $1 = 'cleaning_up' THEN lock_token ELSE NULL END,
-                locked_until = CASE
-                    WHEN $1 = 'cleaning_up' THEN now() + $5::interval
-                    ELSE NULL
-                END,
-                last_error_code = $4,
-                updated_at = now()
-          WHERE deployment_id = $2
-            AND state = 'setting_up'
-            AND lock_token = $3",
-    )
-    .bind(next_job_state)
-    .bind(deployment_id)
-    .bind(lock_token)
-    .bind(DEPLOYMENT_SETUP_FAILED_MESSAGE)
-    .bind(LEASE_INTERVAL_SQL)
-    .execute(&mut *tx)
-    .await?;
-    if job.rows_affected() != 1 {
-        return Err(DeploymentJobError::LeaseLost);
-    }
-    if mark_app_failed {
+    if claimed.cleanup_app_on_setup_failure {
         sqlx::query(
             "UPDATE apps
                 SET status = 'failed'::app_status_enum,
-                    updated_at = now()
-              WHERE id = $1",
+                    updated_at = clock_timestamp()
+              WHERE id = $1 AND org_id = $2",
         )
-        .bind(app.id)
+        .bind(claimed.app_id)
+        .bind(claimed.org_id)
         .execute(&mut *tx)
         .await?;
     }
@@ -452,21 +637,17 @@ async fn mark_setup_failed(
     Ok(())
 }
 
-async fn attempt_setup_cleanup(state: &AppState, payload: &DeploymentApplyJobPayload) -> bool {
-    if !payload.delete_app_on_setup_failure {
-        return true;
-    }
-    let app = &payload.app;
+async fn attempt_setup_cleanup(state: &AppState, app_id: Uuid, org_id: Uuid) -> bool {
     if let Err(error) = crate::dns::delete_all_dns_records_for_app(
         &state.db,
         &state.http_client,
         state.dns.as_ref(),
-        app.id,
+        app_id,
     )
     .await
     {
         tracing::error!(
-            app_id = %app.id,
+            app_id = %app_id,
             error_code = dns_error_code(&error),
             "failed to clean up DNS after deployment setup failure"
         );
@@ -476,14 +657,14 @@ async fn attempt_setup_cleanup(state: &AppState, payload: &DeploymentApplyJobPay
     let records_remain = match sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(SELECT 1 FROM dns_records WHERE app_id = $1)",
     )
-    .bind(app.id)
+    .bind(app_id)
     .fetch_one(&state.db)
     .await
     {
         Ok(remaining) => remaining,
         Err(_error) => {
             tracing::error!(
-                app_id = %app.id,
+                app_id = %app_id,
                 error_code = "database_error",
                 "failed to verify DNS cleanup after deployment setup failure"
             );
@@ -492,19 +673,20 @@ async fn attempt_setup_cleanup(state: &AppState, payload: &DeploymentApplyJobPay
     };
     if records_remain {
         tracing::error!(
-            app_id = %app.id,
+            app_id = %app_id,
             "DNS cleanup left tracked records; retaining app for reconciliation"
         );
         return false;
     }
 
-    if let Err(_error) = sqlx::query("DELETE FROM apps WHERE id = $1")
-        .bind(app.id)
+    if let Err(_error) = sqlx::query("DELETE FROM apps WHERE id = $1 AND org_id = $2")
+        .bind(app_id)
+        .bind(org_id)
         .execute(&state.db)
         .await
     {
         tracing::error!(
-            app_id = %app.id,
+            app_id = %app_id,
             error_code = "database_error",
             "failed to compensate first generic deployment after setup failure"
         );
@@ -513,18 +695,21 @@ async fn attempt_setup_cleanup(state: &AppState, payload: &DeploymentApplyJobPay
     true
 }
 
-async fn process_cleanup_job(
-    state: &AppState,
-    deployment_id: Uuid,
-    lock_token: Uuid,
-    payload: DeploymentApplyJobPayload,
-) {
+async fn process_cleanup_job(state: &AppState, job: ClaimedJob) {
+    if !job.cleanup_app_on_setup_failure {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = "invalid_job_payload",
+            "refused cleanup job without relational cleanup ownership"
+        );
+        return;
+    }
     let outcome = with_lease_heartbeat(
         &state.db,
-        deployment_id,
-        lock_token,
+        job.deployment_id,
+        job.lock_token,
         "cleaning_up",
-        attempt_setup_cleanup(state, &payload),
+        attempt_setup_cleanup(state, job.app_id, job.org_id),
     )
     .await;
     match outcome {
@@ -535,17 +720,17 @@ async fn process_cleanup_job(
         }
         Ok(false) => {
             if let Err(error) =
-                release_cleanup_for_retry(&state.db, deployment_id, lock_token).await
+                release_cleanup_for_retry(&state.db, job.deployment_id, job.lock_token).await
             {
                 tracing::error!(
-                    deployment_id = %deployment_id,
+                    deployment_id = %job.deployment_id,
                     error_code = error.code(),
                     "failed to schedule durable deployment cleanup retry"
                 );
             }
         }
         Err(error) => tracing::error!(
-            deployment_id = %deployment_id,
+            deployment_id = %job.deployment_id,
             error_code = error.code(),
             "durable deployment cleanup lost its lease"
         ),
@@ -562,9 +747,9 @@ async fn release_cleanup_for_retry(
             SET state = 'cleanup_pending',
                 lock_token = NULL,
                 locked_until = NULL,
-                next_attempt_at = now() + $1::interval,
+                next_attempt_at = clock_timestamp() + $1::interval,
                 last_error_code = $2,
-                updated_at = now()
+                updated_at = clock_timestamp()
           WHERE deployment_id = $3
             AND state = 'cleaning_up'
             AND lock_token = $4",
@@ -594,21 +779,14 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
             let mut found_work = false;
 
             if let Ok(worker_slot) = setup_worker_slots.clone().try_acquire_owned() {
-                match claim_expired_setup_job(&state.db).await {
+                match claim_setup_job(&state.db).await {
                     Ok(Some(job)) => {
                         found_work = true;
                         let worker_state = state.clone();
                         tokio::spawn(async move {
                             let _worker_slot = worker_slot;
                             let deployment_id = job.deployment_id;
-                            if let Err(error) = process_setup_job(
-                                &worker_state,
-                                SetupJobLease {
-                                    deployment_id,
-                                    lock_token: job.lock_token,
-                                },
-                            )
-                            .await
+                            if let Err(error) = process_claimed_setup_job(&worker_state, job).await
                             {
                                 tracing::error!(
                                     deployment_id = %deployment_id,
@@ -624,7 +802,7 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
                             let worker_state = state.clone();
                             tokio::spawn(async move {
                                 let _worker_slot = worker_slot;
-                                process_claimed_cleanup_job(worker_state, job).await;
+                                process_cleanup_job(&worker_state, job).await;
                             });
                         }
                         Ok(None) => drop(worker_slot),
@@ -675,23 +853,22 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
     });
 }
 
-async fn claim_expired_setup_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
-    claim_job(pool, "setting_up", "setting_up", true, None).await
+async fn claim_setup_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
+    claim_job(pool, "setup_pending", "setting_up", None).await
 }
 
 async fn claim_apply_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
-    claim_job(pool, "pending", "running", false, None).await
+    claim_job(pool, "pending", "running", None).await
 }
 
 async fn claim_cleanup_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
-    claim_job(pool, "cleanup_pending", "cleaning_up", false, None).await
+    claim_job(pool, "cleanup_pending", "cleaning_up", None).await
 }
 
 async fn claim_job(
     pool: &PgPool,
     ready_state: &str,
     claimed_state: &str,
-    expired_only: bool,
     only_deployment_id: Option<Uuid>,
 ) -> Result<Option<ClaimedJob>, DeploymentJobError> {
     let lock_token = Uuid::new_v4();
@@ -699,13 +876,18 @@ async fn claim_job(
         "WITH candidate AS (
              SELECT deployment_id
                FROM deployment_apply_jobs
-              WHERE (
-                    (state = $1 AND NOT $4)
-                    OR (state = $2 AND locked_until < now())
-                    OR (state = $1 AND $4 AND locked_until < now())
-              )
-                AND next_attempt_at <= now()
-                AND ($6::uuid IS NULL OR deployment_id = $6)
+              WHERE payload_version BETWEEN $4 AND $5
+                AND (
+                    (
+                        state = $1
+                        AND (
+                            $7::uuid IS NOT NULL
+                            OR next_attempt_at <= clock_timestamp()
+                        )
+                    )
+                    OR (state = $2 AND locked_until < clock_timestamp())
+                )
+                AND ($7::uuid IS NULL OR deployment_id = $7)
               ORDER BY created_at, deployment_id
               FOR UPDATE SKIP LOCKED
               LIMIT 1
@@ -713,35 +895,28 @@ async fn claim_job(
          UPDATE deployment_apply_jobs AS job
             SET state = $2,
                 lock_token = $3,
-                locked_until = now() + $5::interval,
+                locked_until = clock_timestamp() + $6::interval,
                 attempts = attempts + 1,
-                updated_at = now()
+                updated_at = clock_timestamp()
            FROM candidate
           WHERE job.deployment_id = candidate.deployment_id
-         RETURNING job.deployment_id, job.lock_token, job.payload",
+         RETURNING job.deployment_id, job.app_id, job.org_id,
+                   job.source_deployment_id, job.payload_version,
+                   job.lock_token, job.payload, job.payload_sha256,
+                   job.cleanup_app_on_setup_failure, job.signed_required,
+                   job.artifact_deployment_id,
+                   job.artifact_descriptor_core_hash, job.log_encryption",
     )
     .bind(ready_state)
     .bind(claimed_state)
     .bind(lock_token)
-    .bind(expired_only)
+    .bind(MIN_SUPPORTED_JOB_PAYLOAD_VERSION)
+    .bind(MAX_SUPPORTED_JOB_PAYLOAD_VERSION)
     .bind(LEASE_INTERVAL_SQL)
     .bind(only_deployment_id)
     .fetch_optional(pool)
     .await?;
     Ok(job)
-}
-
-async fn process_claimed_cleanup_job(state: AppState, job: ClaimedJob) {
-    let deployment_id = job.deployment_id;
-    let lock_token = job.lock_token;
-    let payload = match serde_json::from_value::<DeploymentApplyJobPayload>(job.payload) {
-        Ok(payload) if payload.validate().is_ok() => payload,
-        Ok(_) | Err(_) => {
-            fail_unreadable_job(&state.db, deployment_id, lock_token, "cleaning_up").await;
-            return;
-        }
-    };
-    process_cleanup_job(&state, deployment_id, lock_token, payload).await;
 }
 
 async fn process_apply_job(
@@ -751,12 +926,13 @@ async fn process_apply_job(
 ) {
     let deployment_id = job.deployment_id;
     let lock_token = job.lock_token;
-    let payload = match serde_json::from_value::<DeploymentApplyJobPayload>(job.payload) {
-        Ok(payload) if payload.validate().is_ok() => payload,
-        Ok(_) | Err(_) => {
-            fail_unreadable_job(&state.db, deployment_id, lock_token, "running").await;
+    let payload = match job.decode_payload() {
+        Ok(payload) => payload,
+        Err(DeploymentJobError::InvalidPayload) => {
+            fail_unreadable_job(&state.db, &job, "running").await;
             return;
         }
+        Err(_) => return,
     };
 
     let result = with_lease_heartbeat(
@@ -764,16 +940,13 @@ async fn process_apply_job(
         deployment_id,
         lock_token,
         "running",
-        apply_claimed_job(&state, deployment_id, &payload),
+        apply_claimed_job(&state, &job, &payload),
     )
     .await;
 
     match result {
         Ok(Ok(JobApplyOutcome::Applied(outcome))) => {
-            if let Err(error) =
-                publish_rollout_outcome(&state.db, deployment_id, lock_token, &payload, &outcome)
-                    .await
-            {
+            if let Err(error) = publish_rollout_outcome(&state.db, &job, &outcome).await {
                 tracing::error!(
                     deployment_id = %deployment_id,
                     error_code = error.code(),
@@ -793,7 +966,7 @@ async fn process_apply_job(
             }
         }
         Ok(Err(error)) => {
-            fail_apply_job(&state, deployment_id, lock_token, &payload.app, &error).await;
+            fail_apply_job(&state, &job, &error).await;
         }
         Err(error) => {
             tracing::error!(
@@ -805,35 +978,52 @@ async fn process_apply_job(
     }
 }
 
-async fn fail_unreadable_job(
-    pool: &PgPool,
-    deployment_id: Uuid,
-    lock_token: Uuid,
-    claimed_state: &str,
-) {
-    let setup_phase = matches!(claimed_state, "setting_up" | "cleaning_up");
+async fn fail_unreadable_job(pool: &PgPool, claimed: &ClaimedJob, claimed_state: &str) {
+    let setup_phase = claimed_state == "setting_up";
     let failure_code = if setup_phase {
         DEPLOYMENT_SETUP_FAILED_MESSAGE
     } else {
         DEPLOYMENT_APPLY_FAILED_MESSAGE
     };
+    // Mandatory first-app cleanup is relational. Even completely malformed
+    // JSON remains recoverable: quarantine setup, then let cleanup use app_id.
+    let cleanup_pending = setup_phase && claimed.cleanup_app_on_setup_failure;
+    let next_job_state = if cleanup_pending {
+        "cleanup_pending"
+    } else {
+        "failed"
+    };
+    let next_setup_state = if cleanup_pending {
+        DEPLOYMENT_SETUP_CLEANUP_PENDING
+    } else {
+        DEPLOYMENT_SETUP_FAILED
+    };
     let result = async {
         let mut tx = pool.begin().await?;
         let job = sqlx::query(
             "UPDATE deployment_apply_jobs
-                SET state = 'failed',
+                SET state = $1,
                     lock_token = NULL,
                     locked_until = NULL,
-                    last_error_code = $1,
-                    updated_at = now()
-              WHERE deployment_id = $2
-                AND state = $3
-                AND lock_token = $4",
+                    next_attempt_at = CASE
+                        WHEN $1 = 'cleanup_pending' THEN clock_timestamp()
+                        ELSE next_attempt_at
+                    END,
+                    last_error_code = $2,
+                    updated_at = clock_timestamp()
+              WHERE deployment_id = $3
+                AND app_id = $4
+                AND org_id = $5
+                AND state = $6
+                AND lock_token = $7",
         )
+        .bind(next_job_state)
         .bind(failure_code)
-        .bind(deployment_id)
+        .bind(claimed.deployment_id)
+        .bind(claimed.app_id)
+        .bind(claimed.org_id)
         .bind(claimed_state)
-        .bind(lock_token)
+        .bind(claimed.lock_token)
         .execute(&mut *tx)
         .await?;
         if job.rows_affected() != 1 {
@@ -843,30 +1033,36 @@ async fn fail_unreadable_job(
             "UPDATE deployments
                 SET status = 'failed'::deploy_status_enum,
                     spec_snapshot = CASE
-                        WHEN $1 IN ('setting_up', 'cleaning_up') THEN jsonb_set(
+                        WHEN $1 = 'setting_up' THEN jsonb_set(
                             spec_snapshot,
                             '{setup_state}',
-                            '\"failed\"'::jsonb,
+                            to_jsonb($4::text),
                             true
                         )
                         ELSE spec_snapshot
                     END,
                     error_message = $2,
-                    completed_at = now()
-              WHERE id = $3",
+                    completed_at = clock_timestamp()
+              WHERE id = $3
+                AND app_id = $5
+                AND org_id = $6",
         )
         .bind(claimed_state)
         .bind(failure_code)
-        .bind(deployment_id)
+        .bind(claimed.deployment_id)
+        .bind(next_setup_state)
+        .bind(claimed.app_id)
+        .bind(claimed.org_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
             "UPDATE apps AS app
                 SET status = 'failed'::app_status_enum,
-                    updated_at = now()
+                    updated_at = clock_timestamp()
                FROM deployments AS deployment
               WHERE deployment.id = $1
-                AND app.id = deployment.app_id
+                AND app.id = $2
+                AND app.org_id = $3
                 AND deployment.id = (
                     SELECT latest.id
                       FROM deployments AS latest
@@ -875,7 +1071,9 @@ async fn fail_unreadable_job(
                      LIMIT 1
                 )",
         )
-        .bind(deployment_id)
+        .bind(claimed.deployment_id)
+        .bind(claimed.app_id)
+        .bind(claimed.org_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await
@@ -884,13 +1082,13 @@ async fn fail_unreadable_job(
 
     if result.is_err() {
         tracing::error!(
-            deployment_id = %deployment_id,
+            deployment_id = %claimed.deployment_id,
             error_code = "database_error",
             "failed to quarantine malformed durable deployment job"
         );
     } else {
         tracing::error!(
-            deployment_id = %deployment_id,
+            deployment_id = %claimed.deployment_id,
             error_code = "invalid_job_payload",
             "quarantined malformed durable deployment job"
         );
@@ -905,46 +1103,54 @@ enum JobApplyOutcome {
 
 async fn apply_claimed_job(
     state: &AppState,
-    deployment_id: Uuid,
+    job: &ClaimedJob,
     payload: &DeploymentApplyJobPayload,
 ) -> Result<JobApplyOutcome, DeploymentJobError> {
-    payload.validate()?;
-    validate_deployment_identity(&state.db, deployment_id, payload).await?;
-    if deployment_is_terminal(&state.db, deployment_id).await? {
+    payload.validate_for_app(job.app_id, job.org_id)?;
+    let primary_image_digest = validate_canonical_source_snapshot(&state.db, job, payload).await?;
+    if deployment_is_terminal(&state.db, job.deployment_id).await? {
         return Ok(JobApplyOutcome::AlreadyTerminal);
     }
 
-    let (
-        workload_artifact_binding,
-        signed_policy_artifact,
-        local_workload_artifacts_json,
-        local_trustee_policy_json,
-    ) = if let (Some(artifact_deployment_id), Some(expected_descriptor_core_hash)) = (
-        payload.artifact_deployment_id,
-        payload.artifact_descriptor_core_hash,
-    ) {
-        let loaded = crate::signing_service::load_workload_artifacts_exact(
-            &state.db,
-            payload.app.id,
-            artifact_deployment_id,
-            expected_descriptor_core_hash,
-        )
-        .await
-        .map_err(|_| DeploymentJobError::Artifact)?
-        .ok_or(DeploymentJobError::Artifact)?;
-        if loaded.descriptor.org_id != payload.app.org_id {
-            return Err(DeploymentJobError::Artifact);
-        }
-        (
-            Some(loaded.binding),
-            Some(loaded.signed_policy_artifact),
-            Some(loaded.workload_artifacts_json),
-            Some(loaded.trustee_policy_json),
-        )
-    } else {
-        (None, None, None, None)
+    // Preflight before queueing on the semaphore, then repeat after capacity is
+    // granted. The latest org keyring can change while this future waits.
+    validate_apply_artifacts(state, job, payload, &primary_image_digest).await?;
+
+    let Some((apply_permit, validated)) =
+        acquire_apply_permit_and_revalidate(state, job, payload).await?
+    else {
+        return Ok(JobApplyOutcome::AlreadyTerminal);
     };
 
+    let rollout = crate::deploy::apply_deployment_manifests(ApplyDeploymentManifestsRequest {
+        pool: state.db.clone(),
+        app: payload.app.clone(),
+        snapshot: payload.snapshot.clone(),
+        // The operation deployment remains distinct from the historical
+        // source/artifact deployment used by rollback signatures. Manifests
+        // and encrypted log frame metadata report this new operation ID.
+        deployment_id: job.deployment_id,
+        attestation_config: payload.attestation_config.clone(),
+        kbs_policy_config: state.kbs_policy.clone(),
+        api_signing_pubkey: payload.api_signing_pubkey.clone(),
+        api_url: payload.api_url.clone(),
+        workload_artifact_binding: validated.workload_artifact_binding,
+        signed_policy_artifact: validated.signed_policy_artifact,
+        local_workload_artifacts_json: validated.local_workload_artifacts_json,
+        local_trustee_policy_json: validated.local_trustee_policy_json,
+        log_encryption: payload.log_encryption.clone(),
+    })
+    .await?;
+    drop(apply_permit);
+    Ok(JobApplyOutcome::Applied(rollout.watch().await))
+}
+
+async fn acquire_apply_permit_and_revalidate(
+    state: &AppState,
+    job: &ClaimedJob,
+    payload: &DeploymentApplyJobPayload,
+) -> Result<Option<(tokio::sync::OwnedSemaphorePermit, ValidatedApplyArtifacts)>, DeploymentJobError>
+{
     let apply_permit = state
         .deployment_apply_permits
         .clone()
@@ -953,49 +1159,222 @@ async fn apply_claimed_job(
         .map_err(|_| DeploymentJobError::ApplyLimiterClosed)?;
 
     // A newer accepted deployment may have superseded this row while it was
-    // waiting for apply capacity.  Never render a terminal/superseded job.
-    if deployment_is_terminal(&state.db, deployment_id).await? {
+    // waiting for apply capacity. Never render a terminal/superseded job.
+    if deployment_is_terminal(&state.db, job.deployment_id).await? {
         drop(apply_permit);
-        return Ok(JobApplyOutcome::AlreadyTerminal);
+        return Ok(None);
     }
-    validate_deployment_identity(&state.db, deployment_id, payload).await?;
-
-    let rollout = crate::deploy::apply_deployment_manifests(ApplyDeploymentManifestsRequest {
-        pool: state.db.clone(),
-        app: payload.app.clone(),
-        snapshot: payload.snapshot.clone(),
-        deployment_id,
-        attestation_config: payload.attestation_config.clone(),
-        kbs_policy_config: state.kbs_policy.clone(),
-        api_signing_pubkey: payload.api_signing_pubkey.clone(),
-        api_url: payload.api_url.clone(),
-        workload_artifact_binding,
-        signed_policy_artifact,
-        local_workload_artifacts_json,
-        local_trustee_policy_json,
-        log_encryption: payload.log_encryption.clone(),
-    })
-    .await?;
-    drop(apply_permit);
-    Ok(JobApplyOutcome::Applied(rollout.watch().await))
+    let primary_image_digest = validate_canonical_source_snapshot(&state.db, job, payload).await?;
+    let validated = validate_apply_artifacts(state, job, payload, &primary_image_digest).await?;
+    Ok(Some((apply_permit, validated)))
 }
 
-async fn validate_deployment_identity(
-    pool: &PgPool,
-    deployment_id: Uuid,
+struct ValidatedApplyArtifacts {
+    workload_artifact_binding: Option<enclava_engine::types::WorkloadArtifactBinding>,
+    signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
+    local_workload_artifacts_json: Option<String>,
+    local_trustee_policy_json: Option<String>,
+}
+
+async fn validate_apply_artifacts(
+    state: &AppState,
+    job: &ClaimedJob,
     payload: &DeploymentApplyJobPayload,
-) -> Result<(), DeploymentJobError> {
-    let identity = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
-        "SELECT app_id, org_id FROM deployments WHERE id = $1",
+    primary_image_digest: &str,
+) -> Result<ValidatedApplyArtifacts, DeploymentJobError> {
+    let currently_signed_required = crate::routes::deployments::customer_signed_deploy_required(
+        state.attestation.as_ref(),
+        state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
+    );
+    if (job.signed_required || currently_signed_required) && job.artifact_deployment_id.is_none() {
+        return Err(DeploymentJobError::Artifact);
+    }
+
+    let (Some(artifact_deployment_id), Some(expected_descriptor_core_hash)) = (
+        job.artifact_deployment_id,
+        job.artifact_descriptor_core_hash()?,
+    ) else {
+        return Ok(ValidatedApplyArtifacts {
+            workload_artifact_binding: None,
+            signed_policy_artifact: None,
+            local_workload_artifacts_json: None,
+            local_trustee_policy_json: None,
+        });
+    };
+    let loaded = crate::signing_service::load_workload_artifacts_exact(
+        &state.db,
+        job.app_id,
+        artifact_deployment_id,
+        expected_descriptor_core_hash,
     )
-    .bind(deployment_id)
+    .await
+    .map_err(|_| DeploymentJobError::Artifact)?
+    .ok_or(DeploymentJobError::Artifact)?;
+    if loaded.descriptor.org_id != job.org_id
+        || loaded.descriptor.app_id != job.app_id
+        || loaded.descriptor.deploy_id != artifact_deployment_id
+        || artifact_deployment_id != job.source_deployment_id
+    {
+        return Err(DeploymentJobError::Artifact);
+    }
+    let signing_service_pubkey_hex = state
+        .attestation
+        .as_ref()
+        .and_then(|config| config.signing_service_pubkey_hex.as_deref())
+        .ok_or(DeploymentJobError::Artifact)?;
+    loaded
+        .validate_stored_authority(
+            &state.db,
+            &payload.app,
+            primary_image_digest,
+            &payload.api_signing_pubkey,
+            signing_service_pubkey_hex,
+        )
+        .await
+        .map_err(|_| DeploymentJobError::Artifact)?;
+    validate_signed_render(job, payload, &loaded)?;
+    Ok(ValidatedApplyArtifacts {
+        workload_artifact_binding: Some(loaded.binding),
+        signed_policy_artifact: Some(loaded.signed_policy_artifact),
+        local_workload_artifacts_json: Some(loaded.workload_artifacts_json),
+        local_trustee_policy_json: Some(loaded.trustee_policy_json),
+    })
+}
+
+fn snapshot_signed_hash(
+    spec_snapshot: &serde_json::Value,
+) -> Result<Option<[u8; 32]>, DeploymentJobError> {
+    match spec_snapshot.get("signed_descriptor_core_hash") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(hash)) => hex::decode(hash)
+            .map_err(|_| DeploymentJobError::InvalidPayload)?
+            .try_into()
+            .map(Some)
+            .map_err(|_: Vec<u8>| DeploymentJobError::InvalidPayload),
+        Some(_) => Err(DeploymentJobError::InvalidPayload),
+    }
+}
+
+fn snapshot_log_encryption(spec_snapshot: &serde_json::Value) -> serde_json::Value {
+    spec_snapshot
+        .get("log_encryption")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+async fn validate_canonical_source_snapshot(
+    pool: &PgPool,
+    job: &ClaimedJob,
+    payload: &DeploymentApplyJobPayload,
+) -> Result<String, DeploymentJobError> {
+    let operation = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, serde_json::Value)>(
+        "SELECT app_id, org_id, image_digest, spec_snapshot
+           FROM deployments WHERE id = $1",
+    )
+    .bind(job.deployment_id)
     .fetch_optional(pool)
     .await?
     .ok_or(DeploymentJobError::LeaseLost)?;
-    if identity != (payload.app.id, Some(payload.app.org_id)) {
+    let source = sqlx::query_as::<_, (Uuid, Uuid, Option<String>, serde_json::Value)>(
+        "SELECT app_id, org_id, image_digest, spec_snapshot
+           FROM deployments WHERE id = $1",
+    )
+    .bind(job.source_deployment_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(DeploymentJobError::LeaseLost)?;
+    if (operation.0, operation.1) != (job.app_id, job.org_id)
+        || (source.0, source.1) != (job.app_id, job.org_id)
+        || payload.app.id != job.app_id
+        || payload.app.org_id != job.org_id
+    {
         return Err(DeploymentJobError::InvalidPayload);
     }
-    Ok(())
+
+    let primary = payload
+        .snapshot
+        .containers
+        .iter()
+        .find(|container| container.is_primary)
+        .ok_or(DeploymentJobError::InvalidPayload)?;
+    let primary_digest = primary
+        .image_digest
+        .clone()
+        .ok_or(DeploymentJobError::InvalidPayload)?;
+    if operation.2.as_deref() != Some(primary_digest.as_str())
+        || source.2.as_deref() != Some(primary_digest.as_str())
+    {
+        return Err(DeploymentJobError::InvalidPayload);
+    }
+
+    let accepted_log_encryption = serde_json::to_value(&payload.log_encryption)
+        .map_err(|_| DeploymentJobError::InvalidPayload)?;
+    if snapshot_log_encryption(&operation.3) != accepted_log_encryption
+        || snapshot_log_encryption(&source.3) != accepted_log_encryption
+    {
+        return Err(DeploymentJobError::InvalidPayload);
+    }
+
+    let operation_hash = snapshot_signed_hash(&operation.3)?;
+    let source_hash = snapshot_signed_hash(&source.3)?;
+    match (
+        job.artifact_deployment_id,
+        job.artifact_descriptor_core_hash()?,
+    ) {
+        (Some(artifact_deployment_id), Some(expected_hash)) => {
+            if artifact_deployment_id != job.source_deployment_id
+                || operation_hash != Some(expected_hash)
+                || source_hash != Some(expected_hash)
+            {
+                return Err(DeploymentJobError::Artifact);
+            }
+        }
+        (None, None) if operation_hash.is_none() && source_hash.is_none() => {}
+        _ => return Err(DeploymentJobError::Artifact),
+    }
+    Ok(primary_digest)
+}
+
+fn validate_signed_render(
+    job: &ClaimedJob,
+    payload: &DeploymentApplyJobPayload,
+    loaded: &crate::signing_service::LoadedWorkloadArtifacts,
+) -> Result<(), DeploymentJobError> {
+    let attestation = payload
+        .attestation_config
+        .as_ref()
+        .ok_or(DeploymentJobError::Artifact)?;
+    let mut app_spec = crate::deploy::build_confidential_app_from_rows(
+        &payload.app,
+        job.deployment_id,
+        attestation,
+        &payload.api_signing_pubkey,
+        &payload.api_url,
+        &payload.snapshot.containers,
+        &payload.snapshot.resources,
+    )
+    .map_err(|_| DeploymentJobError::Artifact)?;
+    app_spec.workload_artifact_binding = Some(loaded.binding.clone());
+    app_spec.log_encryption = payload.log_encryption.clone();
+    crate::routes::deployments::select_local_signed_artifact_delivery(&mut app_spec.attestation);
+    let policy_sha256: [u8; 32] = hex::decode(&loaded.signed_policy_artifact.agent_policy_sha256)
+        .map_err(|_| DeploymentJobError::Artifact)?
+        .try_into()
+        .map_err(|_: Vec<u8>| DeploymentJobError::Artifact)?;
+    app_spec.generated_agent_policy = Some(enclava_engine::types::GeneratedAgentPolicy {
+        policy_text: loaded.signed_policy_artifact.agent_policy_text.clone(),
+        policy_sha256,
+        genpolicy_version_pin: loaded
+            .signed_policy_artifact
+            .metadata
+            .genpolicy_version_pin
+            .clone(),
+    });
+    let (_encoded, cc_init_data_hash) =
+        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+    loaded
+        .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
+        .map_err(|_| DeploymentJobError::Artifact)
 }
 
 async fn deployment_is_terminal(
@@ -1014,23 +1393,17 @@ async fn deployment_is_terminal(
     ))
 }
 
-async fn fail_apply_job(
-    state: &AppState,
-    deployment_id: Uuid,
-    lock_token: Uuid,
-    app: &App,
-    error: &DeploymentJobError,
-) {
-    if let Err(db_error) = publish_apply_failure(&state.db, deployment_id, lock_token, app).await {
+async fn fail_apply_job(state: &AppState, job: &ClaimedJob, error: &DeploymentJobError) {
+    if let Err(db_error) = publish_apply_failure(&state.db, job).await {
         tracing::error!(
-            deployment_id = %deployment_id,
+            deployment_id = %job.deployment_id,
             error_code = db_error.code(),
             "failed to atomically publish durable deployment failure"
         );
     }
     tracing::error!(
-        app_id = %app.id,
-        deployment_id = %deployment_id,
+        app_id = %job.app_id,
+        deployment_id = %job.deployment_id,
         error_code = error.code(),
         "durable deployment apply failed"
     );
@@ -1038,8 +1411,7 @@ async fn fail_apply_job(
 
 async fn lock_owned_running_job(
     tx: &mut Transaction<'_, Postgres>,
-    deployment_id: Uuid,
-    lock_token: Uuid,
+    job: &ClaimedJob,
 ) -> Result<(), DeploymentJobError> {
     let owned = sqlx::query_scalar::<_, Uuid>(
         "SELECT deployment_id
@@ -1047,10 +1419,14 @@ async fn lock_owned_running_job(
           WHERE deployment_id = $1
             AND state = 'running'
             AND lock_token = $2
+            AND app_id = $3
+            AND org_id = $4
           FOR UPDATE",
     )
-    .bind(deployment_id)
-    .bind(lock_token)
+    .bind(job.deployment_id)
+    .bind(job.lock_token)
+    .bind(job.app_id)
+    .bind(job.org_id)
     .fetch_optional(&mut **tx)
     .await?;
     if owned.is_none() {
@@ -1061,26 +1437,24 @@ async fn lock_owned_running_job(
 
 async fn publish_rollout_outcome(
     pool: &PgPool,
-    deployment_id: Uuid,
-    lock_token: Uuid,
-    payload: &DeploymentApplyJobPayload,
+    job: &ClaimedJob,
     outcome: &DeploymentRolloutOutcome,
 ) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
     // The lease row is always checked and locked before any tenant-visible
     // deployment or app state can be changed.
-    lock_owned_running_job(&mut tx, deployment_id, lock_token).await?;
-    let deployment = sqlx::query_as::<_, (Uuid, Option<Uuid>, DeployStatus, Option<String>)>(
+    lock_owned_running_job(&mut tx, job).await?;
+    let deployment = sqlx::query_as::<_, (Uuid, Uuid, DeployStatus, Option<String>)>(
         "SELECT app_id, org_id, status, manifest_hash
            FROM deployments
           WHERE id = $1
           FOR UPDATE",
     )
-    .bind(deployment_id)
+    .bind(job.deployment_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(DeploymentJobError::LeaseLost)?;
-    if deployment.0 != payload.app.id || deployment.1 != Some(payload.app.org_id) {
+    if deployment.0 != job.app_id || deployment.1 != job.org_id {
         return Err(DeploymentJobError::InvalidPayload);
     }
     if deployment.2 != DeployStatus::Watching
@@ -1093,7 +1467,7 @@ async fn publish_rollout_outcome(
         "UPDATE deployments
             SET status = $1::deploy_status_enum,
                 error_message = $2,
-                completed_at = CASE WHEN $3 THEN now() ELSE completed_at END
+                completed_at = CASE WHEN $3 THEN clock_timestamp() ELSE completed_at END
           WHERE id = $4
             AND app_id = $5
             AND org_id = $6
@@ -1103,9 +1477,9 @@ async fn publish_rollout_outcome(
     .bind(outcome.deploy_status)
     .bind(outcome.error_code)
     .bind(outcome.terminal)
-    .bind(deployment_id)
-    .bind(payload.app.id)
-    .bind(payload.app.org_id)
+    .bind(job.deployment_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
     .bind(&outcome.manifest_hash)
     .execute(&mut *tx)
     .await?;
@@ -1115,12 +1489,12 @@ async fn publish_rollout_outcome(
     let app_result = sqlx::query(
         "UPDATE apps
             SET status = $1::app_status_enum,
-                updated_at = now()
+                updated_at = clock_timestamp()
           WHERE id = $2 AND org_id = $3",
     )
     .bind(outcome.app_status)
-    .bind(payload.app.id)
-    .bind(payload.app.org_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
     .execute(&mut *tx)
     .await?;
     if app_result.rows_affected() != 1 {
@@ -1132,13 +1506,13 @@ async fn publish_rollout_outcome(
                 lock_token = NULL,
                 locked_until = NULL,
                 last_error_code = NULL,
-                updated_at = now()
+                updated_at = clock_timestamp()
           WHERE deployment_id = $1
             AND state = 'running'
             AND lock_token = $2",
     )
-    .bind(deployment_id)
-    .bind(lock_token)
+    .bind(job.deployment_id)
+    .bind(job.lock_token)
     .execute(&mut *tx)
     .await?;
     if job_result.rows_affected() != 1 {
@@ -1148,25 +1522,20 @@ async fn publish_rollout_outcome(
     Ok(())
 }
 
-async fn publish_apply_failure(
-    pool: &PgPool,
-    deployment_id: Uuid,
-    lock_token: Uuid,
-    app: &App,
-) -> Result<(), DeploymentJobError> {
+async fn publish_apply_failure(pool: &PgPool, job: &ClaimedJob) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
-    lock_owned_running_job(&mut tx, deployment_id, lock_token).await?;
-    let deployment = sqlx::query_as::<_, (Uuid, Option<Uuid>, DeployStatus)>(
+    lock_owned_running_job(&mut tx, job).await?;
+    let deployment = sqlx::query_as::<_, (Uuid, Uuid, DeployStatus)>(
         "SELECT app_id, org_id, status
            FROM deployments
           WHERE id = $1
           FOR UPDATE",
     )
-    .bind(deployment_id)
+    .bind(job.deployment_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(DeploymentJobError::LeaseLost)?;
-    if deployment.0 != app.id || deployment.1 != Some(app.org_id) {
+    if deployment.0 != job.app_id || deployment.1 != job.org_id {
         return Err(DeploymentJobError::InvalidPayload);
     }
     if matches!(
@@ -1180,16 +1549,16 @@ async fn publish_apply_failure(
         "UPDATE deployments
             SET status = 'failed'::deploy_status_enum,
                 error_message = $1,
-                completed_at = now()
+                completed_at = clock_timestamp()
           WHERE id = $2
             AND app_id = $3
             AND org_id = $4
             AND status IN ('pending', 'applying', 'watching')",
     )
     .bind(DEPLOYMENT_APPLY_FAILED_MESSAGE)
-    .bind(deployment_id)
-    .bind(app.id)
-    .bind(app.org_id)
+    .bind(job.deployment_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
     .execute(&mut *tx)
     .await?;
     if deployment_result.rows_affected() != 1 {
@@ -1198,11 +1567,11 @@ async fn publish_apply_failure(
     let app_result = sqlx::query(
         "UPDATE apps
             SET status = 'failed'::app_status_enum,
-                updated_at = now()
+                updated_at = clock_timestamp()
           WHERE id = $1 AND org_id = $2",
     )
-    .bind(app.id)
-    .bind(app.org_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
     .execute(&mut *tx)
     .await?;
     if app_result.rows_affected() != 1 {
@@ -1214,14 +1583,14 @@ async fn publish_apply_failure(
                 lock_token = NULL,
                 locked_until = NULL,
                 last_error_code = $1,
-                updated_at = now()
+                updated_at = clock_timestamp()
           WHERE deployment_id = $2
             AND state = 'running'
             AND lock_token = $3",
     )
     .bind(DEPLOYMENT_APPLY_FAILED_MESSAGE)
-    .bind(deployment_id)
-    .bind(lock_token)
+    .bind(job.deployment_id)
+    .bind(job.lock_token)
     .execute(&mut *tx)
     .await?;
     if job_result.rows_affected() != 1 {
@@ -1244,7 +1613,7 @@ async fn finish_job(
                 lock_token = NULL,
                 locked_until = NULL,
                 last_error_code = $2,
-                updated_at = now()
+                updated_at = clock_timestamp()
           WHERE deployment_id = $3
             AND state = 'running'
             AND lock_token = $4",
@@ -1271,40 +1640,66 @@ async fn with_lease_heartbeat<F, T>(
 where
     F: Future<Output = T>,
 {
+    // Renew immediately after the claim transaction commits and before the
+    // future is first polled. `clock_timestamp()` is wall-clock time even in a
+    // long transaction; `now()` would reuse the transaction start timestamp.
+    renew_job_lease(pool, deployment_id, lock_token, state).await?;
     tokio::pin!(future);
-    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+        HEARTBEAT_INTERVAL,
+    );
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    heartbeat.tick().await;
 
     loop {
         tokio::select! {
             output = &mut future => return Ok(output),
             _ = heartbeat.tick() => {
-                let result = sqlx::query(
-                    "UPDATE deployment_apply_jobs
-                        SET locked_until = now() + $1::interval,
-                            updated_at = now()
-                      WHERE deployment_id = $2
-                        AND state = $3
-                        AND lock_token = $4",
-                )
-                .bind(LEASE_INTERVAL_SQL)
-                .bind(deployment_id)
-                .bind(state)
-                .bind(lock_token)
-                .execute(pool)
-                .await?;
-                if result.rows_affected() != 1 {
-                    return Err(DeploymentJobError::LeaseLost);
-                }
+                renew_job_lease(pool, deployment_id, lock_token, state).await?;
             }
         }
     }
 }
 
+async fn renew_job_lease(
+    pool: &PgPool,
+    deployment_id: Uuid,
+    lock_token: Uuid,
+    state: &str,
+) -> Result<(), DeploymentJobError> {
+    let result = sqlx::query(
+        "UPDATE deployment_apply_jobs
+            SET locked_until = clock_timestamp() + $1::interval,
+                updated_at = clock_timestamp()
+          WHERE deployment_id = $2
+            AND state = $3
+            AND lock_token = $4",
+    )
+    .bind(LEASE_INTERVAL_SQL)
+    .bind(deployment_id)
+    .bind(state)
+    .bind(lock_token)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DeploymentJobError::LeaseLost);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use ed25519_dalek::{Signer, SigningKey};
+    use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
+    use enclava_common::descriptor::{
+        Capabilities, DeploymentDescriptor, OciRuntimeSpec, Resources, SecurityContext, Sidecars,
+        SignerIdentity, descriptor_canonical_bytes, descriptor_core_hash,
+    };
+    use enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH;
+    use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
+    use sqlx::types::Json;
 
     async fn database_test_pool() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -1433,9 +1828,11 @@ mod tests {
         .execute(&mut *tx)
         .await
         .expect("insert deployment job app");
+        let image_digest = format!("sha256:{}", "aa".repeat(32));
         sqlx::query(
-            "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot)
-             VALUES ($1, $2, $3, 'api', $4)",
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, spec_snapshot, image_digest
+             ) VALUES ($1, $2, $3, 'api', $4, $5)",
         )
         .bind(deployment_id)
         .bind(org_id)
@@ -1443,15 +1840,544 @@ mod tests {
         .bind(serde_json::json!({
             "setup_state": DEPLOYMENT_SETUP_DNS_PENDING,
             "image": "ghcr.io/acme/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "image_digest": &image_digest,
+            "signed_descriptor_core_hash": null,
+            "log_encryption": null,
         }))
+        .bind(&image_digest)
         .execute(&mut *tx)
         .await
         .expect("insert deployment job deployment");
-        let lease = insert_setup_job(&mut tx, deployment_id, &payload)
+        let lease = insert_setup_job(&mut tx, deployment_id, deployment_id, &payload, false)
             .await
             .expect("insert setup job");
         tx.commit().await.expect("commit deployment job fixture");
         (app, deployment_id, lease, payload)
+    }
+
+    async fn replace_job_with_raw_payload(
+        pool: &PgPool,
+        deployment_id: Uuid,
+        payload: serde_json::Value,
+        payload_version: i32,
+        cleanup_app_on_setup_failure: bool,
+        state: &str,
+    ) {
+        let payload_sha256 = canonical_payload_hash(&payload).expect("hash raw job payload");
+        let log_encryption = payload
+            .get("log_encryption")
+            .filter(|value| !value.is_null())
+            .cloned();
+        let mut tx = pool.begin().await.expect("begin raw job replacement");
+        sqlx::query("DELETE FROM deployment_apply_jobs WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&mut *tx)
+            .await
+            .expect("delete original job in replacement transaction");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state
+             )
+             SELECT id, app_id, org_id, id, $2, $3, $4, $5, false,
+                    NULL, NULL, $6, $7
+               FROM deployments
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(payload_version)
+        .bind(payload)
+        .bind(payload_sha256.to_vec())
+        .bind(cleanup_app_on_setup_failure)
+        .bind(log_encryption)
+        .bind(state)
+        .execute(&mut *tx)
+        .await
+        .expect("insert raw replacement job");
+        tx.commit().await.expect("commit raw job replacement");
+    }
+
+    async fn recreate_test_deployment_with_signed_hash(
+        tx: &mut Transaction<'_, Postgres>,
+        deployment_id: Uuid,
+        descriptor_hash: [u8; 32],
+    ) {
+        let (org_id, app_id, mut spec_snapshot, image_digest): (
+            Uuid,
+            Uuid,
+            serde_json::Value,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT org_id, app_id, spec_snapshot, image_digest
+               FROM deployments WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("load deployment before signed test recreation");
+        sqlx::query("DELETE FROM deployments WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&mut **tx)
+            .await
+            .expect("delete unsigned deployment before signed test recreation");
+        spec_snapshot["signed_descriptor_core_hash"] =
+            serde_json::json!(hex::encode(descriptor_hash));
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot, image_digest
+             ) VALUES (
+                 $1, $2, $3, 'api'::trigger_enum, 'pending'::deploy_status_enum, $4, $5
+             )",
+        )
+        .bind(deployment_id)
+        .bind(org_id)
+        .bind(app_id)
+        .bind(spec_snapshot)
+        .bind(image_digest)
+        .execute(&mut **tx)
+        .await
+        .expect("recreate canonical signed test deployment");
+    }
+
+    async fn replace_job_with_fake_signed_binding(
+        pool: &PgPool,
+        deployment_id: Uuid,
+        mut payload: DeploymentApplyJobPayload,
+    ) -> [u8; 32] {
+        let descriptor_hash = [0x5a; 32];
+        payload.artifact_deployment_id = Some(deployment_id);
+        payload.artifact_descriptor_core_hash = Some(descriptor_hash);
+        let (payload_value, payload_sha256) = payload
+            .canonical_value_and_hash()
+            .expect("hash fake signed payload");
+        let mut tx = pool.begin().await.expect("begin fake signed replacement");
+        recreate_test_deployment_with_signed_hash(&mut tx, deployment_id, descriptor_hash).await;
+        sqlx::query(
+            "INSERT INTO workload_artifacts (
+                 descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+                 descriptor_signature, descriptor_signing_key_id,
+                 org_keyring_payload, org_keyring_signature,
+                 signed_policy_artifact
+             )
+             SELECT $2, app_id, id,
+                    jsonb_build_object('app_id', app_id, 'deploy_id', id),
+                    $3, 'fake-key', '{}'::jsonb, $4, '{}'::jsonb
+               FROM deployments WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(descriptor_hash.to_vec())
+        .bind(vec![0_u8; 64])
+        .bind(vec![0_u8; 64])
+        .execute(&mut *tx)
+        .await
+        .expect("insert fake signed artifact binding");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state
+             )
+             SELECT id, app_id, org_id, id, $2, $3, $4, false, true,
+                    id, $5, NULL, 'setup_pending'
+               FROM deployments WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(JOB_PAYLOAD_VERSION)
+        .bind(payload_value)
+        .bind(payload_sha256.to_vec())
+        .bind(descriptor_hash.to_vec())
+        .execute(&mut *tx)
+        .await
+        .expect("insert fake signed job");
+        tx.commit().await.expect("commit fake signed replacement");
+        descriptor_hash
+    }
+
+    struct TestKeyringAuthority {
+        owner_key: SigningKey,
+        user_id: Uuid,
+        signing_key_id: Uuid,
+        member_added_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    fn signed_test_keyring(
+        org_id: Uuid,
+        authority: &TestKeyringAuthority,
+        version: u64,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> (serde_json::Value, serde_json::Value, Vec<u8>) {
+        let pubkey = authority.owner_key.verifying_key().to_bytes();
+        let added_at = authority.member_added_at.to_rfc3339();
+        let member_hash = ce_v1_hash(&[
+            ("user_id", authority.user_id.as_bytes().as_slice()),
+            ("pubkey", pubkey.as_slice()),
+            ("role", b"owner"),
+            ("added_at", added_at.as_bytes()),
+        ]);
+        let user_id_label = authority.user_id.to_string();
+        let members_hash = ce_v1_hash(&[(user_id_label.as_str(), member_hash.as_slice())]);
+        let version_bytes = version.to_be_bytes();
+        let updated_at_text = updated_at.to_rfc3339();
+        let canonical = ce_v1_bytes(&[
+            ("purpose", b"enclava-org-keyring-v1"),
+            ("org_id", org_id.as_bytes().as_slice()),
+            ("version", &version_bytes),
+            ("members", &members_hash),
+            ("updated_at", updated_at_text.as_bytes()),
+        ]);
+        let signature = authority.owner_key.sign(&canonical).to_bytes().to_vec();
+        let keyring = serde_json::json!({
+            "org_id": org_id,
+            "version": version,
+            "members": [{
+                "user_id": authority.user_id,
+                "pubkey": hex::encode(pubkey),
+                "role": "owner",
+                "added_at": authority.member_added_at,
+            }],
+            "updated_at": updated_at,
+        });
+        let envelope = serde_json::json!({
+            "keyring": keyring,
+            "signature": hex::encode(&signature),
+            "signing_pubkey": hex::encode(pubkey),
+        });
+        (keyring, envelope, signature)
+    }
+
+    async fn insert_test_keyring_version(
+        pool: &PgPool,
+        org_id: Uuid,
+        authority: &TestKeyringAuthority,
+        version: u64,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
+        let (keyring, envelope, signature) =
+            signed_test_keyring(org_id, authority, version, updated_at);
+        sqlx::query(
+            "INSERT INTO org_keyrings (
+                 org_id, version, keyring_payload, signature, signing_key_id
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(version as i64)
+        .bind(serde_json::to_vec(&keyring).expect("serialize test keyring"))
+        .bind(signature)
+        .bind(authority.signing_key_id)
+        .execute(pool)
+        .await
+        .expect("insert test keyring version");
+        envelope
+    }
+
+    async fn replace_job_with_valid_signed_binding(
+        pool: &PgPool,
+        deployment_id: Uuid,
+        mut payload: DeploymentApplyJobPayload,
+        state: &mut AppState,
+    ) -> (DeploymentApplyJobPayload, TestKeyringAuthority) {
+        let owner_key = SigningKey::from_bytes(&[0x41; 32]);
+        let platform_key = SigningKey::from_bytes(&[0x52; 32]);
+        payload.app.signer_identity_subject = Some(
+            "https://github.com/acme/app/.github/workflows/deploy.yml@refs/heads/main".to_string(),
+        );
+        payload.app.signer_identity_issuer =
+            Some("https://token.actions.githubusercontent.com".to_string());
+        payload.app.signer_identity_set_at = Some(chrono::Utc::now());
+        sqlx::query(
+            "UPDATE apps
+                SET signer_identity_subject = $2,
+                    signer_identity_issuer = $3,
+                    signer_identity_set_at = $4
+              WHERE id = $1",
+        )
+        .bind(payload.app.id)
+        .bind(payload.app.signer_identity_subject.as_deref())
+        .bind(payload.app.signer_identity_issuer.as_deref())
+        .bind(payload.app.signer_identity_set_at)
+        .execute(pool)
+        .await
+        .expect("record signed fixture identity");
+        let user_id = Uuid::new_v4();
+        let signing_key_id = Uuid::new_v4();
+        let member_added_at = chrono::Utc::now();
+        let authority = TestKeyringAuthority {
+            owner_key,
+            user_id,
+            signing_key_id,
+            member_added_at,
+        };
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'durable signer')")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("insert durable signer user");
+        sqlx::query(
+            "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $2, 'owner'::role_enum)",
+        )
+        .bind(user_id)
+        .bind(payload.app.org_id)
+        .execute(pool)
+        .await
+        .expect("insert durable signer membership");
+        sqlx::query(
+            "INSERT INTO user_signing_keys (id, user_id, pubkey)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(signing_key_id)
+        .bind(user_id)
+        .bind(authority.owner_key.verifying_key().to_bytes().to_vec())
+        .execute(pool)
+        .await
+        .expect("insert durable signer key");
+        let keyring_envelope =
+            insert_test_keyring_version(pool, payload.app.org_id, &authority, 1, member_added_at)
+                .await;
+
+        let platform_pubkey_hex = hex::encode(platform_key.verifying_key().to_bytes());
+        state
+            .attestation
+            .as_mut()
+            .expect("signed fixture attestation")
+            .signing_service_pubkey_hex = Some(platform_pubkey_hex.clone());
+        state.require_customer_signed_policy_artifact = true;
+        payload.attestation_config = state.attestation.clone();
+
+        let image_digest = payload.snapshot.containers[0]
+            .image_digest
+            .clone()
+            .expect("signed fixture image digest");
+        let agent_policy_text =
+            "package agent_policy\n\ndefault CreateContainerRequest := true\n".to_string();
+        let rego_text = "package policy\n\ndefault allow := false\n".to_string();
+        let agent_policy_hash: [u8; 32] = Sha256::digest(agent_policy_text.as_bytes()).into();
+        let rego_hash: [u8; 32] = Sha256::digest(rego_text.as_bytes()).into();
+        let mut descriptor = DeploymentDescriptor {
+            schema_version: "v1".to_string(),
+            org_id: payload.app.org_id,
+            org_slug: payload.app.tenant_id.clone(),
+            app_id: payload.app.id,
+            app_name: payload.app.name.clone(),
+            deploy_id: deployment_id,
+            created_at: chrono::Utc::now(),
+            nonce: [0x13; 32],
+            app_domain: payload.app.domain.clone(),
+            tee_domain: payload
+                .app
+                .tee_domain
+                .clone()
+                .unwrap_or_else(|| payload.app.domain.clone()),
+            custom_domains: payload.app.custom_domain.clone().into_iter().collect(),
+            namespace: payload.app.namespace.clone(),
+            service_account: payload.app.service_account.clone(),
+            identity_hash: hex::decode(&payload.app.tenant_instance_identity_hash)
+                .expect("decode fixture identity hash")
+                .try_into()
+                .expect("fixture identity hash length"),
+            image_ref: format!("ghcr.io/acme/app@{image_digest}"),
+            image_digest: image_digest.clone(),
+            signer_identity: SignerIdentity {
+                subject: payload
+                    .app
+                    .signer_identity_subject
+                    .clone()
+                    .unwrap_or_default(),
+                issuer: payload
+                    .app
+                    .signer_identity_issuer
+                    .clone()
+                    .unwrap_or_default(),
+            },
+            oci_runtime_spec: OciRuntimeSpec {
+                command: vec![ENCLAVA_WAIT_EXEC_PATH.to_string()],
+                args: vec!["/usr/local/bin/app".to_string()],
+                env: vec![],
+                ports: vec![],
+                mounts: vec![],
+                capabilities: Capabilities::default(),
+                security_context: SecurityContext::default(),
+                resources: Resources::default(),
+            },
+            sidecars: Sidecars {
+                attestation_proxy_digest: format!("sha256:{}", "11".repeat(32)),
+                caddy_digest: format!("sha256:{}", "22".repeat(32)),
+            },
+            api_signing_pubkey: payload.api_signing_pubkey.clone(),
+            expected_firmware_measurement: [3; 32],
+            expected_runtime_class: "kata-qemu-snp".to_string(),
+            kbs_resource_path: format!("default/{}-owner", payload.app.namespace),
+            unlock_mode: "auto".to_string(),
+            policy_template_id: "enclava-kbs-policy-v1".to_string(),
+            policy_template_sha256: [4; 32],
+            platform_release_version: "cap-test".to_string(),
+            expected_agent_policy_hash: agent_policy_hash,
+            expected_cc_init_data_hash: [0; 32],
+            expected_kbs_policy_hash: rego_hash,
+        };
+        let descriptor_hash = descriptor_core_hash(&descriptor);
+        // Decode through the production adapter so the runtime binding uses
+        // the exact CE-v1 keyring fingerprint implementation.
+        let provisional_descriptor_blob = serde_json::json!({
+            "descriptor": descriptor,
+            "signature": "00".repeat(64),
+            "signing_key_id": "durable-owner",
+            "signing_pubkey": hex::encode(authority.owner_key.verifying_key().to_bytes()),
+        })
+        .to_string();
+        let provisional = crate::signing_service::decode_optional_blobs(
+            Some(provisional_descriptor_blob),
+            Some(keyring_envelope.to_string()),
+        )
+        .expect("decode provisional signed fixture")
+        .expect("provisional signed fixture exists");
+        let binding = provisional.binding();
+        assert_eq!(binding.descriptor_core_hash, descriptor_hash);
+
+        let mut app_spec = crate::deploy::build_confidential_app_from_rows(
+            &payload.app,
+            deployment_id,
+            payload
+                .attestation_config
+                .as_ref()
+                .expect("signed fixture payload attestation"),
+            &payload.api_signing_pubkey,
+            &payload.api_url,
+            &payload.snapshot.containers,
+            &payload.snapshot.resources,
+        )
+        .expect("build signed fixture runtime");
+        app_spec.workload_artifact_binding = Some(WorkloadArtifactBinding {
+            descriptor_core_hash: binding.descriptor_core_hash,
+            descriptor_signing_pubkey: binding.descriptor_signing_pubkey,
+            org_keyring_fingerprint: binding.org_keyring_fingerprint,
+        });
+        crate::routes::deployments::select_local_signed_artifact_delivery(
+            &mut app_spec.attestation,
+        );
+        app_spec.generated_agent_policy = Some(GeneratedAgentPolicy {
+            policy_text: agent_policy_text.clone(),
+            policy_sha256: agent_policy_hash,
+            genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+        });
+        let (_, cc_init_data_hash) =
+            enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+        descriptor.expected_cc_init_data_hash = hex::decode(cc_init_data_hash)
+            .expect("decode signed fixture cc-init hash")
+            .try_into()
+            .expect("signed fixture cc-init hash length");
+
+        let descriptor_signature = authority
+            .owner_key
+            .sign(&descriptor_canonical_bytes(&descriptor));
+        let descriptor_blob = serde_json::json!({
+            "descriptor": descriptor,
+            "signature": hex::encode(descriptor_signature.to_bytes()),
+            "signing_key_id": "durable-owner",
+            "signing_pubkey": hex::encode(authority.owner_key.verifying_key().to_bytes()),
+        })
+        .to_string();
+        let artifacts = crate::signing_service::decode_optional_blobs(
+            Some(descriptor_blob),
+            Some(keyring_envelope.to_string()),
+        )
+        .expect("decode signed fixture")
+        .expect("signed fixture exists");
+        artifacts
+            .validate_customer_authority(pool)
+            .await
+            .expect("validate initial signed fixture authority");
+
+        let metadata = crate::signing_service::PolicyMetadata {
+            app_id: payload.app.id.to_string(),
+            deploy_id: deployment_id.to_string(),
+            descriptor_core_hash: hex::encode(artifacts.descriptor_core_hash),
+            descriptor_signing_pubkey: hex::encode(artifacts.descriptor_signing_pubkey),
+            platform_release_version: artifacts.descriptor.platform_release_version.clone(),
+            policy_template_id: artifacts.descriptor.policy_template_id.clone(),
+            policy_template_sha256: hex::encode(artifacts.descriptor.policy_template_sha256),
+            agent_policy_sha256: hex::encode(agent_policy_hash),
+            genpolicy_version_pin: "kata-containers/genpolicy@3.28.0+test".to_string(),
+            signed_at: "2026-07-17T00:00:00+00:00".to_string(),
+            key_id: "durable-policy-key".to_string(),
+        };
+        let metadata_hash = ce_v1_hash(&[
+            ("app_id", payload.app.id.as_bytes().as_slice()),
+            ("deploy_id", deployment_id.as_bytes().as_slice()),
+            ("descriptor_core_hash", &artifacts.descriptor_core_hash),
+            (
+                "descriptor_signing_pubkey",
+                &artifacts.descriptor_signing_pubkey,
+            ),
+            (
+                "platform_release_version",
+                metadata.platform_release_version.as_bytes(),
+            ),
+            ("policy_template_id", metadata.policy_template_id.as_bytes()),
+            (
+                "policy_template_sha256",
+                &artifacts.descriptor.policy_template_sha256,
+            ),
+            ("agent_policy_sha256", &agent_policy_hash),
+            (
+                "genpolicy_version_pin",
+                metadata.genpolicy_version_pin.as_bytes(),
+            ),
+            ("signed_at", metadata.signed_at.as_bytes()),
+            ("key_id", metadata.key_id.as_bytes()),
+        ]);
+        let signing_input = ce_v1_bytes(&[
+            ("purpose", b"enclava-policy-artifact-v1"),
+            ("metadata", &metadata_hash),
+            ("rego_sha256", &rego_hash),
+        ]);
+        let mut signed_policy_artifact = crate::signing_service::SignedPolicyArtifact {
+            metadata,
+            rego_text,
+            rego_sha256: hex::encode(rego_hash),
+            agent_policy_text,
+            agent_policy_sha256: hex::encode(agent_policy_hash),
+            signature: hex::encode(platform_key.sign(&signing_input).to_bytes()),
+            verify_pubkey_b64: B64.encode(platform_key.verifying_key().to_bytes()),
+            org_keyring: None,
+        };
+        artifacts
+            .validate_signed_artifact(&signed_policy_artifact, &platform_pubkey_hex)
+            .expect("validate signed fixture policy");
+        artifacts
+            .attach_customer_authority(&mut signed_policy_artifact)
+            .expect("attach signed fixture authority");
+
+        payload.artifact_deployment_id = Some(deployment_id);
+        payload.artifact_descriptor_core_hash = Some(artifacts.descriptor_core_hash);
+        let mut tx = pool.begin().await.expect("begin valid signed replacement");
+        recreate_test_deployment_with_signed_hash(
+            &mut tx,
+            deployment_id,
+            artifacts.descriptor_core_hash,
+        )
+        .await;
+        crate::signing_service::persist_workload_artifacts(
+            &mut *tx,
+            payload.app.id,
+            deployment_id,
+            &artifacts,
+            &signed_policy_artifact,
+        )
+        .await
+        .expect("persist valid signed fixture");
+        insert_setup_job(&mut tx, deployment_id, deployment_id, &payload, true)
+            .await
+            .expect("insert valid signed durable job");
+        tx.commit()
+            .await
+            .expect("commit valid signed durable replacement");
+        (payload, authority)
     }
 
     #[test]
@@ -1516,7 +2442,37 @@ mod tests {
         );
 
         assert!(matches!(
-            payload.validate(),
+            payload.validate_for_app(payload.app.id, payload.app.org_id),
+            Err(DeploymentJobError::InvalidPayload)
+        ));
+    }
+
+    #[test]
+    fn durable_payload_hash_binds_the_full_runtime_snapshot() {
+        let app = test_app(Uuid::new_v4(), Uuid::new_v4());
+        let payload = test_payload(&app);
+        let (mut value, accepted_hash) = payload
+            .canonical_value_and_hash()
+            .expect("hash accepted runtime payload");
+        value["snapshot"]["resources"]["cpu_limit"] = serde_json::json!("64");
+        let claimed = ClaimedJob {
+            deployment_id: Uuid::new_v4(),
+            app_id: app.id,
+            org_id: app.org_id,
+            source_deployment_id: Uuid::new_v4(),
+            payload_version: JOB_PAYLOAD_VERSION,
+            lock_token: Uuid::new_v4(),
+            payload: value,
+            payload_sha256: accepted_hash.to_vec(),
+            cleanup_app_on_setup_failure: false,
+            signed_required: false,
+            artifact_deployment_id: None,
+            artifact_descriptor_core_hash: None,
+            log_encryption: None,
+        };
+
+        assert!(matches!(
+            claimed.decode_payload(),
             Err(DeploymentJobError::InvalidPayload)
         ));
     }
@@ -1532,23 +2488,26 @@ mod tests {
     #[tokio::test]
     async fn expired_setup_and_apply_leases_recover_after_restart() {
         let pool = database_test_pool().await;
-        let (app, deployment_id, original_setup_lease, _payload) = insert_job_fixture(&pool).await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let original_setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim initial setup")
+            .expect("initial setup job exists");
 
         sqlx::query(
             "UPDATE deployment_apply_jobs
-                SET locked_until = now() - interval '1 second'
+                SET locked_until = clock_timestamp() - interval '1 second'
               WHERE deployment_id = $1",
         )
         .bind(deployment_id)
         .execute(&pool)
         .await
         .expect("expire setup lease");
-        let recovered_setup =
-            claim_job(&pool, "setting_up", "setting_up", true, Some(deployment_id))
-                .await
-                .expect("claim expired setup")
-                .expect("expired setup job exists");
-        assert_ne!(recovered_setup.lock_token, original_setup_lease.lock_token);
+        let recovered_setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim expired setup")
+            .expect("expired setup job exists");
+        assert_ne!(recovered_setup.lock_token, original_setup.lock_token);
 
         mark_setup_accepted(&pool, deployment_id, recovered_setup.lock_token)
             .await
@@ -1566,26 +2525,27 @@ mod tests {
         assert_eq!(setup_state, DEPLOYMENT_SETUP_ACCEPTED);
         assert_eq!(job_state, "pending");
 
-        let first_apply = claim_job(&pool, "pending", "running", false, Some(deployment_id))
+        let first_apply = claim_job(&pool, "pending", "running", Some(deployment_id))
             .await
             .expect("claim ready apply")
             .expect("ready apply job exists");
         sqlx::query(
             "UPDATE deployment_apply_jobs
-                SET locked_until = now() - interval '1 second'
+                SET locked_until = clock_timestamp() - interval '1 second'
               WHERE deployment_id = $1",
         )
         .bind(deployment_id)
         .execute(&pool)
         .await
         .expect("simulate apply worker crash");
-        let recovered_apply = claim_job(&pool, "pending", "running", false, Some(deployment_id))
+        let recovered_apply = claim_job(&pool, "pending", "running", Some(deployment_id))
             .await
             .expect("reclaim crashed apply")
             .expect("crashed apply job exists");
         assert_ne!(recovered_apply.lock_token, first_apply.lock_token);
-        let recovered_payload: DeploymentApplyJobPayload =
-            serde_json::from_value(recovered_apply.payload).expect("decode recovered payload");
+        let recovered_payload = recovered_apply
+            .decode_payload()
+            .expect("decode recovered payload");
         assert_eq!(recovered_payload.app.id, app.id);
 
         let attempts: i32 = sqlx::query_scalar(
@@ -1595,7 +2555,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("load recovered attempt count");
-        assert_eq!(attempts, 3);
+        assert_eq!(attempts, 4);
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)
@@ -1607,7 +2567,11 @@ mod tests {
     #[tokio::test]
     async fn stale_setup_token_cannot_publish_false_acceptance() {
         let pool = database_test_pool().await;
-        let (app, deployment_id, setup_lease, _payload) = insert_job_fixture(&pool).await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
 
         let error = mark_setup_accepted(&pool, deployment_id, Uuid::new_v4())
             .await
@@ -1625,7 +2589,7 @@ mod tests {
         .expect("load rejected setup transition");
         assert_eq!(setup_state, DEPLOYMENT_SETUP_DNS_PENDING);
         assert_eq!(job_state, "setting_up");
-        assert_eq!(lock_token, setup_lease.lock_token);
+        assert_eq!(lock_token, setup.lock_token);
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)
@@ -1637,9 +2601,13 @@ mod tests {
     #[tokio::test]
     async fn existing_app_setup_failure_is_terminal_without_cleanup_marker() {
         let pool = database_test_pool().await;
-        let (app, deployment_id, setup_lease, _payload) = insert_job_fixture(&pool).await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
 
-        mark_setup_failed(&pool, &app, deployment_id, setup_lease.lock_token, false)
+        mark_setup_failed(&pool, &setup)
             .await
             .expect("persist existing-app setup failure");
 
@@ -1723,7 +2691,7 @@ mod tests {
         .execute(&mut *new_tx)
         .await
         .expect("insert new-style deployment");
-        insert_ready_job(&mut new_tx, new_style_id, &payload)
+        insert_ready_job(&mut new_tx, new_style_id, new_style_id, &payload, false)
             .await
             .expect("insert same-transaction durable job");
         new_tx
@@ -1739,38 +2707,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semantic_setup_payload_failure_is_quarantined_once() {
+    async fn unsupported_future_payload_version_waits_for_compatible_worker() {
         let pool = database_test_pool().await;
-        let (app, deployment_id, setup_lease, _payload) = insert_job_fixture(&pool).await;
-        sqlx::query(
-            "UPDATE deployment_apply_jobs
-                SET payload = jsonb_set(payload, '{version}', '999'::jsonb)
-              WHERE deployment_id = $1",
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let mut future_payload = serde_json::to_value(payload).expect("serialize future payload");
+        future_payload["version"] = serde_json::json!(JOB_PAYLOAD_VERSION + 1);
+        replace_job_with_raw_payload(
+            &pool,
+            deployment_id,
+            future_payload,
+            JOB_PAYLOAD_VERSION + 1,
+            false,
+            "setup_pending",
         )
-        .bind(deployment_id)
-        .execute(&pool)
-        .await
-        .expect("corrupt durable payload version");
+        .await;
 
-        let mut state = crate::test_support::lazy_state();
-        state.db = pool.clone();
-        let error = process_setup_job(&state, setup_lease)
+        let claimed = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
-            .expect_err("invalid semantic payload rejected");
-        assert!(matches!(error, DeploymentJobError::InvalidPayload));
-        let (setup_state, job_state, lock_token): (String, String, Option<Uuid>) = sqlx::query_as(
-            "SELECT d.spec_snapshot->>'setup_state', j.state, j.lock_token
+            .expect("future payload claim query");
+        assert!(claimed.is_none());
+        let (setup_state, job_state, lock_token, attempts): (String, String, Option<Uuid>, i32) =
+            sqlx::query_as(
+                "SELECT d.spec_snapshot->>'setup_state', j.state, j.lock_token, j.attempts
                    FROM deployments d
                    JOIN deployment_apply_jobs j ON j.deployment_id = d.id
                   WHERE d.id = $1",
-        )
-        .bind(deployment_id)
-        .fetch_one(&pool)
-        .await
-        .expect("load quarantined job");
-        assert_eq!(setup_state, DEPLOYMENT_SETUP_FAILED);
-        assert_eq!(job_state, "failed");
+            )
+            .bind(deployment_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load future-version job");
+        assert_eq!(setup_state, DEPLOYMENT_SETUP_DNS_PENDING);
+        assert_eq!(job_state, "setup_pending");
         assert!(lock_token.is_none());
+        assert_eq!(attempts, 0);
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)
@@ -1783,41 +2753,27 @@ mod tests {
     async fn cross_app_and_empty_setup_payloads_are_quarantined_not_reclaimed() {
         let pool = database_test_pool().await;
         for cross_app in [false, true] {
-            let (app, deployment_id, setup_lease, _payload) = insert_job_fixture(&pool).await;
+            let (app, deployment_id, setup_handle, payload) = insert_job_fixture(&pool).await;
+            let mut malformed = serde_json::to_value(payload).expect("serialize payload");
             if cross_app {
-                sqlx::query(
-                    "UPDATE deployment_apply_jobs
-                        SET payload = jsonb_set(
-                            payload,
-                            '{snapshot,containers,0,app_id}',
-                            to_jsonb($2::text)
-                        )
-                      WHERE deployment_id = $1",
-                )
-                .bind(deployment_id)
-                .bind(Uuid::new_v4().to_string())
-                .execute(&pool)
-                .await
-                .expect("cross-bind durable payload container");
+                malformed["snapshot"]["containers"][0]["app_id"] =
+                    serde_json::json!(Uuid::new_v4());
             } else {
-                sqlx::query(
-                    "UPDATE deployment_apply_jobs
-                        SET payload = jsonb_set(
-                            payload,
-                            '{snapshot,containers}',
-                            '[]'::jsonb
-                        )
-                      WHERE deployment_id = $1",
-                )
-                .bind(deployment_id)
-                .execute(&pool)
-                .await
-                .expect("empty durable payload containers");
+                malformed["snapshot"]["containers"] = serde_json::json!([]);
             }
+            replace_job_with_raw_payload(
+                &pool,
+                deployment_id,
+                malformed,
+                JOB_PAYLOAD_VERSION,
+                false,
+                "setup_pending",
+            )
+            .await;
 
             let mut state = crate::test_support::lazy_state();
             state.db = pool.clone();
-            let error = process_setup_job(&state, setup_lease)
+            let error = process_setup_job(&state, setup_handle)
                 .await
                 .expect_err("semantically invalid setup rejected");
             assert!(matches!(error, DeploymentJobError::InvalidPayload));
@@ -1847,20 +2803,26 @@ mod tests {
     #[tokio::test]
     async fn semantic_apply_payload_failure_is_token_conditionally_quarantined() {
         let pool = database_test_pool().await;
-        let (app, deployment_id, setup_lease, _payload) = insert_job_fixture(&pool).await;
-        mark_setup_accepted(&pool, deployment_id, setup_lease.lock_token)
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
             .await
             .expect("accept setup");
-        sqlx::query(
-            "UPDATE deployment_apply_jobs
-                SET payload = jsonb_set(payload, '{snapshot,containers}', '[]'::jsonb)
-              WHERE deployment_id = $1",
+        let mut malformed = serde_json::to_value(payload).expect("serialize payload");
+        malformed["snapshot"]["containers"] = serde_json::json!([]);
+        replace_job_with_raw_payload(
+            &pool,
+            deployment_id,
+            malformed,
+            JOB_PAYLOAD_VERSION,
+            false,
+            "pending",
         )
-        .bind(deployment_id)
-        .execute(&pool)
-        .await
-        .expect("empty apply payload containers");
-        let claimed = claim_job(&pool, "pending", "running", false, Some(deployment_id))
+        .await;
+        let claimed = claim_job(&pool, "pending", "running", Some(deployment_id))
             .await
             .expect("claim invalid apply")
             .expect("invalid apply job exists");
@@ -1898,6 +2860,537 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete invalid apply fixture");
+    }
+
+    #[tokio::test]
+    async fn setup_handoff_is_unowned_until_request_claim_and_dispatcher_honors_delay() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let (state, token, lease, recovery_delayed): (
+            String,
+            Option<Uuid>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            bool,
+        ) = sqlx::query_as(
+            "SELECT state, lock_token, locked_until,
+                    next_attempt_at > clock_timestamp()
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load committed setup handoff");
+        assert_eq!(state, "setup_pending");
+        assert!(token.is_none());
+        assert!(lease.is_none());
+        assert!(recovery_delayed);
+        assert!(
+            claim_setup_job(&pool)
+                .await
+                .expect("dispatcher claim query")
+                .is_none()
+        );
+
+        let request_claim = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("request claim query")
+            .expect("request bypasses recovery delay");
+        renew_job_lease(&pool, deployment_id, request_claim.lock_token, "setting_up")
+            .await
+            .expect("request renews setup lease");
+        let lease_is_live: bool = sqlx::query_scalar(
+            "SELECT locked_until > clock_timestamp()
+               FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load renewed request lease");
+        assert!(lease_is_live);
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete setup handoff fixture");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_winner_is_observed_without_duplicate_request_setup() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, setup_handle, _payload) = insert_job_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET next_attempt_at = clock_timestamp() - interval '1 second'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("make recovery setup due");
+        let dispatcher = claim_setup_job(&pool)
+            .await
+            .expect("dispatcher claim")
+            .expect("dispatcher wins setup");
+        mark_setup_accepted(&pool, deployment_id, dispatcher.lock_token)
+            .await
+            .expect("dispatcher accepts setup");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        process_setup_job(&state, setup_handle)
+            .await
+            .expect("request observes dispatcher acceptance");
+        let attempts: i32 = sqlx::query_scalar(
+            "SELECT attempts FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load dispatcher attempts");
+        assert_eq!(attempts, 1, "request must not claim or duplicate DNS setup");
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete dispatcher-winner fixture");
+    }
+
+    #[tokio::test]
+    async fn request_owned_dns_failure_preserves_typed_error_mapping() {
+        let pool = database_test_pool().await;
+        let (app, _deployment_id, setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.dns = Some(crate::dns::DnsConfig {
+            cloudflare_api_token: "unused-test-token".to_string(),
+            cloudflare_zone_id: Some("unused-test-zone".to_string()),
+            cloudflare_zone_name: "outside.example.test".to_string(),
+            target: "127.0.0.1".to_string(),
+            required: true,
+        });
+        let error = process_setup_job(&state, setup_handle)
+            .await
+            .expect_err("out-of-zone DNS fails setup");
+        assert!(matches!(
+            error,
+            DeploymentJobError::Dns(crate::dns::DnsError::OutsideManagedZone(_))
+        ));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete DNS failure fixture");
+    }
+
+    #[tokio::test]
+    async fn signed_job_and_artifact_snapshots_cannot_be_downgraded_or_mutated() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let descriptor_hash =
+            replace_job_with_fake_signed_binding(&pool, deployment_id, payload).await;
+
+        let downgrade_error = sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET signed_required = false,
+                    artifact_deployment_id = NULL,
+                    artifact_descriptor_core_hash = NULL
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect_err("signed durable job cannot be downgraded");
+        assert_eq!(
+            downgrade_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514")
+        );
+
+        let payload_error = sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET payload = jsonb_set(payload, '{api_url}', to_jsonb('https://changed.test'::text))
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect_err("accepted runtime payload cannot be mutated");
+        assert_eq!(
+            payload_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514")
+        );
+
+        let deployment_error = sqlx::query(
+            "UPDATE deployments
+                SET spec_snapshot = jsonb_set(
+                    spec_snapshot,
+                    '{signed_descriptor_core_hash}',
+                    'null'::jsonb,
+                    true
+                )
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect_err("canonical signed deployment binding cannot be cleared");
+        assert_eq!(
+            deployment_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514")
+        );
+
+        let mut delete_then_downgrade = pool
+            .begin()
+            .await
+            .expect("begin delete-then-downgrade attempt");
+        sqlx::query("DELETE FROM deployment_apply_jobs WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&mut *delete_then_downgrade)
+            .await
+            .expect("job-side invariant is deferred inside bypass attempt");
+        let delete_then_downgrade_error = sqlx::query(
+            "UPDATE deployments
+                SET spec_snapshot = jsonb_set(
+                    spec_snapshot,
+                    '{signed_descriptor_core_hash}',
+                    'null'::jsonb,
+                    true
+                )
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&mut *delete_then_downgrade)
+        .await
+        .expect_err("deleting the job cannot bypass deployment snapshot immutability");
+        assert_eq!(
+            delete_then_downgrade_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514")
+        );
+        delete_then_downgrade
+            .rollback()
+            .await
+            .expect("rollback delete-then-downgrade attempt");
+
+        let artifact_update_error = sqlx::query(
+            "UPDATE workload_artifacts
+                SET descriptor_signing_key_id = 'changed'
+              WHERE deploy_id = $1 AND descriptor_core_hash = $2",
+        )
+        .bind(deployment_id)
+        .bind(descriptor_hash.to_vec())
+        .execute(&pool)
+        .await
+        .expect_err("stored signed artifact cannot be mutated");
+        assert_eq!(
+            artifact_update_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514")
+        );
+
+        let artifact_delete_error = sqlx::query(
+            "DELETE FROM workload_artifacts
+              WHERE deploy_id = $1 AND descriptor_core_hash = $2",
+        )
+        .bind(deployment_id)
+        .bind(descriptor_hash.to_vec())
+        .execute(&pool)
+        .await
+        .expect_err("referenced signed artifact cannot be deleted");
+        assert_eq!(
+            artifact_delete_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23503")
+        );
+
+        let mut delete_then_remove_artifact = pool
+            .begin()
+            .await
+            .expect("begin delete-then-remove-artifact attempt");
+        sqlx::query("DELETE FROM deployment_apply_jobs WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&mut *delete_then_remove_artifact)
+            .await
+            .expect("delete job before direct artifact removal attempt");
+        let live_artifact_delete_error = sqlx::query(
+            "DELETE FROM workload_artifacts
+              WHERE deploy_id = $1 AND descriptor_core_hash = $2",
+        )
+        .bind(deployment_id)
+        .bind(descriptor_hash.to_vec())
+        .execute(&mut *delete_then_remove_artifact)
+        .await
+        .expect_err("live deployment retains artifact even after job deletion");
+        assert_eq!(
+            live_artifact_delete_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23503")
+        );
+        delete_then_remove_artifact
+            .rollback()
+            .await
+            .expect("rollback direct artifact removal attempt");
+
+        let job_delete_error =
+            sqlx::query("DELETE FROM deployment_apply_jobs WHERE deployment_id = $1")
+                .bind(deployment_id)
+                .execute(&pool)
+                .await
+                .expect_err("nonterminal signed deployment cannot lose its durable job");
+        assert_eq!(
+            job_delete_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514")
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete signed immutability fixture");
+    }
+
+    #[tokio::test]
+    async fn permit_wait_revalidates_latest_keyring_before_rendering() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.deployment_apply_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let (payload, authority) =
+            replace_job_with_valid_signed_binding(&pool, deployment_id, payload, &mut state).await;
+
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim signed setup")
+            .expect("signed setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept signed setup");
+        let job = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim signed apply")
+            .expect("signed apply exists");
+        let decoded = job.decode_payload().expect("decode signed durable payload");
+        assert_eq!(
+            decoded.artifact_descriptor_core_hash,
+            payload.artifact_descriptor_core_hash
+        );
+        let primary_image_digest = validate_canonical_source_snapshot(&pool, &job, &decoded)
+            .await
+            .expect("validate signed canonical snapshot before wait");
+        validate_apply_artifacts(&state, &job, &decoded, &primary_image_digest)
+            .await
+            .expect("signed authority passes before permit wait");
+
+        let blocker = state
+            .deployment_apply_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold only apply permit");
+        let state = Arc::new(state);
+        let waiter_state = Arc::clone(&state);
+        let waiter = tokio::spawn(async move {
+            acquire_apply_permit_and_revalidate(&waiter_state, &job, &decoded).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "apply must wait behind held permit");
+
+        insert_test_keyring_version(
+            &pool,
+            app.org_id,
+            &authority,
+            2,
+            authority.member_added_at + chrono::Duration::seconds(1),
+        )
+        .await;
+        drop(blocker);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("post-permit validation completes")
+            .expect("post-permit validation task joins");
+        assert!(matches!(result, Err(DeploymentJobError::Artifact)));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring revalidation fixture");
+    }
+
+    #[tokio::test]
+    async fn malformed_cleanup_owned_payload_remains_reconcilable_by_relational_app_id() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, setup_handle, mut payload) = insert_job_fixture(&pool).await;
+        payload.delete_app_on_setup_failure = true;
+        let mut malformed = serde_json::to_value(payload).expect("serialize cleanup payload");
+        malformed["snapshot"]["containers"] = serde_json::json!([]);
+        replace_job_with_raw_payload(
+            &pool,
+            deployment_id,
+            malformed,
+            JOB_PAYLOAD_VERSION,
+            true,
+            "setup_pending",
+        )
+        .await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let error = process_setup_job(&state, setup_handle)
+            .await
+            .expect_err("malformed mandatory setup is quarantined");
+        assert!(matches!(error, DeploymentJobError::InvalidPayload));
+        let cleanup = claim_job(&pool, "cleanup_pending", "cleaning_up", Some(deployment_id))
+            .await
+            .expect("claim malformed cleanup")
+            .expect("malformed cleanup remains recoverable");
+        process_cleanup_job(&state, cleanup).await;
+        let app_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM apps WHERE id = $1)")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("verify relational cleanup");
+        assert!(!app_exists);
+    }
+
+    #[tokio::test]
+    async fn database_rejects_false_cleanup_state_and_terminal_job_stranding() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let cleanup_error = sqlx::query(
+            "UPDATE deployment_apply_jobs SET state = 'cleanup_pending'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect_err("false cleanup ownership cannot enter cleanup state");
+        assert_eq!(
+            cleanup_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514")
+        );
+
+        let mut stranded = pool.begin().await.expect("begin stranded terminal job");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs SET state = 'failed'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&mut *stranded)
+        .await
+        .expect("terminal job transition is deferred");
+        let stranded_error = stranded
+            .commit()
+            .await
+            .expect_err("nonterminal deployment cannot retain terminal job");
+        assert_eq!(
+            stranded_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514")
+        );
+
+        let mut atomic = pool
+            .begin()
+            .await
+            .expect("begin atomic terminal transition");
+        sqlx::query("UPDATE deployments SET status = 'failed'::deploy_status_enum WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&mut *atomic)
+            .await
+            .expect("terminalize deployment");
+        sqlx::query("UPDATE deployment_apply_jobs SET state = 'failed' WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&mut *atomic)
+            .await
+            .expect("terminalize job");
+        atomic
+            .commit()
+            .await
+            .expect("atomic deployment/job terminalization passes invariant");
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete terminal invariant fixture");
+    }
+
+    #[tokio::test]
+    async fn database_rejects_payload_without_relational_version_match() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin missing-version replacement");
+        sqlx::query("DELETE FROM deployment_apply_jobs WHERE deployment_id = $1")
+            .bind(deployment_id)
+            .execute(&mut *tx)
+            .await
+            .expect("delete versioned job inside replacement transaction");
+        let error = sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required,
+                 artifact_deployment_id, artifact_descriptor_core_hash,
+                 log_encryption, state
+             )
+             SELECT id, app_id, org_id, id, 1, '{}'::jsonb, $2,
+                    false, false, NULL, NULL, NULL, 'setup_pending'
+               FROM deployments WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(vec![0_u8; 32])
+        .execute(&mut *tx)
+        .await
+        .expect_err("missing JSON version cannot satisfy relational version check");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514")
+        );
+        tx.rollback()
+            .await
+            .expect("rollback missing-version replacement");
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete missing-version fixture");
     }
 
     #[tokio::test]
@@ -1966,8 +3459,12 @@ mod tests {
     async fn deployment_identity_must_match_durable_payload() {
         let pool = database_test_pool().await;
         let (app, deployment_id, _setup_lease, mut payload) = insert_job_fixture(&pool).await;
+        let claimed = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
         payload.app.org_id = Uuid::new_v4();
-        let error = validate_deployment_identity(&pool, deployment_id, &payload)
+        let error = validate_canonical_source_snapshot(&pool, &claimed, &payload)
             .await
             .expect_err("mismatched payload organization rejected");
         assert!(matches!(error, DeploymentJobError::InvalidPayload));
@@ -1982,11 +3479,15 @@ mod tests {
     #[tokio::test]
     async fn stale_apply_token_cannot_publish_rollout_success() {
         let pool = database_test_pool().await;
-        let (app, deployment_id, setup_lease, payload) = insert_job_fixture(&pool).await;
-        mark_setup_accepted(&pool, deployment_id, setup_lease.lock_token)
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
             .await
             .expect("accept setup");
-        let stale = claim_job(&pool, "pending", "running", false, Some(deployment_id))
+        let stale = claim_job(&pool, "pending", "running", Some(deployment_id))
             .await
             .expect("claim apply")
             .expect("apply job exists");
@@ -2002,14 +3503,14 @@ mod tests {
         .await
         .expect("prepare watching deployment");
         sqlx::query(
-            "UPDATE deployment_apply_jobs SET locked_until = now() - interval '1 second'
+            "UPDATE deployment_apply_jobs SET locked_until = clock_timestamp() - interval '1 second'
               WHERE deployment_id = $1",
         )
         .bind(deployment_id)
         .execute(&pool)
         .await
         .expect("expire stale owner");
-        let current = claim_job(&pool, "pending", "running", false, Some(deployment_id))
+        let current = claim_job(&pool, "pending", "running", Some(deployment_id))
             .await
             .expect("reclaim apply")
             .expect("reclaimed job exists");
@@ -2021,10 +3522,9 @@ mod tests {
             manifest_hash: manifest_hash.to_string(),
         };
 
-        let error =
-            publish_rollout_outcome(&pool, deployment_id, stale.lock_token, &payload, &outcome)
-                .await
-                .expect_err("stale success publisher rejected");
+        let error = publish_rollout_outcome(&pool, &stale, &outcome)
+            .await
+            .expect_err("stale success publisher rejected");
         assert!(matches!(error, DeploymentJobError::LeaseLost));
         let (deploy_status, app_status, job_state, token): (String, String, String, Uuid) =
             sqlx::query_as(
@@ -2043,7 +3543,7 @@ mod tests {
         assert_eq!(job_state, "running");
         assert_eq!(token, current.lock_token);
 
-        publish_rollout_outcome(&pool, deployment_id, current.lock_token, &payload, &outcome)
+        publish_rollout_outcome(&pool, &current, &outcome)
             .await
             .expect("current owner publishes success");
         let (deploy_status, app_status, job_state): (String, String, String) = sqlx::query_as(
@@ -2076,28 +3576,32 @@ mod tests {
     #[tokio::test]
     async fn stale_apply_token_cannot_publish_failure() {
         let pool = database_test_pool().await;
-        let (app, deployment_id, setup_lease, _payload) = insert_job_fixture(&pool).await;
-        mark_setup_accepted(&pool, deployment_id, setup_lease.lock_token)
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup")
+            .expect("setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
             .await
             .expect("accept setup");
-        let stale = claim_job(&pool, "pending", "running", false, Some(deployment_id))
+        let stale = claim_job(&pool, "pending", "running", Some(deployment_id))
             .await
             .expect("claim apply")
             .expect("apply job exists");
         sqlx::query(
-            "UPDATE deployment_apply_jobs SET locked_until = now() - interval '1 second'
+            "UPDATE deployment_apply_jobs SET locked_until = clock_timestamp() - interval '1 second'
               WHERE deployment_id = $1",
         )
         .bind(deployment_id)
         .execute(&pool)
         .await
         .expect("expire stale owner");
-        let current = claim_job(&pool, "pending", "running", false, Some(deployment_id))
+        let current = claim_job(&pool, "pending", "running", Some(deployment_id))
             .await
             .expect("reclaim apply")
             .expect("reclaimed job exists");
 
-        let error = publish_apply_failure(&pool, deployment_id, stale.lock_token, &app)
+        let error = publish_apply_failure(&pool, &stale)
             .await
             .expect_err("stale failure publisher rejected");
         assert!(matches!(error, DeploymentJobError::LeaseLost));
@@ -2118,7 +3622,7 @@ mod tests {
         assert_eq!(job_state, "running");
         assert_eq!(token, current.lock_token);
 
-        publish_apply_failure(&pool, deployment_id, current.lock_token, &app)
+        publish_apply_failure(&pool, &current)
             .await
             .expect("current owner publishes failure");
         let (deploy_status, app_status, job_state): (String, String, String) = sqlx::query_as(
@@ -2151,16 +3655,23 @@ mod tests {
     #[tokio::test]
     async fn cleanup_is_reclaimed_after_crash_and_retried_after_transient_failure() {
         let pool = database_test_pool().await;
-        let (app, deployment_id, setup_lease, mut payload) = insert_job_fixture(&pool).await;
+        let (app, deployment_id, _setup_handle, mut payload) = insert_job_fixture(&pool).await;
         payload.delete_app_on_setup_failure = true;
-        sqlx::query("UPDATE deployment_apply_jobs SET payload = $1 WHERE deployment_id = $2")
-            .bind(Json(&payload))
-            .bind(deployment_id)
-            .execute(&pool)
+        replace_job_with_raw_payload(
+            &pool,
+            deployment_id,
+            serde_json::to_value(&payload).expect("serialize cleanup payload"),
+            JOB_PAYLOAD_VERSION,
+            true,
+            "setup_pending",
+        )
+        .await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
-            .expect("enable cleanup for fixture");
+            .expect("claim cleanup-owned setup")
+            .expect("cleanup-owned setup exists");
 
-        mark_setup_failed(&pool, &app, deployment_id, setup_lease.lock_token, true)
+        mark_setup_failed(&pool, &setup)
             .await
             .expect("persist cleanup-pending setup failure");
         let (setup_state, initial_state): (String, String) = sqlx::query_as(
@@ -2174,28 +3685,27 @@ mod tests {
         .await
         .expect("load initial cleanup state");
         assert_eq!(setup_state, DEPLOYMENT_SETUP_CLEANUP_PENDING);
-        assert_eq!(initial_state, "cleaning_up");
+        assert_eq!(initial_state, "cleanup_pending");
 
-        // Simulate process exit immediately after the durable failure commit.
+        // Claim cleanup and simulate process exit immediately afterward.
+        let first_cleanup = claim_job(&pool, "cleanup_pending", "cleaning_up", Some(deployment_id))
+            .await
+            .expect("claim initial cleanup")
+            .expect("initial cleanup exists");
         sqlx::query(
             "UPDATE deployment_apply_jobs
-                SET locked_until = now() - interval '1 second'
+                SET locked_until = clock_timestamp() - interval '1 second'
               WHERE deployment_id = $1",
         )
         .bind(deployment_id)
         .execute(&pool)
         .await
         .expect("expire crashed cleanup lease");
-        let claimed = claim_job(
-            &pool,
-            "cleanup_pending",
-            "cleaning_up",
-            false,
-            Some(deployment_id),
-        )
-        .await
-        .expect("claim crashed cleanup")
-        .expect("crashed cleanup exists");
+        let claimed = claim_job(&pool, "cleanup_pending", "cleaning_up", Some(deployment_id))
+            .await
+            .expect("claim crashed cleanup")
+            .expect("crashed cleanup exists");
+        assert_ne!(claimed.lock_token, first_cleanup.lock_token);
 
         let suffix = app.id.simple().to_string();
         let function_name = format!("cap_test_block_cleanup_{suffix}");
@@ -2225,7 +3735,7 @@ mod tests {
 
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
-        process_claimed_cleanup_job(state.clone(), claimed).await;
+        process_cleanup_job(&state, claimed).await;
         let retry_state: String =
             sqlx::query_scalar("SELECT state FROM deployment_apply_jobs WHERE deployment_id = $1")
                 .bind(deployment_id)
@@ -2244,24 +3754,18 @@ mod tests {
             .expect("drop cleanup failure function");
         sqlx::query(
             "UPDATE deployment_apply_jobs
-                SET next_attempt_at = now() - interval '1 second'
+                SET next_attempt_at = clock_timestamp() - interval '1 second'
               WHERE deployment_id = $1",
         )
         .bind(deployment_id)
         .execute(&pool)
         .await
         .expect("make cleanup retry due");
-        let retry = claim_job(
-            &pool,
-            "cleanup_pending",
-            "cleaning_up",
-            false,
-            Some(deployment_id),
-        )
-        .await
-        .expect("claim cleanup retry")
-        .expect("cleanup retry exists");
-        process_claimed_cleanup_job(state, retry).await;
+        let retry = claim_job(&pool, "cleanup_pending", "cleaning_up", Some(deployment_id))
+            .await
+            .expect("claim cleanup retry")
+            .expect("cleanup retry exists");
+        process_cleanup_job(&state, retry).await;
 
         let app_exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM apps WHERE id = $1)")
