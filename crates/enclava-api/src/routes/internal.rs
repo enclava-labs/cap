@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::auth::middleware::{AuthContext, ManagementOrigin};
 use crate::models::Role;
+use crate::routes::deployments::public_deployment_error_message;
 use crate::routes::platform::{DeploymentContextResponse, deployment_context_response};
 use crate::routes::status::observe_app_status_fields_for_deployment;
 use crate::state::AppState;
@@ -1151,7 +1152,7 @@ pub async fn list_paas_deployments(
                         "image": image,
                         "spec": spec,
                         "image_digest": image_digest,
-                        "error_message": error_message,
+                        "error_message": public_deployment_error_message(error_message.as_deref()),
                     })
                 },
             )
@@ -1190,11 +1191,11 @@ async fn observed_internal_status_item(
     } else {
         recorded_deployment_status.clone()
     };
-    let error_message = if runtime_failure_applies {
-        observed.runtime_failure_message().map(str::to_string)
-    } else {
-        recorded_error_message
-    };
+    let live_error_message = runtime_failure_applies
+        .then(|| observed.runtime_failure_public_message())
+        .flatten();
+    let error_message =
+        project_internal_deployment_error(live_error_message, recorded_error_message.as_deref());
     let latest_deployment = cap_deployment_id.map(|id| {
         serde_json::json!({
             "cap_deployment_id": id,
@@ -1215,6 +1216,13 @@ async fn observed_internal_status_item(
         "latest_deployment": latest_deployment,
         "observation": observed.observation,
     })
+}
+
+fn project_internal_deployment_error(
+    live_error_message: Option<String>,
+    recorded_error_message: Option<&str>,
+) -> Option<String> {
+    live_error_message.or_else(|| public_deployment_error_message(recorded_error_message))
 }
 
 pub async fn list_paas_status(
@@ -1965,4 +1973,41 @@ pub async fn update_paas_unlock_mode(
     let response = to_value(response)?;
     finish_actor_idempotent_request(&state, &headers, StatusCode::OK, &response).await?;
     Ok((StatusCode::OK, Json(response)))
+}
+
+#[cfg(test)]
+mod confidentiality_tests {
+    use super::project_internal_deployment_error;
+
+    #[test]
+    fn stored_internal_deployment_errors_are_projected_without_plaintext() {
+        const STORED_SECRET: &str =
+            "pod 'tenant-pod' container 'tenant-app' is CrashLoopBackOff: secret=private-key";
+        let response = serde_json::json!({
+            "latest_deployment": {
+                "status": "failed",
+                "error_message": project_internal_deployment_error(None, Some(STORED_SECRET)),
+            }
+        });
+        let serialized = serde_json::to_string(&response).expect("serialize internal response");
+
+        assert_eq!(
+            response["latest_deployment"]["error_message"],
+            "deployment_error"
+        );
+        assert!(!serialized.contains(STORED_SECRET));
+        assert!(!serialized.contains("private-key"));
+        assert!(serialized.len() < 128);
+    }
+
+    #[test]
+    fn bounded_live_runtime_error_takes_precedence_over_recorded_error() {
+        let live = "container_runtime_failure status=waiting code=crash_loop_back_off";
+        let projected = project_internal_deployment_error(
+            Some(live.to_string()),
+            Some("stored-secret=tenant-token"),
+        );
+
+        assert_eq!(projected.as_deref(), Some(live));
+    }
 }

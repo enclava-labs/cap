@@ -814,14 +814,14 @@ pub async fn update_unlock_mode(
     tokio::spawn(async move {
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
-            Err(e) => {
-                let error_message = format!("deployment apply limiter closed: {e}");
+            Err(_) => {
+                let failure_code = "apply_limiter_closed";
                 let _ = crate::deploy::set_deployment_status(
                     &db,
                     deploy_id,
                     "failed",
                     None,
-                    Some(&error_message),
+                    Some(failure_code),
                     true,
                 )
                 .await;
@@ -829,14 +829,14 @@ pub async fn update_unlock_mode(
                 tracing::error!(
                     app_id = %apply_app.id,
                     deployment_id = %deploy_id,
-                    error = %error_message,
+                    failure_code,
                     "failed to acquire unlock-mode apply permit"
                 );
                 return;
             }
         };
 
-        if let Err(e) = crate::deploy::apply_deployment_manifests(
+        if let Err(error) = crate::deploy::apply_deployment_manifests(
             crate::deploy::ApplyDeploymentManifestsRequest {
                 pool: db.clone(),
                 app: apply_app.clone(),
@@ -854,13 +854,13 @@ pub async fn update_unlock_mode(
         )
         .await
         {
-            let error_message = e.to_string();
+            let failure_code = error.public_code();
             let _ = crate::deploy::set_deployment_status(
                 &db,
                 deploy_id,
                 "failed",
                 None,
-                Some(&error_message),
+                Some(failure_code),
                 true,
             )
             .await;
@@ -868,7 +868,7 @@ pub async fn update_unlock_mode(
             tracing::error!(
                 app_id = %apply_app.id,
                 deployment_id = %deploy_id,
-                error = %error_message,
+                failure_code,
                 "failed to apply unlock-mode manifests"
             );
         }

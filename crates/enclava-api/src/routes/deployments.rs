@@ -427,6 +427,14 @@ pub struct DeploymentResponse {
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
+
+/// Project a stored deployment error across an API boundary without exposing
+/// arbitrary backend, runtime, or workload-controlled plaintext.
+pub(crate) fn public_deployment_error_message(error_message: Option<&str>) -> Option<String> {
+    error_message.map(|_| PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string())
+}
+
 impl DeploymentResponse {
     fn from_deployment(d: Deployment, app: &App) -> Self {
         let app_domain = app
@@ -441,7 +449,7 @@ impl DeploymentResponse {
             status: format!("{:?}", d.status).to_lowercase(),
             image_digest: d.image_digest,
             cosign_verified: d.cosign_verified,
-            error_message: d.error_message,
+            error_message: public_deployment_error_message(d.error_message.as_deref()),
             created_at: d.created_at,
             completed_at: d.completed_at,
         }
@@ -974,14 +982,14 @@ pub async fn deploy(
     tokio::spawn(async move {
         let _apply_permit = match apply_permits.acquire_owned().await {
             Ok(permit) => permit,
-            Err(e) => {
-                let error_message = format!("deployment apply limiter closed: {e}");
+            Err(_) => {
+                let failure_code = "apply_limiter_closed";
                 let _ = crate::deploy::set_deployment_status(
                     &db,
                     deploy_id,
                     "failed",
                     None,
-                    Some(&error_message),
+                    Some(failure_code),
                     true,
                 )
                 .await;
@@ -989,14 +997,14 @@ pub async fn deploy(
                 tracing::error!(
                     app_id = %apply_app.id,
                     deployment_id = %deploy_id,
-                    error = %error_message,
+                    failure_code,
                     "failed to acquire deployment apply permit"
                 );
                 return;
             }
         };
 
-        if let Err(e) = crate::deploy::apply_deployment_manifests(
+        if let Err(error) = crate::deploy::apply_deployment_manifests(
             crate::deploy::ApplyDeploymentManifestsRequest {
                 pool: db.clone(),
                 app: apply_app.clone(),
@@ -1014,13 +1022,13 @@ pub async fn deploy(
         )
         .await
         {
-            let error_message = e.to_string();
+            let failure_code = error.public_code();
             let _ = crate::deploy::set_deployment_status(
                 &db,
                 deploy_id,
                 "failed",
                 None,
-                Some(&error_message),
+                Some(failure_code),
                 true,
             )
             .await;
@@ -1028,7 +1036,7 @@ pub async fn deploy(
             tracing::error!(
                 app_id = %apply_app.id,
                 deployment_id = %deploy_id,
-                error = %error_message,
+                failure_code,
                 "failed to apply deployment manifests"
             );
         }

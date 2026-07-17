@@ -119,6 +119,7 @@ impl GenericDeploymentResponse {
             .get("image")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let error_message = public_deployment_error_message(deployment.error_message.as_deref());
         Self {
             deployment_id: deployment.id,
             app_id: app.id,
@@ -135,7 +136,7 @@ impl GenericDeploymentResponse {
                 .or_else(|| app.source_repository.clone()),
             status: format!("{:?}", deployment.status).to_lowercase(),
             app_status: format!("{:?}", app.status).to_lowercase(),
-            error_message: deployment.error_message,
+            error_message,
             created_at: deployment.created_at,
             completed_at: deployment.completed_at,
             observation: LiveObservation::not_observed(),
@@ -346,12 +347,8 @@ pub async fn get_generic_deployment(
     let observed = observe_app_status_for_deployment(&state, &app, Some(deployment.id)).await;
     let runtime_failure = observed
         .runtime_failure_matches_deployment(deployment.id)
-        .then(|| {
-            observed
-                .runtime_failure_message()
-                .unwrap_or("runtime_failure")
-                .to_string()
-        });
+        .then(|| observed.runtime_failure_public_message())
+        .flatten();
     let observation = observed.observation;
     let mut response =
         GenericDeploymentResponse::from_deployment(deployment, &app).with_observation(observation);
