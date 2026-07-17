@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
-use enclava_engine::apply::watch::{pod_label_selector, pod_runtime_failure_message};
+use enclava_engine::apply::watch::{PodRuntimeFailure, pod_label_selector, pod_runtime_failure};
 use k8s_openapi::api::core::v1::Pod;
 use kube::Api;
 use kube::api::ListParams;
@@ -91,7 +91,7 @@ struct PodEvidence {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RuntimeFailureEvidence {
-    message: String,
+    failure: PodRuntimeFailure,
     deployment_id: Option<Uuid>,
     deployment_id_malformed: bool,
 }
@@ -138,10 +138,10 @@ impl ObservedAppStatus {
         )
     }
 
-    pub(crate) fn runtime_failure_message(&self) -> Option<&str> {
+    pub(crate) fn runtime_failure_public_message(&self) -> Option<String> {
         self.runtime_failure
             .as_ref()
-            .map(|failure| failure.message.as_str())
+            .map(|failure| failure.failure.public_message())
     }
 
     pub(crate) fn runtime_failure_matches_deployment(&self, expected_deployment_id: Uuid) -> bool {
@@ -309,10 +309,10 @@ fn pod_deployment_identity(pod: &Pod) -> (Option<Uuid>, bool) {
 }
 
 fn runtime_failure_evidence(pod: &Pod) -> Option<RuntimeFailureEvidence> {
-    let message = pod_runtime_failure_message(pod)?;
+    let failure = pod_runtime_failure(pod)?;
     let (deployment_id, deployment_id_malformed) = pod_deployment_identity(pod);
     Some(RuntimeFailureEvidence {
-        message,
+        failure,
         deployment_id,
         deployment_id_malformed,
     })
@@ -330,19 +330,6 @@ fn select_runtime_failure(
         return failures.into_iter().nth(index);
     }
     failures.into_iter().next()
-}
-
-/// Compatibility helper for the existing operator inventory. Errors remain
-/// unavailable to callers; live status uses `probe_kubernetes` so it can
-/// distinguish an unavailable API from an observed absence.
-pub async fn live_pod_failure_message(namespace: &str, app_name: &str) -> Option<String> {
-    let client = kube::Client::try_default().await.ok()?;
-    let pods: Api<Pod> = Api::namespaced(client, namespace);
-    let list = pods
-        .list(&ListParams::default().labels(&pod_label_selector(app_name)))
-        .await
-        .ok()?;
-    list.items.iter().find_map(pod_runtime_failure_message)
 }
 
 async fn probe_tee(state: &AppState, tee_status_url: &str) -> TeeEvidence {
@@ -689,7 +676,14 @@ pub async fn app_logs(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use chrono::{TimeZone, Utc};
+    use k8s_openapi::api::core::v1::{
+        ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus, Pod,
+        PodStatus,
+    };
+    use kube::api::ObjectMeta;
     use serde_json::json;
     use uuid::Uuid;
 
@@ -697,8 +691,11 @@ mod tests {
         KubernetesEvidence, LiveObservationReason, LiveObservationState, PodEvidence,
         RuntimeFailureEvidence, TeeEvidence, classify_live_observation,
         classify_live_observation_for_deployment, confidential_status_url, effective_app_status,
-        select_runtime_failure, tee_evidence_fields,
+        runtime_failure_evidence, select_runtime_failure, tee_evidence_fields,
     };
+
+    const WAITING_SECRET: &str = "waiting-message-secret=tenant-api-key";
+    const TERMINATED_SECRET: &str = "terminated-message-secret=tenant-private-key";
 
     fn observed_at() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0)
@@ -729,11 +726,50 @@ mod tests {
         deployment_id: Option<Uuid>,
         deployment_id_malformed: bool,
     ) -> RuntimeFailureEvidence {
-        RuntimeFailureEvidence {
-            message: "container 'app' is CrashLoopBackOff".to_string(),
-            deployment_id,
-            deployment_id_malformed,
-        }
+        let labels = deployment_id
+            .map(|deployment_id| deployment_id.to_string())
+            .or_else(|| deployment_id_malformed.then(|| "not-a-uuid".to_string()))
+            .map(|deployment_id| {
+                BTreeMap::from([("enclava.dev/deployment-id".to_string(), deployment_id)])
+            });
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("tenant-secret-pod-name".to_string()),
+                labels,
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                phase: Some("Running".to_string()),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "tenant-secret-container-name".to_string(),
+                    image: "example.test/workload@sha256:abc".to_string(),
+                    image_id: "example.test/workload@sha256:abc".to_string(),
+                    ready: false,
+                    restart_count: 3,
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some("CrashLoopBackOff".to_string()),
+                            message: Some(WAITING_SECRET.to_string()),
+                        }),
+                        ..Default::default()
+                    }),
+                    last_state: Some(ContainerState {
+                        terminated: Some(ContainerStateTerminated {
+                            reason: Some("StartError".to_string()),
+                            exit_code: 128,
+                            message: Some(TERMINATED_SECRET.to_string()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        runtime_failure_evidence(&pod).expect("fatal runtime failure")
     }
 
     #[test]
@@ -957,6 +993,59 @@ mod tests {
 
         assert_eq!(observed.effective_status("running"), "failed");
         assert!(observed.runtime_failure_matches_deployment(deployment_id));
+    }
+
+    #[test]
+    fn serialized_internal_and_generic_live_failures_exclude_kubernetes_messages() {
+        let deployment_id = Uuid::new_v4();
+        let observed = classify_live_observation_for_deployment(
+            KubernetesEvidence::Available(PodEvidence {
+                found: true,
+                phase: Some("Running".to_string()),
+                deployment_id: Some(deployment_id),
+                deployment_id_malformed: false,
+                runtime_failure: Some(runtime_failure(Some(deployment_id), false)),
+            }),
+            complete_tee(),
+            observed_at(),
+            Some(deployment_id),
+        );
+        let public_message = observed
+            .runtime_failure_public_message()
+            .expect("public runtime failure");
+        assert_eq!(
+            public_message,
+            "container_runtime_failure status=waiting code=crash_loop_back_off; \
+             previous_container_runtime_failure status=terminated code=start_error exit_code=128"
+        );
+
+        let responses = [
+            json!({
+                "latest_deployment": {
+                    "status": "failed",
+                    "error_message": &public_message,
+                    "observation": &observed.observation,
+                },
+                "observation": &observed.observation,
+            }),
+            json!({
+                "status": "failed",
+                "app_status": "failed",
+                "error_message": &public_message,
+                "observation": &observed.observation,
+            }),
+        ];
+
+        for response in responses {
+            let serialized = serde_json::to_string(&response).expect("serialize response");
+            assert!(!serialized.contains(WAITING_SECRET));
+            assert!(!serialized.contains(TERMINATED_SECRET));
+            assert!(!serialized.contains("tenant-secret-pod-name"));
+            assert!(!serialized.contains("tenant-secret-container-name"));
+            assert!(serialized.contains("crash_loop_back_off"));
+            assert!(serialized.contains("start_error"));
+            assert!(serialized.len() < 512);
+        }
     }
 
     #[test]

@@ -106,6 +106,30 @@ fn incomplete_setup_marker_blocks_idempotent_success() {
     );
 }
 
+#[test]
+fn stored_error_plaintext_is_redacted_from_public_and_generic_responses() {
+    const STORED_SECRET: &str = "pod 'tenant-pod' container 'tenant-app' last terminated with StartError exit 128: secret=private-key";
+    let app = idempotency_app();
+
+    let mut generic_deployment = idempotency_deployment(&app);
+    generic_deployment.error_message = Some(STORED_SECRET.to_string());
+    let generic = GenericDeploymentResponse::from_deployment(generic_deployment, &app);
+
+    let mut public_deployment = idempotency_deployment(&app);
+    public_deployment.error_message = Some(STORED_SECRET.to_string());
+    let public = DeploymentResponse::from_deployment(public_deployment, &app);
+
+    for response in [
+        serde_json::to_value(generic).expect("serialize generic response"),
+        serde_json::to_value(public).expect("serialize public response"),
+    ] {
+        let serialized = serde_json::to_string(&response).expect("serialize response value");
+        assert_eq!(response["error_message"], "deployment_error");
+        assert!(!serialized.contains(STORED_SECRET));
+        assert!(!serialized.contains("private-key"));
+    }
+}
+
 fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
     GenericDeploymentRequest {
             external_id: Some("deploy-123".to_string()),

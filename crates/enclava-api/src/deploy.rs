@@ -31,6 +31,7 @@ const DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME: &str = "enclava-registry-auth";
 const TENANT_IMAGE_PULL_SECRET_NAME_ENV: &str = "TENANT_IMAGE_PULL_SECRET_NAME";
 const TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV: &str = "TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES";
 const PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS_ENV: &str = "CAP_PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS";
+pub(crate) const PERSISTED_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 
 #[derive(Debug, Clone)]
 struct TenantImagePullSecretConfig {
@@ -91,18 +92,16 @@ fn classify_rollout_result(
                 terminal: false,
             }
         }
-        Ok(status) => DeploymentOutcome {
+        Ok(_) => DeploymentOutcome {
             deploy_status: "failed",
             app_status: "failed",
-            error_message: status
-                .message
-                .or_else(|| Some(format!("{:?}", status.phase))),
+            error_message: Some(PERSISTED_DEPLOYMENT_ERROR_MESSAGE.to_string()),
             terminal: true,
         },
-        Err(err) => DeploymentOutcome {
+        Err(_) => DeploymentOutcome {
             deploy_status: "failed",
             app_status: "failed",
-            error_message: Some(err),
+            error_message: Some(PERSISTED_DEPLOYMENT_ERROR_MESSAGE.to_string()),
             terminal: true,
         },
     }
@@ -527,6 +526,29 @@ pub enum DeployError {
     EdgeRoute(#[from] crate::edge::EdgeRouteError),
     #[error("durable mutation fence error: {0}")]
     Mutation(#[from] crate::mutation_leases::MutationLeaseError),
+}
+
+impl DeployError {
+    /// Return a bounded code safe for persistence and operator logs.
+    pub(crate) fn public_code(&self) -> &'static str {
+        match self {
+            Self::Db(_) => "database_error",
+            Self::NoContainers => "no_containers",
+            Self::ImageParse(_) => "image_parse_error",
+            Self::NoDigest(_) => "image_digest_required",
+            Self::Validation(_) => "deployment_validation_error",
+            Self::MissingAttestationConfig => "deploy_runtime_not_configured",
+            Self::Apply(error) => error.public_code(),
+            Self::NotDeployed(_) => "app_not_deployed",
+            Self::KbsPolicy(_) => "kbs_policy_error",
+            Self::EdgeRoute(_) => "edge_route_error",
+            Self::Mutation(_) => "mutation_fence_error",
+        }
+    }
+}
+
+fn persisted_deployment_error(error_message: Option<&str>) -> Option<&'static str> {
+    error_message.map(|_| PERSISTED_DEPLOYMENT_ERROR_MESSAGE)
 }
 
 pub(crate) fn serialize_workload_command(
@@ -1145,8 +1167,25 @@ mod tests {
         assert!(outcome.terminal);
         assert_eq!(
             outcome.error_message.as_deref(),
-            Some("rollout did not complete within 600s")
+            Some(PERSISTED_DEPLOYMENT_ERROR_MESSAGE)
         );
+    }
+
+    #[test]
+    fn deployment_error_persistence_discards_plaintext() {
+        const SENSITIVE_ERROR: &str =
+            "kubernetes response included customer-secret-name and private-config";
+
+        let persisted = persisted_deployment_error(Some(SENSITIVE_ERROR));
+        assert_eq!(persisted, Some(PERSISTED_DEPLOYMENT_ERROR_MESSAGE));
+        assert!(!persisted.unwrap().contains("customer-secret-name"));
+        assert_eq!(persisted_deployment_error(None), None);
+
+        let error = DeployError::Apply(enclava_engine::apply::engine::ApplyError::RolloutFailed(
+            SENSITIVE_ERROR.to_string(),
+        ));
+        assert_eq!(error.public_code(), "rollout_failed");
+        assert!(!error.public_code().contains("customer-secret-name"));
     }
 
     #[test]
@@ -1587,7 +1626,7 @@ pub async fn set_deployment_status(
     )
     .bind(status)
     .bind(manifest_hash)
-    .bind(error_message)
+    .bind(persisted_deployment_error(error_message))
     .bind(terminal)
     .bind(deployment_id)
     .execute(pool)
@@ -1757,7 +1796,7 @@ impl DeploymentRollout {
         let unlock_mode = self.app.unlock_mode;
         let result = watch_rollout(&self.engine, &self.app_spec.namespace, &self.app_spec.name)
             .await
-            .map_err(|error| error.to_string());
+            .map_err(|error| error.public_code().to_string());
         let outcome = classify_rollout_result(result, previous_app_status, unlock_mode);
         DeploymentRolloutOutcome {
             deploy_status: outcome.deploy_status,

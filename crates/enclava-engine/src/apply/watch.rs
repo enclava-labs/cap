@@ -8,21 +8,122 @@ use super::engine::{ApplyEngine, ApplyError};
 use super::types::{DeployPhase, DeployStatus};
 
 const STALE_TERMINATING_POD_FORCE_DELETE_BUFFER_SECONDS: i64 = 10;
-const MAX_CONTAINER_FAILURE_DETAIL_CHARS: usize = 300;
+pub const POD_TERMINAL_FAILURE_CODE: &str = "pod_failed";
 
-const FATAL_WAITING_REASONS: &[&str] = &[
-    "CrashLoopBackOff",
-    "CreateContainerConfigError",
-    "CreateContainerError",
-    "Error",
-    "ErrImagePull",
-    "ImagePullBackOff",
-    "InvalidImageName",
-    "RunContainerError",
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerRuntimeStatus {
+    Waiting,
+    Terminated,
+}
 
-const FATAL_TERMINATED_REASONS: &[&str] =
-    &["ContainerCannotRun", "Error", "OOMKilled", "StartError"];
+impl ContainerRuntimeStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Terminated => "terminated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerRuntimeFailureCode {
+    CrashLoopBackOff,
+    CreateContainerConfigError,
+    CreateContainerError,
+    Error,
+    ErrImagePull,
+    ImagePullBackOff,
+    InvalidImageName,
+    RunContainerError,
+    ContainerCannotRun,
+    OomKilled,
+    StartError,
+}
+
+impl ContainerRuntimeFailureCode {
+    fn from_waiting_reason(reason: &str) -> Option<Self> {
+        match reason {
+            "CrashLoopBackOff" => Some(Self::CrashLoopBackOff),
+            "CreateContainerConfigError" => Some(Self::CreateContainerConfigError),
+            "CreateContainerError" => Some(Self::CreateContainerError),
+            "Error" => Some(Self::Error),
+            "ErrImagePull" => Some(Self::ErrImagePull),
+            "ImagePullBackOff" => Some(Self::ImagePullBackOff),
+            "InvalidImageName" => Some(Self::InvalidImageName),
+            "RunContainerError" => Some(Self::RunContainerError),
+            _ => None,
+        }
+    }
+
+    fn from_terminated_reason(reason: &str) -> Option<Self> {
+        match reason {
+            "ContainerCannotRun" => Some(Self::ContainerCannotRun),
+            "Error" => Some(Self::Error),
+            "OOMKilled" => Some(Self::OomKilled),
+            "StartError" => Some(Self::StartError),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CrashLoopBackOff => "crash_loop_back_off",
+            Self::CreateContainerConfigError => "create_container_config_error",
+            Self::CreateContainerError => "create_container_error",
+            Self::Error => "error",
+            Self::ErrImagePull => "err_image_pull",
+            Self::ImagePullBackOff => "image_pull_back_off",
+            Self::InvalidImageName => "invalid_image_name",
+            Self::RunContainerError => "run_container_error",
+            Self::ContainerCannotRun => "container_cannot_run",
+            Self::OomKilled => "oom_killed",
+            Self::StartError => "start_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContainerRuntimeFailure {
+    status: ContainerRuntimeStatus,
+    code: ContainerRuntimeFailureCode,
+    exit_code: Option<i32>,
+}
+
+impl ContainerRuntimeFailure {
+    fn public_message(self) -> String {
+        let mut message = format!(
+            "container_runtime_failure status={} code={}",
+            self.status.as_str(),
+            self.code.as_str()
+        );
+        if let Some(exit_code) = self.exit_code {
+            message.push_str(&format!(" exit_code={exit_code}"));
+        }
+        message
+    }
+}
+
+/// A bounded runtime-failure summary safe to return across API boundaries.
+///
+/// Kubernetes state messages and workload-controlled names are deliberately
+/// not retained. Only allowlisted runtime status/reason codes and a numeric
+/// exit code can be rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PodRuntimeFailure {
+    current: ContainerRuntimeFailure,
+    previous: Option<ContainerRuntimeFailure>,
+}
+
+impl PodRuntimeFailure {
+    pub fn public_message(self) -> String {
+        let mut message = self.current.public_message();
+        if let Some(previous) = self.previous {
+            message.push_str("; previous_");
+            message.push_str(&previous.public_message());
+        }
+        message
+    }
+}
 
 pub fn pod_label_selector(statefulset_name: &str) -> String {
     format!("app={statefulset_name}")
@@ -113,82 +214,50 @@ pub fn classify_pod_phase(snap: &PodSnapshot) -> DeployPhase {
     }
 }
 
-fn detail_or_default(detail: Option<&str>) -> String {
-    let detail = detail
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("no details");
-    detail
-        .chars()
-        .take(MAX_CONTAINER_FAILURE_DETAIL_CHARS)
-        .collect()
-}
-
-fn fatal_waiting_reason(reason: &str) -> bool {
-    FATAL_WAITING_REASONS.contains(&reason)
-}
-
-fn fatal_terminated_reason(reason: &str) -> bool {
-    FATAL_TERMINATED_REASONS.contains(&reason)
-}
-
-fn terminated_failure_message(
-    container_name: &str,
-    state_kind: &str,
+fn terminated_failure(
     terminated: &k8s_openapi::api::core::v1::ContainerStateTerminated,
-) -> Option<String> {
+) -> Option<ContainerRuntimeFailure> {
     let reason = terminated.reason.as_deref().unwrap_or_default();
-    if !fatal_terminated_reason(reason) {
-        return None;
-    }
-    Some(format!(
-        "container '{container_name}' {state_kind} {reason} exit {}: {}",
-        terminated.exit_code,
-        detail_or_default(terminated.message.as_deref())
-    ))
+    Some(ContainerRuntimeFailure {
+        status: ContainerRuntimeStatus::Terminated,
+        code: ContainerRuntimeFailureCode::from_terminated_reason(reason)?,
+        exit_code: Some(terminated.exit_code),
+    })
 }
 
-fn state_failure_message(
-    container_name: &str,
-    state_kind: &str,
-    state: Option<&ContainerState>,
-) -> Option<String> {
+fn state_failure(state: Option<&ContainerState>) -> Option<ContainerRuntimeFailure> {
     let state = state?;
     if let Some(terminated) = state.terminated.as_ref()
-        && let Some(message) = terminated_failure_message(container_name, state_kind, terminated)
+        && let Some(failure) = terminated_failure(terminated)
     {
-        return Some(message);
+        return Some(failure);
     }
     if let Some(waiting) = state.waiting.as_ref()
         && let Some(reason) = waiting.reason.as_deref()
-        && fatal_waiting_reason(reason)
+        && let Some(code) = ContainerRuntimeFailureCode::from_waiting_reason(reason)
     {
-        return Some(format!(
-            "container '{container_name}' {state_kind} {reason}: {}",
-            detail_or_default(waiting.message.as_deref())
-        ));
+        return Some(ContainerRuntimeFailure {
+            status: ContainerRuntimeStatus::Waiting,
+            code,
+            exit_code: None,
+        });
     }
     None
 }
 
-fn container_runtime_failure_message(status: &ContainerStatus) -> Option<String> {
-    let current_message = state_failure_message(&status.name, "is", status.state.as_ref())?;
-    if let Some(last_message) = state_failure_message(
-        &status.name,
-        "last terminated with",
-        status.last_state.as_ref(),
-    ) {
-        return Some(format!("{current_message}; {last_message}"));
-    }
-    Some(current_message)
+fn container_runtime_failure(status: &ContainerStatus) -> Option<PodRuntimeFailure> {
+    Some(PodRuntimeFailure {
+        current: state_failure(status.state.as_ref())?,
+        previous: state_failure(status.last_state.as_ref()),
+    })
 }
 
-/// Return a concise fatal container runtime message for a pod, if one exists.
+/// Return a bounded fatal container runtime summary for a pod, if one exists.
 ///
 /// Kubernetes can keep a pod phase at `Running` while an app container is in
 /// `CrashLoopBackOff` or has a runtime `StartError`, so callers must inspect
 /// container states rather than relying on pod phase alone.
-pub fn pod_runtime_failure_message(pod: &Pod) -> Option<String> {
+pub fn pod_runtime_failure(pod: &Pod) -> Option<PodRuntimeFailure> {
     let status = pod.status.as_ref()?;
     for container in status
         .init_container_statuses
@@ -201,12 +270,26 @@ pub fn pod_runtime_failure_message(pod: &Pod) -> Option<String> {
                 .flat_map(|statuses| statuses.iter()),
         )
     {
-        if let Some(message) = container_runtime_failure_message(container) {
-            let pod_name = pod.metadata.name.as_deref().unwrap_or("<unknown>");
-            return Some(format!("pod '{pod_name}' {message}"));
+        if let Some(failure) = container_runtime_failure(container) {
+            return Some(failure);
         }
     }
     None
+}
+
+/// Compatibility formatter for deployment-watch error storage. The returned
+/// string contains only the bounded fields from [`PodRuntimeFailure`].
+pub fn pod_runtime_failure_message(pod: &Pod) -> Option<String> {
+    pod_runtime_failure(pod).map(PodRuntimeFailure::public_message)
+}
+
+/// Return the fixed code for a terminal pod phase without retaining pod names.
+pub fn pod_terminal_failure_code(pod: &Pod) -> Option<&'static str> {
+    matches!(
+        classify_pod_phase(&PodSnapshot::from_pod(pod)),
+        DeployPhase::Failed
+    )
+    .then_some(POD_TERMINAL_FAILURE_CODE)
 }
 
 pub fn stale_terminating_pod_needs_force_delete(pod: &Pod, now: Timestamp) -> bool {
@@ -343,11 +426,9 @@ pub async fn watch_rollout(
             }
 
             // Pod in terminal failure
-            if matches!(phase, DeployPhase::Failed) {
-                let pod_name = pod.metadata.name.as_deref().unwrap_or("<unknown>");
-                return Ok(DeployStatus::failed(&format!(
-                    "pod '{pod_name}' entered Failed state"
-                )));
+            if let Some(code) = pod_terminal_failure_code(pod) {
+                tracing::warn!(failure_code = code, "pod entered terminal failure state");
+                return Ok(DeployStatus::failed(code));
             }
         }
 

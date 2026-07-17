@@ -474,6 +474,14 @@ pub struct DeploymentResponse {
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
+
+/// Project a stored deployment error across an API boundary without exposing
+/// arbitrary backend, runtime, or workload-controlled plaintext.
+pub(crate) fn public_deployment_error_message(error_message: Option<&str>) -> Option<String> {
+    error_message.map(|_| PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string())
+}
+
 impl DeploymentResponse {
     fn from_deployment(d: Deployment, app: &App) -> Self {
         let app_domain = app
@@ -488,7 +496,7 @@ impl DeploymentResponse {
             status: format!("{:?}", d.status).to_lowercase(),
             image_digest: d.image_digest,
             cosign_verified: d.cosign_verified,
-            error_message: d.error_message,
+            error_message: public_deployment_error_message(d.error_message.as_deref()),
             created_at: d.created_at,
             completed_at: d.completed_at,
         }
