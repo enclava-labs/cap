@@ -1132,6 +1132,10 @@ async fn deploy_app_candidate(
             .await
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     }
+    let current_role =
+        crate::auth::scopes::active_membership_role_in_tx(&mut tx, auth.org_id, auth.user_id)
+            .await?;
+    crate::auth::scopes::require_admin_role(current_role)?;
     crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
@@ -1743,6 +1747,98 @@ mod tests {
             validate_log_encryption_config(Some(config)).expect_err("algorithm rejected");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "unsupported log_encryption.algorithm");
+    }
+
+    #[tokio::test]
+    async fn deployment_acceptance_waits_for_membership_removal_and_rejects() {
+        let pool = database_test_pool().await;
+        let app = insert_setup_test_app(&pool).await;
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Removed Deployer')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert removed deployer");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("insert deployer membership");
+
+        let mut removal = pool.begin().await.expect("begin deployer removal");
+        crate::entitlements::lock_org_entitlement_lane(&mut removal, app.org_id)
+            .await
+            .expect("lock removal entitlement lane");
+        crate::signing_service::lock_org_signing_authority_lane(&mut removal, app.org_id)
+            .await
+            .expect("lock removal signing lane");
+        sqlx::query(
+            "UPDATE memberships
+                SET role = 'member', removed_at = now()
+              WHERE org_id = $1 AND user_id = $2",
+        )
+        .bind(app.org_id)
+        .bind(user_id)
+        .execute(&mut *removal)
+        .await
+        .expect("stage deployer removal");
+
+        let validation_pool = pool.clone();
+        let org_id = app.org_id;
+        let app_id = app.id;
+        let (pid_sender, pid_receiver) = tokio::sync::oneshot::channel();
+        let validation = tokio::spawn(async move {
+            let mut tx = validation_pool
+                .begin()
+                .await
+                .expect("begin deployment membership validation");
+            let backend_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("deployment membership validator backend pid");
+            pid_sender.send(backend_pid).expect("send validator pid");
+            crate::entitlements::lock_org_entitlement_lane(&mut tx, org_id)
+                .await
+                .expect("lock acceptance entitlement lane");
+            crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
+                .await
+                .expect("lock acceptance signing lane");
+            let authority =
+                crate::auth::scopes::active_membership_role_in_tx(&mut tx, org_id, user_id)
+                    .await
+                    .and_then(crate::auth::scopes::require_admin_role);
+            if authority.is_ok() {
+                crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+                    .await
+                    .expect("lock acceptance app lane");
+            }
+            tx.rollback()
+                .await
+                .expect("roll back membership validation");
+            authority
+        });
+
+        let backend_pid = pid_receiver.await.expect("receive validator pid");
+        wait_for_backend_lock(&pool, backend_pid).await;
+        removal.commit().await.expect("commit deployer removal");
+
+        let rejected = validation
+            .await
+            .expect("join deployment membership validation")
+            .expect_err("removed deployer must fail serialized acceptance");
+        assert_eq!(rejected.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            rejected.1.0["error"],
+            "active organization membership required"
+        );
+
+        delete_setup_test_org(&pool, app.org_id).await;
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete removed deployer");
     }
 
     #[tokio::test]

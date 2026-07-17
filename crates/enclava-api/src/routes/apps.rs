@@ -682,6 +682,10 @@ pub async fn create_app(
     crate::entitlements::lock_org_entitlement_lane(&mut tx, auth.org_id)
         .await
         .map_err(|_| internal_server_error())?;
+    let current_role =
+        crate::auth::scopes::active_membership_role_in_tx(&mut tx, auth.org_id, auth.user_id)
+            .await?;
+    crate::auth::scopes::require_admin_role(current_role)?;
     crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
         .await
         .map_err(|_| internal_server_error())?;

@@ -262,6 +262,31 @@ fn role_as_str(role: Role) -> &'static str {
     }
 }
 
+const PAAS_USER_MAPPING_LANE_DOMAIN: i32 = 0x5055_5345;
+
+fn paas_user_mapping_lane_key(paas_user_id: &str) -> i32 {
+    let digest = Sha256::digest(paas_user_id.as_bytes());
+    i32::from_be_bytes(digest[..4].try_into().expect("SHA-256 word"))
+}
+
+/// Serialize creation of the global PaaS-user mapping.
+///
+/// Lock order is organization entitlement -> organization signing -> PaaS
+/// user mapping -> app. No path acquires an organization lane after this
+/// mapping lane, so the same hosted user can be synced into multiple orgs
+/// without a reverse-order deadlock or duplicate local user.
+async fn lock_paas_user_mapping_lane(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    paas_user_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(PAAS_USER_MAPPING_LANE_DOMAIN)
+        .bind(paas_user_mapping_lane_key(paas_user_id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 fn request_hash<T: Serialize>(body: &T) -> Result<Vec<u8>, (StatusCode, Json<serde_json::Value>)> {
     let bytes = serde_json::to_vec(body).map_err(|_| {
         json_error(
@@ -488,6 +513,12 @@ pub async fn sync_paas_member(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
     validate_external_id(&paas_user_id, "paas_user_id")?;
+    if body.version < 0 {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "version must be non-negative",
+        ));
+    }
     let role = parse_role(&body.role)?;
     let key = idempotency_key(&headers)?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}");
@@ -509,87 +540,162 @@ pub async fn sync_paas_member(
     .map_err(|_| db_error())?
     .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "PaaS organization is not mapped"))?;
 
-    let cap_user_id: Option<Uuid> = sqlx::query_scalar(
+    let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, cap_org_id)
+        .await
+        .map_err(|_| db_error())?;
+    crate::signing_service::lock_org_signing_authority_lane(&mut tx, cap_org_id)
+        .await
+        .map_err(|_| db_error())?;
+    lock_paas_user_mapping_lane(&mut tx, &paas_user_id)
+        .await
+        .map_err(|_| db_error())?;
+
+    let mapped_user_id: Option<Uuid> = sqlx::query_scalar(
         "SELECT cap_id
            FROM paas_external_mappings
           WHERE resource_type = 'user'
             AND paas_external_id = $1",
     )
     .bind(&paas_user_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|_| db_error())?;
-
-    let cap_user_id = if let Some(user_id) = cap_user_id {
-        sqlx::query("UPDATE users SET display_name = $2, updated_at = now() WHERE id = $1")
-            .bind(user_id)
-            .bind(&body.display_name)
-            .execute(&state.db)
-            .await
-            .map_err(|_| db_error())?;
-        user_id
-    } else {
-        let user_id = Uuid::new_v4();
-        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
-            .bind(user_id)
-            .bind(&body.display_name)
-            .execute(&state.db)
-            .await
-            .map_err(|_| db_error())?;
-        sqlx::query(
-            "INSERT INTO paas_external_mappings
-                 (resource_type, paas_external_id, cap_id, metadata, updated_at)
-             VALUES ('user', $1, $2, $3, now())",
+    let cap_user_id = mapped_user_id.unwrap_or_else(Uuid::new_v4);
+    type MembershipAuthorityRow = (String, i64, String, bool, String);
+    let existing: Option<MembershipAuthorityRow> = if mapped_user_id.is_some() {
+        sqlx::query_as(
+            "SELECT pms.paas_user_id,
+                    pms.version,
+                    pms.role,
+                    pms.active,
+                    u.display_name
+               FROM paas_membership_sync_state pms
+               JOIN users u ON u.id = pms.user_id
+              WHERE pms.org_id = $1
+                AND pms.user_id = $2",
         )
-        .bind(&paas_user_id)
-        .bind(user_id)
-        .bind(serde_json::json!({"client_san": auth.client_san}))
-        .execute(&state.db)
+        .bind(cap_org_id)
+        .bind(cap_user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| db_error())?
+    } else {
+        None
+    };
+
+    let role_name = role_as_str(role);
+    let write_membership = match existing {
+        Some((_, version, _, _, _)) if body.version < version => {
+            let error = json_error(StatusCode::CONFLICT, "membership version is stale");
+            tx.rollback().await.map_err(|_| db_error())?;
+            finish_idempotent_request(&state, key, error.0, &error.1.0).await?;
+            return Err(error);
+        }
+        Some((existing_paas_user_id, version, existing_role, active, display_name))
+            if body.version == version =>
+        {
+            if existing_paas_user_id != paas_user_id
+                || existing_role != role_name
+                || active != body.active
+                || display_name != body.display_name
+            {
+                let error = json_error(
+                    StatusCode::CONFLICT,
+                    "membership version already exists with different content",
+                );
+                tx.rollback().await.map_err(|_| db_error())?;
+                finish_idempotent_request(&state, key, error.0, &error.1.0).await?;
+                return Err(error);
+            }
+            false
+        }
+        _ => true,
+    };
+
+    if write_membership {
+        if mapped_user_id.is_some() {
+            sqlx::query("UPDATE users SET display_name = $2, updated_at = now() WHERE id = $1")
+                .bind(cap_user_id)
+                .bind(&body.display_name)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| db_error())?;
+        } else {
+            sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, $2)")
+                .bind(cap_user_id)
+                .bind(&body.display_name)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| db_error())?;
+            sqlx::query(
+                "INSERT INTO paas_external_mappings
+                     (resource_type, paas_external_id, cap_id, metadata, updated_at)
+                 VALUES ('user', $1, $2, $3, now())",
+            )
+            .bind(&paas_user_id)
+            .bind(cap_user_id)
+            .bind(serde_json::json!({"client_san": &auth.client_san}))
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| db_error())?;
+        }
+
+        let removed_at: Option<chrono::DateTime<chrono::Utc>> =
+            (!body.active).then(chrono::Utc::now);
+        sqlx::query(
+            "INSERT INTO memberships (user_id, org_id, role, removed_at)
+             VALUES ($1, $2, $3::role_enum, $4)
+             ON CONFLICT (user_id, org_id) DO UPDATE
+                SET role = EXCLUDED.role,
+                    removed_at = EXCLUDED.removed_at",
+        )
+        .bind(cap_user_id)
+        .bind(cap_org_id)
+        .bind(role_name)
+        .bind(removed_at)
+        .execute(&mut *tx)
         .await
         .map_err(|_| db_error())?;
-        user_id
-    };
 
-    let removed_at: Option<chrono::DateTime<chrono::Utc>> = if body.active {
-        None
-    } else {
-        Some(chrono::Utc::now())
-    };
-    sqlx::query(
-        "INSERT INTO memberships (user_id, org_id, role, removed_at)
-         VALUES ($1, $2, $3::role_enum, $4)
-         ON CONFLICT (user_id, org_id) DO UPDATE
-            SET role = EXCLUDED.role,
-                removed_at = EXCLUDED.removed_at",
-    )
-    .bind(cap_user_id)
-    .bind(cap_org_id)
-    .bind(role_as_str(role))
-    .bind(removed_at)
-    .execute(&state.db)
-    .await
-    .map_err(|_| db_error())?;
+        sqlx::query(
+            "INSERT INTO paas_membership_sync_state
+                 (org_id, user_id, paas_user_id, role, version, active, synced_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now())
+             ON CONFLICT (org_id, user_id) DO UPDATE
+                SET paas_user_id = EXCLUDED.paas_user_id,
+                    role = EXCLUDED.role,
+                    version = EXCLUDED.version,
+                    active = EXCLUDED.active,
+                    synced_at = now()",
+        )
+        .bind(cap_org_id)
+        .bind(cap_user_id)
+        .bind(&paas_user_id)
+        .bind(role_name)
+        .bind(body.version)
+        .bind(body.active)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
 
-    sqlx::query(
-        "INSERT INTO paas_membership_sync_state
-             (org_id, user_id, paas_user_id, role, version, active, synced_at)
-         VALUES ($1, $2, $3, $4, $5, $6, now())
-         ON CONFLICT (org_id, user_id) DO UPDATE
-            SET paas_user_id = EXCLUDED.paas_user_id,
-                role = EXCLUDED.role,
-                version = GREATEST(paas_membership_sync_state.version, EXCLUDED.version),
-                active = EXCLUDED.active,
-                synced_at = now()",
-    )
-    .bind(cap_org_id)
-    .bind(cap_user_id)
-    .bind(&paas_user_id)
-    .bind(role_as_str(role))
-    .bind(body.version)
-    .bind(body.active)
-    .execute(&state.db)
-    .await
-    .map_err(|_| db_error())?;
+        sqlx::query(
+            "INSERT INTO audit_log (org_id, user_id, action, detail)
+             VALUES ($1, $2, 'org.member.sync', $3)",
+        )
+        .bind(cap_org_id)
+        .bind(cap_user_id)
+        .bind(serde_json::json!({
+            "role": role_name,
+            "active": body.active,
+            "version": body.version,
+            "client_san": &auth.client_san,
+        }))
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+    }
+    tx.commit().await.map_err(|_| db_error())?;
 
     let response = serde_json::json!({
         "cap_org_id": cap_org_id,
@@ -1987,4 +2093,400 @@ pub async fn update_paas_unlock_mode(
     let response = to_value(response)?;
     finish_actor_idempotent_request(&state, &headers, StatusCode::OK, &response).await?;
     Ok((StatusCode::OK, Json(response)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    async fn database_test_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect membership sync regression database");
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate membership sync regression database");
+        pool
+    }
+
+    async fn named_database_test_pool(application_name: &str) -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let options = database_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("parse membership sync regression database URL")
+            .application_name(application_name);
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("connect named membership sync pool")
+    }
+
+    async fn wait_for_named_lock_waiters(
+        pool: &sqlx::PgPool,
+        application_name: &str,
+        expected: i64,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*)
+                       FROM pg_stat_activity
+                      WHERE datname = current_database()
+                        AND application_name = $1
+                        AND wait_event_type = 'Lock'",
+                )
+                .bind(application_name)
+                .fetch_one(pool)
+                .await
+                .expect("inspect named membership sync lock state");
+                if waiting >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("membership sync writers did not reach the mapping lane");
+    }
+
+    fn idempotency_headers(key: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_str(key).expect("valid idempotency key"),
+        );
+        headers
+    }
+
+    async fn sync_member(
+        state: &AppState,
+        paas_org_id: &str,
+        paas_user_id: &str,
+        idempotency_key: &str,
+        body: SyncPaaSMemberRequest,
+    ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+        sync_paas_member(
+            InternalAuth {
+                client_san: "spiffe://paas.example.test/enclava-paas".to_string(),
+            },
+            State(state.clone()),
+            Path((paas_org_id.to_string(), paas_user_id.to_string())),
+            idempotency_headers(idempotency_key),
+            Json(body),
+        )
+        .await
+    }
+
+    fn member_request(
+        display_name: &str,
+        role: &str,
+        active: bool,
+        version: i64,
+    ) -> SyncPaaSMemberRequest {
+        SyncPaaSMemberRequest {
+            display_name: display_name.to_string(),
+            role: role.to_string(),
+            active,
+            version,
+        }
+    }
+
+    #[tokio::test]
+    async fn membership_sync_rejects_stale_or_divergent_authority_and_replays_exactly() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("member-authority-{suffix}");
+        let paas_org_id = format!("paas-org-{suffix}");
+        let paas_user_id = format!("paas-user-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert membership authority org");
+        sqlx::query(
+            "INSERT INTO paas_external_mappings
+                 (resource_type, paas_external_id, cap_id, org_id)
+             VALUES ('organization', $1, $2, $2)",
+        )
+        .bind(&paas_org_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("map membership authority org");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let _ = sync_member(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &format!("member-v1-{suffix}"),
+            member_request("Initial Owner", "owner", true, 1),
+        )
+        .await
+        .expect("apply initial membership authority");
+        let _ = sync_member(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &format!("member-v2-{suffix}"),
+            member_request("Removed Member", "member", false, 2),
+        )
+        .await
+        .expect("apply membership removal and demotion");
+
+        let stale_key = format!("member-stale-{suffix}");
+        let stale = sync_member(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &stale_key,
+            member_request("Stale Re-Escalation", "owner", true, 1),
+        )
+        .await
+        .expect_err("stale membership reactivation must fail");
+        assert_eq!(stale.0, StatusCode::CONFLICT);
+        assert_eq!(stale.1.0["error"], "membership version is stale");
+        let (stale_retry_status, Json(stale_retry_body)) = sync_member(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &stale_key,
+            member_request("Stale Re-Escalation", "owner", true, 1),
+        )
+        .await
+        .expect("stale membership error replay is completed");
+        assert_eq!(stale_retry_status, StatusCode::CONFLICT);
+        assert_eq!(stale_retry_body["error"], "membership version is stale");
+
+        let _ = sync_member(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &format!("member-v2-replay-{suffix}"),
+            member_request("Removed Member", "member", false, 2),
+        )
+        .await
+        .expect("exact same-version membership replay is idempotent");
+
+        let divergent_key = format!("member-v2-divergent-{suffix}");
+        let divergent = sync_member(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &divergent_key,
+            member_request("Removed Member", "owner", true, 2),
+        )
+        .await
+        .expect_err("same-version divergent membership authority must fail");
+        assert_eq!(divergent.0, StatusCode::CONFLICT);
+        assert_eq!(
+            divergent.1.0["error"],
+            "membership version already exists with different content"
+        );
+        let (divergent_retry_status, Json(divergent_retry_body)) = sync_member(
+            &state,
+            &paas_org_id,
+            &paas_user_id,
+            &divergent_key,
+            member_request("Removed Member", "owner", true, 2),
+        )
+        .await
+        .expect("divergent membership error replay is completed");
+        assert_eq!(divergent_retry_status, StatusCode::CONFLICT);
+        assert_eq!(
+            divergent_retry_body["error"],
+            "membership version already exists with different content"
+        );
+
+        let authority: (String, bool, i64, String, bool, String) = sqlx::query_as(
+            "SELECT m.role::text,
+                    m.removed_at IS NULL,
+                    pms.version,
+                    pms.role,
+                    pms.active,
+                    u.display_name
+               FROM paas_membership_sync_state pms
+               JOIN memberships m
+                 ON m.org_id = pms.org_id AND m.user_id = pms.user_id
+               JOIN users u ON u.id = pms.user_id
+              WHERE pms.org_id = $1",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load final membership authority");
+        assert_eq!(
+            authority,
+            (
+                "member".to_string(),
+                false,
+                2,
+                "member".to_string(),
+                false,
+                "Removed Member".to_string(),
+            ),
+            "stale and divergent deliveries must not reactivate, re-escalate, or rename the member"
+        );
+
+        let audits: Vec<(i64, String, bool, serde_json::Value)> = sqlx::query_as(
+            "SELECT (detail->>'version')::bigint,
+                    detail->>'role',
+                    (detail->>'active')::boolean,
+                    detail
+               FROM audit_log
+              WHERE org_id = $1 AND action = 'org.member.sync'
+              ORDER BY id",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("load membership authority audit");
+        assert_eq!(
+            audits,
+            vec![
+                (
+                    1,
+                    "owner".to_string(),
+                    true,
+                    serde_json::json!({
+                        "role": "owner",
+                        "active": true,
+                        "version": 1,
+                        "client_san": "spiffe://paas.example.test/enclava-paas",
+                    }),
+                ),
+                (
+                    2,
+                    "member".to_string(),
+                    false,
+                    serde_json::json!({
+                        "role": "member",
+                        "active": false,
+                        "version": 2,
+                        "client_san": "spiffe://paas.example.test/enclava-paas",
+                    }),
+                ),
+            ],
+            "only committed authority generations receive minimal mandatory audit rows without user plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_user_syncs_across_orgs_share_one_atomic_mapping() {
+        let pool = database_test_pool().await;
+        let org_a = Uuid::new_v4();
+        let org_b = Uuid::new_v4();
+        let suffix = org_a.simple().to_string();
+        let paas_org_a = format!("paas-org-a-{suffix}");
+        let paas_org_b = format!("paas-org-b-{suffix}");
+        let paas_user_id = format!("paas-shared-user-{suffix}");
+        let display_name = format!("Shared User {suffix}");
+        for (org_id, org_name, paas_org_id) in [
+            (org_a, format!("member-map-a-{suffix}"), &paas_org_a),
+            (org_b, format!("member-map-b-{suffix}"), &paas_org_b),
+        ] {
+            crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+                .await
+                .expect("insert concurrent mapping org");
+            sqlx::query(
+                "INSERT INTO paas_external_mappings
+                     (resource_type, paas_external_id, cap_id, org_id)
+                 VALUES ('organization', $1, $2, $2)",
+            )
+            .bind(paas_org_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("map concurrent membership org");
+        }
+
+        let application_name = format!("member-map-{suffix}");
+        let writer_pool = named_database_test_pool(&application_name).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = writer_pool;
+
+        let mut blocker = pool.begin().await.expect("begin user mapping blocker");
+        lock_paas_user_mapping_lane(&mut blocker, &paas_user_id)
+            .await
+            .expect("block shared user mapping lane");
+
+        let writer_a_state = state.clone();
+        let writer_a_org = paas_org_a.clone();
+        let writer_a_user = paas_user_id.clone();
+        let writer_a_name = display_name.clone();
+        let writer_a_key = format!("member-map-a-{suffix}");
+        let writer_a = tokio::spawn(async move {
+            sync_member(
+                &writer_a_state,
+                &writer_a_org,
+                &writer_a_user,
+                &writer_a_key,
+                member_request(&writer_a_name, "owner", true, 1),
+            )
+            .await
+        });
+        let writer_b_state = state;
+        let writer_b_org = paas_org_b.clone();
+        let writer_b_user = paas_user_id.clone();
+        let writer_b_name = display_name.clone();
+        let writer_b_key = format!("member-map-b-{suffix}");
+        let writer_b = tokio::spawn(async move {
+            sync_member(
+                &writer_b_state,
+                &writer_b_org,
+                &writer_b_user,
+                &writer_b_key,
+                member_request(&writer_b_name, "owner", true, 1),
+            )
+            .await
+        });
+
+        wait_for_named_lock_waiters(&pool, &application_name, 2).await;
+        blocker.commit().await.expect("release user mapping lane");
+        let _ = writer_a
+            .await
+            .expect("join first shared user sync")
+            .expect("sync shared user into first org");
+        let _ = writer_b
+            .await
+            .expect("join second shared user sync")
+            .expect("sync shared user into second org");
+
+        let mapping_count: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+               FROM paas_external_mappings
+              WHERE resource_type = 'user' AND paas_external_id = $1",
+        )
+        .bind(&paas_user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count shared user mappings");
+        assert_eq!(mapping_count, 1);
+        let local_user_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM users WHERE display_name = $1")
+                .bind(&display_name)
+                .fetch_one(&pool)
+                .await
+                .expect("count shared local users");
+        assert_eq!(local_user_count, 1, "no orphan duplicate user may survive");
+        let authority: (i64, i64, i64) = sqlx::query_as(
+            "SELECT count(*),
+                    count(DISTINCT user_id),
+                    (SELECT count(*) FROM audit_log
+                      WHERE org_id IN ($1, $2) AND action = 'org.member.sync')
+               FROM paas_membership_sync_state
+              WHERE org_id IN ($1, $2)",
+        )
+        .bind(org_a)
+        .bind(org_b)
+        .fetch_one(&pool)
+        .await
+        .expect("load shared membership authority");
+        assert_eq!(authority, (2, 1, 2));
+    }
 }

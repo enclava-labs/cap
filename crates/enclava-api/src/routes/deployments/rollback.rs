@@ -217,6 +217,10 @@ pub async fn rollback(
             .await
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     }
+    let current_role =
+        crate::auth::scopes::active_membership_role_in_tx(&mut tx, auth.org_id, auth.user_id)
+            .await?;
+    crate::auth::scopes::require_admin_role(current_role)?;
     crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
