@@ -31,6 +31,92 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// Bounded diagnostics for app deletion failures.
+///
+/// Deletion dependencies can embed tenant-controlled hostnames, namespaces,
+/// response bodies, and upstream error messages in their `Display`
+/// implementations. Keep both the public response and operator diagnostics
+/// on this fixed allowlist instead of formatting those source errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppDeleteFailure {
+    TeardownToken,
+    DnsNotConfigured,
+    DnsOutsideManagedZone,
+    DnsHostnameInUse,
+    DnsUnavailable,
+    EdgeBackend,
+    EdgeRoute,
+    Namespace,
+    KbsOwnerBinding,
+    KbsTlsBinding,
+    KbsPolicy,
+}
+
+impl AppDeleteFailure {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::TeardownToken => "app_delete_teardown_token_failed",
+            Self::DnsNotConfigured => "app_delete_dns_not_configured",
+            Self::DnsOutsideManagedZone => "app_delete_dns_outside_managed_zone",
+            Self::DnsHostnameInUse => "app_delete_dns_hostname_in_use",
+            Self::DnsUnavailable => "app_delete_dns_unavailable",
+            Self::EdgeBackend => "app_delete_edge_backend_invalid",
+            Self::EdgeRoute => "app_delete_edge_unavailable",
+            Self::Namespace => "app_delete_namespace_unavailable",
+            Self::KbsOwnerBinding => "app_delete_kbs_owner_binding_failed",
+            Self::KbsTlsBinding => "app_delete_kbs_tls_binding_failed",
+            Self::KbsPolicy => "app_delete_kbs_policy_failed",
+        }
+    }
+
+    const fn status(self) -> StatusCode {
+        match self {
+            Self::TeardownToken | Self::DnsNotConfigured | Self::EdgeBackend => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            Self::DnsOutsideManagedZone => StatusCode::BAD_REQUEST,
+            Self::DnsHostnameInUse => StatusCode::CONFLICT,
+            Self::DnsUnavailable
+            | Self::EdgeRoute
+            | Self::Namespace
+            | Self::KbsOwnerBinding
+            | Self::KbsTlsBinding
+            | Self::KbsPolicy => StatusCode::BAD_GATEWAY,
+        }
+    }
+}
+
+fn app_delete_failure<T>(
+    app_id: Uuid,
+    failure: AppDeleteFailure,
+    _source: T,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let status = failure.status();
+    let code = failure.code();
+    tracing::warn!(
+        app_id = %app_id,
+        status = status.as_u16(),
+        code,
+        "app deletion step failed"
+    );
+    (status, Json(serde_json::json!({"error": code})))
+}
+
+fn app_delete_dns_failure(
+    app_id: Uuid,
+    source: crate::dns::DnsError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let failure = match &source {
+        crate::dns::DnsError::NotConfigured => AppDeleteFailure::DnsNotConfigured,
+        crate::dns::DnsError::OutsideManagedZone(_) => AppDeleteFailure::DnsOutsideManagedZone,
+        crate::dns::DnsError::HostnameInUse { .. } => AppDeleteFailure::DnsHostnameInUse,
+        crate::dns::DnsError::Cloudflare(_)
+        | crate::dns::DnsError::Http(_)
+        | crate::dns::DnsError::Db(_) => AppDeleteFailure::DnsUnavailable,
+    };
+    app_delete_failure(app_id, failure, source)
+}
+
 fn deploy_blocked_response(reason: &str, message: String) -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::FORBIDDEN,
@@ -111,9 +197,8 @@ async fn request_workload_teardown(
     if !requires_workload_teardown(app.status) {
         tracing::info!(
             app_id = %app.id,
-            app_name = %app.name,
-            namespace = %app.namespace,
             status = ?app.status,
+            code = "app_delete_teardown_not_required",
             "skipping workload teardown endpoint for non-running app"
         );
         return Ok(());
@@ -127,12 +212,7 @@ async fn request_workload_teardown(
         &workload_teardown_instance_id(app),
         vec!["teardown".to_string()],
     )
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("failed to issue teardown token: {e}")})),
-        )
-    })?;
+    .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::TeardownToken, error))?;
 
     let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
     let url = format!(
@@ -147,13 +227,11 @@ async fn request_workload_teardown(
         .await
     {
         Ok(response) => response,
-        Err(error) => {
+        Err(_) => {
             tracing::warn!(
                 app_id = %app.id,
-                app_name = %app.name,
-                namespace = %app.namespace,
-                url = %url,
-                error = %error,
+                status = "unreachable",
+                code = "app_delete_teardown_unreachable",
                 "workload teardown endpoint unreachable; continuing app deletion"
             );
             return Ok(());
@@ -165,14 +243,10 @@ async fn request_workload_teardown(
     }
 
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
     tracing::warn!(
         app_id = %app.id,
-        app_name = %app.name,
-        namespace = %app.namespace,
-        url = %url,
         status = status.as_u16(),
-        body = %body,
+        code = "app_delete_teardown_rejected",
         "workload teardown endpoint returned non-success; continuing app deletion"
     );
     Ok(())
@@ -902,7 +976,7 @@ pub async fn delete_app(
         app.id,
     )
     .await
-    .map_err(dns_error_response)?;
+    .map_err(|error| app_delete_dns_failure(app.id, error))?;
 
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
         .bind(auth.org_id)
@@ -915,23 +989,11 @@ pub async fn delete_app(
             )
         })?;
     let app_backend =
-        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App).map_err(
-            |e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("invalid app name: {}", e)})),
-                )
-            },
-        )?;
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::App)
+            .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::EdgeBackend, error))?;
     let tee_backend =
-        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::Tee).map_err(
-            |e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": format!("invalid app name: {}", e)})),
-                )
-            },
-        )?;
+        crate::edge::backend_name_for(&org_slug, &app.name, crate::edge::BackendTag::Tee)
+            .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::EdgeBackend, error))?;
     let mut routes_to_remove: Vec<(String, String)> =
         vec![(app_backend.clone(), app.domain.clone())];
     if let Some(t) = app.tee_domain.as_deref() {
@@ -946,48 +1008,21 @@ pub async fn delete_app(
         &routes_to_remove,
     )
     .await
-    .map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(
-                serde_json::json!({"error": format!("failed to remove tenant edge route: {}", e)}),
-            ),
-        )
-    })?;
+    .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::EdgeRoute, error))?;
 
-    delete_tenant_namespace(&app.namespace).await.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("failed to delete tenant namespace: {}", e)})),
-        )
-    })?;
+    delete_tenant_namespace(&app.namespace)
+        .await
+        .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::Namespace, error))?;
 
     crate::kbs::soft_delete_owner_binding(&state.db, app.id)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("failed to remove KBS owner binding: {}", e)})),
-            )
-        })?;
+        .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::KbsOwnerBinding, error))?;
     crate::kbs::soft_delete_tls_binding(&state.db, state.kbs_policy.as_ref(), app.id)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("failed to remove KBS TLS binding: {}", e)})),
-            )
-        })?;
+        .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::KbsTlsBinding, error))?;
     crate::kbs::reconcile_policy(&state.db, state.kbs_policy.as_ref())
         .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(
-                    serde_json::json!({"error": format!("failed to reconcile KBS policy: {}", e)}),
-                ),
-            )
-        })?;
+        .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::KbsPolicy, error))?;
 
     sqlx::query("DELETE FROM apps WHERE id = $1")
         .bind(app.id)
