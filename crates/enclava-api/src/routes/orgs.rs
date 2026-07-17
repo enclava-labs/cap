@@ -416,6 +416,9 @@ pub async fn put_keyring(
         .await
         .map_err(|_| db_error())?;
 
+    let current_role = scopes::active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
+    scopes::require_owner_role(current_role)?;
+
     // Re-read key registration and latest keyring only after acquiring the
     // shared signing-authority lane. Rotation and signed acceptance therefore
     // linearize on one exact owner authority generation.
@@ -683,6 +686,15 @@ pub async fn invite_member(
     let requested_role = scopes::parse_role(body.role.as_deref().unwrap_or("member"))?;
 
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, org_id)
+        .await
+        .map_err(|_| db_error())?;
+    crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
+        .await
+        .map_err(|_| db_error())?;
+    let current_caller_role =
+        scopes::active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
+    scopes::require_admin_role(current_caller_role)?;
 
     let existing_role: Option<Role> = sqlx::query_scalar(
         "SELECT role as \"role: _\"
@@ -696,7 +708,11 @@ pub async fn invite_member(
     .await
     .map_err(|_| db_error())?;
 
-    scopes::require_owner_to_modify_owner(caller_role, existing_role, Some(requested_role))?;
+    scopes::require_owner_to_modify_owner(
+        current_caller_role,
+        existing_role,
+        Some(requested_role),
+    )?;
 
     if existing_role == Some(Role::Owner) && requested_role != Role::Owner {
         scopes::ensure_last_owner_invariant(&mut tx, org_id, invitee_id, Some(requested_role))
@@ -805,6 +821,15 @@ pub async fn remove_member(
     scopes::require_admin_role(caller_role)?;
 
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, org_id)
+        .await
+        .map_err(|_| db_error())?;
+    crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
+        .await
+        .map_err(|_| db_error())?;
+    let current_caller_role =
+        scopes::active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
+    scopes::require_admin_role(current_caller_role)?;
     let target_role: Option<Role> = sqlx::query_scalar(
         "SELECT role as \"role: _\"
          FROM memberships
@@ -817,7 +842,7 @@ pub async fn remove_member(
     .await
     .map_err(|_| db_error())?;
 
-    scopes::require_owner_to_modify_owner(caller_role, target_role, None)?;
+    scopes::require_owner_to_modify_owner(current_caller_role, target_role, None)?;
 
     if target_role == Some(Role::Owner) {
         scopes::ensure_last_owner_invariant(&mut tx, org_id, member_id, None).await?;
@@ -871,6 +896,46 @@ mod tests {
             .await
             .expect("migrate keyring regression database");
         pool
+    }
+
+    async fn named_database_test_pool(application_name: &str) -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let options = database_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("parse keyring regression database URL")
+            .application_name(application_name);
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .expect("connect named keyring regression pool")
+    }
+
+    async fn wait_for_named_lock_waiter(pool: &sqlx::PgPool, application_name: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (
+                         SELECT 1
+                           FROM pg_stat_activity
+                          WHERE datname = current_database()
+                            AND application_name = $1
+                            AND wait_event_type = 'Lock'
+                     )",
+                )
+                .bind(application_name)
+                .fetch_one(pool)
+                .await
+                .expect("inspect named keyring writer lock state");
+                if waiting {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("keyring writer did not block on membership authority removal");
     }
 
     fn signed_keyring_request(
@@ -943,6 +1008,128 @@ mod tests {
         }));
 
         assert_eq!(list_orgs_api_key_org_filter(&auth), Some(org_id));
+    }
+
+    #[tokio::test]
+    async fn keyring_acceptance_waits_for_membership_removal_and_rejects() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let remover_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-removal-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert keyring removal org");
+        sqlx::query(
+            "INSERT INTO users (id, display_name)
+             VALUES ($1, 'Removed Owner'), ($2, 'Remaining Owner')",
+        )
+        .bind(user_id)
+        .bind(remover_id)
+        .execute(&pool)
+        .await
+        .expect("insert keyring removal owners");
+        sqlx::query(
+            "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $3, 'owner'), ($2, $3, 'owner')",
+        )
+        .bind(user_id)
+        .bind(remover_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert keyring removal memberships");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert keyring removal signing key");
+
+        let removal_application = format!("member-removal-{suffix}");
+        let keyring_application = format!("keyring-after-removal-{suffix}");
+        let mut removal_state = crate::test_support::lazy_state();
+        removal_state.db = named_database_test_pool(&removal_application).await;
+        let mut keyring_state = crate::test_support::lazy_state();
+        keyring_state.db = named_database_test_pool(&keyring_application).await;
+        let keyring_auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let remover_auth = AuthContext {
+            user_id: remover_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        let mut row_blocker = pool.begin().await.expect("begin membership row blocker");
+        sqlx::query(
+            "SELECT 1 FROM memberships
+              WHERE org_id = $1 AND user_id = $2
+              FOR UPDATE",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_one(&mut *row_blocker)
+        .await
+        .expect("block target membership row");
+
+        let removal_org_name = org_name.clone();
+        let removal = tokio::spawn(remove_member(
+            remover_auth,
+            State(removal_state),
+            Path((removal_org_name, user_id)),
+        ));
+        wait_for_named_lock_waiter(&pool, &removal_application).await;
+
+        let writer = tokio::spawn(put_keyring(
+            keyring_auth,
+            State(keyring_state),
+            Path(org_name),
+            Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+        ));
+        wait_for_named_lock_waiter(&pool, &keyring_application).await;
+        row_blocker
+            .rollback()
+            .await
+            .expect("release target membership row");
+        assert_eq!(
+            removal
+                .await
+                .expect("join public membership removal")
+                .expect("public membership removal succeeds"),
+            StatusCode::NO_CONTENT
+        );
+
+        let rejected = writer
+            .await
+            .expect("join blocked keyring writer")
+            .expect_err("removed owner cannot publish a keyring");
+        assert_eq!(rejected.0, StatusCode::FORBIDDEN);
+        assert_eq!(
+            rejected.1.0["error"],
+            "active organization membership required"
+        );
+        let authority_rows: (i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put')",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rejected keyring authority rows");
+        assert_eq!(authority_rows, (0, 0));
     }
 
     #[tokio::test]
