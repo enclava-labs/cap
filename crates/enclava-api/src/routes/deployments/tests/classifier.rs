@@ -470,6 +470,51 @@ fn idempotent_retry_requires_same_deployment_payload() {
 }
 
 #[test]
+fn idempotent_retry_preserves_none_partial_and_full_resource_requests() {
+    let app = idempotency_app();
+
+    let cases = [
+        None,
+        Some(DeployResources {
+            cpu: Some("750m".to_string()),
+            memory: None,
+            storage: None,
+        }),
+        Some(DeployResources {
+            cpu: Some("2".to_string()),
+            memory: Some("3Gi".to_string()),
+            storage: Some("7Gi".to_string()),
+        }),
+    ];
+
+    for requested in cases {
+        let mut deployment = idempotency_deployment(&app);
+        deployment.spec_snapshot["resources"] =
+            serde_json::to_value(&requested).expect("serialize requested resources");
+        deployment.spec_snapshot["resolved_resources"] = serde_json::json!({
+            "cpu": requested
+                .as_ref()
+                .and_then(|resources| resources.cpu.as_deref())
+                .unwrap_or("1"),
+            "memory": requested
+                .as_ref()
+                .and_then(|resources| resources.memory.as_deref())
+                .unwrap_or("1Gi"),
+            "storage": requested
+                .as_ref()
+                .and_then(|resources| resources.storage.as_deref())
+                .unwrap_or("5Gi"),
+            "tls_storage": "2Gi",
+        });
+        let mut request = idempotency_request(&app.name);
+        request.workload.resources = requested;
+
+        ensure_idempotent_retry_matches(&deployment, &app, &request)
+            .expect("response-loss retry matches the original resource request");
+    }
+}
+
+#[test]
 fn external_id_rejects_empty_or_padded_values() {
     validate_external_id(Some("deploy-123")).unwrap();
 

@@ -1,5 +1,36 @@
 use super::*;
 
+fn target_resources_from_snapshot(
+    app_id: Uuid,
+    snapshot: &serde_json::Value,
+) -> Result<AppResources, (StatusCode, Json<serde_json::Value>)> {
+    let resources = snapshot.get("resolved_resources").ok_or_else(|| {
+        json_error(
+            StatusCode::CONFLICT,
+            "rollback target predates exact resource snapshots; deploy a current generation first",
+        )
+    })?;
+    let required = |field: &'static str| {
+        resources
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                json_error(
+                    StatusCode::CONFLICT,
+                    "rollback target has an incomplete resource snapshot",
+                )
+            })
+    };
+    Ok(AppResources {
+        app_id,
+        cpu_limit: required("cpu")?,
+        memory_limit: required("memory")?,
+        app_data_size: required("storage")?,
+        tls_data_size: required("tls_storage")?,
+    })
+}
+
 /// POST /apps/{name}/rollback -- rollback to a previous deployment.
 pub async fn rollback(
     auth: AuthContext,
@@ -82,6 +113,7 @@ pub async fn rollback(
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({"error": "rollback target is missing image digest"})),
     ))?;
+    let target_resources = target_resources_from_snapshot(app.id, &prev.spec_snapshot)?;
 
     let rollback_artifact =
         crate::signing_service::load_workload_artifact_binding(&state.db, app.id, prev.id)
@@ -159,10 +191,17 @@ pub async fn rollback(
                     Json(serde_json::json!({"error": "database error"})),
                 )
             })?;
+    let locked_primary_profile = authority_containers
+        .iter()
+        .find(|container| container.is_primary)
+        .and_then(|container| container.workload_security_profile.as_deref())
+        .unwrap_or("restricted")
+        .parse::<WorkloadSecurityProfile>()
+        .map_err(|error| json_error(StatusCode::CONFLICT, error))?;
     let authority_snapshot = crate::deploy::ExistingAppAuthoritySnapshot::new(
         app.updated_at,
         authority_containers,
-        authority_resources,
+        authority_resources.clone(),
     );
     let mut tx = state.db.begin().await.map_err(|_| {
         (
@@ -170,9 +209,54 @@ pub async fn rollback(
             Json(serde_json::json!({"error": "database error"})),
         )
     })?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, auth.org_id)
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    if rollback_artifact.is_some() {
+        crate::signing_service::lock_org_signing_authority_lane(&mut tx, auth.org_id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    }
     crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    super::enforce_authoritative_entitlement(&mut tx, auth.org_id, &target_resources, false)
+        .await?;
+    if rollback_artifact.is_some() {
+        let artifacts =
+            crate::signing_service::load_stored_customer_authority_in_tx(&mut tx, app.id, prev.id)
+                .await
+                .map_err(signing_error_response)?
+                .ok_or_else(|| {
+                    signing_error_response(crate::signing_service::SigningServiceError::Mismatch(
+                        "rollback target customer authority is missing".to_string(),
+                    ))
+                })?;
+        artifacts
+            .validate_customer_authority_in_tx(&mut tx)
+            .await
+            .map_err(signing_error_response)?;
+        artifacts
+            .validate_deployment_inputs(
+                &app,
+                &image_digest,
+                &crate::auth::jwt::public_key_base64(&state.signing_key),
+            )
+            .map_err(signing_error_response)?;
+        let signed_profile =
+            super::signed_descriptor_profile(&artifacts.descriptor).ok_or_else(|| {
+                signing_error_response(crate::signing_service::SigningServiceError::Mismatch(
+                    "workload_security_profile".to_string(),
+                ))
+            })?;
+        if signed_profile != locked_primary_profile {
+            return Err(signing_error_response(
+                crate::signing_service::SigningServiceError::Mismatch(
+                    "workload_security_profile".to_string(),
+                ),
+            ));
+        }
+    }
     if !crate::deploy::lock_and_verify_existing_app_authority(&mut tx, app.id, &authority_snapshot)
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
@@ -215,6 +299,29 @@ pub async fn rollback(
             Json(serde_json::json!({"error": "database error"})),
         )
     })?;
+
+    let updated_resources = sqlx::query(
+        "UPDATE app_resources
+            SET cpu_limit = $1,
+                memory_limit = $2,
+                app_data_size = $3,
+                tls_data_size = $4
+          WHERE app_id = $5",
+    )
+    .bind(&target_resources.cpu_limit)
+    .bind(&target_resources.memory_limit)
+    .bind(&target_resources.app_data_size)
+    .bind(&target_resources.tls_data_size)
+    .bind(app.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    if updated_resources.rows_affected() != 1 {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "app resource authority is missing; retry after reconciliation",
+        ));
+    }
 
     let deploy_id = Uuid::new_v4();
     crate::deploy::supersede_incomplete_deployments(&mut tx, app.id)
@@ -357,4 +464,50 @@ pub async fn rollback(
             status: "deploying".to_string(),
         }),
     ))
+}
+
+#[cfg(test)]
+mod resource_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_requires_a_complete_exact_resource_snapshot() {
+        let app_id = Uuid::new_v4();
+        let exact = target_resources_from_snapshot(
+            app_id,
+            &serde_json::json!({
+                "resources": {"cpu": "2"},
+                "resolved_resources": {
+                    "cpu": "2",
+                    "memory": "3Gi",
+                    "storage": "7Gi",
+                    "tls_storage": "2Gi"
+                }
+            }),
+        )
+        .expect("current snapshot is rollback-safe");
+        assert_eq!(exact.app_id, app_id);
+        assert_eq!(exact.cpu_limit, "2");
+        assert_eq!(exact.memory_limit, "3Gi");
+        assert_eq!(exact.app_data_size, "7Gi");
+        assert_eq!(exact.tls_data_size, "2Gi");
+
+        let legacy =
+            target_resources_from_snapshot(app_id, &serde_json::json!({"resources": {"cpu": "2"}}))
+                .expect_err("legacy snapshot must fail closed");
+        assert_eq!(legacy.0, StatusCode::CONFLICT);
+
+        let incomplete = target_resources_from_snapshot(
+            app_id,
+            &serde_json::json!({
+                "resolved_resources": {
+                    "cpu": "2",
+                    "memory": "3Gi",
+                    "storage": "7Gi"
+                }
+            }),
+        )
+        .expect_err("incomplete snapshot must fail closed");
+        assert_eq!(incomplete.0, StatusCode::CONFLICT);
+    }
 }

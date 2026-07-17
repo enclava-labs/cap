@@ -666,6 +666,32 @@ pub async fn create_app(
 
     let app_candidate = prepare_app_candidate(&state, &auth, &body).await?;
     let app_id = app_candidate.id;
+    let resources = crate::models::AppResources {
+        app_id,
+        cpu_limit: "1".to_string(),
+        memory_limit: "1Gi".to_string(),
+        app_data_size: "5Gi".to_string(),
+        tls_data_size: "2Gi".to_string(),
+    };
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| internal_server_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, auth.org_id)
+        .await
+        .map_err(|_| internal_server_error())?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+        .await
+        .map_err(|_| internal_server_error())?;
+    crate::routes::deployments::enforce_authoritative_entitlement(
+        &mut tx,
+        auth.org_id,
+        &resources,
+        true,
+    )
+    .await?;
 
     let result = sqlx::query(
         "INSERT INTO apps (id, org_id, name, namespace, instance_id, tenant_id,
@@ -694,7 +720,7 @@ pub async fn create_app(
     .bind(app_candidate.source_repository.as_deref())
     .bind(&app_candidate.egress_allowlist)
     .bind(&app_candidate.egress_mode)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await;
 
     if let Err(e) = result {
@@ -710,17 +736,38 @@ pub async fn create_app(
         ));
     }
 
-    // Insert default resources
-    sqlx::query("INSERT INTO app_resources (app_id) VALUES ($1)")
-        .bind(app_id)
-        .execute(&state.db)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-        })?;
+    sqlx::query(
+        "INSERT INTO app_resources (
+             app_id, cpu_limit, memory_limit, app_data_size, tls_data_size
+         ) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(resources.app_id)
+    .bind(&resources.cpu_limit)
+    .bind(&resources.memory_limit)
+    .bind(&resources.app_data_size)
+    .bind(&resources.tls_data_size)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| internal_server_error())?;
+
+    sqlx::query(
+        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail)
+         VALUES ($1, $2, $3, 'app.create', $4)",
+    )
+    .bind(auth.org_id)
+    .bind(app_id)
+    .bind(auth.user_id)
+    .bind(serde_json::json!({
+        "name": &body.name,
+        "unlock_mode": &body.unlock_mode,
+        "egress_allowlist": &app_candidate.egress_allowlist.0,
+        "egress_mode": &app_candidate.egress_mode
+    }))
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| internal_server_error())?;
+
+    tx.commit().await.map_err(|_| internal_server_error())?;
 
     if let Err(e) = crate::dns::ensure_dns_pair(
         &state.db,
@@ -741,22 +788,6 @@ pub async fn create_app(
             .await;
         return Err(dns_error_response(e));
     }
-
-    // Audit
-    let _ = sqlx::query(
-        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.create', $4)",
-    )
-    .bind(auth.org_id)
-    .bind(app_id)
-    .bind(auth.user_id)
-    .bind(serde_json::json!({
-        "name": &body.name,
-        "unlock_mode": &body.unlock_mode,
-        "egress_allowlist": &app_candidate.egress_allowlist.0,
-        "egress_mode": &app_candidate.egress_mode
-    }))
-    .execute(&state.db)
-    .await;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(app_id)

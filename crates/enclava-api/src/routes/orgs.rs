@@ -404,17 +404,6 @@ pub async fn put_keyring(
         .verify(&canonical_bytes, &signature_obj)
         .map_err(|_| bad_request("keyring signature verification failed"))?;
 
-    let signing_key_id: Uuid = sqlx::query_scalar(
-        "SELECT id FROM user_signing_keys
-         WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
-    )
-    .bind(auth.user_id)
-    .bind(&signing_pubkey)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|_| db_error())?
-    .ok_or_else(|| bad_request("signing_pubkey is not registered for this user"))?;
-
     let keyring_payload_bytes = serde_json::to_vec(&body.keyring_payload).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -422,64 +411,101 @@ pub async fn put_keyring(
         )
     })?;
 
-    let latest: Option<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-        "SELECT version, keyring_payload, signature
-         FROM org_keyrings
-         WHERE org_id = $1
-         ORDER BY version DESC
+    let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+    crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
+        .await
+        .map_err(|_| db_error())?;
+
+    // Re-read key registration and latest keyring only after acquiring the
+    // shared signing-authority lane. Rotation and signed acceptance therefore
+    // linearize on one exact owner authority generation.
+    let signing_key_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM user_signing_keys
+         WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
+    )
+    .bind(auth.user_id)
+    .bind(&signing_pubkey)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| db_error())?
+    .ok_or_else(|| bad_request("signing_pubkey is not registered for this user"))?;
+
+    type LatestKeyringAuthority = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
+    let latest: Option<LatestKeyringAuthority> = sqlx::query_as(
+        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey
+         FROM org_keyrings ok
+         JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
+         WHERE ok.org_id = $1
+         ORDER BY ok.version DESC
          LIMIT 1",
     )
     .bind(org_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|_| db_error())?;
 
-    if let Some((latest_version, latest_payload, latest_signature)) = latest {
+    let mut insert_new_version = true;
+    if let Some((latest_version, latest_payload, latest_signature, latest_signing_pubkey)) = latest
+    {
         if body.version < latest_version {
-            return Err(bad_request("keyring version is stale"));
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "keyring version is stale"})),
+            ));
         }
         if body.version == latest_version
-            && (latest_payload != keyring_payload_bytes || latest_signature != signature)
+            && (latest_payload != keyring_payload_bytes
+                || latest_signature != signature
+                || latest_signing_pubkey != signing_pubkey)
         {
-            return Err(bad_request(
-                "keyring version already exists with different content",
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "keyring version already exists with different content"
+                })),
             ));
+        }
+        if body.version == latest_version {
+            insert_new_version = false;
         }
         if body.version > latest_version + 1 {
             return Err(bad_request("keyring version must increment by one"));
         }
+    } else if body.version != 1 {
+        return Err(bad_request("first keyring version must be one"));
     }
 
-    sqlx::query(
-        "INSERT INTO org_keyrings
-             (org_id, version, keyring_payload, signature, signing_key_id)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (org_id, version)
-         DO UPDATE SET keyring_payload = EXCLUDED.keyring_payload,
-                       signature = EXCLUDED.signature,
-                       signing_key_id = EXCLUDED.signing_key_id",
-    )
-    .bind(org_id)
-    .bind(body.version)
-    .bind(&keyring_payload_bytes)
-    .bind(&signature)
-    .bind(signing_key_id)
-    .execute(&state.db)
-    .await
-    .map_err(|_| db_error())?;
+    if insert_new_version {
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(body.version)
+        .bind(&keyring_payload_bytes)
+        .bind(&signature)
+        .bind(signing_key_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
 
-    let _ = sqlx::query(
-        "INSERT INTO audit_log (org_id, user_id, action, detail)
-         VALUES ($1, $2, 'org.keyring.put', $3)",
-    )
-    .bind(org_id)
-    .bind(auth.user_id)
-    .bind(serde_json::json!({
-        "version": body.version,
-        "signing_pubkey": body.signing_pubkey,
-    }))
-    .execute(&state.db)
-    .await;
+        sqlx::query(
+            "INSERT INTO audit_log (org_id, user_id, action, detail)
+             VALUES ($1, $2, 'org.keyring.put', $3)",
+        )
+        .bind(org_id)
+        .bind(auth.user_id)
+        .bind(serde_json::json!({
+            "version": body.version,
+            "signing_pubkey": body.signing_pubkey,
+        }))
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+    }
+
+    tx.commit().await.map_err(|_| db_error())?;
 
     let fingerprint = hex::encode(Sha256::digest(&canonical_bytes));
     Ok((
@@ -810,6 +836,62 @@ pub async fn remove_member(
 mod tests {
     use super::*;
     use crate::auth::api_key::ValidatedApiKey;
+    use chrono::{TimeZone, Utc};
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+
+    async fn database_test_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect keyring regression database");
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate keyring regression database");
+        pool
+    }
+
+    fn signed_keyring_request(
+        org_id: Uuid,
+        user_id: Uuid,
+        key: &SigningKey,
+        version: i64,
+        second: u32,
+    ) -> PutOrgKeyringRequest {
+        let added_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let updated_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, second).unwrap();
+        let member = SignedOrgKeyringMember {
+            user_id,
+            pubkey: key.verifying_key().to_bytes(),
+            role: SignedOrgKeyringRole::Owner,
+            added_at,
+        };
+        let keyring = SignedOrgKeyring {
+            org_id,
+            version: version as u64,
+            members: vec![member],
+            updated_at,
+        };
+        let signature = key.sign(&canonical_keyring_bytes(&keyring));
+        let pubkey = hex::encode(key.verifying_key().to_bytes());
+        PutOrgKeyringRequest {
+            version,
+            keyring_payload: serde_json::json!({
+                "org_id": org_id,
+                "version": version,
+                "members": [{
+                    "user_id": user_id,
+                    "pubkey": pubkey,
+                    "role": "owner",
+                    "added_at": added_at,
+                }],
+                "updated_at": updated_at,
+            }),
+            signature: hex::encode(signature.to_bytes()),
+            signing_pubkey: pubkey,
+        }
+    }
 
     fn auth_context(api_key: Option<ValidatedApiKey>) -> AuthContext {
         AuthContext {
@@ -840,5 +922,126 @@ mod tests {
         }));
 
         assert_eq!(list_orgs_api_key_org_filter(&auth), Some(org_id));
+    }
+
+    #[tokio::test]
+    async fn concurrent_distinct_v2_keyrings_have_one_immutable_winner() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-race-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert keyring race org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring owner");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert owner membership");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert owner signing key");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+        )
+        .await
+        .expect("insert v1 keyring");
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let spawn_writer = |request: PutOrgKeyringRequest| {
+            let barrier = barrier.clone();
+            let auth = auth.clone();
+            let state = state.clone();
+            let org_name = org_name.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                put_keyring(auth, State(state), Path(org_name), Json(request)).await
+            })
+        };
+        let writer_a = spawn_writer(signed_keyring_request(org_id, user_id, &key, 2, 2));
+        let writer_b = spawn_writer(signed_keyring_request(org_id, user_id, &key, 2, 3));
+        barrier.wait().await;
+        let results = [
+            writer_a.await.expect("join keyring writer A"),
+            writer_b.await.expect("join keyring writer B"),
+        ];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let conflicts: Vec<_> = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].0, StatusCode::CONFLICT);
+        assert_eq!(
+            conflicts[0].1.0["error"],
+            "keyring version already exists with different content"
+        );
+
+        let versions: Vec<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT version, keyring_payload FROM org_keyrings
+             WHERE org_id = $1 ORDER BY version",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("load immutable keyring versions");
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].0, 1);
+        assert_eq!(versions[1].0, 2);
+        let v2_payload: serde_json::Value =
+            serde_json::from_slice(&versions[1].1).expect("decode winning v2 payload");
+        assert!(
+            matches!(v2_payload["updated_at"].as_str(), Some(value) if value.ends_with("02Z") || value.ends_with("03Z"))
+        );
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+             WHERE org_id = $1 AND action = 'org.keyring.put'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count mandatory keyring audit rows");
+        assert_eq!(audit_count, 2, "v1 and the single winning v2 are audited");
+
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring race audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring race org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring race user");
     }
 }
