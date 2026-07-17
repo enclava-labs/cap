@@ -9,6 +9,7 @@ on:
       - "scripts/render-api-release-manifest.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
+      - "scripts/verify-api-image-ref.bash"
       - "scripts/verify-api-image-ref.sh"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -22,6 +23,7 @@ on:
       - "scripts/render-api-release-manifest.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
+      - "scripts/verify-api-image-ref.bash"
       - "scripts/verify-api-image-ref.sh"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -58,7 +60,8 @@ jobs:
 
       - name: API image reference verifier tests
         run: |
-          bash -n scripts/verify-api-image-ref.sh
+          sh -n scripts/verify-api-image-ref.sh
+          bash -n scripts/verify-api-image-ref.bash
           bash -n scripts/test-verify-api-image-ref.sh
           scripts/test-verify-api-image-ref.sh
 

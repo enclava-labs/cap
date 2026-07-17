@@ -71,7 +71,10 @@ for required in \
   "scripts/verify-api-image-ref.sh --cosign dist/enclava-api-image.txt" \
   "name: enclava-api-release-manifest" \
   "scripts/test-api-image-workflow.sh" \
-  "scripts/test-verify-api-image-ref.sh"; do
+  "scripts/test-verify-api-image-ref.sh" \
+  "scripts/verify-api-image-ref.bash" \
+  "sh -n scripts/verify-api-image-ref.sh" \
+  "bash -n scripts/verify-api-image-ref.bash"; do
   assert_contains "$required"
 done
 
