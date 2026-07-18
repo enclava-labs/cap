@@ -78,6 +78,10 @@ fn generic_deployment_response_reports_current_app_status_separately() {
 
     assert_eq!(response.status, "pending");
     assert_eq!(response.app_status, "running");
+    let observation = serde_json::to_value(&response.observation).expect("serialize observation");
+    assert_eq!(observation["state"], "partial");
+    assert_eq!(observation["reason"], "not_observed");
+    assert!(observation["deployment_id"].is_null());
 }
 
 #[test]
@@ -100,6 +104,53 @@ fn incomplete_setup_marker_blocks_idempotent_success() {
         !deployment_setup_incomplete(&deployment),
         "a terminal setup failure on an existing app must not block future deploys"
     );
+}
+
+#[test]
+fn stored_error_plaintext_is_redacted_from_public_and_generic_responses() {
+    const STORED_SECRET: &str = "pod 'tenant-pod' container 'tenant-app' last terminated with StartError exit 128: secret=private-key";
+    let app = idempotency_app();
+
+    let mut generic_deployment = idempotency_deployment(&app);
+    generic_deployment.error_message = Some(STORED_SECRET.to_string());
+    let generic = GenericDeploymentResponse::from_deployment(generic_deployment, &app);
+
+    let mut public_deployment = idempotency_deployment(&app);
+    public_deployment.error_message = Some(STORED_SECRET.to_string());
+    let public = DeploymentResponse::from_deployment(public_deployment, &app);
+
+    for response in [
+        serde_json::to_value(generic).expect("serialize generic response"),
+        serde_json::to_value(public).expect("serialize public response"),
+    ] {
+        let serialized = serde_json::to_string(&response).expect("serialize response value");
+        assert_eq!(response["error_message"], "deployment_error");
+        assert!(!serialized.contains(STORED_SECRET));
+        assert!(!serialized.contains("private-key"));
+    }
+}
+
+#[test]
+fn control_plane_supersession_code_is_preserved_across_deployment_responses() {
+    let app = idempotency_app();
+
+    let mut generic_deployment = idempotency_deployment(&app);
+    generic_deployment.error_message = Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR.to_string());
+    let generic = GenericDeploymentResponse::from_deployment(generic_deployment, &app);
+
+    let mut public_deployment = idempotency_deployment(&app);
+    public_deployment.error_message = Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR.to_string());
+    let public = DeploymentResponse::from_deployment(public_deployment, &app);
+
+    for response in [
+        serde_json::to_value(generic).expect("serialize generic response"),
+        serde_json::to_value(public).expect("serialize public response"),
+    ] {
+        assert_eq!(
+            response["error_message"],
+            crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR
+        );
+    }
 }
 
 fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {

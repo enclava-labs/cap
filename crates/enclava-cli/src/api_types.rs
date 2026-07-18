@@ -476,6 +476,25 @@ pub struct DeploymentContextResponse {
 // --- Status ---
 
 #[derive(Debug, Deserialize)]
+pub struct AppStatusObservation {
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    #[serde(default)]
+    pub last_reconciliation_attempted_at: Option<String>,
+    #[serde(default)]
+    pub last_successful_reconciled_at: Option<String>,
+    #[serde(default)]
+    pub deployment_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub drifted: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct AppStatus {
     pub app_name: String,
     pub status: String,
@@ -484,6 +503,61 @@ pub struct AppStatus {
     pub unlock_status: Option<String>,
     pub domain: String,
     pub last_deployed: Option<String>,
+    #[serde(default)]
+    pub observation: Option<AppStatusObservation>,
+}
+
+#[cfg(test)]
+mod app_status_contract_tests {
+    use super::AppStatus;
+
+    #[test]
+    fn app_status_accepts_explicit_freshness_and_drift_contract() {
+        let status: AppStatus = serde_json::from_value(serde_json::json!({
+            "app_name": "demo",
+            "status": "drifted",
+            "pod_phase": null,
+            "tee_status": null,
+            "unlock_status": null,
+            "domain": "demo.example.test",
+            "last_deployed": null,
+            "observation": {
+                "state": "mismatched",
+                "reason": "deployment_id_mismatch",
+                "observed_at": "2026-07-15T12:00:00Z",
+                "last_reconciliation_attempted_at": "2026-07-15T12:00:05Z",
+                "last_successful_reconciled_at": "2026-07-15T12:00:05Z",
+                "deployment_id": "00000000-0000-0000-0000-000000000222",
+                "status": "healthy",
+                "drifted": true
+            }
+        }))
+        .expect("parse hosted status observation");
+
+        let observation = status.observation.expect("observation");
+        assert_eq!(observation.state, "mismatched");
+        assert!(observation.drifted);
+        assert_eq!(
+            observation.reason.as_deref(),
+            Some("deployment_id_mismatch")
+        );
+    }
+
+    #[test]
+    fn app_status_remains_compatible_with_legacy_hosted_response() {
+        let status: AppStatus = serde_json::from_value(serde_json::json!({
+            "app_name": "demo",
+            "status": "creating",
+            "pod_phase": null,
+            "tee_status": null,
+            "unlock_status": null,
+            "domain": "demo.example.test",
+            "last_deployed": null
+        }))
+        .expect("parse legacy hosted status");
+
+        assert!(status.observation.is_none());
+    }
 }
 
 // --- Logs ---

@@ -4,14 +4,16 @@ use axum::{
     http::{HeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::auth::middleware::{AuthContext, ManagementOrigin};
 use crate::models::Role;
+use crate::routes::deployments::public_deployment_error_message;
 use crate::routes::platform::{DeploymentContextResponse, deployment_context_response};
-use crate::routes::status::live_pod_failure_message;
+use crate::routes::status::observe_app_status_fields_for_deployment;
 use crate::state::AppState;
 
 type InternalRouteError = (StatusCode, Json<serde_json::Value>);
@@ -147,6 +149,8 @@ impl Drop for IdempotencyLease {
         self.stop_heartbeat();
     }
 }
+
+const STATUS_OBSERVATION_CONCURRENCY: usize = 16;
 
 pub struct InternalAuth {
     pub client_san: String,
@@ -2195,12 +2199,77 @@ pub async fn list_paas_deployments(
                         "image": image,
                         "spec": spec,
                         "image_digest": image_digest,
-                        "error_message": error_message,
+                        "error_message": public_deployment_error_message(error_message.as_deref()),
                     })
                 },
             )
             .collect(),
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn observed_internal_status_item(
+    state: &AppState,
+    cap_app_id: Uuid,
+    app_name: String,
+    namespace: String,
+    recorded_app_status: String,
+    domain: String,
+    tee_domain: Option<String>,
+    cap_deployment_id: Option<Uuid>,
+    recorded_deployment_status: Option<String>,
+    image_digest: Option<String>,
+    recorded_error_message: Option<String>,
+) -> serde_json::Value {
+    let observed = observe_app_status_fields_for_deployment(
+        state,
+        &namespace,
+        &app_name,
+        &domain,
+        tee_domain.as_deref(),
+        cap_deployment_id,
+    )
+    .await;
+    let app_status = observed.effective_status(&recorded_app_status);
+    let runtime_failure_applies = cap_deployment_id
+        .is_some_and(|deployment_id| observed.runtime_failure_applies_to_latest(deployment_id));
+    let deployment_status = if runtime_failure_applies {
+        Some("failed".to_string())
+    } else {
+        recorded_deployment_status.clone()
+    };
+    let live_error_message = runtime_failure_applies
+        .then(|| observed.runtime_failure_public_message())
+        .flatten();
+    let error_message =
+        project_internal_deployment_error(live_error_message, recorded_error_message.as_deref());
+    let latest_deployment = cap_deployment_id.map(|id| {
+        serde_json::json!({
+            "cap_deployment_id": id,
+            "status": deployment_status,
+            "recorded_status": recorded_deployment_status,
+            "image_digest": image_digest,
+            "error_message": error_message,
+            "observation": &observed.observation,
+        })
+    });
+    serde_json::json!({
+        "cap_app_id": cap_app_id,
+        "app_name": app_name,
+        "status": app_status,
+        "recorded_status": recorded_app_status,
+        "domain": domain,
+        "tee_domain": tee_domain,
+        "latest_deployment": latest_deployment,
+        "observation": observed.observation,
+    })
+}
+
+fn project_internal_deployment_error(
+    live_error_message: Option<String>,
+    recorded_error_message: Option<&str>,
+) -> Option<String> {
+    live_error_message.or_else(|| public_deployment_error_message(recorded_error_message))
 }
 
 pub async fn list_paas_status(
@@ -2258,49 +2327,41 @@ pub async fn list_paas_status(
     .fetch_all(&state.db)
     .await
     .map_err(|_| db_error())?;
-    let mut items = Vec::with_capacity(rows.len());
-    for (
-        cap_app_id,
-        app_name,
-        namespace,
-        app_status,
-        domain,
-        tee_domain,
-        cap_deployment_id,
-        deployment_status,
-        image_digest,
-        error_message,
-    ) in rows
-    {
-        let runtime_failure = live_pod_failure_message(&namespace, &app_name).await;
-        let app_status = if runtime_failure.is_some() {
-            "failed".to_string()
-        } else {
-            app_status
-        };
-        let deployment_status = if runtime_failure.is_some() && cap_deployment_id.is_some() {
-            Some("failed".to_string())
-        } else {
-            deployment_status
-        };
-        let error_message = runtime_failure.or(error_message);
-        let latest_deployment = cap_deployment_id.map(|id| {
-            serde_json::json!({
-                "cap_deployment_id": id,
-                "status": deployment_status,
-                "image_digest": image_digest,
-                "error_message": error_message,
-            })
-        });
-        items.push(serde_json::json!({
-            "cap_app_id": cap_app_id,
-            "app_name": app_name,
-            "status": app_status,
-            "domain": domain,
-            "tee_domain": tee_domain,
-            "latest_deployment": latest_deployment,
-        }));
-    }
+    let items = stream::iter(rows.into_iter().map(
+        |(
+            cap_app_id,
+            app_name,
+            namespace,
+            app_status,
+            domain,
+            tee_domain,
+            cap_deployment_id,
+            deployment_status,
+            image_digest,
+            error_message,
+        )| {
+            let state = state.clone();
+            async move {
+                observed_internal_status_item(
+                    &state,
+                    cap_app_id,
+                    app_name,
+                    namespace,
+                    app_status,
+                    domain,
+                    tee_domain,
+                    cap_deployment_id,
+                    deployment_status,
+                    image_digest,
+                    error_message,
+                )
+                .await
+            }
+        },
+    ))
+    .buffered(STATUS_OBSERVATION_CONCURRENCY)
+    .collect()
+    .await;
     Ok(Json(InternalListResponse { items }))
 }
 
@@ -2367,57 +2428,56 @@ pub async fn list_paas_cluster_status(
     .await
     .map_err(|_| db_error())?;
 
-    let mut items = Vec::with_capacity(rows.len());
-    for (
-        paas_org_id,
-        cap_org_id,
-        cap_org_name,
-        cap_org_display_name,
-        cap_app_id,
-        app_name,
-        namespace,
-        app_status,
-        domain,
-        tee_domain,
-        cap_deployment_id,
-        deployment_status,
-        image_digest,
-        error_message,
-    ) in rows
-    {
-        let runtime_failure = live_pod_failure_message(&namespace, &app_name).await;
-        let app_status = if runtime_failure.is_some() {
-            "failed".to_string()
-        } else {
-            app_status
-        };
-        let deployment_status = if runtime_failure.is_some() && cap_deployment_id.is_some() {
-            Some("failed".to_string())
-        } else {
-            deployment_status
-        };
-        let error_message = runtime_failure.or(error_message);
-        let latest_deployment = cap_deployment_id.map(|id| {
-            serde_json::json!({
-                "cap_deployment_id": id,
-                "status": deployment_status,
-                "image_digest": image_digest,
-                "error_message": error_message,
-            })
-        });
-        items.push(serde_json::json!({
-            "paas_org_id": paas_org_id,
-            "cap_org_id": cap_org_id,
-            "cap_org_name": cap_org_name,
-            "cap_org_display_name": cap_org_display_name,
-            "cap_app_id": cap_app_id,
-            "app_name": app_name,
-            "status": app_status,
-            "domain": domain,
-            "tee_domain": tee_domain,
-            "latest_deployment": latest_deployment,
-        }));
-    }
+    let items = stream::iter(rows.into_iter().map(
+        |(
+            paas_org_id,
+            cap_org_id,
+            cap_org_name,
+            cap_org_display_name,
+            cap_app_id,
+            app_name,
+            namespace,
+            app_status,
+            domain,
+            tee_domain,
+            cap_deployment_id,
+            deployment_status,
+            image_digest,
+            error_message,
+        )| {
+            let state = state.clone();
+            async move {
+                let mut item = observed_internal_status_item(
+                    &state,
+                    cap_app_id,
+                    app_name,
+                    namespace,
+                    app_status,
+                    domain,
+                    tee_domain,
+                    cap_deployment_id,
+                    deployment_status,
+                    image_digest,
+                    error_message,
+                )
+                .await;
+                let object = item
+                    .as_object_mut()
+                    .expect("internal status item is always an object");
+                object.insert("paas_org_id".to_string(), serde_json::json!(paas_org_id));
+                object.insert("cap_org_id".to_string(), serde_json::json!(cap_org_id));
+                object.insert("cap_org_name".to_string(), serde_json::json!(cap_org_name));
+                object.insert(
+                    "cap_org_display_name".to_string(),
+                    serde_json::json!(cap_org_display_name),
+                );
+                item
+            }
+        },
+    ))
+    .buffered(STATUS_OBSERVATION_CONCURRENCY)
+    .collect()
+    .await;
     Ok(Json(InternalListResponse { items }))
 }
 
@@ -2522,7 +2582,7 @@ async fn adopt_exact_internal_deployment(
         "status": row.4,
         "image_digest": row.5,
         "cosign_verified": row.6,
-        "error_message": row.7,
+        "error_message": public_deployment_error_message(row.7.as_deref()),
         "created_at": row.8,
         "completed_at": row.9,
     })))
@@ -5411,5 +5471,55 @@ mod tests {
         .await
         .expect("load shared membership authority");
         assert_eq!(authority, (2, 1, 2));
+    }
+}
+
+#[cfg(test)]
+mod confidentiality_tests {
+    use super::project_internal_deployment_error;
+
+    #[test]
+    fn stored_internal_deployment_errors_are_projected_without_plaintext() {
+        const STORED_SECRET: &str =
+            "pod 'tenant-pod' container 'tenant-app' is CrashLoopBackOff: secret=private-key";
+        let response = serde_json::json!({
+            "latest_deployment": {
+                "status": "failed",
+                "error_message": project_internal_deployment_error(None, Some(STORED_SECRET)),
+            }
+        });
+        let serialized = serde_json::to_string(&response).expect("serialize internal response");
+
+        assert_eq!(
+            response["latest_deployment"]["error_message"],
+            "deployment_error"
+        );
+        assert!(!serialized.contains(STORED_SECRET));
+        assert!(!serialized.contains("private-key"));
+        assert!(serialized.len() < 128);
+    }
+
+    #[test]
+    fn internal_deployment_projection_preserves_safe_supersession_code() {
+        let projected = project_internal_deployment_error(
+            None,
+            Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR),
+        );
+
+        assert_eq!(
+            projected.as_deref(),
+            Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR)
+        );
+    }
+
+    #[test]
+    fn bounded_live_runtime_error_takes_precedence_over_recorded_error() {
+        let live = "container_runtime_failure status=waiting code=crash_loop_back_off";
+        let projected = project_internal_deployment_error(
+            Some(live.to_string()),
+            Some("stored-secret=tenant-token"),
+        );
+
+        assert_eq!(projected.as_deref(), Some(live));
     }
 }

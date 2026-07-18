@@ -483,6 +483,148 @@ fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
         endpoint < tee && tee < attest && attest < status && body.contains("tee_unlock_state"),
         "deploy runtime wait must not depend only on API status when the direct TEE status is available"
     );
+    assert!(
+        body.contains("observation_is_fresh")
+            && body.contains("if observation_is_fresh && target.accepts_api_status")
+            && body.contains("pod_phase_is_verified")
+            && body
+                .contains("observation.deployment_id.as_deref() == Some(expected_deployment_id)")
+            && body.contains("observation.state == \"fresh\"")
+            && body.contains("direct_tee_allowed")
+            && body.contains("status.status != \"failed\""),
+        "new observations must be fresh and deployment-bound while legacy responses without observation remain compatible"
+    );
+}
+
+fn deploy_observation(
+    state: &str,
+    reason: Option<&str>,
+    deployment_id: Option<&str>,
+    drifted: bool,
+) -> AppStatusObservation {
+    AppStatusObservation {
+        state: state.to_string(),
+        reason: reason.map(str::to_string),
+        observed_at: None,
+        last_reconciliation_attempted_at: None,
+        last_successful_reconciled_at: None,
+        deployment_id: deployment_id.map(str::to_string),
+        status: None,
+        drifted,
+    }
+}
+
+#[test]
+fn deploy_runtime_direct_tee_fallback_accepts_matching_partial_observation() {
+    let expected_deployment_id = "22222222-2222-2222-2222-222222222222";
+    for reason in [
+        "tee_unavailable",
+        "tee_malformed",
+        "tee_evidence_incomplete",
+    ] {
+        let observation =
+            deploy_observation("partial", Some(reason), Some(expected_deployment_id), false);
+
+        assert!(observation_allows_direct_tee_fallback(
+            Some(&observation),
+            expected_deployment_id
+        ));
+        assert!(!observation_is_fresh_for_deployment(
+            Some(&observation),
+            expected_deployment_id
+        ));
+    }
+}
+
+#[test]
+fn deploy_runtime_direct_tee_fallback_rejects_pod_gaps_wrong_or_drifted_deployment() {
+    let expected_deployment_id = "22222222-2222-2222-2222-222222222222";
+    let wrong = deploy_observation(
+        "partial",
+        Some("tee_unavailable"),
+        Some("33333333-3333-3333-3333-333333333333"),
+        false,
+    );
+    let drifted = deploy_observation(
+        "partial",
+        Some("tee_unavailable"),
+        Some(expected_deployment_id),
+        true,
+    );
+
+    assert!(!observation_allows_direct_tee_fallback(
+        Some(&wrong),
+        expected_deployment_id
+    ));
+    assert!(!observation_allows_direct_tee_fallback(
+        Some(&drifted),
+        expected_deployment_id
+    ));
+
+    for reason in [
+        None,
+        Some("pod_evidence_incomplete"),
+        Some("evidence_mismatch"),
+        Some("not_observed"),
+    ] {
+        let observation =
+            deploy_observation("partial", reason, Some(expected_deployment_id), false);
+        assert!(
+            !observation_allows_direct_tee_fallback(Some(&observation), expected_deployment_id),
+            "partial observation reason {reason:?} must retain the pod-evidence fence"
+        );
+    }
+}
+
+#[test]
+fn direct_tee_status_prefers_current_unlock_state() {
+    let status = serde_json::json!({
+        "state": "unlocked",
+        "unlock_state": "error",
+        "ownership_state": "locked"
+    });
+
+    assert_eq!(tee_unlock_state(&status), "error");
+}
+
+#[test]
+fn direct_tee_status_accepts_matching_or_omitted_supplemental_fields() {
+    for status in [
+        serde_json::json!({
+            "unlock_state": "unlocked",
+            "pod_status": "Running",
+            "tee_status": "READY",
+            "storage_status": "Unlocked"
+        }),
+        serde_json::json!({
+            "state": "locked",
+            "tee_status": "ready",
+            "storage_status": "locked"
+        }),
+        serde_json::json!({"state": "unlocked"}),
+        serde_json::json!({
+            "state": "unlocked",
+            "tee_status": null,
+            "storage_status": null
+        }),
+    ] {
+        assert!(tee_supplemental_fields_are_consistent(&status), "{status}");
+    }
+}
+
+#[test]
+fn direct_tee_status_rejects_errors_mismatches_and_malformed_fields() {
+    for status in [
+        serde_json::json!({"state": "unlocked", "tee_status": "error"}),
+        serde_json::json!({"state": "unlocked", "storage_status": "error"}),
+        serde_json::json!({"state": "locked", "storage_status": "unlocked"}),
+        serde_json::json!({"state": "unlocked", "pod_status": "Pending"}),
+        serde_json::json!({"state": "unlocked", "pod_status": 1}),
+        serde_json::json!({"state": "unlocked", "tee_status": 1}),
+        serde_json::json!({"state": "unlocked", "storage_status": ["unlocked"]}),
+    ] {
+        assert!(!tee_supplemental_fields_are_consistent(&status), "{status}");
+    }
 }
 
 #[test]

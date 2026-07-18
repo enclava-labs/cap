@@ -493,6 +493,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             wait_for_deploy_runtime(
                 &api,
                 &app_name,
+                &resp.deployment_id,
                 max_wait,
                 poll_interval,
                 &pb,
@@ -523,6 +524,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         wait_for_deploy_runtime(
             &api,
             &app_name,
+            &resp.deployment_id,
             max_wait,
             poll_interval,
             &pb,
@@ -638,6 +640,7 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
 async fn wait_for_deploy_runtime(
     api: &ApiClient,
     app_name: &str,
+    expected_deployment_id: &str,
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
@@ -658,9 +661,18 @@ async fn wait_for_deploy_runtime(
             return Err("deploy timed out waiting for TEE to boot".into());
         }
 
-        match api.get_status(app_name).await {
+        let direct_tee_allowed = match api.get_status(app_name).await {
             Ok(status) => {
-                if target.accepts_api_status(status.status.as_str()) {
+                let observation_is_fresh = observation_is_fresh_for_deployment(
+                    status.observation.as_ref(),
+                    expected_deployment_id,
+                );
+                let direct_tee_allowed = status.status != "failed"
+                    && observation_allows_direct_tee_fallback(
+                        status.observation.as_ref(),
+                        expected_deployment_id,
+                    );
+                if observation_is_fresh && target.accepts_api_status(status.status.as_str()) {
                     pb.set_position(3);
                     pb.set_message(match status.status.as_str() {
                         "locked" => "TEE running, storage locked",
@@ -669,8 +681,11 @@ async fn wait_for_deploy_runtime(
                     return Ok(());
                 }
 
+                let pod_phase_is_verified = observation_is_fresh && status.status != "failed";
                 match status.pod_phase.as_deref() {
-                    Some("Running") if target.accepts_running_pod_phase() => {
+                    Some("Running")
+                        if pod_phase_is_verified && target.accepts_running_pod_phase() =>
+                    {
                         pb.set_position(3);
                         pb.set_message("TEE running, attestation complete");
                         return Ok(());
@@ -680,36 +695,77 @@ async fn wait_for_deploy_runtime(
                     }
                     None => {}
                 }
+                direct_tee_allowed
             }
             Err(_) => {
-                // Status endpoint may not be ready yet.
+                // The direct endpoint is app-bound rather than deployment-bound.
+                // Without a current CAP observation there is no pod/deployment
+                // evidence proving it belongs to this deploy, so retry CAP and
+                // do not let an old TEE satisfy a replacement rollout.
+                false
             }
-        }
+        };
 
-        if let Some(tee) = direct_tee.as_ref()
+        if direct_tee_allowed
+            && let Some(tee) = direct_tee.as_ref()
             && let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
             && let Ok(status) = attested_tee.status_json().await
         {
-            match tee_unlock_state(&status) {
-                "locked" => {
-                    pb.set_position(3);
-                    pb.set_message("TEE running, storage locked");
-                    return Ok(());
+            if tee_supplemental_fields_are_consistent(&status) {
+                match tee_unlock_state(&status) {
+                    "locked" => {
+                        pb.set_position(3);
+                        pb.set_message("TEE running, storage locked");
+                        return Ok(());
+                    }
+                    "unlocked" if target.accepts_direct_unlocked() => {
+                        pb.set_position(3);
+                        pb.set_message("TEE running, attestation complete");
+                        return Ok(());
+                    }
+                    "unlocked" => {
+                        pb.set_message("Waiting for replacement TEE lock...");
+                    }
+                    _ => {}
                 }
-                "unlocked" if target.accepts_direct_unlocked() => {
-                    pb.set_position(3);
-                    pb.set_message("TEE running, attestation complete");
-                    return Ok(());
-                }
-                "unlocked" => {
-                    pb.set_message("Waiting for replacement TEE lock...");
-                }
-                _ => {}
+            } else {
+                pb.set_message("Waiting for healthy TEE status...");
             }
         }
 
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+fn observation_is_fresh_for_deployment(
+    observation: Option<&AppStatusObservation>,
+    expected_deployment_id: &str,
+) -> bool {
+    observation.is_none_or(|observation| {
+        observation.state == "fresh"
+            && !observation.drifted
+            && observation.deployment_id.as_deref() == Some(expected_deployment_id)
+    })
+}
+
+fn observation_allows_direct_tee_fallback(
+    observation: Option<&AppStatusObservation>,
+    expected_deployment_id: &str,
+) -> bool {
+    observation.is_none_or(|observation| {
+        let pod_evidence_allows_fallback = match observation.state.as_str() {
+            "fresh" => observation.reason.is_none(),
+            "partial" => matches!(
+                observation.reason.as_deref(),
+                Some("tee_unavailable" | "tee_malformed" | "tee_evidence_incomplete")
+            ),
+            _ => false,
+        };
+
+        pod_evidence_allows_fallback
+            && !observation.drifted
+            && observation.deployment_id.as_deref() == Some(expected_deployment_id)
+    })
 }
 
 async fn find_deployment_entry(
@@ -837,11 +893,25 @@ async fn ensure_password_storage_unlocked_for_config(
 
 fn tee_unlock_state(status: &serde_json::Value) -> &str {
     status
-        .get("state")
-        .or_else(|| status.get("unlock_state"))
+        .get("unlock_state")
+        .or_else(|| status.get("state"))
         .or_else(|| status.get("ownership_state"))
         .and_then(|value| value.as_str())
         .unwrap_or("unknown")
+}
+
+fn tee_supplemental_fields_are_consistent(status: &serde_json::Value) -> bool {
+    let live_state = tee_unlock_state(status);
+    let optional_field_matches = |name: &str, expected: &str| match status.get(name) {
+        None | Some(serde_json::Value::Null) => true,
+        Some(value) => value
+            .as_str()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected)),
+    };
+
+    optional_field_matches("pod_status", "running")
+        && optional_field_matches("tee_status", "ready")
+        && optional_field_matches("storage_status", live_state)
 }
 
 async fn wait_for_deploy_unlock_completion(
@@ -1024,6 +1094,18 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
     if let Some(deployed) = &status.last_deployed {
         println!("Deployed: {deployed}");
+    }
+    if let Some(observation) = &status.observation {
+        println!("Freshness: {}", observation.state);
+        if observation.drifted {
+            println!("Drift:    deployment identity mismatch");
+        }
+        if let Some(observed_at) = &observation.observed_at {
+            println!("Observed: {observed_at}");
+        }
+        if let Some(reason) = &observation.reason {
+            println!("Evidence: {reason}");
+        }
     }
 
     Ok(())

@@ -1,4 +1,5 @@
 use super::*;
+use crate::routes::status::{LiveObservation, observe_app_status_for_deployment};
 
 #[derive(Debug, Deserialize)]
 pub struct GenericDeploymentRequest {
@@ -86,6 +87,10 @@ pub struct GenericDeploymentResponse {
     pub error_message: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Explicit live evidence. The lifecycle fields above remain database
+    /// projections; consumers must use this observation to decide whether a
+    /// healthy/running projection is current.
+    pub observation: LiveObservation,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +119,7 @@ impl GenericDeploymentResponse {
             .get("image")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let error_message = public_deployment_error_message(deployment.error_message.as_deref());
         Self {
             deployment_id: deployment.id,
             app_id: app.id,
@@ -130,10 +136,16 @@ impl GenericDeploymentResponse {
                 .or_else(|| app.source_repository.clone()),
             status: format!("{:?}", deployment.status).to_lowercase(),
             app_status: format!("{:?}", app.status).to_lowercase(),
-            error_message: deployment.error_message,
+            error_message,
             created_at: deployment.created_at,
             completed_at: deployment.completed_at,
+            observation: LiveObservation::not_observed(),
         }
+    }
+
+    fn with_observation(mut self, observation: LiveObservation) -> Self {
+        self.observation = observation;
+        self
     }
 }
 
@@ -331,9 +343,20 @@ pub async fn get_generic_deployment(
         .await?
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "deployment not found"))?;
 
-    Ok(Json(GenericDeploymentResponse::from_deployment(
-        deployment, &app,
-    )))
+    let observed = observe_app_status_for_deployment(&state, &app, Some(deployment.id)).await;
+    let runtime_failure = observed
+        .runtime_failure_matches_deployment(deployment.id)
+        .then(|| observed.runtime_failure_public_message())
+        .flatten();
+    let observation = observed.observation;
+    let mut response =
+        GenericDeploymentResponse::from_deployment(deployment, &app).with_observation(observation);
+    if let Some(runtime_failure) = runtime_failure {
+        response.status = "failed".to_string();
+        response.app_status = "failed".to_string();
+        response.error_message = Some(runtime_failure);
+    }
+    Ok(Json(response))
 }
 
 /// POST /deployments/{deployment_id}/config-token -- generic config-token bridge.
