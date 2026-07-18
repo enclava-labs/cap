@@ -22,6 +22,10 @@ type IdempotencyResponse = (StatusCode, serde_json::Value);
 const IDEMPOTENCY_DEFAULT_LEASE_SECONDS: i64 = 60;
 const IDEMPOTENCY_LEGACY_STALE_SECONDS: i64 = 30 * 60;
 const IDEMPOTENCY_RETRY_DEFER_SECONDS: i64 = 5;
+const CONFIG_TOKEN_HARD_ATTEMPT_SECONDS: u64 = 30;
+const CONFIG_TOKEN_CANCELLATION_SECONDS: u64 = 5;
+const CONFIG_TOKEN_RECEIPT_LEASE_SECONDS: i64 = 60;
+const CONFIG_TOKEN_SAFE_RETURN_SECONDS: i64 = CONFIG_TOKEN_HARD_ATTEMPT_SECONDS as i64;
 
 #[derive(Debug, sqlx::FromRow)]
 struct IdempotencyRow {
@@ -34,6 +38,11 @@ struct IdempotencyRow {
     operation_id: Option<Uuid>,
     lease_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     recovery_kind: Option<String>,
+    capability_receipt_version: Option<i16>,
+    capability_resource_id: Option<Uuid>,
+    capability_instance_id: Option<String>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     database_now: chrono::DateTime<chrono::Utc>,
 }
@@ -43,6 +52,7 @@ enum IdempotencyRecovery {
     RetrySafe,
     DeterministicResource { legacy_identity_bound: bool },
     ExpiringCapability { recovery_after_seconds: i64 },
+    DeterministicExpiringCapability,
     FailClosed,
 }
 
@@ -52,6 +62,7 @@ impl IdempotencyRecovery {
             Self::RetrySafe => "retry_safe",
             Self::DeterministicResource { .. } => "deterministic_resource",
             Self::ExpiringCapability { .. } => "expiring_capability",
+            Self::DeterministicExpiringCapability => "deterministic_expiring_capability",
             Self::FailClosed => "fail_closed",
         }
     }
@@ -61,8 +72,13 @@ impl IdempotencyRecovery {
             Self::ExpiringCapability {
                 recovery_after_seconds,
             } => recovery_after_seconds,
+            Self::DeterministicExpiringCapability => CONFIG_TOKEN_RECEIPT_LEASE_SECONDS,
             _ => IDEMPOTENCY_DEFAULT_LEASE_SECONDS,
         }
+    }
+
+    fn refreshes_lease(self) -> bool {
+        !matches!(self, Self::DeterministicExpiringCapability)
     }
 }
 
@@ -77,7 +93,70 @@ struct IdempotencyLease {
     token: Uuid,
     operation_id: Uuid,
     reclaimed: bool,
+    regenerate: bool,
+    config_token_receipt: Option<ConfigTokenReceipt>,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+struct IdempotencyLeaseClaim {
+    operation_id: Uuid,
+    reclaimed: bool,
+    regenerate: bool,
+    config_token_receipt: Option<ConfigTokenReceipt>,
+}
+
+#[derive(Clone, Debug)]
+struct ConfigTokenReceipt {
+    operation_id: Uuid,
+    receipt_version: i16,
+    resource_id: Uuid,
+    instance_id: String,
+    issued_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug)]
+struct ConfigTokenResourceBinding {
+    resource_id: Uuid,
+    instance_id: String,
+}
+
+impl ConfigTokenReceipt {
+    fn new(
+        operation_id: Uuid,
+        created_at: chrono::DateTime<chrono::Utc>,
+        receipt_version: i16,
+        binding: ConfigTokenResourceBinding,
+    ) -> Self {
+        let issued_at = chrono::DateTime::from_timestamp(created_at.timestamp(), 0)
+            .expect("PostgreSQL timestamptz has a representable whole-second value");
+        Self {
+            operation_id,
+            receipt_version,
+            resource_id: binding.resource_id,
+            instance_id: binding.instance_id,
+            issued_at,
+            expires_at: issued_at
+                + chrono::Duration::seconds(crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS),
+        }
+    }
+
+    fn issuance(&self) -> crate::auth::jwt::ConfigTokenIssuance {
+        crate::auth::jwt::ConfigTokenIssuance {
+            receipt_version: self.receipt_version,
+            issued_at: self.issued_at,
+            jti: format!("cap-config-receipt-v1-{}", self.operation_id),
+            resource_id: self.resource_id,
+            instance_id: self.instance_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct IdempotencyCancellation {
+    pool: sqlx::PgPool,
+    key: String,
+    token: Uuid,
 }
 
 impl IdempotencyLease {
@@ -85,47 +164,50 @@ impl IdempotencyLease {
         pool: sqlx::PgPool,
         key: String,
         token: Uuid,
-        operation_id: Uuid,
-        reclaimed: bool,
-        lease_seconds: i64,
+        claim: IdempotencyLeaseClaim,
+        recovery: IdempotencyRecovery,
     ) -> Self {
+        let lease_seconds = recovery.lease_seconds();
         let heartbeat_pool = pool.clone();
         let heartbeat_key = key.clone();
-        let heartbeat = tokio::spawn(async move {
-            let refresh_seconds = (lease_seconds / 3).max(1) as u64;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(refresh_seconds)).await;
-                match sqlx::query(
-                    "UPDATE cap_internal_idempotency
-                        SET lease_expires_at = clock_timestamp()
-                            + ($3::bigint * interval '1 second'),
-                            updated_at = clock_timestamp()
-                      WHERE idempotency_key = $1
-                        AND reservation_token = $2
-                        AND completed_at IS NULL",
-                )
-                .bind(&heartbeat_key)
-                .bind(token)
-                .bind(lease_seconds)
-                .execute(&heartbeat_pool)
-                .await
-                {
-                    Ok(result) if result.rows_affected() == 1 => {}
-                    Ok(_) => return,
-                    // A transient database failure must not spin.  Retry on
-                    // the next interval while the last DB-authored deadline
-                    // remains authoritative.
-                    Err(_) => {}
+        let heartbeat = recovery.refreshes_lease().then(|| {
+            tokio::spawn(async move {
+                let refresh_seconds = (lease_seconds / 3).max(1) as u64;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(refresh_seconds)).await;
+                    match sqlx::query(
+                        "UPDATE cap_internal_idempotency
+                            SET lease_expires_at = clock_timestamp()
+                                + ($3::bigint * interval '1 second'),
+                                updated_at = clock_timestamp()
+                          WHERE idempotency_key = $1
+                            AND reservation_token = $2
+                            AND completed_at IS NULL",
+                    )
+                    .bind(&heartbeat_key)
+                    .bind(token)
+                    .bind(lease_seconds)
+                    .execute(&heartbeat_pool)
+                    .await
+                    {
+                        Ok(result) if result.rows_affected() == 1 => {}
+                        Ok(_) => return,
+                        // A transient database failure must not spin. Retry on
+                        // the next interval while the DB deadline is authority.
+                        Err(_) => {}
+                    }
                 }
-            }
+            })
         });
         Self {
             pool,
             key,
             token,
-            operation_id,
-            reclaimed,
-            heartbeat: Some(heartbeat),
+            operation_id: claim.operation_id,
+            reclaimed: claim.reclaimed,
+            regenerate: claim.regenerate,
+            config_token_receipt: claim.config_token_receipt,
+            heartbeat,
         }
     }
 
@@ -135,6 +217,18 @@ impl IdempotencyLease {
 
     fn reclaimed(&self) -> bool {
         self.reclaimed
+    }
+
+    fn config_token_receipt(&self) -> Option<&ConfigTokenReceipt> {
+        self.config_token_receipt.as_ref()
+    }
+
+    fn cancellation(&self) -> IdempotencyCancellation {
+        IdempotencyCancellation {
+            pool: self.pool.clone(),
+            key: self.key.clone(),
+            token: self.token,
+        }
     }
 
     fn stop_heartbeat(&mut self) {
@@ -645,6 +739,160 @@ async fn complete_unrecoverable_idempotency_request(
     Ok(IdempotencyBegin::Replay((StatusCode::CONFLICT, body)))
 }
 
+fn is_paas_config_token_idempotency_path(method: &str, path: &str) -> bool {
+    if method != "POST" {
+        return false;
+    }
+    let Some(rest) = path.strip_prefix("/internal/paas/orgs/") else {
+        return false;
+    };
+    let segments = rest.split('/').collect::<Vec<_>>();
+    match segments.as_slice() {
+        [org, "apps", app, "config-token"] => !org.is_empty() && !app.is_empty(),
+        [org, "deployments", deployment_id, "config-token"] => {
+            !org.is_empty() && Uuid::parse_str(deployment_id).is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn expired_config_token_body(
+    issued_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    legacy: bool,
+) -> serde_json::Value {
+    if legacy {
+        serde_json::json!({
+            "error": "idempotency_capability_expired",
+            "retryable": false,
+            "disposition": "new_key_after_expiry",
+            "proof_version": "legacy_expiring_capability_lease_v1",
+            "recovery_after": expires_at,
+        })
+    } else {
+        serde_json::json!({
+            "error": "idempotency_capability_expired",
+            "retryable": false,
+            "disposition": "new_key_after_expiry",
+            "proof_version": "deterministic_config_token_receipt_v1",
+            "capability_issued_at": issued_at,
+            "capability_expires_at": expires_at,
+        })
+    }
+}
+
+struct ExpiredConfigTokenReceipt<'a> {
+    key: &'a str,
+    previous_token: Option<Uuid>,
+    operation_id: Uuid,
+    stored_recovery_kind: &'a str,
+    issued_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    legacy: bool,
+}
+
+async fn terminalize_expired_config_token_receipt(
+    pool: &sqlx::PgPool,
+    receipt: ExpiredConfigTokenReceipt<'_>,
+) -> Result<IdempotencyBegin, InternalRouteError> {
+    let terminal_token = receipt.previous_token.unwrap_or_else(Uuid::new_v4);
+    let body = expired_config_token_body(receipt.issued_at, receipt.expires_at, receipt.legacy);
+    let mut tx = pool.begin().await.map_err(|_| db_error())?;
+    set_idempotency_completion_owner(&mut tx, terminal_token).await?;
+    let updated = sqlx::query(
+        "UPDATE cap_internal_idempotency
+            SET reservation_token = $2,
+                operation_id = COALESCE(operation_id, $3),
+                response_status = $4,
+                response_body = $5,
+                completed_at = COALESCE(completed_at, clock_timestamp()),
+                lease_expires_at = NULL,
+                updated_at = clock_timestamp()
+          WHERE idempotency_key = $1
+            AND reservation_token IS NOT DISTINCT FROM $6
+            AND recovery_kind = $7
+            AND response_status IS NULL
+            AND $8::timestamptz <= clock_timestamp()
+            AND (
+                completed_at IS NOT NULL
+                OR lease_expires_at <= clock_timestamp()
+            )",
+    )
+    .bind(receipt.key)
+    .bind(terminal_token)
+    .bind(receipt.operation_id)
+    .bind(StatusCode::CONFLICT.as_u16() as i32)
+    .bind(&body)
+    .bind(receipt.previous_token)
+    .bind(receipt.stored_recovery_kind)
+    .bind(receipt.expires_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| db_error())?;
+    if updated.rows_affected() == 1 {
+        tx.commit().await.map_err(|_| db_error())?;
+        return Ok(IdempotencyBegin::Replay((StatusCode::CONFLICT, body)));
+    }
+    tx.rollback().await.map_err(|_| db_error())?;
+
+    let replay: Option<(i32, serde_json::Value)> = sqlx::query_as(
+        "SELECT response_status, response_body
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1
+            AND response_status IS NOT NULL",
+    )
+    .bind(receipt.key)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| db_error())?;
+    if let Some((status, body)) = replay {
+        let status = StatusCode::from_u16(status as u16).map_err(|_| db_error())?;
+        return Ok(IdempotencyBegin::Replay((status, body)));
+    }
+    Err(idempotency_in_progress_error())
+}
+
+async fn sanitize_legacy_completed_config_token_response(
+    pool: &sqlx::PgPool,
+    key: &str,
+    previous_token: Option<Uuid>,
+    operation_id: Uuid,
+    issued_at: chrono::DateTime<chrono::Utc>,
+    recovery_after: chrono::DateTime<chrono::Utc>,
+) -> Result<IdempotencyBegin, InternalRouteError> {
+    let terminal_token = previous_token.unwrap_or_else(Uuid::new_v4);
+    let body = expired_config_token_body(issued_at, recovery_after, true);
+    let mut tx = pool.begin().await.map_err(|_| db_error())?;
+    set_idempotency_completion_owner(&mut tx, terminal_token).await?;
+    let updated = sqlx::query(
+        "UPDATE cap_internal_idempotency
+            SET reservation_token = $2,
+                operation_id = COALESCE(operation_id, $3),
+                response_status = $4,
+                response_body = $5,
+                completed_at = COALESCE(completed_at, clock_timestamp()),
+                lease_expires_at = NULL,
+                updated_at = clock_timestamp()
+          WHERE idempotency_key = $1
+            AND reservation_token IS NOT DISTINCT FROM $6
+            AND response_status BETWEEN 200 AND 299",
+    )
+    .bind(key)
+    .bind(terminal_token)
+    .bind(operation_id)
+    .bind(StatusCode::CONFLICT.as_u16() as i32)
+    .bind(&body)
+    .bind(previous_token)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| db_error())?;
+    if updated.rows_affected() != 1 {
+        return Err(idempotency_in_progress_error());
+    }
+    tx.commit().await.map_err(|_| db_error())?;
+    Ok(IdempotencyBegin::Replay((StatusCode::CONFLICT, body)))
+}
+
 async fn begin_idempotent_request_with_recovery(
     state: &AppState,
     key: &str,
@@ -653,20 +901,71 @@ async fn begin_idempotent_request_with_recovery(
     hash: &[u8],
     recovery: IdempotencyRecovery,
 ) -> Result<IdempotencyBegin, InternalRouteError> {
+    begin_idempotent_request_with_recovery_and_binding(
+        state,
+        key,
+        method,
+        path,
+        hash,
+        recovery,
+        ConfigTokenIdempotencyOptions::default(),
+    )
+    .await
+}
+
+#[derive(Default)]
+struct ConfigTokenIdempotencyOptions<'a> {
+    binding: Option<&'a ConfigTokenResourceBinding>,
+    legacy_request_hash: Option<&'a [u8]>,
+}
+
+fn config_token_receipt_from_row(
+    row: &IdempotencyRow,
+    fallback_operation_id: Uuid,
+) -> Result<ConfigTokenReceipt, InternalRouteError> {
+    Ok(ConfigTokenReceipt::new(
+        row.operation_id.unwrap_or(fallback_operation_id),
+        row.created_at,
+        row.capability_receipt_version.ok_or_else(db_error)?,
+        ConfigTokenResourceBinding {
+            resource_id: row.capability_resource_id.ok_or_else(db_error)?,
+            instance_id: row.capability_instance_id.clone().ok_or_else(db_error)?,
+        },
+    ))
+}
+
+async fn begin_idempotent_request_with_recovery_and_binding(
+    state: &AppState,
+    key: &str,
+    method: &str,
+    path: &str,
+    hash: &[u8],
+    recovery: IdempotencyRecovery,
+    options: ConfigTokenIdempotencyOptions<'_>,
+) -> Result<IdempotencyBegin, InternalRouteError> {
+    let config_token_binding = options.binding;
+    let legacy_request_hash = options.legacy_request_hash;
+    if recovery == IdempotencyRecovery::DeterministicExpiringCapability
+        && (!is_paas_config_token_idempotency_path(method, path) || config_token_binding.is_none())
+    {
+        return Err(db_error());
+    }
     let operation_id = idempotency_operation_id(key, method, path, hash);
     let token = Uuid::new_v4();
-    let inserted = sqlx::query(
+    let inserted_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
         "INSERT INTO cap_internal_idempotency (
              idempotency_key, method, path, request_hash,
              reservation_token, operation_id, lease_expires_at,
-             recovery_kind, attempt_count
+             recovery_kind, attempt_count, capability_receipt_version,
+             capability_resource_id, capability_instance_id
          )
          VALUES (
              $1, $2, $3, $4, $5, $6,
              clock_timestamp() + ($7::bigint * interval '1 second'),
-             $8, 1
+             $8, 1, $9, $10, $11
          )
-         ON CONFLICT (idempotency_key) DO NOTHING",
+         ON CONFLICT (idempotency_key) DO NOTHING
+         RETURNING created_at",
     )
     .bind(key)
     .bind(method)
@@ -676,27 +975,46 @@ async fn begin_idempotent_request_with_recovery(
     .bind(operation_id)
     .bind(recovery.lease_seconds())
     .bind(recovery.kind())
-    .execute(&state.db)
+    .bind(config_token_binding.map(|_| crate::auth::jwt::CONFIG_TOKEN_RECEIPT_VERSION))
+    .bind(config_token_binding.map(|binding| binding.resource_id))
+    .bind(config_token_binding.map(|binding| binding.instance_id.as_str()))
+    .fetch_optional(&state.db)
     .await
-    .map_err(|_| db_error())?
-    .rows_affected()
-        == 1;
+    .map_err(|_| db_error())?;
 
-    if inserted {
+    if let Some(created_at) = inserted_at {
+        let config_token_receipt =
+            (recovery == IdempotencyRecovery::DeterministicExpiringCapability).then(|| {
+                ConfigTokenReceipt::new(
+                    operation_id,
+                    created_at,
+                    crate::auth::jwt::CONFIG_TOKEN_RECEIPT_VERSION,
+                    config_token_binding
+                        .expect("config-token recovery requires a binding")
+                        .clone(),
+                )
+            });
         return Ok(IdempotencyBegin::Execute(IdempotencyLease::new(
             state.db.clone(),
             key.to_string(),
             token,
-            operation_id,
-            false,
-            recovery.lease_seconds(),
+            IdempotencyLeaseClaim {
+                operation_id,
+                reclaimed: false,
+                regenerate: false,
+                config_token_receipt,
+            },
+            recovery,
         )));
     }
 
     let row: IdempotencyRow = sqlx::query_as(
         "SELECT method, path, request_hash, response_status, response_body,
                 reservation_token, operation_id, lease_expires_at,
-                recovery_kind, updated_at, clock_timestamp() AS database_now
+                recovery_kind, capability_receipt_version,
+                capability_resource_id, capability_instance_id,
+                completed_at, created_at, updated_at,
+                clock_timestamp() AS database_now
            FROM cap_internal_idempotency
           WHERE idempotency_key = $1",
     )
@@ -705,8 +1023,44 @@ async fn begin_idempotent_request_with_recovery(
     .await
     .map_err(|_| db_error())?;
 
-    if row.method != method || row.path != path || row.request_hash != hash {
+    let exact_request = row.request_hash == hash;
+    let compatible_legacy_request = recovery
+        == IdempotencyRecovery::DeterministicExpiringCapability
+        && row.recovery_kind.as_deref() == Some("expiring_capability")
+        && legacy_request_hash.is_some_and(|legacy_hash| row.request_hash == legacy_hash);
+    if row.method != method || row.path != path || (!exact_request && !compatible_legacy_request) {
         return Err(idempotency_key_reused_error());
+    }
+    if row.recovery_kind.as_deref() == Some(recovery.kind())
+        && let Some(binding) = config_token_binding
+        && (row.capability_receipt_version != Some(crate::auth::jwt::CONFIG_TOKEN_RECEIPT_VERSION)
+            || row.capability_resource_id != Some(binding.resource_id)
+            || row.capability_instance_id.as_deref() != Some(binding.instance_id.as_str()))
+    {
+        return Err(idempotency_key_reused_error());
+    }
+
+    if recovery == IdempotencyRecovery::DeterministicExpiringCapability
+        && row
+            .response_status
+            .is_some_and(|status| (200..300).contains(&status))
+    {
+        let issued_at = chrono::DateTime::from_timestamp(row.created_at.timestamp(), 0)
+            .expect("PostgreSQL timestamptz has a whole-second value");
+        let minimum_recovery_after = issued_at + chrono::Duration::seconds(6 * 60);
+        let recovery_after = row
+            .lease_expires_at
+            .map(|lease| lease.max(minimum_recovery_after))
+            .unwrap_or(minimum_recovery_after);
+        return sanitize_legacy_completed_config_token_response(
+            &state.db,
+            key,
+            row.reservation_token,
+            row.operation_id.unwrap_or(operation_id),
+            issued_at,
+            recovery_after,
+        )
+        .await;
     }
 
     if let Some(response) = completed_idempotency_response(&row) {
@@ -722,6 +1076,79 @@ async fn begin_idempotent_request_with_recovery(
             .lease_expires_at
             .is_some_and(|lease_expires_at| lease_expires_at <= row.database_now),
     };
+    if !reclaimable && recovery != IdempotencyRecovery::DeterministicExpiringCapability {
+        return Err(idempotency_in_progress_error());
+    }
+
+    if recovery == IdempotencyRecovery::DeterministicExpiringCapability
+        && row.recovery_kind.as_deref() == Some(recovery.kind())
+    {
+        let receipt = config_token_receipt_from_row(&row, operation_id)?;
+        if receipt.expires_at <= row.database_now {
+            if row.completed_at.is_none() && !reclaimable {
+                return Err(idempotency_in_progress_error());
+            }
+            return terminalize_expired_config_token_receipt(
+                &state.db,
+                ExpiredConfigTokenReceipt {
+                    key,
+                    previous_token: row.reservation_token,
+                    operation_id: receipt.operation_id,
+                    stored_recovery_kind: recovery.kind(),
+                    issued_at: receipt.issued_at,
+                    expires_at: receipt.expires_at,
+                    legacy: false,
+                },
+            )
+            .await;
+        }
+        if row.completed_at.is_some() {
+            return Ok(IdempotencyBegin::Execute(IdempotencyLease::new(
+                state.db.clone(),
+                key.to_string(),
+                row.reservation_token.unwrap_or(token),
+                IdempotencyLeaseClaim {
+                    operation_id: receipt.operation_id,
+                    reclaimed: false,
+                    regenerate: true,
+                    config_token_receipt: Some(receipt),
+                },
+                recovery,
+            )));
+        }
+        if !reclaimable {
+            return Err(idempotency_in_progress_error());
+        }
+    }
+
+    if recovery == IdempotencyRecovery::DeterministicExpiringCapability
+        && row.recovery_kind.as_deref() == Some("expiring_capability")
+    {
+        let issued_at = chrono::DateTime::from_timestamp(row.created_at.timestamp(), 0)
+            .expect("PostgreSQL timestamptz has a whole-second value");
+        let minimum_recovery_after = issued_at + chrono::Duration::seconds(6 * 60);
+        let expires_at = row
+            .lease_expires_at
+            .map(|lease| lease.max(minimum_recovery_after))
+            .unwrap_or(minimum_recovery_after);
+        if expires_at > row.database_now || !reclaimable {
+            return Err(idempotency_in_progress_error());
+        }
+        return terminalize_expired_config_token_receipt(
+            &state.db,
+            ExpiredConfigTokenReceipt {
+                key,
+                previous_token: row.reservation_token,
+                operation_id: row.operation_id.unwrap_or(operation_id),
+                stored_recovery_kind: "expiring_capability",
+                issued_at,
+                expires_at,
+                legacy: true,
+            },
+        )
+        .await;
+    }
+
     if !reclaimable {
         return Err(idempotency_in_progress_error());
     }
@@ -815,9 +1242,31 @@ async fn begin_idempotent_request_with_recovery(
         state.db.clone(),
         key.to_string(),
         token,
-        row.operation_id.unwrap_or(operation_id),
-        true,
-        recovery.lease_seconds(),
+        IdempotencyLeaseClaim {
+            operation_id: row.operation_id.unwrap_or(operation_id),
+            reclaimed: true,
+            regenerate: false,
+            config_token_receipt: (recovery
+                == IdempotencyRecovery::DeterministicExpiringCapability)
+                .then(|| {
+                    ConfigTokenReceipt::new(
+                        row.operation_id.unwrap_or(operation_id),
+                        row.created_at,
+                        row.capability_receipt_version
+                            .expect("config-token receipt version was validated"),
+                        ConfigTokenResourceBinding {
+                            resource_id: row
+                                .capability_resource_id
+                                .expect("config-token resource was validated"),
+                            instance_id: row
+                                .capability_instance_id
+                                .clone()
+                                .expect("config-token instance was validated"),
+                        },
+                    )
+                }),
+        },
+        recovery,
     )))
 }
 
@@ -879,7 +1328,10 @@ async fn begin_membership_idempotent_request_in_tx(
     let row: IdempotencyRow = sqlx::query_as(
         "SELECT method, path, request_hash, response_status, response_body,
                 reservation_token, operation_id, lease_expires_at,
-                recovery_kind, updated_at, clock_timestamp() AS database_now
+                recovery_kind, capability_receipt_version,
+                capability_resource_id, capability_instance_id,
+                completed_at, created_at, updated_at,
+                clock_timestamp() AS database_now
            FROM cap_internal_idempotency
           WHERE idempotency_key = $1",
     )
@@ -1004,6 +1456,362 @@ async fn complete_expiring_capability_result(
         }
         Err(error) => complete_idempotent_result(lease, Err(error)).await,
     }
+}
+
+async fn cancel_incomplete_idempotency_reservation(
+    cancellation: &IdempotencyCancellation,
+) -> Result<(), InternalRouteError> {
+    let deleted = sqlx::query(
+        "DELETE FROM cap_internal_idempotency
+          WHERE idempotency_key = $1
+            AND reservation_token = $2
+            AND completed_at IS NULL",
+    )
+    .bind(&cancellation.key)
+    .bind(cancellation.token)
+    .execute(&cancellation.pool)
+    .await
+    .map_err(|_| db_error())?;
+    if deleted.rows_affected() == 1 {
+        return Ok(());
+    }
+
+    let completed: Option<bool> = sqlx::query_scalar(
+        "SELECT completed_at IS NOT NULL
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1",
+    )
+    .bind(&cancellation.key)
+    .fetch_optional(&cancellation.pool)
+    .await
+    .map_err(|_| db_error())?;
+    match completed {
+        None | Some(true) => Ok(()),
+        Some(false) => Err(idempotency_in_progress_error()),
+    }
+}
+
+async fn cancel_incomplete_idempotency_reservation_bounded(
+    cancellation: &IdempotencyCancellation,
+    timeout: std::time::Duration,
+) -> Result<(), InternalRouteError> {
+    // A Tokio timeout alone can drop the client future while PostgreSQL is
+    // still waiting on a row lock. Give the server a slightly shorter hard
+    // statement/lock timeout so a canceled cleanup cannot wake later and
+    // delete a receipt that has since become authoritative.
+    let started = std::time::Instant::now();
+    let mut tx = cancellation.pool.begin().await.map_err(|_| db_error())?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    // Reserve most of the outer budget for PostgreSQL cancellation and the
+    // transaction rollback. A blocked DELETE is never allowed to outlive the
+    // client-side cleanup future.
+    let database_millis = (remaining.as_millis() / 3).clamp(1, 250);
+    let timeout_setting = format!("{database_millis}ms");
+    sqlx::query_scalar::<_, String>("SELECT set_config('statement_timeout', $1, true)")
+        .bind(&timeout_setting)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+    sqlx::query_scalar::<_, String>("SELECT set_config('lock_timeout', $1, true)")
+        .bind(&timeout_setting)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+    sqlx::query(
+        "DELETE FROM cap_internal_idempotency
+          WHERE idempotency_key = $1
+            AND reservation_token = $2
+            AND completed_at IS NULL",
+    )
+    .bind(&cancellation.key)
+    .bind(cancellation.token)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| db_error())?;
+    tx.commit().await.map_err(|_| db_error())?;
+    Ok(())
+}
+
+async fn cancel_idempotency_reservation(
+    mut lease: IdempotencyLease,
+) -> Result<(), InternalRouteError> {
+    lease.stop_heartbeat();
+    let cancellation = lease.cancellation();
+    cancel_incomplete_idempotency_reservation(&cancellation).await
+}
+
+enum ConfigTokenReceiptCompletion {
+    Completed,
+    Deferred,
+    Terminal(IdempotencyResponse),
+}
+
+async fn finish_config_token_receipt(
+    lease: &mut IdempotencyLease,
+) -> Result<ConfigTokenReceiptCompletion, InternalRouteError> {
+    lease.stop_heartbeat();
+    let receipt = lease.config_token_receipt.clone().ok_or_else(db_error)?;
+    let mut tx = lease.pool.begin().await.map_err(|_| db_error())?;
+    set_idempotency_completion_owner(&mut tx, lease.token).await?;
+    let updated = sqlx::query(
+        "UPDATE cap_internal_idempotency
+            SET completed_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+          WHERE idempotency_key = $1
+            AND reservation_token = $2
+            AND recovery_kind = 'deterministic_expiring_capability'
+            AND completed_at IS NULL
+            AND response_status IS NULL
+            AND response_body IS NULL
+            AND operation_id = $3
+            AND capability_receipt_version = $4
+            AND capability_resource_id = $5
+            AND capability_instance_id = $6
+            AND date_trunc('second', created_at)
+                + ($7::bigint * interval '1 second')
+                > clock_timestamp() + ($8::bigint * interval '1 second')",
+    )
+    .bind(&lease.key)
+    .bind(lease.token)
+    .bind(receipt.operation_id)
+    .bind(receipt.receipt_version)
+    .bind(receipt.resource_id)
+    .bind(&receipt.instance_id)
+    .bind(crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS)
+    .bind(CONFIG_TOKEN_SAFE_RETURN_SECONDS)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| db_error())?;
+    if updated.rows_affected() == 1 {
+        tx.commit().await.map_err(|_| db_error())?;
+        return Ok(ConfigTokenReceiptCompletion::Completed);
+    }
+    tx.rollback().await.map_err(|_| db_error())?;
+
+    // Signing has already happened. If it completed inside the no-return
+    // window, retain a durable completed receipt without returning or
+    // deleting the bearer generation. Duplicates remain retryable under the
+    // same key until absolute expiry terminalizes it.
+    let mut tx = lease.pool.begin().await.map_err(|_| db_error())?;
+    set_idempotency_completion_owner(&mut tx, lease.token).await?;
+    let deferred = sqlx::query(
+        "UPDATE cap_internal_idempotency
+            SET completed_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+          WHERE idempotency_key = $1
+            AND reservation_token = $2
+            AND recovery_kind = 'deterministic_expiring_capability'
+            AND completed_at IS NULL
+            AND response_status IS NULL
+            AND response_body IS NULL
+            AND operation_id = $3
+            AND capability_receipt_version = $4
+            AND capability_resource_id = $5
+            AND capability_instance_id = $6
+            AND date_trunc('second', created_at)
+                + ($7::bigint * interval '1 second') > clock_timestamp()",
+    )
+    .bind(&lease.key)
+    .bind(lease.token)
+    .bind(receipt.operation_id)
+    .bind(receipt.receipt_version)
+    .bind(receipt.resource_id)
+    .bind(&receipt.instance_id)
+    .bind(crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| db_error())?;
+    if deferred.rows_affected() == 1 {
+        tx.commit().await.map_err(|_| db_error())?;
+        return Ok(ConfigTokenReceiptCompletion::Deferred);
+    }
+    tx.rollback().await.map_err(|_| db_error())?;
+
+    if receipt.expires_at <= database_clock(&lease.pool).await? {
+        let terminal = terminalize_expired_config_token_receipt(
+            &lease.pool,
+            ExpiredConfigTokenReceipt {
+                key: &lease.key,
+                previous_token: Some(lease.token),
+                operation_id: receipt.operation_id,
+                stored_recovery_kind: IdempotencyRecovery::DeterministicExpiringCapability.kind(),
+                issued_at: receipt.issued_at,
+                expires_at: receipt.expires_at,
+                legacy: false,
+            },
+        )
+        .await?;
+        return match terminal {
+            IdempotencyBegin::Replay(response) => {
+                Ok(ConfigTokenReceiptCompletion::Terminal(response))
+            }
+            IdempotencyBegin::Execute(_) => Err(db_error()),
+        };
+    }
+    Err(db_error())
+}
+
+async fn database_clock(
+    pool: &sqlx::PgPool,
+) -> Result<chrono::DateTime<chrono::Utc>, InternalRouteError> {
+    sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .map_err(|_| db_error())
+}
+
+async fn finalize_regenerated_config_token_response(
+    lease: &IdempotencyLease,
+    response: IdempotencyResponse,
+) -> Result<IdempotencyResponse, InternalRouteError> {
+    let receipt = lease.config_token_receipt.as_ref().ok_or_else(db_error)?;
+    let mut tx = lease.pool.begin().await.map_err(|_| db_error())?;
+    let row: Option<(Option<i32>, Option<serde_json::Value>, bool, bool)> = sqlx::query_as(
+        "SELECT response_status, response_body,
+                date_trunc('second', created_at)
+                    + ($7::bigint * interval '1 second')
+                    > clock_timestamp() + ($8::bigint * interval '1 second')
+                    AS safe_to_return,
+                date_trunc('second', created_at)
+                    + ($7::bigint * interval '1 second') <= clock_timestamp()
+                    AS expired
+           FROM cap_internal_idempotency
+          WHERE idempotency_key = $1
+            AND reservation_token = $2
+            AND operation_id = $3
+            AND recovery_kind = 'deterministic_expiring_capability'
+            AND capability_receipt_version = $4
+            AND capability_resource_id = $5
+            AND capability_instance_id = $6
+            AND completed_at IS NOT NULL
+          FOR UPDATE",
+    )
+    .bind(&lease.key)
+    .bind(lease.token)
+    .bind(receipt.operation_id)
+    .bind(receipt.receipt_version)
+    .bind(receipt.resource_id)
+    .bind(&receipt.instance_id)
+    .bind(crate::auth::jwt::CONFIG_TOKEN_TTL_SECONDS)
+    .bind(CONFIG_TOKEN_SAFE_RETURN_SECONDS)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| db_error())?;
+    match row {
+        Some((None, None, true, false)) => {
+            tx.commit().await.map_err(|_| db_error())?;
+            Ok(response)
+        }
+        Some((Some(status), Some(body), _, _)) => {
+            tx.rollback().await.map_err(|_| db_error())?;
+            let status = StatusCode::from_u16(status as u16).map_err(|_| db_error())?;
+            Ok((status, body))
+        }
+        Some((None, None, false, true)) => {
+            tx.rollback().await.map_err(|_| db_error())?;
+            let terminal = terminalize_expired_config_token_receipt(
+                &lease.pool,
+                ExpiredConfigTokenReceipt {
+                    key: &lease.key,
+                    previous_token: Some(lease.token),
+                    operation_id: receipt.operation_id,
+                    stored_recovery_kind: IdempotencyRecovery::DeterministicExpiringCapability
+                        .kind(),
+                    issued_at: receipt.issued_at,
+                    expires_at: receipt.expires_at,
+                    legacy: false,
+                },
+            )
+            .await?;
+            match terminal {
+                IdempotencyBegin::Replay(response) => Ok(response),
+                IdempotencyBegin::Execute(_) => Err(db_error()),
+            }
+        }
+        Some((None, None, false, false)) => {
+            tx.rollback().await.map_err(|_| db_error())?;
+            Err(idempotency_in_progress_error())
+        }
+        _ => Err(db_error()),
+    }
+}
+
+async fn complete_deterministic_config_token_result_with_timeout<F>(
+    lease: IdempotencyLease,
+    result: F,
+    hard_timeout: std::time::Duration,
+    cancellation_timeout: std::time::Duration,
+) -> Result<IdempotencyResponse, InternalRouteError>
+where
+    F: std::future::Future<Output = Result<IdempotencyResponse, InternalRouteError>>,
+{
+    let mut lease = lease;
+    let regenerate = lease.regenerate;
+    let cancellation = (!regenerate).then(|| lease.cancellation());
+    let attempt = async move {
+        match result.await {
+            Ok(response) if regenerate => {
+                finalize_regenerated_config_token_response(&lease, response).await
+            }
+            Ok(response) => {
+                let finish_cancellation = lease.cancellation();
+                match finish_config_token_receipt(&mut lease).await {
+                    Ok(ConfigTokenReceiptCompletion::Completed) => {
+                        finalize_regenerated_config_token_response(&lease, response).await
+                    }
+                    Ok(ConfigTokenReceiptCompletion::Deferred) => {
+                        Err(idempotency_in_progress_error())
+                    }
+                    Ok(ConfigTokenReceiptCompletion::Terminal(terminal)) => Ok(terminal),
+                    Err(error) => {
+                        cancel_incomplete_idempotency_reservation(&finish_cancellation).await?;
+                        Err(error)
+                    }
+                }
+            }
+            Err(error) if regenerate => Err(error),
+            Err(error) => {
+                cancel_idempotency_reservation(lease).await?;
+                Err(error)
+            }
+        }
+    };
+
+    match tokio::time::timeout(hard_timeout, attempt).await {
+        Ok(result) => result,
+        Err(_) => {
+            if let Some(cancellation) = cancellation.as_ref() {
+                let _ = tokio::time::timeout(
+                    cancellation_timeout,
+                    cancel_incomplete_idempotency_reservation_bounded(
+                        cancellation,
+                        cancellation_timeout,
+                    ),
+                )
+                .await;
+            }
+            Err(json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "config token generation timed out",
+            ))
+        }
+    }
+}
+
+async fn complete_deterministic_config_token_result<F>(
+    lease: IdempotencyLease,
+    result: F,
+) -> Result<IdempotencyResponse, InternalRouteError>
+where
+    F: std::future::Future<Output = Result<IdempotencyResponse, InternalRouteError>>,
+{
+    complete_deterministic_config_token_result_with_timeout(
+        lease,
+        result,
+        std::time::Duration::from_secs(CONFIG_TOKEN_HARD_ATTEMPT_SECONDS),
+        std::time::Duration::from_secs(CONFIG_TOKEN_CANCELLATION_SECONDS),
+    )
+    .await
 }
 
 pub async fn upsert_paas_org(
@@ -1637,6 +2445,92 @@ async fn begin_actor_idempotent_request(
         "body": body,
     }))?;
     begin_idempotent_request_with_recovery(state, key, method, path, &hash, recovery).await
+}
+
+async fn begin_actor_deterministic_config_token_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    auth: &AuthContext,
+    body: &serde_json::Value,
+    binding: &ConfigTokenResourceBinding,
+) -> Result<IdempotencyBegin, InternalRouteError> {
+    let key = idempotency_key(headers)?;
+    let hash = request_hash(&serde_json::json!({
+        "cap_user_id": auth.user_id,
+        "cap_org_id": auth.org_id,
+        "capability_resource_id": binding.resource_id,
+        "capability_instance_id": binding.instance_id,
+        "body": body,
+    }))?;
+    let legacy_hash = request_hash(&serde_json::json!({
+        "cap_user_id": auth.user_id,
+        "cap_org_id": auth.org_id,
+        "body": body,
+    }))?;
+    begin_idempotent_request_with_recovery_and_binding(
+        state,
+        key,
+        "POST",
+        path,
+        &hash,
+        IdempotencyRecovery::DeterministicExpiringCapability,
+        ConfigTokenIdempotencyOptions {
+            binding: Some(binding),
+            legacy_request_hash: Some(&legacy_hash),
+        },
+    )
+    .await
+}
+
+async fn app_config_token_resource_binding(
+    state: &AppState,
+    org_id: Uuid,
+    app_name: &str,
+) -> Result<ConfigTokenResourceBinding, InternalRouteError> {
+    let row: Option<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT id, namespace, name
+           FROM apps
+          WHERE org_id = $1
+            AND name = $2",
+    )
+    .bind(org_id)
+    .bind(app_name)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| db_error())?;
+    let (resource_id, namespace, name) =
+        row.ok_or_else(|| json_error(StatusCode::NOT_FOUND, "app not found"))?;
+    Ok(ConfigTokenResourceBinding {
+        resource_id,
+        instance_id: format!("{namespace}-{name}"),
+    })
+}
+
+async fn deployment_config_token_resource_binding(
+    state: &AppState,
+    org_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<ConfigTokenResourceBinding, InternalRouteError> {
+    let row: Option<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT a.id, a.namespace, a.name
+           FROM deployments d
+           JOIN apps a ON a.id = d.app_id
+          WHERE d.id = $1
+            AND d.org_id = $2
+            AND a.org_id = $2",
+    )
+    .bind(deployment_id)
+    .bind(org_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| db_error())?;
+    let (resource_id, namespace, name) =
+        row.ok_or_else(|| json_error(StatusCode::NOT_FOUND, "deployment not found"))?;
+    Ok(ConfigTokenResourceBinding {
+        resource_id,
+        instance_id: format!("{namespace}-{name}"),
+    })
 }
 
 async fn require_deploy_entitlement(
@@ -3067,33 +3961,31 @@ pub async fn issue_paas_config_token(
     validate_external_id(&paas_org_id, "paas_org_id")?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config-token");
-    let idempotency = match begin_actor_idempotent_request(
-        &state,
-        &headers,
-        "POST",
-        &path,
-        &auth,
-        &body,
-        IdempotencyRecovery::ExpiringCapability {
-            recovery_after_seconds: 6 * 60,
-        },
+    let binding = app_config_token_resource_binding(&state, auth.org_id, &app_name).await?;
+    let idempotency = match begin_actor_deterministic_config_token_request(
+        &state, &headers, &path, &auth, &body, &binding,
     )
     .await?
     {
         IdempotencyBegin::Execute(lease) => lease,
         IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
     };
-    let result: Result<IdempotencyResponse, InternalRouteError> = async {
-        let Json(response) = crate::routes::config::issue_config_token_route(
+    let issuance = idempotency
+        .config_token_receipt()
+        .ok_or_else(db_error)?
+        .issuance();
+    let result = async {
+        let Json(response) = crate::routes::config::issue_config_token_route_for_issuance(
             auth,
-            State(state.clone()),
-            Path(app_name),
+            state.clone(),
+            app_name,
+            issuance,
         )
         .await?;
         Ok((StatusCode::OK, to_value(response)?))
-    }
-    .await;
-    let (status, response) = complete_expiring_capability_result(idempotency, result).await?;
+    };
+    let (status, response) =
+        complete_deterministic_config_token_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -3308,33 +4200,32 @@ pub async fn issue_paas_generic_config_token(
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path =
         format!("/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/config-token");
-    let idempotency = match begin_actor_idempotent_request(
-        &state,
-        &headers,
-        "POST",
-        &path,
-        &auth,
-        &body,
-        IdempotencyRecovery::ExpiringCapability {
-            recovery_after_seconds: 6 * 60,
-        },
+    let binding =
+        deployment_config_token_resource_binding(&state, auth.org_id, deployment_id).await?;
+    let idempotency = match begin_actor_deterministic_config_token_request(
+        &state, &headers, &path, &auth, &body, &binding,
     )
     .await?
     {
         IdempotencyBegin::Execute(lease) => lease,
         IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
     };
-    let result: Result<IdempotencyResponse, InternalRouteError> = async {
-        let Json(response) = crate::routes::deployments::generic_config_token(
+    let issuance = idempotency
+        .config_token_receipt()
+        .ok_or_else(db_error)?
+        .issuance();
+    let result = async {
+        let Json(response) = crate::routes::deployments::generic_config_token_for_issuance(
             auth,
-            State(state.clone()),
-            Path(deployment_id),
+            state.clone(),
+            deployment_id,
+            issuance,
         )
         .await?;
         Ok((StatusCode::OK, to_value(response)?))
-    }
-    .await;
-    let (status, response) = complete_expiring_capability_result(idempotency, result).await?;
+    };
+    let (status, response) =
+        complete_deterministic_config_token_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -3551,6 +4442,128 @@ mod tests {
         }
     }
 
+    fn test_config_token_binding() -> ConfigTokenResourceBinding {
+        ConfigTokenResourceBinding {
+            resource_id: Uuid::new_v4(),
+            instance_id: format!("test-instance-{}", Uuid::new_v4().simple()),
+        }
+    }
+
+    async fn begin_test_config_token_receipt(
+        state: &AppState,
+        key: &str,
+        path: &str,
+        hash: &[u8],
+        binding: &ConfigTokenResourceBinding,
+    ) -> Result<IdempotencyBegin, InternalRouteError> {
+        begin_idempotent_request_with_recovery_and_binding(
+            state,
+            key,
+            "POST",
+            path,
+            hash,
+            IdempotencyRecovery::DeterministicExpiringCapability,
+            ConfigTokenIdempotencyOptions {
+                binding: Some(binding),
+                legacy_request_hash: None,
+            },
+        )
+        .await
+    }
+
+    async fn insert_config_token_test_actor(
+        pool: &sqlx::PgPool,
+        org_id: Uuid,
+        org_name: &str,
+        paas_org_id: &str,
+        user_id: Uuid,
+        paas_user_id: &str,
+    ) {
+        insert_mapped_org(pool, org_id, org_name, paas_org_id).await;
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Config Token Test')")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("insert config-token actor");
+        sqlx::query(
+            "INSERT INTO paas_external_mappings
+                 (resource_type, paas_external_id, cap_id)
+             VALUES ('user', $1, $2)",
+        )
+        .bind(paas_user_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("map config-token actor");
+        sqlx::query(
+            "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(user_id)
+        .bind(org_id)
+        .execute(pool)
+        .await
+        .expect("authorize config-token actor");
+    }
+
+    async fn insert_config_token_test_app(
+        pool: &sqlx::PgPool,
+        org_id: Uuid,
+        org_name: &str,
+        app_id: Uuid,
+        app_name: &str,
+        identity_suffix: &str,
+    ) {
+        let namespace = format!("cap-{org_name}-{app_name}-{identity_suffix}");
+        sqlx::query(
+            "INSERT INTO apps (
+                 id, org_id, name, namespace, instance_id, tenant_id,
+                 service_account, bootstrap_owner_pubkey_hash,
+                 tenant_instance_identity_hash, domain, tee_domain,
+                 signer_identity_subject, signer_identity_issuer,
+                 egress_allowlist, egress_mode
+             ) VALUES (
+                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                 $12, $13, '[]'::jsonb, 'restricted'
+             )",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .bind(app_name)
+        .bind(&namespace)
+        .bind(format!("{org_name}-{identity_suffix}"))
+        .bind(org_name)
+        .bind(format!("cap-{app_name}-{identity_suffix}-sa"))
+        .bind("11".repeat(32))
+        .bind("22".repeat(32))
+        .bind(format!(
+            "{app_name}-{identity_suffix}.{org_name}.enclava.test"
+        ))
+        .bind(format!(
+            "{app_name}-{identity_suffix}.{org_name}.tee.enclava.test"
+        ))
+        .bind("https://github.com/enclava/test/.github/workflows/build.yml@refs/heads/main")
+        .bind("https://token.actions.githubusercontent.com")
+        .execute(pool)
+        .await
+        .expect("insert config-token app");
+    }
+
+    fn config_token_actor_headers(key: &str, paas_user_id: &str) -> HeaderMap {
+        let mut headers = idempotency_headers(key);
+        headers.insert(
+            "x-enclava-paas-user-id",
+            HeaderValue::from_str(paas_user_id).expect("valid PaaS actor header"),
+        );
+        headers
+    }
+
+    fn internal_test_auth() -> InternalAuth {
+        InternalAuth {
+            client_san: "spiffe://paas.example.test/enclava-paas".to_string(),
+        }
+    }
+
     async fn expire_idempotency_lease(pool: &sqlx::PgPool, key: &str) {
         sqlx::query(
             "UPDATE cap_internal_idempotency
@@ -3715,7 +4728,12 @@ mod tests {
         let stale_row: IdempotencyRow = sqlx::query_as(
             "SELECT method, path, request_hash, response_status, response_body,
                     reservation_token, operation_id, lease_expires_at,
-                    recovery_kind, updated_at, clock_timestamp() AS database_now
+                    recovery_kind,
+                    NULL::smallint AS capability_receipt_version,
+                    NULL::uuid AS capability_resource_id,
+                    NULL::text AS capability_instance_id,
+                    completed_at, created_at, updated_at,
+                    clock_timestamp() AS database_now
                FROM cap_internal_idempotency
               WHERE idempotency_key = $1",
         )
@@ -3752,7 +4770,12 @@ mod tests {
         let recent_row: IdempotencyRow = sqlx::query_as(
             "SELECT method, path, request_hash, response_status, response_body,
                     reservation_token, operation_id, lease_expires_at,
-                    recovery_kind, updated_at, clock_timestamp() AS database_now
+                    recovery_kind,
+                    NULL::smallint AS capability_receipt_version,
+                    NULL::uuid AS capability_resource_id,
+                    NULL::text AS capability_instance_id,
+                    completed_at, created_at, updated_at,
+                    clock_timestamp() AS database_now
                FROM cap_internal_idempotency
               WHERE idempotency_key = $1",
         )
@@ -3794,6 +4817,287 @@ mod tests {
             .execute(&mut connection)
             .await
             .expect("drop isolated idempotency migration schema");
+    }
+
+    #[tokio::test]
+    async fn deterministic_config_token_migration_scrubs_legacy_and_enforces_confidentiality() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let mut connection = sqlx::PgConnection::connect(&database_url)
+            .await
+            .expect("connect isolated config-token migration database");
+        let schema = format!("config_token_migration_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE SCHEMA {schema}"))
+            .execute(&mut connection)
+            .await
+            .expect("create isolated config-token migration schema");
+        sqlx::query(&format!("SET search_path TO {schema}, public"))
+            .execute(&mut connection)
+            .await
+            .expect("select isolated config-token migration schema");
+
+        let migration_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut migrations: Vec<std::path::PathBuf> = std::fs::read_dir(&migration_dir)
+            .expect("read API migrations")
+            .map(|entry| entry.expect("read migration entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "sql"))
+            .collect();
+        migrations.sort();
+        let receipt_migration = migrations
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("0043_"))
+            })
+            .cloned()
+            .expect("find deterministic config-token receipt migration");
+        for migration in migrations.iter().filter(|path| *path < &receipt_migration) {
+            let sql = std::fs::read_to_string(migration).expect("read prerequisite migration");
+            sqlx::raw_sql(&sql)
+                .execute(&mut connection)
+                .await
+                .unwrap_or_else(|error| panic!("apply {}: {error}", migration.display()));
+        }
+
+        let app_key = format!("legacy-app-{}", Uuid::new_v4().simple());
+        let deployment_key = format!("legacy-deployment-{}", Uuid::new_v4().simple());
+        let signer_key = format!("legacy-signer-{}", Uuid::new_v4().simple());
+        let deployment_id = Uuid::new_v4();
+        let app_secret = format!("legacy-app-bearer-{}", Uuid::new_v4());
+        let deployment_secret = format!("legacy-deployment-bearer-{}", Uuid::new_v4());
+        let signer_secret = format!("legacy-signer-bearer-{}", Uuid::new_v4());
+        let app_path = "/internal/paas/orgs/legacy/apps/example/config-token";
+        let deployment_path =
+            format!("/internal/paas/orgs/legacy/deployments/{deployment_id}/config-token");
+        let signer_path = "/internal/paas/orgs/legacy/apps/example/signer/rotation-token";
+        for (key, path, status, body) in [
+            (
+                app_key.as_str(),
+                app_path,
+                200_i32,
+                serde_json::json!({
+                    "token": app_secret,
+                    "tee_url": "https://legacy-secret.example.test/config"
+                }),
+            ),
+            (
+                deployment_key.as_str(),
+                deployment_path.as_str(),
+                409_i32,
+                serde_json::json!({
+                    "error": "idempotency_recovery_required",
+                    "retryable": false,
+                    "disposition": "reconcile_then_retry_with_new_key",
+                    "discarded_marker": deployment_secret,
+                }),
+            ),
+            (
+                signer_key.as_str(),
+                signer_path,
+                200_i32,
+                serde_json::json!({"token": signer_secret}),
+            ),
+        ] {
+            let token = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO cap_internal_idempotency (
+                     idempotency_key, method, path, request_hash,
+                     response_status, response_body, completed_at,
+                     reservation_token, operation_id, lease_expires_at,
+                     recovery_kind, attempt_count, created_at, updated_at
+                 ) VALUES (
+                     $1, 'POST', $2, $3, $4, $5,
+                     clock_timestamp() - interval '1 minute',
+                     $6, $6,
+                     date_trunc('second', clock_timestamp()) - interval '1 minute',
+                     'expiring_capability', 1,
+                     date_trunc('second', clock_timestamp()) - interval '7 minutes',
+                     clock_timestamp() - interval '1 minute'
+                 )",
+            )
+            .bind(key)
+            .bind(path)
+            .bind(Sha256::digest(key.as_bytes()).to_vec())
+            .bind(status)
+            .bind(body)
+            .bind(token)
+            .execute(&mut connection)
+            .await
+            .expect("seed pre-0043 capability row");
+        }
+
+        let migration_sql =
+            std::fs::read_to_string(&receipt_migration).expect("read receipt migration");
+        sqlx::raw_sql(&migration_sql)
+            .execute(&mut connection)
+            .await
+            .expect("apply deterministic config-token receipt migration");
+
+        for (key, secret) in [
+            (app_key.as_str(), app_secret.as_str()),
+            (deployment_key.as_str(), deployment_secret.as_str()),
+        ] {
+            let (status, body, ledger_text): (i32, serde_json::Value, String) = sqlx::query_as(
+                "SELECT response_status, response_body,
+                        to_jsonb(cap_internal_idempotency)::text
+                   FROM cap_internal_idempotency
+                  WHERE idempotency_key = $1",
+            )
+            .bind(key)
+            .fetch_one(&mut connection)
+            .await
+            .expect("inspect migrated legacy config-token row");
+            assert_eq!(status, 409);
+            assert_eq!(body["error"], "idempotency_capability_expired");
+            assert_eq!(body["retryable"], false);
+            assert_eq!(body["disposition"], "new_key_after_expiry");
+            assert_eq!(body["proof_version"], "legacy_expiring_capability_lease_v1");
+            assert!(body.get("recovery_after").is_some());
+            assert!(body.get("capability_expires_at").is_none());
+            assert!(!ledger_text.contains(secret));
+            assert!(!ledger_text.contains("legacy-secret.example.test"));
+        }
+        let signer_control: (i32, serde_json::Value) = sqlx::query_as(
+            "SELECT response_status, response_body
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(&signer_key)
+        .fetch_one(&mut connection)
+        .await
+        .expect("inspect signer-rotation control row");
+        assert_eq!(signer_control.0, 200);
+        assert_eq!(signer_control.1["token"], signer_secret);
+
+        let constraint_path = format!(
+            "/internal/paas/orgs/constraint/deployments/{}/config-token",
+            Uuid::new_v4()
+        );
+        let missing_binding = sqlx::query(
+            "INSERT INTO cap_internal_idempotency (
+                 idempotency_key, method, path, request_hash,
+                 reservation_token, operation_id, lease_expires_at,
+                 recovery_kind, attempt_count
+             ) VALUES (
+                 $1, 'POST', $2, $3, $4, $4,
+                 clock_timestamp() + interval '1 minute',
+                 'deterministic_expiring_capability', 1
+             )",
+        )
+        .bind(format!("missing-binding-{}", Uuid::new_v4()))
+        .bind(&constraint_path)
+        .bind(vec![1_u8; 32])
+        .bind(Uuid::new_v4())
+        .execute(&mut connection)
+        .await
+        .expect_err("deterministic receipt requires its complete binding");
+        assert_eq!(
+            missing_binding
+                .as_database_error()
+                .and_then(|error| error.code().map(|code| code.into_owned()))
+                .as_deref(),
+            Some("23514")
+        );
+
+        let invalid_binding = sqlx::query(
+            "INSERT INTO cap_internal_idempotency (
+                 idempotency_key, method, path, request_hash,
+                 reservation_token, operation_id, lease_expires_at,
+                 recovery_kind, attempt_count,
+                 capability_receipt_version, capability_resource_id,
+                 capability_instance_id
+             ) VALUES (
+                 $1, 'POST', $2, $3, $4, $4,
+                 clock_timestamp() + interval '1 minute',
+                 'deterministic_expiring_capability', 1, 2, $5, ''
+             )",
+        )
+        .bind(format!("invalid-binding-{}", Uuid::new_v4()))
+        .bind(&constraint_path)
+        .bind(vec![2_u8; 32])
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .execute(&mut connection)
+        .await
+        .expect_err("deterministic receipt rejects unknown version and empty instance");
+        assert_eq!(
+            invalid_binding
+                .as_database_error()
+                .and_then(|error| error.code().map(|code| code.into_owned()))
+                .as_deref(),
+            Some("23514")
+        );
+
+        let malicious_body = sqlx::query(
+            "INSERT INTO cap_internal_idempotency (
+                 idempotency_key, method, path, request_hash,
+                 response_status, response_body, completed_at,
+                 reservation_token, operation_id, recovery_kind, attempt_count,
+                 capability_receipt_version, capability_resource_id,
+                 capability_instance_id, created_at
+             ) VALUES (
+                 $1, 'POST', $2, $3, 409,
+                 jsonb_build_object(
+                     'error', 'idempotency_capability_expired',
+                     'retryable', false,
+                     'disposition', 'new_key_after_expiry',
+                     'proof_version', 'deterministic_config_token_receipt_v1',
+                     'capability_issued_at', 'eyJhbGciOiJFZERTQSJ9.bearer',
+                     'capability_expires_at', 'eyJhbGciOiJFZERTQSJ9.bearer',
+                     'token', 'extra-bearer-sink'
+                 ),
+                 clock_timestamp(), $4, $4,
+                 'deterministic_expiring_capability', 1, 1, $5,
+                 'safe-instance', date_trunc('second', clock_timestamp())
+             )",
+        )
+        .bind(format!("malicious-body-{}", Uuid::new_v4()))
+        .bind(&constraint_path)
+        .bind(vec![3_u8; 32])
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .execute(&mut connection)
+        .await
+        .expect_err("terminal timestamp fields and extra keys cannot carry bearers");
+        assert_eq!(
+            malicious_body
+                .as_database_error()
+                .and_then(|error| error.code().map(|code| code.into_owned()))
+                .as_deref(),
+            Some("23514")
+        );
+
+        let stale_writer_success = sqlx::query(
+            "INSERT INTO cap_internal_idempotency (
+                 idempotency_key, method, path, request_hash,
+                 response_status, response_body, completed_at,
+                 reservation_token, operation_id, recovery_kind, attempt_count
+             ) VALUES (
+                 $1, 'POST', $2, $3, 200,
+                 '{\"token\":\"stale-old-writer-bearer\"}'::jsonb,
+                 clock_timestamp(), $4, $4, 'expiring_capability', 1
+             )",
+        )
+        .bind(format!("stale-writer-{}", Uuid::new_v4()))
+        .bind(&constraint_path)
+        .bind(vec![4_u8; 32])
+        .bind(Uuid::new_v4())
+        .execute(&mut connection)
+        .await
+        .expect_err("all config-token route families reject stored 2xx responses");
+        assert_eq!(
+            stale_writer_success
+                .as_database_error()
+                .and_then(|error| error.code().map(|code| code.into_owned()))
+                .as_deref(),
+            Some("23514")
+        );
+
+        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+            .execute(&mut connection)
+            .await
+            .expect("drop isolated config-token migration schema");
     }
 
     #[test]
@@ -4000,6 +5304,8 @@ mod tests {
             token: stale_token,
             operation_id,
             reclaimed: false,
+            regenerate: false,
+            config_token_receipt: None,
             heartbeat: None,
         };
         let stale_completion = finish_idempotent_request(
@@ -4155,7 +5461,7 @@ mod tests {
         let state = idempotency_test_state(pool.clone());
         let suffix = Uuid::new_v4().simple().to_string();
         let key = format!("capability-confidentiality-{suffix}");
-        let path = "/internal/paas/orgs/org/apps/app/config-token".to_string();
+        let path = "/internal/paas/orgs/org/apps/app/signer/rotation-token".to_string();
         let hash = Sha256::digest(format!("capability-{suffix}")).to_vec();
         let recovery = IdempotencyRecovery::ExpiringCapability {
             recovery_after_seconds: 360,
@@ -4216,6 +5522,802 @@ mod tests {
         for marker in [secret_token.as_str(), secret_url.as_str(), secret_ip] {
             assert!(!ledger_text.contains(marker));
         }
+    }
+
+    #[tokio::test]
+    async fn deterministic_config_token_receipt_regenerates_exact_bearer_without_plaintext() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let deployment_id = Uuid::new_v4();
+        let key = format!("deterministic-config-token-{suffix}");
+        let path =
+            format!("/internal/paas/orgs/org-{suffix}/deployments/{deployment_id}/config-token");
+        let hash = Sha256::digest(format!("deterministic-config-token-{suffix}")).to_vec();
+        let binding = test_config_token_binding();
+        let first = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &key, &path, &hash, &binding)
+                .await
+                .expect("reserve deterministic config-token receipt"),
+        );
+        let first_receipt = first.config_token_receipt().unwrap().clone();
+        let user_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let issued = crate::auth::jwt::issue_config_token_for_issuance(
+            &state.signing_key,
+            user_id,
+            org_id,
+            binding.resource_id,
+            &binding.instance_id,
+            vec!["config:write".to_string()],
+            &first_receipt.issuance(),
+        )
+        .expect("issue deterministic config bearer");
+        let secret_url = format!("https://tee-{suffix}.example.test/config");
+        let secret_ip = "192.0.2.77";
+        let first_response = serde_json::json!({
+            "token": issued.token,
+            "tee_url": secret_url,
+            "tee_resolve_ip": secret_ip,
+            "issued_at": issued.issued_at,
+            "expires_at": issued.expires_at,
+            "expires_in_seconds": 299,
+        });
+        let first_returned = complete_deterministic_config_token_result_with_timeout(
+            first,
+            async { Ok((StatusCode::OK, first_response.clone())) },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("complete non-secret issuance receipt");
+        assert_eq!(first_returned, (StatusCode::OK, first_response.clone()));
+
+        let ledger: (bool, Option<i32>, Option<serde_json::Value>, String) = sqlx::query_as(
+            "SELECT completed_at IS NOT NULL, response_status, response_body,
+                    to_jsonb(cap_internal_idempotency)::text
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect deterministic capability receipt");
+        assert!(ledger.0);
+        assert_eq!(ledger.1, None);
+        assert_eq!(ledger.2, None);
+        for marker in [
+            first_response["token"].as_str().unwrap(),
+            first_response["tee_url"].as_str().unwrap(),
+            secret_ip,
+        ] {
+            assert!(!ledger.3.contains(marker));
+        }
+
+        let duplicate = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &key, &path, &hash, &binding)
+                .await
+                .expect("regenerate completed config-token receipt"),
+        );
+        assert!(duplicate.regenerate);
+        let duplicate_receipt = duplicate.config_token_receipt().unwrap().clone();
+        assert_eq!(duplicate_receipt.issued_at, first_receipt.issued_at);
+        assert_eq!(duplicate_receipt.expires_at, first_receipt.expires_at);
+        let regenerated = crate::auth::jwt::issue_config_token_for_issuance(
+            &state.signing_key,
+            user_id,
+            org_id,
+            binding.resource_id,
+            &binding.instance_id,
+            vec!["config:write".to_string()],
+            &duplicate_receipt.issuance(),
+        )
+        .expect("regenerate exact config bearer");
+        assert_eq!(regenerated.token, first_response["token"]);
+        assert_eq!(regenerated.issued_at, issued.issued_at);
+        assert_eq!(regenerated.expires_at, issued.expires_at);
+        let duplicate_response = serde_json::json!({
+            "token": regenerated.token,
+            "tee_url": first_response["tee_url"],
+            "tee_resolve_ip": "192.0.2.88",
+            "issued_at": regenerated.issued_at,
+            "expires_at": regenerated.expires_at,
+            "expires_in_seconds": 298,
+        });
+        let duplicate_returned = complete_deterministic_config_token_result_with_timeout(
+            duplicate,
+            async { Ok((StatusCode::OK, duplicate_response.clone())) },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("return regenerated config bearer");
+        assert_eq!(duplicate_returned, (StatusCode::OK, duplicate_response));
+    }
+
+    #[tokio::test]
+    async fn deterministic_config_token_errors_cancel_and_live_then_stale_lease_reclaims() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let deployment_id = Uuid::new_v4();
+        let path =
+            format!("/internal/paas/orgs/org-{suffix}/deployments/{deployment_id}/config-token");
+        let hash = Sha256::digest(format!("config-token-errors-{suffix}")).to_vec();
+        let binding = test_config_token_binding();
+        let error_key = format!("config-token-error-{suffix}");
+        let first = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &error_key, &path, &hash, &binding)
+                .await
+                .expect("reserve failing config-token attempt"),
+        );
+        let failure = complete_deterministic_config_token_result_with_timeout(
+            first,
+            async {
+                Err(json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "bounded config token failure",
+                ))
+            },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("explicit handler failure is returned");
+        assert_eq!(failure.0, StatusCode::BAD_GATEWAY);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&error_key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "explicit failure must release the exact key");
+        let retry = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &error_key, &path, &hash, &binding)
+                .await
+                .expect("retry released key"),
+        );
+        cancel_idempotency_reservation(retry).await.unwrap();
+
+        let stale_key = format!("config-token-stale-{suffix}");
+        let live = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &stale_key, &path, &hash, &binding)
+                .await
+                .expect("reserve live config-token attempt"),
+        );
+        let in_progress =
+            begin_test_config_token_receipt(&state, &stale_key, &path, &hash, &binding)
+                .await
+                .err()
+                .expect("live receipt remains exclusive");
+        assert_eq!(in_progress.1.0["error"], "idempotency_request_in_progress");
+        let issued_at = live.config_token_receipt().unwrap().issued_at;
+        drop(live);
+        expire_idempotency_lease(&pool, &stale_key).await;
+        let reclaimed = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &stale_key, &path, &hash, &binding)
+                .await
+                .expect("stale config-token lease is reclaimable"),
+        );
+        assert!(reclaimed.reclaimed());
+        assert_eq!(
+            reclaimed.config_token_receipt().unwrap().issued_at,
+            issued_at
+        );
+        cancel_idempotency_reservation(reclaimed).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deterministic_config_token_policy_cannot_reclaim_generic_deploy_mutation() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("generic-deploy-not-config-{suffix}");
+        let path = format!("/internal/paas/orgs/org-{suffix}/deployments");
+        let hash = Sha256::digest(format!("generic-deploy-not-config-{suffix}")).to_vec();
+        let original = expect_idempotency_execution(
+            begin_idempotent_request_with_recovery(
+                &state,
+                &key,
+                "POST",
+                &path,
+                &hash,
+                IdempotencyRecovery::DeterministicResource {
+                    legacy_identity_bound: true,
+                },
+            )
+            .await
+            .expect("reserve generic deploy mutation"),
+        );
+        let original_token = original.token;
+        drop(original);
+        expire_idempotency_lease(&pool, &key).await;
+
+        let rejected = begin_idempotent_request_with_recovery(
+            &state,
+            &key,
+            "POST",
+            &path,
+            &hash,
+            IdempotencyRecovery::DeterministicExpiringCapability,
+        )
+        .await
+        .err()
+        .expect("config-token recovery is path scoped");
+        assert_eq!(rejected.0, StatusCode::INTERNAL_SERVER_ERROR);
+        let unchanged: (Uuid, i32) = sqlx::query_as(
+            "SELECT reservation_token, attempt_count
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged, (original_token, 1));
+    }
+
+    #[tokio::test]
+    async fn config_token_finalizers_enforce_safe_return_cutoff_and_terminal_authority() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let path = format!(
+            "/internal/paas/orgs/org-{suffix}/deployments/{}/config-token",
+            Uuid::new_v4()
+        );
+        let hash = Sha256::digest(format!("safe-return-{suffix}")).to_vec();
+        let binding = test_config_token_binding();
+
+        // Initial completion is also fenced. Even if its route future
+        // succeeds, CAP must not hand a bearer across the final 30 seconds.
+        let initial_key = format!("safe-return-initial-{suffix}");
+        let initial = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &initial_key, &path, &hash, &binding)
+                .await
+                .expect("reserve initial safe-return receipt"),
+        );
+        sqlx::query(
+            "UPDATE cap_internal_idempotency
+                SET created_at = date_trunc('second', clock_timestamp()) - interval '271 seconds'
+              WHERE idempotency_key = $1",
+        )
+        .bind(&initial_key)
+        .execute(&pool)
+        .await
+        .expect("move initial receipt inside safe-return cutoff");
+        let initial_error = complete_deterministic_config_token_result_with_timeout(
+            initial,
+            async {
+                Ok((
+                    StatusCode::OK,
+                    serde_json::json!({"token": "must-not-cross-cutoff"}),
+                ))
+            },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("initial completion inside cutoff is deferred");
+        assert_eq!(initial_error.0, StatusCode::CONFLICT);
+        assert_eq!(
+            initial_error.1.0["error"],
+            "idempotency_request_in_progress"
+        );
+        let initial_stored: (bool, Option<i32>, Option<serde_json::Value>) = sqlx::query_as(
+            "SELECT completed_at IS NOT NULL, response_status, response_body
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(&initial_key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect cutoff-fenced initial receipt");
+        assert_eq!(initial_stored, (true, None, None));
+
+        // A paused regeneration that crosses absolute expiry must observe the
+        // concurrently committed terminal proof, never return its bearer.
+        let replay_key = format!("safe-return-replay-{suffix}");
+        let first = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &replay_key, &path, &hash, &binding)
+                .await
+                .expect("reserve replay cutoff receipt"),
+        );
+        complete_deterministic_config_token_result_with_timeout(
+            first,
+            async { Ok((StatusCode::OK, serde_json::json!({"token": "first"}))) },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("complete replay cutoff receipt");
+        sqlx::query(
+            "UPDATE cap_internal_idempotency
+                SET created_at = date_trunc('second', clock_timestamp()) - interval '299 seconds'
+              WHERE idempotency_key = $1",
+        )
+        .bind(&replay_key)
+        .execute(&pool)
+        .await
+        .expect("move replay receipt next to expiry");
+        let replay = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &replay_key, &path, &hash, &binding)
+                .await
+                .expect("begin near-expiry regeneration"),
+        );
+        let expires_at = replay.config_token_receipt().unwrap().expires_at;
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let paused = tokio::spawn(async move {
+            complete_deterministic_config_token_result_with_timeout(
+                replay,
+                async move {
+                    let _ = release_rx.await;
+                    Ok((
+                        StatusCode::OK,
+                        serde_json::json!({"token": "must-not-cross-expiry"}),
+                    ))
+                },
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if database_clock(&pool).await.expect("read DB clock") >= expires_at {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("receipt reaches DB-authored expiry");
+        let terminal = expect_idempotency_replay(
+            begin_test_config_token_receipt(&state, &replay_key, &path, &hash, &binding)
+                .await
+                .expect("terminalize expired receipt"),
+        );
+        assert_eq!(terminal.0, StatusCode::CONFLICT);
+        assert_eq!(terminal.1["error"], "idempotency_capability_expired");
+        release_tx.send(()).expect("release paused regeneration");
+        let paused_result = paused
+            .await
+            .expect("join paused regeneration")
+            .expect("terminal proof is returned as an idempotency response");
+        assert_eq!(paused_result, terminal);
+        assert!(paused_result.1.get("token").is_none());
+    }
+
+    #[tokio::test]
+    async fn config_token_timeout_is_bounded_and_completion_cancellation_is_cas_safe() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("bounded-cancellation-{suffix}");
+        let path = format!(
+            "/internal/paas/orgs/org-{suffix}/deployments/{}/config-token",
+            Uuid::new_v4()
+        );
+        let hash = Sha256::digest(format!("bounded-cancellation-{suffix}")).to_vec();
+        let binding = test_config_token_binding();
+        let lease = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &key, &path, &hash, &binding)
+                .await
+                .expect("reserve bounded cancellation receipt"),
+        );
+        let stale_cancellation = lease.cancellation();
+        let mut blocker = pool.begin().await.expect("begin cancellation blocker");
+        sqlx::query(
+            "SELECT 1 FROM cap_internal_idempotency
+              WHERE idempotency_key = $1 FOR UPDATE",
+        )
+        .bind(&key)
+        .fetch_one(&mut *blocker)
+        .await
+        .expect("lock cancellation receipt");
+        let started = std::time::Instant::now();
+        let timed_out = complete_deterministic_config_token_result_with_timeout(
+            lease,
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                Ok((StatusCode::OK, serde_json::json!({"token": "late"})))
+            },
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .expect_err("blocked cancellation remains bounded");
+        assert_eq!(timed_out.0, StatusCode::GATEWAY_TIMEOUT);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        blocker
+            .rollback()
+            .await
+            .expect("release cancellation blocker");
+        let still_incomplete: Option<bool> = sqlx::query_scalar(
+            "SELECT completed_at IS NULL FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_optional(&pool)
+        .await
+        .expect("bounded cancellation leaves locked receipt for lease recovery");
+        if still_incomplete == Some(true) {
+            expire_idempotency_lease(&pool, &key).await;
+        }
+        let current = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &key, &path, &hash, &binding)
+                .await
+                .expect("retry absent receipt or reclaim after fixed receipt lease"),
+        );
+        assert_eq!(current.reclaimed(), still_incomplete == Some(true));
+        let mut current = current;
+        assert!(matches!(
+            finish_config_token_receipt(&mut current).await.unwrap(),
+            ConfigTokenReceiptCompletion::Completed
+        ));
+        cancel_incomplete_idempotency_reservation(&stale_cancellation)
+            .await
+            .expect("late old cancellation must not delete current completed receipt");
+        let completed: bool = sqlx::query_scalar(
+            "SELECT completed_at IS NOT NULL FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("completed receipt survives stale cancellation");
+        assert!(completed);
+    }
+
+    #[tokio::test]
+    async fn config_token_finish_error_releases_exact_reservation_for_retry() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("finish-error-{suffix}");
+        let path = format!(
+            "/internal/paas/orgs/org-{suffix}/deployments/{}/config-token",
+            Uuid::new_v4()
+        );
+        let hash = Sha256::digest(format!("finish-error-{suffix}")).to_vec();
+        let binding = test_config_token_binding();
+        let lease = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &key, &path, &hash, &binding)
+                .await
+                .expect("reserve finish-error receipt"),
+        );
+        let function_name = format!("fail_config_finish_{suffix}");
+        let trigger_name = format!("fail_config_finish_trigger_{suffix}");
+        let ddl = format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN RAISE EXCEPTION 'forced config receipt finish failure'; END $$;
+             CREATE TRIGGER {trigger_name}
+             BEFORE UPDATE OF completed_at ON cap_internal_idempotency
+             FOR EACH ROW WHEN (OLD.idempotency_key = '{key}')
+             EXECUTE FUNCTION {function_name}();"
+        );
+        sqlx::raw_sql(&ddl)
+            .execute(&pool)
+            .await
+            .expect("install scoped finish failure trigger");
+        let error = complete_deterministic_config_token_result_with_timeout(
+            lease,
+            async { Ok((StatusCode::OK, serde_json::json!({"token": "not-returned"}))) },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("finish failure is returned");
+        assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect failed receipt cleanup");
+        assert_eq!(remaining, 0);
+        let cleanup = format!(
+            "DROP TRIGGER {trigger_name} ON cap_internal_idempotency;
+             DROP FUNCTION {function_name}();"
+        );
+        sqlx::raw_sql(&cleanup)
+            .execute(&pool)
+            .await
+            .expect("remove scoped finish failure trigger");
+        let retry = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &key, &path, &hash, &binding)
+                .await
+                .expect("retry key released by finish failure"),
+        );
+        cancel_idempotency_reservation(retry).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn config_token_binding_mismatch_rejects_same_key() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("binding-mismatch-{suffix}");
+        let path = format!(
+            "/internal/paas/orgs/org-{suffix}/deployments/{}/config-token",
+            Uuid::new_v4()
+        );
+        let hash = Sha256::digest(format!("binding-mismatch-{suffix}")).to_vec();
+        let binding = test_config_token_binding();
+        let first = expect_idempotency_execution(
+            begin_test_config_token_receipt(&state, &key, &path, &hash, &binding)
+                .await
+                .expect("reserve bound receipt"),
+        );
+        complete_deterministic_config_token_result_with_timeout(
+            first,
+            async { Ok((StatusCode::OK, serde_json::json!({"token": "first"}))) },
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("complete bound receipt");
+        let mutated = ConfigTokenResourceBinding {
+            resource_id: binding.resource_id,
+            instance_id: format!("{}-mutated", binding.instance_id),
+        };
+        let reused = begin_test_config_token_receipt(&state, &key, &path, &hash, &mutated)
+            .await
+            .err()
+            .expect("mutated instance binding must not regenerate");
+        assert_eq!(reused.0, StatusCode::CONFLICT);
+        assert_eq!(reused.1.0["error"], "idempotency_key_reused");
+    }
+
+    #[tokio::test]
+    async fn app_config_token_route_replays_exactly_and_rejects_name_recreation() {
+        let pool = database_test_pool().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let app_a = Uuid::new_v4();
+        let app_b = Uuid::new_v4();
+        let org_name = format!("tokenorg{}", &suffix[..8]);
+        let paas_org_id = format!("paas-token-org-{suffix}");
+        let paas_user_id = format!("paas-token-user-{suffix}");
+        let app_name = format!("tokenapp{}", &suffix[..8]);
+        insert_config_token_test_actor(
+            &pool,
+            org_id,
+            &org_name,
+            &paas_org_id,
+            user_id,
+            &paas_user_id,
+        )
+        .await;
+        insert_config_token_test_app(&pool, org_id, &org_name, app_a, &app_name, "a").await;
+        let state = idempotency_test_state(pool.clone());
+        let key = format!("app-config-route-{suffix}");
+        let headers = config_token_actor_headers(&key, &paas_user_id);
+        let call = |state: AppState, headers: HeaderMap| {
+            issue_paas_config_token(
+                internal_test_auth(),
+                State(state),
+                Path((paas_org_id.clone(), app_name.clone())),
+                headers,
+                Json(serde_json::json!({})),
+            )
+        };
+        let (first_status, Json(first)) = call(state.clone(), headers.clone())
+            .await
+            .expect("issue first app config token");
+        assert_eq!(first_status, StatusCode::OK);
+        let (duplicate_status, Json(duplicate)) = call(state.clone(), headers.clone())
+            .await
+            .expect("regenerate exact app config token");
+        assert_eq!(duplicate_status, StatusCode::OK);
+        assert_eq!(duplicate["token"], first["token"]);
+        assert_eq!(duplicate["issued_at"], first["issued_at"]);
+        assert_eq!(duplicate["expires_at"], first["expires_at"]);
+        let issued_at = chrono::DateTime::parse_from_rfc3339(
+            first["issued_at"].as_str().expect("issued_at string"),
+        )
+        .unwrap();
+        let expires_at = chrono::DateTime::parse_from_rfc3339(
+            first["expires_at"].as_str().expect("expires_at string"),
+        )
+        .unwrap();
+        assert_eq!((expires_at - issued_at).num_seconds(), 300);
+
+        sqlx::query("DELETE FROM apps WHERE id = $1")
+            .bind(app_a)
+            .execute(&pool)
+            .await
+            .expect("delete original app identity");
+        insert_config_token_test_app(&pool, org_id, &org_name, app_b, &app_name, "b").await;
+        let recreated = call(state, headers)
+            .await
+            .expect_err("same app name with a new UUID cannot reuse receipt");
+        assert_eq!(recreated.0, StatusCode::CONFLICT);
+        assert_eq!(recreated.1.0["error"], "idempotency_key_reused");
+        let ledger: (Uuid, String, Option<i32>, Option<serde_json::Value>, String) =
+            sqlx::query_as(
+                "SELECT capability_resource_id, capability_instance_id,
+                        response_status, response_body,
+                        to_jsonb(cap_internal_idempotency)::text
+                   FROM cap_internal_idempotency
+                  WHERE idempotency_key = $1",
+            )
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect app config-token receipt");
+        assert_eq!(ledger.0, app_a);
+        assert!(ledger.1.ends_with(&format!("-{app_name}")));
+        assert_eq!(ledger.2, None);
+        assert_eq!(ledger.3, None);
+        assert!(!ledger.4.contains(first["token"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn generic_deployment_config_token_route_replays_and_rejects_app_rebind() {
+        let pool = database_test_pool().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let app_a = Uuid::new_v4();
+        let app_b = Uuid::new_v4();
+        let deployment_id = Uuid::new_v4();
+        let org_name = format!("genericorg{}", &suffix[..8]);
+        let paas_org_id = format!("paas-generic-org-{suffix}");
+        let paas_user_id = format!("paas-generic-user-{suffix}");
+        let app_name_a = format!("genericapp{}", &suffix[..8]);
+        let app_name_b = format!("reboundapp{}", &suffix[..8]);
+        insert_config_token_test_actor(
+            &pool,
+            org_id,
+            &org_name,
+            &paas_org_id,
+            user_id,
+            &paas_user_id,
+        )
+        .await;
+        insert_config_token_test_app(&pool, org_id, &org_name, app_a, &app_name_a, "a").await;
+        sqlx::query(
+            "INSERT INTO deployments
+                 (id, org_id, app_id, trigger, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'api', 'healthy', '{}'::jsonb)",
+        )
+        .bind(deployment_id)
+        .bind(org_id)
+        .bind(app_a)
+        .execute(&pool)
+        .await
+        .expect("insert generic config-token deployment");
+        let state = idempotency_test_state(pool.clone());
+        let key = format!("generic-config-route-{suffix}");
+        let headers = config_token_actor_headers(&key, &paas_user_id);
+        let call = |state: AppState, headers: HeaderMap| {
+            issue_paas_generic_config_token(
+                internal_test_auth(),
+                State(state),
+                Path((paas_org_id.clone(), deployment_id)),
+                headers,
+                Json(serde_json::json!({})),
+            )
+        };
+        let (first_status, Json(first)) = call(state.clone(), headers.clone())
+            .await
+            .expect("issue first generic config token");
+        let (duplicate_status, Json(duplicate)) = call(state.clone(), headers.clone())
+            .await
+            .expect("regenerate exact generic config token");
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(duplicate_status, StatusCode::OK);
+        assert_eq!(first["deployment_id"], deployment_id.to_string());
+        assert_eq!(duplicate["token"], first["token"]);
+        assert_eq!(duplicate["issued_at"], first["issued_at"]);
+        assert_eq!(duplicate["expires_at"], first["expires_at"]);
+
+        insert_config_token_test_app(&pool, org_id, &org_name, app_b, &app_name_b, "b").await;
+        sqlx::query("DELETE FROM deployments WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("remove deployment before identity rebind");
+        sqlx::query(
+            "INSERT INTO deployments
+                 (id, org_id, app_id, trigger, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'api', 'healthy', '{}'::jsonb)",
+        )
+        .bind(deployment_id)
+        .bind(org_id)
+        .bind(app_b)
+        .execute(&pool)
+        .await
+        .expect("recreate deployment ID against a different app identity");
+        let rebound = call(state, headers)
+            .await
+            .expect_err("deployment app rebind cannot reuse receipt");
+        assert_eq!(rebound.0, StatusCode::CONFLICT);
+        assert_eq!(rebound.1.0["error"], "idempotency_key_reused");
+        let ledger_text: String = sqlx::query_scalar(
+            "SELECT to_jsonb(cap_internal_idempotency)::text
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect generic config-token receipt");
+        assert!(!ledger_text.contains(first["token"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn legacy_config_token_receipt_uses_conservative_lease_proof() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("legacy-config-receipt-{suffix}");
+        let path = format!(
+            "/internal/paas/orgs/org-{suffix}/deployments/{}/config-token",
+            Uuid::new_v4()
+        );
+        let auth = AuthContext {
+            user_id: Uuid::new_v4(),
+            org_id: Uuid::new_v4(),
+            org_name: format!("org-{suffix}"),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: ManagementOrigin::PaasInternal,
+        };
+        let body = serde_json::json!({});
+        let legacy_hash = request_hash(&serde_json::json!({
+            "cap_user_id": auth.user_id,
+            "cap_org_id": auth.org_id,
+            "body": body,
+        }))
+        .unwrap();
+        let operation_id = idempotency_operation_id(&key, "POST", &path, &legacy_hash);
+        let token = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO cap_internal_idempotency (
+                 idempotency_key, method, path, request_hash,
+                 reservation_token, operation_id, lease_expires_at,
+                 recovery_kind, attempt_count, created_at, updated_at
+             ) VALUES (
+                 $1, 'POST', $2, $3, $4, $5,
+                 date_trunc('second', clock_timestamp()) - interval '1 minute',
+                 'expiring_capability', 1,
+                 date_trunc('second', clock_timestamp()) - interval '7 minutes',
+                 clock_timestamp() - interval '1 minute'
+             )",
+        )
+        .bind(&key)
+        .bind(&path)
+        .bind(&legacy_hash)
+        .bind(token)
+        .bind(operation_id)
+        .execute(&pool)
+        .await
+        .expect("seed legacy config-token lease");
+        let binding = test_config_token_binding();
+        let headers = idempotency_headers(&key);
+        let (status, proof) = expect_idempotency_replay(
+            begin_actor_deterministic_config_token_request(
+                &state, &headers, &path, &auth, &body, &binding,
+            )
+            .await
+            .expect("terminalize legacy config-token lease"),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(proof["error"], "idempotency_capability_expired");
+        assert_eq!(proof["retryable"], false);
+        assert_eq!(proof["disposition"], "new_key_after_expiry");
+        assert_eq!(
+            proof["proof_version"],
+            "legacy_expiring_capability_lease_v1"
+        );
+        assert!(proof.get("recovery_after").is_some());
+        assert!(proof.get("capability_expires_at").is_none());
+        assert!(proof.get("token").is_none());
     }
 
     #[tokio::test]

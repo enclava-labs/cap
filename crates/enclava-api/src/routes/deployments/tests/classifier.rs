@@ -85,6 +85,29 @@ fn generic_deployment_response_reports_current_app_status_separately() {
 }
 
 #[test]
+fn generic_config_token_response_exposes_whole_second_signed_lifetime_contract() {
+    let issued_at = chrono::DateTime::parse_from_rfc3339("2026-07-18T12:30:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let response = GenericConfigTokenResponse {
+        deployment_id: Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap(),
+        token: "compact.jwt.signature".to_string(),
+        tee_url: "https://customer-app.test.tee.enclava.dev/.well-known/confidential/config"
+            .to_string(),
+        tee_resolve_ip: Some("192.0.2.77".parse().unwrap()),
+        expires_in_seconds: 299,
+        issued_at,
+        expires_at: issued_at + chrono::Duration::seconds(300),
+    };
+    let json = serde_json::to_value(response).unwrap();
+
+    assert_eq!(json["issued_at"], "2026-07-18T12:30:00Z");
+    assert_eq!(json["expires_at"], "2026-07-18T12:35:00Z");
+    assert_eq!(json["expires_in_seconds"], 299);
+    assert_eq!(json["tee_resolve_ip"], "192.0.2.77");
+}
+
+#[test]
 fn incomplete_setup_marker_blocks_idempotent_success() {
     let app = idempotency_app();
     let mut deployment = idempotency_deployment(&app);
