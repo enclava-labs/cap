@@ -753,14 +753,20 @@ pub(crate) fn build_confidential_app_from_rows(
     })
 }
 
-async fn latest_deployment_id_for_app(pool: &PgPool, app_id: Uuid) -> Result<Uuid, sqlx::Error> {
+pub(crate) async fn latest_deployment_id_for_app(
+    pool: &PgPool,
+    app_id: Uuid,
+) -> Result<Uuid, sqlx::Error> {
     let deployment_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT deployment.id
            FROM deployments AS deployment
-           JOIN deployment_apply_jobs AS apply_job
+           LEFT JOIN deployment_apply_jobs AS apply_job
              ON apply_job.deployment_id = deployment.id
           WHERE deployment.app_id = $1
-          ORDER BY apply_job.generation DESC
+          ORDER BY (apply_job.generation IS NOT NULL) DESC,
+                   apply_job.generation DESC NULLS LAST,
+                   deployment.created_at DESC,
+                   deployment.id DESC
           LIMIT 1",
     )
     .bind(app_id)

@@ -2208,10 +2208,13 @@ pub async fn list_paas_status(
                      d.image_digest,
                      d.error_message
                 FROM deployments d
-                JOIN deployment_apply_jobs apply_job
+                LEFT JOIN deployment_apply_jobs apply_job
                   ON apply_job.deployment_id = d.id
                WHERE d.app_id = a.id
-               ORDER BY apply_job.generation DESC
+               ORDER BY (apply_job.generation IS NOT NULL) DESC,
+                        apply_job.generation DESC NULLS LAST,
+                        d.created_at DESC,
+                        d.id DESC
                LIMIT 1
           ) latest ON TRUE
          WHERE a.org_id = $1
@@ -2315,10 +2318,13 @@ pub async fn list_paas_cluster_status(
                      d.image_digest,
                      d.error_message
                 FROM deployments d
-                JOIN deployment_apply_jobs apply_job
+                LEFT JOIN deployment_apply_jobs apply_job
                   ON apply_job.deployment_id = d.id
                WHERE d.app_id = a.id
-               ORDER BY apply_job.generation DESC
+               ORDER BY (apply_job.generation IS NOT NULL) DESC,
+                        apply_job.generation DESC NULLS LAST,
+                        d.created_at DESC,
+                        d.id DESC
                LIMIT 1
           ) latest ON TRUE
          ORDER BY a.created_at DESC, a.id
