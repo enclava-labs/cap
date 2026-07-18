@@ -130,6 +130,29 @@ fn stored_error_plaintext_is_redacted_from_public_and_generic_responses() {
     }
 }
 
+#[test]
+fn control_plane_supersession_code_is_preserved_across_deployment_responses() {
+    let app = idempotency_app();
+
+    let mut generic_deployment = idempotency_deployment(&app);
+    generic_deployment.error_message = Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR.to_string());
+    let generic = GenericDeploymentResponse::from_deployment(generic_deployment, &app);
+
+    let mut public_deployment = idempotency_deployment(&app);
+    public_deployment.error_message = Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR.to_string());
+    let public = DeploymentResponse::from_deployment(public_deployment, &app);
+
+    for response in [
+        serde_json::to_value(generic).expect("serialize generic response"),
+        serde_json::to_value(public).expect("serialize public response"),
+    ] {
+        assert_eq!(
+            response["error_message"],
+            crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR
+        );
+    }
+}
+
 fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
     GenericDeploymentRequest {
             external_id: Some("deploy-123".to_string()),

@@ -479,7 +479,10 @@ const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 /// Project a stored deployment error across an API boundary without exposing
 /// arbitrary backend, runtime, or workload-controlled plaintext.
 pub(crate) fn public_deployment_error_message(error_message: Option<&str>) -> Option<String> {
-    error_message.map(|_| PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string())
+    error_message.map(|error_message| match error_message {
+        crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR => error_message.to_string(),
+        _ => PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string(),
+    })
 }
 
 impl DeploymentResponse {

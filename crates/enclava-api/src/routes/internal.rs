@@ -5500,6 +5500,19 @@ mod confidentiality_tests {
     }
 
     #[test]
+    fn internal_deployment_projection_preserves_safe_supersession_code() {
+        let projected = project_internal_deployment_error(
+            None,
+            Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR),
+        );
+
+        assert_eq!(
+            projected.as_deref(),
+            Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR)
+        );
+    }
+
+    #[test]
     fn bounded_live_runtime_error_takes_precedence_over_recorded_error() {
         let live = "container_runtime_failure status=waiting code=crash_loop_back_off";
         let projected = project_internal_deployment_error(
