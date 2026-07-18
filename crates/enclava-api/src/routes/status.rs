@@ -13,7 +13,7 @@ use kube::Api;
 use kube::api::ListParams;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 use uuid::Uuid;
 
 use crate::auth::{middleware::AuthContext, scopes};
@@ -21,6 +21,7 @@ use crate::models::App;
 use crate::state::AppState;
 
 const DEPLOYMENT_ID_LABEL: &str = "enclava.dev/deployment-id";
+const KUBERNETES_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const TEE_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -84,6 +85,7 @@ pub struct AppStatusResponse {
 struct PodEvidence {
     found: bool,
     phase: Option<String>,
+    ready: bool,
     deployment_id: Option<Uuid>,
     deployment_id_malformed: bool,
     runtime_failure: Option<RuntimeFailureEvidence>,
@@ -246,6 +248,27 @@ async fn probe_kubernetes(
     app_name: &str,
     expected_deployment_id: Option<Uuid>,
 ) -> KubernetesEvidence {
+    bounded_kubernetes_probe(
+        probe_kubernetes_unbounded(namespace, app_name, expected_deployment_id),
+        KUBERNETES_STATUS_PROBE_TIMEOUT,
+    )
+    .await
+}
+
+async fn bounded_kubernetes_probe<F>(probe: F, deadline: Duration) -> KubernetesEvidence
+where
+    F: Future<Output = KubernetesEvidence>,
+{
+    tokio::time::timeout(deadline, probe)
+        .await
+        .unwrap_or(KubernetesEvidence::Unavailable)
+}
+
+async fn probe_kubernetes_unbounded(
+    namespace: &str,
+    app_name: &str,
+    expected_deployment_id: Option<Uuid>,
+) -> KubernetesEvidence {
     let Ok(client) = kube::Client::try_default().await else {
         return KubernetesEvidence::Unavailable;
     };
@@ -261,12 +284,17 @@ async fn probe_kubernetes(
         .iter()
         .filter(|pod| pod.metadata.deletion_timestamp.is_none())
         .collect::<Vec<_>>();
+    let legacy_failure_eligible = active.iter().all(|pod| {
+        let (deployment_id, deployment_id_malformed) = pod_deployment_identity(pod);
+        deployment_id.is_none() && !deployment_id_malformed
+    });
     let runtime_failure = select_runtime_failure(
         active
             .iter()
             .filter_map(|pod| runtime_failure_evidence(pod))
             .collect(),
         expected_deployment_id,
+        legacy_failure_eligible,
     );
     if active.len() != 1 {
         return KubernetesEvidence::Available(PodEvidence {
@@ -283,14 +311,34 @@ async fn probe_kubernetes(
     }
     let pod = active[0];
     let phase = pod.status.as_ref().and_then(|status| status.phase.clone());
+    let ready = pod_is_ready(pod);
     let (deployment_id, deployment_id_malformed) = pod_deployment_identity(pod);
     KubernetesEvidence::Available(PodEvidence {
         found: true,
         phase,
+        ready,
         deployment_id,
         deployment_id_malformed,
         runtime_failure,
     })
+}
+
+fn pod_is_ready(pod: &Pod) -> bool {
+    let Some(status) = pod.status.as_ref() else {
+        return false;
+    };
+    let pod_ready = status.conditions.as_ref().is_some_and(|conditions| {
+        conditions
+            .iter()
+            .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+    });
+    let containers_ready = status
+        .container_statuses
+        .as_ref()
+        .is_some_and(|containers| {
+            !containers.is_empty() && containers.iter().all(|container| container.ready)
+        });
+    pod_ready && containers_ready
 }
 
 fn pod_deployment_identity(pod: &Pod) -> (Option<Uuid>, bool) {
@@ -321,15 +369,26 @@ fn runtime_failure_evidence(pod: &Pod) -> Option<RuntimeFailureEvidence> {
 fn select_runtime_failure(
     failures: Vec<RuntimeFailureEvidence>,
     expected_deployment_id: Option<Uuid>,
+    legacy_failure_eligible: bool,
 ) -> Option<RuntimeFailureEvidence> {
-    if let Some(expected_deployment_id) = expected_deployment_id
-        && let Some(index) = failures
-            .iter()
-            .position(|failure| failure.deployment_id == Some(expected_deployment_id))
-    {
-        return failures.into_iter().nth(index);
-    }
-    failures.into_iter().next()
+    let Some(expected_deployment_id) = expected_deployment_id else {
+        return failures.into_iter().next();
+    };
+    let selected = failures
+        .iter()
+        .position(|failure| failure.deployment_id == Some(expected_deployment_id))
+        .or_else(|| {
+            failures
+                .iter()
+                .position(|failure| failure.deployment_id.is_some())
+        })
+        .or_else(|| {
+            failures
+                .iter()
+                .position(|failure| failure.deployment_id_malformed)
+        })
+        .or_else(|| legacy_failure_eligible.then_some(0));
+    selected.and_then(|index| failures.into_iter().nth(index))
 }
 
 async fn probe_tee(state: &AppState, tee_status_url: &str) -> TeeEvidence {
@@ -369,7 +428,7 @@ fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
             .get("unlock_state")
             .or_else(|| body.get("state"))
             .and_then(Value::as_str)
-            .map(str::to_string),
+            .map(str::to_ascii_lowercase),
     }
 }
 
@@ -512,6 +571,24 @@ fn classify_live_observation_for_deployment(
         return incomplete_observation(
             LiveObservationState::Partial,
             LiveObservationReason::EvidenceMismatch,
+            observed_at,
+            pod.deployment_id,
+            pod.phase,
+            fields.pod_status,
+            fields.tee_status,
+            fields.storage_status,
+            pod.runtime_failure,
+        );
+    }
+    if fields
+        .live_state
+        .as_deref()
+        .is_some_and(|state| state.eq_ignore_ascii_case("unlocked"))
+        && !pod.ready
+    {
+        return incomplete_observation(
+            LiveObservationState::Partial,
+            LiveObservationReason::PodEvidenceIncomplete,
             observed_at,
             pod.deployment_id,
             pod.phase,
@@ -681,7 +758,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use k8s_openapi::api::core::v1::{
         ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus, Pod,
-        PodStatus,
+        PodCondition, PodStatus,
     };
     use kube::api::ObjectMeta;
     use serde_json::json;
@@ -689,9 +766,9 @@ mod tests {
 
     use super::{
         KubernetesEvidence, LiveObservationReason, LiveObservationState, PodEvidence,
-        RuntimeFailureEvidence, TeeEvidence, classify_live_observation,
+        RuntimeFailureEvidence, TeeEvidence, bounded_kubernetes_probe, classify_live_observation,
         classify_live_observation_for_deployment, confidential_status_url, effective_app_status,
-        runtime_failure_evidence, select_runtime_failure, tee_evidence_fields,
+        pod_is_ready, runtime_failure_evidence, select_runtime_failure, tee_evidence_fields,
     };
 
     const WAITING_SECRET: &str = "waiting-message-secret=tenant-api-key";
@@ -707,6 +784,7 @@ mod tests {
         KubernetesEvidence::Available(PodEvidence {
             found: true,
             phase: Some("Running".to_string()),
+            ready: true,
             deployment_id: Some(deployment_id),
             deployment_id_malformed: false,
             runtime_failure: None,
@@ -864,6 +942,7 @@ mod tests {
         let pod = KubernetesEvidence::Available(PodEvidence {
             found: true,
             phase: Some("Running".to_string()),
+            ready: true,
             deployment_id: None,
             deployment_id_malformed: false,
             runtime_failure: None,
@@ -907,6 +986,37 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_locked_state_is_canonical_and_cannot_look_running() {
+        let deployment_id = Uuid::new_v4();
+        let tee = TeeEvidence::Available(tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "tee_status": "ready",
+            "storage_status": "locked",
+            "unlock_state": "LoCkEd"
+        })));
+        let observed = classify_live_observation_for_deployment(
+            complete_pod(deployment_id),
+            tee,
+            observed_at(),
+            Some(deployment_id),
+        );
+
+        assert_eq!(observed.observation.state, LiveObservationState::Fresh);
+        assert_eq!(observed.effective_status("running"), "locked");
+    }
+
+    #[tokio::test]
+    async fn kubernetes_probe_timeout_is_unavailable() {
+        let result = bounded_kubernetes_probe(
+            std::future::pending::<KubernetesEvidence>(),
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(result, KubernetesEvidence::Unavailable);
+    }
+
+    #[test]
     fn tee_error_state_cannot_produce_fresh_readiness() {
         let tee = TeeEvidence::Available(tee_evidence_fields(&json!({
             "pod_status": "Running",
@@ -929,6 +1039,7 @@ mod tests {
         let pod = KubernetesEvidence::Available(PodEvidence {
             found: true,
             phase: Some("Pending".to_string()),
+            ready: false,
             deployment_id: Some(Uuid::new_v4()),
             deployment_id_malformed: false,
             runtime_failure: None,
@@ -944,10 +1055,94 @@ mod tests {
     }
 
     #[test]
+    fn unlocked_running_but_unready_pod_cannot_be_fresh() {
+        let deployment_id = Uuid::new_v4();
+        let pod = KubernetesEvidence::Available(PodEvidence {
+            found: true,
+            phase: Some("Running".to_string()),
+            ready: false,
+            deployment_id: Some(deployment_id),
+            deployment_id_malformed: false,
+            runtime_failure: None,
+        });
+        let observed = classify_live_observation_for_deployment(
+            pod,
+            complete_tee(),
+            observed_at(),
+            Some(deployment_id),
+        );
+
+        assert_eq!(observed.observation.state, LiveObservationState::Partial);
+        assert_eq!(
+            observed.observation.reason,
+            Some(LiveObservationReason::PodEvidenceIncomplete)
+        );
+        assert_eq!(observed.effective_status("running"), "partial");
+    }
+
+    #[test]
+    fn locked_running_pod_can_be_fresh_before_readiness() {
+        let deployment_id = Uuid::new_v4();
+        let pod = KubernetesEvidence::Available(PodEvidence {
+            found: true,
+            phase: Some("Running".to_string()),
+            ready: false,
+            deployment_id: Some(deployment_id),
+            deployment_id_malformed: false,
+            runtime_failure: None,
+        });
+        let tee = TeeEvidence::Available(tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "tee_status": "ready",
+            "storage_status": "locked",
+            "unlock_state": "locked"
+        })));
+        let observed =
+            classify_live_observation_for_deployment(pod, tee, observed_at(), Some(deployment_id));
+
+        assert_eq!(observed.observation.state, LiveObservationState::Fresh);
+        assert_eq!(observed.effective_status("running"), "locked");
+    }
+
+    #[test]
+    fn pod_readiness_requires_ready_condition_and_all_containers() {
+        let ready_status = || PodStatus {
+            phase: Some("Running".to_string()),
+            conditions: Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "True".to_string(),
+                ..Default::default()
+            }]),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "app".to_string(),
+                image: "example.test/app@sha256:abc".to_string(),
+                image_id: "example.test/app@sha256:abc".to_string(),
+                ready: true,
+                restart_count: 0,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let mut pod = Pod {
+            status: Some(ready_status()),
+            ..Default::default()
+        };
+
+        assert!(pod_is_ready(&pod));
+        pod.status
+            .as_mut()
+            .and_then(|status| status.container_statuses.as_mut())
+            .expect("container status")[0]
+            .ready = false;
+        assert!(!pod_is_ready(&pod));
+    }
+
+    #[test]
     fn malformed_deployment_identity_cannot_use_legacy_compatibility() {
         let pod = KubernetesEvidence::Available(PodEvidence {
             found: true,
             phase: Some("Running".to_string()),
+            ready: true,
             deployment_id: None,
             deployment_id_malformed: true,
             runtime_failure: None,
@@ -983,6 +1178,7 @@ mod tests {
             KubernetesEvidence::Available(PodEvidence {
                 found: true,
                 phase: None,
+                ready: false,
                 deployment_id: Some(deployment_id),
                 deployment_id_malformed: false,
                 runtime_failure: Some(runtime_failure(Some(deployment_id), false)),
@@ -1002,6 +1198,7 @@ mod tests {
             KubernetesEvidence::Available(PodEvidence {
                 found: true,
                 phase: Some("Running".to_string()),
+                ready: true,
                 deployment_id: Some(deployment_id),
                 deployment_id_malformed: false,
                 runtime_failure: Some(runtime_failure(Some(deployment_id), false)),
@@ -1058,10 +1255,37 @@ mod tests {
                 runtime_failure(Some(expected_deployment_id), false),
             ],
             Some(expected_deployment_id),
+            false,
         )
         .expect("runtime failure");
 
         assert_eq!(selected.deployment_id, Some(expected_deployment_id));
+    }
+
+    #[test]
+    fn labelled_rollout_does_not_attribute_unlabelled_failure_to_latest() {
+        let expected_deployment_id = Uuid::new_v4();
+        let selected = select_runtime_failure(
+            vec![runtime_failure(None, false)],
+            Some(expected_deployment_id),
+            false,
+        );
+
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn pure_legacy_fleet_keeps_unlabelled_failure_compatibility() {
+        let expected_deployment_id = Uuid::new_v4();
+        let selected = select_runtime_failure(
+            vec![runtime_failure(None, false)],
+            Some(expected_deployment_id),
+            true,
+        )
+        .expect("legacy runtime failure");
+
+        assert_eq!(selected.deployment_id, None);
+        assert!(!selected.deployment_id_malformed);
     }
 
     #[test]
@@ -1071,6 +1295,7 @@ mod tests {
             KubernetesEvidence::Available(PodEvidence {
                 found: true,
                 phase: Some("Running".to_string()),
+                ready: false,
                 deployment_id: None,
                 deployment_id_malformed: false,
                 runtime_failure: Some(runtime_failure(None, false)),
@@ -1091,6 +1316,7 @@ mod tests {
             KubernetesEvidence::Available(PodEvidence {
                 found: true,
                 phase: Some("Running".to_string()),
+                ready: false,
                 deployment_id: None,
                 deployment_id_malformed: true,
                 runtime_failure: Some(runtime_failure(None, true)),
