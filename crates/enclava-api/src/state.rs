@@ -265,8 +265,8 @@ mod tests {
         assert!(config.is_usable());
     }
 
-    #[test]
-    fn side_effect_admission_reserves_pool_headroom_before_lane_entry() {
+    #[tokio::test]
+    async fn side_effect_admission_reserves_pool_headroom_before_lane_entry() {
         let pool = |max_connections| {
             PgPoolOptions::new()
                 .max_connections(max_connections)

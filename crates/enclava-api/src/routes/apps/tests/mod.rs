@@ -304,7 +304,7 @@ async fn unreachable_running_workload_teardown_is_best_effort_and_diagnostics_ar
 
     let diagnostics = captured_log_text(&logs);
     assert!(diagnostics.contains(&app.id.to_string()));
-    assert!(diagnostics.contains("app_delete_teardown_unreachable"));
+    assert!(diagnostics.contains("app_delete_teardown_unavailable"));
     for secret in [SECRET_APP_NAME, SECRET_NAMESPACE, SECRET_DOMAIN] {
         assert!(
             !diagnostics.contains(secret),
