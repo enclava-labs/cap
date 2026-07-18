@@ -86,11 +86,17 @@ struct CloudflareRecord {
     id: String,
 }
 
-struct RecordPayload<'a> {
-    record_type: &'a str,
-    hostname: &'a str,
-    content: &'a str,
-    ttl: u32,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DnsRecordHandle {
+    zone_id: String,
+    record_id: String,
+    hostname: String,
+}
+
+impl DnsRecordHandle {
+    pub fn hostname(&self) -> &str {
+        &self.hostname
+    }
 }
 
 fn cloudflare_error(errors: &[CloudflareApiError]) -> String {
@@ -150,36 +156,6 @@ async fn find_record(
     hostname: &str,
 ) -> Result<Option<CloudflareRecord>, DnsError> {
     let record_type = config.record_type();
-    let response = client
-        .get(config.api_url(&format!(
-            "/zones/{zone_id}/dns_records?type={record_type}&name={hostname}&per_page=100"
-        )))
-        .bearer_auth(&config.cloudflare_api_token)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(DnsError::Cloudflare(format!(
-            "record lookup for '{hostname}' returned HTTP {}",
-            response.status()
-        )));
-    }
-
-    let body: CloudflareList<CloudflareRecord> = response.json().await?;
-    if !body.success {
-        return Err(DnsError::Cloudflare(cloudflare_error(&body.errors)));
-    }
-
-    Ok(body.result.into_iter().next())
-}
-
-async fn find_record_by_type(
-    client: &reqwest::Client,
-    config: &DnsConfig,
-    zone_id: &str,
-    record_type: &str,
-    hostname: &str,
-) -> Result<Option<CloudflareRecord>, DnsError> {
     let response = client
         .get(config.api_url(&format!(
             "/zones/{zone_id}/dns_records?type={record_type}&name={hostname}&per_page=100"
@@ -303,89 +279,41 @@ async fn update_record(
         .ok_or_else(|| DnsError::Cloudflare("update record response had no result".to_string()))
 }
 
-async fn update_record_by_type(
-    client: &reqwest::Client,
-    config: &DnsConfig,
-    zone_id: &str,
-    record_id: &str,
-    payload: RecordPayload<'_>,
-) -> Result<CloudflareRecord, DnsError> {
-    let response = client
-        .put(config.api_url(&format!("/zones/{zone_id}/dns_records/{record_id}")))
-        .bearer_auth(&config.cloudflare_api_token)
-        .json(&serde_json::json!({
-            "type": payload.record_type,
-            "name": payload.hostname,
-            "content": payload.content,
-            "ttl": payload.ttl,
-            "proxied": false,
-        }))
-        .send()
-        .await?;
-
-    let status = response.status();
-    let body: CloudflareSingle<CloudflareRecord> = response.json().await?;
-    if !status.is_success() || !body.success {
-        return Err(DnsError::Cloudflare(format!(
-            "update record for '{}' failed: {}",
-            payload.hostname,
-            cloudflare_error(&body.errors)
-        )));
-    }
-
-    body.result
-        .ok_or_else(|| DnsError::Cloudflare("update record response had no result".to_string()))
-}
-
-pub async fn ensure_txt_record(
+/// Create one immutable ACME TXT record and return its provider identity.
+/// Multiple concurrent challenges for the same hostname intentionally create
+/// distinct records; cleanup must never update or delete a sibling challenge.
+pub async fn create_txt_record(
     client: &reqwest::Client,
     config: &DnsConfig,
     hostname: &str,
     content: &str,
-) -> Result<(), DnsError> {
+) -> Result<DnsRecordHandle, DnsError> {
     if !config.manages_hostname(hostname) {
         return Err(DnsError::OutsideManagedZone(hostname.to_string()));
     }
     let zone_id = resolve_zone_id(client, config).await?;
-    let existing = find_record_by_type(client, config, &zone_id, "TXT", hostname).await?;
-    match existing {
-        Some(record) => {
-            update_record_by_type(
-                client,
-                config,
-                &zone_id,
-                &record.id,
-                RecordPayload {
-                    record_type: "TXT",
-                    hostname,
-                    content,
-                    ttl: 60,
-                },
-            )
-            .await?;
-        }
-        None => {
-            create_record_by_type(client, config, &zone_id, "TXT", hostname, content, 60).await?;
-        }
-    }
-    Ok(())
+    let record =
+        create_record_by_type(client, config, &zone_id, "TXT", hostname, content, 60).await?;
+    Ok(DnsRecordHandle {
+        zone_id,
+        record_id: record.id,
+        hostname: hostname.to_string(),
+    })
 }
 
 pub async fn delete_txt_record(
     client: &reqwest::Client,
     config: &DnsConfig,
-    hostname: &str,
-    _content: &str,
+    record: &DnsRecordHandle,
 ) -> Result<(), DnsError> {
-    if !config.manages_hostname(hostname) {
-        return Err(DnsError::OutsideManagedZone(hostname.to_string()));
+    if !config.manages_hostname(&record.hostname) {
+        return Err(DnsError::OutsideManagedZone(record.hostname.clone()));
     }
-    let zone_id = resolve_zone_id(client, config).await?;
-    let Some(record) = find_record_by_type(client, config, &zone_id, "TXT", hostname).await? else {
-        return Ok(());
-    };
     let response = client
-        .delete(config.api_url(&format!("/zones/{zone_id}/dns_records/{}", record.id)))
+        .delete(config.api_url(&format!(
+            "/zones/{}/dns_records/{}",
+            record.zone_id, record.record_id
+        )))
         .bearer_auth(&config.cloudflare_api_token)
         .send()
         .await?;
@@ -396,7 +324,8 @@ pub async fn delete_txt_record(
     let body: CloudflareSingle<serde_json::Value> = response.json().await?;
     if !status.is_success() || !body.success {
         return Err(DnsError::Cloudflare(format!(
-            "delete record for '{hostname}' failed: {}",
+            "delete record for '{}' failed: {}",
+            record.hostname,
             cloudflare_error(&body.errors)
         )));
     }
@@ -719,7 +648,68 @@ pub async fn delete_all_dns_records_for_app(
 
 #[cfg(test)]
 mod tests {
-    use super::DnsConfig;
+    use std::{collections::HashMap, sync::Arc};
+
+    use axum::{
+        Json, Router,
+        extract::{Path, State},
+        routing::{delete, post},
+    };
+    use serde_json::{Value, json};
+    use tokio::sync::Mutex;
+
+    use super::{DnsConfig, create_txt_record, delete_txt_record};
+
+    #[derive(Default)]
+    struct FakeCloudflare {
+        next_id: u64,
+        records: HashMap<String, Value>,
+    }
+
+    async fn create_fake_record(
+        State(state): State<Arc<Mutex<FakeCloudflare>>>,
+        Path(_zone_id): Path<String>,
+        Json(payload): Json<Value>,
+    ) -> Json<Value> {
+        let mut state = state.lock().await;
+        state.next_id += 1;
+        let id = format!("record-{}", state.next_id);
+        state.records.insert(id.clone(), payload);
+        Json(json!({"success": true, "result": {"id": id}, "errors": []}))
+    }
+
+    async fn delete_fake_record(
+        State(state): State<Arc<Mutex<FakeCloudflare>>>,
+        Path((_zone_id, record_id)): Path<(String, String)>,
+    ) -> Json<Value> {
+        state.lock().await.records.remove(&record_id);
+        Json(json!({"success": true, "result": {"id": record_id}, "errors": []}))
+    }
+
+    async fn fake_cloudflare_server() -> (
+        String,
+        Arc<Mutex<FakeCloudflare>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let state = Arc::new(Mutex::new(FakeCloudflare::default()));
+        let app = Router::new()
+            .route("/zones/{zone_id}/dns_records", post(create_fake_record))
+            .route(
+                "/zones/{zone_id}/dns_records/{record_id}",
+                delete(delete_fake_record),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Cloudflare");
+        let address = listener.local_addr().expect("fake Cloudflare address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake Cloudflare");
+        });
+        (format!("http://{address}"), state, server)
+    }
 
     fn config() -> DnsConfig {
         DnsConfig {
@@ -750,5 +740,37 @@ mod tests {
         assert!(config.manages_hostname("app.enclava.dev"));
         assert!(config.manages_hostname("enclava.dev"));
         assert!(!config.manages_hostname("app.example.com"));
+    }
+
+    #[tokio::test]
+    async fn acme_txt_cleanup_deletes_only_its_immutable_provider_record() {
+        let (base_url, state, server) = fake_cloudflare_server().await;
+        let mut config = config();
+        config.cloudflare_api_base_url = base_url;
+        config.cloudflare_zone_id = Some("zone-1".to_string());
+        let client = reqwest::Client::new();
+        let hostname = "_acme-challenge.app.enclava.dev";
+
+        let old = create_txt_record(&client, &config, hostname, "old-challenge")
+            .await
+            .expect("create old challenge");
+        let current = create_txt_record(&client, &config, hostname, "current-challenge")
+            .await
+            .expect("create current challenge");
+        assert_ne!(old, current);
+
+        delete_txt_record(&client, &config, &old)
+            .await
+            .expect("delete exact old challenge");
+        let records = &state.lock().await.records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records
+                .get(&current.record_id)
+                .and_then(|record| record.get("content"))
+                .and_then(Value::as_str),
+            Some("current-challenge")
+        );
+        server.abort();
     }
 }

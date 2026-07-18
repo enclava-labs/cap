@@ -649,6 +649,11 @@ async fn process_claimed_setup_job(
             return Ok(());
         }
     };
+    if state.dns.is_some() {
+        mutation
+            .arm_resource_scope_until_reconciled("dns_hostname")
+            .await?;
+    }
     let mut side_effect_lane =
         match acquire_job_side_effect_lane(state, &job, "setting_up", Some(&payload.app)).await {
             Ok(lane) => lane,
@@ -1022,6 +1027,15 @@ async fn process_cleanup_job(state: &AppState, job: ClaimedJob) {
             return;
         }
     };
+    if state.dns.is_some()
+        && mutation
+            .arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .is_err()
+    {
+        let _ = release_cleanup_for_retry(&state.db, job.deployment_id, job.lock_token).await;
+        return;
+    }
     let mut side_effect_lane =
         match acquire_job_side_effect_lane(state, &job, "cleaning_up", None).await {
             Ok(lane) => lane,
@@ -1080,12 +1094,40 @@ async fn process_cleanup_job(state: &AppState, job: ClaimedJob) {
         .await;
     match outcome {
         Ok(Ok(true)) => {
-            if mutation.finish_in_tx(&mut side_effect_lane).await.is_err() {
+            if sqlx::query("SAVEPOINT cleanup_app_delete")
+                .execute(&mut *side_effect_lane)
+                .await
+                .is_err()
+                || mutation.finish_in_tx(&mut side_effect_lane).await.is_err()
+            {
                 return;
             }
-            if sqlx::query("DELETE FROM apps WHERE id = $1 AND org_id = $2")
+            let app_delete = sqlx::query("DELETE FROM apps WHERE id = $1 AND org_id = $2")
                 .bind(job.app_id)
                 .bind(job.org_id)
+                .execute(&mut *side_effect_lane)
+                .await;
+            if app_delete.is_err() {
+                if sqlx::query("ROLLBACK TO SAVEPOINT cleanup_app_delete")
+                    .execute(&mut *side_effect_lane)
+                    .await
+                    .is_err()
+                    || sqlx::query("RELEASE SAVEPOINT cleanup_app_delete")
+                        .execute(&mut *side_effect_lane)
+                        .await
+                        .is_err()
+                    || mutation.finish_in_tx(&mut side_effect_lane).await.is_err()
+                    || release_cleanup_for_retry_in_tx(
+                        &mut side_effect_lane,
+                        job.deployment_id,
+                        job.lock_token,
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            } else if sqlx::query("RELEASE SAVEPOINT cleanup_app_delete")
                 .execute(&mut *side_effect_lane)
                 .await
                 .is_err()

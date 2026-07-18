@@ -939,6 +939,13 @@ pub async fn create_app(
         ));
     }
 
+    if state.dns.is_some() {
+        dns_mutation
+            .arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .map_err(|_| internal_server_error())?;
+    }
+
     let dns_setup = dns_mutation
         .guard_provider(crate::dns::ensure_dns_pair(
             &state.db,
@@ -1276,6 +1283,12 @@ pub async fn delete_app(
         .await
         .map_err(|_| internal_server_error())??;
 
+    if state.dns.is_some() {
+        delete_mutation
+            .arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .map_err(|_| internal_server_error())?;
+    }
     let tracked_dns_cleanup = delete_mutation
         .guard_provider(crate::dns::delete_all_dns_records_for_app(
             &state.db,
@@ -1321,7 +1334,6 @@ pub async fn delete_app(
             .map_err(|_| internal_server_error())?;
         return Err(app_delete_dns_failure(deleting_app.id, error));
     }
-
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
         .bind(auth.org_id)
         .fetch_one(&state.db)

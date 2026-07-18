@@ -254,6 +254,30 @@ impl AppMutationLease {
         Ok(())
     }
 
+    /// Arm every claimed resource in `resource_scope` before sending an
+    /// unconditional provider mutation. Cloudflare does not expose a
+    /// generation precondition, so a caller crash or lost response must leave
+    /// the resource poisoned indefinitely rather than allowing elapsed time to
+    /// authorize reuse.
+    ///
+    /// This intentionally does not require the renewable deadline to still be
+    /// current. The token/generation CAS is the authority: after a heartbeat
+    /// loss the old owner may still poison its exact generation, but it cannot
+    /// touch a generation that has already been reclaimed.
+    pub async fn arm_resource_scope_until_reconciled(
+        &self,
+        resource_scope: &str,
+    ) -> Result<(), MutationLeaseError> {
+        let mut tx = self.pool.begin().await?;
+        let retained =
+            poison_resource_scope(&mut tx, self.token, &self.resources, resource_scope).await?;
+        if retained == 0 {
+            return Err(MutationLeaseError::Lost);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Fail closed after an external provider response is fundamentally
     /// unreconcilable (Cloudflare has no conditional mutation primitive).
     /// These rows require explicit/durable provider reconciliation before
@@ -264,40 +288,8 @@ impl AppMutationLease {
         resource_scope: &str,
     ) -> Result<(), MutationLeaseError> {
         self.stop_heartbeat();
-        assert_current_rows(
-            tx,
-            self.app_id,
-            self.token,
-            self.generation,
-            &self.resources,
-        )
-        .await?;
-        let mut retained = 0usize;
-        for resource in self
-            .resources
-            .iter()
-            .filter(|resource| resource.fence.scope == resource_scope)
-        {
-            let result = sqlx::query(
-                "UPDATE external_resource_mutation_leases
-                    SET reclaim_after = 'infinity'::timestamptz,
-                        updated_at = clock_timestamp()
-                  WHERE resource_scope = $1
-                    AND resource_key = $2
-                    AND owner_token = $3
-                    AND generation = $4",
-            )
-            .bind(&resource.fence.scope)
-            .bind(&resource.fence.key)
-            .bind(self.token)
-            .bind(resource.generation)
-            .execute(&mut **tx)
-            .await?;
-            if result.rows_affected() != 1 {
-                return Err(MutationLeaseError::Lost);
-            }
-            retained += 1;
-        }
+        let retained =
+            poison_resource_scope(tx, self.token, &self.resources, resource_scope).await?;
         if retained == 0 {
             return Err(MutationLeaseError::Lost);
         }
@@ -681,8 +673,12 @@ async fn renew(
             "UPDATE external_resource_mutation_leases
                 SET locked_until = clock_timestamp()
                         + ($5::bigint * interval '1 second'),
-                    reclaim_after = clock_timestamp()
-                        + (($5 + $6)::bigint * interval '1 second'),
+                    reclaim_after = CASE
+                        WHEN reclaim_after = 'infinity'::timestamptz
+                            THEN reclaim_after
+                        ELSE clock_timestamp()
+                            + (($5 + $6)::bigint * interval '1 second')
+                    END,
                     updated_at = clock_timestamp()
               WHERE resource_scope = $1
                 AND resource_key = $2
@@ -717,8 +713,12 @@ async fn renew_resources(
             "UPDATE external_resource_mutation_leases
                 SET locked_until = clock_timestamp()
                         + ($5::bigint * interval '1 second'),
-                    reclaim_after = clock_timestamp()
-                        + (($5 + $6)::bigint * interval '1 second'),
+                    reclaim_after = CASE
+                        WHEN reclaim_after = 'infinity'::timestamptz
+                            THEN reclaim_after
+                        ELSE clock_timestamp()
+                            + (($5 + $6)::bigint * interval '1 second')
+                    END,
                     updated_at = clock_timestamp()
               WHERE resource_scope = $1
                 AND resource_key = $2
@@ -803,6 +803,40 @@ async fn clear_resource_rows(
     Ok(())
 }
 
+async fn poison_resource_scope(
+    tx: &mut Transaction<'_, Postgres>,
+    token: Uuid,
+    resources: &[ClaimedResource],
+    resource_scope: &str,
+) -> Result<usize, MutationLeaseError> {
+    let mut retained = 0usize;
+    for resource in resources
+        .iter()
+        .filter(|resource| resource.fence.scope == resource_scope)
+    {
+        let result = sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET reclaim_after = 'infinity'::timestamptz,
+                    updated_at = clock_timestamp()
+              WHERE resource_scope = $1
+                AND resource_key = $2
+                AND owner_token = $3
+                AND generation = $4",
+        )
+        .bind(&resource.fence.scope)
+        .bind(&resource.fence.key)
+        .bind(token)
+        .bind(resource.generation)
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(MutationLeaseError::Lost);
+        }
+        retained += 1;
+    }
+    Ok(retained)
+}
+
 async fn assert_current_rows(
     tx: &mut Transaction<'_, Postgres>,
     app_id: Uuid,
@@ -854,11 +888,73 @@ async fn assert_current_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Json, Router, extract::State, routing::get};
+    use serde_json::{Value, json};
     use sqlx::postgres::PgPoolOptions;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
     };
+    use tokio::sync::{Mutex, Notify};
+
+    #[derive(Default)]
+    struct DelayedCloudflare {
+        records: Mutex<HashMap<String, Value>>,
+        accepted: Notify,
+        release: Notify,
+        applied: Notify,
+    }
+
+    async fn list_delayed_cloudflare_records() -> Json<Value> {
+        Json(json!({"success": true, "result": [], "errors": []}))
+    }
+
+    async fn create_delayed_cloudflare_record(
+        State(state): State<Arc<DelayedCloudflare>>,
+        Json(payload): Json<Value>,
+    ) -> Json<Value> {
+        state.accepted.notify_one();
+        let detached = state.clone();
+        tokio::spawn(async move {
+            detached.release.notified().await;
+            detached
+                .records
+                .lock()
+                .await
+                .insert("accepted-record".to_string(), payload);
+            detached.applied.notify_one();
+        });
+
+        // Model an accepted provider request whose response never reaches the
+        // caller. The detached mutation above survives cancellation of this
+        // response future.
+        std::future::pending::<()>().await;
+        unreachable!("pending provider response completed")
+    }
+
+    async fn delayed_cloudflare_server()
+    -> (String, Arc<DelayedCloudflare>, tokio::task::JoinHandle<()>) {
+        let state = Arc::new(DelayedCloudflare::default());
+        let app = Router::new()
+            .route(
+                "/zones/{zone_id}/dns_records",
+                get(list_delayed_cloudflare_records).post(create_delayed_cloudflare_record),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed Cloudflare");
+        let address = listener.local_addr().expect("delayed Cloudflare address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve delayed Cloudflare");
+        });
+        (format!("http://{address}"), state, server)
+    }
 
     async fn database_test_pool(max_connections: u32) -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -1090,6 +1186,237 @@ mod tests {
             "canceled old provider future cannot issue a late write after replacement"
         );
         replacement.finish().await.expect("finish replacement");
+    }
+
+    #[tokio::test]
+    async fn prearmed_dns_rejects_reuse_after_detached_provider_outlives_caller() {
+        let pool = database_test_pool(4).await;
+        let hostname = format!("detached-{}.example.test", Uuid::new_v4().simple());
+        let (org_id, app_id) = insert_app(&pool, &hostname).await;
+        let state = state_with_pool(pool.clone());
+        let mut owner = claim(
+            &state,
+            app_id,
+            "detached_dns_create",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("claim detached DNS generation");
+        let owner_token = owner.token;
+        let app_generation = owner.generation;
+        let resource_generation = owner.resources[0].generation;
+        owner
+            .arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .expect("poison hostname before provider request");
+
+        let (base_url, provider, server) = delayed_cloudflare_server().await;
+        let dns_config = crate::dns::DnsConfig {
+            cloudflare_api_token: "fake-token".to_string(),
+            cloudflare_api_base_url: base_url,
+            cloudflare_zone_id: Some("zone-1".to_string()),
+            cloudflare_zone_name: "example.test".to_string(),
+            target: "192.0.2.44".to_string(),
+            required: true,
+        };
+        let request_pool = pool.clone();
+        let request_hostname = hostname.clone();
+        let request = tokio::spawn(async move {
+            crate::dns::ensure_dns_record(
+                &request_pool,
+                &reqwest::Client::new(),
+                Some(&dns_config),
+                app_id,
+                &request_hostname,
+                false,
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), provider.accepted.notified())
+            .await
+            .expect("provider accepts old create");
+
+        // Simulate process death after provider acceptance: the request future
+        // is gone, but the fake provider's detached accepted work remains.
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("request is canceled")
+                .is_cancelled()
+        );
+        owner.stop_heartbeat();
+        drop(owner);
+
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("advance app reclaim boundary");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds'
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("expire resource lease while preserving poison");
+        let poisoned: bool = sqlx::query_scalar(
+            "SELECT reclaim_after = 'infinity'::timestamptz
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(&hostname)
+        .fetch_one(&pool)
+        .await
+        .expect("load pre-send DNS poison");
+        assert!(poisoned);
+
+        let inverse = claim(
+            &state,
+            app_id,
+            "newer_dns_delete",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect_err("poison rejects newer inverse mutation after timed reclaim");
+        assert!(matches!(inverse, MutationLeaseError::Busy));
+
+        provider.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), provider.applied.notified())
+            .await
+            .expect("detached accepted provider write completes");
+        let records = provider.records.lock().await;
+        let record = records
+            .get("accepted-record")
+            .expect("detached create reached provider");
+        assert_eq!(
+            record.get("name").and_then(Value::as_str),
+            Some(hostname.as_str())
+        );
+        assert_eq!(
+            record.get("content").and_then(Value::as_str),
+            Some("192.0.2.44")
+        );
+        drop(records);
+
+        let still_rejected = claim(
+            &state,
+            app_id,
+            "retry_dns_delete",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect_err("provider completion alone cannot authorize hostname reuse");
+        assert!(matches!(still_rejected, MutationLeaseError::Busy));
+        let persisted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM dns_records WHERE app_id = $1 AND hostname = $2)",
+        )
+        .bind(app_id)
+        .bind(&hostname)
+        .fetch_one(&pool)
+        .await
+        .expect("check canceled caller publication");
+        assert!(!persisted, "canceled caller must not publish a provider ID");
+
+        // Model the documented operator path only after the detached provider
+        // is known quiescent: converge the exact provider record, then clear
+        // the poison with the captured token/generation CAS. A stale incident
+        // record cannot unpoison a later generation.
+        provider.records.lock().await.remove("accepted-record");
+        let cleared_resource = sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL,
+                    updated_at = clock_timestamp()
+              WHERE resource_scope = 'dns_hostname'
+                AND resource_key = $1
+                AND generation = $2
+                AND owner_token = $3
+                AND reclaim_after = 'infinity'::timestamptz
+                AND locked_until <= clock_timestamp()",
+        )
+        .bind(&hostname)
+        .bind(resource_generation)
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("operator clears reconciled DNS poison");
+        assert_eq!(cleared_resource.rows_affected(), 1);
+        let cleared_app = sqlx::query(
+            "UPDATE app_mutation_leases AS app
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL,
+                    updated_at = clock_timestamp()
+              WHERE app.app_id = $1
+                AND app.generation = $2
+                AND app.owner_token = $3
+                AND app.locked_until <= clock_timestamp()
+                AND NOT EXISTS (
+                    SELECT 1 FROM external_resource_mutation_leases AS resource
+                     WHERE resource.owner_token = app.owner_token
+                )",
+        )
+        .bind(app_id)
+        .bind(app_generation)
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("operator clears reconciled app owner");
+        assert_eq!(cleared_app.rows_affected(), 1);
+        let reconciled = claim(
+            &state,
+            app_id,
+            "post_operator_reconciliation",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("exact reconciliation permits a new generation");
+        assert_eq!(reconciled.generation(), app_generation + 1);
+        reconciled
+            .finish()
+            .await
+            .expect("finish post-reconciliation generation");
+        assert!(provider.records.lock().await.is_empty());
+        server.abort();
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'dns_hostname' AND resource_key = $1",
+        )
+        .bind(&hostname)
+        .execute(&pool)
+        .await
+        .expect("remove detached DNS poison fixture");
+        sqlx::query("DELETE FROM apps WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("remove detached DNS app fixture");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("remove detached DNS organization fixture");
     }
 
     #[tokio::test]
