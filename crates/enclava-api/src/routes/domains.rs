@@ -64,6 +64,7 @@ async fn ensure_custom_domain_haproxy_route(
     org_id: Uuid,
     app: &App,
     domain: &str,
+    edge_config_generation: i64,
 ) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
         .bind(org_id)
@@ -96,6 +97,7 @@ async fn ensure_custom_domain_haproxy_route(
     crate::edge::ensure_haproxy_routes(
         &state.db,
         &crate::edge::EdgeRouteConfig::from_env(),
+        Some(edge_config_generation),
         &[route],
     )
     .await
@@ -256,7 +258,7 @@ pub async fn verify_challenge(
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
 
-    let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+    let mut app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
         .fetch_optional(&state.db)
@@ -349,12 +351,113 @@ pub async fn verify_challenge(
         verified_at
     };
 
-    crate::dns::record_custom_domain(&state.db, app.id, &domain)
+    // Domain mutation follows the same queue order as deployment apply:
+    // apply-specific capacity, shared side-effect admission, then DB lanes.
+    let apply_permit = state
+        .deployment_apply_permits
+        .clone()
+        .acquire_owned()
         .await
+        .map_err(|_| internal_error())?;
+    let previous_custom = app.custom_domain.clone();
+    let expected_namespace = app.namespace.clone();
+    let mut resources = vec![
+        crate::mutation_leases::ResourceFence::dns(&domain),
+        crate::mutation_leases::ResourceFence::edge(&domain),
+        crate::mutation_leases::ResourceFence::edge_config(),
+        crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &app.namespace),
+    ];
+    if let Some(old) = previous_custom.as_deref() {
+        resources.push(crate::mutation_leases::ResourceFence::dns(old));
+        resources.push(crate::mutation_leases::ResourceFence::edge(old));
+    }
+    let mut mutation = crate::mutation_leases::claim(
+        &state,
+        app.id,
+        "custom_domain_set",
+        challenge_id,
+        false,
+        resources,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::mutation_leases::MutationLeaseError::Busy => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "app mutation already in progress"})),
+        ),
+        _ => internal_error(),
+    })?;
+    let edge_config_generation = mutation
+        .resource_generation(&crate::mutation_leases::ResourceFence::edge_config())
+        .ok_or_else(internal_error)?;
+    let kubernetes_mutation_generation = mutation
+        .resource_generation(&crate::mutation_leases::ResourceFence::new(
+            "kubernetes_namespace",
+            &app.namespace,
+        ))
+        .ok_or_else(internal_error)?;
+    let mut app_lane = state.db.begin().await.map_err(|_| internal_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut app_lane, auth.org_id)
+        .await
+        .map_err(|_| internal_error())?;
+    let current_role =
+        crate::auth::scopes::active_membership_role_in_tx(&mut app_lane, auth.org_id, auth.user_id)
+            .await?;
+    crate::auth::scopes::require_admin_role(current_role)?;
+    crate::deploy::lock_app_deployment_lane(&mut app_lane, app.id)
+        .await
+        .map_err(|_| internal_error())?;
+    let current_app: Option<App> = sqlx::query_as(
+        "SELECT * FROM apps
+          WHERE id = $1
+            AND org_id = $2
+            AND status <> 'deleting'::app_status_enum
+            AND custom_domain IS NOT DISTINCT FROM $3
+            AND namespace = $4",
+    )
+    .bind(app.id)
+    .bind(auth.org_id)
+    .bind(previous_custom.as_deref())
+    .bind(&expected_namespace)
+    .fetch_optional(&mut *app_lane)
+    .await
+    .map_err(|_| internal_error())?;
+    let Some(current_app) = current_app else {
+        mutation
+            .finish_in_tx(&mut app_lane)
+            .await
+            .map_err(|_| internal_error())?;
+        app_lane.commit().await.map_err(|_| internal_error())?;
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "app authority changed"})),
+        ));
+    };
+    app = current_app;
+
+    mutation
+        .guard_provider(crate::dns::record_custom_domain(&state.db, app.id, &domain))
+        .await
+        .map_err(|_| internal_error())?
         .map_err(dns_error_response)?;
 
     if app.custom_domain.as_deref() == Some(domain.as_str()) {
-        ensure_custom_domain_haproxy_route(&state, auth.org_id, &app, &domain).await?;
+        mutation
+            .guard_provider(ensure_custom_domain_haproxy_route(
+                &state,
+                auth.org_id,
+                &app,
+                &domain,
+                edge_config_generation,
+            ))
+            .await
+            .map_err(|_| internal_error())??;
+        mutation
+            .finish_in_tx(&mut app_lane)
+            .await
+            .map_err(|_| internal_error())?;
+        app_lane.commit().await.map_err(|_| internal_error())?;
+        drop(apply_permit);
         return Ok(Json(VerifyResponse {
             domain,
             verified_at,
@@ -373,25 +476,18 @@ pub async fn verify_challenge(
         custom_domain: Some(domain.clone()),
         ..app.clone()
     };
-    let apply_permit = state
-        .deployment_apply_permits
-        .clone()
-        .acquire_owned()
+    let ingress_ready = match mutation
+        .guard_provider(crate::deploy::reapply_tenant_ingress(
+            &state.db,
+            &next_app,
+            state.attestation.as_ref(),
+            &api_signing_pubkey,
+            &state.api_url,
+            &mutation,
+            kubernetes_mutation_generation,
+        ))
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("deployment apply limiter closed: {e}")})),
-            )
-        })?;
-    let ingress_ready = match crate::deploy::reapply_tenant_ingress(
-        &state.db,
-        &next_app,
-        state.attestation.as_ref(),
-        &api_signing_pubkey,
-        &state.api_url,
-    )
-    .await
+        .map_err(|_| internal_error())?
     {
         Ok(()) => true,
         Err(crate::deploy::DeployError::NoContainers)
@@ -416,10 +512,17 @@ pub async fn verify_challenge(
             ));
         }
     };
-    drop(apply_permit);
-
     let app_backend = if ingress_ready {
-        ensure_custom_domain_haproxy_route(&state, auth.org_id, &app, &domain).await?
+        mutation
+            .guard_provider(ensure_custom_domain_haproxy_route(
+                &state,
+                auth.org_id,
+                &app,
+                &domain,
+                edge_config_generation,
+            ))
+            .await
+            .map_err(|_| internal_error())??
     } else {
         let org_slug: String =
             sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
@@ -440,34 +543,48 @@ pub async fn verify_challenge(
     sqlx::query("UPDATE apps SET custom_domain = $1, updated_at = now() WHERE id = $2")
         .bind(&domain)
         .bind(app.id)
-        .execute(&state.db)
+        .execute(&mut *app_lane)
         .await
         .map_err(|_| internal_error())?;
 
     if let Some(old) = previous_custom.as_deref()
         && old != domain
     {
-        if let Err(e) = crate::dns::delete_dns_record(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            app.id,
-            old,
-        )
-        .await
+        mutation
+            .guard_provider(crate::dns::delete_dns_record(
+                &state.db,
+                &state.http_client,
+                state.dns.as_ref(),
+                app.id,
+                old,
+            ))
+            .await
+            .map_err(|_| internal_error())?
+            .map_err(dns_error_response)?;
+        if mutation
+            .guard_provider(crate::edge::remove_haproxy_routes(
+                &state.db,
+                &crate::edge::EdgeRouteConfig::from_env(),
+                Some(edge_config_generation),
+                &[(app_backend.clone(), old.to_string())],
+            ))
+            .await
+            .map_err(|_| internal_error())?
+            .is_err()
         {
-            tracing::warn!(error = %e, old_domain = %old, "failed to clean up previous custom domain DNS record");
-        }
-        if let Err(e) = crate::edge::remove_haproxy_routes(
-            &state.db,
-            &crate::edge::EdgeRouteConfig::from_env(),
-            &[(app_backend.clone(), old.to_string())],
-        )
-        .await
-        {
-            tracing::warn!(error = %e, old_domain = %old, "failed to remove previous custom domain HAProxy route");
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "previous edge route reconciliation failed"})),
+            ));
         }
     }
+
+    mutation
+        .finish_in_tx(&mut app_lane)
+        .await
+        .map_err(|_| internal_error())?;
+    app_lane.commit().await.map_err(|_| internal_error())?;
+    drop(apply_permit);
 
     Ok(Json(VerifyResponse {
         domain,
@@ -504,15 +621,78 @@ pub async fn remove_custom_domain(
             )
         })?;
 
-    crate::dns::delete_dns_record(
-        &state.db,
-        &state.http_client,
-        state.dns.as_ref(),
+    let mut mutation = crate::mutation_leases::claim(
+        &state,
         app.id,
-        &domain,
+        "custom_domain_remove",
+        Uuid::new_v4(),
+        false,
+        vec![
+            crate::mutation_leases::ResourceFence::dns(&domain),
+            crate::mutation_leases::ResourceFence::edge(&domain),
+            crate::mutation_leases::ResourceFence::edge_config(),
+        ],
     )
     .await
-    .map_err(dns_error_response)?;
+    .map_err(|error| match error {
+        crate::mutation_leases::MutationLeaseError::Busy => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "app mutation already in progress"})),
+        ),
+        _ => internal_error(),
+    })?;
+    let edge_config_generation = mutation
+        .resource_generation(&crate::mutation_leases::ResourceFence::edge_config())
+        .ok_or_else(internal_error)?;
+    let mut app_lane = state.db.begin().await.map_err(|_| internal_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut app_lane, auth.org_id)
+        .await
+        .map_err(|_| internal_error())?;
+    crate::deploy::lock_app_deployment_lane(&mut app_lane, app.id)
+        .await
+        .map_err(|_| internal_error())?;
+    let current_role =
+        crate::auth::scopes::active_membership_role_in_tx(&mut app_lane, auth.org_id, auth.user_id)
+            .await?;
+    crate::auth::scopes::require_admin_role(current_role)?;
+    let current: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM apps
+              WHERE id = $1
+                AND org_id = $2
+                AND status <> 'deleting'::app_status_enum
+                AND custom_domain = $3
+         )",
+    )
+    .bind(app.id)
+    .bind(auth.org_id)
+    .bind(&domain)
+    .fetch_one(&mut *app_lane)
+    .await
+    .map_err(|_| internal_error())?;
+    if !current {
+        mutation
+            .finish_in_tx(&mut app_lane)
+            .await
+            .map_err(|_| internal_error())?;
+        app_lane.commit().await.map_err(|_| internal_error())?;
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "custom domain authority changed"})),
+        ));
+    }
+
+    mutation
+        .guard_provider(crate::dns::delete_dns_record(
+            &state.db,
+            &state.http_client,
+            state.dns.as_ref(),
+            app.id,
+            &domain,
+        ))
+        .await
+        .map_err(|_| internal_error())?
+        .map_err(dns_error_response)?;
 
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
         .bind(auth.org_id)
@@ -529,22 +709,35 @@ pub async fn remove_custom_domain(
             },
         )?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
-    if let Err(e) = crate::edge::remove_haproxy_routes(
-        &state.db,
-        &edge_config,
-        &[(app_backend, domain.clone())],
-    )
-    .await
+    if mutation
+        .guard_provider(crate::edge::remove_haproxy_routes(
+            &state.db,
+            &edge_config,
+            Some(edge_config_generation),
+            &[(app_backend, domain.clone())],
+        ))
+        .await
+        .map_err(|_| internal_error())?
+        .is_err()
     {
-        tracing::warn!(error = %e, %domain, "failed to remove custom domain HAProxy route");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": "edge route reconciliation failed"})),
+        ));
     }
 
     sqlx::query("UPDATE apps SET custom_domain = NULL, updated_at = now() WHERE id = $1 AND custom_domain = $2")
         .bind(app.id)
         .bind(&domain)
-        .execute(&state.db)
+        .execute(&mut *app_lane)
         .await
         .map_err(|_| internal_error())?;
+
+    mutation
+        .finish_in_tx(&mut app_lane)
+        .await
+        .map_err(|_| internal_error())?;
+    app_lane.commit().await.map_err(|_| internal_error())?;
 
     Ok(StatusCode::NO_CONTENT)
 }

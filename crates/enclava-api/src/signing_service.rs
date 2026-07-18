@@ -16,12 +16,38 @@ use enclava_engine::types::{GeneratedAgentPolicy, LogEncryptionConfig, WorkloadA
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{Executor, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::models::App;
 
 const DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS: u64 = 120;
+const ORG_SIGNING_AUTHORITY_LANE_DOMAIN: i32 = 0x5349_474e;
+
+fn org_signing_advisory_key(id: Uuid) -> i32 {
+    let bytes = id.as_bytes();
+    let a = u32::from_be_bytes(bytes[0..4].try_into().expect("UUID word"));
+    let b = u32::from_be_bytes(bytes[4..8].try_into().expect("UUID word"));
+    let c = u32::from_be_bytes(bytes[8..12].try_into().expect("UUID word"));
+    let d = u32::from_be_bytes(bytes[12..16].try_into().expect("UUID word"));
+    (a ^ b ^ c ^ d) as i32
+}
+
+/// Serialize owner keyring rotation with signed deployment acceptance.
+///
+/// Callers that also depend on hosted entitlements must acquire the
+/// entitlement lane first, then this lane, then the app deployment lane.
+pub async fn lock_org_signing_authority_lane(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(ORG_SIGNING_AUTHORITY_LANE_DOMAIN)
+        .bind(org_signing_advisory_key(org_id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SigningServiceError {
@@ -407,6 +433,23 @@ impl DeploymentSigningArtifacts {
         &self,
         pool: &PgPool,
     ) -> Result<(), SigningServiceError> {
+        self.validate_customer_authority_signatures()?;
+        self.verify_matches_latest_cap_keyring(pool).await?;
+        Ok(())
+    }
+
+    /// Repeat customer-authority validation inside the serialized acceptance
+    /// transaction immediately before committing signed workload artifacts.
+    pub async fn validate_customer_authority_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), SigningServiceError> {
+        self.validate_customer_authority_signatures()?;
+        self.verify_matches_latest_cap_keyring(&mut **tx).await?;
+        Ok(())
+    }
+
+    fn validate_customer_authority_signatures(&self) -> Result<(), SigningServiceError> {
         self.verify_keyring_signature()?;
         self.verify_descriptor_signature()?;
         if !self.descriptor_signing_key_is_authorized() {
@@ -414,7 +457,6 @@ impl DeploymentSigningArtifacts {
                 "descriptor_signing_pubkey not authorized by org_keyring".into(),
             ));
         }
-        self.verify_matches_latest_cap_keyring(pool).await?;
         Ok(())
     }
 
@@ -594,10 +636,13 @@ impl DeploymentSigningArtifacts {
             .any(|member| member.pubkey == self.descriptor_signing_pubkey && member.allows_deploy())
     }
 
-    async fn verify_matches_latest_cap_keyring(
+    async fn verify_matches_latest_cap_keyring<'e, E>(
         &self,
-        pool: &PgPool,
-    ) -> Result<(), SigningServiceError> {
+        executor: E,
+    ) -> Result<(), SigningServiceError>
+    where
+        E: Executor<'e, Database = Postgres>,
+    {
         let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
             "SELECT ok.keyring_payload, ok.signature, usk.pubkey
              FROM org_keyrings ok
@@ -607,7 +652,7 @@ impl DeploymentSigningArtifacts {
              LIMIT 1",
         )
         .bind(self.org_keyring.org_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         let Some((payload, signature, signing_pubkey)) = row else {
@@ -802,13 +847,134 @@ pub fn decode_optional_policy_artifact(
         .transpose()
 }
 
-pub async fn persist_workload_artifacts(
-    pool: &PgPool,
+#[derive(Debug, sqlx::FromRow)]
+struct StoredCustomerAuthorityRow {
+    descriptor_core_hash: Vec<u8>,
+    descriptor_payload: serde_json::Value,
+    descriptor_signature: Vec<u8>,
+    descriptor_signing_key_id: String,
+    org_keyring_payload: serde_json::Value,
+    org_keyring_signature: Vec<u8>,
+    signed_policy_artifact: serde_json::Value,
+}
+
+/// Reconstruct the customer authority persisted for one historical deployment.
+/// The signing owner pubkey is intentionally taken from the latest CAP keyring;
+/// subsequent validation therefore fails closed after a keyring rotation.
+pub async fn load_stored_customer_authority_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<Option<DeploymentSigningArtifacts>, SigningServiceError> {
+    let row = sqlx::query_as::<_, StoredCustomerAuthorityRow>(
+        "SELECT descriptor_core_hash, descriptor_payload, descriptor_signature,
+                descriptor_signing_key_id, org_keyring_payload,
+                org_keyring_signature, signed_policy_artifact
+           FROM workload_artifacts
+          WHERE app_id = $1 AND deploy_id = $2",
+    )
+    .bind(app_id)
+    .bind(deployment_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let descriptor: DeploymentDescriptor = serde_json::from_value(row.descriptor_payload)?;
+    let descriptor_core_hash = descriptor_core_hash(&descriptor);
+    if row.descriptor_core_hash.as_slice() != descriptor_core_hash {
+        return Err(SigningServiceError::Mismatch(
+            "stored descriptor_core_hash".to_string(),
+        ));
+    }
+    let signed_policy_artifact: SignedPolicyArtifact =
+        serde_json::from_value(row.signed_policy_artifact)?;
+    if signed_policy_artifact.metadata.app_id != app_id.to_string()
+        || signed_policy_artifact.metadata.deploy_id != deployment_id.to_string()
+        || signed_policy_artifact.metadata.descriptor_core_hash != hex::encode(descriptor_core_hash)
+    {
+        return Err(SigningServiceError::Mismatch(
+            "stored signed policy artifact identity".to_string(),
+        ));
+    }
+    let descriptor_signing_pubkey = decode_hex32(
+        "artifact.metadata.descriptor_signing_pubkey",
+        &signed_policy_artifact.metadata.descriptor_signing_pubkey,
+    )?;
+    let org_keyring: OrgKeyring = serde_json::from_value(row.org_keyring_payload.clone())?;
+    let latest_signing_pubkey: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT usk.pubkey
+           FROM org_keyrings ok
+           JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
+          WHERE ok.org_id = $1
+          ORDER BY ok.version DESC
+          LIMIT 1",
+    )
+    .bind(org_keyring.org_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let latest_signing_pubkey: [u8; 32] = latest_signing_pubkey
+        .ok_or_else(|| {
+            SigningServiceError::Mismatch("org_keyring not registered with CAP".to_string())
+        })?
+        .try_into()
+        .map_err(|bytes: Vec<u8>| {
+            SigningServiceError::Blob(format!(
+                "latest org keyring signing pubkey must be 32 bytes, got {}",
+                bytes.len()
+            ))
+        })?;
+    let descriptor_signature: [u8; 64] =
+        row.descriptor_signature
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                SigningServiceError::Blob(format!(
+                    "stored descriptor signature must be 64 bytes, got {}",
+                    bytes.len()
+                ))
+            })?;
+    let org_keyring_signature: [u8; 64] =
+        row.org_keyring_signature
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                SigningServiceError::Blob(format!(
+                    "stored org keyring signature must be 64 bytes, got {}",
+                    bytes.len()
+                ))
+            })?;
+    let org_keyring_envelope = serde_json::json!({
+        "keyring": &row.org_keyring_payload,
+        "signature": hex::encode(org_keyring_signature),
+        "signing_pubkey": hex::encode(latest_signing_pubkey),
+    });
+
+    Ok(Some(DeploymentSigningArtifacts {
+        customer_descriptor_blob: String::new(),
+        org_keyring_blob: String::new(),
+        org_keyring_envelope,
+        descriptor,
+        descriptor_signature,
+        descriptor_signing_key_id: row.descriptor_signing_key_id,
+        descriptor_signing_pubkey,
+        descriptor_core_hash,
+        org_keyring_fingerprint: keyring_fingerprint(&org_keyring),
+        org_keyring,
+        org_keyring_signature,
+        org_keyring_signing_pubkey: latest_signing_pubkey,
+    }))
+}
+
+pub async fn persist_workload_artifacts<'e, E>(
+    executor: E,
     app_id: Uuid,
     deploy_id: Uuid,
     artifacts: &DeploymentSigningArtifacts,
     signed_policy_artifact: &SignedPolicyArtifact,
-) -> Result<(), SigningServiceError> {
+) -> Result<(), SigningServiceError>
+where
+    E: Executor<'e, Database = Postgres>,
+{
     let descriptor_payload = serde_json::to_value(&artifacts.descriptor)?;
     let org_keyring_payload = serde_json::to_value(&artifacts.org_keyring)?;
     let signed_policy_artifact = serde_json::to_value(signed_policy_artifact)?;
@@ -819,16 +985,7 @@ pub async fn persist_workload_artifacts(
              descriptor_signature, descriptor_signing_key_id, org_keyring_payload,
              org_keyring_signature, signed_policy_artifact
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (descriptor_core_hash) DO UPDATE SET
-             app_id = EXCLUDED.app_id,
-             deploy_id = EXCLUDED.deploy_id,
-             descriptor_payload = EXCLUDED.descriptor_payload,
-             descriptor_signature = EXCLUDED.descriptor_signature,
-             descriptor_signing_key_id = EXCLUDED.descriptor_signing_key_id,
-             org_keyring_payload = EXCLUDED.org_keyring_payload,
-             org_keyring_signature = EXCLUDED.org_keyring_signature,
-             signed_policy_artifact = EXCLUDED.signed_policy_artifact",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(artifacts.descriptor_core_hash.to_vec())
     .bind(app_id)
@@ -839,7 +996,7 @@ pub async fn persist_workload_artifacts(
     .bind(org_keyring_payload)
     .bind(artifacts.org_keyring_signature.to_vec())
     .bind(signed_policy_artifact)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
@@ -874,6 +1031,224 @@ struct StoredWorkloadArtifactsJsonRow {
     org_keyring_payload: serde_json::Value,
     org_keyring_signature: Vec<u8>,
     signed_policy_artifact: serde_json::Value,
+}
+
+#[derive(Debug)]
+pub struct LoadedWorkloadArtifacts {
+    pub descriptor_core_hash: [u8; 32],
+    pub descriptor: DeploymentDescriptor,
+    pub binding: WorkloadArtifactBinding,
+    pub signed_policy_artifact: SignedPolicyArtifact,
+    pub workload_artifacts_json: String,
+    pub trustee_policy_json: String,
+    signing_artifacts: DeploymentSigningArtifacts,
+}
+
+impl LoadedWorkloadArtifacts {
+    /// Revalidate every stored cryptographic relationship at dispatch time.
+    /// Acceptance-time checks are not enough for a durable queue: the org's
+    /// latest keyring and the platform signing key may have changed while a
+    /// job waited or a stored JSON value may have been corrupted.
+    pub async fn validate_stored_authority(
+        &self,
+        pool: &PgPool,
+        app: &App,
+        image_digest: &str,
+        api_signing_pubkey: &str,
+        signing_service_pubkey_hex: &str,
+    ) -> Result<(), SigningServiceError> {
+        self.signing_artifacts
+            .validate_deployment_inputs(app, image_digest, api_signing_pubkey)?;
+        self.signing_artifacts
+            .validate_customer_authority(pool)
+            .await?;
+        self.signing_artifacts
+            .validate_signed_artifact(&self.signed_policy_artifact, signing_service_pubkey_hex)?;
+        // This also ensures the stored policy's attached keyring, signature,
+        // and signing key are the authority used for descriptor verification.
+        let mut artifact = self.signed_policy_artifact.clone();
+        self.signing_artifacts
+            .attach_customer_authority(&mut artifact)?;
+        Ok(())
+    }
+
+    pub fn validate_rendered_cc_init_data_hash(
+        &self,
+        actual_hash_hex: &str,
+    ) -> Result<(), SigningServiceError> {
+        self.signing_artifacts
+            .validate_rendered_cc_init_data_hash(actual_hash_hex)
+    }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct LoadedWorkloadArtifactsRow {
+    descriptor_core_hash: Vec<u8>,
+    descriptor_payload: serde_json::Value,
+    descriptor_signature: Vec<u8>,
+    descriptor_signing_key_id: String,
+    org_keyring_payload: serde_json::Value,
+    org_keyring_signature: Vec<u8>,
+    signed_policy_artifact: serde_json::Value,
+}
+
+fn decode_loaded_workload_artifacts(
+    row: LoadedWorkloadArtifactsRow,
+    app_id: Uuid,
+    deploy_id: Uuid,
+) -> Result<LoadedWorkloadArtifacts, SigningServiceError> {
+    let stored_descriptor_core_hash: [u8; 32] =
+        row.descriptor_core_hash
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                SigningServiceError::Blob(format!(
+                    "descriptor_core_hash must be 32 bytes, got {}",
+                    bytes.len()
+                ))
+            })?;
+    let descriptor: DeploymentDescriptor = serde_json::from_value(row.descriptor_payload.clone())?;
+    if descriptor.app_id != app_id {
+        return Err(SigningServiceError::Mismatch(
+            "stored descriptor app_id".into(),
+        ));
+    }
+    if descriptor.deploy_id != deploy_id {
+        return Err(SigningServiceError::Mismatch(
+            "stored descriptor deploy_id".into(),
+        ));
+    }
+    if descriptor_core_hash(&descriptor) != stored_descriptor_core_hash {
+        return Err(SigningServiceError::Mismatch(
+            "stored descriptor_core_hash".into(),
+        ));
+    }
+
+    let org_keyring: OrgKeyring = serde_json::from_value(row.org_keyring_payload.clone())?;
+    let signed_policy_artifact: SignedPolicyArtifact =
+        serde_json::from_value(row.signed_policy_artifact.clone())?;
+    let descriptor_signing_pubkey = decode_hex32(
+        "artifact.metadata.descriptor_signing_pubkey",
+        &signed_policy_artifact.metadata.descriptor_signing_pubkey,
+    )?;
+    let attached_keyring: OrgKeyringEnvelope =
+        serde_json::from_value(signed_policy_artifact.org_keyring.clone().ok_or_else(|| {
+            SigningServiceError::Mismatch("artifact.org_keyring missing".into())
+        })?)?;
+    let descriptor_signature: [u8; 64] =
+        row.descriptor_signature
+            .clone()
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                SigningServiceError::Blob(format!(
+                    "descriptor_signature must be 64 bytes, got {}",
+                    bytes.len()
+                ))
+            })?;
+    let org_keyring_signature: [u8; 64] =
+        row.org_keyring_signature
+            .clone()
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                SigningServiceError::Blob(format!(
+                    "org_keyring_signature must be 64 bytes, got {}",
+                    bytes.len()
+                ))
+            })?;
+    if keyring_fingerprint(&attached_keyring.keyring) != keyring_fingerprint(&org_keyring)
+        || attached_keyring.signature != org_keyring_signature
+    {
+        return Err(SigningServiceError::Mismatch(
+            "artifact.org_keyring does not match stored authority".into(),
+        ));
+    }
+    let org_keyring_fingerprint = keyring_fingerprint(&org_keyring);
+    let org_keyring_envelope = serde_json::to_value(&attached_keyring)?;
+    let signing_artifacts = DeploymentSigningArtifacts {
+        customer_descriptor_blob: String::new(),
+        org_keyring_blob: String::new(),
+        org_keyring_envelope,
+        descriptor: descriptor.clone(),
+        descriptor_signature,
+        descriptor_signing_key_id: row.descriptor_signing_key_id.clone(),
+        descriptor_signing_pubkey,
+        descriptor_core_hash: stored_descriptor_core_hash,
+        org_keyring: org_keyring.clone(),
+        org_keyring_signature,
+        org_keyring_signing_pubkey: attached_keyring.signing_pubkey,
+        org_keyring_fingerprint,
+    };
+    let artifacts_json = serde_json::json!({
+        "descriptor_payload": row.descriptor_payload,
+        "descriptor_signature": hex::encode(row.descriptor_signature),
+        "descriptor_signing_key_id": row.descriptor_signing_key_id,
+        "org_keyring_payload": row.org_keyring_payload,
+        "org_keyring_signature": hex::encode(row.org_keyring_signature),
+        "signed_policy_artifact": row.signed_policy_artifact,
+    });
+
+    Ok(LoadedWorkloadArtifacts {
+        descriptor_core_hash: stored_descriptor_core_hash,
+        descriptor,
+        binding: WorkloadArtifactBinding {
+            descriptor_core_hash: stored_descriptor_core_hash,
+            descriptor_signing_pubkey,
+            org_keyring_fingerprint,
+        },
+        trustee_policy_json: serde_json::to_string(&signed_policy_artifact)?,
+        workload_artifacts_json: serde_json::to_string(&artifacts_json)?,
+        signed_policy_artifact,
+        signing_artifacts,
+    })
+}
+
+/// Load the single authoritative artifact row for a deployment. The unique
+/// `(app_id, deploy_id)` constraint makes absence or malformed content
+/// unambiguous during rollback preparation.
+pub async fn load_workload_artifacts_for_deployment(
+    pool: &PgPool,
+    app_id: Uuid,
+    deploy_id: Uuid,
+) -> Result<Option<LoadedWorkloadArtifacts>, SigningServiceError> {
+    let row = sqlx::query_as::<_, LoadedWorkloadArtifactsRow>(
+        "SELECT descriptor_core_hash, descriptor_payload, descriptor_signature,
+                descriptor_signing_key_id, org_keyring_payload,
+                org_keyring_signature, signed_policy_artifact
+           FROM workload_artifacts
+          WHERE app_id = $1 AND deploy_id = $2",
+    )
+    .bind(app_id)
+    .bind(deploy_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| decode_loaded_workload_artifacts(row, app_id, deploy_id))
+        .transpose()
+}
+
+/// Reload an accepted job's exact immutable artifact row. All three identity
+/// components are required so neither a colliding core hash nor a repointed
+/// app/deployment binding can be mixed into the apply payload.
+pub async fn load_workload_artifacts_exact(
+    pool: &PgPool,
+    app_id: Uuid,
+    deploy_id: Uuid,
+    expected_descriptor_core_hash: [u8; 32],
+) -> Result<Option<LoadedWorkloadArtifacts>, SigningServiceError> {
+    let row = sqlx::query_as::<_, LoadedWorkloadArtifactsRow>(
+        "SELECT descriptor_core_hash, descriptor_payload, descriptor_signature,
+                descriptor_signing_key_id, org_keyring_payload,
+                org_keyring_signature, signed_policy_artifact
+           FROM workload_artifacts
+          WHERE descriptor_core_hash = $1
+            AND app_id = $2
+            AND deploy_id = $3",
+    )
+    .bind(expected_descriptor_core_hash.to_vec())
+    .bind(app_id)
+    .bind(deploy_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| decode_loaded_workload_artifacts(row, app_id, deploy_id))
+        .transpose()
 }
 
 pub async fn load_workload_artifacts_json(

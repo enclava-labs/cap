@@ -1,7 +1,7 @@
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{ContainerState, ContainerStatus, Pod};
 use k8s_openapi::jiff::Timestamp;
-use kube::api::{Api, DeleteParams, ListParams};
+use kube::api::{Api, ListParams};
 use tokio::time::Instant;
 
 use super::engine::{ApplyEngine, ApplyError};
@@ -314,28 +314,16 @@ pub async fn watch_rollout(
                 continue;
             };
 
+            // Rollout observation must remain side-effect free. A force-delete
+            // accepted by Kubernetes with a lost response cannot be safely
+            // distinguished from a failed request, and could otherwise land
+            // after this deployment's durable mutation fence is reclaimed.
             tracing::warn!(
                 namespace = %namespace,
                 statefulset = %statefulset_name,
                 pod = %pod_name,
-                "force deleting stale terminating pod after grace period"
+                "stale terminating pod requires operator/controller reconciliation"
             );
-            match pod_api
-                .delete(pod_name, &DeleteParams::default().grace_period(0))
-                .await
-            {
-                Ok(_) => {}
-                Err(kube::Error::Api(ae)) if ae.code == 404 => {}
-                Err(err) => {
-                    tracing::warn!(
-                        namespace = %namespace,
-                        statefulset = %statefulset_name,
-                        pod = %pod_name,
-                        error = %err,
-                        "failed to force delete stale terminating pod"
-                    );
-                }
-            }
         }
 
         let mut worst_phase = DeployPhase::Running;

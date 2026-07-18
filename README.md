@@ -155,6 +155,10 @@ See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the current security snapshot.
   helper.
 - [runbooks/ct-monitoring.md](runbooks/ct-monitoring.md) - certificate
   transparency monitoring notes.
+- [runbooks/dns-mutation-reconciliation.md](runbooks/dns-mutation-reconciliation.md)
+  - fail-closed Cloudflare mutation recovery.
+- [runbooks/kubernetes-mutation-fence-recovery.md](runbooks/kubernetes-mutation-fence-recovery.md)
+  - fail-closed Kubernetes namespace mutation recovery.
 
 ## License
 

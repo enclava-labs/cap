@@ -287,6 +287,45 @@ fn rejects_descriptor_for_different_api_signing_key() {
 }
 
 #[test]
+fn rejects_descriptor_for_different_app_signer_and_image() {
+    let descriptor = descriptor();
+    let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+    let mut different_app = descriptor.clone();
+    different_app.app_id = Uuid::new_v4();
+    let err = signing_artifacts(different_app)
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+        )
+        .unwrap_err();
+    assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "app_id"));
+
+    let mut different_signer = descriptor.clone();
+    different_signer.signer_identity.subject = "https://example.test/attacker".to_string();
+    let err = signing_artifacts(different_signer)
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Mismatch(field) if field == "signer_identity.subject")
+    );
+
+    let err = signing_artifacts(descriptor.clone())
+        .validate_deployment_inputs(
+            &app,
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            &descriptor.api_signing_pubkey,
+        )
+        .unwrap_err();
+    assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "image_digest"));
+}
+
+#[test]
 fn rejects_descriptor_without_workload_command() {
     let mut descriptor = descriptor();
     descriptor.oci_runtime_spec.args.clear();
@@ -493,6 +532,18 @@ fn signed_artifact_agent_policy_drives_cc_init_data_hash() {
     artifacts
         .validate_rendered_cc_init_data_hash(&hash_hex)
         .unwrap();
+}
+
+#[test]
+fn rejects_rendered_cc_init_data_hash_mismatch() {
+    let artifacts = signing_artifacts(descriptor());
+    let err = artifacts
+        .validate_rendered_cc_init_data_hash(&"00".repeat(32))
+        .unwrap_err();
+
+    assert!(
+        matches!(err, SigningServiceError::Mismatch(field) if field == "expected_cc_init_data_hash")
+    );
 }
 
 fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> ConfidentialApp {

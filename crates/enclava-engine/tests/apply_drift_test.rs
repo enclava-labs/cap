@@ -72,13 +72,16 @@ async fn check_drift_detects_missing_statefulset() {
 async fn check_drift_no_drift_after_apply() {
     use enclava_engine::apply::drift::check_drift;
     use enclava_engine::apply::engine::ApplyEngine;
+    use enclava_engine::apply::generation::MutationGeneration;
     use enclava_engine::apply::orchestrator::apply_all;
 
     let engine = ApplyEngine::try_default().await.unwrap();
     let app = sample_app();
     let manifests = generate_all_manifests(&app);
 
-    apply_all(&engine, &manifests).await.unwrap();
+    apply_all(&engine, &manifests, MutationGeneration::new(1).unwrap())
+        .await
+        .unwrap();
 
     let result = check_drift(&engine, &app, &manifests).await.unwrap();
     assert!(!result.has_drift);

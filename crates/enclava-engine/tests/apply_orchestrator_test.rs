@@ -38,13 +38,16 @@ fn manifest_hash_changes_with_different_app() {
 #[ignore]
 async fn apply_all_creates_full_stack() {
     use enclava_engine::apply::engine::ApplyEngine;
+    use enclava_engine::apply::generation::MutationGeneration;
     use enclava_engine::apply::orchestrator::apply_all;
 
     let engine = ApplyEngine::try_default().await.unwrap();
     let app = sample_app();
     let manifests = generate_all_manifests(&app);
 
-    apply_all(&engine, &manifests).await.unwrap();
+    apply_all(&engine, &manifests, MutationGeneration::new(1).unwrap())
+        .await
+        .unwrap();
 
     // Verify namespace exists
     use k8s_openapi::api::core::v1::Namespace;
@@ -71,15 +74,17 @@ async fn apply_all_creates_full_stack() {
 #[ignore]
 async fn apply_all_is_idempotent() {
     use enclava_engine::apply::engine::ApplyEngine;
+    use enclava_engine::apply::generation::MutationGeneration;
     use enclava_engine::apply::orchestrator::apply_all;
 
     let engine = ApplyEngine::try_default().await.unwrap();
     let app = sample_app();
     let manifests = generate_all_manifests(&app);
 
-    apply_all(&engine, &manifests).await.unwrap();
+    let generation = MutationGeneration::new(1).unwrap();
+    apply_all(&engine, &manifests, generation).await.unwrap();
     // Second apply should succeed without errors
-    apply_all(&engine, &manifests).await.unwrap();
+    apply_all(&engine, &manifests, generation).await.unwrap();
 
     // Cleanup
     use k8s_openapi::api::core::v1::Namespace;

@@ -219,6 +219,7 @@ pub async fn create_generic_deployment(
     Json(body): Json<GenericDeploymentRequest>,
 ) -> Result<(StatusCode, Json<GenericDeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
+    crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
     validate_external_id(body.external_id.as_deref())?;
 
     validate_source_context(
@@ -234,6 +235,12 @@ pub async fn create_generic_deployment(
         && let Some((deployment, app)) =
             fetch_deployment_by_external_id(&state, auth.org_id, external_id).await?
     {
+        if super::deployment_setup_incomplete(&deployment) {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "external_id belongs to a deployment whose setup did not complete",
+            ));
+        }
         ensure_idempotent_retry_matches(&deployment, &app, &body)?;
         return Ok((
             StatusCode::OK,
@@ -247,10 +254,9 @@ pub async fn create_generic_deployment(
     let normalized_egress_mode = crate::routes::apps::validate_egress_mode(&body.app.egress_mode)
         .map_err(|e| json_error(StatusCode::BAD_REQUEST, e))?;
 
-    let app = match fetch_app_by_name(&state, auth.org_id, &body.app.name).await? {
-        Some(app) => {
+    let (app, app_mutation) = match fetch_app_by_name(&state, auth.org_id, &body.app.name).await? {
+        Some(app) => (
             ensure_generic_app_metadata(
-                &state,
                 app,
                 GenericAppMetadata {
                     provider: body.source.provider,
@@ -260,9 +266,9 @@ pub async fn create_generic_deployment(
                     egress_allowlist: &normalized_egress_allowlist,
                     egress_mode: normalized_egress_mode,
                 },
-            )
-            .await?
-        }
+            )?,
+            super::AppMutation::UpdateGenericMetadata,
+        ),
         None if body.app.create_if_missing => {
             let create = crate::routes::apps::CreateAppRequest {
                 name: body.app.name.clone(),
@@ -275,12 +281,10 @@ pub async fn create_generic_deployment(
                 egress_allowlist: body.app.egress_allowlist.clone(),
                 egress_mode: normalized_egress_mode.as_str().to_string(),
             };
-            let (_, Json(created)) =
-                crate::routes::apps::create_app(auth.clone(), State(state.clone()), Json(create))
-                    .await?;
-            fetch_app_by_name(&state, auth.org_id, &created.name)
-                .await?
-                .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+            (
+                crate::routes::apps::prepare_app_candidate(&state, &auth, &create).await?,
+                super::AppMutation::Insert,
+            )
         }
         None => {
             return Err(json_error(
@@ -304,13 +308,8 @@ pub async fn create_generic_deployment(
         log_encryption: body.security.log_encryption.clone(),
     };
     let org_id = auth.org_id;
-    let (status, Json(deployed)) = deploy(
-        auth,
-        State(state.clone()),
-        Path(app.name.clone()),
-        Json(deploy_request),
-    )
-    .await?;
+    let (status, Json(deployed)) =
+        super::deploy_app_candidate(auth, state.clone(), app, deploy_request, app_mutation).await?;
     let (deployment, app) = fetch_deployment_with_app(&state, org_id, deployed.deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
@@ -564,9 +563,8 @@ struct GenericAppMetadata<'a> {
     egress_mode: enclava_engine::types::EgressMode,
 }
 
-async fn ensure_generic_app_metadata(
-    state: &AppState,
-    app: App,
+fn ensure_generic_app_metadata(
+    mut app: App,
     metadata: GenericAppMetadata<'_>,
 ) -> Result<App, (StatusCode, Json<serde_json::Value>)> {
     let provider_str = metadata.provider.as_str();
@@ -601,27 +599,11 @@ async fn ensure_generic_app_metadata(
         }
     }
 
-    sqlx::query_as(
-        "UPDATE apps
-            SET source_provider = $1,
-                source_repository = $2,
-                signer_identity_subject = $3,
-                signer_identity_issuer = $4,
-                signer_identity_set_at = COALESCE(signer_identity_set_at, now()),
-                egress_allowlist = $5,
-                egress_mode = $6,
-                updated_at = now()
-          WHERE id = $7
-          RETURNING *",
-    )
-    .bind(provider_str)
-    .bind(metadata.repository)
-    .bind(metadata.subject)
-    .bind(metadata.issuer)
-    .bind(sqlx::types::Json(metadata.egress_allowlist.to_vec()))
-    .bind(metadata.egress_mode.as_str())
-    .bind(app.id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))
+    app.source_provider = Some(provider_str.to_string());
+    app.source_repository = Some(metadata.repository.to_string());
+    app.signer_identity_subject = Some(metadata.subject.to_string());
+    app.signer_identity_issuer = Some(metadata.issuer.to_string());
+    app.egress_allowlist = sqlx::types::Json(metadata.egress_allowlist.to_vec());
+    app.egress_mode = metadata.egress_mode.as_str().to_string();
+    Ok(app)
 }

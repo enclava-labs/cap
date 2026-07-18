@@ -4,12 +4,14 @@ pub mod clients;
 pub mod cosign;
 pub mod db;
 pub mod deploy;
+pub mod deployment_jobs;
 pub mod dns;
 pub mod edge;
 pub mod entitlements;
 pub mod env_gates;
 pub mod kbs;
 pub mod models;
+pub mod mutation_leases;
 pub mod platform_release;
 pub mod ratelimit;
 pub mod registry;
@@ -531,6 +533,7 @@ pub(crate) mod test_support {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgresql://test:test@localhost:5432/test")
             .expect("lazy postgres URL should parse");
+        let side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
         AppState {
             db: pool,
             management_mode: crate::state::CapManagementMode::Standalone,
@@ -577,6 +580,7 @@ pub(crate) mod test_support {
             signing_service: None,
             require_customer_signed_policy_artifact: true,
             deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            side_effect_admission,
             internal_auth: None,
         }
     }

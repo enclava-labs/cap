@@ -85,6 +85,32 @@ pub fn require_owner_role(role: Role) -> AuthzResult {
     }
 }
 
+/// Re-read an actor's active organization role while the caller holds the
+/// organization authority lane that serializes the pending mutation.
+///
+/// Request authentication happens before potentially slow deployment and
+/// signing validation. This check prevents a membership removal or demotion
+/// that wins the authority lane from being overwritten by a stale request.
+pub async fn active_membership_role_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: Uuid,
+    user_id: Uuid,
+) -> AuthzResult<Role> {
+    sqlx::query_scalar(
+        "SELECT role as \"role: _\"
+           FROM memberships
+          WHERE org_id = $1
+            AND user_id = $2
+            AND removed_at IS NULL",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|_| database_error())?
+    .ok_or_else(|| forbidden("active organization membership required"))
+}
+
 pub fn parse_role(role: &str) -> AuthzResult<Role> {
     match role {
         "owner" => Ok(Role::Owner),

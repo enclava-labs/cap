@@ -1,7 +1,8 @@
 use k8s_openapi::api::core::v1::Namespace;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, PatchParams};
 
 use super::engine::{ApplyEngine, ApplyError};
+use super::generation::{MutationGeneration, apply_resource};
 
 /// Build SSA PatchParams for the given field manager.
 pub fn namespace_patch_params(field_manager: &str) -> PatchParams {
@@ -15,6 +16,7 @@ pub fn namespace_patch_params(field_manager: &str) -> PatchParams {
 pub async fn apply_namespace(
     engine: &ApplyEngine,
     namespace: &Namespace,
+    generation: MutationGeneration,
 ) -> Result<Namespace, ApplyError> {
     let name = namespace
         .metadata
@@ -23,9 +25,7 @@ pub async fn apply_namespace(
         .ok_or_else(|| ApplyError::NamespaceNotReady("namespace has no name".to_string()))?;
 
     let api: Api<Namespace> = Api::all(engine.client().clone());
-    let pp = namespace_patch_params(&engine.config().field_manager);
-
-    let patched = api.patch(name, &pp, &Patch::Apply(namespace)).await?;
+    let patched = apply_resource(engine, &api, namespace, generation, true).await?;
 
     tracing::info!(namespace = %name, "namespace applied via SSA");
     Ok(patched)

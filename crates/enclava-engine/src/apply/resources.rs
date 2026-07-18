@@ -1,11 +1,12 @@
 use k8s_openapi::NamespaceResourceScope;
 use kube::Resource;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::Api;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt::Debug;
 
 use super::engine::{ApplyEngine, ApplyError};
+use super::generation::{MutationGeneration, apply_resource};
 
 /// Apply a typed namespaced Kubernetes resource via server-side apply.
 ///
@@ -15,6 +16,7 @@ pub async fn apply_namespaced_resource<K>(
     engine: &ApplyEngine,
     namespace: &str,
     resource: &K,
+    generation: MutationGeneration,
 ) -> Result<K, ApplyError>
 where
     K: Resource<Scope = NamespaceResourceScope> + Clone + Debug + Serialize + DeserializeOwned,
@@ -23,9 +25,7 @@ where
     let name = resource.meta().name.as_deref().unwrap_or("<unnamed>");
 
     let api: Api<K> = Api::namespaced(engine.client().clone(), namespace);
-    let pp = PatchParams::apply(&engine.config().field_manager);
-
-    let patched = api.patch(name, &pp, &Patch::Apply(resource)).await?;
+    let patched = apply_resource(engine, &api, resource, generation, false).await?;
 
     tracing::info!(
         kind = %K::kind(&Default::default()),
@@ -42,6 +42,7 @@ where
 pub async fn apply_standard_resources(
     engine: &ApplyEngine,
     manifests: &crate::manifest::GeneratedManifests,
+    generation: MutationGeneration,
 ) -> Result<(), ApplyError> {
     let ns = manifests
         .namespace
@@ -50,14 +51,14 @@ pub async fn apply_standard_resources(
         .as_deref()
         .ok_or_else(|| ApplyError::NamespaceNotReady("namespace has no name".to_string()))?;
 
-    apply_namespaced_resource(engine, ns, &manifests.service_account).await?;
-    apply_namespaced_resource(engine, ns, &manifests.resource_quota).await?;
-    apply_namespaced_resource(engine, ns, &manifests.service).await?;
-    apply_namespaced_resource(engine, ns, &manifests.sni_route_configmap).await?;
-    apply_namespaced_resource(engine, ns, &manifests.bootstrap_configmap).await?;
-    apply_namespaced_resource(engine, ns, &manifests.startup_configmap).await?;
-    apply_namespaced_resource(engine, ns, &manifests.ingress_configmap).await?;
-    apply_namespaced_resource(engine, ns, &manifests.enclava_init_configmap).await?;
+    apply_namespaced_resource(engine, ns, &manifests.service_account, generation).await?;
+    apply_namespaced_resource(engine, ns, &manifests.resource_quota, generation).await?;
+    apply_namespaced_resource(engine, ns, &manifests.service, generation).await?;
+    apply_namespaced_resource(engine, ns, &manifests.sni_route_configmap, generation).await?;
+    apply_namespaced_resource(engine, ns, &manifests.bootstrap_configmap, generation).await?;
+    apply_namespaced_resource(engine, ns, &manifests.startup_configmap, generation).await?;
+    apply_namespaced_resource(engine, ns, &manifests.ingress_configmap, generation).await?;
+    apply_namespaced_resource(engine, ns, &manifests.enclava_init_configmap, generation).await?;
 
     tracing::info!(namespace = %ns, "all standard resources applied");
     Ok(())

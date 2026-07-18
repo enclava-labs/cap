@@ -42,6 +42,7 @@ fn cleanup_report_failure_messages() {
 async fn cleanup_handles_nonexistent_namespace() {
     use enclava_engine::apply::cleanup::delete_namespace_and_wait;
     use enclava_engine::apply::engine::ApplyEngine;
+    use enclava_engine::apply::generation::MutationGeneration;
 
     let engine = ApplyEngine::try_default().await.unwrap();
 
@@ -50,6 +51,7 @@ async fn cleanup_handles_nonexistent_namespace() {
         &engine,
         "nonexistent-ns-for-cleanup-test",
         std::time::Duration::from_secs(5),
+        MutationGeneration::new(1).unwrap(),
     )
     .await;
     assert!(result.is_ok());
