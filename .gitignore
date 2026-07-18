@@ -4,6 +4,7 @@
 /tools
 /runbooks/audits
 /runbooks/*
+!/runbooks/paas-config-token-idempotency.md
 /design-proposals/*
 # Agent scratch (never commit)
 .claude/

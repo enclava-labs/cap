@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use uuid::Uuid;
 
-use crate::auth::jwt::issue_config_token;
+use crate::auth::jwt::{
+    CONFIG_TOKEN_TTL_SECONDS, ConfigTokenIssuance, issue_config_token_for_issuance,
+    issue_config_token_with_expiry,
+};
 use crate::auth::middleware::AuthContext;
 use crate::auth::scopes;
 use crate::models::App;
@@ -25,6 +28,8 @@ pub struct ConfigTokenResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tee_resolve_ip: Option<IpAddr>,
     pub expires_in_seconds: u64,
+    pub issued_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn config_token_instance_id(app: &App) -> String {
@@ -41,6 +46,24 @@ pub async fn issue_config_token_route(
     auth: AuthContext,
     State(state): State<AppState>,
     Path(app_name): Path<String>,
+) -> Result<Json<ConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+    issue_config_token_route_inner(auth, state, app_name, None).await
+}
+
+pub(crate) async fn issue_config_token_route_for_issuance(
+    auth: AuthContext,
+    state: AppState,
+    app_name: String,
+    issuance: ConfigTokenIssuance,
+) -> Result<Json<ConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+    issue_config_token_route_inner(auth, state, app_name, Some(issuance)).await
+}
+
+async fn issue_config_token_route_inner(
+    auth: AuthContext,
+    state: AppState,
+    app_name: String,
+    issuance: Option<ConfigTokenIssuance>,
 ) -> Result<Json<ConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "config:write")?;
@@ -61,14 +84,25 @@ pub async fn issue_config_token_route(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    let token = issue_config_token(
-        &state.signing_key,
-        auth.user_id,
-        auth.org_id,
-        app.id,
-        &config_token_instance_id(&app),
-        vec!["config:write".to_string()],
-    )
+    let issued = match issuance.as_ref() {
+        Some(issuance) => issue_config_token_for_issuance(
+            &state.signing_key,
+            auth.user_id,
+            auth.org_id,
+            app.id,
+            &config_token_instance_id(&app),
+            vec!["config:write".to_string()],
+            issuance,
+        ),
+        None => issue_config_token_with_expiry(
+            &state.signing_key,
+            auth.user_id,
+            auth.org_id,
+            app.id,
+            &config_token_instance_id(&app),
+            vec!["config:write".to_string()],
+        ),
+    }
     .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -96,11 +130,27 @@ pub async fn issue_config_token_route(
         }
     };
 
+    let database_now: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+            })?;
+    let expires_in_seconds = (issued.expires_at - database_now)
+        .num_seconds()
+        .clamp(0, CONFIG_TOKEN_TTL_SECONDS) as u64;
+
     Ok(Json(ConfigTokenResponse {
-        token,
+        token: issued.token,
         tee_url,
         tee_resolve_ip,
-        expires_in_seconds: 300,
+        expires_in_seconds,
+        issued_at: issued.issued_at,
+        expires_at: issued.expires_at,
     }))
 }
 

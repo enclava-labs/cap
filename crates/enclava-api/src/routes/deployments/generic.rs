@@ -101,6 +101,7 @@ pub struct GenericConfigTokenResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tee_resolve_ip: Option<std::net::IpAddr>,
     pub expires_in_seconds: u64,
+    pub issued_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -365,15 +366,49 @@ pub async fn generic_config_token(
     State(state): State<AppState>,
     Path(deployment_id): Path<Uuid>,
 ) -> Result<Json<GenericConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+    generic_config_token_inner(auth, state, deployment_id, None).await
+}
+
+pub(crate) async fn generic_config_token_for_issuance(
+    auth: AuthContext,
+    state: AppState,
+    deployment_id: Uuid,
+    issuance: crate::auth::jwt::ConfigTokenIssuance,
+) -> Result<Json<GenericConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+    generic_config_token_inner(auth, state, deployment_id, Some(issuance)).await
+}
+
+async fn generic_config_token_inner(
+    auth: AuthContext,
+    state: AppState,
+    deployment_id: Uuid,
+    issuance: Option<crate::auth::jwt::ConfigTokenIssuance>,
+) -> Result<Json<GenericConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "config:write")?;
 
     let (_deployment, app) = fetch_deployment_with_app(&state, auth.org_id, deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "deployment not found"))?;
-    let Json(token) =
-        crate::routes::config::issue_config_token_route(auth, State(state), Path(app.name.clone()))
-            .await?;
+    let Json(token) = match issuance {
+        Some(issuance) => {
+            crate::routes::config::issue_config_token_route_for_issuance(
+                auth,
+                state,
+                app.name.clone(),
+                issuance,
+            )
+            .await?
+        }
+        None => {
+            crate::routes::config::issue_config_token_route(
+                auth,
+                State(state),
+                Path(app.name.clone()),
+            )
+            .await?
+        }
+    };
 
     Ok(Json(GenericConfigTokenResponse {
         deployment_id,
@@ -381,7 +416,8 @@ pub async fn generic_config_token(
         tee_url: token.tee_url,
         tee_resolve_ip: token.tee_resolve_ip,
         expires_in_seconds: token.expires_in_seconds,
-        expires_at: chrono::Utc::now() + chrono::Duration::seconds(token.expires_in_seconds as i64),
+        issued_at: token.issued_at,
+        expires_at: token.expires_at,
     }))
 }
 

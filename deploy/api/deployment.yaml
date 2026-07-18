@@ -5,6 +5,11 @@ metadata:
   namespace: enclava-platform
 spec:
   replicas: 2
+  # Deterministic config-token receipts can be replayed for five minutes.
+  # Never mix binaries with different receipt/signing contracts in that live
+  # window; see runbooks/paas-config-token-idempotency.md.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: enclava-api
