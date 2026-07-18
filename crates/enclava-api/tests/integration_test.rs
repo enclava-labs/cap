@@ -1546,11 +1546,8 @@ async fn rejected_signed_deployments_leave_existing_and_candidate_container_rows
 
         response.assert_status(StatusCode::BAD_REQUEST);
         let body: Value = response.json();
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(expected_field),
+        assert_eq!(
+            body["error"], "signed_artifact_mismatch",
             "unexpected rejection for {expected_field}: {body}"
         );
         assert_eq!(
