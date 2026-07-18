@@ -70,8 +70,10 @@ pub async fn issue_dns01_certificate(
             let hostname = challenge.identifier().to_string();
             let record_name = format!("_acme-challenge.{hostname}");
             let record_value = challenge.key_authorization().dns_value();
-            dns::ensure_txt_record(http_client, dns_config, &record_name, &record_value).await?;
-            challenge_records.push((record_name.clone(), record_value.clone()));
+            let record =
+                dns::create_txt_record(http_client, dns_config, &record_name, &record_value)
+                    .await?;
+            challenge_records.push(record);
             if let Err(err) = wait_for_txt_record(
                 &record_name,
                 &record_value,
@@ -183,12 +185,12 @@ fn collect_txt_values(response: hickory_resolver::lookup::Lookup) -> Result<Vec<
 async fn cleanup_challenges(
     http_client: &reqwest::Client,
     dns_config: &DnsConfig,
-    records: &[(String, String)],
+    records: &[dns::DnsRecordHandle],
 ) {
-    for (name, value) in records {
-        if let Err(err) = dns::delete_txt_record(http_client, dns_config, name, value).await {
+    for record in records {
+        if let Err(err) = dns::delete_txt_record(http_client, dns_config, record).await {
             tracing::warn!(
-                record = %name,
+                record = %record.hostname(),
                 error = %err,
                 "failed to clean up ACME DNS-01 TXT record"
             );
