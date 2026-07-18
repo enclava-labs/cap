@@ -35,7 +35,9 @@ const MAX_SUPPORTED_JOB_PAYLOAD_VERSION: i32 = JOB_PAYLOAD_VERSION;
 const LEASE_INTERVAL_SQL: &str = "90 seconds";
 const SETUP_RECOVERY_DELAY_SQL: &str = "5 seconds";
 const CLEANUP_RETRY_INTERVAL_SQL: &str = "30 seconds";
+const APPLY_RETRY_INTERVAL_SQL: &str = "5 seconds";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const HEARTBEAT_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_SETUP_WORKERS: usize = 8;
 const MAX_APPLY_WORKERS: usize = 32;
@@ -221,6 +223,7 @@ pub(crate) struct StoredDeploymentApplyAuthority {
     pub signed_required: bool,
     pub artifact_deployment_id: Option<Uuid>,
     pub artifact_descriptor_core_hash: Option<[u8; 32]>,
+    pub payload_sha256: [u8; 32],
 }
 
 /// Load an accepted deployment's exact immutable worker snapshot. Rollback
@@ -259,6 +262,11 @@ pub(crate) async fn load_stored_deployment_apply_authority(
         signed_required: job.signed_required,
         artifact_deployment_id: job.artifact_deployment_id,
         artifact_descriptor_core_hash: job.artifact_descriptor_core_hash()?,
+        payload_sha256: job
+            .payload_sha256
+            .as_slice()
+            .try_into()
+            .map_err(|_| DeploymentJobError::InvalidPayload)?,
     })
 }
 
@@ -282,8 +290,14 @@ pub enum DeploymentJobError {
     Authority,
     #[error("deployment apply failed: {0}")]
     Apply(#[from] crate::deploy::DeployError),
+    #[error("KBS policy authority update failed: {0}")]
+    Kbs(#[from] crate::kbs::KbsPolicyError),
     #[error("deployment apply limiter closed")]
     ApplyLimiterClosed,
+    #[error("side-effect admission limiter closed")]
+    SideEffectAdmissionClosed,
+    #[error("durable application mutation fence failed: {0}")]
+    Mutation(#[from] crate::mutation_leases::MutationLeaseError),
 }
 
 impl DeploymentJobError {
@@ -300,8 +314,32 @@ impl DeploymentJobError {
             Self::LeaseLost => "lease_lost",
             Self::Authority => "deployment_authority_changed",
             Self::Apply(_) => "deployment_apply_error",
+            Self::Kbs(_) => "kbs_policy_error",
             Self::ApplyLimiterClosed => "apply_limiter_closed",
+            Self::SideEffectAdmissionClosed => "side_effect_admission_closed",
+            Self::Mutation(error) => match error {
+                crate::mutation_leases::MutationLeaseError::Busy => "app_mutation_busy",
+                crate::mutation_leases::MutationLeaseError::Lost => "app_mutation_lease_lost",
+                crate::mutation_leases::MutationLeaseError::AppUnavailable => {
+                    "app_mutation_unavailable"
+                }
+                crate::mutation_leases::MutationLeaseError::AdmissionClosed => {
+                    "side_effect_admission_closed"
+                }
+                crate::mutation_leases::MutationLeaseError::Database(_) => "database_error",
+            },
         }
+    }
+
+    fn should_requeue_without_terminal_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Db(_)
+                | Self::LeaseLost
+                | Self::ApplyLimiterClosed
+                | Self::SideEffectAdmissionClosed
+                | Self::Mutation(_)
+        )
     }
 }
 
@@ -508,11 +546,12 @@ pub async fn process_setup_job(
 /// deployment generation and durable deleting phase are rechecked only after
 /// the advisory lane has been acquired.
 async fn acquire_job_side_effect_lane(
-    pool: &PgPool,
+    state: &AppState,
     job: &ClaimedJob,
     expected_state: &'static str,
+    expected_app_resources: Option<&App>,
 ) -> Result<Transaction<'static, Postgres>, DeploymentJobError> {
-    let mut lane = pool.begin().await?;
+    let mut lane = state.db.begin().await?;
     crate::deploy::lock_app_deployment_lane(&mut lane, job.app_id).await?;
     let current: bool = sqlx::query_scalar(
         "SELECT EXISTS(
@@ -543,6 +582,28 @@ async fn acquire_job_side_effect_lane(
     if !current {
         return Err(DeploymentJobError::LeaseLost);
     }
+    if let Some(expected) = expected_app_resources {
+        let current_resources: Option<(String, Option<String>, Option<String>, String)> =
+            sqlx::query_as(
+                "SELECT domain, tee_domain, custom_domain, namespace
+                   FROM apps
+                  WHERE id = $1 AND org_id = $2",
+            )
+            .bind(job.app_id)
+            .bind(job.org_id)
+            .fetch_optional(&mut *lane)
+            .await?;
+        if current_resources
+            != Some((
+                expected.domain.clone(),
+                expected.tee_domain.clone(),
+                expected.custom_domain.clone(),
+                expected.namespace.clone(),
+            ))
+        {
+            return Err(DeploymentJobError::Authority);
+        }
+    }
     Ok(lane)
 }
 
@@ -558,7 +619,48 @@ async fn process_claimed_setup_job(
         }
         Err(error) => return Err(error),
     };
-    let side_effect_lane = acquire_job_side_effect_lane(&state.db, &job, "setting_up").await?;
+    let mut resources = vec![
+        crate::mutation_leases::ResourceFence::dns(&payload.app.domain),
+        crate::mutation_leases::ResourceFence::dns(
+            payload
+                .app
+                .tee_domain
+                .as_deref()
+                .unwrap_or(&payload.app.domain),
+        ),
+        crate::mutation_leases::ResourceFence::kbs_policy(),
+    ];
+    if let Some(custom_domain) = payload.app.custom_domain.as_deref() {
+        resources.push(crate::mutation_leases::ResourceFence::dns(custom_domain));
+    }
+    let mut mutation = match crate::mutation_leases::claim(
+        state,
+        job.app_id,
+        "deployment_setup",
+        job.deployment_id,
+        false,
+        resources,
+    )
+    .await
+    {
+        Ok(mutation) => mutation,
+        Err(error) => {
+            requeue_setup_job(&state.db, &job, DeploymentJobError::from(error).code()).await?;
+            return Ok(());
+        }
+    };
+    let mut side_effect_lane =
+        match acquire_job_side_effect_lane(state, &job, "setting_up", Some(&payload.app)).await {
+            Ok(lane) => lane,
+            Err(error) => {
+                if matches!(error, DeploymentJobError::Authority) {
+                    mark_setup_failed(&state.db, &job).await?;
+                    reconcile_pending_kbs_with_mutation(state, &mutation).await?;
+                }
+                mutation.finish().await?;
+                return Err(error);
+            }
+        };
 
     let setup = async {
         let tee_domain = payload
@@ -581,48 +683,92 @@ async fn process_claimed_setup_job(
         Ok::<(), crate::dns::DnsError>(())
     };
 
-    let outcome = with_lease_heartbeat(
-        &state.db,
-        job.deployment_id,
-        job.lock_token,
-        "setting_up",
-        setup,
-    )
-    .await?;
+    let outcome = mutation
+        .guard_provider(with_lease_heartbeat(
+            &state.db,
+            job.deployment_id,
+            job.lock_token,
+            "setting_up",
+            setup,
+        ))
+        .await??;
     match outcome {
         Ok(()) => {
-            let result = mark_setup_accepted(&state.db, job.deployment_id, job.lock_token).await;
+            mark_setup_accepted_in_tx(&mut side_effect_lane, job.deployment_id, job.lock_token)
+                .await?;
+            mutation.finish_in_tx(&mut side_effect_lane).await?;
             side_effect_lane.commit().await?;
-            result
+            Ok(())
         }
         Err(error) => {
-            mark_setup_failed(&state.db, &job).await?;
-            let cleanup_job = if job.cleanup_app_on_setup_failure {
-                claim_job(
-                    &state.db,
-                    "cleanup_pending",
-                    "cleaning_up",
-                    Some(job.deployment_id),
-                )
-                .await?
-            } else {
-                None
-            };
+            mutation.assert_current_in_tx(&mut side_effect_lane).await?;
+            mark_setup_failed_in_tx(&mut side_effect_lane, &job).await?;
             side_effect_lane.commit().await?;
-            if let Some(cleanup_job) = cleanup_job {
-                process_cleanup_job(state, cleanup_job).await;
+            if reconcile_pending_kbs_with_mutation(state, &mutation)
+                .await
+                .is_ok()
+            {
+                // DNS may have accepted the failed request, so retain its
+                // app/hostname quarantine while unblocking KBS revocation.
+                release_kbs_resource(&state.db, &mut mutation).await?;
             }
+            mutation
+                .retain_resource_scope_until_reconciled("dns_hostname")
+                .await?;
             Err(DeploymentJobError::Dns(error))
         }
     }
 }
 
+async fn requeue_setup_job(
+    pool: &PgPool,
+    job: &ClaimedJob,
+    _reason: &'static str,
+) -> Result<(), DeploymentJobError> {
+    let result = sqlx::query(
+        "UPDATE deployment_apply_jobs
+            SET state = 'setup_pending',
+                lock_token = NULL,
+                locked_until = NULL,
+                next_attempt_at = clock_timestamp() + $1::interval,
+                last_error_code = NULL,
+                updated_at = clock_timestamp()
+          WHERE deployment_id = $2
+            AND app_id = $3
+            AND org_id = $4
+            AND state = 'setting_up'
+            AND lock_token = $5",
+    )
+    .bind(SETUP_RECOVERY_DELAY_SQL)
+    .bind(job.deployment_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
+    .bind(job.lock_token)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DeploymentJobError::LeaseLost);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 async fn mark_setup_accepted(
     pool: &PgPool,
     deployment_id: Uuid,
     lock_token: Uuid,
 ) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
+    mark_setup_accepted_in_tx(&mut tx, deployment_id, lock_token).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn mark_setup_accepted_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    lock_token: Uuid,
+) -> Result<(), DeploymentJobError> {
     let deployment = sqlx::query(
         "UPDATE deployments
             SET spec_snapshot = jsonb_set(
@@ -636,7 +782,7 @@ async fn mark_setup_accepted(
     )
     .bind(deployment_id)
     .bind(DEPLOYMENT_SETUP_DNS_PENDING)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     if deployment.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
@@ -654,17 +800,26 @@ async fn mark_setup_accepted(
     )
     .bind(deployment_id)
     .bind(lock_token)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     if job.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
     }
-    tx.commit().await?;
     Ok(())
 }
 
 async fn mark_setup_failed(pool: &PgPool, claimed: &ClaimedJob) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, claimed.app_id).await?;
+    mark_setup_failed_in_tx(&mut tx, claimed).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn mark_setup_failed_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    claimed: &ClaimedJob,
+) -> Result<(), DeploymentJobError> {
     let next_setup_state = if claimed.cleanup_app_on_setup_failure {
         DEPLOYMENT_SETUP_CLEANUP_PENDING
     } else {
@@ -695,7 +850,7 @@ async fn mark_setup_failed(pool: &PgPool, claimed: &ClaimedJob) -> Result<(), De
     .bind(claimed.app_id)
     .bind(claimed.org_id)
     .bind(claimed.lock_token)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     if job.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
@@ -720,7 +875,7 @@ async fn mark_setup_failed(pool: &PgPool, claimed: &ClaimedJob) -> Result<(), De
     .bind(next_setup_state)
     .bind(claimed.app_id)
     .bind(claimed.org_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     if deployment.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
@@ -734,14 +889,19 @@ async fn mark_setup_failed(pool: &PgPool, claimed: &ClaimedJob) -> Result<(), De
         )
         .bind(claimed.app_id)
         .bind(claimed.org_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
-    tx.commit().await?;
+    crate::kbs::enqueue_signed_policy_revocation_if_active(tx).await?;
     Ok(())
 }
 
-async fn attempt_setup_cleanup(state: &AppState, app_id: Uuid, org_id: Uuid) -> bool {
+async fn attempt_setup_cleanup(
+    state: &AppState,
+    app_id: Uuid,
+    org_id: Uuid,
+    expected_managed_pair: Option<(&str, &str)>,
+) -> bool {
     if let Err(error) = crate::dns::delete_all_dns_records_for_app(
         &state.db,
         &state.http_client,
@@ -754,6 +914,24 @@ async fn attempt_setup_cleanup(state: &AppState, app_id: Uuid, org_id: Uuid) -> 
             app_id = %app_id,
             error_code = dns_error_code(&error),
             "failed to clean up DNS after deployment setup failure"
+        );
+        return false;
+    }
+    if let Some((app_host, tee_host)) = expected_managed_pair
+        && let Err(error) = crate::dns::delete_managed_dns_pair_by_hostname(
+            &state.db,
+            &state.http_client,
+            state.dns.as_ref(),
+            app_id,
+            app_host,
+            tee_host,
+        )
+        .await
+    {
+        tracing::error!(
+            app_id = %app_id,
+            error_code = dns_error_code(&error),
+            "failed to reconcile provider DNS after setup response loss"
         );
         return false;
     }
@@ -783,19 +961,7 @@ async fn attempt_setup_cleanup(state: &AppState, app_id: Uuid, org_id: Uuid) -> 
         return false;
     }
 
-    if let Err(_error) = sqlx::query("DELETE FROM apps WHERE id = $1 AND org_id = $2")
-        .bind(app_id)
-        .bind(org_id)
-        .execute(&state.db)
-        .await
-    {
-        tracing::error!(
-            app_id = %app_id,
-            error_code = "database_error",
-            "failed to compensate first generic deployment after setup failure"
-        );
-        return false;
-    }
+    let _ = org_id;
     true
 }
 
@@ -808,62 +974,182 @@ async fn process_cleanup_job(state: &AppState, job: ClaimedJob) {
         );
         return;
     }
-    let side_effect_lane = match acquire_job_side_effect_lane(&state.db, &job, "cleaning_up").await
+    let expected_app = job.decode_payload().ok().map(|payload| payload.app);
+    let hostnames = match sqlx::query_scalar::<_, String>(
+        "SELECT hostname FROM dns_records WHERE app_id = $1 ORDER BY hostname",
+    )
+    .bind(job.app_id)
+    .fetch_all(&state.db)
+    .await
     {
-        Ok(lane) => lane,
+        Ok(hostnames) => hostnames,
+        Err(_) => {
+            let _ = release_cleanup_for_retry(&state.db, job.deployment_id, job.lock_token).await;
+            return;
+        }
+    };
+    let mut resources: Vec<_> = hostnames
+        .iter()
+        .map(|hostname| crate::mutation_leases::ResourceFence::dns(hostname))
+        .collect();
+    if let Some(app) = expected_app.as_ref() {
+        resources.push(crate::mutation_leases::ResourceFence::dns(&app.domain));
+        resources.push(crate::mutation_leases::ResourceFence::dns(
+            app.tee_domain.as_deref().unwrap_or(&app.domain),
+        ));
+        if let Some(custom_domain) = app.custom_domain.as_deref() {
+            resources.push(crate::mutation_leases::ResourceFence::dns(custom_domain));
+        }
+    }
+    let mut mutation = match crate::mutation_leases::claim(
+        state,
+        job.app_id,
+        "deployment_cleanup",
+        job.deployment_id,
+        true,
+        resources,
+    )
+    .await
+    {
+        Ok(mutation) => mutation,
         Err(error) => {
+            let _ = release_cleanup_for_retry(&state.db, job.deployment_id, job.lock_token).await;
             tracing::info!(
                 deployment_id = %job.deployment_id,
-                error_code = error.code(),
-                "skipped stale durable deployment cleanup"
+                error_code = DeploymentJobError::from(error).code(),
+                "deferred durable deployment cleanup behind mutation fence"
             );
             return;
         }
     };
-    let outcome = with_lease_heartbeat(
-        &state.db,
-        job.deployment_id,
-        job.lock_token,
-        "cleaning_up",
-        attempt_setup_cleanup(state, job.app_id, job.org_id),
+    let mut side_effect_lane =
+        match acquire_job_side_effect_lane(state, &job, "cleaning_up", None).await {
+            Ok(lane) => lane,
+            Err(error) => {
+                let _ = mutation.finish().await;
+                tracing::info!(
+                    deployment_id = %job.deployment_id,
+                    error_code = error.code(),
+                    "skipped stale durable deployment cleanup"
+                );
+                return;
+            }
+        };
+    let current_hostnames = match sqlx::query_scalar::<_, String>(
+        "SELECT hostname FROM dns_records WHERE app_id = $1 ORDER BY hostname",
     )
-    .await;
-    if let Err(error) = side_effect_lane.commit().await {
+    .bind(job.app_id)
+    .fetch_all(&mut *side_effect_lane)
+    .await
+    {
+        Ok(hostnames) => hostnames,
+        Err(_) => return,
+    };
+    if current_hostnames != hostnames {
+        if mutation.finish_in_tx(&mut side_effect_lane).await.is_ok()
+            && release_cleanup_for_retry_in_tx(
+                &mut side_effect_lane,
+                job.deployment_id,
+                job.lock_token,
+            )
+            .await
+            .is_ok()
+        {
+            let _ = side_effect_lane.commit().await;
+        }
+        return;
+    }
+    let outcome = mutation
+        .guard_provider(with_lease_heartbeat(
+            &state.db,
+            job.deployment_id,
+            job.lock_token,
+            "cleaning_up",
+            attempt_setup_cleanup(
+                state,
+                job.app_id,
+                job.org_id,
+                expected_app.as_ref().map(|app| {
+                    (
+                        app.domain.as_str(),
+                        app.tee_domain.as_deref().unwrap_or(&app.domain),
+                    )
+                }),
+            ),
+        ))
+        .await;
+    match outcome {
+        Ok(Ok(true)) => {
+            if mutation.finish_in_tx(&mut side_effect_lane).await.is_err() {
+                return;
+            }
+            if sqlx::query("DELETE FROM apps WHERE id = $1 AND org_id = $2")
+                .bind(job.app_id)
+                .bind(job.org_id)
+                .execute(&mut *side_effect_lane)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        Ok(Ok(false)) => {
+            if mutation
+                .assert_current_in_tx(&mut side_effect_lane)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if mutation
+                .retain_resource_scope_until_reconciled_in_tx(&mut side_effect_lane, "dns_hostname")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if let Err(error) = release_cleanup_for_retry_in_tx(
+                &mut side_effect_lane,
+                job.deployment_id,
+                job.lock_token,
+            )
+            .await
+            {
+                tracing::error!(deployment_id = %job.deployment_id, error_code = error.code(), "failed to schedule durable deployment cleanup retry");
+                return;
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::error!(deployment_id = %job.deployment_id, error_code = error.code(), "durable deployment cleanup lost its lease");
+            return;
+        }
+        Err(_) => {
+            tracing::error!(deployment_id = %job.deployment_id, error_code = "app_mutation_lease_lost", "durable deployment cleanup lost provider mutation authority");
+            return;
+        }
+    }
+    if side_effect_lane.commit().await.is_err() {
         tracing::error!(
             deployment_id = %job.deployment_id,
             error_code = "database_error",
-            "failed to release durable deployment cleanup lane"
+            "failed to publish durable deployment cleanup"
         );
-        let _ = error;
-        return;
-    }
-    match outcome {
-        Ok(true) => {
-            // Deleting the first-deployment app cascades the deployment and
-            // job rows. If another cleanup owner already completed it, there
-            // is likewise nothing left to publish.
-        }
-        Ok(false) => {
-            if let Err(error) =
-                release_cleanup_for_retry(&state.db, job.deployment_id, job.lock_token).await
-            {
-                tracing::error!(
-                    deployment_id = %job.deployment_id,
-                    error_code = error.code(),
-                    "failed to schedule durable deployment cleanup retry"
-                );
-            }
-        }
-        Err(error) => tracing::error!(
-            deployment_id = %job.deployment_id,
-            error_code = error.code(),
-            "durable deployment cleanup lost its lease"
-        ),
     }
 }
 
 async fn release_cleanup_for_retry(
     pool: &PgPool,
+    deployment_id: Uuid,
+    lock_token: Uuid,
+) -> Result<(), DeploymentJobError> {
+    let mut tx = pool.begin().await?;
+    release_cleanup_for_retry_in_tx(&mut tx, deployment_id, lock_token).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn release_cleanup_for_retry_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
     deployment_id: Uuid,
     lock_token: Uuid,
 ) -> Result<(), DeploymentJobError> {
@@ -883,7 +1169,7 @@ async fn release_cleanup_for_retry(
     .bind(DEPLOYMENT_SETUP_FAILED_MESSAGE)
     .bind(deployment_id)
     .bind(lock_token)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     if result.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
@@ -1070,13 +1356,37 @@ async fn process_apply_job(
     .await;
 
     match result {
-        Ok(Ok(JobApplyOutcome::Applied(outcome))) => {
-            if let Err(error) = publish_rollout_outcome(&state.db, &job, &outcome).await {
+        Ok(Ok(JobApplyOutcome::Applied(outcome, mut mutation))) => {
+            let publication = publish_rollout_outcome_with_mutation(
+                &state.db,
+                &job,
+                &outcome,
+                Some(&mut mutation),
+            )
+            .await;
+            if let Err(error) = publication {
                 tracing::error!(
                     deployment_id = %deployment_id,
                     error_code = error.code(),
                     "failed to publish durable deployment rollout outcome"
                 );
+            } else if outcome.deploy_status == "failed" {
+                match reconcile_pending_kbs_with_mutation(&state, &mutation).await {
+                    Ok(()) => {
+                        if let Err(error) = release_kbs_resource(&state.db, &mut mutation).await {
+                            tracing::error!(
+                                deployment_id = %deployment_id,
+                                error_code = error.code(),
+                                "failed to release reconciled rollout KBS fence"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::error!(
+                        deployment_id = %deployment_id,
+                        error_code = error.code(),
+                        "failed rollout revocation remains durably pending"
+                    ),
+                }
             }
         }
         Ok(Ok(JobApplyOutcome::AlreadyTerminal)) => {
@@ -1087,6 +1397,18 @@ async fn process_apply_job(
                     deployment_id = %deployment_id,
                     error_code = error.code(),
                     "failed to complete terminal durable deployment job"
+                );
+            }
+        }
+        Ok(Ok(JobApplyOutcome::ApplyFailed(error, mut mutation))) => {
+            fail_apply_job_with_mutation(&state, &job, &error, Some(&mut mutation)).await;
+        }
+        Ok(Err(error)) if error.should_requeue_without_terminal_failure() => {
+            if let Err(requeue_error) = requeue_apply_job(&state.db, &job, error.code()).await {
+                tracing::error!(
+                    deployment_id = %deployment_id,
+                    error_code = requeue_error.code(),
+                    "failed to requeue durable deployment after transient contention"
                 );
             }
         }
@@ -1101,6 +1423,38 @@ async fn process_apply_job(
             );
         }
     }
+}
+
+async fn requeue_apply_job(
+    pool: &PgPool,
+    job: &ClaimedJob,
+    _reason: &'static str,
+) -> Result<(), DeploymentJobError> {
+    let result = sqlx::query(
+        "UPDATE deployment_apply_jobs
+            SET state = 'pending',
+                lock_token = NULL,
+                locked_until = NULL,
+                next_attempt_at = clock_timestamp() + $1::interval,
+                last_error_code = NULL,
+                updated_at = clock_timestamp()
+          WHERE deployment_id = $2
+            AND app_id = $3
+            AND org_id = $4
+            AND state = 'running'
+            AND lock_token = $5",
+    )
+    .bind(APPLY_RETRY_INTERVAL_SQL)
+    .bind(job.deployment_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
+    .bind(job.lock_token)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DeploymentJobError::LeaseLost);
+    }
+    Ok(())
 }
 
 async fn fail_unreadable_job(pool: &PgPool, claimed: &ClaimedJob, claimed_state: &str) {
@@ -1123,8 +1477,12 @@ async fn fail_unreadable_job(pool: &PgPool, claimed: &ClaimedJob, claimed_state:
     } else {
         DEPLOYMENT_SETUP_FAILED
     };
-    let result = async {
+    let result: Result<(), DeploymentJobError> = async {
         let mut tx = pool.begin().await?;
+        // Canonical publication order: advisory app lane, durable job row,
+        // deployment row, then app row.  Every acceptance/deletion/rollback
+        // writer uses the same outer lane, preventing row-lock inversion.
+        crate::deploy::lock_app_deployment_lane(&mut tx, claimed.app_id).await?;
         let job = sqlx::query(
             "UPDATE deployment_apply_jobs
                 SET state = $1,
@@ -1152,7 +1510,7 @@ async fn fail_unreadable_job(pool: &PgPool, claimed: &ClaimedJob, claimed_state:
         .execute(&mut *tx)
         .await?;
         if job.rows_affected() != 1 {
-            return Err(sqlx::Error::RowNotFound);
+            return Err(DeploymentJobError::LeaseLost);
         }
         sqlx::query(
             "UPDATE deployments
@@ -1201,7 +1559,9 @@ async fn fail_unreadable_job(pool: &PgPool, claimed: &ClaimedJob, claimed_state:
         .bind(claimed.org_id)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx).await?;
+        tx.commit().await?;
+        Ok::<(), DeploymentJobError>(())
     }
     .await;
 
@@ -1220,9 +1580,13 @@ async fn fail_unreadable_job(pool: &PgPool, claimed: &ClaimedJob, claimed_state:
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum JobApplyOutcome {
-    Applied(DeploymentRolloutOutcome),
+    Applied(
+        DeploymentRolloutOutcome,
+        crate::mutation_leases::AppMutationLease,
+    ),
+    ApplyFailed(DeploymentJobError, crate::mutation_leases::AppMutationLease),
     AlreadyTerminal,
 }
 
@@ -1241,37 +1605,55 @@ async fn apply_claimed_job(
     // granted. The latest org keyring can change while this future waits.
     validate_apply_artifacts(state, job, payload, &primary_image_digest).await?;
 
-    let Some((apply_permit, authority_lane, validated)) =
+    let Some((apply_permit, mut mutation, authority_lane, validated)) =
         acquire_apply_permit_and_revalidate(state, job, payload).await?
     else {
         return Ok(JobApplyOutcome::AlreadyTerminal);
     };
 
-    let rollout = crate::deploy::apply_deployment_manifests(ApplyDeploymentManifestsRequest {
-        pool: state.db.clone(),
-        app: payload.app.clone(),
-        snapshot: payload.snapshot.clone(),
-        // The operation deployment remains distinct from the historical
-        // source/artifact deployment used by rollback signatures. Manifests
-        // and encrypted log frame metadata report this new operation ID.
-        deployment_id: job.deployment_id,
-        attestation_config: payload.attestation_config.clone(),
-        kbs_policy_config: state.kbs_policy.clone(),
-        api_signing_pubkey: payload.api_signing_pubkey.clone(),
-        api_url: payload.api_url.clone(),
-        workload_artifact_binding: validated.workload_artifact_binding,
-        signed_policy_artifact: validated.signed_policy_artifact,
-        local_workload_artifacts_json: validated.local_workload_artifacts_json,
-        local_trustee_policy_json: validated.local_trustee_policy_json,
-        log_encryption: payload.log_encryption.clone(),
-    })
-    .await?;
-    authority_lane.commit().await?;
+    let edge_config_generation = mutation
+        .resource_generation(&crate::mutation_leases::ResourceFence::edge_config())
+        .ok_or(crate::mutation_leases::MutationLeaseError::Lost)?;
+    let rollout = mutation
+        .guard_provider(crate::deploy::apply_deployment_manifests(
+            ApplyDeploymentManifestsRequest {
+                pool: state.db.clone(),
+                app: payload.app.clone(),
+                snapshot: payload.snapshot.clone(),
+                // The operation deployment remains distinct from the historical
+                // source/artifact deployment used by rollback signatures. Manifests
+                // and encrypted log frame metadata report this new operation ID.
+                deployment_id: job.deployment_id,
+                attestation_config: payload.attestation_config.clone(),
+                kbs_policy_config: state.kbs_policy.clone(),
+                edge_config_generation,
+                api_signing_pubkey: payload.api_signing_pubkey.clone(),
+                api_url: payload.api_url.clone(),
+                workload_artifact_binding: validated.workload_artifact_binding,
+                signed_policy_artifact: validated.signed_policy_artifact,
+                local_workload_artifacts_json: validated.local_workload_artifacts_json,
+                local_trustee_policy_json: validated.local_trustee_policy_json,
+                log_encryption: payload.log_encryption.clone(),
+            },
+        ))
+        .await?;
+    let mut authority_lane = authority_lane;
     drop(apply_permit);
+    let rollout = match rollout {
+        Ok(rollout) => rollout,
+        Err(error) => {
+            authority_lane.commit().await?;
+            return Ok(JobApplyOutcome::ApplyFailed(error.into(), mutation));
+        }
+    };
     let Some(rollout) = rollout else {
+        mutation.finish_in_tx(&mut authority_lane).await?;
+        authority_lane.commit().await?;
         return Ok(JobApplyOutcome::AlreadyTerminal);
     };
-    Ok(JobApplyOutcome::Applied(rollout.watch().await))
+    authority_lane.commit().await?;
+    let outcome = mutation.guard_provider(rollout.watch()).await?;
+    Ok(JobApplyOutcome::Applied(outcome, mutation))
 }
 
 async fn acquire_apply_permit_and_revalidate(
@@ -1281,6 +1663,7 @@ async fn acquire_apply_permit_and_revalidate(
 ) -> Result<
     Option<(
         tokio::sync::OwnedSemaphorePermit,
+        crate::mutation_leases::AppMutationLease,
         Transaction<'static, Postgres>,
         ValidatedApplyArtifacts,
     )>,
@@ -1292,6 +1675,29 @@ async fn acquire_apply_permit_and_revalidate(
         .acquire_owned()
         .await
         .map_err(|_| DeploymentJobError::ApplyLimiterClosed)?;
+    // Keep the apply-specific queue outside durable mutation admission. The
+    // mutation claim acquires exactly one shared permit before any connection.
+    let mut resources = vec![
+        crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &payload.app.namespace),
+        crate::mutation_leases::ResourceFence::kbs_policy(),
+        crate::mutation_leases::ResourceFence::edge_config(),
+        crate::mutation_leases::ResourceFence::edge(&payload.app.domain),
+    ];
+    if let Some(tee_domain) = payload.app.tee_domain.as_deref() {
+        resources.push(crate::mutation_leases::ResourceFence::edge(tee_domain));
+    }
+    if let Some(custom_domain) = payload.app.custom_domain.as_deref() {
+        resources.push(crate::mutation_leases::ResourceFence::edge(custom_domain));
+    }
+    let mut mutation = crate::mutation_leases::claim(
+        state,
+        job.app_id,
+        "deployment_apply",
+        job.deployment_id,
+        false,
+        resources,
+    )
+    .await?;
 
     // Revalidate every mutable authority immediately before external side
     // effects while holding the global authority order. Keyring rotation,
@@ -1303,60 +1709,83 @@ async fn acquire_apply_permit_and_revalidate(
     crate::signing_service::lock_org_signing_authority_lane(&mut authority_lane, job.org_id)
         .await?;
     crate::deploy::lock_app_deployment_lane(&mut authority_lane, job.app_id).await?;
-    let current_job: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-             SELECT 1
-               FROM deployment_apply_jobs
-              WHERE deployment_id = $1
-                AND app_id = $2
-                AND org_id = $3
-                AND state = 'running'
-                AND lock_token = $4
-         )",
-    )
-    .bind(job.deployment_id)
-    .bind(job.app_id)
-    .bind(job.org_id)
-    .bind(job.lock_token)
-    .fetch_one(&mut *authority_lane)
-    .await?;
-    if !current_job
-        || !crate::deploy::deployment_is_active_for_apply(
+    let validation: Result<Option<ValidatedApplyArtifacts>, DeploymentJobError> = async {
+        let current_job: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1
+                   FROM deployment_apply_jobs
+                  WHERE deployment_id = $1
+                    AND app_id = $2
+                    AND org_id = $3
+                    AND state = 'running'
+                    AND lock_token = $4
+             )",
+        )
+        .bind(job.deployment_id)
+        .bind(job.app_id)
+        .bind(job.org_id)
+        .bind(job.lock_token)
+        .fetch_one(&mut *authority_lane)
+        .await?;
+        if !current_job
+            || !crate::deploy::deployment_is_active_for_apply(
+                &mut authority_lane,
+                job.app_id,
+                job.deployment_id,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
+
+        let expected_authority = crate::deploy::ExistingAppAuthoritySnapshot::new(
+            payload.app.updated_at,
+            payload.snapshot.containers.clone(),
+            payload.snapshot.resources.clone(),
+        );
+        if !crate::deploy::verify_existing_app_authority(
             &mut authority_lane,
             job.app_id,
-            job.deployment_id,
+            &expected_authority,
         )
         .await?
-    {
-        drop(apply_permit);
-        return Ok(None);
+        {
+            return Err(DeploymentJobError::Authority);
+        }
+        crate::routes::deployments::enforce_authoritative_entitlement(
+            &mut authority_lane,
+            job.org_id,
+            &payload.snapshot.resources,
+            false,
+        )
+        .await
+        .map_err(|_| DeploymentJobError::Authority)?;
+        let primary_image_digest =
+            validate_canonical_source_snapshot(&state.db, job, payload).await?;
+        validate_apply_artifacts(state, job, payload, &primary_image_digest)
+            .await
+            .map(Some)
     }
-
-    let expected_authority = crate::deploy::ExistingAppAuthoritySnapshot::new(
-        payload.app.updated_at,
-        payload.snapshot.containers.clone(),
-        payload.snapshot.resources.clone(),
-    );
-    if !crate::deploy::verify_existing_app_authority(
-        &mut authority_lane,
-        job.app_id,
-        &expected_authority,
-    )
-    .await?
-    {
-        return Err(DeploymentJobError::Authority);
-    }
-    crate::routes::deployments::enforce_authoritative_entitlement(
-        &mut authority_lane,
-        job.org_id,
-        &payload.snapshot.resources,
-        false,
-    )
-    .await
-    .map_err(|_| DeploymentJobError::Authority)?;
-    let primary_image_digest = validate_canonical_source_snapshot(&state.db, job, payload).await?;
-    let validated = validate_apply_artifacts(state, job, payload, &primary_image_digest).await?;
-    Ok(Some((apply_permit, authority_lane, validated)))
+    .await;
+    let validated = match validation {
+        Ok(Some(validated)) => validated,
+        Ok(None) => {
+            mutation.finish_in_tx(&mut authority_lane).await?;
+            authority_lane.commit().await?;
+            drop(apply_permit);
+            return Ok(None);
+        }
+        Err(error) => {
+            // No provider future has been polled yet, so releasing this claim
+            // is safe and avoids quarantining KBS/namespace resources for a
+            // stale job or deterministic authority rejection.
+            mutation.finish_in_tx(&mut authority_lane).await?;
+            authority_lane.commit().await?;
+            drop(apply_permit);
+            return Err(error);
+        }
+    };
+    Ok(Some((apply_permit, mutation, authority_lane, validated)))
 }
 
 #[derive(Debug)]
@@ -1585,12 +2014,75 @@ async fn deployment_is_terminal(
 }
 
 async fn fail_apply_job(state: &AppState, job: &ClaimedJob, error: &DeploymentJobError) {
-    if let Err(db_error) = publish_apply_failure(&state.db, job).await {
-        tracing::error!(
-            deployment_id = %job.deployment_id,
-            error_code = db_error.code(),
-            "failed to atomically publish durable deployment failure"
-        );
+    fail_apply_job_with_mutation(state, job, error, None).await;
+}
+
+async fn reconcile_pending_kbs_with_mutation(
+    state: &AppState,
+    mutation: &crate::mutation_leases::AppMutationLease,
+) -> Result<(), DeploymentJobError> {
+    mutation
+        .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
+            &state.db,
+            state.kbs_policy.as_ref(),
+        ))
+        .await??;
+    Ok(())
+}
+
+async fn release_kbs_resource(
+    pool: &PgPool,
+    mutation: &mut crate::mutation_leases::AppMutationLease,
+) -> Result<(), DeploymentJobError> {
+    let mut tx = pool.begin().await?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, mutation.app_id()).await?;
+    mutation
+        .release_resource_in_tx(
+            &mut tx,
+            &crate::mutation_leases::ResourceFence::kbs_policy(),
+        )
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn fail_apply_job_with_mutation(
+    state: &AppState,
+    job: &ClaimedJob,
+    error: &DeploymentJobError,
+    mut mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
+) {
+    let published =
+        match publish_apply_failure_with_mutation(&state.db, job, mutation.as_deref_mut()).await {
+            Ok(()) => true,
+            Err(db_error) => {
+                tracing::error!(
+                    deployment_id = %job.deployment_id,
+                    error_code = db_error.code(),
+                    "failed to atomically publish durable deployment failure"
+                );
+                false
+            }
+        };
+    if published && let Some(mutation) = mutation {
+        if reconcile_pending_kbs_with_mutation(state, mutation)
+            .await
+            .is_ok()
+        {
+            if let Err(release_error) = release_kbs_resource(&state.db, mutation).await {
+                tracing::error!(
+                    deployment_id = %job.deployment_id,
+                    error_code = release_error.code(),
+                    "failed to release reconciled global KBS mutation fence"
+                );
+            }
+        } else {
+            tracing::error!(
+                deployment_id = %job.deployment_id,
+                error_code = "kbs_policy_reconciliation_failed",
+                "terminal deployment revocation remains durably pending"
+            );
+        }
     }
     tracing::error!(
         app_id = %job.app_id,
@@ -1626,14 +2118,16 @@ async fn lock_owned_running_job(
     Ok(())
 }
 
-async fn publish_rollout_outcome(
+async fn publish_rollout_outcome_with_mutation(
     pool: &PgPool,
     job: &ClaimedJob,
     outcome: &DeploymentRolloutOutcome,
+    mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
 ) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
-    // The lease row is always checked and locked before any tenant-visible
-    // deployment or app state can be changed.
+    // Canonical order shared with acceptance/delete/rollback/unlock:
+    // app advisory lane -> job row -> deployment row -> app row.
+    crate::deploy::lock_app_deployment_lane(&mut tx, job.app_id).await?;
     lock_owned_running_job(&mut tx, job).await?;
     let deployment = sqlx::query_as::<_, (Uuid, Uuid, DeployStatus, Option<String>)>(
         "SELECT app_id, org_id, status, manifest_hash
@@ -1681,11 +2175,21 @@ async fn publish_rollout_outcome(
         "UPDATE apps
             SET status = $1::app_status_enum,
                 updated_at = clock_timestamp()
-          WHERE id = $2 AND org_id = $3",
+          WHERE id = $2
+            AND org_id = $3
+            AND status <> 'deleting'::app_status_enum
+            AND $4 = (
+                SELECT latest.deployment_id
+                  FROM deployment_apply_jobs AS latest
+                 WHERE latest.app_id = $2
+                 ORDER BY latest.generation DESC
+                 LIMIT 1
+            )",
     )
     .bind(outcome.app_status)
     .bind(job.app_id)
     .bind(job.org_id)
+    .bind(job.deployment_id)
     .execute(&mut *tx)
     .await?;
     if app_result.rows_affected() != 1 {
@@ -1709,12 +2213,39 @@ async fn publish_rollout_outcome(
     if job_result.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
     }
+    let failed = outcome.deploy_status == "failed";
+    if failed {
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx).await?;
+    }
+    if let Some(mutation) = mutation {
+        if failed {
+            // Keep the global/provider generations until the newly-enqueued
+            // signed-policy revocation has converged after commit.
+            mutation.assert_current_in_tx(&mut tx).await?;
+        } else {
+            mutation.finish_in_tx(&mut tx).await?;
+        }
+    }
     tx.commit().await?;
     Ok(())
 }
 
-async fn publish_apply_failure(pool: &PgPool, job: &ClaimedJob) -> Result<(), DeploymentJobError> {
+#[cfg(test)]
+async fn publish_rollout_outcome(
+    pool: &PgPool,
+    job: &ClaimedJob,
+    outcome: &DeploymentRolloutOutcome,
+) -> Result<(), DeploymentJobError> {
+    publish_rollout_outcome_with_mutation(pool, job, outcome, None).await
+}
+
+async fn publish_apply_failure_with_mutation(
+    pool: &PgPool,
+    job: &ClaimedJob,
+    mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
+) -> Result<(), DeploymentJobError> {
     let mut tx = pool.begin().await?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, job.app_id).await?;
     lock_owned_running_job(&mut tx, job).await?;
     let deployment = sqlx::query_as::<_, (Uuid, Uuid, DeployStatus)>(
         "SELECT app_id, org_id, status
@@ -1759,10 +2290,20 @@ async fn publish_apply_failure(pool: &PgPool, job: &ClaimedJob) -> Result<(), De
         "UPDATE apps
             SET status = 'failed'::app_status_enum,
                 updated_at = clock_timestamp()
-          WHERE id = $1 AND org_id = $2",
+          WHERE id = $1
+            AND org_id = $2
+            AND status <> 'deleting'::app_status_enum
+            AND $3 = (
+                SELECT latest.deployment_id
+                  FROM deployment_apply_jobs AS latest
+                 WHERE latest.app_id = $1
+                 ORDER BY latest.generation DESC
+                 LIMIT 1
+            )",
     )
     .bind(job.app_id)
     .bind(job.org_id)
+    .bind(job.deployment_id)
     .execute(&mut *tx)
     .await?;
     if app_result.rows_affected() != 1 {
@@ -1787,8 +2328,21 @@ async fn publish_apply_failure(pool: &PgPool, job: &ClaimedJob) -> Result<(), De
     if job_result.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
     }
+    crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx).await?;
+    if let Some(mutation) = mutation {
+        // A deploy error can follow partial Kubernetes/KBS publication or a
+        // local timeout. Fence the terminal DB publication, but deliberately
+        // retain the provider generations through their reclaim quarantine so
+        // a late response cannot clobber the next accepted generation.
+        mutation.assert_current_in_tx(&mut tx).await?;
+    }
     tx.commit().await?;
     Ok(())
+}
+
+#[cfg(test)]
+async fn publish_apply_failure(pool: &PgPool, job: &ClaimedJob) -> Result<(), DeploymentJobError> {
+    publish_apply_failure_with_mutation(pool, job, None).await
 }
 
 async fn finish_job(
@@ -1834,7 +2388,7 @@ where
     // Renew immediately after the claim transaction commits and before the
     // future is first polled. `clock_timestamp()` is wall-clock time even in a
     // long transaction; `now()` would reuse the transaction start timestamp.
-    renew_job_lease(pool, deployment_id, lock_token, state).await?;
+    renew_job_lease_bounded(pool, deployment_id, lock_token, state).await?;
     tokio::pin!(future);
     let mut heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
@@ -1846,10 +2400,24 @@ where
         tokio::select! {
             output = &mut future => return Ok(output),
             _ = heartbeat.tick() => {
-                renew_job_lease(pool, deployment_id, lock_token, state).await?;
+                renew_job_lease_bounded(pool, deployment_id, lock_token, state).await?;
             }
         }
     }
+}
+
+async fn renew_job_lease_bounded(
+    pool: &PgPool,
+    deployment_id: Uuid,
+    lock_token: Uuid,
+    state: &str,
+) -> Result<(), DeploymentJobError> {
+    tokio::time::timeout(
+        HEARTBEAT_RENEW_TIMEOUT,
+        renew_job_lease(pool, deployment_id, lock_token, state),
+    )
+    .await
+    .map_err(|_| DeploymentJobError::LeaseLost)?
 }
 
 async fn renew_job_lease(
@@ -3366,6 +3934,7 @@ mod tests {
         state.db = pool.clone();
         state.dns = Some(crate::dns::DnsConfig {
             cloudflare_api_token: "unused-test-token".to_string(),
+            cloudflare_api_base_url: "http://127.0.0.1:1".to_string(),
             cloudflare_zone_id: Some("unused-test-zone".to_string()),
             cloudflare_zone_name: "outside.example.test".to_string(),
             target: "127.0.0.1".to_string(),
@@ -3643,6 +4212,272 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete keyring revalidation fixture");
+    }
+
+    #[tokio::test]
+    async fn cross_app_kbs_fence_contention_requeues_without_terminal_failure() {
+        let pool = database_test_pool().await;
+        let (holder_app, _, _, _) = insert_job_fixture(&pool).await;
+        let (queued_app, queued_deployment, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+        state.deployment_apply_permits = Arc::new(tokio::sync::Semaphore::new(2));
+        state.require_customer_signed_policy_artifact = false;
+        state.attestation = None;
+
+        let holder = crate::mutation_leases::claim(
+            &state,
+            holder_app.id,
+            "other_app_kbs_publish",
+            Uuid::new_v4(),
+            false,
+            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+        )
+        .await
+        .expect("hold global KBS generation for another app");
+
+        let setup = claim_job(
+            &pool,
+            "setup_pending",
+            "setting_up",
+            Some(queued_deployment),
+        )
+        .await
+        .expect("claim queued setup")
+        .expect("queued setup exists");
+        mark_setup_accepted(&pool, queued_deployment, setup.lock_token)
+            .await
+            .expect("accept queued setup without provider side effect");
+        let apply = claim_job(&pool, "pending", "running", Some(queued_deployment))
+            .await
+            .expect("claim queued apply")
+            .expect("queued apply exists");
+        let worker_slot = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("acquire test worker slot");
+        process_apply_job(state.clone(), apply, worker_slot).await;
+
+        let (job_state, token, deployment_status, app_status): (
+            String,
+            Option<Uuid>,
+            DeployStatus,
+            crate::models::AppStatus,
+        ) = sqlx::query_as(
+            "SELECT job.state, job.lock_token, deployment.status, app.status
+               FROM deployment_apply_jobs AS job
+               JOIN deployments AS deployment ON deployment.id = job.deployment_id
+               JOIN apps AS app ON app.id = job.app_id
+              WHERE job.deployment_id = $1",
+        )
+        .bind(queued_deployment)
+        .fetch_one(&pool)
+        .await
+        .expect("read requeued deployment");
+        assert_eq!(job_state, "pending");
+        assert!(token.is_none());
+        assert_eq!(deployment_status, DeployStatus::Pending);
+        assert_ne!(app_status, crate::models::AppStatus::Failed);
+
+        holder.finish().await.expect("release global KBS fence");
+        let retry = crate::mutation_leases::claim(
+            &state,
+            queued_app.id,
+            "retried_kbs_publish",
+            queued_deployment,
+            false,
+            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+        )
+        .await
+        .expect("retry can claim KBS generation after release");
+        retry.finish().await.expect("release retry claim");
+        for org_id in [holder_app.org_id, queued_app.org_id] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .expect("clean KBS contention fixture");
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_apply_releases_pre_provider_app_and_resource_claims() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+        state.deployment_apply_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim stale setup")
+            .expect("stale setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept stale setup");
+        let job = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim stale apply")
+            .expect("stale apply exists");
+        let payload = job.decode_payload().expect("decode stale apply payload");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET lock_token = $2,
+                    locked_until = clock_timestamp() + interval '90 seconds'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("make apply owner stale before final lane validation");
+
+        let result = acquire_apply_permit_and_revalidate(&state, &job, &payload)
+            .await
+            .expect("stale validation returns cleanly");
+        assert!(result.is_none());
+        let app_owned: bool = sqlx::query_scalar(
+            "SELECT owner_token IS NOT NULL FROM app_mutation_leases WHERE app_id = $1",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read released app claim");
+        assert!(!app_owned);
+        let owned_resources: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM external_resource_mutation_leases
+              WHERE owner_token IS NOT NULL
+                AND (
+                    (resource_scope = 'kbs_policy' AND resource_key = 'global')
+                    OR (resource_scope = 'kubernetes_namespace' AND resource_key = $1)
+                )",
+        )
+        .bind(&app.namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("read released provider claims");
+        assert_eq!(owned_resources, 0);
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean stale apply fixture");
+    }
+
+    #[tokio::test]
+    async fn shared_dns_fence_contention_requeues_setup_without_failure() {
+        let pool = database_test_pool().await;
+        let (holder_app, _, _, _) = insert_job_fixture(&pool).await;
+        let (queued_app, queued_deployment, _, _) = insert_job_fixture(&pool).await;
+        let shared_hostname = queued_app.domain.clone();
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+        let holder = crate::mutation_leases::claim(
+            &state,
+            holder_app.id,
+            "other_setup_dns",
+            Uuid::new_v4(),
+            false,
+            vec![crate::mutation_leases::ResourceFence::dns(&shared_hostname)],
+        )
+        .await
+        .expect("hold shared DNS generation");
+        let queued = claim_job(
+            &pool,
+            "setup_pending",
+            "setting_up",
+            Some(queued_deployment),
+        )
+        .await
+        .expect("claim contended setup")
+        .expect("contended setup exists");
+        process_claimed_setup_job(&state, queued)
+            .await
+            .expect("contention is an accepted durable retry");
+        let (job_state, lock_token, deployment_status): (String, Option<Uuid>, DeployStatus) =
+            sqlx::query_as(
+                "SELECT job.state, job.lock_token, deployment.status
+                   FROM deployment_apply_jobs AS job
+                   JOIN deployments AS deployment ON deployment.id = job.deployment_id
+                  WHERE job.deployment_id = $1",
+            )
+            .bind(queued_deployment)
+            .fetch_one(&pool)
+            .await
+            .expect("read requeued setup");
+        assert_eq!(job_state, "setup_pending");
+        assert!(lock_token.is_none());
+        assert_eq!(deployment_status, DeployStatus::Pending);
+        holder
+            .finish()
+            .await
+            .expect("release shared DNS generation");
+        for org_id in [holder_app.org_id, queued_app.org_id] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .expect("clean DNS contention fixture");
+        }
+    }
+
+    #[tokio::test]
+    async fn supersession_rejects_unexpired_mutator_and_accepts_expired_owner() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim supersession setup")
+            .expect("supersession setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept supersession setup");
+        let _running = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim supersession apply")
+            .expect("supersession apply exists");
+
+        let mut blocked = pool.begin().await.expect("begin blocked supersession");
+        crate::deploy::lock_app_deployment_lane(&mut blocked, app.id)
+            .await
+            .expect("lock blocked supersession lane");
+        assert!(matches!(
+            crate::deploy::supersede_incomplete_deployments(&mut blocked, app.id).await,
+            Err(crate::deploy::SupersedeDeploymentError::Busy)
+        ));
+        blocked
+            .rollback()
+            .await
+            .expect("rollback blocked supersession");
+
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET locked_until = clock_timestamp() - interval '1 second'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("expire mutating owner");
+        let mut reclaim = pool.begin().await.expect("begin expired supersession");
+        crate::deploy::lock_app_deployment_lane(&mut reclaim, app.id)
+            .await
+            .expect("lock expired supersession lane");
+        assert_eq!(
+            crate::deploy::supersede_incomplete_deployments(&mut reclaim, app.id)
+                .await
+                .expect("supersede expired owner"),
+            1
+        );
+        reclaim.commit().await.expect("commit expired supersession");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean supersession fixture");
     }
 
     #[tokio::test]
@@ -4053,6 +4888,79 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete stale failure fixture");
+    }
+
+    #[tokio::test]
+    async fn publisher_and_acceptance_share_app_then_job_lock_order() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim lock-order setup")
+            .expect("lock-order setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept lock-order setup");
+        let job = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim lock-order apply")
+            .expect("lock-order apply exists");
+
+        let mut acceptance = pool.begin().await.expect("begin acceptance barrier");
+        crate::deploy::lock_app_deployment_lane(&mut acceptance, app.id)
+            .await
+            .expect("acceptance owns outer app lane");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let publisher_barrier = barrier.clone();
+        let publisher_pool = pool.clone();
+        let publisher = tokio::spawn(async move {
+            publisher_barrier.wait().await;
+            publish_apply_failure(&publisher_pool, &job).await
+        });
+        barrier.wait().await;
+        // Give the publisher a scheduling turn. In the former inverse order it
+        // acquired the job row here and then waited on our app lane.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            sqlx::query(
+                "SELECT deployment_id FROM deployment_apply_jobs
+                  WHERE deployment_id = $1 FOR UPDATE",
+            )
+            .bind(deployment_id)
+            .execute(&mut *acceptance),
+        )
+        .await
+        .expect("app-lane owner is never blocked behind inverse job lock")
+        .expect("acceptance locks job row");
+        acceptance
+            .commit()
+            .await
+            .expect("release acceptance barrier");
+
+        tokio::time::timeout(Duration::from_secs(2), publisher)
+            .await
+            .expect("publisher completes without deadlock")
+            .expect("publisher task joins")
+            .expect("publisher commits after canonical lane wait");
+        let (deployment_status, app_status): (DeployStatus, crate::models::AppStatus) =
+            sqlx::query_as(
+                "SELECT deployment.status, app.status
+                   FROM deployments AS deployment
+                   JOIN apps AS app ON app.id = deployment.app_id
+                  WHERE deployment.id = $1",
+            )
+            .bind(deployment_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read lock-order publication");
+        assert_eq!(deployment_status, DeployStatus::Failed);
+        assert_eq!(app_status, crate::models::AppStatus::Failed);
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean lock-order fixture");
     }
 
     #[tokio::test]

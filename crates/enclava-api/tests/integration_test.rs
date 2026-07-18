@@ -163,6 +163,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
         );
     }
 
+    let side_effect_admission = enclava_api::state::side_effect_admission_for_pool(&pool);
     let state = AppState {
         db: pool.clone(),
         management_mode,
@@ -209,6 +210,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
         signing_service: None,
         require_customer_signed_policy_artifact: false,
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        side_effect_admission,
         internal_auth: Some(InternalAuthConfig::from_plaintext_tokens(
             &["cap-internal-current", "cap-internal-next"],
             &["spiffe://paas.example.test/enclava-paas"],

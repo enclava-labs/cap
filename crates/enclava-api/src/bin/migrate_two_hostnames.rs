@@ -57,6 +57,8 @@ async fn main() -> anyhow::Result<()> {
     ) {
         (Ok(t), Ok(target)) if !t.is_empty() && !target.is_empty() => Some(DnsConfig {
             cloudflare_api_token: t,
+            cloudflare_api_base_url: std::env::var("CLOUDFLARE_API_BASE_URL")
+                .unwrap_or_else(|_| "https://api.cloudflare.com/client/v4".to_string()),
             cloudflare_zone_id: std::env::var("CLOUDFLARE_ZONE_ID")
                 .ok()
                 .filter(|v| !v.is_empty()),
@@ -117,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
             SniRoute::new(&app_host, &app_backend, &app_target)?,
             SniRoute::new(&tee_host, &tee_backend, &tee_target)?,
         ];
-        ensure_haproxy_routes(&pool, &edge, &routes).await?;
+        ensure_haproxy_routes(&pool, &edge, None, &routes).await?;
 
         // Update DB row to point at the new hostnames.
         sqlx::query(

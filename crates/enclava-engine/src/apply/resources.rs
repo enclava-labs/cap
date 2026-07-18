@@ -25,7 +25,7 @@ where
     let api: Api<K> = Api::namespaced(engine.client().clone(), namespace);
     let pp = PatchParams::apply(&engine.config().field_manager);
 
-    let patched = api.patch(name, &pp, &Patch::Apply(resource)).await?;
+    let patched = super::bounded_kube_write(api.patch(name, &pp, &Patch::Apply(resource))).await?;
 
     tracing::info!(
         kind = %K::kind(&Default::default()),

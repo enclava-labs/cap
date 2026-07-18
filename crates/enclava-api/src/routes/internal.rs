@@ -758,6 +758,21 @@ async fn begin_idempotent_request_with_recovery(
         if recovery_at > row.database_now {
             return Err(idempotency_in_progress_error());
         }
+
+        // Capability responses deliberately remain absent from the ledger:
+        // bearer tokens and their endpoint metadata must never become
+        // operator-readable replay state.  Once the capability's DB-authored
+        // validity window has elapsed, close the key with a bounded
+        // reconciliation disposition instead of issuing a second capability.
+        return complete_unrecoverable_idempotency_request(
+            &state.db,
+            key,
+            row.reservation_token,
+            token,
+            row.operation_id.unwrap_or(operation_id),
+            recovery.kind(),
+        )
+        .await;
     }
 
     let updated = sqlx::query(
@@ -966,6 +981,24 @@ async fn complete_idempotent_result(
             finish_idempotent_request(lease, status, &body).await?;
             Err((status, Json(body)))
         }
+    }
+}
+
+/// Return an expiring capability exactly once without persisting it in CAP's
+/// idempotency ledger.  The incomplete row and its DB-authored lease are the
+/// replay marker: callers receive `idempotency_in_progress` while the
+/// capability may still be valid and a bounded reconcile/new-key disposition
+/// after expiry.  Error DTOs remain safe to persist and replay.
+async fn complete_expiring_capability_result(
+    mut lease: IdempotencyLease,
+    result: Result<IdempotencyResponse, InternalRouteError>,
+) -> Result<IdempotencyResponse, InternalRouteError> {
+    match result {
+        Ok(response) => {
+            lease.stop_heartbeat();
+            Ok(response)
+        }
+        Err(error) => complete_idempotent_result(lease, Err(error)).await,
     }
 }
 
@@ -2208,10 +2241,13 @@ pub async fn list_paas_status(
                      d.image_digest,
                      d.error_message
                 FROM deployments d
-                JOIN deployment_apply_jobs apply_job
+                LEFT JOIN deployment_apply_jobs apply_job
                   ON apply_job.deployment_id = d.id
                WHERE d.app_id = a.id
-               ORDER BY apply_job.generation DESC
+               ORDER BY (apply_job.generation IS NOT NULL) DESC,
+                        apply_job.generation DESC NULLS LAST,
+                        d.created_at DESC,
+                        d.id DESC
                LIMIT 1
           ) latest ON TRUE
          WHERE a.org_id = $1
@@ -2315,10 +2351,13 @@ pub async fn list_paas_cluster_status(
                      d.image_digest,
                      d.error_message
                 FROM deployments d
-                JOIN deployment_apply_jobs apply_job
+                LEFT JOIN deployment_apply_jobs apply_job
                   ON apply_job.deployment_id = d.id
                WHERE d.app_id = a.id
-               ORDER BY apply_job.generation DESC
+               ORDER BY (apply_job.generation IS NOT NULL) DESC,
+                        apply_job.generation DESC NULLS LAST,
+                        d.created_at DESC,
+                        d.id DESC
                LIMIT 1
           ) latest ON TRUE
          ORDER BY a.created_at DESC, a.id
@@ -2771,7 +2810,7 @@ pub async fn issue_paas_signer_rotation_token(
         Ok((StatusCode::OK, response))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_expiring_capability_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -2994,7 +3033,7 @@ pub async fn issue_paas_config_token(
         Ok((StatusCode::OK, to_value(response)?))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_expiring_capability_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -3235,7 +3274,7 @@ pub async fn issue_paas_generic_config_token(
         Ok((StatusCode::OK, to_value(response)?))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    let (status, response) = complete_expiring_capability_result(idempotency, result).await?;
     Ok((status, Json(response)))
 }
 
@@ -3431,6 +3470,7 @@ mod tests {
 
     fn idempotency_test_state(pool: sqlx::PgPool) -> AppState {
         let mut state = crate::test_support::lazy_state();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
         state.db = pool;
         state
     }
@@ -4031,7 +4071,7 @@ mod tests {
             "idempotency_request_in_progress"
         );
         expire_idempotency_lease(&pool, &capability_key).await;
-        let reclaimed_capability = expect_idempotency_execution(
+        let (status, body) = expect_idempotency_replay(
             begin_idempotent_request_with_recovery(
                 &state,
                 &capability_key,
@@ -4041,16 +4081,81 @@ mod tests {
                 capability_recovery,
             )
             .await
-            .expect("database-past capability is reclaimable"),
+            .expect("database-past capability is closed for reconciliation"),
         );
-        assert!(reclaimed_capability.reclaimed());
-        finish_idempotent_request(
-            reclaimed_capability,
-            StatusCode::OK,
-            &serde_json::json!({"capability": "renewed"}),
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "idempotency_recovery_required");
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["disposition"], "reconcile_then_retry_with_new_key");
+    }
+
+    #[tokio::test]
+    async fn expiring_capability_plaintext_never_enters_idempotency_ledger() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("capability-confidentiality-{suffix}");
+        let path = "/internal/paas/orgs/org/apps/app/config-token".to_string();
+        let hash = Sha256::digest(format!("capability-{suffix}")).to_vec();
+        let recovery = IdempotencyRecovery::ExpiringCapability {
+            recovery_after_seconds: 360,
+        };
+        let lease = expect_idempotency_execution(
+            begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
+                .await
+                .expect("reserve capability request"),
+        );
+        let secret_token = format!("jwt-secret-marker-{suffix}");
+        let secret_url = format!("https://secret-{suffix}.example.test");
+        let secret_ip = "192.0.2.77";
+        let response = serde_json::json!({
+            "token": secret_token,
+            "tee_url": secret_url,
+            "resolve_ip": secret_ip,
+        });
+        let (status, returned) =
+            complete_expiring_capability_result(lease, Ok((StatusCode::OK, response.clone())))
+                .await
+                .expect("return capability once");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(returned, response);
+
+        let stored: (Option<i32>, Option<serde_json::Value>, bool) = sqlx::query_as(
+            "SELECT response_status, response_body, completed_at IS NOT NULL
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
         )
+        .bind(&key)
+        .fetch_one(&pool)
         .await
-        .expect("complete capability recovery");
+        .expect("read capability ledger marker");
+        assert_eq!(stored, (None, None, false));
+
+        let duplicate =
+            begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
+                .await
+                .err()
+                .expect("live capability cannot be replayed or reissued");
+        assert_eq!(duplicate.1.0["error"], "idempotency_request_in_progress");
+
+        expire_idempotency_lease(&pool, &key).await;
+        let (status, tombstone) = expect_idempotency_replay(
+            begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
+                .await
+                .expect("expired capability closes with tombstone"),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(tombstone["retryable"], false);
+        let ledger_text: String = sqlx::query_scalar(
+            "SELECT response_body::text FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("read capability tombstone");
+        for marker in [secret_token.as_str(), secret_url.as_str(), secret_ip] {
+            assert!(!ledger_text.contains(marker));
+        }
     }
 
     #[tokio::test]

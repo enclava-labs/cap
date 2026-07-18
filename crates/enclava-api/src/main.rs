@@ -128,6 +128,9 @@ fn build_tenant_tee_http_client_with_env(
                     matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
                 }),
         )
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
         .https_only(true);
 
     if let Some(cert_pem) = lookup("TENANT_TEE_CA_CERT_PEM") {
@@ -469,6 +472,8 @@ fn load_dns_config() -> anyhow::Result<Option<DnsConfig>> {
 
     Ok(Some(DnsConfig {
         cloudflare_api_token,
+        cloudflare_api_base_url: std::env::var("CLOUDFLARE_API_BASE_URL")
+            .unwrap_or_else(|_| "https://api.cloudflare.com/client/v4".to_string()),
         cloudflare_zone_id: std::env::var("CLOUDFLARE_ZONE_ID")
             .ok()
             .filter(|v| !v.trim().is_empty()),
@@ -749,6 +754,7 @@ async fn main() {
     let trustee_http_client =
         build_trustee_http_client().expect("failed to build Trustee HTTP client");
 
+    let side_effect_admission = enclava_api::state::side_effect_admission_for_pool(&pool);
     let state = AppState {
         db: pool,
         management_mode,
@@ -772,10 +778,12 @@ async fn main() {
         signing_service,
         require_customer_signed_policy_artifact,
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_applies)),
+        side_effect_admission,
         internal_auth,
     };
 
     enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
+    enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
     let app = build_router(state);
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());

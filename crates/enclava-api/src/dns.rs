@@ -6,6 +6,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct DnsConfig {
     pub cloudflare_api_token: String,
+    pub cloudflare_api_base_url: String,
     pub cloudflare_zone_id: Option<String>,
     pub cloudflare_zone_name: String,
     pub target: String,
@@ -13,6 +14,14 @@ pub struct DnsConfig {
 }
 
 impl DnsConfig {
+    fn api_url(&self, path: &str) -> String {
+        format!(
+            "{}{}",
+            self.cloudflare_api_base_url.trim_end_matches('/'),
+            path
+        )
+    }
+
     pub fn record_type(&self) -> &'static str {
         if self.target.contains(':') {
             "AAAA"
@@ -105,10 +114,7 @@ async fn resolve_zone_id(client: &reqwest::Client, config: &DnsConfig) -> Result
     }
 
     let response = client
-        .get(format!(
-            "https://api.cloudflare.com/client/v4/zones?name={}",
-            config.cloudflare_zone_name
-        ))
+        .get(config.api_url(&format!("/zones?name={}", config.cloudflare_zone_name)))
         .bearer_auth(&config.cloudflare_api_token)
         .send()
         .await?;
@@ -145,9 +151,9 @@ async fn find_record(
 ) -> Result<Option<CloudflareRecord>, DnsError> {
     let record_type = config.record_type();
     let response = client
-        .get(format!(
-            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type={record_type}&name={hostname}&per_page=100"
-        ))
+        .get(config.api_url(&format!(
+            "/zones/{zone_id}/dns_records?type={record_type}&name={hostname}&per_page=100"
+        )))
         .bearer_auth(&config.cloudflare_api_token)
         .send()
         .await?;
@@ -175,9 +181,9 @@ async fn find_record_by_type(
     hostname: &str,
 ) -> Result<Option<CloudflareRecord>, DnsError> {
     let response = client
-        .get(format!(
-            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records?type={record_type}&name={hostname}&per_page=100"
-        ))
+        .get(config.api_url(&format!(
+            "/zones/{zone_id}/dns_records?type={record_type}&name={hostname}&per_page=100"
+        )))
         .bearer_auth(&config.cloudflare_api_token)
         .send()
         .await?;
@@ -204,9 +210,7 @@ async fn create_record(
     hostname: &str,
 ) -> Result<CloudflareRecord, DnsError> {
     let response = client
-        .post(format!(
-            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
-        ))
+        .post(config.api_url(&format!("/zones/{zone_id}/dns_records")))
         .bearer_auth(&config.cloudflare_api_token)
         .json(&serde_json::json!({
             "type": config.record_type(),
@@ -241,9 +245,7 @@ async fn create_record_by_type(
     ttl: u32,
 ) -> Result<CloudflareRecord, DnsError> {
     let response = client
-        .post(format!(
-            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
-        ))
+        .post(config.api_url(&format!("/zones/{zone_id}/dns_records")))
         .bearer_auth(&config.cloudflare_api_token)
         .json(&serde_json::json!({
             "type": record_type,
@@ -276,9 +278,7 @@ async fn update_record(
     hostname: &str,
 ) -> Result<CloudflareRecord, DnsError> {
     let response = client
-        .put(format!(
-            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
-        ))
+        .put(config.api_url(&format!("/zones/{zone_id}/dns_records/{record_id}")))
         .bearer_auth(&config.cloudflare_api_token)
         .json(&serde_json::json!({
             "type": config.record_type(),
@@ -311,9 +311,7 @@ async fn update_record_by_type(
     payload: RecordPayload<'_>,
 ) -> Result<CloudflareRecord, DnsError> {
     let response = client
-        .put(format!(
-            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
-        ))
+        .put(config.api_url(&format!("/zones/{zone_id}/dns_records/{record_id}")))
         .bearer_auth(&config.cloudflare_api_token)
         .json(&serde_json::json!({
             "type": payload.record_type,
@@ -387,10 +385,7 @@ pub async fn delete_txt_record(
         return Ok(());
     };
     let response = client
-        .delete(format!(
-            "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{}",
-            record.id
-        ))
+        .delete(config.api_url(&format!("/zones/{zone_id}/dns_records/{}", record.id)))
         .bearer_auth(&config.cloudflare_api_token)
         .send()
         .await?;
@@ -492,9 +487,7 @@ pub async fn delete_dns_record(
         };
 
         let response = client
-            .delete(format!(
-                "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}"
-            ))
+            .delete(config.api_url(&format!("/zones/{zone_id}/dns_records/{record_id}")))
             .bearer_auth(&config.cloudflare_api_token)
             .send()
             .await?;
@@ -530,6 +523,74 @@ pub async fn delete_dns_record(
         .execute(pool)
         .await?;
 
+    Ok(())
+}
+
+/// Reconcile a managed record by provider hostname even when the create/update
+/// response was lost before CAP could persist the provider record ID.
+pub async fn delete_managed_dns_record_by_hostname(
+    pool: &PgPool,
+    client: &reqwest::Client,
+    config: Option<&DnsConfig>,
+    app_id: Uuid,
+    hostname: &str,
+) -> Result<(), DnsError> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    if !config.manages_hostname(hostname) {
+        return Err(DnsError::OutsideManagedZone(hostname.to_string()));
+    }
+    let conflicting_owner: Option<Uuid> =
+        sqlx::query_scalar("SELECT app_id FROM dns_records WHERE hostname = $1 AND app_id <> $2")
+            .bind(hostname)
+            .bind(app_id)
+            .fetch_optional(pool)
+            .await?;
+    if conflicting_owner.is_some() {
+        return Err(DnsError::HostnameInUse {
+            hostname: hostname.to_string(),
+        });
+    }
+
+    let zone_id = resolve_zone_id(client, config).await?;
+    if let Some(record) = find_record(client, config, &zone_id, hostname).await? {
+        let response = client
+            .delete(config.api_url(&format!("/zones/{zone_id}/dns_records/{}", record.id)))
+            .bearer_auth(&config.cloudflare_api_token)
+            .send()
+            .await?;
+        if response.status() != StatusCode::NOT_FOUND {
+            let status = response.status();
+            let body: CloudflareSingle<serde_json::Value> = response.json().await?;
+            if !status.is_success() || !body.success {
+                return Err(DnsError::Cloudflare(format!(
+                    "delete record for '{hostname}' failed: {}",
+                    cloudflare_error(&body.errors)
+                )));
+            }
+        }
+    }
+    sqlx::query("DELETE FROM dns_records WHERE app_id = $1 AND hostname = $2")
+        .bind(app_id)
+        .bind(hostname)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_managed_dns_pair_by_hostname(
+    pool: &PgPool,
+    client: &reqwest::Client,
+    config: Option<&DnsConfig>,
+    app_id: Uuid,
+    app_host: &str,
+    tee_host: &str,
+) -> Result<(), DnsError> {
+    delete_managed_dns_record_by_hostname(pool, client, config, app_id, app_host).await?;
+    if tee_host != app_host {
+        delete_managed_dns_record_by_hostname(pool, client, config, app_id, tee_host).await?;
+    }
     Ok(())
 }
 
@@ -663,6 +724,7 @@ mod tests {
     fn config() -> DnsConfig {
         DnsConfig {
             cloudflare_api_token: "token".to_string(),
+            cloudflare_api_base_url: "https://api.cloudflare.com/client/v4".to_string(),
             cloudflare_zone_id: None,
             cloudflare_zone_name: "enclava.dev".to_string(),
             target: "95.217.56.248".to_string(),

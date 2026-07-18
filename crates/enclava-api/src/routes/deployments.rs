@@ -1265,7 +1265,15 @@ async fn deploy_app_candidate(
 
     crate::deploy::supersede_incomplete_deployments(&mut tx, app.id)
         .await
-        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+        .map_err(|error| match error {
+            crate::deploy::SupersedeDeploymentError::Busy => json_error(
+                StatusCode::CONFLICT,
+                "deployment mutation is still in progress; retry after its lease completes",
+            ),
+            crate::deploy::SupersedeDeploymentError::Database(_) => {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+            }
+        })?;
 
     // Create deployment record. cosign_verified is set from the actual
     // verification result, not hardcoded.
@@ -1306,6 +1314,16 @@ async fn deploy_app_candidate(
         )
         .await
         .map_err(signing_error_response)?;
+        crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    } else {
+        // An unsigned generation makes a previously-current signed artifact
+        // ineligible.  Persist revocation intent atomically with acceptance;
+        // this is a no-op for installations that never entered signed mode.
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     }
 
     let setup_job = crate::deployment_jobs::insert_setup_job(

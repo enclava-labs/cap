@@ -25,7 +25,7 @@ pub async fn apply_namespace(
     let api: Api<Namespace> = Api::all(engine.client().clone());
     let pp = namespace_patch_params(&engine.config().field_manager);
 
-    let patched = api.patch(name, &pp, &Patch::Apply(namespace)).await?;
+    let patched = super::bounded_kube_write(api.patch(name, &pp, &Patch::Apply(namespace))).await?;
 
     tracing::info!(namespace = %name, "namespace applied via SSA");
     Ok(patched)

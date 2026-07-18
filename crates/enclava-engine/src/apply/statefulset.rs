@@ -24,7 +24,7 @@ pub async fn apply_statefulset(
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
     let pp = PatchParams::apply(&engine.config().field_manager);
 
-    match api.patch(name, &pp, &Patch::Apply(statefulset)).await {
+    match super::bounded_kube_write(api.patch(name, &pp, &Patch::Apply(statefulset))).await {
         Ok(patched) => {
             tracing::info!(
                 namespace = %namespace,
@@ -33,7 +33,7 @@ pub async fn apply_statefulset(
             );
             Ok(patched)
         }
-        Err(kube::Error::Api(ae)) if ae.code == 409 => {
+        Err(ApplyError::Kube(kube::Error::Api(ae))) if ae.code == 409 => {
             tracing::warn!(
                 namespace = %namespace,
                 statefulset = %name,
@@ -43,6 +43,6 @@ pub async fn apply_statefulset(
             );
             Err(ApplyError::Kube(kube::Error::Api(ae)))
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e),
     }
 }

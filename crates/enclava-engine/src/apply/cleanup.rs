@@ -82,7 +82,7 @@ pub async fn scale_statefulset_to_zero(
         "spec": { "replicas": 0 }
     });
     let pp = PatchParams::apply(&engine.config().field_manager).force();
-    api.patch(name, &pp, &Patch::Apply(&patch)).await?;
+    super::bounded_kube_write(api.patch(name, &pp, &Patch::Apply(&patch))).await?;
     tracing::info!(namespace = %namespace, statefulset = %name, "scaled StatefulSet to 0");
 
     // Wait for pods to terminate
@@ -128,12 +128,12 @@ pub async fn delete_statefulset(
 ) -> Result<(), ApplyError> {
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
 
-    match api.delete(name, &DeleteParams::default()).await {
+    match super::bounded_kube_write(api.delete(name, &DeleteParams::default())).await {
         Ok(_) => {
             tracing::info!(namespace = %namespace, statefulset = %name, "StatefulSet deleted");
             Ok(())
         }
-        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+        Err(ApplyError::Kube(kube::Error::Api(ae))) if ae.code == 404 => {
             tracing::info!(
                 namespace = %namespace,
                 statefulset = %name,
@@ -141,7 +141,7 @@ pub async fn delete_statefulset(
             );
             Ok(())
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e),
     }
 }
 
@@ -163,11 +163,11 @@ pub async fn delete_pvcs_and_wait(
 
     for pvc in &pvcs.items {
         let pvc_name = pvc.metadata.name.as_deref().unwrap_or("<unnamed>");
-        match api.delete(pvc_name, &DeleteParams::default()).await {
+        match super::bounded_kube_write(api.delete(pvc_name, &DeleteParams::default())).await {
             Ok(_) => {
                 tracing::info!(namespace = %namespace, pvc = %pvc_name, "PVC delete requested");
             }
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            Err(ApplyError::Kube(kube::Error::Api(ae))) if ae.code == 404 => {
                 tracing::info!(namespace = %namespace, pvc = %pvc_name, "PVC already gone");
             }
             Err(e) => {
@@ -228,15 +228,15 @@ pub async fn delete_namespace_and_wait(
 ) -> Result<(), ApplyError> {
     let api: Api<Namespace> = Api::all(engine.client().clone());
 
-    match api.delete(namespace, &DeleteParams::default()).await {
+    match super::bounded_kube_write(api.delete(namespace, &DeleteParams::default())).await {
         Ok(_) => {
             tracing::info!(namespace = %namespace, "namespace delete requested");
         }
-        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+        Err(ApplyError::Kube(kube::Error::Api(ae))) if ae.code == 404 => {
             tracing::info!(namespace = %namespace, "namespace already deleted");
             return Ok(());
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(e),
     }
 
     // Wait for the namespace to disappear

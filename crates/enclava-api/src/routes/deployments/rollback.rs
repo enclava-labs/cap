@@ -89,6 +89,32 @@ async fn latest_implicit_rollback_target(
     .await
 }
 
+async fn latest_implicit_rollback_target_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app_id: Uuid,
+) -> Result<Option<Deployment>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT deployment.*
+           FROM deployments AS deployment
+           JOIN deployment_apply_jobs AS apply_job
+             ON apply_job.deployment_id = deployment.id
+          WHERE deployment.app_id = $1
+            AND deployment.status = 'healthy'
+            AND deployment.id <> (
+                SELECT latest.deployment_id
+                  FROM deployment_apply_jobs AS latest
+                 WHERE latest.app_id = $1
+                 ORDER BY latest.generation DESC
+                 LIMIT 1
+            )
+         ORDER BY apply_job.generation DESC
+         LIMIT 1",
+    )
+    .bind(app_id)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
 /// POST /apps/{name}/rollback -- rollback to a previous deployment.
 pub async fn rollback(
     auth: AuthContext,
@@ -121,6 +147,7 @@ pub async fn rollback(
         ));
     }
 
+    let implicit_target = body.deployment_id.is_none();
     let prev: Deployment = if let Some(deployment_id) = body.deployment_id {
         sqlx::query_as(
             "SELECT * FROM deployments
@@ -307,6 +334,87 @@ pub async fn rollback(
     crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+
+    if implicit_target {
+        let selected = latest_implicit_rollback_target_in_tx(&mut tx, app.id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+        if selected.as_ref().map(|deployment| deployment.id) != Some(prev.id) {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "rollback target changed while validating; retry the rollback",
+            ));
+        }
+    }
+    let locked_target: Option<Deployment> = sqlx::query_as(
+        "SELECT * FROM deployments
+          WHERE id = $1
+            AND app_id = $2
+            AND org_id = $3
+            AND status = 'healthy'::deploy_status_enum
+          FOR UPDATE",
+    )
+    .bind(prev.id)
+    .bind(app.id)
+    .bind(app.org_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let Some(locked_target) = locked_target else {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "rollback target authority changed; retry the rollback",
+        ));
+    };
+    if locked_target.spec_snapshot != prev.spec_snapshot
+        || locked_target.image_digest != prev.image_digest
+        || locked_target.source_provider != prev.source_provider
+        || locked_target.source_repository != prev.source_repository
+    {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "rollback target authority changed; retry the rollback",
+        ));
+    }
+    let locked_job = sqlx::query_as::<_, (Uuid, bool, Option<Uuid>, Option<Vec<u8>>, Vec<u8>)>(
+        "SELECT source_deployment_id, signed_required,
+                artifact_deployment_id, artifact_descriptor_core_hash,
+                payload_sha256
+           FROM deployment_apply_jobs
+          WHERE deployment_id = $1
+            AND app_id = $2
+            AND org_id = $3
+          FOR UPDATE",
+    )
+    .bind(prev.id)
+    .bind(app.id)
+    .bind(app.org_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let Some((source_id, signed_required_now, artifact_id, artifact_hash, payload_hash)) =
+        locked_job
+    else {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "rollback target has no valid immutable apply snapshot",
+        ));
+    };
+    if source_id != target_authority.source_deployment_id
+        || signed_required_now != target_authority.signed_required
+        || artifact_id != target_authority.artifact_deployment_id
+        || artifact_hash.as_deref()
+            != target_authority
+                .artifact_descriptor_core_hash
+                .as_ref()
+                .map(|hash| hash.as_slice())
+        || payload_hash.as_slice() != target_authority.payload_sha256
+    {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "rollback target authority changed; retry the rollback",
+        ));
+    }
     super::enforce_authoritative_entitlement(&mut tx, auth.org_id, &target_resources, false)
         .await?;
     if let Some(artifacts) = rollback_artifacts.as_ref() {
@@ -375,7 +483,15 @@ pub async fn rollback(
     let deploy_id = Uuid::new_v4();
     crate::deploy::supersede_incomplete_deployments(&mut tx, app.id)
         .await
-        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+        .map_err(|error| match error {
+            crate::deploy::SupersedeDeploymentError::Busy => json_error(
+                StatusCode::CONFLICT,
+                "deployment mutation is still in progress; retry rollback",
+            ),
+            crate::deploy::SupersedeDeploymentError::Database(_) => {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error")
+            }
+        })?;
     let mut rollback_spec_snapshot = prev.spec_snapshot.clone();
     rollback_spec_snapshot[DEPLOYMENT_SETUP_STATE] =
         serde_json::json!(crate::deployment_jobs::DEPLOYMENT_SETUP_ACCEPTED);
@@ -524,6 +640,15 @@ pub async fn rollback(
     )
     .await
     .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    if rollback_artifacts.is_some() {
+        crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    } else {
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    }
     tx.commit().await.map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,

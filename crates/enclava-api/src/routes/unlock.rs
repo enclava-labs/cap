@@ -698,7 +698,13 @@ async fn commit_unlock_mode_transition(
 
     crate::deploy::supersede_incomplete_deployments(&mut tx, locked_app.id)
         .await
-        .map_err(|_| unlock_database_error())?;
+        .map_err(|error| match error {
+            crate::deploy::SupersedeDeploymentError::Busy => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "deployment mutation is still in progress"})),
+            ),
+            crate::deploy::SupersedeDeploymentError::Database(_) => unlock_database_error(),
+        })?;
     sqlx::query(
         "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest)
          VALUES ($1, $2, $3, 'api', $4, $5)",
@@ -751,6 +757,13 @@ async fn commit_unlock_mode_transition(
         )
         .await
         .map_err(|_| unlock_database_error())?;
+        crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
+            .await
+            .map_err(|_| unlock_database_error())?;
+    } else {
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
+            .await
+            .map_err(|_| unlock_database_error())?;
     }
 
     let apply_payload = crate::deployment_jobs::DeploymentApplyJobPayload::new(

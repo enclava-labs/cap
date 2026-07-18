@@ -372,6 +372,7 @@ pub struct ApplyDeploymentManifestsRequest {
     pub deployment_id: Uuid,
     pub attestation_config: Option<AttestationConfig>,
     pub kbs_policy_config: Option<crate::kbs::KbsPolicyConfig>,
+    pub edge_config_generation: i64,
     pub api_signing_pubkey: String,
     pub api_url: String,
     pub workload_artifact_binding: Option<WorkloadArtifactBinding>,
@@ -753,14 +754,20 @@ pub(crate) fn build_confidential_app_from_rows(
     })
 }
 
-async fn latest_deployment_id_for_app(pool: &PgPool, app_id: Uuid) -> Result<Uuid, sqlx::Error> {
+pub(crate) async fn latest_deployment_id_for_app(
+    pool: &PgPool,
+    app_id: Uuid,
+) -> Result<Uuid, sqlx::Error> {
     let deployment_id = sqlx::query_scalar::<_, Uuid>(
         "SELECT deployment.id
            FROM deployments AS deployment
-           JOIN deployment_apply_jobs AS apply_job
+           LEFT JOIN deployment_apply_jobs AS apply_job
              ON apply_job.deployment_id = deployment.id
           WHERE deployment.app_id = $1
-          ORDER BY apply_job.generation DESC
+          ORDER BY (apply_job.generation IS NOT NULL) DESC,
+                   apply_job.generation DESC NULLS LAST,
+                   deployment.created_at DESC,
+                   deployment.id DESC
           LIMIT 1",
     )
     .bind(app_id)
@@ -770,6 +777,14 @@ async fn latest_deployment_id_for_app(pool: &PgPool, app_id: Uuid) -> Result<Uui
 }
 
 pub(crate) const DEPLOYMENT_SUPERSEDED_ERROR: &str = "deployment_superseded";
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SupersedeDeploymentError {
+    #[error("an unexpired deployment mutation is still in progress")]
+    Busy,
+    #[error("database error")]
+    Database(#[from] sqlx::Error),
+}
 
 fn app_deployment_lane_key(app_id: Uuid) -> i64 {
     let (high, low) = app_id.as_u64_pair();
@@ -798,7 +813,36 @@ pub(crate) async fn lock_app_deployment_lane(
 pub(crate) async fn supersede_incomplete_deployments(
     tx: &mut Transaction<'_, Postgres>,
     app_id: Uuid,
-) -> Result<u64, sqlx::Error> {
+) -> Result<u64, SupersedeDeploymentError> {
+    // Never revoke the relational owner of an external mutation while its DB
+    // lease is live. Queued work and expired owners are safe to terminalize;
+    // an active watcher is observation-only and publication remains fenced by
+    // its generation/token after supersession.
+    let active_mutation: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployment_apply_jobs AS job
+               JOIN deployments AS deployment ON deployment.id = job.deployment_id
+              WHERE job.app_id = $1
+                AND job.locked_until >= clock_timestamp()
+                AND (
+                    job.state IN ('setting_up', 'cleaning_up')
+                    OR (
+                        job.state = 'running'
+                        AND deployment.status IN (
+                            'pending'::deploy_status_enum,
+                            'applying'::deploy_status_enum
+                        )
+                    )
+                )
+         )",
+    )
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if active_mutation {
+        return Err(SupersedeDeploymentError::Busy);
+    }
     // Stop every queued or leased operation before terminalizing its
     // deployment. A worker that already holds a lease must acquire the same
     // app lane before any setup/apply/cleanup side effect, so once this update
@@ -1652,9 +1696,12 @@ async fn restart_statefulset_for_ingress(
             }
         }
     });
-    api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
-        .await
-        .map_err(enclava_engine::apply::engine::ApplyError::Kube)?;
+    enclava_engine::apply::bounded_kube_write(api.patch(
+        name,
+        &PatchParams::default(),
+        &Patch::Merge(&patch),
+    ))
+    .await?;
 
     tracing::info!(
         namespace = %namespace,
@@ -1717,6 +1764,7 @@ pub async fn apply_deployment_manifests(
         deployment_id,
         attestation_config,
         kbs_policy_config,
+        edge_config_generation,
         api_signing_pubkey,
         api_url,
         workload_artifact_binding,
@@ -1774,12 +1822,15 @@ pub async fn apply_deployment_manifests(
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
     set_app_status(&pool, app.id, "creating").await?;
 
-    if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
+    if signed_policy_artifact.is_some() {
         if should_reconcile_global_signed_policy_artifacts(true, &app_spec.attestation) {
-            crate::kbs::reconcile_signed_policy_artifacts(
+            // Acceptance already advanced the durable desired generation in
+            // the same transaction that persisted this artifact.  Converge
+            // that generation here while the caller holds the global KBS
+            // mutation fence; do not enqueue a second generation.
+            crate::kbs::reconcile_pending_signed_policy_artifacts(
                 &pool,
                 kbs_policy_config.as_ref(),
-                Some(signed_policy_artifact),
             )
             .await?;
         } else {
@@ -1829,7 +1880,8 @@ pub async fn apply_deployment_manifests(
             &app_target,
         )?);
     }
-    crate::edge::ensure_haproxy_routes(&pool, &edge_config, &routes).await?;
+    crate::edge::ensure_haproxy_routes(&pool, &edge_config, Some(edge_config_generation), &routes)
+        .await?;
     set_deployment_status(&pool, deployment_id, "watching", Some(&hash), None, false).await?;
 
     Ok(Some(DeploymentRollout {

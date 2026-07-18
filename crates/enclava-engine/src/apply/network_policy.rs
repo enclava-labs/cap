@@ -78,7 +78,7 @@ pub async fn apply_network_policy(
     let api: Api<DynamicObject> = Api::namespaced_with(engine.client().clone(), namespace, &ar);
     let pp = PatchParams::apply(&engine.config().field_manager);
 
-    let patched = api.patch(name, &pp, &Patch::Apply(&dyn_obj)).await?;
+    let patched = super::bounded_kube_write(api.patch(name, &pp, &Patch::Apply(&dyn_obj))).await?;
 
     tracing::info!(
         namespace = %namespace,

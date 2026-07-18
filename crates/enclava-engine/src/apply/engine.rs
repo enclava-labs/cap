@@ -8,6 +8,9 @@ pub enum ApplyError {
     #[error("Kubernetes API error: {0}")]
     Kube(#[from] kube::Error),
 
+    #[error("Kubernetes mutating request exceeded its 30 second deadline")]
+    ProviderWriteTimeout,
+
     #[error("namespace '{0}' must be created before applying namespaced resources")]
     NamespaceNotReady(String),
 

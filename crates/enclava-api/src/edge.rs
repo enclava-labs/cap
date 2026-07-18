@@ -7,28 +7,19 @@ use k8s_openapi::api::{
 };
 use kube::{
     Api, Client,
-    api::{ApiResource, DynamicObject, Patch, PatchParams},
+    api::{ApiResource, DynamicObject, PostParams},
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::net::IpAddr;
 
-/// Fixed PostgreSQL advisory lock id for serialising HAProxy ConfigMap edits.
-///
-/// The 64-bit value is the truncated SHA-256 of the literal string
-/// "cap-haproxy-config" — chosen so the constant is reproducible from the
-/// label rather than a magic number, and unlikely to clash with any other
-/// advisory lock used elsewhere in the platform. See `haproxy_lock_id` for
-/// the derivation.
-pub const HAPROXY_LOCK_ID: i64 = haproxy_lock_id();
-
 const HAPROXY_CONFIG_GENERATION_ANNOTATION: &str = "config.enclava.dev/haproxy-sha256";
+const HAPROXY_MUTATION_GENERATION_ANNOTATION: &str =
+    "config.enclava.dev/haproxy-mutation-generation";
 const HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES: usize = 900 * 1024;
-
-const fn haproxy_lock_id() -> i64 {
-    0xe9_d6_37_8a_9d_46_b5_88u64 as i64
-}
+const KUBERNETES_CAS_ATTEMPTS: usize = 8;
+const KUBERNETES_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EdgeRouteError {
@@ -36,8 +27,12 @@ pub enum EdgeRouteError {
     Kube(#[from] kube::Error),
     #[error("haproxy ConfigMap {namespace}/{name} is missing data key 'haproxy.cfg'")]
     MissingConfig { namespace: String, name: String },
-    #[error("database error while taking HAProxy advisory lock: {0}")]
-    Db(#[from] sqlx::Error),
+    #[error("Kubernetes HAProxy mutation exceeded its 30 second deadline")]
+    ProviderWriteTimeout,
+    #[error("Kubernetes HAProxy compare-and-swap retries were exhausted")]
+    CasExhausted,
+    #[error("HAProxy ConfigMap has invalid durable mutation generation metadata")]
+    InvalidMutationGeneration,
     #[error("invalid hostname for HAProxy route: {0}")]
     InvalidHostname(#[from] ValidateError),
     #[error("invalid app name for HAProxy backend: {0}")]
@@ -125,9 +120,10 @@ impl SniRoute {
 pub async fn ensure_haproxy_routes(
     pool: &PgPool,
     config: &EdgeRouteConfig,
+    mutation_generation: Option<i64>,
     routes: &[SniRoute],
 ) -> Result<(), EdgeRouteError> {
-    mutate_haproxy_config(pool, config, |current| {
+    mutate_haproxy_config(pool, config, mutation_generation, |current| {
         let mut out = current.to_string();
         for r in routes {
             out = render_route_into(&out, r);
@@ -145,9 +141,10 @@ pub async fn ensure_haproxy_routes(
 pub async fn remove_haproxy_routes(
     pool: &PgPool,
     config: &EdgeRouteConfig,
+    mutation_generation: Option<i64>,
     routes: &[(String, String)],
 ) -> Result<(), EdgeRouteError> {
-    let changed = mutate_haproxy_config(pool, config, |current| {
+    let changed = mutate_haproxy_config(pool, config, mutation_generation, |current| {
         let mut out = current.to_string();
         for (backend, host) in routes {
             out = remove_route_from(&out, backend, host);
@@ -165,54 +162,72 @@ pub async fn remove_haproxy_routes(
 }
 
 async fn mutate_haproxy_config<F>(
-    pool: &PgPool,
+    _pool: &PgPool,
     config: &EdgeRouteConfig,
+    mutation_generation: Option<i64>,
     mutate: F,
 ) -> Result<bool, EdgeRouteError>
 where
-    F: FnOnce(&str) -> String,
+    F: Fn(&str) -> String,
 {
-    // Take a session-scoped transaction and a transaction-scoped advisory
-    // lock. The lock is released automatically on commit/rollback. This is
-    // the multi-replica replacement for the previous process-local Mutex.
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(HAPROXY_LOCK_ID)
-        .execute(&mut *tx)
-        .await?;
-
+    // Runtime callers already own the durable global edge_config generation.
+    // Do not hold a second PostgreSQL connection across Kubernetes I/O: with a
+    // two-connection pool that would starve both job and mutation heartbeats.
     let client = Client::try_default().await?;
-    let changed = reconcile_haproxy_config(client, config, mutate).await?;
+    mutate_haproxy_config_with_client(_pool, client, config, mutation_generation, mutate).await
+}
 
-    tx.commit().await?;
-    Ok(changed)
+async fn mutate_haproxy_config_with_client<F>(
+    _pool: &PgPool,
+    client: Client,
+    config: &EdgeRouteConfig,
+    mutation_generation: Option<i64>,
+    mutate: F,
+) -> Result<bool, EdgeRouteError>
+where
+    F: Fn(&str) -> String,
+{
+    reconcile_haproxy_config(client, config, mutation_generation, mutate).await
 }
 
 async fn reconcile_haproxy_config<F>(
     client: Client,
     config: &EdgeRouteConfig,
+    mutation_generation: Option<i64>,
     mutate: F,
 ) -> Result<bool, EdgeRouteError>
 where
-    F: FnOnce(&str) -> String,
+    F: Fn(&str) -> String,
 {
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
-    let cm = cm_api.get(&config.configmap_name).await?;
-    let current = cm
-        .data
-        .as_ref()
-        .and_then(|data| data.get("haproxy.cfg"))
-        .cloned()
-        .ok_or_else(|| EdgeRouteError::MissingConfig {
-            namespace: config.namespace.clone(),
-            name: config.configmap_name.clone(),
-        })?;
-
-    let updated = mutate(&current);
-    let generation = haproxy_config_generation(&updated);
-    let config_changed = updated != current;
-
-    if config_changed {
+    let mut changed = false;
+    let mut converged = false;
+    for _ in 0..KUBERNETES_CAS_ATTEMPTS {
+        let mut cm = cm_api.get(&config.configmap_name).await?;
+        let current = cm
+            .data
+            .as_ref()
+            .and_then(|data| data.get("haproxy.cfg"))
+            .cloned()
+            .ok_or_else(|| EdgeRouteError::MissingConfig {
+                namespace: config.namespace.clone(),
+                name: config.configmap_name.clone(),
+            })?;
+        let current_mutation_generation = configmap_mutation_generation(&cm)?;
+        if let Some(expected_generation) = mutation_generation
+            && current_mutation_generation > expected_generation
+        {
+            // This closure belongs to an older durable resource owner. Never
+            // recompute it atop the newer intent after an RV conflict.
+            return Ok(false);
+        }
+        let updated = mutate(&current);
+        let mutation_generation_changed =
+            mutation_generation.is_some_and(|expected| current_mutation_generation != expected);
+        if updated == current && !mutation_generation_changed {
+            converged = true;
+            break;
+        }
         let serialized_size = serialized_configmap_size_with_config(&cm, &updated)
             .map_err(EdgeRouteError::ConfigSerialization)?;
         if serialized_size > HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES
@@ -223,67 +238,135 @@ where
                 limit: HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES,
             });
         }
-
-        let patch = json!({
-            "data": {
-                "haproxy.cfg": &updated,
-            }
-        });
-        let patched = cm_api
-            .patch(
-                &config.configmap_name,
-                &PatchParams::default(),
-                &Patch::Merge(&patch),
-            )
-            .await?;
-        if patched
-            .data
-            .as_ref()
-            .and_then(|data| data.get("haproxy.cfg"))
-            .map(String::as_str)
-            != Some(updated.as_str())
-        {
-            return Err(EdgeRouteError::ConfigNotApplied);
+        cm.data
+            .get_or_insert_default()
+            .insert("haproxy.cfg".to_string(), updated.clone());
+        if let Some(expected_generation) = mutation_generation {
+            cm.metadata.annotations.get_or_insert_default().insert(
+                HAPROXY_MUTATION_GENERATION_ANNOTATION.to_string(),
+                expected_generation.to_string(),
+            );
         }
+        match bounded_kube_write(cm_api.replace(
+            &config.configmap_name,
+            &PostParams::default(),
+            &cm,
+        ))
+        .await
+        {
+            Ok(replaced)
+                if replaced
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("haproxy.cfg"))
+                    .map(String::as_str)
+                    == Some(updated.as_str()) =>
+            {
+                changed |= updated != current;
+                converged = true;
+                break;
+            }
+            Ok(_) => return Err(EdgeRouteError::ConfigNotApplied),
+            Err(EdgeRouteError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    if !converged {
+        return Err(EdgeRouteError::CasExhausted);
     }
 
     let ds_api: Api<DaemonSet> = Api::namespaced(client, &config.namespace);
-    let daemonset = ds_api.get(&config.daemonset_name).await?;
-    let generation_changed = daemonset_config_generation(&daemonset) != Some(&generation);
-
-    if generation_changed {
-        let generation_patch = json!({
-            "spec": {
-                "template": {
-                    "metadata": {
-                        "annotations": {
-                            HAPROXY_CONFIG_GENERATION_ANNOTATION: &generation,
-                        }
-                    }
+    for _ in 0..KUBERNETES_CAS_ATTEMPTS {
+        // Always derive the rollout generation from the latest ConfigMap. A
+        // delayed older writer can therefore repair, but never roll back, a
+        // newer ConfigMap publication.
+        let cm = cm_api.get(&config.configmap_name).await?;
+        let current = cm
+            .data
+            .as_ref()
+            .and_then(|data| data.get("haproxy.cfg"))
+            .ok_or_else(|| EdgeRouteError::MissingConfig {
+                namespace: config.namespace.clone(),
+                name: config.configmap_name.clone(),
+            })?;
+        let generation = haproxy_config_generation(current);
+        let mut daemonset = ds_api.get(&config.daemonset_name).await?;
+        if daemonset_config_generation(&daemonset) == Some(generation.as_str()) {
+            return Ok(changed);
+        }
+        daemonset
+            .spec
+            .as_mut()
+            .ok_or_else(|| EdgeRouteError::GenerationNotApplied {
+                expected: generation.clone(),
+                actual: None,
+            })?
+            .template
+            .metadata
+            .get_or_insert_default()
+            .annotations
+            .get_or_insert_default()
+            .insert(
+                HAPROXY_CONFIG_GENERATION_ANNOTATION.to_string(),
+                generation.clone(),
+            );
+        match bounded_kube_write(ds_api.replace(
+            &config.daemonset_name,
+            &PostParams::default(),
+            &daemonset,
+        ))
+        .await
+        {
+            Ok(replaced) => {
+                let applied = daemonset_config_generation(&replaced);
+                if applied != Some(generation.as_str()) {
+                    return Err(EdgeRouteError::GenerationNotApplied {
+                        expected: generation,
+                        actual: applied.map(str::to_string),
+                    });
                 }
+                changed = true;
             }
-        });
-        let patched = ds_api
-            .patch(
-                &config.daemonset_name,
-                &PatchParams::default(),
-                &Patch::Merge(&generation_patch),
-            )
-            .await?;
-        let applied = daemonset_config_generation(&patched);
-        if applied != Some(generation.as_str()) {
-            return Err(EdgeRouteError::GenerationNotApplied {
-                expected: generation,
-                actual: applied.map(str::to_string),
-            });
+            Err(EdgeRouteError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
+            Err(error) => return Err(error),
         }
     }
+    Err(EdgeRouteError::CasExhausted)
+}
 
-    Ok(config_changed || generation_changed)
+async fn bounded_kube_write<F, T>(future: F) -> Result<T, EdgeRouteError>
+where
+    F: std::future::Future<Output = Result<T, kube::Error>>,
+{
+    tokio::time::timeout(KUBERNETES_WRITE_TIMEOUT, future)
+        .await
+        .map_err(|_| EdgeRouteError::ProviderWriteTimeout)?
+        .map_err(EdgeRouteError::Kube)
+}
+
+fn is_kubernetes_conflict(error: &kube::Error) -> bool {
+    matches!(error, kube::Error::Api(response) if response.code == 409)
 }
 
 fn haproxy_config_generation(config: &str) -> String {
     hex::encode(Sha256::digest(config.as_bytes()))
+}
+
+fn configmap_mutation_generation(configmap: &ConfigMap) -> Result<i64, EdgeRouteError> {
+    configmap
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(HAPROXY_MUTATION_GENERATION_ANNOTATION))
+        .map(|generation| {
+            generation
+                .parse::<i64>()
+                .ok()
+                .filter(|generation| *generation >= 0)
+                .ok_or(EdgeRouteError::InvalidMutationGeneration)
+        })
+        .transpose()
+        .map(|generation| generation.unwrap_or(0))
 }
 
 fn daemonset_config_generation(daemonset: &DaemonSet) -> Option<&str> {
@@ -523,9 +606,10 @@ fn remove_backend_block(config: &str, backend_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::{Method, Request, Response};
+    use axum::http::{Method, Request, Response, StatusCode};
     use http_body_util::BodyExt;
     use kube::client::Body;
+    use serde_json::json;
     use std::{
         collections::VecDeque,
         io,
@@ -547,10 +631,16 @@ mod tests {
     struct FakeKubeState {
         config: String,
         generation: Option<String>,
+        mutation_generation: Option<i64>,
         configmap_patch_outcomes: VecDeque<FakePatchOutcome>,
         daemonset_patch_outcomes: VecDeque<FakePatchOutcome>,
         configmap_patch_attempts: usize,
         daemonset_patch_attempts: usize,
+        configmap_resource_version: u64,
+        daemonset_resource_version: u64,
+        pause_next_configmap_replace: bool,
+        configmap_replace_entered: Arc<tokio::sync::Notify>,
+        configmap_replace_release: Arc<tokio::sync::Notify>,
     }
 
     impl FakeKubeState {
@@ -558,20 +648,31 @@ mod tests {
             Self {
                 config: config.to_string(),
                 generation: Some(haproxy_config_generation(config)),
+                mutation_generation: None,
                 configmap_patch_outcomes: VecDeque::new(),
                 daemonset_patch_outcomes: VecDeque::new(),
                 configmap_patch_attempts: 0,
                 daemonset_patch_attempts: 0,
+                configmap_resource_version: 1,
+                daemonset_resource_version: 1,
+                pause_next_configmap_replace: false,
+                configmap_replace_entered: Arc::new(tokio::sync::Notify::new()),
+                configmap_replace_release: Arc::new(tokio::sync::Notify::new()),
             }
         }
 
         fn configmap(&self) -> Value {
+            let annotations = self.mutation_generation.map(|generation| {
+                json!({ HAPROXY_MUTATION_GENERATION_ANNOTATION: generation.to_string() })
+            });
             json!({
                 "apiVersion": "v1",
                 "kind": "ConfigMap",
                 "metadata": {
                     "name": "haproxy-tenant",
                     "namespace": "tenant-envoy",
+                    "resourceVersion": self.configmap_resource_version.to_string(),
+                    "annotations": annotations,
                 },
                 "data": {
                     "haproxy.cfg": self.config,
@@ -590,6 +691,7 @@ mod tests {
                 "metadata": {
                     "name": "haproxy-tenant",
                     "namespace": "tenant-envoy",
+                    "resourceVersion": self.daemonset_resource_version.to_string(),
                 },
                 "spec": {
                     "selector": { "matchLabels": { "app": "haproxy-tenant" } },
@@ -625,54 +727,104 @@ mod tests {
             .await
             .map_err(io::Error::other)?
             .to_bytes();
-        let mut state = state.lock().expect("fake Kubernetes state poisoned");
-
         match (method, path.as_str()) {
-            (Method::GET, CONFIGMAP_PATH) => Ok(json_response(state.configmap())),
-            (Method::GET, DAEMONSET_PATH) => Ok(json_response(state.daemonset())),
-            (Method::PATCH, CONFIGMAP_PATH) => {
-                state.configmap_patch_attempts += 1;
-                let outcome = state
+            (Method::GET, CONFIGMAP_PATH) => Ok(json_response(
+                state
+                    .lock()
+                    .expect("fake Kubernetes state poisoned")
+                    .configmap(),
+            )),
+            (Method::GET, DAEMONSET_PATH) => Ok(json_response(
+                state
+                    .lock()
+                    .expect("fake Kubernetes state poisoned")
+                    .daemonset(),
+            )),
+            (Method::PUT, CONFIGMAP_PATH) => {
+                let replacement: Value =
+                    serde_json::from_slice(&body).expect("valid ConfigMap replacement");
+                let pause = {
+                    let mut locked = state.lock().expect("fake Kubernetes state poisoned");
+                    if locked.pause_next_configmap_replace {
+                        locked.pause_next_configmap_replace = false;
+                        Some((
+                            locked.configmap_replace_entered.clone(),
+                            locked.configmap_replace_release.clone(),
+                        ))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((entered, release)) = pause {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                let mut locked = state.lock().expect("fake Kubernetes state poisoned");
+                locked.configmap_patch_attempts += 1;
+                let expected_resource_version = replacement
+                    .pointer("/metadata/resourceVersion")
+                    .and_then(Value::as_str);
+                let current_resource_version = locked.configmap_resource_version.to_string();
+                if expected_resource_version != Some(current_resource_version.as_str()) {
+                    return Ok(conflict_response());
+                }
+                let outcome = locked
                     .configmap_patch_outcomes
                     .pop_front()
                     .unwrap_or(FakePatchOutcome::Success);
                 if outcome == FakePatchOutcome::FailBeforeApply {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionReset,
-                        "ConfigMap patch failed before apply",
+                        "ConfigMap replacement failed before apply",
                     ));
                 }
-
-                let patch: Value = serde_json::from_slice(&body).expect("valid ConfigMap patch");
-                state.config = patch
+                locked.config = replacement
                     .pointer("/data/haproxy.cfg")
                     .and_then(Value::as_str)
-                    .expect("ConfigMap patch includes haproxy.cfg")
+                    .expect("ConfigMap replacement includes haproxy.cfg")
                     .to_string();
+                locked.mutation_generation = replacement
+                    .pointer(&format!(
+                        "/metadata/annotations/{}",
+                        HAPROXY_MUTATION_GENERATION_ANNOTATION
+                            .replace('~', "~0")
+                            .replace('/', "~1")
+                    ))
+                    .and_then(Value::as_str)
+                    .and_then(|generation| generation.parse().ok());
+                locked.configmap_resource_version += 1;
                 if outcome == FakePatchOutcome::LoseResponseAfterApply {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "ConfigMap patch response timed out after apply",
+                        "ConfigMap replacement response timed out after apply",
                     ));
                 }
-                Ok(json_response(state.configmap()))
+                Ok(json_response(locked.configmap()))
             }
-            (Method::PATCH, DAEMONSET_PATH) => {
-                state.daemonset_patch_attempts += 1;
-                let outcome = state
+            (Method::PUT, DAEMONSET_PATH) => {
+                let replacement: Value =
+                    serde_json::from_slice(&body).expect("valid DaemonSet replacement");
+                let mut locked = state.lock().expect("fake Kubernetes state poisoned");
+                locked.daemonset_patch_attempts += 1;
+                let expected_resource_version = replacement
+                    .pointer("/metadata/resourceVersion")
+                    .and_then(Value::as_str);
+                let current_resource_version = locked.daemonset_resource_version.to_string();
+                if expected_resource_version != Some(current_resource_version.as_str()) {
+                    return Ok(conflict_response());
+                }
+                let outcome = locked
                     .daemonset_patch_outcomes
                     .pop_front()
                     .unwrap_or(FakePatchOutcome::Success);
                 if outcome == FakePatchOutcome::FailBeforeApply {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionReset,
-                        "DaemonSet patch failed before apply",
+                        "DaemonSet replacement failed before apply",
                     ));
                 }
-
-                let patch: Value = serde_json::from_slice(&body).expect("valid DaemonSet patch");
-                state.generation = Some(
-                    patch
+                locked.generation = Some(
+                    replacement
                         .pointer(&format!(
                             "/spec/template/metadata/annotations/{}",
                             HAPROXY_CONFIG_GENERATION_ANNOTATION
@@ -680,21 +832,40 @@ mod tests {
                                 .replace('/', "~1")
                         ))
                         .and_then(Value::as_str)
-                        .expect("DaemonSet patch includes the HAProxy generation")
+                        .expect("DaemonSet replacement includes the HAProxy generation")
                         .to_string(),
                 );
+                locked.daemonset_resource_version += 1;
                 if outcome == FakePatchOutcome::LoseResponseAfterApply {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "DaemonSet patch response timed out after apply",
+                        "DaemonSet replacement response timed out after apply",
                     ));
                 }
-                Ok(json_response(state.daemonset()))
+                Ok(json_response(locked.daemonset()))
             }
             (method, path) => Err(io::Error::other(format!(
                 "unexpected fake Kubernetes request: {method} {path}"
             ))),
         }
+    }
+
+    fn conflict_response() -> Response<Body> {
+        Response::builder()
+            .status(StatusCode::CONFLICT)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "reason": "Conflict",
+                    "message": "resourceVersion conflict",
+                    "code": 409,
+                }))
+                .expect("serialize conflict response"),
+            ))
+            .expect("build conflict response")
     }
 
     fn json_response(value: Value) -> Response<Body> {
@@ -715,7 +886,7 @@ mod tests {
     }
 
     async fn reconcile_to(client: Client, desired: &str) -> Result<bool, EdgeRouteError> {
-        reconcile_haproxy_config(client, &edge_config(), |_| desired.to_string()).await
+        reconcile_haproxy_config(client, &edge_config(), Some(1), |_| desired.to_string()).await
     }
 
     #[tokio::test]
@@ -797,6 +968,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_old_ensure_cannot_readd_route_removed_by_new_generation() {
+        let route = SniRoute::new("stale.example.test", "be_stale_app", "10.0.0.1:443")
+            .expect("valid stale-writer route");
+        let initial = render_route_into("global\n", &route);
+        let state = Arc::new(Mutex::new(FakeKubeState::new(&initial)));
+        let (entered, release) = {
+            let mut locked = state.lock().unwrap();
+            locked.pause_next_configmap_replace = true;
+            (
+                locked.configmap_replace_entered.clone(),
+                locked.configmap_replace_release.clone(),
+            )
+        };
+        let old_route = route.clone();
+        let old_client = fake_kube_client(Arc::clone(&state));
+        let old = tokio::spawn(async move {
+            reconcile_haproxy_config(old_client, &edge_config(), Some(1), |current| {
+                render_route_into(current, &old_route)
+            })
+            .await
+        });
+        entered.notified().await;
+
+        let new_client = fake_kube_client(Arc::clone(&state));
+        reconcile_haproxy_config(new_client, &edge_config(), Some(2), |current| {
+            remove_route_from(current, &route.backend_name, &route.host)
+        })
+        .await
+        .expect("newer delete publishes while old ensure request is delayed");
+        release.notify_one();
+        let old_changed = old
+            .await
+            .expect("old writer joins")
+            .expect("old writer observes the newer mutation generation");
+        assert!(!old_changed);
+
+        let converged = state.lock().unwrap();
+        assert!(!converged.config.contains("stale.example.test"));
+        assert_eq!(converged.mutation_generation, Some(2));
+        assert_eq!(
+            converged.generation.as_deref(),
+            Some(haproxy_config_generation(&converged.config).as_str())
+        );
+        assert_eq!(converged.configmap_patch_attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn pool_two_edge_reconcile_does_not_take_nested_database_connection() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect edge liveness database");
+        let authority_lane = pool.begin().await.expect("hold caller authority lane");
+        let state = Arc::new(Mutex::new(FakeKubeState::new("global\n")));
+        let (entered, release) = {
+            let mut locked = state.lock().unwrap();
+            locked.pause_next_configmap_replace = true;
+            (
+                locked.configmap_replace_entered.clone(),
+                locked.configmap_replace_release.clone(),
+            )
+        };
+        let reconcile_pool = pool.clone();
+        let client = fake_kube_client(Arc::clone(&state));
+        let reconcile = tokio::spawn(async move {
+            mutate_haproxy_config_with_client(
+                &reconcile_pool,
+                client,
+                &edge_config(),
+                Some(1),
+                |_| "global\n  maxconn 4096\n".to_string(),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .expect("edge reaches provider without waiting for a second DB connection");
+        let heartbeat_headroom: i32 = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sqlx::query_scalar("SELECT 1").fetch_one(&pool),
+        )
+        .await
+        .expect("reserved connection remains available")
+        .expect("heartbeat-style query succeeds");
+        assert_eq!(heartbeat_headroom, 1);
+        release.notify_one();
+        reconcile
+            .await
+            .expect("edge task joins")
+            .expect("edge reconcile succeeds");
+        authority_lane
+            .rollback()
+            .await
+            .expect("release authority lane");
+    }
+
+    #[tokio::test]
     async fn configmap_growth_over_serialized_budget_is_rejected_before_patch() {
         let state = Arc::new(Mutex::new(FakeKubeState::new("global\n")));
         let client = fake_kube_client(Arc::clone(&state));
@@ -814,17 +1085,6 @@ mod tests {
         assert_eq!(unchanged.config, "global\n");
         assert_eq!(unchanged.configmap_patch_attempts, 0);
         assert_eq!(unchanged.daemonset_patch_attempts, 0);
-    }
-
-    #[test]
-    fn lock_id_matches_label_hash() {
-        let mut hasher = Sha256::new();
-        hasher.update(b"cap-haproxy-config");
-        let digest = hasher.finalize();
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&digest[0..8]);
-        let computed = i64::from_be_bytes(buf);
-        assert_eq!(computed, HAPROXY_LOCK_ID);
     }
 
     #[test]

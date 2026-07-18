@@ -40,6 +40,7 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AppDeleteFailure {
     TeardownToken,
+    TeardownEndpoint,
     DnsNotConfigured,
     DnsOutsideManagedZone,
     DnsHostnameInUse,
@@ -56,6 +57,7 @@ impl AppDeleteFailure {
     const fn code(self) -> &'static str {
         match self {
             Self::TeardownToken => "app_delete_teardown_token_failed",
+            Self::TeardownEndpoint => "app_delete_teardown_unavailable",
             Self::DnsNotConfigured => "app_delete_dns_not_configured",
             Self::DnsOutsideManagedZone => "app_delete_dns_outside_managed_zone",
             Self::DnsHostnameInUse => "app_delete_dns_hostname_in_use",
@@ -76,7 +78,8 @@ impl AppDeleteFailure {
             }
             Self::DnsOutsideManagedZone => StatusCode::BAD_REQUEST,
             Self::DnsHostnameInUse => StatusCode::CONFLICT,
-            Self::DnsUnavailable
+            Self::TeardownEndpoint
+            | Self::DnsUnavailable
             | Self::EdgeRoute
             | Self::Namespace
             | Self::KbsOwnerBinding
@@ -224,17 +227,13 @@ async fn request_workload_teardown(
         .tee_http_client
         .post(&url)
         .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(15))
         .send()
         .await
     {
         Ok(response) => response,
         Err(_) => {
-            tracing::warn!(
-                app_id = %app.id,
-                status = "unreachable",
-                code = "app_delete_teardown_unreachable",
-                "workload teardown endpoint unreachable; continuing app deletion"
-            );
+            let _ = app_delete_failure(app.id, AppDeleteFailure::TeardownEndpoint, "unreachable");
             return Ok(());
         }
     };
@@ -243,12 +242,10 @@ async fn request_workload_teardown(
         return Ok(());
     }
 
-    let status = response.status();
-    tracing::warn!(
-        app_id = %app.id,
-        status = status.as_u16(),
-        code = "app_delete_teardown_rejected",
-        "workload teardown endpoint returned non-success; continuing app deletion"
+    let _ = app_delete_failure(
+        app.id,
+        AppDeleteFailure::TeardownEndpoint,
+        response.status().as_u16(),
     );
     Ok(())
 }
@@ -845,6 +842,71 @@ pub async fn create_app(
 
     tx.commit().await.map_err(|_| internal_server_error())?;
 
+    let mut dns_mutation = match crate::mutation_leases::claim(
+        &state,
+        app_id,
+        "app_create_dns",
+        app_id,
+        false,
+        vec![
+            crate::mutation_leases::ResourceFence::dns(&app_candidate.domain),
+            crate::mutation_leases::ResourceFence::dns(
+                app_candidate
+                    .tee_domain
+                    .as_deref()
+                    .unwrap_or(&app_candidate.domain),
+            ),
+        ],
+    )
+    .await
+    {
+        Ok(mutation) => mutation,
+        Err(error) => {
+            // No provider future has been polled. Remove the pristine create
+            // transaction under the app lane so a hostname-fence conflict or
+            // closed admission queue cannot strand an undeployable name.
+            let mut compensation = state
+                .db
+                .begin()
+                .await
+                .map_err(|_| internal_server_error())?;
+            crate::deploy::lock_app_deployment_lane(&mut compensation, app_id)
+                .await
+                .map_err(|_| internal_server_error())?;
+            let deleted = sqlx::query(
+                "DELETE FROM apps AS app
+                  WHERE app.id = $1
+                    AND app.org_id = $2
+                    AND app.status = 'creating'::app_status_enum
+                    AND NOT EXISTS (
+                        SELECT 1 FROM deployments WHERE app_id = app.id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM dns_records WHERE app_id = app.id
+                    )",
+            )
+            .bind(app_id)
+            .bind(auth.org_id)
+            .execute(&mut *compensation)
+            .await
+            .map_err(|_| internal_server_error())?;
+            if deleted.rows_affected() != 1 {
+                return Err(internal_server_error());
+            }
+            compensation
+                .commit()
+                .await
+                .map_err(|_| internal_server_error())?;
+            return Err(match error {
+                crate::mutation_leases::MutationLeaseError::Busy => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": "app mutation already in progress"})),
+                ),
+                _ => internal_server_error(),
+            });
+        }
+    };
+
     // Reacquire and hold the app generation lane across legacy DNS setup.
     // Deletion and deployment acceptance use the same lane, so neither can
     // remove or supersede this app between the provider side effect and its
@@ -877,53 +939,70 @@ pub async fn create_app(
         ));
     }
 
-    if let Err(e) = crate::dns::ensure_dns_pair(
-        &state.db,
-        &state.http_client,
-        state.dns.as_ref(),
-        app_id,
-        &app_candidate.domain,
-        app_candidate
-            .tee_domain
-            .as_deref()
-            .unwrap_or(&app_candidate.domain),
-    )
-    .await
-    {
-        let cleaned = crate::dns::delete_all_dns_records_for_app(
+    let dns_setup = dns_mutation
+        .guard_provider(crate::dns::ensure_dns_pair(
             &state.db,
             &state.http_client,
             state.dns.as_ref(),
             app_id,
-        )
+            &app_candidate.domain,
+            app_candidate
+                .tee_domain
+                .as_deref()
+                .unwrap_or(&app_candidate.domain),
+        ))
         .await
-        .is_ok();
-        if cleaned {
-            sqlx::query("DELETE FROM apps WHERE id = $1 AND org_id = $2")
-                .bind(app_id)
-                .bind(auth.org_id)
-                .execute(&state.db)
-                .await
-                .map_err(|_| internal_server_error())?;
-        } else {
-            sqlx::query(
-                "UPDATE apps
-                    SET status = 'failed'::app_status_enum,
-                        updated_at = clock_timestamp()
-                  WHERE id = $1 AND org_id = $2",
-            )
-            .bind(app_id)
-            .bind(auth.org_id)
-            .execute(&state.db)
+        .map_err(|_| internal_server_error())?;
+    if let Err(e) = dns_setup {
+        // A provider POST can be accepted while its response is lost. An
+        // immediate lookup may still be empty while that request is queued,
+        // so cleanup success is not proof that no late record can appear.
+        // Keep the failed app as durable reconciliation authority and retain
+        // the hostname generations through quarantine; DELETE retries perform
+        // provider discovery by hostname before the app can disappear.
+        let _cleanup_result = dns_mutation
+            .guard_provider(crate::dns::delete_managed_dns_pair_by_hostname(
+                &state.db,
+                &state.http_client,
+                state.dns.as_ref(),
+                app_id,
+                &app_candidate.domain,
+                app_candidate
+                    .tee_domain
+                    .as_deref()
+                    .unwrap_or(&app_candidate.domain),
+            ))
             .await
             .map_err(|_| internal_server_error())?;
-        }
+        dns_mutation
+            .assert_current_in_tx(&mut dns_lane)
+            .await
+            .map_err(|_| internal_server_error())?;
+        dns_mutation
+            .retain_resource_scope_until_reconciled_in_tx(&mut dns_lane, "dns_hostname")
+            .await
+            .map_err(|_| internal_server_error())?;
+        sqlx::query(
+            "UPDATE apps
+                SET status = 'failed'::app_status_enum,
+                    updated_at = clock_timestamp()
+              WHERE id = $1 AND org_id = $2",
+        )
+        .bind(app_id)
+        .bind(auth.org_id)
+        .execute(&mut *dns_lane)
+        .await
+        .map_err(|_| internal_server_error())?;
         dns_lane
             .commit()
             .await
             .map_err(|_| internal_server_error())?;
         return Err(dns_error_response(e));
     }
+    dns_mutation
+        .finish_in_tx(&mut dns_lane)
+        .await
+        .map_err(|_| internal_server_error())?;
     dns_lane
         .commit()
         .await
@@ -1017,6 +1096,45 @@ pub async fn delete_app(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
+    let mut delete_resources = vec![
+        crate::mutation_leases::ResourceFence::dns(&app.domain),
+        crate::mutation_leases::ResourceFence::edge(&app.domain),
+        crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &app.namespace),
+        crate::mutation_leases::ResourceFence::kbs_policy(),
+        crate::mutation_leases::ResourceFence::edge_config(),
+    ];
+    let tracked_dns_hostnames: Vec<String> =
+        sqlx::query_scalar("SELECT hostname FROM dns_records WHERE app_id = $1 ORDER BY hostname")
+            .bind(app.id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|_| internal_server_error())?;
+    for hostname in &tracked_dns_hostnames {
+        delete_resources.push(crate::mutation_leases::ResourceFence::dns(hostname));
+        delete_resources.push(crate::mutation_leases::ResourceFence::edge(hostname));
+    }
+    if let Some(tee_domain) = app.tee_domain.as_deref() {
+        delete_resources.push(crate::mutation_leases::ResourceFence::dns(tee_domain));
+        delete_resources.push(crate::mutation_leases::ResourceFence::edge(tee_domain));
+    }
+    if let Some(custom_domain) = app.custom_domain.as_deref() {
+        delete_resources.push(crate::mutation_leases::ResourceFence::dns(custom_domain));
+        delete_resources.push(crate::mutation_leases::ResourceFence::edge(custom_domain));
+    }
+    let mut delete_mutation =
+        crate::mutation_leases::claim(&state, app.id, "app_delete", app.id, true, delete_resources)
+            .await
+            .map_err(|error| match error {
+                crate::mutation_leases::MutationLeaseError::Busy => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": "app mutation already in progress"})),
+                ),
+                _ => internal_server_error(),
+            })?;
+    let edge_config_generation = delete_mutation
+        .resource_generation(&crate::mutation_leases::ResourceFence::edge_config())
+        .ok_or_else(internal_server_error)?;
+
     // Persist the durable deleting phase before any external teardown. A retry
     // therefore repeats the workload wipe even if token issuance or a later
     // provider step failed. The same transaction terminalizes every queued or
@@ -1053,6 +1171,32 @@ pub async fn delete_app(
             .map_err(|_| internal_server_error())?;
         return Ok(StatusCode::NO_CONTENT);
     };
+    let current_dns_hostnames: Vec<String> =
+        sqlx::query_scalar("SELECT hostname FROM dns_records WHERE app_id = $1 ORDER BY hostname")
+            .bind(phase_app.id)
+            .fetch_all(&mut *phase_tx)
+            .await
+            .map_err(|_| internal_server_error())?;
+    if phase_app.domain != app.domain
+        || phase_app.tee_domain != app.tee_domain
+        || phase_app.custom_domain != app.custom_domain
+        || phase_app.namespace != app.namespace
+        || phase_app.name != app.name
+        || current_dns_hostnames != tracked_dns_hostnames
+    {
+        delete_mutation
+            .finish_in_tx(&mut phase_tx)
+            .await
+            .map_err(|_| internal_server_error())?;
+        phase_tx
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "app resource authority changed; retry deletion"})),
+        ));
+    }
     sqlx::query(
         "UPDATE apps
             SET status = 'deleting'::app_status_enum,
@@ -1065,11 +1209,35 @@ pub async fn delete_app(
     .map_err(|_| internal_server_error())?;
     crate::deploy::supersede_incomplete_deployments(&mut phase_tx, phase_app.id)
         .await
-        .map_err(|_| internal_server_error())?;
+        .map_err(|error| match error {
+            crate::deploy::SupersedeDeploymentError::Busy => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "deployment mutation is still in progress"})),
+            ),
+            crate::deploy::SupersedeDeploymentError::Database(_) => internal_server_error(),
+        })?;
+    let signed_policy_revocation =
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut phase_tx)
+            .await
+            .map_err(|_| internal_server_error())?
+            .is_some();
     phase_tx
         .commit()
         .await
         .map_err(|_| internal_server_error())?;
+
+    if signed_policy_revocation {
+        delete_mutation
+            .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
+                &state.db,
+                state.kbs_policy.as_ref(),
+            ))
+            .await
+            .map_err(|_| internal_server_error())?
+            .map_err(|error| {
+                app_delete_failure(phase_app.id, AppDeleteFailure::KbsPolicy, error)
+            })?;
+    }
 
     // Hold the generation lane across all external teardown steps. Workers and
     // new deployment acceptance either finish before this point or observe the
@@ -1103,16 +1271,56 @@ pub async fn delete_app(
         ));
     }
 
-    request_workload_teardown(&state, &auth, &deleting_app).await?;
+    delete_mutation
+        .guard_provider(request_workload_teardown(&state, &auth, &deleting_app))
+        .await
+        .map_err(|_| internal_server_error())??;
 
-    crate::dns::delete_all_dns_records_for_app(
-        &state.db,
-        &state.http_client,
-        state.dns.as_ref(),
-        deleting_app.id,
-    )
-    .await
-    .map_err(|error| app_delete_dns_failure(deleting_app.id, error))?;
+    let tracked_dns_cleanup = delete_mutation
+        .guard_provider(crate::dns::delete_all_dns_records_for_app(
+            &state.db,
+            &state.http_client,
+            state.dns.as_ref(),
+            deleting_app.id,
+        ))
+        .await
+        .map_err(|_| internal_server_error())?;
+    if let Err(error) = tracked_dns_cleanup {
+        delete_mutation
+            .retain_resource_scope_until_reconciled_in_tx(&mut delete_lane, "dns_hostname")
+            .await
+            .map_err(|_| internal_server_error())?;
+        delete_lane
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
+        return Err(app_delete_dns_failure(deleting_app.id, error));
+    }
+    let expected_dns_cleanup = delete_mutation
+        .guard_provider(crate::dns::delete_managed_dns_pair_by_hostname(
+            &state.db,
+            &state.http_client,
+            state.dns.as_ref(),
+            deleting_app.id,
+            &deleting_app.domain,
+            deleting_app
+                .tee_domain
+                .as_deref()
+                .unwrap_or(&deleting_app.domain),
+        ))
+        .await
+        .map_err(|_| internal_server_error())?;
+    if let Err(error) = expected_dns_cleanup {
+        delete_mutation
+            .retain_resource_scope_until_reconciled_in_tx(&mut delete_lane, "dns_hostname")
+            .await
+            .map_err(|_| internal_server_error())?;
+        delete_lane
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
+        return Err(app_delete_dns_failure(deleting_app.id, error));
+    }
 
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
         .bind(auth.org_id)
@@ -1137,21 +1345,49 @@ pub async fn delete_app(
     let mut routes_to_remove: Vec<(String, String)> =
         vec![(app_backend.clone(), deleting_app.domain.clone())];
     if let Some(t) = deleting_app.tee_domain.as_deref() {
-        routes_to_remove.push((tee_backend, t.to_string()));
+        routes_to_remove.push((tee_backend.clone(), t.to_string()));
     }
     if let Some(c) = deleting_app.custom_domain.as_deref() {
-        routes_to_remove.push((app_backend, c.to_string()));
+        routes_to_remove.push((app_backend.clone(), c.to_string()));
     }
-    crate::edge::remove_haproxy_routes(
-        &state.db,
-        &crate::edge::EdgeRouteConfig::from_env(),
-        &routes_to_remove,
-    )
-    .await
-    .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeRoute, error))?;
-
-    delete_tenant_namespace(&deleting_app.namespace)
+    // Include every provider-tracked hostname, not only current app columns.
+    // A failed custom-domain replacement can leave the old hostname tracked
+    // even though `apps.custom_domain` already points elsewhere.
+    for hostname in &tracked_dns_hostnames {
+        let backend = if deleting_app.tee_domain.as_deref() == Some(hostname.as_str()) {
+            tee_backend.clone()
+        } else {
+            app_backend.clone()
+        };
+        routes_to_remove.push((backend, hostname.clone()));
+    }
+    routes_to_remove.sort();
+    routes_to_remove.dedup();
+    delete_mutation
+        .guard_provider(crate::edge::remove_haproxy_routes(
+            &state.db,
+            &crate::edge::EdgeRouteConfig::from_env(),
+            Some(edge_config_generation),
+            &routes_to_remove,
+        ))
         .await
+        .map_err(|_| internal_server_error())?
+        .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeRoute, error))?;
+
+    delete_mutation
+        .guard_provider(tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            delete_tenant_namespace(&deleting_app.namespace),
+        ))
+        .await
+        .map_err(|_| internal_server_error())?
+        .map_err(|_| {
+            app_delete_failure(
+                deleting_app.id,
+                AppDeleteFailure::Namespace,
+                "deadline_exceeded",
+            )
+        })?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::Namespace, error))?;
 
     crate::kbs::soft_delete_owner_binding(&state.db, deleting_app.id)
@@ -1164,8 +1400,13 @@ pub async fn delete_app(
         .map_err(|error| {
             app_delete_failure(deleting_app.id, AppDeleteFailure::KbsTlsBinding, error)
         })?;
-    crate::kbs::reconcile_policy(&state.db, state.kbs_policy.as_ref())
+    delete_mutation
+        .guard_provider(crate::kbs::reconcile_policy(
+            &state.db,
+            state.kbs_policy.as_ref(),
+        ))
         .await
+        .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::KbsPolicy, error))?;
 
     sqlx::query(
@@ -1178,6 +1419,10 @@ pub async fn delete_app(
     .execute(&mut *delete_lane)
     .await
     .map_err(|_| internal_server_error())?;
+    delete_mutation
+        .finish_in_tx(&mut delete_lane)
+        .await
+        .map_err(|_| internal_server_error())?;
     sqlx::query("DELETE FROM apps WHERE id = $1 AND status = 'deleting'::app_status_enum")
         .bind(deleting_app.id)
         .execute(&mut *delete_lane)
@@ -1249,7 +1494,7 @@ pub async fn issue_signer_rotation_token_route(
         ));
     }
 
-    let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+    let app_lookup: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
         .fetch_optional(&state.db)
@@ -1259,6 +1504,43 @@ pub async fn issue_signer_rotation_token_route(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| internal_server_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, auth.org_id)
+        .await
+        .map_err(|_| internal_server_error())?;
+    crate::signing_service::lock_org_signing_authority_lane(&mut tx, auth.org_id)
+        .await
+        .map_err(|_| internal_server_error())?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, app_lookup.id)
+        .await
+        .map_err(|_| internal_server_error())?;
+    let current_role =
+        crate::auth::scopes::active_membership_role_in_tx(&mut tx, auth.org_id, auth.user_id)
+            .await?;
+    crate::auth::scopes::require_owner_role(current_role)?;
+    let app: App = sqlx::query_as(
+        "SELECT * FROM apps
+          WHERE id = $1
+            AND org_id = $2
+            AND name = $3
+            AND status <> 'deleting'::app_status_enum
+          FOR UPDATE",
+    )
+    .bind(app_lookup.id)
+    .bind(auth.org_id)
+    .bind(&app_name)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| internal_server_error())?
+    .ok_or((
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({"error": "app signer authority is unavailable"})),
+    ))?;
 
     let previous_subject = app
         .signer_identity_subject
@@ -1311,7 +1593,7 @@ pub async fn issue_signer_rotation_token_route(
         )
     })?;
 
-    let _ = sqlx::query(
+    sqlx::query(
         "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, 'app.signer.rotation_token.issue', $4)",
     )
     .bind(auth.org_id)
@@ -1324,8 +1606,10 @@ pub async fn issue_signer_rotation_token_route(
         "new_issuer":       input.new_issuer,
         "expires_in_seconds": SIGNER_ROTATION_TOKEN_TTL_SECONDS,
     }))
-    .execute(&state.db)
-    .await;
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| internal_server_error())?;
+    tx.commit().await.map_err(|_| internal_server_error())?;
 
     Ok(Json(SignerRotationTokenResponse {
         token,
@@ -1355,7 +1639,7 @@ pub async fn rotate_signer(
         ));
     }
 
-    let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+    let app_lookup: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
         .fetch_optional(&state.db)
@@ -1365,6 +1649,43 @@ pub async fn rotate_signer(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
+
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| internal_server_error())?;
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, auth.org_id)
+        .await
+        .map_err(|_| internal_server_error())?;
+    crate::signing_service::lock_org_signing_authority_lane(&mut tx, auth.org_id)
+        .await
+        .map_err(|_| internal_server_error())?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, app_lookup.id)
+        .await
+        .map_err(|_| internal_server_error())?;
+    let current_role =
+        crate::auth::scopes::active_membership_role_in_tx(&mut tx, auth.org_id, auth.user_id)
+            .await?;
+    crate::auth::scopes::require_owner_role(current_role)?;
+    let app: App = sqlx::query_as(
+        "SELECT * FROM apps
+          WHERE id = $1
+            AND org_id = $2
+            AND name = $3
+            AND status <> 'deleting'::app_status_enum
+          FOR UPDATE",
+    )
+    .bind(app_lookup.id)
+    .bind(auth.org_id)
+    .bind(&app_name)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| internal_server_error())?
+    .ok_or((
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({"error": "app signer authority is unavailable"})),
+    ))?;
 
     let previous_subject = app.signer_identity_subject.clone();
     let previous_issuer = app.signer_identity_issuer.clone();
@@ -1419,7 +1740,7 @@ pub async fn rotate_signer(
     .bind(&subject)
     .bind(&issuer)
     .bind(app.id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await
     .map_err(|_| internal_server_error())?;
 
@@ -1431,7 +1752,7 @@ pub async fn rotate_signer(
     } else {
         "app.signer.rotate"
     };
-    let _ = sqlx::query(
+    sqlx::query(
         "INSERT INTO audit_log (org_id, app_id, user_id, action, detail) VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(auth.org_id)
@@ -1445,14 +1766,16 @@ pub async fn rotate_signer(
         "new_issuer":       &issuer,
         "initial_set":      is_initial_set,
     }))
-    .execute(&state.db)
-    .await;
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| internal_server_error())?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
         .bind(app.id)
-        .fetch_one(&state.db)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|_| internal_server_error())?;
+    tx.commit().await.map_err(|_| internal_server_error())?;
 
     Ok(Json(app.into()))
 }
