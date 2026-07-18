@@ -577,6 +577,57 @@ fn deploy_runtime_direct_tee_fallback_rejects_pod_gaps_wrong_or_drifted_deployme
 }
 
 #[test]
+fn direct_tee_status_prefers_current_unlock_state() {
+    let status = serde_json::json!({
+        "state": "unlocked",
+        "unlock_state": "error",
+        "ownership_state": "locked"
+    });
+
+    assert_eq!(tee_unlock_state(&status), "error");
+}
+
+#[test]
+fn direct_tee_status_accepts_matching_or_omitted_supplemental_fields() {
+    for status in [
+        serde_json::json!({
+            "unlock_state": "unlocked",
+            "pod_status": "Running",
+            "tee_status": "READY",
+            "storage_status": "Unlocked"
+        }),
+        serde_json::json!({
+            "state": "locked",
+            "tee_status": "ready",
+            "storage_status": "locked"
+        }),
+        serde_json::json!({"state": "unlocked"}),
+        serde_json::json!({
+            "state": "unlocked",
+            "tee_status": null,
+            "storage_status": null
+        }),
+    ] {
+        assert!(tee_supplemental_fields_are_consistent(&status), "{status}");
+    }
+}
+
+#[test]
+fn direct_tee_status_rejects_errors_mismatches_and_malformed_fields() {
+    for status in [
+        serde_json::json!({"state": "unlocked", "tee_status": "error"}),
+        serde_json::json!({"state": "unlocked", "storage_status": "error"}),
+        serde_json::json!({"state": "locked", "storage_status": "unlocked"}),
+        serde_json::json!({"state": "unlocked", "pod_status": "Pending"}),
+        serde_json::json!({"state": "unlocked", "pod_status": 1}),
+        serde_json::json!({"state": "unlocked", "tee_status": 1}),
+        serde_json::json!({"state": "unlocked", "storage_status": ["unlocked"]}),
+    ] {
+        assert!(!tee_supplemental_fields_are_consistent(&status), "{status}");
+    }
+}
+
+#[test]
 fn status_command_falls_back_to_attested_tee_status() {
     let source = include_str!("../../app.rs");
     let fn_start = source

@@ -110,6 +110,7 @@ struct TeeEvidenceFields {
     tee_status: Option<String>,
     storage_status: Option<String>,
     live_state: Option<String>,
+    supplemental_fields_malformed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -409,6 +410,12 @@ async fn probe_tee(state: &AppState, tee_status_url: &str) -> TeeEvidence {
 }
 
 fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
+    let supplemental_fields_malformed = ["pod_status", "tee_status", "storage_status"]
+        .into_iter()
+        .any(|field| {
+            body.get(field)
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+        });
     TeeEvidenceFields {
         pod_status: body
             .get("pod_status")
@@ -427,6 +434,7 @@ fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
             .or_else(|| body.get("state"))
             .and_then(Value::as_str)
             .map(str::to_ascii_lowercase),
+        supplemental_fields_malformed,
     }
 }
 
@@ -549,6 +557,29 @@ fn classify_live_observation_for_deployment(
     if !fields.live_state.as_deref().is_some_and(|state| {
         state.eq_ignore_ascii_case("locked") || state.eq_ignore_ascii_case("unlocked")
     }) {
+        return incomplete_observation(
+            LiveObservationState::Partial,
+            LiveObservationReason::TeeEvidenceIncomplete,
+            observed_at,
+            pod.deployment_id,
+            pod.phase,
+            fields.pod_status,
+            fields.tee_status,
+            fields.storage_status,
+            pod.runtime_failure,
+        );
+    }
+    let tee_is_ready = fields
+        .tee_status
+        .as_deref()
+        .is_none_or(|status| status.eq_ignore_ascii_case("ready"));
+    let storage_matches_live_state = fields.storage_status.as_deref().is_none_or(|status| {
+        fields
+            .live_state
+            .as_deref()
+            .is_some_and(|state| status.eq_ignore_ascii_case(state))
+    });
+    if fields.supplemental_fields_malformed || !tee_is_ready || !storage_matches_live_state {
         return incomplete_observation(
             LiveObservationState::Partial,
             LiveObservationReason::TeeEvidenceIncomplete,
@@ -1030,6 +1061,85 @@ mod tests {
             Some(LiveObservationReason::TeeEvidenceIncomplete)
         );
         assert_eq!(observed.effective_status("running"), "partial");
+    }
+
+    #[test]
+    fn unhealthy_tee_or_storage_field_cannot_produce_fresh_readiness() {
+        for (tee_status, storage_status) in [
+            ("error", "unlocked"),
+            ("ready", "error"),
+            ("ready", "locked"),
+        ] {
+            let tee = TeeEvidence::Available(tee_evidence_fields(&json!({
+                "pod_status": "Running",
+                "tee_status": tee_status,
+                "storage_status": storage_status,
+                "unlock_state": "unlocked"
+            })));
+            let observed =
+                classify_live_observation(complete_pod(Uuid::new_v4()), tee, observed_at());
+
+            assert_eq!(observed.observation.state, LiveObservationState::Partial);
+            assert_eq!(
+                observed.observation.reason,
+                Some(LiveObservationReason::TeeEvidenceIncomplete)
+            );
+            assert_eq!(observed.effective_status("running"), "partial");
+        }
+    }
+
+    #[test]
+    fn malformed_tee_supplemental_field_cannot_be_treated_as_omitted() {
+        for body in [
+            json!({
+                "pod_status": "Running",
+                "tee_status": 1,
+                "storage_status": "unlocked",
+                "unlock_state": "unlocked"
+            }),
+            json!({
+                "pod_status": "Running",
+                "tee_status": "ready",
+                "storage_status": {"state": "unlocked"},
+                "unlock_state": "unlocked"
+            }),
+            json!({
+                "pod_status": ["Running"],
+                "tee_status": "ready",
+                "storage_status": "unlocked",
+                "unlock_state": "unlocked"
+            }),
+        ] {
+            let tee = TeeEvidence::Available(tee_evidence_fields(&body));
+            let observed =
+                classify_live_observation(complete_pod(Uuid::new_v4()), tee, observed_at());
+
+            assert_eq!(observed.observation.state, LiveObservationState::Partial);
+            assert_eq!(
+                observed.observation.reason,
+                Some(LiveObservationReason::TeeEvidenceIncomplete)
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_or_null_supplemental_health_fields_remain_compatible() {
+        for body in [
+            json!({"state": "unlocked"}),
+            json!({
+                "pod_status": null,
+                "tee_status": null,
+                "storage_status": null,
+                "state": "unlocked"
+            }),
+        ] {
+            let tee = TeeEvidence::Available(tee_evidence_fields(&body));
+            let observed =
+                classify_live_observation(complete_pod(Uuid::new_v4()), tee, observed_at());
+
+            assert_eq!(observed.observation.state, LiveObservationState::Fresh);
+            assert_eq!(observed.effective_status("running"), "running");
+        }
     }
 
     #[test]

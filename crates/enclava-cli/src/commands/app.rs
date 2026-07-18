@@ -698,7 +698,10 @@ async fn wait_for_deploy_runtime(
                 direct_tee_allowed
             }
             Err(_) => {
-                // Status endpoint may not be ready yet.
+                // The direct endpoint is app-bound rather than deployment-bound.
+                // Without a current CAP observation there is no pod/deployment
+                // evidence proving it belongs to this deploy, so retry CAP and
+                // do not let an old TEE satisfy a replacement rollout.
                 false
             }
         };
@@ -708,21 +711,25 @@ async fn wait_for_deploy_runtime(
             && let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
             && let Ok(status) = attested_tee.status_json().await
         {
-            match tee_unlock_state(&status) {
-                "locked" => {
-                    pb.set_position(3);
-                    pb.set_message("TEE running, storage locked");
-                    return Ok(());
+            if tee_supplemental_fields_are_consistent(&status) {
+                match tee_unlock_state(&status) {
+                    "locked" => {
+                        pb.set_position(3);
+                        pb.set_message("TEE running, storage locked");
+                        return Ok(());
+                    }
+                    "unlocked" if target.accepts_direct_unlocked() => {
+                        pb.set_position(3);
+                        pb.set_message("TEE running, attestation complete");
+                        return Ok(());
+                    }
+                    "unlocked" => {
+                        pb.set_message("Waiting for replacement TEE lock...");
+                    }
+                    _ => {}
                 }
-                "unlocked" if target.accepts_direct_unlocked() => {
-                    pb.set_position(3);
-                    pb.set_message("TEE running, attestation complete");
-                    return Ok(());
-                }
-                "unlocked" => {
-                    pb.set_message("Waiting for replacement TEE lock...");
-                }
-                _ => {}
+            } else {
+                pb.set_message("Waiting for healthy TEE status...");
             }
         }
 
@@ -886,11 +893,25 @@ async fn ensure_password_storage_unlocked_for_config(
 
 fn tee_unlock_state(status: &serde_json::Value) -> &str {
     status
-        .get("state")
-        .or_else(|| status.get("unlock_state"))
+        .get("unlock_state")
+        .or_else(|| status.get("state"))
         .or_else(|| status.get("ownership_state"))
         .and_then(|value| value.as_str())
         .unwrap_or("unknown")
+}
+
+fn tee_supplemental_fields_are_consistent(status: &serde_json::Value) -> bool {
+    let live_state = tee_unlock_state(status);
+    let optional_field_matches = |name: &str, expected: &str| match status.get(name) {
+        None | Some(serde_json::Value::Null) => true,
+        Some(value) => value
+            .as_str()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected)),
+    };
+
+    optional_field_matches("pod_status", "running")
+        && optional_field_matches("tee_status", "ready")
+        && optional_field_matches("storage_status", live_state)
 }
 
 async fn wait_for_deploy_unlock_completion(
