@@ -65,7 +65,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        # Database-backed tests share one PostgreSQL service and exercise
+        # intentionally global provider fences. Serialize them so independent
+        # fixtures cannot contend through that shared authority.
+        run: cargo test --workspace -- --test-threads=1
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test
 
