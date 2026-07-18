@@ -172,17 +172,68 @@ pub(crate) async fn ensure_management_write_allowed(
     }
 }
 
-async fn delete_tenant_namespace(namespace: &str) -> Result<(), kube::Error> {
-    let client = kube::Client::try_default().await?;
-    let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
-    match api
-        .delete(namespace, &kube::api::DeleteParams::default())
+async fn delete_tenant_namespace(
+    api: kube::Api<k8s_openapi::api::core::v1::Namespace>,
+    namespace: &str,
+    generation: enclava_engine::apply::generation::MutationGeneration,
+) -> Result<(), enclava_engine::apply::engine::ApplyError> {
+    delete_tenant_namespace_with_timeouts(
+        api,
+        namespace,
+        generation,
+        std::time::Duration::from_secs(120),
+        std::time::Duration::from_secs(150),
+    )
+    .await
+}
+
+async fn delete_tenant_namespace_with_timeouts(
+    api: kube::Api<k8s_openapi::api::core::v1::Namespace>,
+    namespace: &str,
+    generation: enclava_engine::apply::generation::MutationGeneration,
+    convergence_timeout: std::time::Duration,
+    operation_timeout: std::time::Duration,
+) -> Result<(), enclava_engine::apply::engine::ApplyError> {
+    let delete_and_wait = async {
+        enclava_engine::apply::generation::delete_resource(
+            &api,
+            namespace,
+            generation,
+            kube::api::DeleteParams::default(),
+        )
+        .await?;
+
+        let deadline = tokio::time::Instant::now() + convergence_timeout;
+        loop {
+            match api.get(namespace).await {
+                Err(kube::Error::Api(error)) if error.code == 404 => return Ok(()),
+                Ok(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                Ok(_) => {
+                    return Err(
+                        enclava_engine::apply::engine::ApplyError::CleanupStepFailed {
+                            step: "delete_namespace".to_string(),
+                            detail: "namespace deletion did not converge".to_string(),
+                        },
+                    );
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
+
+    // A Kubernetes read can hang beyond the convergence deadline. Bound the
+    // entire provider operation so this path fails closed while the pre-armed
+    // resource fence remains at infinity for operator reconciliation.
+    tokio::time::timeout(operation_timeout, delete_and_wait)
         .await
-    {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
-        Err(e) => Err(e),
-    }
+        .map_err(
+            |_| enclava_engine::apply::engine::ApplyError::CleanupStepFailed {
+                step: "delete_namespace".to_string(),
+                detail: "namespace deletion provider operation timed out".to_string(),
+            },
+        )?
 }
 
 fn workload_teardown_instance_id(app: &App) -> String {
@@ -1141,6 +1192,12 @@ pub async fn delete_app(
     let edge_config_generation = delete_mutation
         .resource_generation(&crate::mutation_leases::ResourceFence::edge_config())
         .ok_or_else(internal_server_error)?;
+    let kubernetes_mutation_generation = delete_mutation
+        .resource_generation(&crate::mutation_leases::ResourceFence::new(
+            "kubernetes_namespace",
+            &app.namespace,
+        ))
+        .ok_or_else(internal_server_error)?;
 
     // Persist the durable deleting phase before any external teardown. A retry
     // therefore repeats the workload wipe even if token issuance or a later
@@ -1386,22 +1443,27 @@ pub async fn delete_app(
         .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeRoute, error))?;
 
+    let kubernetes_mutation_generation =
+        enclava_engine::apply::generation::MutationGeneration::new(kubernetes_mutation_generation)
+            .map_err(|_| internal_server_error())?;
+    let kubernetes_client = kube::Client::try_default()
+        .await
+        .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::Namespace, error))?;
+    let kubernetes_namespaces: kube::Api<k8s_openapi::api::core::v1::Namespace> =
+        kube::Api::all(kubernetes_client);
     delete_mutation
-        .guard_provider(tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            delete_tenant_namespace(&deleting_app.namespace),
+        .arm_resource_scope_until_reconciled("kubernetes_namespace")
+        .await
+        .map_err(|_| internal_server_error())?;
+    delete_mutation
+        .guard_provider(delete_tenant_namespace(
+            kubernetes_namespaces,
+            &deleting_app.namespace,
+            kubernetes_mutation_generation,
         ))
         .await
         .map_err(|_| internal_server_error())?
-        .map_err(|_| {
-            app_delete_failure(
-                deleting_app.id,
-                AppDeleteFailure::Namespace,
-                "deadline_exceeded",
-            )
-        })?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::Namespace, error))?;
-
     crate::kbs::soft_delete_owner_binding(&state.db, deleting_app.id)
         .await
         .map_err(|error| {

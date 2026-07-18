@@ -157,6 +157,8 @@ See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the current security snapshot.
   transparency monitoring notes.
 - [runbooks/dns-mutation-reconciliation.md](runbooks/dns-mutation-reconciliation.md)
   - fail-closed Cloudflare mutation recovery.
+- [runbooks/kubernetes-mutation-fence-recovery.md](runbooks/kubernetes-mutation-fence-recovery.md)
+  - fail-closed Kubernetes namespace mutation recovery.
 
 ## License
 

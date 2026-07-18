@@ -390,6 +390,12 @@ pub async fn verify_challenge(
     let edge_config_generation = mutation
         .resource_generation(&crate::mutation_leases::ResourceFence::edge_config())
         .ok_or_else(internal_error)?;
+    let kubernetes_mutation_generation = mutation
+        .resource_generation(&crate::mutation_leases::ResourceFence::new(
+            "kubernetes_namespace",
+            &app.namespace,
+        ))
+        .ok_or_else(internal_error)?;
     let mut app_lane = state.db.begin().await.map_err(|_| internal_error())?;
     crate::entitlements::lock_org_entitlement_lane(&mut app_lane, auth.org_id)
         .await
@@ -477,6 +483,8 @@ pub async fn verify_challenge(
             state.attestation.as_ref(),
             &api_signing_pubkey,
             &state.api_url,
+            &mutation,
+            kubernetes_mutation_generation,
         ))
         .await
         .map_err(|_| internal_error())?

@@ -4,6 +4,7 @@
 async fn cleanup_app_handles_full_lifecycle() {
     use enclava_engine::apply::cleanup::cleanup_app;
     use enclava_engine::apply::engine::ApplyEngine;
+    use enclava_engine::apply::generation::MutationGeneration;
     use enclava_engine::apply::orchestrator::apply_all;
     use enclava_engine::manifest::generate_all_manifests;
     use enclava_engine::testutil::sample_app;
@@ -13,10 +14,11 @@ async fn cleanup_app_handles_full_lifecycle() {
     let manifests = generate_all_manifests(&app);
 
     // Create all resources
-    apply_all(&engine, &manifests).await.unwrap();
+    let generation = MutationGeneration::new(1).unwrap();
+    apply_all(&engine, &manifests, generation).await.unwrap();
 
     // Cleanup
-    let report = cleanup_app(&engine, &app, None).await;
+    let report = cleanup_app(&engine, &app, None, generation).await;
     // At least some steps should succeed
     assert!(!report.steps.is_empty());
 
@@ -35,12 +37,13 @@ async fn cleanup_app_handles_full_lifecycle() {
 async fn cleanup_app_handles_already_deleted() {
     use enclava_engine::apply::cleanup::cleanup_app;
     use enclava_engine::apply::engine::ApplyEngine;
+    use enclava_engine::apply::generation::MutationGeneration;
     use enclava_engine::testutil::sample_app;
 
     let engine = ApplyEngine::try_default().await.unwrap();
     let app = sample_app();
 
     // Cleanup with nothing deployed -- should not panic
-    let report = cleanup_app(&engine, &app, None).await;
+    let report = cleanup_app(&engine, &app, None, MutationGeneration::new(1).unwrap()).await;
     assert!(!report.steps.is_empty());
 }

@@ -1,19 +1,22 @@
 use super::{
     AppDeleteFailure, CreateAppRequest, EgressAllowlistAuditReason, RotateSignerRequest,
     SignerRotationTokenRequest, app_delete_failure, create_app,
-    egress_allowlist_host_audit_reasons, issue_signer_rotation_token_route, list_apps,
-    request_workload_teardown, requires_workload_teardown, validate_egress_allowlist,
-    validate_egress_mode, workload_teardown_instance_id,
+    delete_tenant_namespace_with_timeouts, egress_allowlist_host_audit_reasons,
+    issue_signer_rotation_token_route, list_apps, request_workload_teardown,
+    requires_workload_teardown, validate_egress_allowlist, validate_egress_mode,
+    workload_teardown_instance_id,
 };
 use crate::models::{App, AppStatus, Role, UnlockMode};
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{Request, Response, StatusCode};
+use kube::client::Body;
 use std::{
     io::{self, Write},
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tower::service_fn;
 
 struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -221,6 +224,37 @@ fn running_and_deleting_apps_require_workload_teardown_endpoint() {
     assert!(!requires_workload_teardown(AppStatus::Creating));
     assert!(!requires_workload_teardown(AppStatus::Failed));
     assert!(!requires_workload_teardown(AppStatus::Stopped));
+}
+
+#[tokio::test]
+async fn tenant_namespace_delete_is_bounded_when_provider_read_hangs() {
+    let client = kube::Client::new(
+        service_fn(|_request: Request<Body>| async move {
+            std::future::pending::<Result<Response<Body>, io::Error>>().await
+        }),
+        "default",
+    );
+    let namespaces = kube::Api::all(client);
+    let error = tokio::time::timeout(
+        Duration::from_secs(1),
+        delete_tenant_namespace_with_timeouts(
+            namespaces,
+            "bounded-delete",
+            enclava_engine::apply::generation::MutationGeneration::new(1).unwrap(),
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+        ),
+    )
+    .await
+    .expect("test guard: provider operation deadline did not fire")
+    .expect_err("hung provider read must hit the outer operation deadline");
+
+    assert!(matches!(
+        error,
+        enclava_engine::apply::engine::ApplyError::CleanupStepFailed { step, detail }
+            if step == "delete_namespace"
+                && detail == "namespace deletion provider operation timed out"
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]

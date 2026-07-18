@@ -2,13 +2,14 @@ use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::core::v1::{Namespace, PersistentVolumeClaim};
-use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
+use kube::api::{Api, DeleteParams, ListParams};
 use serde_json::json;
 use tokio::time::Instant;
 
 use crate::types::ConfidentialApp;
 
 use super::engine::{ApplyEngine, ApplyError};
+use super::generation::{MutationGeneration, apply_existing_partial, delete_resource};
 use super::teardown::notify_teardown_proxy;
 
 /// Result of a single cleanup step.
@@ -74,15 +75,17 @@ pub async fn scale_statefulset_to_zero(
     namespace: &str,
     name: &str,
     timeout_duration: Duration,
+    generation: MutationGeneration,
 ) -> Result<(), ApplyError> {
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
 
     // Patch replicas to 0
     let patch = json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
         "spec": { "replicas": 0 }
     });
-    let pp = PatchParams::apply(&engine.config().field_manager).force();
-    super::bounded_kube_write(api.patch(name, &pp, &Patch::Apply(&patch))).await?;
+    apply_existing_partial(&api, name, &patch, generation).await?;
     tracing::info!(namespace = %namespace, statefulset = %name, "scaled StatefulSet to 0");
 
     // Wait for pods to terminate
@@ -125,15 +128,16 @@ pub async fn delete_statefulset(
     engine: &ApplyEngine,
     namespace: &str,
     name: &str,
+    generation: MutationGeneration,
 ) -> Result<(), ApplyError> {
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
 
-    match super::bounded_kube_write(api.delete(name, &DeleteParams::default())).await {
-        Ok(_) => {
+    match delete_resource(&api, name, generation, DeleteParams::default()).await {
+        Ok(true) => {
             tracing::info!(namespace = %namespace, statefulset = %name, "StatefulSet deleted");
             Ok(())
         }
-        Err(ApplyError::Kube(kube::Error::Api(ae))) if ae.code == 404 => {
+        Ok(false) => {
             tracing::info!(
                 namespace = %namespace,
                 statefulset = %name,
@@ -150,6 +154,7 @@ pub async fn delete_pvcs_and_wait(
     engine: &ApplyEngine,
     namespace: &str,
     timeout_duration: Duration,
+    generation: MutationGeneration,
 ) -> Result<(), ApplyError> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(engine.client().clone(), namespace);
 
@@ -163,11 +168,11 @@ pub async fn delete_pvcs_and_wait(
 
     for pvc in &pvcs.items {
         let pvc_name = pvc.metadata.name.as_deref().unwrap_or("<unnamed>");
-        match super::bounded_kube_write(api.delete(pvc_name, &DeleteParams::default())).await {
-            Ok(_) => {
+        match delete_resource(&api, pvc_name, generation, DeleteParams::default()).await {
+            Ok(true) => {
                 tracing::info!(namespace = %namespace, pvc = %pvc_name, "PVC delete requested");
             }
-            Err(ApplyError::Kube(kube::Error::Api(ae))) if ae.code == 404 => {
+            Ok(false) => {
                 tracing::info!(namespace = %namespace, pvc = %pvc_name, "PVC already gone");
             }
             Err(e) => {
@@ -225,58 +230,73 @@ pub async fn delete_namespace_and_wait(
     engine: &ApplyEngine,
     namespace: &str,
     timeout_duration: Duration,
+    generation: MutationGeneration,
 ) -> Result<(), ApplyError> {
     let api: Api<Namespace> = Api::all(engine.client().clone());
-
-    match super::bounded_kube_write(api.delete(namespace, &DeleteParams::default())).await {
-        Ok(_) => {
-            tracing::info!(namespace = %namespace, "namespace delete requested");
-        }
-        Err(ApplyError::Kube(kube::Error::Api(ae))) if ae.code == 404 => {
-            tracing::info!(namespace = %namespace, "namespace already deleted");
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    }
-
-    // Wait for the namespace to disappear
-    let start = Instant::now();
-    loop {
-        if start.elapsed() >= timeout_duration {
-            tracing::warn!(
-                namespace = %namespace,
-                "namespace deletion timed out -- may be stuck in Terminating"
-            );
-            return Err(ApplyError::CleanupStepFailed {
-                step: "delete_namespace".to_string(),
-                detail: format!(
-                    "namespace '{namespace}' stuck in Terminating after {timeout_duration:?}"
-                ),
-            });
-        }
-
-        match api.get(namespace).await {
-            Err(kube::Error::Api(ae)) if ae.code == 404 => {
-                tracing::info!(namespace = %namespace, "namespace fully deleted");
+    let delete_and_wait = async {
+        match delete_resource(&api, namespace, generation, DeleteParams::default()).await {
+            Ok(true) => {
+                tracing::info!(namespace = %namespace, "namespace delete requested");
+            }
+            Ok(false) => {
+                tracing::info!(namespace = %namespace, "namespace already deleted");
                 return Ok(());
             }
-            Ok(ns) => {
-                let phase = ns
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.phase.as_deref())
-                    .unwrap_or("Unknown");
-                tracing::debug!(
-                    namespace = %namespace,
-                    phase = %phase,
-                    "waiting for namespace deletion"
-                );
-            }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         }
 
-        tokio::time::sleep(Duration::from_secs(3)).await;
-    }
+        // Wait for the namespace to disappear.
+        let start = Instant::now();
+        loop {
+            if start.elapsed() >= timeout_duration {
+                tracing::warn!(
+                    namespace = %namespace,
+                    "namespace deletion timed out -- may be stuck in Terminating"
+                );
+                return Err(ApplyError::CleanupStepFailed {
+                    step: "delete_namespace".to_string(),
+                    detail: format!(
+                        "namespace '{namespace}' stuck in Terminating after {timeout_duration:?}"
+                    ),
+                });
+            }
+
+            match api.get(namespace).await {
+                Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                    tracing::info!(namespace = %namespace, "namespace fully deleted");
+                    return Ok(());
+                }
+                Ok(ns) => {
+                    let phase = ns
+                        .status
+                        .as_ref()
+                        .and_then(|s| s.phase.as_deref())
+                        .unwrap_or("Unknown");
+                    tracing::debug!(
+                        namespace = %namespace,
+                        phase = %phase,
+                        "waiting for namespace deletion"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    };
+
+    // The convergence deadline alone cannot bound a hung GET. Keep the whole
+    // provider operation bounded so callers retain their durable fail-closed
+    // fence instead of waiting forever.
+    tokio::time::timeout(
+        timeout_duration.saturating_add(Duration::from_secs(30)),
+        delete_and_wait,
+    )
+    .await
+    .map_err(|_| ApplyError::CleanupStepFailed {
+        step: "delete_namespace".to_string(),
+        detail: format!("namespace '{namespace}' provider operation exceeded its outer timeout"),
+    })?
 }
 
 /// Ordered cleanup of all resources for a confidential app.
@@ -299,6 +319,7 @@ pub async fn cleanup_app(
     engine: &ApplyEngine,
     app: &ConfidentialApp,
     api_token: Option<&str>,
+    generation: MutationGeneration,
 ) -> CleanupReport {
     let mut report = CleanupReport::new();
 
@@ -328,6 +349,7 @@ pub async fn cleanup_app(
         &app.namespace,
         &app.name,
         engine.config().rollout_timeout,
+        generation,
     )
     .await
     {
@@ -347,7 +369,7 @@ pub async fn cleanup_app(
         }
     }
 
-    match delete_statefulset(engine, &app.namespace, &app.name).await {
+    match delete_statefulset(engine, &app.namespace, &app.name, generation).await {
         Ok(()) => report.record_success("delete_statefulset"),
         Err(e) => {
             tracing::warn!(app = %app.name, error = %e, "delete StatefulSet failed");
@@ -355,7 +377,14 @@ pub async fn cleanup_app(
         }
     }
 
-    match delete_pvcs_and_wait(engine, &app.namespace, engine.config().pvc_delete_timeout).await {
+    match delete_pvcs_and_wait(
+        engine,
+        &app.namespace,
+        engine.config().pvc_delete_timeout,
+        generation,
+    )
+    .await
+    {
         Ok(()) => report.record_success("delete_pvcs"),
         Err(e) => {
             tracing::warn!(app = %app.name, error = %e, "PVC cleanup issue");
@@ -367,6 +396,7 @@ pub async fn cleanup_app(
         engine,
         &app.namespace,
         engine.config().namespace_delete_timeout,
+        generation,
     )
     .await
     {

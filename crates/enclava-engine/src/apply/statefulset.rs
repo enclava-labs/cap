@@ -1,7 +1,8 @@
 use k8s_openapi::api::apps::v1::StatefulSet;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::Api;
 
 use super::engine::{ApplyEngine, ApplyError};
+use super::generation::{MutationGeneration, apply_resource};
 
 /// Apply the StatefulSet via SSA WITHOUT `force` (Phase 11).
 ///
@@ -19,12 +20,11 @@ pub async fn apply_statefulset(
     engine: &ApplyEngine,
     namespace: &str,
     statefulset: &StatefulSet,
+    generation: MutationGeneration,
 ) -> Result<StatefulSet, ApplyError> {
     let name = statefulset.metadata.name.as_deref().unwrap_or("<unnamed>");
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
-    let pp = PatchParams::apply(&engine.config().field_manager);
-
-    match super::bounded_kube_write(api.patch(name, &pp, &Patch::Apply(statefulset))).await {
+    match apply_resource(engine, &api, statefulset, generation, false).await {
         Ok(patched) => {
             tracing::info!(
                 namespace = %namespace,

@@ -1656,6 +1656,12 @@ async fn apply_claimed_job(
     let edge_config_generation = mutation
         .resource_generation(&crate::mutation_leases::ResourceFence::edge_config())
         .ok_or(crate::mutation_leases::MutationLeaseError::Lost)?;
+    let kubernetes_mutation_generation = mutation
+        .resource_generation(&crate::mutation_leases::ResourceFence::new(
+            "kubernetes_namespace",
+            &payload.app.namespace,
+        ))
+        .ok_or(crate::mutation_leases::MutationLeaseError::Lost)?;
     let rollout = mutation
         .guard_provider(crate::deploy::apply_deployment_manifests(
             ApplyDeploymentManifestsRequest {
@@ -1669,6 +1675,7 @@ async fn apply_claimed_job(
                 attestation_config: payload.attestation_config.clone(),
                 kbs_policy_config: state.kbs_policy.clone(),
                 edge_config_generation,
+                kubernetes_mutation_generation,
                 api_signing_pubkey: payload.api_signing_pubkey.clone(),
                 api_url: payload.api_url.clone(),
                 workload_artifact_binding: validated.workload_artifact_binding,
@@ -1677,6 +1684,7 @@ async fn apply_claimed_job(
                 local_trustee_policy_json: validated.local_trustee_policy_json,
                 log_encryption: payload.log_encryption.clone(),
             },
+            &mutation,
         ))
         .await?;
     let mut authority_lane = authority_lane;
@@ -3971,7 +3979,7 @@ mod tests {
     #[tokio::test]
     async fn request_owned_dns_failure_preserves_typed_error_mapping() {
         let pool = database_test_pool().await;
-        let (app, _deployment_id, setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let (app, deployment_id, setup_handle, _payload) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
         state.dns = Some(crate::dns::DnsConfig {
@@ -3989,6 +3997,103 @@ mod tests {
             error,
             DeploymentJobError::Dns(crate::dns::DnsError::OutsideManagedZone(_))
         ));
+
+        let (owner_token, app_generation): (Uuid, i64) = sqlx::query_as(
+            "SELECT owner_token, generation
+               FROM app_mutation_leases
+              WHERE app_id = $1
+                AND operation_kind = 'deployment_setup'
+                AND operation_id = $2",
+        )
+        .bind(app.id)
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load exact failed setup mutation owner");
+        let owned_resources: Vec<(String, String, i64, bool)> = sqlx::query_as(
+            "SELECT resource_scope,
+                    resource_key,
+                    generation,
+                    reclaim_after = 'infinity'::timestamptz
+               FROM external_resource_mutation_leases
+              WHERE owner_token = $1
+                AND operation_kind = 'deployment_setup'
+                AND operation_id = $2
+              ORDER BY resource_scope, resource_key",
+        )
+        .bind(owner_token)
+        .bind(deployment_id)
+        .fetch_all(&pool)
+        .await
+        .expect("load failed setup provider ownership");
+        assert!(
+            owned_resources
+                .iter()
+                .any(|(scope, _, _, poisoned)| { scope == "dns_hostname" && *poisoned }),
+            "failed setup must retain an infinite DNS ambiguity fence"
+        );
+
+        // OutsideManagedZone is rejected before an HTTP request is sent, so
+        // this test knows no detached provider write exists. Clear only the
+        // exact operation/token/generation it just observed; never weaken the
+        // production fail-closed path or any later owner.
+        let mut cleanup = pool.begin().await.expect("begin exact test-owner cleanup");
+        for (scope, key, generation, _) in &owned_resources {
+            let cleared = sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                    SET owner_token = NULL,
+                        operation_kind = NULL,
+                        operation_id = NULL,
+                        locked_until = NULL,
+                        reclaim_after = NULL,
+                        updated_at = clock_timestamp()
+                  WHERE resource_scope = $1
+                    AND resource_key = $2
+                    AND generation = $3
+                    AND owner_token = $4
+                    AND operation_kind = 'deployment_setup'
+                    AND operation_id = $5",
+            )
+            .bind(scope)
+            .bind(key)
+            .bind(generation)
+            .bind(owner_token)
+            .bind(deployment_id)
+            .execute(&mut *cleanup)
+            .await
+            .expect("clear exact failed setup resource owner");
+            assert_eq!(cleared.rows_affected(), 1);
+        }
+        let cleared_app = sqlx::query(
+            "UPDATE app_mutation_leases
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL,
+                    updated_at = clock_timestamp()
+              WHERE app_id = $1
+                AND generation = $2
+                AND owner_token = $3
+                AND operation_kind = 'deployment_setup'
+                AND operation_id = $4
+                AND NOT EXISTS (
+                    SELECT 1 FROM external_resource_mutation_leases
+                     WHERE owner_token = $3
+                )",
+        )
+        .bind(app.id)
+        .bind(app_generation)
+        .bind(owner_token)
+        .bind(deployment_id)
+        .execute(&mut *cleanup)
+        .await
+        .expect("clear exact failed setup app owner");
+        assert_eq!(cleared_app.rows_affected(), 1);
+        cleanup
+            .commit()
+            .await
+            .expect("commit exact test-owner cleanup");
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)
@@ -4299,7 +4404,9 @@ mod tests {
             .acquire_owned()
             .await
             .expect("acquire test worker slot");
-        process_apply_job(state.clone(), apply, worker_slot).await;
+        tokio::spawn(process_apply_job(state.clone(), apply, worker_slot))
+            .await
+            .expect("KBS contention worker task joins");
 
         let (job_state, token, deployment_status, app_status): (
             String,

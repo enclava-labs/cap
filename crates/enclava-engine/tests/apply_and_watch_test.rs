@@ -6,6 +6,7 @@
 #[ignore]
 async fn apply_and_watch_completes_or_times_out() {
     use enclava_engine::apply::engine::ApplyEngine;
+    use enclava_engine::apply::generation::MutationGeneration;
     use enclava_engine::apply::orchestrator::apply_and_watch;
     use enclava_engine::apply::types::ApplyConfig;
     use enclava_engine::testutil::sample_app;
@@ -19,7 +20,9 @@ async fn apply_and_watch_completes_or_times_out() {
     let engine = ApplyEngine::try_with_config(config).await.unwrap();
     let app = sample_app();
 
-    let status = apply_and_watch(&engine, &app).await.unwrap();
+    let status = apply_and_watch(&engine, &app, MutationGeneration::new(1).unwrap())
+        .await
+        .unwrap();
 
     // In a test env without SEV-SNP, we expect timeout or failure, not Running
     assert!(

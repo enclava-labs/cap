@@ -2,6 +2,7 @@ pub mod cleanup;
 pub mod drift;
 pub mod engine;
 pub mod gateway;
+pub mod generation;
 pub mod namespace;
 pub mod network_policy;
 pub mod orchestrator;

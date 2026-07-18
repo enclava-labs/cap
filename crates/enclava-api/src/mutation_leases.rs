@@ -1420,6 +1420,163 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prearmed_kubernetes_namespace_survives_process_loss_and_rejects_reclaim() {
+        let pool = database_test_pool(4).await;
+        let namespace = format!("detached-kube-{}", Uuid::new_v4().simple());
+        let hostname = format!("{namespace}.example.test");
+        let (org_id, app_id) = insert_app(&pool, &hostname).await;
+        sqlx::query("UPDATE apps SET namespace = $1 WHERE id = $2")
+            .bind(&namespace)
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("set unique Kubernetes namespace fixture");
+        let state = state_with_pool(pool.clone());
+        let mut owner = claim(
+            &state,
+            app_id,
+            "detached_kubernetes_apply",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::new("kubernetes_namespace", &namespace)],
+        )
+        .await
+        .expect("claim Kubernetes namespace generation");
+        let generation = owner.resources[0].generation;
+        owner
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("arm namespace before first Kubernetes write");
+
+        // Model API process loss after a detached Kubernetes handler accepted
+        // the request: no Drop cleanup or elapsed deadline may authorize a
+        // newer inverse generation while that handler can still complete.
+        owner.stop_heartbeat();
+        drop(owner);
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("advance app reclaim boundary");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("expire renewable namespace lease");
+
+        let poisoned: (i64, bool) = sqlx::query_as(
+            "SELECT generation,
+                    reclaim_after = 'infinity'::timestamptz
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("load durable Kubernetes ambiguity fence");
+        assert_eq!(poisoned, (generation, true));
+
+        let inverse = claim(
+            &state,
+            app_id,
+            "newer_kubernetes_delete",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::new("kubernetes_namespace", &namespace)],
+        )
+        .await
+        .expect_err("infinite provider fence rejects timed namespace reclaim");
+        assert!(matches!(inverse, MutationLeaseError::Busy));
+
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("remove Kubernetes ambiguity fixture");
+        sqlx::query("DELETE FROM apps WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("remove Kubernetes app fixture");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("remove Kubernetes organization fixture");
+    }
+
+    #[tokio::test]
+    async fn successful_publication_clears_prearmed_kubernetes_namespace_atomically() {
+        let pool = database_test_pool(4).await;
+        let namespace = format!("finished-kube-{}", Uuid::new_v4().simple());
+        let hostname = format!("{namespace}.example.test");
+        let (org_id, app_id) = insert_app(&pool, &hostname).await;
+        let state = state_with_pool(pool.clone());
+        let owner = claim(
+            &state,
+            app_id,
+            "successful_kubernetes_apply",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::new("kubernetes_namespace", &namespace)],
+        )
+        .await
+        .expect("claim Kubernetes namespace generation");
+        owner
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("arm namespace before Kubernetes write");
+        owner.finish().await.expect("publish and clear exact owner");
+
+        let cleared: (bool, bool) = sqlx::query_as(
+            "SELECT owner_token IS NULL, reclaim_after IS NULL
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("load cleared Kubernetes fence");
+        assert_eq!(cleared, (true, true));
+
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("remove successful Kubernetes fence fixture");
+        sqlx::query("DELETE FROM apps WHERE id = $1")
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("remove successful Kubernetes app fixture");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("remove successful Kubernetes organization fixture");
+    }
+
+    #[tokio::test]
     async fn reclaim_quarantine_rejects_late_owner_then_allows_new_generation() {
         let pool = database_test_pool(4).await;
         let hostname = format!("reclaim-{}.example.test", Uuid::new_v4().simple());

@@ -11,6 +11,41 @@ pub enum ApplyError {
     #[error("Kubernetes mutating request exceeded its 30 second deadline")]
     ProviderWriteTimeout,
 
+    #[error("durable provider mutation generation must be positive, got {0}")]
+    InvalidMutationGeneration(i64),
+
+    #[error("{kind} '{name}' has invalid provider mutation generation metadata")]
+    InvalidLiveMutationGeneration { kind: String, name: String },
+
+    #[error(
+        "stale provider mutation for {kind} '{name}': requested generation {desired}, live generation {actual}"
+    )]
+    StaleMutationGeneration {
+        kind: String,
+        name: String,
+        desired: i64,
+        actual: i64,
+    },
+
+    #[error(
+        "Kubernetes accepted {kind} '{name}' without provider mutation generation {expected} (found {actual})"
+    )]
+    ProviderGenerationNotApplied {
+        kind: String,
+        name: String,
+        expected: i64,
+        actual: i64,
+    },
+
+    #[error("{0} is missing the UID, name, or resourceVersion required for a fenced mutation")]
+    MissingResourceIdentity(String),
+
+    #[error("{kind} '{name}' was not found for a fenced partial mutation")]
+    ResourceNotFound { kind: String, name: String },
+
+    #[error("conditional mutation retries exhausted for {kind} '{name}'")]
+    MutationConflictExhausted { kind: String, name: String },
+
     #[error("namespace '{0}' must be created before applying namespaced resources")]
     NamespaceNotReady(String),
 

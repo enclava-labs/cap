@@ -1614,12 +1614,14 @@ dependencies = [
 name = "enclava-engine"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "base64 0.22.1",
  "enclava-common",
  "enclava-engine",
  "flate2",
  "futures",
  "hex",
+ "http-body-util",
  "k8s-openapi",
  "kube",
  "reqwest 0.13.2",
@@ -1630,6 +1632,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "uuid",
 ]

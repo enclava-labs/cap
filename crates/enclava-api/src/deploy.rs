@@ -5,6 +5,7 @@ use enclava_common::types::{ResourceLimits, UnlockMode as CommonUnlockMode};
 use enclava_engine::apply::{
     engine::ApplyEngine,
     gateway::apply_gateway_resources,
+    generation::MutationGeneration,
     namespace::apply_namespace,
     network_policy::apply_network_policy,
     orchestrator::{MANIFEST_HASH_ANNOTATION, manifest_hash},
@@ -303,6 +304,7 @@ async fn apply_all_with_tenant_image_pull_secret(
     manifests: &enclava_engine::manifest::GeneratedManifests,
     manifest_hash: &str,
     image_pull_secret_config: Option<&TenantImagePullSecretConfig>,
+    generation: MutationGeneration,
 ) -> Result<(), DeployError> {
     let ns_name = manifests
         .namespace
@@ -315,12 +317,12 @@ async fn apply_all_with_tenant_image_pull_secret(
             )
         })?;
 
-    apply_namespace(engine, &manifests.namespace).await?;
+    apply_namespace(engine, &manifests.namespace, generation).await?;
     tracing::info!(namespace = %ns_name, "step 1/5: namespace ready");
 
     if let Some(config) = image_pull_secret_config {
         let secret = generate_tenant_image_pull_secret(ns_name, config);
-        apply_namespaced_resource(engine, ns_name, &secret).await?;
+        apply_namespaced_resource(engine, ns_name, &secret, generation).await?;
         tracing::info!(
             namespace = %ns_name,
             secret = %config.name,
@@ -328,10 +330,10 @@ async fn apply_all_with_tenant_image_pull_secret(
         );
     }
 
-    apply_standard_resources(engine, manifests).await?;
+    apply_standard_resources(engine, manifests, generation).await?;
     tracing::info!(namespace = %ns_name, "step 2/5: standard resources applied");
 
-    apply_network_policy(engine, ns_name, &manifests.network_policy).await?;
+    apply_network_policy(engine, ns_name, &manifests.network_policy, generation).await?;
     tracing::info!(namespace = %ns_name, "step 3/5: CiliumNetworkPolicy applied");
 
     apply_gateway_resources(
@@ -341,6 +343,7 @@ async fn apply_all_with_tenant_image_pull_secret(
         &manifests.gateway,
         &manifests.tls_route,
         &manifests.tee_tls_route,
+        generation,
     )
     .await?;
     tracing::info!(namespace = %ns_name, "step 4/5: Gateway API resources applied");
@@ -354,7 +357,7 @@ async fn apply_all_with_tenant_image_pull_secret(
             manifest_hash.to_string(),
         );
 
-    apply_statefulset(engine, ns_name, &sts).await?;
+    apply_statefulset(engine, ns_name, &sts, generation).await?;
     tracing::info!(
         namespace = %ns_name,
         manifest_hash = %manifest_hash,
@@ -373,6 +376,7 @@ pub struct ApplyDeploymentManifestsRequest {
     pub attestation_config: Option<AttestationConfig>,
     pub kbs_policy_config: Option<crate::kbs::KbsPolicyConfig>,
     pub edge_config_generation: i64,
+    pub kubernetes_mutation_generation: i64,
     pub api_signing_pubkey: String,
     pub api_url: String,
     pub workload_artifact_binding: Option<WorkloadArtifactBinding>,
@@ -521,6 +525,8 @@ pub enum DeployError {
     KbsPolicy(#[from] crate::kbs::KbsPolicyError),
     #[error("edge route error: {0}")]
     EdgeRoute(#[from] crate::edge::EdgeRouteError),
+    #[error("durable mutation fence error: {0}")]
+    Mutation(#[from] crate::mutation_leases::MutationLeaseError),
 }
 
 pub(crate) fn serialize_workload_command(
@@ -1618,6 +1624,8 @@ pub async fn reapply_tenant_ingress(
     attestation_config: Option<&AttestationConfig>,
     api_signing_pubkey: &str,
     api_url: &str,
+    mutation: &crate::mutation_leases::AppMutationLease,
+    kubernetes_mutation_generation: i64,
 ) -> Result<(), DeployError> {
     let Some(attestation_config) = attestation_config else {
         return Err(DeployError::MissingAttestationConfig);
@@ -1640,9 +1648,19 @@ pub async fn reapply_tenant_ingress(
 
     let engine = ApplyEngine::try_default().await?;
     ensure_statefulset_exists(&engine, &app_spec.namespace, &app_spec.name).await?;
-    enclava_engine::apply::resources::apply_namespaced_resource(&engine, &app_spec.namespace, &cm)
+    let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
+    mutation
+        .arm_resource_scope_until_reconciled("kubernetes_namespace")
         .await?;
-    restart_statefulset_for_ingress(&engine, &app_spec.namespace, &app_spec.name).await?;
+    enclava_engine::apply::resources::apply_namespaced_resource(
+        &engine,
+        &app_spec.namespace,
+        &cm,
+        generation,
+    )
+    .await?;
+    restart_statefulset_for_ingress(&engine, &app_spec.namespace, &app_spec.name, generation)
+        .await?;
 
     let status = watch_rollout(&engine, &app_spec.namespace, &app_spec.name).await?;
     if status.phase != DeployPhase::Running {
@@ -1679,13 +1697,15 @@ async fn restart_statefulset_for_ingress(
     engine: &ApplyEngine,
     namespace: &str,
     name: &str,
+    generation: MutationGeneration,
 ) -> Result<(), DeployError> {
     use k8s_openapi::api::apps::v1::StatefulSet;
     use kube::Api;
-    use kube::api::{Patch, PatchParams};
 
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
     let patch = serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
         "spec": {
             "template": {
                 "metadata": {
@@ -1696,12 +1716,8 @@ async fn restart_statefulset_for_ingress(
             }
         }
     });
-    enclava_engine::apply::bounded_kube_write(api.patch(
-        name,
-        &PatchParams::default(),
-        &Patch::Merge(&patch),
-    ))
-    .await?;
+    enclava_engine::apply::generation::apply_existing_partial(&api, name, &patch, generation)
+        .await?;
 
     tracing::info!(
         namespace = %namespace,
@@ -1756,6 +1772,7 @@ impl DeploymentRollout {
 /// Apply manifests and return durable rollout-observation context.
 pub async fn apply_deployment_manifests(
     request: ApplyDeploymentManifestsRequest,
+    mutation: &crate::mutation_leases::AppMutationLease,
 ) -> Result<Option<DeploymentRollout>, DeployError> {
     let ApplyDeploymentManifestsRequest {
         pool,
@@ -1765,6 +1782,7 @@ pub async fn apply_deployment_manifests(
         attestation_config,
         kbs_policy_config,
         edge_config_generation,
+        kubernetes_mutation_generation,
         api_signing_pubkey,
         api_url,
         workload_artifact_binding,
@@ -1846,12 +1864,17 @@ pub async fn apply_deployment_manifests(
         crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref()).await?;
     }
 
+    let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
     let engine = ApplyEngine::try_default().await?;
+    mutation
+        .arm_resource_scope_until_reconciled("kubernetes_namespace")
+        .await?;
     apply_all_with_tenant_image_pull_secret(
         &engine,
         &manifests,
         &hash,
         tenant_image_pull_secret_config.as_ref(),
+        generation,
     )
     .await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
