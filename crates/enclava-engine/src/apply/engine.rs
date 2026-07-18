@@ -134,3 +134,68 @@ impl ApplyEngine {
         &self.config
     }
 }
+
+#[cfg(test)]
+mod public_code_tests {
+    use super::ApplyError;
+
+    #[test]
+    fn provider_fencing_errors_have_fixed_public_codes() {
+        const SECRET: &str = "tenant-secret-resource";
+        let errors = [
+            (ApplyError::ProviderWriteTimeout, "provider_write_timeout"),
+            (
+                ApplyError::InvalidMutationGeneration(-1),
+                "invalid_mutation_generation",
+            ),
+            (
+                ApplyError::InvalidLiveMutationGeneration {
+                    kind: SECRET.to_string(),
+                    name: SECRET.to_string(),
+                },
+                "invalid_live_mutation_generation",
+            ),
+            (
+                ApplyError::StaleMutationGeneration {
+                    kind: SECRET.to_string(),
+                    name: SECRET.to_string(),
+                    desired: 2,
+                    actual: 3,
+                },
+                "stale_mutation_generation",
+            ),
+            (
+                ApplyError::ProviderGenerationNotApplied {
+                    kind: SECRET.to_string(),
+                    name: SECRET.to_string(),
+                    expected: 2,
+                    actual: 1,
+                },
+                "provider_generation_not_applied",
+            ),
+            (
+                ApplyError::MissingResourceIdentity(SECRET.to_string()),
+                "missing_resource_identity",
+            ),
+            (
+                ApplyError::ResourceNotFound {
+                    kind: SECRET.to_string(),
+                    name: SECRET.to_string(),
+                },
+                "resource_not_found",
+            ),
+            (
+                ApplyError::MutationConflictExhausted {
+                    kind: SECRET.to_string(),
+                    name: SECRET.to_string(),
+                },
+                "mutation_conflict_exhausted",
+            ),
+        ];
+
+        for (error, expected) in errors {
+            assert_eq!(error.public_code(), expected);
+            assert!(!error.public_code().contains(SECRET));
+        }
+    }
+}

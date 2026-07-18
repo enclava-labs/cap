@@ -313,7 +313,7 @@ impl DeploymentJobError {
             Self::Artifact => "artifact_invalid",
             Self::LeaseLost => "lease_lost",
             Self::Authority => "deployment_authority_changed",
-            Self::Apply(_) => "deployment_apply_error",
+            Self::Apply(error) => error.public_code(),
             Self::Kbs(_) => "kbs_policy_error",
             Self::ApplyLimiterClosed => "apply_limiter_closed",
             Self::SideEffectAdmissionClosed => "side_effect_admission_closed",

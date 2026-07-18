@@ -1186,6 +1186,14 @@ mod tests {
         ));
         assert_eq!(error.public_code(), "rollout_failed");
         assert!(!error.public_code().contains("customer-secret-name"));
+
+        let mutation_error =
+            DeployError::Mutation(crate::mutation_leases::MutationLeaseError::Busy);
+        assert_eq!(mutation_error.public_code(), "mutation_fence_error");
+        assert_eq!(
+            crate::deployment_jobs::DeploymentJobError::from(mutation_error).code(),
+            "mutation_fence_error"
+        );
     }
 
     #[test]

@@ -2582,7 +2582,7 @@ async fn adopt_exact_internal_deployment(
         "status": row.4,
         "image_digest": row.5,
         "cosign_verified": row.6,
-        "error_message": row.7,
+        "error_message": public_deployment_error_message(row.7.as_deref()),
         "created_at": row.8,
         "completed_at": row.9,
     })))
