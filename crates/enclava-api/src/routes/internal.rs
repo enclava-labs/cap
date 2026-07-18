@@ -115,7 +115,7 @@ struct ConfigTokenReceipt {
     expires_at: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigTokenResourceBinding {
     resource_id: Uuid,
     instance_id: String,
@@ -806,7 +806,7 @@ async fn terminalize_expired_config_token_receipt(
                 response_status = $4,
                 response_body = $5,
                 completed_at = COALESCE(completed_at, clock_timestamp()),
-                lease_expires_at = NULL,
+                lease_expires_at = CASE WHEN $9 THEN lease_expires_at ELSE NULL END,
                 updated_at = clock_timestamp()
           WHERE idempotency_key = $1
             AND reservation_token IS NOT DISTINCT FROM $6
@@ -814,7 +814,9 @@ async fn terminalize_expired_config_token_receipt(
             AND response_status IS NULL
             AND $8::timestamptz <= clock_timestamp()
             AND (
-                completed_at IS NOT NULL
+                NOT $9
+                OR completed_at IS NOT NULL
+                OR lease_expires_at IS NULL
                 OR lease_expires_at <= clock_timestamp()
             )",
     )
@@ -826,6 +828,7 @@ async fn terminalize_expired_config_token_receipt(
     .bind(receipt.previous_token)
     .bind(receipt.stored_recovery_kind)
     .bind(receipt.expires_at)
+    .bind(receipt.legacy)
     .execute(&mut *tx)
     .await
     .map_err(|_| db_error())?;
@@ -871,7 +874,6 @@ async fn sanitize_legacy_completed_config_token_response(
                 response_status = $4,
                 response_body = $5,
                 completed_at = COALESCE(completed_at, clock_timestamp()),
-                lease_expires_at = NULL,
                 updated_at = clock_timestamp()
           WHERE idempotency_key = $1
             AND reservation_token IS NOT DISTINCT FROM $6
@@ -2505,18 +2507,8 @@ async fn begin_actor_deterministic_config_token_request(
     binding: &ConfigTokenResourceBinding,
 ) -> Result<IdempotencyBegin, InternalRouteError> {
     let key = idempotency_key(headers)?;
-    let hash = request_hash(&serde_json::json!({
-        "cap_user_id": auth.user_id,
-        "cap_org_id": auth.org_id,
-        "capability_resource_id": binding.resource_id,
-        "capability_instance_id": binding.instance_id,
-        "body": body,
-    }))?;
-    let legacy_hash = request_hash(&serde_json::json!({
-        "cap_user_id": auth.user_id,
-        "cap_org_id": auth.org_id,
-        "body": body,
-    }))?;
+    let hash = deterministic_config_token_request_hash(auth, body, binding)?;
+    let legacy_hash = legacy_config_token_request_hash(auth, body)?;
     begin_idempotent_request_with_recovery_and_binding(
         state,
         key,
@@ -2532,18 +2524,38 @@ async fn begin_actor_deterministic_config_token_request(
     .await
 }
 
-async fn replay_safe_migrated_legacy_config_token_terminal(
+fn deterministic_config_token_request_hash(
+    auth: &AuthContext,
+    body: &serde_json::Value,
+    binding: &ConfigTokenResourceBinding,
+) -> Result<Vec<u8>, InternalRouteError> {
+    request_hash(&serde_json::json!({
+        "cap_user_id": auth.user_id,
+        "cap_org_id": auth.org_id,
+        "capability_resource_id": binding.resource_id,
+        "capability_instance_id": binding.instance_id,
+        "body": body,
+    }))
+}
+
+fn legacy_config_token_request_hash(
+    auth: &AuthContext,
+    body: &serde_json::Value,
+) -> Result<Vec<u8>, InternalRouteError> {
+    request_hash(&serde_json::json!({
+        "cap_user_id": auth.user_id,
+        "cap_org_id": auth.org_id,
+        "body": body,
+    }))
+}
+
+async fn preflight_existing_config_token_request(
     state: &AppState,
     key: &str,
     path: &str,
     auth: &AuthContext,
     body: &serde_json::Value,
 ) -> Result<Option<IdempotencyResponse>, InternalRouteError> {
-    let legacy_hash = request_hash(&serde_json::json!({
-        "cap_user_id": auth.user_id,
-        "cap_org_id": auth.org_id,
-        "body": body,
-    }))?;
     let row: Option<IdempotencyRow> = sqlx::query_as(
         "SELECT method, path, request_hash, response_status, response_body,
                 reservation_token, operation_id, lease_expires_at,
@@ -2561,14 +2573,117 @@ async fn replay_safe_migrated_legacy_config_token_terminal(
     let Some(row) = row else {
         return Ok(None);
     };
-    if row.method != "POST"
-        || row.path != path
-        || row.request_hash != legacy_hash
-        || !is_safe_migrated_legacy_config_token_terminal(&row)
-    {
-        return Ok(None);
+    if row.method != "POST" || row.path != path {
+        return Err(idempotency_key_reused_error());
     }
-    Ok(completed_idempotency_response(&row))
+
+    match row.recovery_kind.as_deref() {
+        Some("deterministic_expiring_capability") => {
+            let fallback_operation_id =
+                idempotency_operation_id(key, "POST", path, &row.request_hash);
+            let receipt = config_token_receipt_from_row(&row, fallback_operation_id)?;
+            let stored_binding = ConfigTokenResourceBinding {
+                resource_id: receipt.resource_id,
+                instance_id: receipt.instance_id.clone(),
+            };
+            let expected_hash =
+                deterministic_config_token_request_hash(auth, body, &stored_binding)?;
+            if row.request_hash != expected_hash {
+                return Err(idempotency_key_reused_error());
+            }
+            if let Some(response) = completed_idempotency_response(&row) {
+                return Ok(Some(response));
+            }
+            if receipt.expires_at > row.database_now {
+                return Ok(None);
+            }
+            let terminal = terminalize_expired_config_token_receipt(
+                &state.db,
+                ExpiredConfigTokenReceipt {
+                    key,
+                    previous_token: row.reservation_token,
+                    operation_id: receipt.operation_id,
+                    stored_recovery_kind: "deterministic_expiring_capability",
+                    issued_at: receipt.issued_at,
+                    expires_at: receipt.expires_at,
+                    legacy: false,
+                },
+            )
+            .await?;
+            match terminal {
+                IdempotencyBegin::Replay(response) => Ok(Some(response)),
+                IdempotencyBegin::Execute(_) => Err(db_error()),
+            }
+        }
+        Some("expiring_capability") => {
+            let legacy_hash = legacy_config_token_request_hash(auth, body)?;
+            if row.request_hash != legacy_hash {
+                return Err(idempotency_key_reused_error());
+            }
+            let issued_at = chrono::DateTime::from_timestamp(row.created_at.timestamp(), 0)
+                .expect("PostgreSQL timestamptz has a whole-second value");
+            let minimum_recovery_after = issued_at + chrono::Duration::minutes(6);
+            let recovery_after = row
+                .lease_expires_at
+                .map(|lease| lease.max(minimum_recovery_after))
+                .unwrap_or(minimum_recovery_after);
+            if row
+                .response_status
+                .is_some_and(|status| (200..300).contains(&status))
+            {
+                let sanitized = sanitize_legacy_completed_config_token_response(
+                    &state.db,
+                    key,
+                    row.reservation_token,
+                    row.operation_id.unwrap_or_else(|| {
+                        idempotency_operation_id(key, "POST", path, &legacy_hash)
+                    }),
+                    issued_at,
+                    recovery_after,
+                )
+                .await?;
+                return match sanitized {
+                    IdempotencyBegin::Replay(response) => Ok(Some(response)),
+                    IdempotencyBegin::Execute(_) => Err(db_error()),
+                };
+            }
+            if let Some(response) = completed_idempotency_response(&row) {
+                return Ok(Some(response));
+            }
+            if recovery_after > row.database_now {
+                return Err(idempotency_in_progress_error());
+            }
+            let terminal = terminalize_expired_config_token_receipt(
+                &state.db,
+                ExpiredConfigTokenReceipt {
+                    key,
+                    previous_token: row.reservation_token,
+                    operation_id: row.operation_id.unwrap_or_else(|| {
+                        idempotency_operation_id(key, "POST", path, &legacy_hash)
+                    }),
+                    stored_recovery_kind: "expiring_capability",
+                    issued_at,
+                    expires_at: recovery_after,
+                    legacy: true,
+                },
+            )
+            .await?;
+            match terminal {
+                IdempotencyBegin::Replay(response) => Ok(Some(response)),
+                IdempotencyBegin::Execute(_) => Err(db_error()),
+            }
+        }
+        None => {
+            let legacy_hash = legacy_config_token_request_hash(auth, body)?;
+            if row.request_hash != legacy_hash
+                || !is_safe_migrated_legacy_config_token_terminal(&row)
+            {
+                return Err(idempotency_key_reused_error());
+            }
+            Ok(completed_idempotency_response(&row))
+        }
+        _ => Err(idempotency_key_reused_error()),
+    }
 }
 
 async fn app_config_token_resource_binding(
@@ -2666,22 +2781,21 @@ async fn config_token_binding_with_receipt_fallback(
     path: &str,
     live_binding: Result<ConfigTokenResourceBinding, InternalRouteError>,
 ) -> Result<ConfigTokenBindingResolution, InternalRouteError> {
-    match live_binding {
-        Ok(binding) => Ok(ConfigTokenBindingResolution {
+    let stored_binding = stored_deterministic_config_token_binding(state, key, path).await?;
+    match (live_binding, stored_binding) {
+        (Ok(binding), Some(stored)) if binding != stored => Err(idempotency_key_reused_error()),
+        (Ok(binding), _) => Ok(ConfigTokenBindingResolution {
             binding,
             live_resource: true,
         }),
-        Err(not_found) if not_found.0 == StatusCode::NOT_FOUND => {
-            let Some(binding) = stored_deterministic_config_token_binding(state, key, path).await?
-            else {
-                return Err(not_found);
-            };
+        (Err(not_found), Some(binding)) if not_found.0 == StatusCode::NOT_FOUND => {
             Ok(ConfigTokenBindingResolution {
                 binding,
                 live_resource: false,
             })
         }
-        Err(error) => Err(error),
+        (Err(not_found), None) if not_found.0 == StatusCode::NOT_FOUND => Err(not_found),
+        (Err(error), _) => Err(error),
     }
 }
 
@@ -4115,7 +4229,7 @@ pub async fn issue_paas_config_token(
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config-token");
     let key = idempotency_key(&headers)?;
     if let Some((status, response)) =
-        replay_safe_migrated_legacy_config_token_terminal(&state, key, &path, &auth, &body).await?
+        preflight_existing_config_token_request(&state, key, &path, &auth, &body).await?
     {
         return Ok((status, Json(response)));
     }
@@ -4126,6 +4240,9 @@ pub async fn issue_paas_config_token(
         app_config_token_resource_binding(&state, auth.org_id, &app_name).await,
     )
     .await?;
+    if !binding.live_resource {
+        return Err(idempotency_in_progress_error());
+    }
     let idempotency = match begin_actor_deterministic_config_token_request(
         &state,
         &headers,
@@ -4136,10 +4253,6 @@ pub async fn issue_paas_config_token(
     )
     .await?
     {
-        IdempotencyBegin::Execute(lease) if !binding.live_resource => {
-            drop(lease);
-            return Err(idempotency_in_progress_error());
-        }
         IdempotencyBegin::Execute(lease) => lease,
         IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
     };
@@ -4375,7 +4488,7 @@ pub async fn issue_paas_generic_config_token(
         format!("/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/config-token");
     let key = idempotency_key(&headers)?;
     if let Some((status, response)) =
-        replay_safe_migrated_legacy_config_token_terminal(&state, key, &path, &auth, &body).await?
+        preflight_existing_config_token_request(&state, key, &path, &auth, &body).await?
     {
         return Ok((status, Json(response)));
     }
@@ -4386,6 +4499,9 @@ pub async fn issue_paas_generic_config_token(
         deployment_config_token_resource_binding(&state, auth.org_id, deployment_id).await,
     )
     .await?;
+    if !binding.live_resource {
+        return Err(idempotency_in_progress_error());
+    }
     let idempotency = match begin_actor_deterministic_config_token_request(
         &state,
         &headers,
@@ -4396,10 +4512,6 @@ pub async fn issue_paas_generic_config_token(
     )
     .await?
     {
-        IdempotencyBegin::Execute(lease) if !binding.live_resource => {
-            drop(lease);
-            return Err(idempotency_in_progress_error());
-        }
         IdempotencyBegin::Execute(lease) => lease,
         IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
     };
@@ -6544,11 +6656,11 @@ mod tests {
         }
 
         insert_config_token_test_app(&pool, org_id, &org_name, app_b, &app_name, "b").await;
-        let recreated = call(state, headers)
+        let (recreated_status, Json(recreated)) = call(state, headers)
             .await
-            .expect_err("same app name with a new UUID cannot reuse receipt");
-        assert_eq!(recreated.0, StatusCode::CONFLICT);
-        assert_eq!(recreated.1.0["error"], "idempotency_key_reused");
+            .expect("an expired receipt replays its terminal proof after name recreation");
+        assert_eq!(recreated_status, StatusCode::CONFLICT);
+        assert_eq!(recreated, expired);
         let ledger: (Uuid, String, Option<i32>, Option<serde_json::Value>, String) =
             sqlx::query_as(
                 "SELECT capability_resource_id, capability_instance_id,
@@ -6685,11 +6797,11 @@ mod tests {
         .execute(&pool)
         .await
         .expect("recreate deployment ID against a different app identity");
-        let rebound = call(state, headers)
+        let (rebound_status, Json(rebound)) = call(state, headers)
             .await
-            .expect_err("deployment app rebind cannot reuse receipt");
-        assert_eq!(rebound.0, StatusCode::CONFLICT);
-        assert_eq!(rebound.1.0["error"], "idempotency_key_reused");
+            .expect("an expired receipt replays its terminal proof after app rebind");
+        assert_eq!(rebound_status, StatusCode::CONFLICT);
+        assert_eq!(rebound, expired);
         let ledger: (Option<i32>, Option<serde_json::Value>, String) = sqlx::query_as(
             "SELECT response_status, response_body,
                     to_jsonb(cap_internal_idempotency)::text
@@ -6703,6 +6815,530 @@ mod tests {
         assert_eq!(ledger.0, Some(StatusCode::CONFLICT.as_u16() as i32));
         assert_eq!(ledger.1, Some(expired));
         assert!(!ledger.2.contains(first["token"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn deleted_and_rebound_config_token_routes_do_not_extend_or_mask_expiry() {
+        let pool = database_test_pool().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let app_original = Uuid::new_v4();
+        let app_recreated = Uuid::new_v4();
+        let deployment_app_original = Uuid::new_v4();
+        let deployment_app_rebound = Uuid::new_v4();
+        let deployment_id = Uuid::new_v4();
+        let org_name = format!("recoveryorg{}", &suffix[..8]);
+        let paas_org_id = format!("paas-recovery-org-{suffix}");
+        let paas_user_id = format!("paas-recovery-user-{suffix}");
+        let app_name = format!("recoveryapp{}", &suffix[..8]);
+        let deployment_app_name = format!("deployapp{}", &suffix[..8]);
+        let rebound_app_name = format!("reboundapp{}", &suffix[..8]);
+        insert_config_token_test_actor(
+            &pool,
+            org_id,
+            &org_name,
+            &paas_org_id,
+            user_id,
+            &paas_user_id,
+        )
+        .await;
+        insert_config_token_test_app(
+            &pool,
+            org_id,
+            &org_name,
+            app_original,
+            &app_name,
+            "original",
+        )
+        .await;
+        insert_config_token_test_app(
+            &pool,
+            org_id,
+            &org_name,
+            deployment_app_original,
+            &deployment_app_name,
+            "deploy-original",
+        )
+        .await;
+        insert_config_token_test_app(
+            &pool,
+            org_id,
+            &org_name,
+            deployment_app_rebound,
+            &rebound_app_name,
+            "deploy-rebound",
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO deployments
+                 (id, org_id, app_id, trigger, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'api', 'healthy', '{}'::jsonb)",
+        )
+        .bind(deployment_id)
+        .bind(org_id)
+        .bind(deployment_app_original)
+        .execute(&pool)
+        .await
+        .expect("insert recovery-test deployment");
+
+        let state = idempotency_test_state(pool.clone());
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: ManagementOrigin::PaasInternal,
+        };
+        let body = serde_json::json!({});
+        let app_path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config-token");
+        let deployment_path =
+            format!("/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/config-token");
+        let app_key = format!("deleted-incomplete-app-{suffix}");
+        let deployment_key = format!("deleted-incomplete-deployment-{suffix}");
+        let app_headers = config_token_actor_headers(&app_key, &paas_user_id);
+        let deployment_headers = config_token_actor_headers(&deployment_key, &paas_user_id);
+        let app_binding = app_config_token_resource_binding(&state, org_id, &app_name)
+            .await
+            .expect("resolve original app binding");
+        let deployment_binding =
+            deployment_config_token_resource_binding(&state, org_id, deployment_id)
+                .await
+                .expect("resolve original deployment binding");
+        let app_lease = expect_idempotency_execution(
+            begin_actor_deterministic_config_token_request(
+                &state,
+                &app_headers,
+                &app_path,
+                &auth,
+                &body,
+                &app_binding,
+            )
+            .await
+            .expect("reserve incomplete app receipt"),
+        );
+        let deployment_lease = expect_idempotency_execution(
+            begin_actor_deterministic_config_token_request(
+                &state,
+                &deployment_headers,
+                &deployment_path,
+                &auth,
+                &body,
+                &deployment_binding,
+            )
+            .await
+            .expect("reserve incomplete deployment receipt"),
+        );
+        drop(app_lease);
+        drop(deployment_lease);
+
+        sqlx::query("DELETE FROM apps WHERE id = $1")
+            .bind(app_original)
+            .execute(&pool)
+            .await
+            .expect("delete app while its receipt is incomplete");
+        sqlx::query("DELETE FROM deployments WHERE id = $1")
+            .bind(deployment_id)
+            .execute(&pool)
+            .await
+            .expect("delete deployment while its receipt is incomplete");
+        sqlx::query(
+            "UPDATE cap_internal_idempotency
+                SET lease_expires_at = clock_timestamp() - interval '1 minute',
+                    updated_at = clock_timestamp() - interval '1 minute'
+              WHERE idempotency_key = ANY($1)",
+        )
+        .bind(vec![app_key.clone(), deployment_key.clone()])
+        .execute(&pool)
+        .await
+        .expect("expire both deleted-resource receipt leases");
+        let before: Vec<(String, Option<chrono::DateTime<chrono::Utc>>, i32)> = sqlx::query_as(
+            "SELECT idempotency_key, lease_expires_at, attempt_count
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = ANY($1)
+              ORDER BY idempotency_key",
+        )
+        .bind(vec![app_key.clone(), deployment_key.clone()])
+        .fetch_all(&pool)
+        .await
+        .expect("inspect receipt leases before deleted-resource retry");
+
+        let app_missing = issue_paas_config_token(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), app_name.clone())),
+            app_headers.clone(),
+            Json(body.clone()),
+        )
+        .await
+        .expect_err("deleted app receipt remains unavailable before absolute expiry");
+        assert_eq!(app_missing.0, StatusCode::CONFLICT);
+        assert_eq!(app_missing.1.0["error"], "idempotency_request_in_progress");
+        let deployment_missing = issue_paas_generic_config_token(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), deployment_id)),
+            deployment_headers.clone(),
+            Json(body.clone()),
+        )
+        .await
+        .expect_err("deleted deployment receipt remains unavailable before absolute expiry");
+        assert_eq!(deployment_missing.0, StatusCode::CONFLICT);
+        assert_eq!(
+            deployment_missing.1.0["error"],
+            "idempotency_request_in_progress"
+        );
+        let after: Vec<(String, Option<chrono::DateTime<chrono::Utc>>, i32)> = sqlx::query_as(
+            "SELECT idempotency_key, lease_expires_at, attempt_count
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = ANY($1)
+              ORDER BY idempotency_key",
+        )
+        .bind(vec![app_key.clone(), deployment_key.clone()])
+        .fetch_all(&pool)
+        .await
+        .expect("inspect receipt leases after deleted-resource retry");
+        assert_eq!(
+            after, before,
+            "deleted retries must not renew receipt leases"
+        );
+
+        insert_config_token_test_app(
+            &pool,
+            org_id,
+            &org_name,
+            app_recreated,
+            &app_name,
+            "recreated",
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO deployments
+                 (id, org_id, app_id, trigger, status, spec_snapshot)
+             VALUES ($1, $2, $3, 'api', 'healthy', '{}'::jsonb)",
+        )
+        .bind(deployment_id)
+        .bind(org_id)
+        .bind(deployment_app_rebound)
+        .execute(&pool)
+        .await
+        .expect("rebind deployment before receipt expiry");
+        let app_rebound = issue_paas_config_token(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), app_name.clone())),
+            app_headers.clone(),
+            Json(body.clone()),
+        )
+        .await
+        .expect_err("recreated app binding cannot use an unexpired old receipt");
+        assert_eq!(app_rebound.1.0["error"], "idempotency_key_reused");
+        let deployment_rebound = issue_paas_generic_config_token(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), deployment_id)),
+            deployment_headers.clone(),
+            Json(body.clone()),
+        )
+        .await
+        .expect_err("rebound deployment cannot use an unexpired old receipt");
+        assert_eq!(deployment_rebound.1.0["error"], "idempotency_key_reused");
+
+        sqlx::query(
+            "UPDATE cap_internal_idempotency
+                SET created_at = date_trunc('second', clock_timestamp()) - interval '301 seconds',
+                    lease_expires_at = clock_timestamp() + interval '10 minutes'
+              WHERE idempotency_key = ANY($1)",
+        )
+        .bind(vec![app_key.clone(), deployment_key.clone()])
+        .execute(&pool)
+        .await
+        .expect("expire receipts while leaving their stale leases in the future");
+        let (app_status, Json(app_terminal)) = issue_paas_config_token(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), app_name.clone())),
+            app_headers.clone(),
+            Json(body.clone()),
+        )
+        .await
+        .expect("absolute expiry terminalizes before recreated binding mismatch");
+        let (deployment_status, Json(deployment_terminal)) = issue_paas_generic_config_token(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), deployment_id)),
+            deployment_headers.clone(),
+            Json(body.clone()),
+        )
+        .await
+        .expect("absolute expiry terminalizes before deployment binding mismatch");
+        for (status, terminal) in [
+            (app_status, &app_terminal),
+            (deployment_status, &deployment_terminal),
+        ] {
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(terminal["error"], "idempotency_capability_expired");
+            assert_eq!(
+                terminal["proof_version"],
+                "deterministic_config_token_receipt_v1"
+            );
+            assert!(terminal.get("token").is_none());
+        }
+        let (_, Json(app_replay)) = issue_paas_config_token(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), app_name)),
+            app_headers,
+            Json(body.clone()),
+        )
+        .await
+        .expect("recreated app replays terminal proof");
+        let (_, Json(deployment_replay)) = issue_paas_generic_config_token(
+            internal_test_auth(),
+            State(state),
+            Path((paas_org_id, deployment_id)),
+            deployment_headers,
+            Json(body),
+        )
+        .await
+        .expect("rebound deployment replays terminal proof");
+        assert_eq!(app_replay, app_terminal);
+        assert_eq!(deployment_replay, deployment_terminal);
+        let terminal_leases: Vec<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
+            "SELECT lease_expires_at
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = ANY($1)
+              ORDER BY idempotency_key",
+        )
+        .bind(vec![app_key, deployment_key])
+        .fetch_all(&pool)
+        .await
+        .expect("inspect deterministic terminal leases");
+        assert_eq!(terminal_leases, vec![None, None]);
+    }
+
+    #[tokio::test]
+    async fn deleted_legacy_config_token_routes_preserve_extended_terminal_proof() {
+        let pool = database_test_pool().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let deployment_id = Uuid::new_v4();
+        let org_name = format!("legacydelete{}", &suffix[..8]);
+        let paas_org_id = format!("paas-legacy-delete-org-{suffix}");
+        let paas_user_id = format!("paas-legacy-delete-user-{suffix}");
+        let missing_app_name = format!("missingapp{}", &suffix[..8]);
+        insert_config_token_test_actor(
+            &pool,
+            org_id,
+            &org_name,
+            &paas_org_id,
+            user_id,
+            &paas_user_id,
+        )
+        .await;
+        let state = idempotency_test_state(pool.clone());
+        let body = serde_json::json!({});
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name,
+            role: Role::Owner,
+            api_key: None,
+            management_origin: ManagementOrigin::PaasInternal,
+        };
+        let legacy_hash = legacy_config_token_request_hash(&auth, &body)
+            .expect("hash deleted-resource legacy request");
+        let app_key = format!("deleted-legacy-app-{suffix}");
+        let deployment_key = format!("deleted-legacy-deployment-{suffix}");
+        let app_path =
+            format!("/internal/paas/orgs/{paas_org_id}/apps/{missing_app_name}/config-token");
+        let deployment_path =
+            format!("/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/config-token");
+        for (key, path) in [
+            (app_key.as_str(), app_path.as_str()),
+            (deployment_key.as_str(), deployment_path.as_str()),
+        ] {
+            sqlx::query(
+                "INSERT INTO cap_internal_idempotency (
+                     idempotency_key, method, path, request_hash,
+                     reservation_token, operation_id, lease_expires_at,
+                     recovery_kind, attempt_count, created_at, updated_at
+                 ) VALUES (
+                     $1, 'POST', $2, $3, $4, $5,
+                     date_trunc('second', clock_timestamp()) - interval '1 minute',
+                     'expiring_capability', 1,
+                     date_trunc('second', clock_timestamp()) - interval '10 minutes',
+                     clock_timestamp() - interval '1 minute'
+                 )",
+            )
+            .bind(key)
+            .bind(path)
+            .bind(&legacy_hash)
+            .bind(Uuid::new_v4())
+            .bind(idempotency_operation_id(key, "POST", path, &legacy_hash))
+            .execute(&pool)
+            .await
+            .expect("seed deleted-resource legacy lease with extended deadline");
+        }
+
+        let (app_status, Json(app_terminal)) = issue_paas_config_token(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), missing_app_name.clone())),
+            config_token_actor_headers(&app_key, &paas_user_id),
+            Json(body.clone()),
+        )
+        .await
+        .expect("deleted app legacy lease reaches terminal proof");
+        let (deployment_status, Json(deployment_terminal)) = issue_paas_generic_config_token(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), deployment_id)),
+            config_token_actor_headers(&deployment_key, &paas_user_id),
+            Json(body.clone()),
+        )
+        .await
+        .expect("deleted deployment legacy lease reaches terminal proof");
+        for (status, terminal) in [
+            (app_status, &app_terminal),
+            (deployment_status, &deployment_terminal),
+        ] {
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(terminal["error"], "idempotency_capability_expired");
+            assert_eq!(
+                terminal["proof_version"],
+                "legacy_expiring_capability_lease_v1"
+            );
+            assert!(terminal.get("recovery_after").is_some());
+            assert!(terminal.get("token").is_none());
+        }
+
+        for (key, expected) in [
+            (app_key.as_str(), &app_terminal),
+            (deployment_key.as_str(), &deployment_terminal),
+        ] {
+            let row: IdempotencyRow = sqlx::query_as(
+                "SELECT method, path, request_hash, response_status, response_body,
+                        reservation_token, operation_id, lease_expires_at,
+                        recovery_kind, capability_receipt_version,
+                        capability_resource_id, capability_instance_id,
+                        completed_at, created_at, updated_at,
+                        clock_timestamp() AS database_now
+                   FROM cap_internal_idempotency
+                  WHERE idempotency_key = $1",
+            )
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect terminal legacy proof row");
+            assert!(row.lease_expires_at.is_some());
+            assert!(is_safe_migrated_legacy_config_token_terminal(&row));
+            assert_eq!(row.response_body.as_ref(), Some(expected));
+        }
+
+        let (_, Json(app_replay)) = issue_paas_config_token(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_org_id.clone(), missing_app_name)),
+            config_token_actor_headers(&app_key, &paas_user_id),
+            Json(body.clone()),
+        )
+        .await
+        .expect("deleted app replays the preserved legacy proof");
+        let (_, Json(deployment_replay)) = issue_paas_generic_config_token(
+            internal_test_auth(),
+            State(state),
+            Path((paas_org_id, deployment_id)),
+            config_token_actor_headers(&deployment_key, &paas_user_id),
+            Json(body),
+        )
+        .await
+        .expect("deleted deployment replays the preserved legacy proof");
+        assert_eq!(app_replay, app_terminal);
+        assert_eq!(deployment_replay, deployment_terminal);
+    }
+
+    #[tokio::test]
+    async fn legacy_completed_config_token_sanitizer_preserves_extended_lease_proof() {
+        let pool = database_test_pool().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("legacy-sanitizer-{suffix}");
+        let path = format!("/internal/test/legacy-sanitizer/{suffix}");
+        let hash = Sha256::digest(format!("legacy-sanitizer-{suffix}")).to_vec();
+        let token = Uuid::new_v4();
+        let operation_id = idempotency_operation_id(&key, "POST", &path, &hash);
+        let secret = format!("legacy-sanitizer-secret-{suffix}");
+        let (issued_at, recovery_after): (
+            chrono::DateTime<chrono::Utc>,
+            chrono::DateTime<chrono::Utc>,
+        ) = sqlx::query_as(
+            "INSERT INTO cap_internal_idempotency (
+                 idempotency_key, method, path, request_hash,
+                 response_status, response_body, completed_at,
+                 reservation_token, operation_id, lease_expires_at,
+                 recovery_kind, attempt_count, created_at, updated_at
+             ) VALUES (
+                 $1, 'POST', $2, $3, 200,
+                 jsonb_build_object('token', $4::text), clock_timestamp(),
+                 $5, $6,
+                 date_trunc('second', clock_timestamp()) - interval '1 minute',
+                 'expiring_capability', 1,
+                 date_trunc('second', clock_timestamp()) - interval '10 minutes',
+                 clock_timestamp()
+             )
+             RETURNING date_trunc('second', created_at), lease_expires_at",
+        )
+        .bind(&key)
+        .bind(&path)
+        .bind(&hash)
+        .bind(&secret)
+        .bind(token)
+        .bind(operation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("seed completed legacy response with an extended lease");
+        let (status, proof) = expect_idempotency_replay(
+            sanitize_legacy_completed_config_token_response(
+                &pool,
+                &key,
+                Some(token),
+                operation_id,
+                issued_at,
+                recovery_after,
+            )
+            .await
+            .expect("sanitize completed legacy response"),
+        );
+        assert_eq!(status, StatusCode::CONFLICT);
+        let proof_recovery_after = chrono::DateTime::parse_from_rfc3339(
+            proof["recovery_after"]
+                .as_str()
+                .expect("legacy proof recovery timestamp"),
+        )
+        .expect("parse legacy proof recovery timestamp")
+        .with_timezone(&chrono::Utc);
+        assert_eq!(proof_recovery_after, recovery_after);
+
+        let row: IdempotencyRow = sqlx::query_as(
+            "SELECT method, path, request_hash, response_status, response_body,
+                    reservation_token, operation_id, lease_expires_at,
+                    recovery_kind, capability_receipt_version,
+                    capability_resource_id, capability_instance_id,
+                    completed_at, created_at, updated_at,
+                    clock_timestamp() AS database_now
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect sanitized legacy response");
+        assert_eq!(row.lease_expires_at, Some(recovery_after));
+        assert!(is_safe_migrated_legacy_config_token_terminal(&row));
+        let ledger_text = serde_json::to_string(&row.response_body).unwrap();
+        assert!(!ledger_text.contains(&secret));
     }
 
     #[tokio::test]
