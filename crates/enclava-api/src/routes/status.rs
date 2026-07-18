@@ -378,16 +378,14 @@ fn select_runtime_failure(
         .iter()
         .position(|failure| failure.deployment_id == Some(expected_deployment_id))
         .or_else(|| {
-            failures
-                .iter()
-                .position(|failure| failure.deployment_id.is_some())
-        })
-        .or_else(|| {
-            failures
-                .iter()
-                .position(|failure| failure.deployment_id_malformed)
-        })
-        .or_else(|| legacy_failure_eligible.then_some(0));
+            if legacy_failure_eligible {
+                failures.iter().position(|failure| {
+                    failure.deployment_id.is_none() && !failure.deployment_id_malformed
+                })
+            } else {
+                None
+            }
+        });
     selected.and_then(|index| failures.into_iter().nth(index))
 }
 
@@ -1260,6 +1258,19 @@ mod tests {
         .expect("runtime failure");
 
         assert_eq!(selected.deployment_id, Some(expected_deployment_id));
+    }
+
+    #[test]
+    fn stale_labelled_failure_is_not_attributed_to_expected_deployment() {
+        let previous_deployment_id = Uuid::new_v4();
+        let expected_deployment_id = Uuid::new_v4();
+        let selected = select_runtime_failure(
+            vec![runtime_failure(Some(previous_deployment_id), false)],
+            Some(expected_deployment_id),
+            false,
+        );
+
+        assert_eq!(selected, None);
     }
 
     #[test]

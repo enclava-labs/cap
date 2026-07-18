@@ -498,12 +498,13 @@ fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
 
 fn deploy_observation(
     state: &str,
+    reason: Option<&str>,
     deployment_id: Option<&str>,
     drifted: bool,
 ) -> AppStatusObservation {
     AppStatusObservation {
         state: state.to_string(),
-        reason: None,
+        reason: reason.map(str::to_string),
         observed_at: None,
         last_reconciliation_attempted_at: None,
         last_successful_reconciled_at: None,
@@ -516,27 +517,40 @@ fn deploy_observation(
 #[test]
 fn deploy_runtime_direct_tee_fallback_accepts_matching_partial_observation() {
     let expected_deployment_id = "22222222-2222-2222-2222-222222222222";
-    let observation = deploy_observation("partial", Some(expected_deployment_id), false);
+    for reason in [
+        "tee_unavailable",
+        "tee_malformed",
+        "tee_evidence_incomplete",
+    ] {
+        let observation =
+            deploy_observation("partial", Some(reason), Some(expected_deployment_id), false);
 
-    assert!(observation_allows_direct_tee_fallback(
-        Some(&observation),
-        expected_deployment_id
-    ));
-    assert!(!observation_is_fresh_for_deployment(
-        Some(&observation),
-        expected_deployment_id
-    ));
+        assert!(observation_allows_direct_tee_fallback(
+            Some(&observation),
+            expected_deployment_id
+        ));
+        assert!(!observation_is_fresh_for_deployment(
+            Some(&observation),
+            expected_deployment_id
+        ));
+    }
 }
 
 #[test]
-fn deploy_runtime_direct_tee_fallback_rejects_wrong_or_drifted_deployment() {
+fn deploy_runtime_direct_tee_fallback_rejects_pod_gaps_wrong_or_drifted_deployment() {
     let expected_deployment_id = "22222222-2222-2222-2222-222222222222";
     let wrong = deploy_observation(
         "partial",
+        Some("tee_unavailable"),
         Some("33333333-3333-3333-3333-333333333333"),
         false,
     );
-    let drifted = deploy_observation("partial", Some(expected_deployment_id), true);
+    let drifted = deploy_observation(
+        "partial",
+        Some("tee_unavailable"),
+        Some(expected_deployment_id),
+        true,
+    );
 
     assert!(!observation_allows_direct_tee_fallback(
         Some(&wrong),
@@ -546,6 +560,20 @@ fn deploy_runtime_direct_tee_fallback_rejects_wrong_or_drifted_deployment() {
         Some(&drifted),
         expected_deployment_id
     ));
+
+    for reason in [
+        None,
+        Some("pod_evidence_incomplete"),
+        Some("evidence_mismatch"),
+        Some("not_observed"),
+    ] {
+        let observation =
+            deploy_observation("partial", reason, Some(expected_deployment_id), false);
+        assert!(
+            !observation_allows_direct_tee_fallback(Some(&observation), expected_deployment_id),
+            "partial observation reason {reason:?} must retain the pod-evidence fence"
+        );
+    }
 }
 
 #[test]

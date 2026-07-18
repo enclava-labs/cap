@@ -746,7 +746,16 @@ fn observation_allows_direct_tee_fallback(
     expected_deployment_id: &str,
 ) -> bool {
     observation.is_none_or(|observation| {
-        matches!(observation.state.as_str(), "fresh" | "partial")
+        let pod_evidence_allows_fallback = match observation.state.as_str() {
+            "fresh" => observation.reason.is_none(),
+            "partial" => matches!(
+                observation.reason.as_deref(),
+                Some("tee_unavailable" | "tee_malformed" | "tee_evidence_incomplete")
+            ),
+            _ => false,
+        };
+
+        pod_evidence_allows_fallback
             && !observation.drifted
             && observation.deployment_id.as_deref() == Some(expected_deployment_id)
     })
