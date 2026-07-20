@@ -102,24 +102,6 @@ fn build_tenant_tee_http_client() -> anyhow::Result<reqwest::Client> {
     build_tenant_tee_http_client_with_env(|name| std::env::var(name).ok())
 }
 
-const DEFAULT_TENANT_TEE_REQUEST_TIMEOUT_SECONDS: u64 = 30;
-const MAX_TENANT_TEE_REQUEST_TIMEOUT_SECONDS: u64 = 300;
-
-fn tenant_tee_request_timeout_seconds(raw: Option<String>) -> anyhow::Result<u64> {
-    let Some(raw) = raw else {
-        return Ok(DEFAULT_TENANT_TEE_REQUEST_TIMEOUT_SECONDS);
-    };
-    let seconds = raw
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("TENANT_TEE_REQUEST_TIMEOUT_SECONDS must be an integer"))?;
-    if !(1..=MAX_TENANT_TEE_REQUEST_TIMEOUT_SECONDS).contains(&seconds) {
-        anyhow::bail!(
-            "TENANT_TEE_REQUEST_TIMEOUT_SECONDS must be between 1 and {MAX_TENANT_TEE_REQUEST_TIMEOUT_SECONDS}"
-        );
-    }
-    Ok(seconds)
-}
-
 fn tenant_tee_root_certificate_from_pem(
     source: &'static str,
     cert_pem: &[u8],
@@ -137,10 +119,7 @@ fn tenant_tee_root_certificate_from_pem(
 fn build_tenant_tee_http_client_with_env(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<reqwest::Client> {
-    let timeout_seconds =
-        tenant_tee_request_timeout_seconds(lookup("TENANT_TEE_REQUEST_TIMEOUT_SECONDS"))?;
     let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_seconds))
         .danger_accept_invalid_certs(
             lookup("TENANT_TEE_TLS_MODE")
                 .map(|mode| matches!(mode.as_str(), "staging" | "insecure"))
@@ -852,24 +831,5 @@ mod tests {
             err.to_string().contains("TENANT_TEE_CA_CERT_PEM"),
             "error should name the invalid tenant TEE CA env var: {err}"
         );
-    }
-
-    #[test]
-    fn tenant_tee_http_timeout_is_finite_and_bounded() {
-        assert_eq!(tenant_tee_request_timeout_seconds(None).unwrap(), 30);
-        assert_eq!(
-            tenant_tee_request_timeout_seconds(Some("45".to_string())).unwrap(),
-            45
-        );
-
-        for invalid in ["0", "301", "not-a-number"] {
-            let err = tenant_tee_request_timeout_seconds(Some(invalid.to_string()))
-                .expect_err("invalid tenant TEE timeout must fail closed");
-            assert!(
-                err.to_string()
-                    .contains("TENANT_TEE_REQUEST_TIMEOUT_SECONDS"),
-                "error should name the invalid timeout setting: {err}"
-            );
-        }
     }
 }
