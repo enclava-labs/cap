@@ -2425,32 +2425,34 @@ async fn finish_job(
     Ok(())
 }
 
-async fn with_lease_heartbeat<F, T>(
-    pool: &PgPool,
+fn with_lease_heartbeat<'a, F, T>(
+    pool: &'a PgPool,
     deployment_id: Uuid,
     lock_token: Uuid,
-    state: &str,
+    state: &'a str,
     future: F,
-) -> Result<T, DeploymentJobError>
+) -> impl Future<Output = Result<T, DeploymentJobError>> + 'a
 where
-    F: Future<Output = T>,
+    F: Future<Output = T> + 'a,
 {
-    // Renew immediately after the claim transaction commits and before the
-    // future is first polled. `clock_timestamp()` is wall-clock time even in a
-    // long transaction; `now()` would reuse the transaction start timestamp.
-    renew_job_lease_bounded(pool, deployment_id, lock_token, state).await?;
-    tokio::pin!(future);
-    let mut heartbeat = tokio::time::interval_at(
-        tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
-        HEARTBEAT_INTERVAL,
-    );
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut future = Box::pin(future);
+    async move {
+        // Renew immediately after the claim transaction commits and before the
+        // future is first polled. `clock_timestamp()` is wall-clock time even in a
+        // long transaction; `now()` would reuse the transaction start timestamp.
+        renew_job_lease_bounded(pool, deployment_id, lock_token, state).await?;
+        let mut heartbeat = tokio::time::interval_at(
+            tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
+            HEARTBEAT_INTERVAL,
+        );
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    loop {
-        tokio::select! {
-            output = &mut future => return Ok(output),
-            _ = heartbeat.tick() => {
-                renew_job_lease_bounded(pool, deployment_id, lock_token, state).await?;
+        loop {
+            tokio::select! {
+                output = &mut future => return Ok(output),
+                _ = heartbeat.tick() => {
+                    renew_job_lease_bounded(pool, deployment_id, lock_token, state).await?;
+                }
             }
         }
     }
@@ -2509,6 +2511,34 @@ mod tests {
     use enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH;
     use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
     use sqlx::types::Json;
+
+    #[tokio::test]
+    async fn lease_heartbeat_does_not_duplicate_large_future_state() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://stack-size.invalid/enclava")
+            .expect("lazy pool does not connect");
+        let payload = [0_u8; 32 * 1024];
+        let operation = async move {
+            std::future::pending::<()>().await;
+            std::hint::black_box(payload);
+        };
+        let operation_size = std::mem::size_of_val(&operation);
+        assert!(
+            operation_size >= payload.len(),
+            "size canary must retain its {}-byte payload, got {operation_size}",
+            payload.len()
+        );
+        let heartbeat = with_lease_heartbeat(&pool, Uuid::nil(), Uuid::nil(), "running", operation);
+        let heartbeat_size = std::mem::size_of_val(&heartbeat);
+
+        fn assert_send<T: Send>(_: &T) {}
+        assert_send(&heartbeat);
+
+        assert!(
+            heartbeat_size <= 8 * 1024,
+            "lease heartbeat amplified future state from {operation_size} to {heartbeat_size} bytes"
+        );
+    }
 
     async fn database_test_pool() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")

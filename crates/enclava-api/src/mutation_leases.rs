@@ -126,11 +126,15 @@ impl AppMutationLease {
     /// Cancel the provider future as soon as durable renewal is lost.  The
     /// rows intentionally remain owned through reclaim quarantine, which is
     /// longer than one bounded in-flight provider request.
-    pub async fn guard_provider<F, T>(&self, future: F) -> Result<T, MutationLeaseError>
+    pub fn guard_provider<'a, F, T>(
+        &'a self,
+        future: F,
+    ) -> impl Future<Output = Result<T, MutationLeaseError>> + 'a + use<'a, F, T>
     where
-        F: Future<Output = T>,
+        F: Future<Output = T> + 'a,
+        T: 'a,
     {
-        guard_provider_future(self.heartbeat_lost.clone(), future).await
+        guard_provider_future(self.heartbeat_lost.clone(), future)
     }
 
     /// Assert generation/token ownership and clear it in the caller's
@@ -346,11 +350,15 @@ impl ResourceMutationLease {
         }
     }
 
-    pub async fn guard_provider<F, T>(&self, future: F) -> Result<T, MutationLeaseError>
+    pub fn guard_provider<'a, F, T>(
+        &'a self,
+        future: F,
+    ) -> impl Future<Output = Result<T, MutationLeaseError>> + 'a + use<'a, F, T>
     where
-        F: Future<Output = T>,
+        F: Future<Output = T> + 'a,
+        T: 'a,
     {
-        guard_provider_future(self.heartbeat_lost.clone(), future).await
+        guard_provider_future(self.heartbeat_lost.clone(), future)
     }
 
     pub async fn finish(mut self) -> Result<(), MutationLeaseError> {
@@ -369,26 +377,28 @@ impl Drop for ResourceMutationLease {
     }
 }
 
-async fn guard_provider_future<F, T>(
+fn guard_provider_future<F, T>(
     mut heartbeat_lost: watch::Receiver<bool>,
     future: F,
-) -> Result<T, MutationLeaseError>
+) -> impl Future<Output = Result<T, MutationLeaseError>>
 where
     F: Future<Output = T>,
 {
-    if *heartbeat_lost.borrow() {
-        return Err(MutationLeaseError::Lost);
-    }
-    tokio::pin!(future);
-    loop {
-        tokio::select! {
-            biased;
-            changed = heartbeat_lost.changed() => {
-                if changed.is_err() || *heartbeat_lost.borrow() {
-                    return Err(MutationLeaseError::Lost);
+    let mut future = Box::pin(future);
+    async move {
+        if *heartbeat_lost.borrow() {
+            return Err(MutationLeaseError::Lost);
+        }
+        loop {
+            tokio::select! {
+                biased;
+                changed = heartbeat_lost.changed() => {
+                    if changed.is_err() || *heartbeat_lost.borrow() {
+                        return Err(MutationLeaseError::Lost);
+                    }
                 }
+                output = &mut future => return Ok(output),
             }
-            output = &mut future => return Ok(output),
         }
     }
 }
@@ -899,6 +909,123 @@ mod tests {
         },
     };
     use tokio::sync::{Mutex, Notify};
+
+    fn test_app_mutation_lease(heartbeat_lost: watch::Receiver<bool>) -> AppMutationLease {
+        AppMutationLease {
+            pool: PgPoolOptions::new()
+                .connect_lazy("postgresql://stack-size.invalid/enclava")
+                .expect("lazy pool does not connect"),
+            app_id: Uuid::nil(),
+            token: Uuid::nil(),
+            generation: 1,
+            resources: Vec::new(),
+            heartbeat: None,
+            heartbeat_lost,
+            _admission: Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("app admission permit"),
+        }
+    }
+
+    fn test_resource_mutation_lease(
+        heartbeat_lost: watch::Receiver<bool>,
+    ) -> ResourceMutationLease {
+        ResourceMutationLease {
+            pool: PgPoolOptions::new()
+                .connect_lazy("postgresql://stack-size.invalid/enclava")
+                .expect("lazy pool does not connect"),
+            token: Uuid::nil(),
+            resources: Vec::new(),
+            heartbeat: None,
+            heartbeat_lost,
+            _admission: Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("resource admission permit"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_guard_does_not_duplicate_large_future_state() {
+        fn large_provider() -> impl Future<Output = ()> + Send + 'static {
+            let payload = [0_u8; 32 * 1024];
+            async move {
+                std::future::pending::<()>().await;
+                std::hint::black_box(payload);
+            }
+        }
+
+        let (_app_lost_tx, app_lost_rx) = watch::channel(false);
+        let app_lease = test_app_mutation_lease(app_lost_rx);
+        let (_resource_lost_tx, resource_lost_rx) = watch::channel(false);
+        let resource_lease = test_resource_mutation_lease(resource_lost_rx);
+
+        let (_helper_lost_tx, helper_lost_rx) = watch::channel(false);
+        let provider = large_provider();
+        let provider_size = std::mem::size_of_val(&provider);
+        assert!(
+            provider_size >= 32 * 1024,
+            "size canary must retain its 32 KiB payload, got {provider_size}"
+        );
+        let helper_guard = guard_provider_future(helper_lost_rx, provider);
+        let helper_size = std::mem::size_of_val(&helper_guard);
+        let app_guard = app_lease.guard_provider(large_provider());
+        let app_size = std::mem::size_of_val(&app_guard);
+        let resource_guard = resource_lease.guard_provider(large_provider());
+        let resource_size = std::mem::size_of_val(&resource_guard);
+
+        fn assert_send<T: Send>(_: &T) {}
+        assert_send(&helper_guard);
+        assert_send(&app_guard);
+        assert_send(&resource_guard);
+
+        assert!(
+            helper_size <= 4 * 1024 && app_size <= 4 * 1024 && resource_size <= 4 * 1024,
+            "provider guard amplified {provider_size}-byte state: helper={helper_size}, app={app_size}, resource={resource_size}"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_provider_guard_preserves_completion_and_cancellation() {
+        let (_lost_tx, lost_rx) = watch::channel(false);
+        let app_lease = test_app_mutation_lease(lost_rx);
+        assert_eq!(
+            app_lease
+                .guard_provider(async { 7_u8 })
+                .await
+                .expect("provider completion passes through"),
+            7
+        );
+
+        struct DropSignal(Arc<AtomicBool>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let (lost_tx, lost_rx) = watch::channel(false);
+        let app_lease = test_app_mutation_lease(lost_rx);
+        let entered = Arc::new(Notify::new());
+        let provider_entered = entered.clone();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let provider_dropped = dropped.clone();
+        let guarded = app_lease.guard_provider(async move {
+            let _drop_signal = DropSignal(provider_dropped);
+            provider_entered.notify_one();
+            std::future::pending::<()>().await;
+        });
+        let signal_loss = async {
+            entered.notified().await;
+            lost_tx.send(true).expect("signal lease loss");
+        };
+        let (guarded, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(guarded, signal_loss)
+        })
+        .await
+        .expect("provider guard must react promptly to lease loss");
+        assert!(matches!(guarded, Err(MutationLeaseError::Lost)));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
     #[derive(Default)]
     struct DelayedCloudflare {
