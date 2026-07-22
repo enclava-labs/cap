@@ -1452,7 +1452,48 @@ async fn finish_idempotent_request(
     Ok(())
 }
 
-async fn defer_idempotent_request(mut lease: IdempotencyLease) -> Result<(), InternalRouteError> {
+/// Body returned for every deferred idempotent response. Carries the explicit
+/// `idempotency_disposition: "deferred"` stamp so callers can distinguish a
+/// CAP-intentional defer (retain intent, retry same key) from a missing field
+/// (conservative fallback) without inferring from the status code.
+fn deferred_idempotency_response() -> InternalRouteError {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "idempotency_request_in_progress",
+            "retryable": true,
+            "disposition": "retry_same_key",
+            "idempotency_disposition": "deferred",
+        })),
+    )
+}
+
+/// `true` for the transient app-mutation-lease conflict (`MutationLeaseError::Busy`
+/// surfaced as `409 {"error":"app mutation already in progress"}`). Such a
+/// response must defer (leave the lease incomplete) so a same-key retry
+/// re-executes once the mutation lease frees, instead of being cached.
+fn is_busy_mutation_conflict(status: StatusCode, body: &serde_json::Value) -> bool {
+    status == StatusCode::CONFLICT
+        && body.get("error").and_then(serde_json::Value::as_str)
+            == Some("app mutation already in progress")
+}
+
+/// Stamp a durably-cached error body as a completed idempotent result. PaaS
+/// terminalizes the intent regardless of HTTP status when this field is present.
+fn stamp_idempotency_completion(body: &mut serde_json::Value) {
+    if let Some(map) = body.as_object_mut() {
+        map.insert(
+            "idempotency_disposition".to_string(),
+            serde_json::json!("completed"),
+        );
+        map.insert("retryable".to_string(), serde_json::json!(false));
+    }
+}
+
+/// Defer an idempotent request: stop the heartbeat and push the lease expiry
+/// out by the retry interval, leaving the row incomplete so a same-key retry
+/// re-executes. Returns the stamped body the caller must return to the client.
+async fn defer_idempotent_request(mut lease: IdempotencyLease) -> InternalRouteError {
     lease.stop_heartbeat();
     let updated = sqlx::query(
         "UPDATE cap_internal_idempotency
@@ -1467,12 +1508,12 @@ async fn defer_idempotent_request(mut lease: IdempotencyLease) -> Result<(), Int
     .bind(lease.token)
     .bind(IDEMPOTENCY_RETRY_DEFER_SECONDS)
     .execute(&lease.pool)
-    .await
-    .map_err(|_| db_error())?;
-    if updated.rows_affected() != 1 {
-        return Err(idempotency_in_progress_error());
+    .await;
+    match updated {
+        Ok(updated) if updated.rows_affected() == 1 => deferred_idempotency_response(),
+        Ok(_) => idempotency_in_progress_error(),
+        Err(_) => db_error(),
     }
-    Ok(())
 }
 
 async fn complete_idempotent_result(
@@ -1484,7 +1525,14 @@ async fn complete_idempotent_result(
             finish_idempotent_request(lease, status, &body).await?;
             Ok((status, body))
         }
-        Err((status, Json(body))) => {
+        Err((status, Json(mut body))) => {
+            // The transient app-mutation-lease conflict is never a terminal
+            // result: defer so a same-key retry re-executes once the lease
+            // frees, rather than caching the conflict for every replay.
+            if is_busy_mutation_conflict(status, &body) {
+                return Err(defer_idempotent_request(lease).await);
+            }
+            stamp_idempotency_completion(&mut body);
             finish_idempotent_request(lease, status, &body).await?;
             Err((status, Json(body)))
         }
@@ -3790,8 +3838,7 @@ pub async fn deploy_paas_app(
         {
             Ok(InternalDeploymentAdoption::Missing) => {}
             Ok(InternalDeploymentAdoption::SetupIncomplete) => {
-                defer_idempotent_request(idempotency).await?;
-                return Err(idempotency_in_progress_error());
+                return Err(defer_idempotent_request(idempotency).await);
             }
             Ok(InternalDeploymentAdoption::Response(response)) => {
                 let (status, response) =
@@ -4454,8 +4501,7 @@ pub async fn create_paas_generic_deployment(
                     == Some("external_id belongs to a deployment whose setup did not complete")
         )
     {
-        defer_idempotent_request(idempotency).await?;
-        return Err(idempotency_in_progress_error());
+        return Err(defer_idempotent_request(idempotency).await);
     }
     let (status, response) = complete_idempotent_result(idempotency, result).await?;
     Ok((status, Json(response)))
@@ -7462,6 +7508,147 @@ mod tests {
         .await
         .expect("inspect completed handler error");
         assert!(completed);
+    }
+
+    #[tokio::test]
+    async fn completed_error_is_stamped_in_returned_and_cached_body() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("completed-stamp-{suffix}");
+        let path = format!("/internal/test/completed-stamp/{suffix}");
+        let hash = Sha256::digest(b"completed-stamp-request").to_vec();
+
+        let lease = expect_idempotency_execution(
+            begin_idempotent_request(&state, &key, "POST", &path, &hash)
+                .await
+                .expect("reserve stamped handler error"),
+        );
+        let result: Result<IdempotencyResponse, InternalRouteError> = async {
+            Err(json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "bounded_handler_failure",
+            ))
+        }
+        .await;
+        let failure = complete_idempotent_result(lease, result)
+            .await
+            .expect_err("completed error is returned as Err");
+        // The returned body carries the explicit completion stamp.
+        assert_eq!(failure.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(failure.1["error"], "bounded_handler_failure");
+        assert_eq!(failure.1["idempotency_disposition"], "completed");
+        assert_eq!(failure.1["retryable"], false);
+
+        // The cached (replayed) body carries the same stamp.
+        let (status, body) = expect_idempotency_replay(
+            begin_idempotent_request(&state, &key, "POST", &path, &hash)
+                .await
+                .expect("replay stamped completed error"),
+        );
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["error"], "bounded_handler_failure");
+        assert_eq!(body["idempotency_disposition"], "completed");
+        assert_eq!(body["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn deferred_response_is_stamped_and_leaves_row_incomplete() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("deferred-stamp-{suffix}");
+        let path = format!("/internal/test/deferred-stamp/{suffix}");
+        let hash = Sha256::digest(b"deferred-stamp-request").to_vec();
+
+        let lease = expect_idempotency_execution(
+            begin_idempotent_request(&state, &key, "POST", &path, &hash)
+                .await
+                .expect("reserve deferred handler"),
+        );
+        let deferred = defer_idempotent_request(lease).await;
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(deferred.1["idempotency_disposition"], "deferred");
+        assert_eq!(deferred.1["retryable"], true);
+        assert_eq!(deferred.1["disposition"], "retry_same_key");
+
+        // Deferral leaves the row incomplete so a same-key retry can re-acquire.
+        let completed: bool = sqlx::query_scalar(
+            "SELECT completed_at IS NOT NULL
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect deferred row");
+        assert!(!completed);
+    }
+
+    #[tokio::test]
+    async fn busy_mutation_conflict_is_deferred_not_cached_and_re_executes() {
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("busy-defer-{suffix}");
+        let path = format!("/internal/test/busy-defer/{suffix}");
+        let hash = Sha256::digest(b"busy-defer-request").to_vec();
+
+        let lease = expect_idempotency_execution(
+            begin_idempotent_request(&state, &key, "POST", &path, &hash)
+                .await
+                .expect("reserve busy handler"),
+        );
+        let result: Result<IdempotencyResponse, InternalRouteError> = async {
+            Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "app mutation already in progress",
+                })),
+            ))
+        }
+        .await;
+        let deferred = complete_idempotent_result(lease, result)
+            .await
+            .expect_err("busy-409 defers, returning the deferred body");
+        // The client sees the stamped defer body, not the raw busy-409 conflict.
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(deferred.1["idempotency_disposition"], "deferred");
+        assert_eq!(deferred.1["retryable"], true);
+        assert_ne!(deferred.1["error"], "app mutation already in progress");
+
+        // The busy-409 was NOT durably cached as a completed result.
+        let completed: bool = sqlx::query_scalar(
+            "SELECT completed_at IS NOT NULL
+               FROM cap_internal_idempotency
+              WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect busy-deferred row");
+        assert!(!completed);
+
+        // Once the deferred lease has freed, a same-key retry re-executes
+        // (acquires a fresh lease) instead of replaying a cached conflict.
+        sqlx::query(
+            "UPDATE cap_internal_idempotency
+                SET lease_expires_at = clock_timestamp() - interval '1 second'
+              WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .execute(&pool)
+        .await
+        .expect("expire deferred lease");
+        match begin_idempotent_request(&state, &key, "POST", &path, &hash)
+            .await
+            .expect("re-begin after defer")
+        {
+            IdempotencyBegin::Execute(_) => { /* re-executed as intended */ }
+            IdempotencyBegin::Replay((status, body)) => {
+                panic!("same-key retry should re-execute, not replay {status}: {body}");
+            }
+        }
     }
 
     #[tokio::test]
