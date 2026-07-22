@@ -441,6 +441,9 @@ fn json_error(
 /// defer (retain intent, retry same key) from a missing field (conservative
 /// fallback) without inferring it from the status code.
 fn idempotency_in_progress_error() -> InternalRouteError {
+    // Contract row 2: the lease is incomplete and a same-key retry re-executes
+    // once it frees. Every such response is semantically "deferred"; stamp it
+    // centrally so callers no longer lean on the legacy `disposition` field.
     (
         StatusCode::CONFLICT,
         Json(serde_json::json!({
@@ -1616,6 +1619,17 @@ async fn complete_idempotent_result(
 /// replay marker: callers receive `idempotency_in_progress` while the
 /// capability may still be valid and a bounded reconcile/new-key disposition
 /// after expiry.  Error DTOs remain safe to persist and replay.
+///
+/// A handler 5xx is deferred in place: the heartbeat is stopped and the row
+/// stays incomplete with its DB-authored lease preserved
+/// (`lease_seconds()` = `recovery_after_seconds`, e.g. 11 min for signer
+/// rotation).  That lease must not be shortened to the generic retry interval,
+/// or reclaim would collapse to the bounded reconcile disposition seconds
+/// after a transient failure instead of holding the capability window.
+/// Non-5xx handler errors are persist-safe DTOs and delegate to
+/// [`complete_idempotent_result`] (stamped + cached).  The only caller,
+/// `issue_paas_signer_rotation_token`, claims no mutation or deployment lane,
+/// so neither busy string can surface here.
 async fn complete_expiring_capability_result(
     mut lease: IdempotencyLease,
     result: Result<IdempotencyResponse, InternalRouteError>,
@@ -1625,7 +1639,18 @@ async fn complete_expiring_capability_result(
             lease.stop_heartbeat();
             Ok(response)
         }
-        Err(error) => complete_idempotent_result(lease, Err(error)).await,
+        Err((status, body)) => {
+            // Defer a 5xx WITHOUT calling `defer_idempotent_request`: that
+            // helper rewrites `lease_expires_at` to the ~5 s retry interval,
+            // shortening the capability's heartbeat-maintained hold and
+            // collapsing reclaim to `recovery_required` seconds after a
+            // transient failure. Preserve the DB-authored lease instead.
+            if status.is_server_error() {
+                lease.stop_heartbeat();
+                return Err(idempotency_in_progress_error());
+            }
+            complete_idempotent_result(lease, Err((status, body))).await
+        }
     }
 }
 
@@ -8158,6 +8183,10 @@ mod tests {
             terminal.1["disposition"],
             "reconcile_then_retry_with_new_key"
         );
+        // Fix 2 (#53): the recovery_required terminal body carries the
+        // completed disposition marker so a disposition-driven PaaS terminalizes
+        // through the completed channel on this 5xx-defer -> FailClosed path.
+        assert_eq!(terminal.1["idempotency_disposition"], "completed");
         assert_eq!(
             side_effects.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -8223,6 +8252,88 @@ mod tests {
             count, 0,
             "config-token 5xx cancels the reservation, leaving no row to reclaim"
         );
+    }
+
+    #[tokio::test]
+    async fn five_xx_in_capability_path_defers_preserving_capability_lease() {
+        // A handler 5xx during capability issuance is an unknown outcome, so
+        // defer (leave the row incomplete). But unlike the generic defer in
+        // `complete_idempotent_result`, the capability's DB-authored lease hold
+        // (`lease_seconds()` = `recovery_after_seconds`) must be PRESERVED --
+        // not shortened to the ~5 s generic retry interval -- so reclaim holds
+        // the capability window instead of collapsing to `recovery_required`
+        // seconds after a transient 5xx. `complete_expiring_capability_result`
+        // intercepts the 5xx before delegating for exactly this reason.
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("five-xx-capability-{suffix}");
+        let path =
+            format!("/internal/paas/orgs/org-{suffix}/apps/app-{suffix}/signer/rotation-token");
+        let hash = Sha256::digest(b"five-xx-capability-request").to_vec();
+        // A deliberately long window so the NOT-shortened invariant is
+        // observable: the generic defer would set lease_expires_at to ~now+5s;
+        // the preserved lease stays near now + recovery_after_seconds.
+        let recovery = IdempotencyRecovery::ExpiringCapability {
+            recovery_after_seconds: 600,
+        };
+        let lease = expect_idempotency_execution(
+            begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
+                .await
+                .expect("reserve capability handler"),
+        );
+        let result: Result<IdempotencyResponse, InternalRouteError> =
+            async { Err(json_error(StatusCode::BAD_GATEWAY, "signing service 5xx")) }.await;
+        let deferred = complete_expiring_capability_result(lease, result)
+            .await
+            .expect_err("5xx defers, preserving the capability lease");
+        // Same stamped deferred body as the generic defer path.
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(deferred.1["error"], "idempotency_request_in_progress");
+        assert_eq!(deferred.1["idempotency_disposition"], "deferred");
+        assert_eq!(deferred.1["retryable"], true);
+
+        // Row is incomplete AND the lease hold was NOT shortened: it stays near
+        // now + recovery_after_seconds (600s), not now + IDEMPOTENCY_RETRY_DEFER_SECONDS (5s).
+        let (completed, lease_expires_at): (bool, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as(
+                "SELECT completed_at IS NOT NULL, lease_expires_at
+                   FROM cap_internal_idempotency
+                  WHERE idempotency_key = $1",
+            )
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect deferred capability row");
+        assert!(!completed, "5xx must not cache a capability result");
+        let now = chrono::Utc::now();
+        let expires_at = lease_expires_at.expect("lease_expires_at is set");
+        // The bug would set this to ~now+5s; the fix preserves ~now+600s. A
+        // 300s threshold cleanly separates them and tolerates DB/app clock skew.
+        assert!(
+            expires_at > now + chrono::Duration::seconds(300),
+            "capability lease must be preserved (~now+600s), not shortened to the ~5s generic defer; got {expires_at}"
+        );
+
+        // Same-key retry within the window -> still in-progress (lease not expired).
+        let in_progress =
+            begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
+                .await
+                .err()
+                .expect("live capability window blocks same-key retry");
+        assert_eq!(in_progress.1.0["error"], "idempotency_request_in_progress");
+        assert_eq!(in_progress.1.0["idempotency_disposition"], "deferred");
+
+        // After the window elapses, reclaim terminalizes recovery_required.
+        expire_idempotency_lease(&pool, &key).await;
+        let terminal = expect_idempotency_replay(
+            begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
+                .await
+                .expect("expired capability closes with recovery_required"),
+        );
+        assert_eq!(terminal.0, StatusCode::CONFLICT);
+        assert_eq!(terminal.1["error"], "idempotency_recovery_required");
+        assert_eq!(terminal.1["retryable"], false);
     }
 
     #[tokio::test]
