@@ -1468,14 +1468,23 @@ fn deferred_idempotency_response() -> InternalRouteError {
     )
 }
 
-/// `true` for the transient app-mutation-lease conflict (`MutationLeaseError::Busy`
-/// surfaced as `409 {"error":"app mutation already in progress"}`). Such a
-/// response must defer (leave the lease incomplete) so a same-key retry
-/// re-executes once the mutation lease frees, instead of being cached.
-fn is_busy_mutation_conflict(status: StatusCode, body: &serde_json::Value) -> bool {
+/// `true` for a transient mutation/deployment-lease conflict — the two
+/// "busy" families that signal the lane claim failed before the handler
+/// body ran (a known-not-applied outcome). Both surface as `409`:
+/// - `MutationLeaseError::Busy` -> `{"error":"app mutation already in
+///   progress"}` (`apps.rs`, `domains.rs` — claim sites; `create_app` runs a
+///   compensation that deletes the pristine row first).
+/// - `SupersedeDeploymentError::Busy` -> `{"error":"deployment mutation is
+///   still in progress"[...]}` (`deployments.rs`, `unlock.rs`, `rollback.rs`,
+///   `apps.rs` — all `?`-propagated from an uncommitted transaction that
+///   rolls back). Prefix-matched so all three variants are covered.
+fn is_transient_mutation_conflict(status: StatusCode, body: &serde_json::Value) -> bool {
+    let Some(message) = body.get("error").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
     status == StatusCode::CONFLICT
-        && body.get("error").and_then(serde_json::Value::as_str)
-            == Some("app mutation already in progress")
+        && (message == "app mutation already in progress"
+            || message.starts_with("deployment mutation is still in progress"))
 }
 
 /// Stamp a durably-cached error body as a completed idempotent result. PaaS
@@ -1526,11 +1535,18 @@ async fn complete_idempotent_result(
             Ok((status, body))
         }
         Err((status, Json(mut body))) => {
-            // The transient app-mutation-lease conflict is never a terminal
-            // result: defer so a same-key retry re-executes once the lease
-            // frees, rather than caching the conflict for every replay.
-            if is_busy_mutation_conflict(status, &body) {
-                return Err(defer_idempotent_request(lease).await);
+            // A transient mutation/deployment-lease conflict is a
+            // known-not-applied outcome: the lane claim failed before the
+            // handler body ran (or, for the supersede sites, the uncommitted
+            // transaction rolled back). Cancel the reservation so a same-key
+            // retry starts fresh and re-executes under every recovery policy
+            // -- FailClosed included -- rather than leaving a reclaimable row
+            // that FailClosed would terminalize as recovery-required, or a
+            // cached conflict that RetrySafe/Deterministic would replay
+            // forever. Contrast with 5xx (unknown outcome), which must defer.
+            if is_transient_mutation_conflict(status, &body) {
+                cancel_idempotency_reservation(lease).await?;
+                return Err(deferred_idempotency_response());
             }
             stamp_idempotency_completion(&mut body);
             finish_idempotent_request(lease, status, &body).await?;
@@ -2120,10 +2136,11 @@ pub async fn sync_paas_member(
         .as_ref()
         .is_some_and(|(stored_paas_user_id, _, _, _)| stored_paas_user_id != &paas_user_id)
     {
-        let error = json_error(
+        let mut error = json_error(
             StatusCode::CONFLICT,
             "membership user mapping is inconsistent",
         );
+        stamp_idempotency_completion(&mut error.1.0);
         finish_membership_idempotent_request_in_tx(&mut tx, key, error.0, &error.1.0).await?;
         tx.commit().await.map_err(|_| db_error())?;
         return Err(error);
@@ -2190,7 +2207,8 @@ pub async fn sync_paas_member(
 
     let write_authority = match existing {
         Some((_, version, _, _)) if body.version < version => {
-            let error = json_error(StatusCode::CONFLICT, "membership version is stale");
+            let mut error = json_error(StatusCode::CONFLICT, "membership version is stale");
+            stamp_idempotency_completion(&mut error.1.0);
             finish_membership_idempotent_request_in_tx(&mut tx, key, error.0, &error.1.0).await?;
             tx.commit().await.map_err(|_| db_error())?;
             return Err(error);
@@ -2202,10 +2220,11 @@ pub async fn sync_paas_member(
                 || existing_role != role_name
                 || active != body.active
             {
-                let error = json_error(
+                let mut error = json_error(
                     StatusCode::CONFLICT,
                     "membership version already exists with different content",
                 );
+                stamp_idempotency_completion(&mut error.1.0);
                 finish_membership_idempotent_request_in_tx(&mut tx, key, error.0, &error.1.0)
                     .await?;
                 tx.commit().await.map_err(|_| db_error())?;
@@ -7586,67 +7605,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn busy_mutation_conflict_is_deferred_not_cached_and_re_executes() {
+    async fn app_mutation_busy_cancels_reservation_and_re_executes() {
+        // The app-mutation-lease conflict (MutationLeaseError::Busy) is a
+        // known-not-applied outcome: the lane claim failed before the handler
+        // body ran. Cancel the reservation so a same-key retry starts fresh,
+        // rather than leaving a reclaimable/cached row. RetrySafe here; the
+        // FailClosed case is the headline test below.
         let pool = database_test_pool().await;
         let state = idempotency_test_state(pool.clone());
         let suffix = Uuid::new_v4().simple().to_string();
-        let key = format!("busy-defer-{suffix}");
-        let path = format!("/internal/test/busy-defer/{suffix}");
-        let hash = Sha256::digest(b"busy-defer-request").to_vec();
+        let key = format!("app-busy-cancel-{suffix}");
+        let path = format!("/internal/test/app-busy-cancel/{suffix}");
+        let hash = Sha256::digest(b"app-busy-cancel-request").to_vec();
 
         let lease = expect_idempotency_execution(
             begin_idempotent_request(&state, &key, "POST", &path, &hash)
                 .await
-                .expect("reserve busy handler"),
+                .expect("reserve app-busy handler"),
         );
         let result: Result<IdempotencyResponse, InternalRouteError> = async {
             Err((
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "app mutation already in progress",
-                })),
+                Json(serde_json::json!({"error": "app mutation already in progress"})),
             ))
         }
         .await;
         let deferred = complete_idempotent_result(lease, result)
             .await
-            .expect_err("busy-409 defers, returning the deferred body");
-        // The client sees the stamped defer body, not the raw busy-409 conflict.
+            .expect_err("busy-409 cancels and returns the deferred body");
         assert_eq!(deferred.0, StatusCode::CONFLICT);
         assert_eq!(deferred.1["idempotency_disposition"], "deferred");
         assert_eq!(deferred.1["retryable"], true);
+        assert_eq!(deferred.1["disposition"], "retry_same_key");
         assert_ne!(deferred.1["error"], "app mutation already in progress");
 
-        // The busy-409 was NOT durably cached as a completed result.
-        let completed: bool = sqlx::query_scalar(
-            "SELECT completed_at IS NOT NULL
-               FROM cap_internal_idempotency
-              WHERE idempotency_key = $1",
+        // The reservation was canceled (row deleted), not cached or deferred.
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cap_internal_idempotency WHERE idempotency_key = $1",
         )
         .bind(&key)
         .fetch_one(&pool)
         .await
-        .expect("inspect busy-deferred row");
-        assert!(!completed);
+        .expect("inspect canceled row");
+        assert_eq!(count, 0, "busy-409 must cancel (delete) the reservation");
 
-        // Once the deferred lease has freed, a same-key retry re-executes
-        // (acquires a fresh lease) instead of replaying a cached conflict.
-        sqlx::query(
-            "UPDATE cap_internal_idempotency
-                SET lease_expires_at = clock_timestamp() - interval '1 second'
-              WHERE idempotency_key = $1",
-        )
-        .bind(&key)
-        .execute(&pool)
-        .await
-        .expect("expire deferred lease");
+        // A same-key retry starts fresh (re-executes) -- no lease expiry needed,
+        // since there is no row to reclaim or replay.
         match begin_idempotent_request(&state, &key, "POST", &path, &hash)
             .await
-            .expect("re-begin after defer")
+            .expect("re-begin after cancel")
         {
             IdempotencyBegin::Execute(_) => { /* re-executed as intended */ }
             IdempotencyBegin::Replay((status, body)) => {
                 panic!("same-key retry should re-execute, not replay {status}: {body}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_mutation_busy_cancels_reservation_across_all_variants() {
+        // The second busy family -- SupersedeDeploymentError::Busy, emitted as
+        // "deployment mutation is still in progress"[...] (3 variants) -- is
+        // also known-not-applied (?-propagated from an uncommitted transaction
+        // that rolls back). Same cancel treatment; the predicate prefix-matches
+        // so all variants are covered.
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let hash = Sha256::digest(b"deploy-busy-cancel-request").to_vec();
+        let variants = [
+            "deployment mutation is still in progress",
+            "deployment mutation is still in progress; retry after its lease completes",
+            "deployment mutation is still in progress; retry rollback",
+        ];
+        for (i, message) in variants.iter().enumerate() {
+            let key = format!("deploy-busy-cancel-{suffix}-{i}");
+            let path = format!("/internal/test/deploy-busy-cancel-{suffix}/{i}");
+            let lease = expect_idempotency_execution(
+                begin_idempotent_request(&state, &key, "POST", &path, &hash)
+                    .await
+                    .expect("reserve deploy-busy handler"),
+            );
+            let result: Result<IdempotencyResponse, InternalRouteError> = async {
+                Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": message})),
+                ))
+            }
+            .await;
+            let deferred = complete_idempotent_result(lease, result)
+                .await
+                .expect_err("deployment busy-409 cancels and returns the deferred body");
+            assert_eq!(deferred.1["idempotency_disposition"], "deferred");
+            assert_eq!(deferred.1["retryable"], true);
+            assert_ne!(deferred.1["error"], *message);
+
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM cap_internal_idempotency WHERE idempotency_key = $1",
+            )
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect canceled row");
+            assert_eq!(count, 0, "deployment busy-409 must cancel the reservation");
+        }
+    }
+
+    #[tokio::test]
+    async fn app_mutation_busy_fail_closed_cancels_and_re_executes() {
+        // HEADLINE regression test (review Finding A): a FailClosed route that
+        // hits a busy-409 must cancel, not defer. Under the old defer, the
+        // incomplete fail_closed row would persist and a same-key retry after
+        // lease expiry would hit the FailClosed reclaim branch (~internal.rs
+        // :1220) and terminalize as idempotency_recovery_required -- a client
+        // following retry_same_key would lose the intent. Cancel deletes the
+        // row, so the retry re-executes under FailClosed exactly as under
+        // RetrySafe. Reachable via verify_paas_domain_challenge (FailClosed)
+        // -> domains::verify_challenge, and the deployment-busy FailClosed
+        // routes (update_paas_unlock_mode, rollback_paas_app).
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let key = format!("app-busy-failclosed-{suffix}");
+        let path = format!("/internal/test/app-busy-failclosed/{suffix}");
+        let hash = Sha256::digest(b"app-busy-failclosed-request").to_vec();
+        let recovery = IdempotencyRecovery::FailClosed;
+
+        let lease = expect_idempotency_execution(
+            begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
+                .await
+                .expect("reserve fail-closed handler"),
+        );
+        let result: Result<IdempotencyResponse, InternalRouteError> = async {
+            Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "app mutation already in progress"})),
+            ))
+        }
+        .await;
+        let deferred = complete_idempotent_result(lease, result)
+            .await
+            .expect_err("fail-closed busy-409 cancels, returning the deferred body");
+        assert_eq!(deferred.0, StatusCode::CONFLICT);
+        assert_eq!(deferred.1["idempotency_disposition"], "deferred");
+        assert_eq!(deferred.1["disposition"], "retry_same_key");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .expect("inspect canceled fail-closed row");
+        assert_eq!(
+            count, 0,
+            "fail-closed busy-409 must cancel, leaving no row to reclaim"
+        );
+
+        // The retry re-executes (fresh reservation), NOT recovery_required.
+        match begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
+            .await
+            .expect("re-begin after fail-closed cancel")
+        {
+            IdempotencyBegin::Execute(_) => { /* re-executed under FailClosed as intended */ }
+            IdempotencyBegin::Replay((status, body)) => {
+                panic!(
+                    "fail-closed same-key retry should re-execute after cancel, not replay \
+                     {status}: {body}"
+                );
             }
         }
     }
@@ -8530,6 +8656,8 @@ mod tests {
         .expect_err("stale membership reactivation must fail");
         assert_eq!(stale.0, StatusCode::CONFLICT);
         assert_eq!(stale.1.0["error"], "membership version is stale");
+        assert_eq!(stale.1.0["idempotency_disposition"], "completed");
+        assert_eq!(stale.1.0["retryable"], false);
         let (stale_retry_status, Json(stale_retry_body)) = sync_member(
             &state,
             &paas_org_id,
@@ -8541,6 +8669,8 @@ mod tests {
         .expect("stale membership error replay is completed");
         assert_eq!(stale_retry_status, StatusCode::CONFLICT);
         assert_eq!(stale_retry_body["error"], "membership version is stale");
+        assert_eq!(stale_retry_body["idempotency_disposition"], "completed");
+        assert_eq!(stale_retry_body["retryable"], false);
 
         let _ = sync_member(
             &state,
@@ -8567,6 +8697,8 @@ mod tests {
             divergent.1.0["error"],
             "membership version already exists with different content"
         );
+        assert_eq!(divergent.1.0["idempotency_disposition"], "completed");
+        assert_eq!(divergent.1.0["retryable"], false);
         let (divergent_retry_status, Json(divergent_retry_body)) = sync_member(
             &state,
             &paas_org_id,
@@ -8581,6 +8713,8 @@ mod tests {
             divergent_retry_body["error"],
             "membership version already exists with different content"
         );
+        assert_eq!(divergent_retry_body["idempotency_disposition"], "completed");
+        assert_eq!(divergent_retry_body["retryable"], false);
 
         let authority: (String, bool, i64, String, bool, String) = sqlx::query_as(
             "SELECT m.role::text,
