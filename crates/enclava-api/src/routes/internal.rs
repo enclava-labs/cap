@@ -701,6 +701,12 @@ async fn complete_unrecoverable_idempotency_request(
         "error": "idempotency_recovery_required",
         "retryable": false,
         "disposition": "reconcile_then_retry_with_new_key",
+        // Stamp the disposition-driven terminal marker so PaaS terminalizes
+        // through the completed channel: the key is consumed, the outcome is
+        // terminal, and the cached row is replayable. The `error` + legacy
+        // `disposition` carry the operator-facing recovery nuance. This single
+        // body serves both the cached row and the immediate `Replay` response.
+        "idempotency_disposition": "completed",
     });
     let updated = sqlx::query(
         "UPDATE cap_internal_idempotency
@@ -1468,23 +1474,69 @@ fn deferred_idempotency_response() -> InternalRouteError {
     )
 }
 
-/// `true` for a transient mutation/deployment-lease conflict — the two
-/// "busy" families that signal the lane claim failed before the handler
-/// body ran (a known-not-applied outcome). Both surface as `409`:
-/// - `MutationLeaseError::Busy` -> `{"error":"app mutation already in
-///   progress"}` (`apps.rs`, `domains.rs` — claim sites; `create_app` runs a
-///   compensation that deletes the pristine row first).
-/// - `SupersedeDeploymentError::Busy` -> `{"error":"deployment mutation is
-///   still in progress"[...]}` (`deployments.rs`, `unlock.rs`, `rollback.rs`,
-///   `apps.rs` — all `?`-propagated from an uncommitted transaction that
-///   rolls back). Prefix-matched so all three variants are covered.
-fn is_transient_mutation_conflict(status: StatusCode, body: &serde_json::Value) -> bool {
+/// `true` for a transient, *known-not-applied* `409` conflict returned by an
+/// idempotency-wrapped route. Every such conflict must cancel the reservation
+/// (not cache it) so a same-key retry re-executes under every recovery policy
+/// — FailClosed included — instead of being terminalized as recovery-required
+/// or replaying a stale conflict forever.
+///
+/// A conflict qualifies when, on a `409`, the `error` string:
+/// - contains `"in progress"` — the two busy families (a lane claim that
+///   failed before the handler body ran): `MutationLeaseError::Busy` ->
+///   `"app mutation already in progress"` (`apps.rs`, `domains.rs` — claim
+///   sites; `create_app` runs a compensation that deletes the pristine row
+///   first) and `SupersedeDeploymentError::Busy` -> `"deployment mutation is
+///   still in progress"` (+ the `"; retry after its lease completes"` /
+///   `"; retry rollback"` variants; `deployments.rs`, `unlock.rs`,
+///   `rollback.rs`, `apps.rs` — `?`-propagated from an uncommitted
+///   transaction that rolls back); plus the setup/deletion guards
+///   `"app deletion is in progress"` (`deployments.rs`, `unlock.rs`,
+///   `rollback.rs`) and `"current deployment generation is still in
+///   progress"` (`unlock.rs`).
+/// - contains `"retry"` — the deploy/rollback/unlock CAS guards whose
+///   uncommitted transaction rolled back: `"app deployment inputs changed
+///   while deployment was validating; retry the deployment"`, `"app metadata
+///   changed while deployment was validating; retry the deployment"`, `"an
+///   earlier deployment is still completing setup; retry after setup is
+///   reconciled"` (`deployments.rs`, `rollback.rs`), `"app resource
+///   authority changed; retry deletion"` (`apps.rs` — commits only the
+///   lease-release compensation, not the delete), and the rollback/unlock
+///   `"... while validating; retry the rollback"` / `"... while unlock mode
+///   transition was validating; retry"` families.
+/// - contains `"authority changed"` — the domains CAS guards `"app
+///   authority changed"` and `"custom domain authority changed"`
+///   (`domains.rs` — each commits only the lease-release compensation; the
+///   record/delete it guards has not run).
+///
+/// Substring checks are case-sensitive: every CAP `error` string is lowercase,
+/// and matching on the lowercase literal keeps a hypothetical capitalized
+/// permanent from matching by accident. The full `409` space across all
+/// wrapped routes was enumerated to confirm no *permanent* `409` carries any
+/// of these substrings (name/external_id/keyring/entitlement duplicates,
+/// `dns_hostname_in_use`, `invalid unlock mode transition`, `replayed
+/// transition_receipt`, `app deletion phase is invalid`, `app signer identity
+///   is incomplete`, the rollback target shape guards, etc.).
+///
+/// Deliberately **not** matched (kept stamp-completed), even though they are
+/// `409`s on wrapped-adjacent routes:
+/// - `"app creation was superseded"` (`apps.rs`) is emitted *after* a DNS
+///   provider side effect, so the outcome is genuinely ambiguous — deferring
+///   it would risk a duplicate provider mutation on retry. (The internal
+///   `create_paas_app` path does its own `INSERT` and never reaches it; it is
+///   documented here as the canonical example of why "looks transient" is not
+///   enough — a pre-return side effect disqualifies a conflict from cancel.)
+/// - `"app signer authority is unavailable"` (`apps.rs`, signer rotation)
+///   is a guard on a deleting app on the capability route; matching it would
+///   require heartbeat handling in the capability `Err` arm. It carries no
+///   matching substring regardless, so it stays stamp-completed automatically.
+fn is_transient_retry_conflict(status: StatusCode, body: &serde_json::Value) -> bool {
     let Some(message) = body.get("error").and_then(serde_json::Value::as_str) else {
         return false;
     };
     status == StatusCode::CONFLICT
-        && (message == "app mutation already in progress"
-            || message.starts_with("deployment mutation is still in progress"))
+        && (message.contains("in progress")
+            || message.contains("retry")
+            || message.contains("authority changed"))
 }
 
 /// Stamp a durably-cached error body as a completed idempotent result. PaaS
@@ -1544,7 +1596,7 @@ async fn complete_idempotent_result(
             // that FailClosed would terminalize as recovery-required, or a
             // cached conflict that RetrySafe/Deterministic would replay
             // forever. Contrast with 5xx (unknown outcome), which must defer.
-            if is_transient_mutation_conflict(status, &body) {
+            if is_transient_retry_conflict(status, &body) {
                 cancel_idempotency_reservation(lease).await?;
                 return Err(deferred_idempotency_response());
             }
@@ -7778,6 +7830,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_retry_and_authority_conflicts_cancel_and_re_execute() {
+        // The expanded transient predicate covers every known-not-applied 409
+        // that carries "in progress", "retry", or "authority changed": the
+        // deploy/rollback/unlock CAS guards (uncommitted tx rolled back) and
+        // the domains authority-CAS guards (only the lease-release compensation
+        // committed, not the guarded op). Each must cancel the reservation so a
+        // same-key retry re-executes, exactly like the busy families.
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let hash = Sha256::digest(b"transient-retry-cancel-request").to_vec();
+        let messages = [
+            // contains "retry" -- deploy CAS guards (deployments.rs)
+            "app deployment inputs changed while deployment was validating; retry the deployment",
+            "app metadata changed while deployment was validating; retry the deployment",
+            "an earlier deployment is still completing setup; retry after setup is reconciled",
+            // contains "retry" -- apps.rs delete CAS (commits lease-release only)
+            "app resource authority changed; retry deletion",
+            // contains "retry" -- rollback CAS guards (rollback.rs)
+            "rollback target changed while validating; retry the rollback",
+            "rollback target authority changed; retry the rollback",
+            "app deployment inputs changed while rollback was validating; retry the rollback",
+            // contains "retry" -- unlock transition CAS guards (unlock.rs)
+            "app changed while unlock mode transition was validating; retry",
+            "deployment generation changed while unlock mode transition was validating; retry",
+            // contains "in progress" -- setup/deletion guards
+            "app deletion is in progress",
+            "current deployment generation is still in progress",
+            // contains "authority changed" -- domains CAS guards (lease-release only)
+            "app authority changed",
+            "custom domain authority changed",
+        ];
+        for (i, message) in messages.iter().enumerate() {
+            let key = format!("transient-retry-cancel-{suffix}-{i}");
+            let path = format!("/internal/test/transient-retry-cancel-{suffix}/{i}");
+            let lease = expect_idempotency_execution(
+                begin_idempotent_request(&state, &key, "POST", &path, &hash)
+                    .await
+                    .expect("reserve transient-retry handler"),
+            );
+            let result: Result<IdempotencyResponse, InternalRouteError> = async {
+                Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": message})),
+                ))
+            }
+            .await;
+            let deferred = complete_idempotent_result(lease, result)
+                .await
+                .expect_err("transient retry/authority 409 cancels and returns the deferred body");
+            assert_eq!(deferred.0, StatusCode::CONFLICT);
+            assert_eq!(deferred.1["idempotency_disposition"], "deferred");
+            assert_eq!(deferred.1["retryable"], true);
+            assert_ne!(deferred.1["error"], *message);
+
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM cap_internal_idempotency WHERE idempotency_key = $1",
+            )
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect canceled row");
+            assert_eq!(
+                count, 0,
+                "transient retry/authority 409 must cancel (delete) the reservation"
+            );
+
+            // A same-key retry re-executes, never replays a cached conflict.
+            match begin_idempotent_request(&state, &key, "POST", &path, &hash)
+                .await
+                .expect("re-begin after cancel")
+            {
+                IdempotencyBegin::Execute(_) => { /* re-executed as intended */ }
+                IdempotencyBegin::Replay((status, body)) => {
+                    panic!("same-key retry should re-execute, not replay {status}: {body}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_conflicts_are_stamped_completed_and_cached() {
+        // Negative space: the permanent 409s that share the wrapped routes
+        // carry none of the transient substrings, so they are stamped
+        // completed and durably cached -- a same-key retry replays the cached
+        // body rather than re-executing. Also pins the two deliberate
+        // exclusions ("app creation was superseded", "app signer authority is
+        // unavailable") to stamp-completed behavior.
+        let pool = database_test_pool().await;
+        let state = idempotency_test_state(pool.clone());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let hash = Sha256::digest(b"permanent-conflict-stamp-request").to_vec();
+        let messages = [
+            "app name already taken in this org",
+            "deployment with external_id already exists in this org",
+            "dns_hostname_in_use",
+            "invalid unlock mode transition",
+            "replayed transition_receipt",
+            "app deletion phase is invalid",
+            "app signer identity is incomplete",
+            "app creation was superseded",
+            "app signer authority is unavailable",
+            "rollback target has no valid immutable apply snapshot",
+            "external_id already exists with different security.log_encryption",
+        ];
+        for (i, message) in messages.iter().enumerate() {
+            let key = format!("permanent-stamp-{suffix}-{i}");
+            let path = format!("/internal/test/permanent-stamp-{suffix}/{i}");
+            let lease = expect_idempotency_execution(
+                begin_idempotent_request(&state, &key, "POST", &path, &hash)
+                    .await
+                    .expect("reserve permanent-conflict handler"),
+            );
+            let result: Result<IdempotencyResponse, InternalRouteError> = async {
+                Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"error": message})),
+                ))
+            }
+            .await;
+            let stamped = complete_idempotent_result(lease, result)
+                .await
+                .expect_err("permanent 409 is stamped completed and returned");
+            assert_eq!(stamped.0, StatusCode::CONFLICT);
+            assert_eq!(stamped.1["error"], *message);
+            assert_eq!(stamped.1["idempotency_disposition"], "completed");
+            assert_eq!(stamped.1["retryable"], false);
+
+            // Cached as completed: a same-key retry replays the stamped body.
+            let replay = expect_idempotency_replay(
+                begin_idempotent_request(&state, &key, "POST", &path, &hash)
+                    .await
+                    .expect("re-begin replays the cached permanent conflict"),
+            );
+            assert_eq!(replay.0, StatusCode::CONFLICT);
+            assert_eq!(replay.1["error"], *message);
+            assert_eq!(replay.1["idempotency_disposition"], "completed");
+        }
+    }
+
+    #[tokio::test]
     async fn unsafe_legacy_recovery_terminalizes_with_nonretryable_disposition() {
         let pool = database_test_pool().await;
         let state = idempotency_test_state(pool.clone());
@@ -7813,6 +8006,10 @@ mod tests {
         assert_eq!(first.1["error"], "idempotency_recovery_required");
         assert_eq!(first.1["retryable"], false);
         assert_eq!(first.1["disposition"], "reconcile_then_retry_with_new_key");
+        // The terminal body carries the completed disposition marker so a
+        // disposition-driven PaaS terminalizes through the completed channel;
+        // the cached row replays verbatim on a same-key retry.
+        assert_eq!(first.1["idempotency_disposition"], "completed");
         assert_eq!(
             expect_idempotency_replay(
                 begin_idempotent_request_with_recovery(
