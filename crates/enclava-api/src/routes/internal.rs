@@ -430,6 +430,16 @@ fn json_error(
     (status, Json(serde_json::json!({"error": error.into()})))
 }
 
+/// Body for every `idempotency_request_in_progress` response: the request is
+/// deferred under a live (or reapplied) lease and the caller must retry with
+/// the same key. Every in-progress 409 routes through this body so
+/// disposition-driven callers see one uniform contract -- live-lease retries
+/// (`begin_idempotent_request_with_recovery`), the deterministic config-token
+/// cutoff deferrals, the explicit `defer_idempotent_request`, and the
+/// cancel-after-transient-conflict path all carry the same stamp. The explicit
+/// `idempotency_disposition: "deferred"` field distinguishes a CAP-intentional
+/// defer (retain intent, retry same key) from a missing field (conservative
+/// fallback) without inferring it from the status code.
 fn idempotency_in_progress_error() -> InternalRouteError {
     (
         StatusCode::CONFLICT,
@@ -437,6 +447,7 @@ fn idempotency_in_progress_error() -> InternalRouteError {
             "error": "idempotency_request_in_progress",
             "retryable": true,
             "disposition": "retry_same_key",
+            "idempotency_disposition": "deferred",
         })),
     )
 }
@@ -1458,22 +1469,6 @@ async fn finish_idempotent_request(
     Ok(())
 }
 
-/// Body returned for every deferred idempotent response. Carries the explicit
-/// `idempotency_disposition: "deferred"` stamp so callers can distinguish a
-/// CAP-intentional defer (retain intent, retry same key) from a missing field
-/// (conservative fallback) without inferring from the status code.
-fn deferred_idempotency_response() -> InternalRouteError {
-    (
-        StatusCode::CONFLICT,
-        Json(serde_json::json!({
-            "error": "idempotency_request_in_progress",
-            "retryable": true,
-            "disposition": "retry_same_key",
-            "idempotency_disposition": "deferred",
-        })),
-    )
-}
-
 /// `true` for a transient, *known-not-applied* `409` conflict returned by an
 /// idempotency-wrapped route. Every such conflict must cancel the reservation
 /// (not cache it) so a same-key retry re-executes under every recovery policy
@@ -1570,8 +1565,11 @@ async fn defer_idempotent_request(mut lease: IdempotencyLease) -> InternalRouteE
     .bind(IDEMPOTENCY_RETRY_DEFER_SECONDS)
     .execute(&lease.pool)
     .await;
+    // Both Ok arms return the same deferred body now that the central
+    // in-progress helper carries the `deferred` stamp: a 1-row update means the
+    // defer landed; a 0-row update means the lease was already completed or
+    // reclaimed. Either way the client guidance is retry-same-key.
     match updated {
-        Ok(updated) if updated.rows_affected() == 1 => deferred_idempotency_response(),
         Ok(_) => idempotency_in_progress_error(),
         Err(_) => db_error(),
     }
@@ -1598,7 +1596,7 @@ async fn complete_idempotent_result(
             // forever. Contrast with 5xx (unknown outcome), which must defer.
             if is_transient_retry_conflict(status, &body) {
                 cancel_idempotency_reservation(lease).await?;
-                return Err(deferred_idempotency_response());
+                return Err(idempotency_in_progress_error());
             }
             stamp_idempotency_completion(&mut body);
             finish_idempotent_request(lease, status, &body).await?;
@@ -5214,6 +5212,7 @@ mod tests {
                 "error": "idempotency_request_in_progress",
                 "retryable": true,
                 "disposition": "retry_same_key",
+                "idempotency_disposition": "deferred",
             })
         );
 
@@ -8397,6 +8396,11 @@ mod tests {
         assert_eq!(pending.1.0["error"], "idempotency_request_in_progress");
         assert_eq!(pending.1.0["retryable"], true);
         assert_eq!(pending.1.0["disposition"], "retry_same_key");
+        // The central in-progress helper carries the `deferred` stamp on every
+        // path -- including this live-lease retry through
+        // `begin_idempotent_request_with_recovery`, not only the explicit
+        // defer/cancel paths.
+        assert_eq!(pending.1.0["idempotency_disposition"], "deferred");
         let pending_authority: (bool, i64, i32) = sqlx::query_as(
             "SELECT completed_at IS NULL,
                     (SELECT count(*) FROM deployments WHERE external_id = $2),
