@@ -304,6 +304,10 @@ pub async fn verify_challenge(
         )
     })?;
 
+    // Expiry is absolute: a challenge past `expires_at` is refused whether or
+    // not ownership was previously proven (migration 0014: "`expires_at` bounds
+    // the window for the proof"). The live TXT lookup is not run, so an expired
+    // challenge never re-contacts DNS.
     if Utc::now() > expires_at {
         let e = DomainError::Expired;
         return Err((
@@ -312,9 +316,14 @@ pub async fn verify_challenge(
         ));
     }
 
+    // Every verify re-proves current DNS control with a live TXT lookup -- a
+    // captured `verified_at` does not bypass it. The lookup runs before the
+    // app-mutation lease is claimed so the lease is never held across DNS; a
+    // lookup failure returns without ever claiming it. `verified_at` is not
+    // persisted here -- it is written inside the apply transaction below, after
+    // the CAS guard, so persist + apply commit or roll back together.
     let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
     let expected = format!("enclava-domain-verification={token}");
-
     let live = lookup_txt(&txt_name).await.map_err(|e| {
         let de = DomainError::Lookup(e.to_string());
         (
@@ -322,7 +331,6 @@ pub async fn verify_challenge(
             Json(serde_json::json!({"error": de.to_string()})),
         )
     })?;
-
     let mut matched = false;
     for value in &live {
         if value.as_bytes().ct_eq(expected.as_bytes()).into() {
@@ -337,18 +345,11 @@ pub async fn verify_challenge(
             Json(serde_json::json!({"error": e.to_string()})),
         ));
     }
-
-    let verified_at = if let Some(verified_at) = verified_at {
-        verified_at
-    } else {
-        let verified_at = Utc::now();
-        sqlx::query("UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2")
-            .bind(verified_at)
-            .bind(challenge_id)
-            .execute(&state.db)
-            .await
-            .map_err(|_| internal_error())?;
-        verified_at
+    // Reuse the captured timestamp or stage a new one; it is persisted inside
+    // the apply transaction below.
+    let (verified_at, needs_persist) = match verified_at {
+        Some(verified_at) => (verified_at, false),
+        None => (Utc::now(), true),
     };
 
     // Domain mutation follows the same queue order as deployment apply:
@@ -396,6 +397,7 @@ pub async fn verify_challenge(
             &app.namespace,
         ))
         .ok_or_else(internal_error)?;
+
     let mut app_lane = state.db.begin().await.map_err(|_| internal_error())?;
     crate::entitlements::lock_org_entitlement_lane(&mut app_lane, auth.org_id)
         .await
@@ -434,6 +436,20 @@ pub async fn verify_challenge(
         ));
     };
     app = current_app;
+
+    // Persist the verification timestamp inside the apply transaction, after
+    // the lease and the CAS guard. A Busy lease or an authority mismatch
+    // returns above, so a proof can never be persisted without its apply:
+    // `verified_at` and the `apps.custom_domain` write commit or roll back
+    // together in `app_lane`.
+    if needs_persist {
+        sqlx::query("UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2")
+            .bind(verified_at)
+            .bind(challenge_id)
+            .execute(&mut *app_lane)
+            .await
+            .map_err(|_| internal_error())?;
+    }
 
     mutation
         .guard_provider(crate::dns::record_custom_domain(&state.db, app.id, &domain))

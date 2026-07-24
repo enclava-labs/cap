@@ -1957,6 +1957,10 @@ async fn paas_internal_app_logs_fail_closed_after_actor_validation() {
 
 #[tokio::test]
 async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
+    // Expiry is absolute: a challenge past `expires_at` is refused even when
+    // `verified_at` was already captured, and the live TXT lookup never runs
+    // (this env has no DNS, so a 409 -- not a 502 -- proves the lookup was
+    // skipped). No domain is attached and no DNS record is tracked.
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);
@@ -2019,6 +2023,86 @@ async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
             .await
             .expect("load tracked custom DNS row");
     assert_eq!(tracked_dns, None);
+}
+
+#[tokio::test]
+async fn custom_domain_verified_challenge_rechecks_txt_within_window() {
+    // Regression guard against re-introducing a verified-skip: a challenge that
+    // already holds `verified_at` but is still within its window MUST re-run the
+    // live TXT lookup -- it may not skip straight to applying the domain. This
+    // env has no DNS, so the lookup surfaces as a 502 lookup error (not a 200
+    // skip-to-apply), and no domain is attached.
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("recheck-{}", &suffix[..12]);
+    let domain = format!("recheck-{}.example.com", &suffix[..12]);
+    let (session_token, _org_id) = signup_owner(&server, "domain-recheck").await;
+
+    let create = server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await;
+    create.assert_status(StatusCode::CREATED);
+    let create_body: Value = create.json();
+    let app_id = Uuid::parse_str(create_body["id"].as_str().expect("app id")).unwrap();
+
+    // Postgres `timestamptz` stores microsecond precision; truncate the planted
+    // value so the round-trip through the DB compares exactly.
+    let planted_verified_at = chrono::DateTime::from_timestamp_micros(
+        (Utc::now() - Duration::hours(1)).timestamp_micros(),
+    )
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO custom_domain_challenges (
+             id, app_id, domain, challenge_token, expires_at, verified_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(app_id)
+    .bind(&domain)
+    .bind("historically-valid-token")
+    .bind(Utc::now() + Duration::hours(1))
+    .bind(planted_verified_at)
+    .execute(&pool)
+    .await
+    .expect("insert verified in-window domain challenge");
+
+    let verify = server
+        .post(&format!("/apps/{app_name}/domains/{domain}/verify"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    // The live TXT lookup ran and failed (no DNS in this env) -- proof that a
+    // captured `verified_at` did not bypass it.
+    verify.assert_status(StatusCode::BAD_GATEWAY);
+
+    // No apply, no re-persist: the domain is not attached and the proof stands
+    // unchanged.
+    let custom_domain: Option<String> =
+        sqlx::query_scalar("SELECT custom_domain FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app custom domain");
+    assert_eq!(custom_domain, None);
+
+    let verified_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT verified_at FROM custom_domain_challenges WHERE app_id = $1 AND domain = $2",
+    )
+    .bind(app_id)
+    .bind(&domain)
+    .fetch_one(&pool)
+    .await
+    .expect("load verified_at");
+    assert_eq!(verified_at, Some(planted_verified_at));
 }
 
 #[tokio::test]

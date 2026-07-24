@@ -1271,15 +1271,34 @@ pub async fn delete_app(
     .execute(&mut *phase_tx)
     .await
     .map_err(|_| internal_server_error())?;
-    crate::deploy::supersede_incomplete_deployments(&mut phase_tx, phase_app.id)
-        .await
-        .map_err(|error| match error {
-            crate::deploy::SupersedeDeploymentError::Busy => (
+    match crate::deploy::supersede_incomplete_deployments(&mut phase_tx, phase_app.id).await {
+        Ok(_) => {}
+        Err(crate::deploy::SupersedeDeploymentError::Busy) => {
+            // A deployment mutation is still in progress, so this delete is
+            // known-not-applied: only the in-transaction `status = 'deleting'`
+            // transition ran, and it is discarded by the rollback below. The
+            // delete mutation lease must be released too — leaving it abandoned
+            // (Drop only stops the heartbeat; the lock rows persist until
+            // quarantine expiry) would block a same-key retry from re-claiming
+            // until then, turning the cancel disposition into a self-inflicted
+            // busy loop on this app's own abandoned lease.
+            phase_tx
+                .rollback()
+                .await
+                .map_err(|_| internal_server_error())?;
+            delete_mutation
+                .finish()
+                .await
+                .map_err(|_| internal_server_error())?;
+            return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({"error": "deployment mutation is still in progress"})),
-            ),
-            crate::deploy::SupersedeDeploymentError::Database(_) => internal_server_error(),
-        })?;
+            ));
+        }
+        Err(crate::deploy::SupersedeDeploymentError::Database(_)) => {
+            return Err(internal_server_error());
+        }
+    }
     let signed_policy_revocation =
         crate::kbs::enqueue_signed_policy_revocation_if_active(&mut phase_tx)
             .await
