@@ -1956,7 +1956,13 @@ async fn paas_internal_app_logs_fail_closed_after_actor_validation() {
 }
 
 #[tokio::test]
-async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
+async fn custom_domain_verified_challenge_applies_after_expiry() {
+    // `verified_at` is durable proof of ownership: a verified challenge applies
+    // on a same-key retry even after the challenge expired and the TXT record
+    // is gone (this env has no DNS, so a live lookup would fail). This is the
+    // busy-cancelled-then-retried path -- the first verify persisted
+    // `verified_at`, so the retry must apply, not terminalize as
+    // "challenge has expired".
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);
@@ -1999,9 +2005,9 @@ async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
         .add_header("x-forwarded-for", "127.0.0.1")
         .authorization_bearer(&session_token)
         .await;
-    verify.assert_status(StatusCode::CONFLICT);
+    verify.assert_status(StatusCode::OK);
     let body: Value = verify.json();
-    assert_eq!(body["error"], "challenge has expired");
+    assert_eq!(body["domain"], domain);
 
     let custom_domain: Option<String> =
         sqlx::query_scalar("SELECT custom_domain FROM apps WHERE id = $1")
@@ -2009,7 +2015,7 @@ async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
             .fetch_one(&pool)
             .await
             .expect("load app custom domain");
-    assert_eq!(custom_domain, None);
+    assert_eq!(custom_domain.as_deref(), Some(domain.as_str()));
 
     let tracked_dns: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM dns_records WHERE app_id = $1 AND hostname = $2")
@@ -2018,7 +2024,7 @@ async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
             .fetch_optional(&pool)
             .await
             .expect("load tracked custom DNS row");
-    assert_eq!(tracked_dns, None);
+    assert!(tracked_dns.is_some());
 }
 
 #[tokio::test]

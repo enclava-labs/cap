@@ -249,18 +249,6 @@ pub struct VerifyResponse {
     pub verified_at: chrono::DateTime<Utc>,
 }
 
-/// A challenge is past its usable window only while ownership is still
-/// unproven. Once `verified_at` is set the TXT check already succeeded, so
-/// expiry no longer blocks applying the domain on a later attempt (e.g. a
-/// retry that hit an app-mutation-busy 409 after persisting verification).
-fn challenge_past_expiry(
-    verified_at: Option<chrono::DateTime<Utc>>,
-    expires_at: chrono::DateTime<Utc>,
-    now: chrono::DateTime<Utc>,
-) -> bool {
-    verified_at.is_none() && now > expires_at
-}
-
 /// POST /apps/{name}/domains/{domain}/verify -- verify a published TXT record.
 pub async fn verify_challenge(
     auth: AuthContext,
@@ -316,43 +304,51 @@ pub async fn verify_challenge(
         )
     })?;
 
-    if challenge_past_expiry(verified_at, expires_at, Utc::now()) {
-        let e = DomainError::Expired;
-        return Err((
-            e.status(),
-            Json(serde_json::json!({"error": e.to_string()})),
-        ));
-    }
-
-    let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
-    let expected = format!("enclava-domain-verification={token}");
-
-    let live = lookup_txt(&txt_name).await.map_err(|e| {
-        let de = DomainError::Lookup(e.to_string());
-        (
-            de.status(),
-            Json(serde_json::json!({"error": de.to_string()})),
-        )
-    })?;
-
-    let mut matched = false;
-    for value in &live {
-        if value.as_bytes().ct_eq(expected.as_bytes()).into() {
-            matched = true;
-            break;
-        }
-    }
-    if !matched {
-        let e = DomainError::MismatchedToken(txt_name);
-        return Err((
-            e.status(),
-            Json(serde_json::json!({"error": e.to_string()})),
-        ));
-    }
-
+    // `verified_at` is durable proof of ownership: once a challenge has been
+    // verified, a same-key idempotent retry applies the domain without
+    // re-checking the challenge. `expires_at` bounds only the *initial*
+    // verification window; it does not invalidate an already-captured proof.
+    // This lets a verify that was cancelled/deferred by an app-mutation-busy
+    // conflict complete on retry even after the challenge expired or the TXT
+    // record was removed. Cross-app theft of a re-registered domain is still
+    // blocked downstream by the `dns_records.UNIQUE(hostname)` constraint.
     let verified_at = if let Some(verified_at) = verified_at {
         verified_at
     } else {
+        if Utc::now() > expires_at {
+            let e = DomainError::Expired;
+            return Err((
+                e.status(),
+                Json(serde_json::json!({"error": e.to_string()})),
+            ));
+        }
+
+        let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
+        let expected = format!("enclava-domain-verification={token}");
+
+        let live = lookup_txt(&txt_name).await.map_err(|e| {
+            let de = DomainError::Lookup(e.to_string());
+            (
+                de.status(),
+                Json(serde_json::json!({"error": de.to_string()})),
+            )
+        })?;
+
+        let mut matched = false;
+        for value in &live {
+            if value.as_bytes().ct_eq(expected.as_bytes()).into() {
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            let e = DomainError::MismatchedToken(txt_name);
+            return Err((
+                e.status(),
+                Json(serde_json::json!({"error": e.to_string()})),
+            ));
+        }
+
         let verified_at = Utc::now();
         sqlx::query("UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2")
             .bind(verified_at)
@@ -854,30 +850,5 @@ mod tests {
                 "expected invalid for {bad:?}"
             );
         }
-    }
-
-    #[test]
-    fn verified_challenge_is_not_past_expiry_even_when_expired() {
-        // Ownership was proven (verified_at set); a retry that arrives after
-        // the challenge clock expired must still apply, not terminalize as
-        // "challenge has expired".
-        let now = Utc::now();
-        let expires_at = now - Duration::minutes(5);
-        let verified_at = Some(expires_at - Duration::minutes(1));
-        assert!(!challenge_past_expiry(verified_at, expires_at, now));
-    }
-
-    #[test]
-    fn unverified_challenge_past_expiry_is_refused() {
-        let now = Utc::now();
-        let expires_at = now - Duration::minutes(5);
-        assert!(challenge_past_expiry(None, expires_at, now));
-    }
-
-    #[test]
-    fn unverified_challenge_not_yet_expired_is_accepted() {
-        let now = Utc::now();
-        let expires_at = now + Duration::minutes(5);
-        assert!(!challenge_past_expiry(None, expires_at, now));
     }
 }
