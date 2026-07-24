@@ -316,45 +316,40 @@ pub async fn verify_challenge(
         ));
     }
 
-    // An unverified challenge must prove current DNS control with a live TXT
-    // lookup. A challenge that already holds `verified_at` (written inside the
-    // apply transaction on a prior successful verify) keeps standing within the
-    // window, so the lookup is not repeated. `verified_at` is NOT persisted
-    // here: it is written inside the apply transaction below, after the lease
-    // and CAS guard, so a Busy lease or an authority mismatch leaves no stranded
-    // proof (the timestamp and the `apps.custom_domain` write commit or roll
-    // back together).
+    // Every verify re-proves current DNS control with a live TXT lookup -- a
+    // captured `verified_at` does not bypass it. The lookup runs before the
+    // app-mutation lease is claimed so the lease is never held across DNS; a
+    // lookup failure returns without ever claiming it. `verified_at` is not
+    // persisted here -- it is written inside the apply transaction below, after
+    // the CAS guard, so persist + apply commit or roll back together.
+    let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
+    let expected = format!("enclava-domain-verification={token}");
+    let live = lookup_txt(&txt_name).await.map_err(|e| {
+        let de = DomainError::Lookup(e.to_string());
+        (
+            de.status(),
+            Json(serde_json::json!({"error": de.to_string()})),
+        )
+    })?;
+    let mut matched = false;
+    for value in &live {
+        if value.as_bytes().ct_eq(expected.as_bytes()).into() {
+            matched = true;
+            break;
+        }
+    }
+    if !matched {
+        let e = DomainError::MismatchedToken(txt_name);
+        return Err((
+            e.status(),
+            Json(serde_json::json!({"error": e.to_string()})),
+        ));
+    }
+    // Reuse the captured timestamp or stage a new one; it is persisted inside
+    // the apply transaction below.
     let (verified_at, needs_persist) = match verified_at {
         Some(verified_at) => (verified_at, false),
-        None => {
-            let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
-            let expected = format!("enclava-domain-verification={token}");
-
-            let live = lookup_txt(&txt_name).await.map_err(|e| {
-                let de = DomainError::Lookup(e.to_string());
-                (
-                    de.status(),
-                    Json(serde_json::json!({"error": de.to_string()})),
-                )
-            })?;
-
-            let mut matched = false;
-            for value in &live {
-                if value.as_bytes().ct_eq(expected.as_bytes()).into() {
-                    matched = true;
-                    break;
-                }
-            }
-            if !matched {
-                let e = DomainError::MismatchedToken(txt_name);
-                return Err((
-                    e.status(),
-                    Json(serde_json::json!({"error": e.to_string()})),
-                ));
-            }
-
-            (Utc::now(), true)
-        }
+        None => (Utc::now(), true),
     };
 
     // Domain mutation follows the same queue order as deployment apply:
@@ -402,6 +397,7 @@ pub async fn verify_challenge(
             &app.namespace,
         ))
         .ok_or_else(internal_error)?;
+
     let mut app_lane = state.db.begin().await.map_err(|_| internal_error())?;
     crate::entitlements::lock_org_entitlement_lane(&mut app_lane, auth.org_id)
         .await
