@@ -1496,20 +1496,25 @@ async fn finish_idempotent_request(
 ///
 /// The whitelist holds only the two genuine busy-lease families (the lane
 /// claim fails before the handler body runs; `?`-propagated busy errors roll
-/// back an uncommitted transaction) plus the in-flight-generation guard — all
-/// emitted before the handler commits, so a same-key retry can succeed:
+/// back an uncommitted transaction) plus two in-flight-operation guards —
+/// all emitted before the handler commits, so a same-key retry can succeed:
 /// - `MutationLeaseError::Busy` -> `"app mutation already in progress"`
 ///   (`apps.rs`, `domains.rs`).
 /// - `SupersedeDeploymentError::Busy` -> the three
 ///   `"deployment mutation is still in progress"` variants (`deployments.rs`,
 ///   `rollback.rs`, `unlock.rs`, `apps.rs`).
-/// - `"current deployment generation is still in progress"` (`unlock.rs`).
+/// - `"current deployment generation is still in progress"` (`unlock.rs`) and
+///   `"an earlier deployment is still completing setup; retry after setup is
+///   reconciled"` (`deployments.rs`, `rollback.rs`) — a prior rollout / DNS
+///   setup job is mid-flight; both re-check a precondition (not
+///   effect-determining state), so a retry proceeds once it reconciles.
 const TRANSIENT_RETRY_CONFLICT_MESSAGES: &[&str] = &[
     "app mutation already in progress",
     "deployment mutation is still in progress",
     "deployment mutation is still in progress; retry after its lease completes",
     "deployment mutation is still in progress; retry rollback",
     "current deployment generation is still in progress",
+    "an earlier deployment is still completing setup; retry after setup is reconciled",
 ];
 
 fn is_transient_retry_conflict(status: StatusCode, body: &serde_json::Value) -> bool {
@@ -7832,7 +7837,7 @@ mod tests {
         let messages: Vec<&str> = TRANSIENT_RETRY_CONFLICT_MESSAGES.to_vec();
         assert_eq!(
             messages.len(),
-            5,
+            6,
             "whitelist drift: update this count when editing the constant"
         );
         for (i, message) in messages.iter().enumerate() {
@@ -7917,7 +7922,6 @@ mod tests {
             "custom domain authority changed",
             "app deployment inputs changed while deployment was validating; retry the deployment",
             "app metadata changed while deployment was validating; retry the deployment",
-            "an earlier deployment is still completing setup; retry after setup is reconciled",
             "app resource authority changed; retry deletion",
             "app deletion is in progress",
             "rollback target changed while validating; retry the rollback",
