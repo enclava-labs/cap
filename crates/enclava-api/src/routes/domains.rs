@@ -249,23 +249,6 @@ pub struct VerifyResponse {
     pub verified_at: chrono::DateTime<Utc>,
 }
 
-/// A captured proof (`verified_at`) is durable only within the challenge's own
-/// window: `expires_at` bounds how long a prior verification stands on its own
-/// (migration 0014: "`expires_at` bounds the window for the proof"). Within the
-/// window a same-key retry applies without re-checking the TXT record — this
-/// lets a verify that was cancelled/deferred by an app-mutation-busy conflict
-/// complete on retry even if the TXT record was removed or DNS flaked. Past
-/// the window the proof no longer stands alone and the live lookup runs again,
-/// so attaching a hostname always requires current DNS control within the proof
-/// window.
-fn proof_is_durable(
-    verified_at: Option<chrono::DateTime<Utc>>,
-    expires_at: chrono::DateTime<Utc>,
-    now: chrono::DateTime<Utc>,
-) -> bool {
-    verified_at.is_some() && now <= expires_at
-}
-
 /// POST /apps/{name}/domains/{domain}/verify -- verify a published TXT record.
 pub async fn verify_challenge(
     auth: AuthContext,
@@ -321,22 +304,29 @@ pub async fn verify_challenge(
         )
     })?;
 
-    let now = Utc::now();
-    let verified_at = match (verified_at, proof_is_durable(verified_at, expires_at, now)) {
-        // Verified and still within the proof window: durable — apply without
-        // re-checking the TXT record.
-        (Some(verified_at), true) => verified_at,
-        // Otherwise the live TXT proof runs: a first-time verification, or a
-        // verified-but-expired challenge re-proving current DNS control.
-        (prior, _) => {
-            if prior.is_none() && now > expires_at {
-                let e = DomainError::Expired;
-                return Err((
-                    e.status(),
-                    Json(serde_json::json!({"error": e.to_string()})),
-                ));
-            }
+    // Expiry is absolute: a challenge past `expires_at` is refused whether or
+    // not ownership was previously proven (migration 0014: "`expires_at` bounds
+    // the window for the proof"). The live TXT lookup is not run, so an expired
+    // challenge never re-contacts DNS.
+    if Utc::now() > expires_at {
+        let e = DomainError::Expired;
+        return Err((
+            e.status(),
+            Json(serde_json::json!({"error": e.to_string()})),
+        ));
+    }
 
+    // An unverified challenge must prove current DNS control with a live TXT
+    // lookup. A challenge that already holds `verified_at` (written inside the
+    // apply transaction on a prior successful verify) keeps standing within the
+    // window, so the lookup is not repeated. `verified_at` is NOT persisted
+    // here: it is written inside the apply transaction below, after the lease
+    // and CAS guard, so a Busy lease or an authority mismatch leaves no stranded
+    // proof (the timestamp and the `apps.custom_domain` write commit or roll
+    // back together).
+    let (verified_at, needs_persist) = match verified_at {
+        Some(verified_at) => (verified_at, false),
+        None => {
             let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
             let expected = format!("enclava-domain-verification={token}");
 
@@ -363,23 +353,7 @@ pub async fn verify_challenge(
                 ));
             }
 
-            match prior {
-                // Verified but expired: the fresh TXT match re-proved current
-                // DNS control; keep the original proof timestamp.
-                Some(verified_at) => verified_at,
-                None => {
-                    let verified_at = Utc::now();
-                    sqlx::query(
-                        "UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2",
-                    )
-                    .bind(verified_at)
-                    .bind(challenge_id)
-                    .execute(&state.db)
-                    .await
-                    .map_err(|_| internal_error())?;
-                    verified_at
-                }
-            }
+            (Utc::now(), true)
         }
     };
 
@@ -466,6 +440,20 @@ pub async fn verify_challenge(
         ));
     };
     app = current_app;
+
+    // Persist the verification timestamp inside the apply transaction, after
+    // the lease and the CAS guard. A Busy lease or an authority mismatch
+    // returns above, so a proof can never be persisted without its apply:
+    // `verified_at` and the `apps.custom_domain` write commit or roll back
+    // together in `app_lane`.
+    if needs_persist {
+        sqlx::query("UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2")
+            .bind(verified_at)
+            .bind(challenge_id)
+            .execute(&mut *app_lane)
+            .await
+            .map_err(|_| internal_error())?;
+    }
 
     mutation
         .guard_provider(crate::dns::record_custom_domain(&state.db, app.id, &domain))
@@ -874,38 +862,5 @@ mod tests {
                 "expected invalid for {bad:?}"
             );
         }
-    }
-
-    #[test]
-    fn verified_within_window_is_durable() {
-        let now = Utc::now();
-        let expires_at = now + Duration::hours(1);
-        let verified_at = Some(now - Duration::minutes(30));
-        assert!(proof_is_durable(verified_at, expires_at, now));
-    }
-
-    #[test]
-    fn verified_at_exact_expiry_is_durable() {
-        // Boundary is inclusive: a retry landing exactly at expiry still uses
-        // the captured proof.
-        let now = Utc::now();
-        let verified_at = Some(now - Duration::minutes(30));
-        assert!(proof_is_durable(verified_at, now, now));
-    }
-
-    #[test]
-    fn verified_past_window_is_not_durable() {
-        let now = Utc::now();
-        let expires_at = now - Duration::hours(1);
-        let verified_at = Some(now - Duration::hours(2));
-        assert!(!proof_is_durable(verified_at, expires_at, now));
-    }
-
-    #[test]
-    fn unverified_is_never_durable() {
-        let now = Utc::now();
-        // Within the window and past it alike: no captured proof, no durability.
-        assert!(!proof_is_durable(None, now + Duration::hours(1), now));
-        assert!(!proof_is_durable(None, now - Duration::hours(1), now));
     }
 }

@@ -1956,12 +1956,11 @@ async fn paas_internal_app_logs_fail_closed_after_actor_validation() {
 }
 
 #[tokio::test]
-async fn custom_domain_verified_challenge_applies_within_window() {
-    // Within the proof window (`expires_at`), a captured `verified_at` is
-    // durable: a same-key retry applies without re-checking the TXT record.
-    // This env has no DNS, so a live lookup would fail with 502 -- a 200 here
-    // proves the lookup was skipped. This is the busy-cancelled-then-retried
-    // path: the first verify persisted `verified_at`, so the retry must apply.
+async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
+    // Expiry is absolute: a challenge past `expires_at` is refused even when
+    // `verified_at` was already captured, and the live TXT lookup never runs
+    // (this env has no DNS, so a 409 -- not a 502 -- proves the lookup was
+    // skipped). No domain is attached and no DNS record is tracked.
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);
@@ -1993,8 +1992,8 @@ async fn custom_domain_verified_challenge_applies_within_window() {
     .bind(app_id)
     .bind(&domain)
     .bind("historically-valid-token")
-    .bind(Utc::now() + Duration::hours(1))
     .bind(Utc::now() - Duration::hours(1))
+    .bind(Utc::now() - Duration::hours(2))
     .execute(&pool)
     .await
     .expect("insert stale verified domain challenge");
@@ -2004,9 +2003,9 @@ async fn custom_domain_verified_challenge_applies_within_window() {
         .add_header("x-forwarded-for", "127.0.0.1")
         .authorization_bearer(&session_token)
         .await;
-    verify.assert_status(StatusCode::OK);
+    verify.assert_status(StatusCode::CONFLICT);
     let body: Value = verify.json();
-    assert_eq!(body["domain"], domain);
+    assert_eq!(body["error"], "challenge has expired");
 
     let custom_domain: Option<String> =
         sqlx::query_scalar("SELECT custom_domain FROM apps WHERE id = $1")
@@ -2014,7 +2013,7 @@ async fn custom_domain_verified_challenge_applies_within_window() {
             .fetch_one(&pool)
             .await
             .expect("load app custom domain");
-    assert_eq!(custom_domain.as_deref(), Some(domain.as_str()));
+    assert_eq!(custom_domain, None);
 
     let tracked_dns: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM dns_records WHERE app_id = $1 AND hostname = $2")
@@ -2023,6 +2022,162 @@ async fn custom_domain_verified_challenge_applies_within_window() {
             .fetch_optional(&pool)
             .await
             .expect("load tracked custom DNS row");
+    assert_eq!(tracked_dns, None);
+}
+
+#[tokio::test]
+async fn custom_domain_verify_busy_lease_persists_nothing_then_applies() {
+    // A verify that hits an app-mutation-busy conflict must persist nothing: no
+    // `custom_domain`, no DNS record. Clearing the lease lets a retry apply.
+    // The challenge is planted verified and within its window so the live TXT
+    // lookup is skipped (no DNS in this env) and the request reaches the lease
+    // claim -- the boundary the fix moves `verified_at` persistence behind.
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("busy-{}", &suffix[..12]);
+    let domain = format!("busy-{}.example.com", &suffix[..12]);
+    let (session_token, _org_id) = signup_owner(&server, "domain-busy").await;
+
+    let create = server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await;
+    create.assert_status(StatusCode::CREATED);
+    let create_body: Value = create.json();
+    let app_id = Uuid::parse_str(create_body["id"].as_str().expect("app id")).unwrap();
+
+    // Postgres `timestamptz` stores microsecond precision; truncate the
+    // planted value so the round-trip through the DB compares exactly.
+    let planted_verified_at = chrono::DateTime::from_timestamp_micros(
+        (Utc::now() - Duration::hours(1)).timestamp_micros(),
+    )
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO custom_domain_challenges (
+             id, app_id, domain, challenge_token, expires_at, verified_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(app_id)
+    .bind(&domain)
+    .bind("historically-valid-token")
+    .bind(Utc::now() + Duration::hours(1))
+    .bind(planted_verified_at)
+    .execute(&pool)
+    .await
+    .expect("insert verified in-window domain challenge");
+
+    // Hold the app-mutation lease so the verify's claim returns Busy. `claim`
+    // reuses a row whose `owner_token` is set and whose `reclaim_after` has not
+    // elapsed, so plant exactly that shape.
+    sqlx::query(
+        "INSERT INTO app_mutation_leases
+             (app_id, generation, owner_token, operation_kind, operation_id,
+              locked_until, reclaim_after)
+         VALUES ($1, 1, $2, 'planted_busy', $3,
+                 clock_timestamp() + interval '60 seconds',
+                 clock_timestamp() + interval '120 seconds')
+         ON CONFLICT (app_id) DO UPDATE SET
+             generation = app_mutation_leases.generation + 1,
+             owner_token = EXCLUDED.owner_token,
+             operation_kind = EXCLUDED.operation_kind,
+             operation_id = EXCLUDED.operation_id,
+             locked_until = EXCLUDED.locked_until,
+             reclaim_after = EXCLUDED.reclaim_after,
+             updated_at = clock_timestamp()",
+    )
+    .bind(app_id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("plant busy app mutation lease");
+
+    let verify = server
+        .post(&format!("/apps/{app_name}/domains/{domain}/verify"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    verify.assert_status(StatusCode::CONFLICT);
+    let body: Value = verify.json();
+    assert_eq!(body["error"], "app mutation already in progress");
+
+    // Nothing was applied: no custom domain, no DNS record, and the planted
+    // proof was not touched.
+    let custom_domain: Option<String> =
+        sqlx::query_scalar("SELECT custom_domain FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app custom domain");
+    assert_eq!(custom_domain, None);
+
+    let tracked_dns: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM dns_records WHERE app_id = $1 AND hostname = $2")
+            .bind(app_id)
+            .bind(&domain)
+            .fetch_optional(&pool)
+            .await
+            .expect("load tracked custom DNS row");
+    assert!(tracked_dns.is_none());
+
+    let verified_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT verified_at FROM custom_domain_challenges WHERE app_id = $1 AND domain = $2",
+    )
+    .bind(app_id)
+    .bind(&domain)
+    .fetch_one(&pool)
+    .await
+    .expect("load verified_at");
+    assert_eq!(verified_at, Some(planted_verified_at));
+
+    // Release the lease and retry: the same challenge now applies.
+    sqlx::query(
+        "UPDATE app_mutation_leases
+            SET owner_token = NULL,
+                operation_kind = NULL,
+                operation_id = NULL,
+                locked_until = NULL,
+                reclaim_after = NULL
+          WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .execute(&pool)
+    .await
+    .expect("release planted app mutation lease");
+
+    let retry = server
+        .post(&format!("/apps/{app_name}/domains/{domain}/verify"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    retry.assert_status(StatusCode::OK);
+    let retry_body: Value = retry.json();
+    assert_eq!(retry_body["domain"], domain);
+
+    let custom_domain: Option<String> =
+        sqlx::query_scalar("SELECT custom_domain FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app custom domain after retry");
+    assert_eq!(custom_domain.as_deref(), Some(domain.as_str()));
+
+    let tracked_dns: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM dns_records WHERE app_id = $1 AND hostname = $2")
+            .bind(app_id)
+            .bind(&domain)
+            .fetch_optional(&pool)
+            .await
+            .expect("load tracked custom DNS row after retry");
     assert!(tracked_dns.is_some());
 }
 
