@@ -1956,13 +1956,12 @@ async fn paas_internal_app_logs_fail_closed_after_actor_validation() {
 }
 
 #[tokio::test]
-async fn custom_domain_verified_challenge_applies_after_expiry() {
-    // `verified_at` is durable proof of ownership: a verified challenge applies
-    // on a same-key retry even after the challenge expired and the TXT record
-    // is gone (this env has no DNS, so a live lookup would fail). This is the
-    // busy-cancelled-then-retried path -- the first verify persisted
-    // `verified_at`, so the retry must apply, not terminalize as
-    // "challenge has expired".
+async fn custom_domain_verified_challenge_applies_within_window() {
+    // Within the proof window (`expires_at`), a captured `verified_at` is
+    // durable: a same-key retry applies without re-checking the TXT record.
+    // This env has no DNS, so a live lookup would fail with 502 -- a 200 here
+    // proves the lookup was skipped. This is the busy-cancelled-then-retried
+    // path: the first verify persisted `verified_at`, so the retry must apply.
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);
@@ -1994,8 +1993,8 @@ async fn custom_domain_verified_challenge_applies_after_expiry() {
     .bind(app_id)
     .bind(&domain)
     .bind("historically-valid-token")
+    .bind(Utc::now() + Duration::hours(1))
     .bind(Utc::now() - Duration::hours(1))
-    .bind(Utc::now() - Duration::hours(2))
     .execute(&pool)
     .await
     .expect("insert stale verified domain challenge");

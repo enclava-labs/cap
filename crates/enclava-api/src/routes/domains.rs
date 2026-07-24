@@ -249,6 +249,23 @@ pub struct VerifyResponse {
     pub verified_at: chrono::DateTime<Utc>,
 }
 
+/// A captured proof (`verified_at`) is durable only within the challenge's own
+/// window: `expires_at` bounds how long a prior verification stands on its own
+/// (migration 0014: "`expires_at` bounds the window for the proof"). Within the
+/// window a same-key retry applies without re-checking the TXT record — this
+/// lets a verify that was cancelled/deferred by an app-mutation-busy conflict
+/// complete on retry even if the TXT record was removed or DNS flaked. Past
+/// the window the proof no longer stands alone and the live lookup runs again,
+/// so attaching a hostname always requires current DNS control within the proof
+/// window.
+fn proof_is_durable(
+    verified_at: Option<chrono::DateTime<Utc>>,
+    expires_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    verified_at.is_some() && now <= expires_at
+}
+
 /// POST /apps/{name}/domains/{domain}/verify -- verify a published TXT record.
 pub async fn verify_challenge(
     auth: AuthContext,
@@ -304,59 +321,66 @@ pub async fn verify_challenge(
         )
     })?;
 
-    // `verified_at` is durable proof of ownership: once a challenge has been
-    // verified, a same-key idempotent retry applies the domain without
-    // re-checking the challenge. `expires_at` bounds only the *initial*
-    // verification window; it does not invalidate an already-captured proof.
-    // This lets a verify that was cancelled/deferred by an app-mutation-busy
-    // conflict complete on retry even after the challenge expired or the TXT
-    // record was removed. Cross-app theft of a re-registered domain is still
-    // blocked downstream by the `dns_records.UNIQUE(hostname)` constraint.
-    let verified_at = if let Some(verified_at) = verified_at {
-        verified_at
-    } else {
-        if Utc::now() > expires_at {
-            let e = DomainError::Expired;
-            return Err((
-                e.status(),
-                Json(serde_json::json!({"error": e.to_string()})),
-            ));
-        }
+    let now = Utc::now();
+    let verified_at = match (verified_at, proof_is_durable(verified_at, expires_at, now)) {
+        // Verified and still within the proof window: durable — apply without
+        // re-checking the TXT record.
+        (Some(verified_at), true) => verified_at,
+        // Otherwise the live TXT proof runs: a first-time verification, or a
+        // verified-but-expired challenge re-proving current DNS control.
+        (prior, _) => {
+            if prior.is_none() && now > expires_at {
+                let e = DomainError::Expired;
+                return Err((
+                    e.status(),
+                    Json(serde_json::json!({"error": e.to_string()})),
+                ));
+            }
 
-        let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
-        let expected = format!("enclava-domain-verification={token}");
+            let txt_name = format!("{CHALLENGE_PREFIX}{domain}");
+            let expected = format!("enclava-domain-verification={token}");
 
-        let live = lookup_txt(&txt_name).await.map_err(|e| {
-            let de = DomainError::Lookup(e.to_string());
-            (
-                de.status(),
-                Json(serde_json::json!({"error": de.to_string()})),
-            )
-        })?;
+            let live = lookup_txt(&txt_name).await.map_err(|e| {
+                let de = DomainError::Lookup(e.to_string());
+                (
+                    de.status(),
+                    Json(serde_json::json!({"error": de.to_string()})),
+                )
+            })?;
 
-        let mut matched = false;
-        for value in &live {
-            if value.as_bytes().ct_eq(expected.as_bytes()).into() {
-                matched = true;
-                break;
+            let mut matched = false;
+            for value in &live {
+                if value.as_bytes().ct_eq(expected.as_bytes()).into() {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                let e = DomainError::MismatchedToken(txt_name);
+                return Err((
+                    e.status(),
+                    Json(serde_json::json!({"error": e.to_string()})),
+                ));
+            }
+
+            match prior {
+                // Verified but expired: the fresh TXT match re-proved current
+                // DNS control; keep the original proof timestamp.
+                Some(verified_at) => verified_at,
+                None => {
+                    let verified_at = Utc::now();
+                    sqlx::query(
+                        "UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2",
+                    )
+                    .bind(verified_at)
+                    .bind(challenge_id)
+                    .execute(&state.db)
+                    .await
+                    .map_err(|_| internal_error())?;
+                    verified_at
+                }
             }
         }
-        if !matched {
-            let e = DomainError::MismatchedToken(txt_name);
-            return Err((
-                e.status(),
-                Json(serde_json::json!({"error": e.to_string()})),
-            ));
-        }
-
-        let verified_at = Utc::now();
-        sqlx::query("UPDATE custom_domain_challenges SET verified_at = $1 WHERE id = $2")
-            .bind(verified_at)
-            .bind(challenge_id)
-            .execute(&state.db)
-            .await
-            .map_err(|_| internal_error())?;
-        verified_at
     };
 
     // Domain mutation follows the same queue order as deployment apply:
@@ -850,5 +874,38 @@ mod tests {
                 "expected invalid for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn verified_within_window_is_durable() {
+        let now = Utc::now();
+        let expires_at = now + Duration::hours(1);
+        let verified_at = Some(now - Duration::minutes(30));
+        assert!(proof_is_durable(verified_at, expires_at, now));
+    }
+
+    #[test]
+    fn verified_at_exact_expiry_is_durable() {
+        // Boundary is inclusive: a retry landing exactly at expiry still uses
+        // the captured proof.
+        let now = Utc::now();
+        let verified_at = Some(now - Duration::minutes(30));
+        assert!(proof_is_durable(verified_at, now, now));
+    }
+
+    #[test]
+    fn verified_past_window_is_not_durable() {
+        let now = Utc::now();
+        let expires_at = now - Duration::hours(1);
+        let verified_at = Some(now - Duration::hours(2));
+        assert!(!proof_is_durable(verified_at, expires_at, now));
+    }
+
+    #[test]
+    fn unverified_is_never_durable() {
+        let now = Utc::now();
+        // Within the window and past it alike: no captured proof, no durability.
+        assert!(!proof_is_durable(None, now + Duration::hours(1), now));
+        assert!(!proof_is_durable(None, now - Duration::hours(1), now));
     }
 }
