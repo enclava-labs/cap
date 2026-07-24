@@ -1475,82 +1475,51 @@ async fn finish_idempotent_request(
 /// — FailClosed included — instead of being terminalized as recovery-required
 /// or replaying a stale conflict forever.
 ///
-/// A conflict qualifies when, on a `409`, the `error` string:
-/// - contains `"in progress"` — the two busy families (a lane claim that
-///   failed before the handler body ran): `MutationLeaseError::Busy` ->
-///   `"app mutation already in progress"` (`apps.rs`, `domains.rs` — claim
-///   sites; `create_app` runs a compensation that deletes the pristine row
-///   first) and `SupersedeDeploymentError::Busy` -> `"deployment mutation is
-///   still in progress"` (+ the `"; retry after its lease completes"` /
-///   `"; retry rollback"` variants; `deployments.rs`, `unlock.rs`,
-///   `rollback.rs`, `apps.rs` — `?`-propagated from an uncommitted
-///   transaction that rolls back); plus the setup guard `"current
-///   deployment generation is still in progress"` (`unlock.rs`).
-/// - contains `"retry"` — the deploy/rollback/unlock CAS guards whose
-///   uncommitted transaction rolled back: `"app deployment inputs changed
-///   while deployment was validating; retry the deployment"`, `"app metadata
-///   changed while deployment was validating; retry the deployment"`, `"an
-///   earlier deployment is still completing setup; retry after setup is
-///   reconciled"` (`deployments.rs`, `rollback.rs`), `"app resource
-///   authority changed; retry deletion"` (`apps.rs` — commits only the
-///   lease-release compensation, not the delete), and the rollback/unlock
-///   `"... while validating; retry the rollback"` / `"... while unlock mode
-///   transition was validating; retry"` families.
-/// - contains `"authority changed"` — the verify-path domains CAS guard
-///   `"app authority changed"` (`domains.rs` — commits only the lease-release
-///   compensation; the record it guards has not run, and a same-key retry
-///   re-reads fresh state, so it can succeed).
+/// Classification is an **exact-match whitelist**: a `409` cancels only when
+/// its `error` string is byte-equal to an entry in
+/// [`TRANSIENT_RETRY_CONFLICT_MESSAGES`]; every other `409` defaults to
+/// terminal (stamped `completed` and cached). This replaces the former
+/// substring inference (`"in progress"` / `"retry"` / `"authority changed"`),
+/// which mis-classified deterministically-terminal conflicts as retryable.
 ///
-/// Substring checks are case-sensitive: every CAP `error` string is lowercase,
-/// and matching on the lowercase literal keeps a hypothetical capitalized
-/// permanent from matching by accident. The full `409` space across all
-/// wrapped routes was enumerated to confirm no *permanent* `409` carries any
-/// of these substrings (name/external_id/keyring/entitlement duplicates,
-/// `dns_hostname_in_use`, `invalid unlock mode transition`, `replayed
-/// transition_receipt`, `app deletion phase is invalid`, `app signer identity
-///   is incomplete`, the rollback target shape guards, etc.).
+/// Those substrings also appear on conflicts a same-key retry *always*
+/// re-fails, so cancelling/re-running them would spin or replay a stale
+/// block (now all terminal-by-default):
+/// - CAS-guard `"... changed while ...; retry ..."` families (deploy/rollback/
+///   unlock inputs, metadata, runtime, generation, target, resource-authority)
+///   read divergent state under a lane lock — a same-key retry re-reads the
+///   same divergence.
+/// - `"app authority changed"` / `"custom domain authority changed"`
+///   (`domains.rs` CAS guards) re-fail on a same-key retry.
+/// - `"app deletion is in progress"` is a one-way status — a retry re-sees it
+///   or the app `404`s.
 ///
-/// Deliberately **not** matched (kept stamp-completed), even though they are
-/// `409`s on wrapped-adjacent routes:
-/// - `"app deletion is in progress"` (`deployments.rs`, `unlock.rs`,
-///   `rollback.rs`) is terminal: `deleting` is a one-way status, so a same-key
-///   retry either re-sees it or the app `404`s — it never succeeds. (Were the
-///   name later recreated, a deferred intent could even run against a
-///   different app.) It carries `"in progress"`, so it is excluded by exact
-///   match before the substring checks below.
-/// - `"custom domain authority changed"` (`domains.rs`, `remove_custom_domain`)
-///   is terminal: the CAS guard runs under the app deployment lane lock, so it
-///   reads a stable state and a same-key retry re-reads the same divergence
-///   forever. It carries `"authority changed"`, so it is excluded by exact
-///   match before the substring checks below. (Contrast `"app authority
-///   changed"` on the verify path, which stays transient because a retry
-///   re-reads fresh state.)
-/// - `"app creation was superseded"` (`apps.rs`) is emitted *after* a DNS
-///   provider side effect, so the outcome is genuinely ambiguous — deferring
-///   it would risk a duplicate provider mutation on retry. (The internal
-///   `create_paas_app` path does its own `INSERT` and never reaches it; it is
-///   documented here as the canonical example of why "looks transient" is not
-///   enough — a pre-return side effect disqualifies a conflict from cancel.)
-/// - `"app signer authority is unavailable"` (`apps.rs`, signer rotation)
-///   is a guard on a deleting app on the capability route; matching it would
-///   require heartbeat handling in the capability `Err` arm. It carries no
-///   matching substring regardless, so it stays stamp-completed automatically.
+/// The whitelist holds only the two genuine busy-lease families (the lane
+/// claim fails before the handler body runs; `?`-propagated busy errors roll
+/// back an uncommitted transaction) plus the in-flight-generation guard — all
+/// emitted before the handler commits, so a same-key retry can succeed:
+/// - `MutationLeaseError::Busy` -> `"app mutation already in progress"`
+///   (`apps.rs`, `domains.rs`).
+/// - `SupersedeDeploymentError::Busy` -> the three
+///   `"deployment mutation is still in progress"` variants (`deployments.rs`,
+///   `rollback.rs`, `unlock.rs`, `apps.rs`).
+/// - `"current deployment generation is still in progress"` (`unlock.rs`).
+const TRANSIENT_RETRY_CONFLICT_MESSAGES: &[&str] = &[
+    "app mutation already in progress",
+    "deployment mutation is still in progress",
+    "deployment mutation is still in progress; retry after its lease completes",
+    "deployment mutation is still in progress; retry rollback",
+    "current deployment generation is still in progress",
+];
+
 fn is_transient_retry_conflict(status: StatusCode, body: &serde_json::Value) -> bool {
-    let Some(message) = body.get("error").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
     if status != StatusCode::CONFLICT {
         return false;
     }
-    // Deterministically-terminal 409s whose same-key retry always re-fails (see
-    // the doc above). Both carry a transient substring, so exclude them by
-    // exact match before the substring checks.
-    if message == "app deletion is in progress" || message == "custom domain authority changed" {
+    let Some(message) = body.get("error").and_then(serde_json::Value::as_str) else {
         return false;
-    }
-    message.contains("in progress")
-        || message.contains("retry")
-        || message.contains("authority changed")
+    };
+    TRANSIENT_RETRY_CONFLICT_MESSAGES.contains(&message)
 }
 
 /// Stamp a durably-cached error body as a completed idempotent result. PaaS
@@ -7848,41 +7817,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_retry_and_authority_conflicts_cancel_and_re_execute() {
-        // The transient predicate covers every known-not-applied 409 that
-        // carries "in progress", "retry", or "authority changed": the
-        // deploy/rollback/unlock CAS guards (uncommitted tx rolled back) and
-        // the verify-path domains authority-CAS guard (only the lease-release
-        // compensation committed, not the guarded op). Each must cancel the
-        // reservation so a same-key retry re-executes, exactly like the busy
-        // families. The two deterministically-terminal 409s that also carry
-        // these substrings ("app deletion is in progress", "custom domain
-        // authority changed") are excluded and pinned in
+    async fn whitelisted_transients_cancel_and_re_execute() {
+        // The exact-match whitelist is the complete set of known-not-applied
+        // 409s that cancel the reservation so a same-key retry re-executes.
+        // Iterating the const pins the contract: add an entry here only by
+        // editing TRANSIENT_RETRY_CONFLICT_MESSAGES. Every former substring
+        // match ("... changed ...; retry", "authority changed", deletion) is
+        // now terminal and lives in
         // permanent_conflicts_are_stamped_completed_and_cached.
         let pool = database_test_pool().await;
         let state = idempotency_test_state(pool.clone());
         let suffix = Uuid::new_v4().simple().to_string();
         let hash = Sha256::digest(b"transient-retry-cancel-request").to_vec();
-        let messages = [
-            // contains "retry" -- deploy CAS guards (deployments.rs)
-            "app deployment inputs changed while deployment was validating; retry the deployment",
-            "app metadata changed while deployment was validating; retry the deployment",
-            "an earlier deployment is still completing setup; retry after setup is reconciled",
-            // contains "retry" -- apps.rs delete CAS (commits lease-release only)
-            "app resource authority changed; retry deletion",
-            // contains "retry" -- rollback CAS guards (rollback.rs)
-            "rollback target changed while validating; retry the rollback",
-            "rollback target authority changed; retry the rollback",
-            "app deployment inputs changed while rollback was validating; retry the rollback",
-            // contains "retry" -- unlock transition CAS guards (unlock.rs)
-            "app changed while unlock mode transition was validating; retry",
-            "deployment generation changed while unlock mode transition was validating; retry",
-            // contains "in progress" -- setup guard
-            "current deployment generation is still in progress",
-            // contains "authority changed" -- verify-path domains CAS guard
-            // (lease-release only; retry re-reads fresh state)
-            "app authority changed",
-        ];
+        let messages: Vec<&str> = TRANSIENT_RETRY_CONFLICT_MESSAGES.to_vec();
+        assert_eq!(
+            messages.len(),
+            5,
+            "whitelist drift: update this count when editing the constant"
+        );
         for (i, message) in messages.iter().enumerate() {
             let key = format!("transient-retry-cancel-{suffix}-{i}");
             let path = format!("/internal/test/transient-retry-cancel-{suffix}/{i}");
@@ -7900,7 +7852,7 @@ mod tests {
             .await;
             let deferred = complete_idempotent_result(lease, result)
                 .await
-                .expect_err("transient retry/authority 409 cancels and returns the deferred body");
+                .expect_err("whitelisted transient 409 cancels and returns the deferred body");
             assert_eq!(deferred.0, StatusCode::CONFLICT);
             assert_eq!(deferred.1["idempotency_disposition"], "deferred");
             assert_eq!(deferred.1["retryable"], true);
@@ -7915,7 +7867,7 @@ mod tests {
             .expect("inspect canceled row");
             assert_eq!(
                 count, 0,
-                "transient retry/authority 409 must cancel (delete) the reservation"
+                "whitelisted transient 409 must cancel (delete) the reservation"
             );
 
             // A same-key retry re-executes, never replays a cached conflict.
@@ -7933,20 +7885,21 @@ mod tests {
 
     #[tokio::test]
     async fn permanent_conflicts_are_stamped_completed_and_cached() {
-        // Negative space: the permanent 409s that share the wrapped routes are
-        // stamped completed and durably cached -- a same-key retry replays the
-        // cached body rather than re-executing. Most carry none of the
-        // transient substrings; the rest are deliberate exclusions. Two of
-        // those DO carry a transient substring yet are terminal because a
-        // same-key retry deterministically re-fails ("app deletion is in
-        // progress", "custom domain authority changed"); the others ("app
-        // creation was superseded", "app signer authority is unavailable") are
-        // excluded for side-effect / heartbeat reasons.
+        // Terminal-by-default: every 409 that is NOT on the exact-match
+        // whitelist is stamped completed and durably cached, so a same-key
+        // retry replays the cached body instead of re-executing. This pins the
+        // former substring matches ("... changed ...; retry", "authority
+        // changed", "app deletion is in progress", the setup-incomplete guard)
+        // as terminal -- a same-key retry deterministically re-fails them, so
+        // cancelling/re-running would spin or replay a stale block. A few
+        // ("app creation was superseded", "app signer authority is
+        // unavailable") are terminal for side-effect / heartbeat reasons.
         let pool = database_test_pool().await;
         let state = idempotency_test_state(pool.clone());
         let suffix = Uuid::new_v4().simple().to_string();
         let hash = Sha256::digest(b"permanent-conflict-stamp-request").to_vec();
         let messages = [
+            // duplicate / shape / state guards (never carried a transient substring):
             "app name already taken in this org",
             "deployment with external_id already exists in this org",
             "dns_hostname_in_use",
@@ -7956,11 +7909,23 @@ mod tests {
             "app signer identity is incomplete",
             "app creation was superseded",
             "app signer authority is unavailable",
-            // deterministically terminal despite carrying a transient substring:
-            "app deletion is in progress",
-            "custom domain authority changed",
             "rollback target has no valid immutable apply snapshot",
             "external_id already exists with different security.log_encryption",
+            // former substring matches, now correctly terminal (CAS-guard
+            // "changed"/"authority" + one-way deletion; same-key retry re-fails):
+            "app authority changed",
+            "custom domain authority changed",
+            "app deployment inputs changed while deployment was validating; retry the deployment",
+            "app metadata changed while deployment was validating; retry the deployment",
+            "an earlier deployment is still completing setup; retry after setup is reconciled",
+            "app resource authority changed; retry deletion",
+            "app deletion is in progress",
+            "rollback target changed while validating; retry the rollback",
+            "rollback target authority changed; retry the rollback",
+            "app deployment inputs changed while rollback was validating; retry the rollback",
+            "app changed while unlock mode transition was validating; retry",
+            "app runtime changed while unlock mode transition was validating; retry",
+            "deployment generation changed while unlock mode transition was validating; retry",
         ];
         for (i, message) in messages.iter().enumerate() {
             let key = format!("permanent-stamp-{suffix}-{i}");
