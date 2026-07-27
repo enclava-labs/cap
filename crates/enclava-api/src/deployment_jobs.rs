@@ -1552,10 +1552,10 @@ async fn reconcile_failed_rollout_cleanup(
         retained_resources.contains(&crate::mutation_leases::ResourceFence::kbs_policy());
     preflight.commit().await?;
 
-    // A missing KBS fence means the pre-upgrade worker already completed
-    // Trustee reconciliation before crashing. Standalone mode never enqueues
-    // signed-policy work and has no Trustee configuration, so it likewise
-    // releases the retained deployment authority without a provider call.
+    // A missing KBS fence means the pre-upgrade worker already completed this
+    // job's Trustee reconciliation before crashing. When KBS is not configured
+    // the atomic completion path below must additionally prove that no global
+    // signed-policy generation remains pending before releasing any authority.
     if kbs_retained && let Some(kbs_policy) = state.kbs_policy.as_ref() {
         crate::mutation_leases::guard_provider_with_runtime_authority(
             &state.db,
@@ -1574,6 +1574,7 @@ async fn reconcile_failed_rollout_cleanup(
         state.runtime_authority,
         job,
         &retained_resources,
+        state.kbs_policy.is_none(),
     )
     .await
 }
@@ -1583,6 +1584,7 @@ async fn complete_reconciled_rollout_cleanup(
     runtime_authority: crate::runtime_authority::RuntimeAuthority,
     job: &ClaimedJob,
     expected_resources: &[crate::mutation_leases::ResourceFence],
+    require_no_pending_signed_policy: bool,
 ) -> Result<(), DeploymentJobError> {
     // Clearing the retained provider generations and marking the durable job
     // complete are one transaction. A crash on either side leaves both for a
@@ -1593,6 +1595,9 @@ async fn complete_reconciled_rollout_cleanup(
     }
     crate::deploy::lock_app_deployment_lane(&mut tx, job.app_id).await?;
     lock_owned_rollout_cleanup_job(&mut tx, job).await?;
+    if require_no_pending_signed_policy {
+        crate::kbs::require_no_pending_signed_policy_in_tx(&mut tx).await?;
+    }
     crate::mutation_leases::release_reconciled_operation_in_tx(
         &mut tx,
         job.app_id,
@@ -4169,6 +4174,7 @@ mod tests {
             stale_authority,
             &retry,
             &expected_resources,
+            false,
         )
         .await
         .expect_err("pre-restore cleanup authority cannot release retained provider fences");
@@ -4184,6 +4190,7 @@ mod tests {
             crate::runtime_authority::TEST_RUNTIME_AUTHORITY,
             &crashed,
             &expected_resources,
+            false,
         )
         .await
         .expect_err("stale cleanup owner cannot release provider fences");
@@ -4251,6 +4258,319 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete failed-rollout cleanup fixture");
+    }
+
+    #[tokio::test]
+    async fn missing_kbs_config_retains_cleanup_until_signed_generation_is_applied() {
+        #[derive(sqlx::FromRow)]
+        struct ReconciliationSnapshot {
+            desired_generation: i64,
+            configmap_generation: i64,
+            applied_generation: i64,
+            configmap_policy_sha256: Option<Vec<u8>>,
+            applied_policy_sha256: Option<Vec<u8>>,
+            configmap_resource_version: Option<String>,
+        }
+
+        let pool = database_test_pool().await;
+        let original_reconciliation: ReconciliationSnapshot = sqlx::query_as(
+            "SELECT desired_generation, configmap_generation, applied_generation,
+                    configmap_policy_sha256, applied_policy_sha256,
+                    configmap_resource_version
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load original signed-policy reconciliation");
+        let applied_hash = vec![0x5a_u8; 32];
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 1,
+                    configmap_generation = 1,
+                    applied_generation = 1,
+                    configmap_policy_sha256 = $1,
+                    applied_policy_sha256 = $1,
+                    configmap_resource_version = 'pre-missing-config-test',
+                    updated_at = clock_timestamp()
+              WHERE singleton",
+        )
+        .bind(&applied_hash)
+        .execute(&pool)
+        .await
+        .expect("establish previously applied signed-policy authority");
+
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        state.kbs_policy = None;
+
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim missing-config setup")
+            .expect("missing-config setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept missing-config setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim missing-config apply")
+            .expect("missing-config apply exists");
+        let expected_resources = deployment_apply_resource_fences(&payload);
+        let mut mutation = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            expected_resources.clone(),
+        )
+        .await
+        .expect("claim missing-config mutation");
+        let manifest_hash = "missing-kbs-config-failed-rollout";
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = $2
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(manifest_hash)
+        .execute(&pool)
+        .await
+        .expect("stage missing-config rollout watcher");
+        publish_rollout_outcome_with_mutation(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "failed",
+                app_status: "failed",
+                error_code: Some("rollout_failed"),
+                terminal: true,
+                manifest_hash: manifest_hash.to_string(),
+            },
+            Some(&mut mutation),
+        )
+        .await
+        .expect("publish pending signed-policy revocation");
+        drop(mutation);
+
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET next_attempt_at = clock_timestamp() - interval '1 second'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("make missing-config cleanup due");
+        let cleanup = claim_job(
+            &pool,
+            "rollout_cleanup_pending",
+            "rollout_cleaning_up",
+            Some(deployment_id),
+        )
+        .await
+        .expect("claim missing-config cleanup")
+        .expect("missing-config cleanup exists");
+        let error = execute_rollout_cleanup_job(&state, &cleanup)
+            .await
+            .expect_err("pending signed-policy generation must fail closed without KBS config");
+        assert!(matches!(
+            error,
+            DeploymentJobError::Kbs(crate::kbs::KbsPolicyError::NotConfigured)
+        ));
+        requeue_rollout_cleanup_job(&pool, &cleanup, error.code())
+            .await
+            .expect("requeue missing-config cleanup");
+
+        let (
+            pending_state,
+            desired_generation,
+            applied_generation,
+            retained_app_owners,
+            retained_resource_owners,
+        ): (String, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT job.state,
+                    reconciliation.desired_generation,
+                    reconciliation.applied_generation,
+                    (
+                        SELECT count(*)
+                          FROM app_mutation_leases
+                         WHERE app_id = job.app_id
+                           AND owner_token IS NOT NULL
+                    ),
+                    (
+                        SELECT count(*)
+                          FROM external_resource_mutation_leases
+                         WHERE operation_kind = 'deployment_apply'
+                           AND operation_id = job.deployment_id
+                           AND owner_token IS NOT NULL
+                    )
+               FROM deployment_apply_jobs AS job
+               CROSS JOIN kbs_signed_policy_reconciliation AS reconciliation
+              WHERE job.deployment_id = $1
+                AND reconciliation.singleton",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load fail-closed missing-config state");
+        assert_eq!(pending_state, "rollout_cleanup_pending");
+        assert_eq!(desired_generation, 2);
+        assert_eq!(applied_generation, 1);
+        assert_eq!(retained_app_owners, 1);
+        assert_eq!(retained_resource_owners, expected_resources.len() as i64);
+
+        let reconciled_hash = vec![0x6b_u8; 32];
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET configmap_generation = desired_generation,
+                    applied_generation = desired_generation,
+                    configmap_policy_sha256 = $1,
+                    applied_policy_sha256 = $1,
+                    configmap_resource_version = 'reconciled-missing-config-test',
+                    updated_at = clock_timestamp()
+              WHERE singleton",
+        )
+        .bind(&reconciled_hash)
+        .execute(&pool)
+        .await
+        .expect("simulate externally completed signed-policy reconciliation");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET next_attempt_at = clock_timestamp() - interval '1 second'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("make reconciled cleanup due");
+        let reconciled = claim_job(
+            &pool,
+            "rollout_cleanup_pending",
+            "rollout_cleaning_up",
+            Some(deployment_id),
+        )
+        .await
+        .expect("claim reconciled cleanup")
+        .expect("reconciled cleanup exists");
+        execute_rollout_cleanup_job(&state, &reconciled)
+            .await
+            .expect("current signed generation permits no-provider authority release");
+        let completed: (String, i64, i64) = sqlx::query_as(
+            "SELECT job.state,
+                    (
+                        SELECT count(*)
+                          FROM app_mutation_leases
+                         WHERE app_id = job.app_id
+                           AND owner_token IS NOT NULL
+                    ),
+                    (
+                        SELECT count(*)
+                          FROM external_resource_mutation_leases
+                         WHERE operation_kind = 'deployment_apply'
+                           AND operation_id = job.deployment_id
+                           AND owner_token IS NOT NULL
+                    )
+               FROM deployment_apply_jobs AS job
+              WHERE job.deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load completed no-provider cleanup");
+        assert_eq!(completed, ("completed".to_string(), 0, 0));
+
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = $1,
+                    configmap_generation = $2,
+                    applied_generation = $3,
+                    configmap_policy_sha256 = $4,
+                    applied_policy_sha256 = $5,
+                    configmap_resource_version = $6,
+                    updated_at = clock_timestamp()
+              WHERE singleton",
+        )
+        .bind(original_reconciliation.desired_generation)
+        .bind(original_reconciliation.configmap_generation)
+        .bind(original_reconciliation.applied_generation)
+        .bind(original_reconciliation.configmap_policy_sha256)
+        .bind(original_reconciliation.applied_policy_sha256)
+        .bind(original_reconciliation.configmap_resource_version)
+        .execute(&pool)
+        .await
+        .expect("restore original signed-policy reconciliation");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete missing-config cleanup fixture");
+    }
+
+    #[tokio::test]
+    async fn restore_rotation_completes_cleanup_with_allowed_error_code() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'failed'::deploy_status_enum,
+                    error_message = 'restore-rotation-test',
+                    completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("make restore rotation deployment terminal");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'rollout_cleanup_pending',
+                    next_attempt_at = clock_timestamp(),
+                    updated_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("stage retained cleanup before restore rotation");
+
+        let mut tx = pool.begin().await.expect("begin restore rotation test");
+        let rotated = crate::runtime_authority::establish_epoch_with(
+            &mut tx,
+            crate::runtime_authority::TEST_RUNTIME_AUTHORITY.restore_generation + 1,
+        )
+        .await
+        .expect("restore rotation retires retained cleanup");
+        assert_eq!(
+            rotated.restore_generation,
+            crate::runtime_authority::TEST_RUNTIME_AUTHORITY.restore_generation + 1
+        );
+        let retired: (String, Option<String>) = sqlx::query_as(
+            "SELECT state, last_error_code
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("load restore-retired cleanup");
+        assert_eq!(
+            retired,
+            (
+                "completed".to_string(),
+                Some("runtime_authority_rotated".to_string()),
+            )
+        );
+        tx.rollback().await.expect("rollback restore rotation test");
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete restore rotation fixture");
     }
 
     #[tokio::test]

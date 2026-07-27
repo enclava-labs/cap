@@ -495,6 +495,27 @@ async fn load_signed_policy_reconciliation(
     .await?)
 }
 
+/// Prove under a row lock that no signed-policy publication is waiting for
+/// Trustee. Callers without KBS configuration must hold this lock through
+/// their authority release so a concurrent generation cannot appear between
+/// the proof and commit.
+pub(crate) async fn require_no_pending_signed_policy_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), KbsPolicyError> {
+    let current: bool = sqlx::query_scalar(
+        "SELECT desired_generation = applied_generation
+           FROM kbs_signed_policy_reconciliation
+          WHERE singleton
+          FOR SHARE",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if !current {
+        return Err(KbsPolicyError::NotConfigured);
+    }
+    Ok(())
+}
+
 async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> {
     Ok(sqlx::query_scalar(
         "SELECT desired_generation > 0

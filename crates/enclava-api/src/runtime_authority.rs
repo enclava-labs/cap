@@ -69,7 +69,7 @@ pub async fn establish_epoch(
     Ok(authority)
 }
 
-async fn establish_epoch_with(
+pub(crate) async fn establish_epoch_with(
     transaction: &mut Transaction<'_, Postgres>,
     restore_generation: i64,
 ) -> Result<RuntimeAuthority, EstablishAuthorityError> {
@@ -97,6 +97,27 @@ async fn establish_epoch_with(
         return Ok(RuntimeAuthority {
             epoch: current_epoch,
             restore_generation: stored_generation,
+        });
+    }
+
+    // Migration 0044 creates the first database-lifetime epoch before the
+    // deployment's required positive restore generation is known. Adopting
+    // the initial configured value is not a database restore: preserve that
+    // freshly generated epoch and every live mutation owner. Only later
+    // generation advances represent explicit restore authority.
+    if stored_generation == 0 && restore_generation == 1 {
+        let adopted_generation: i64 = sqlx::query_scalar(
+            "UPDATE cap_runtime_authority
+                SET restore_generation = $1
+              WHERE singleton
+          RETURNING restore_generation",
+        )
+        .bind(restore_generation)
+        .fetch_one(&mut **transaction)
+        .await?;
+        return Ok(RuntimeAuthority {
+            epoch: current_epoch,
+            restore_generation: adopted_generation,
         });
     }
 
@@ -277,6 +298,81 @@ mod tests {
         tx.rollback()
             .await
             .expect("rollback runtime authority test");
+    }
+
+    #[tokio::test]
+    async fn initial_generation_adopts_migration_epoch_without_retiring_live_owners() {
+        let pool = database_test_pool().await;
+        let mut tx = pool.begin().await.expect("begin initial authority test");
+        let migration_epoch = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE cap_runtime_authority
+                SET authority_epoch = $1,
+                    restore_generation = 0
+              WHERE singleton",
+        )
+        .bind(migration_epoch)
+        .execute(&mut *tx)
+        .await
+        .expect("restore migration-created authority state");
+
+        let resource_key = format!("initial-authority-{}", Uuid::new_v4().simple());
+        let owner_token = Uuid::new_v4();
+        let operation_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO external_resource_mutation_leases (
+                 resource_scope, resource_key, generation, owner_token,
+                 operation_kind, operation_id, locked_until, reclaim_after,
+                 updated_at
+             )
+             VALUES (
+                 'initial_authority_test', $1, 7, $2,
+                 'live_provider_operation', $3,
+                 clock_timestamp() + interval '3 minutes',
+                 'infinity'::timestamptz,
+                 clock_timestamp()
+             )",
+        )
+        .bind(&resource_key)
+        .bind(owner_token)
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await
+        .expect("insert live pre-upgrade owner");
+
+        let established = establish_epoch_with(&mut tx, 1)
+            .await
+            .expect("adopt first configured restore generation");
+        assert_eq!(
+            established,
+            RuntimeAuthority {
+                epoch: migration_epoch,
+                restore_generation: 1,
+            }
+        );
+        let retained: (i64, Option<Uuid>, Option<String>, Option<Uuid>) = sqlx::query_as(
+            "SELECT generation, owner_token, operation_kind, operation_id
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'initial_authority_test'
+                AND resource_key = $1",
+        )
+        .bind(&resource_key)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("load owner after initial generation adoption");
+        assert_eq!(
+            retained,
+            (
+                7,
+                Some(owner_token),
+                Some("live_provider_operation".to_string()),
+                Some(operation_id),
+            )
+        );
+
+        tx.rollback()
+            .await
+            .expect("rollback initial authority test");
     }
 
     #[tokio::test]

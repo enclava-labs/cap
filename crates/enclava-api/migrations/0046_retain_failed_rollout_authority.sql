@@ -4,6 +4,26 @@
 -- owners indefinitely so generic KBS/edge startup reconcilers cannot reclaim
 -- a finite provider fence first.
 
+-- A restore-generation advance retires cleanup jobs from the restored
+-- authority with a distinct bounded operator code. Migration 0038's original
+-- inline constraint predates runtime authority, so extend it before startup
+-- can rotate the first restored generation. DROP+ADD keeps this migration's
+-- executable upgrade regression idempotent.
+ALTER TABLE deployment_apply_jobs
+    DROP CONSTRAINT IF EXISTS deployment_apply_jobs_last_error_code_check;
+
+ALTER TABLE deployment_apply_jobs
+    ADD CONSTRAINT deployment_apply_jobs_last_error_code_check
+    CHECK (
+        last_error_code IS NULL
+        OR last_error_code IN (
+            'deployment_setup_failed',
+            'deployment_apply_failed',
+            'deployment_superseded',
+            'runtime_authority_rotated'
+        )
+    );
+
 UPDATE app_mutation_leases AS mutation
    SET reclaim_after = 'infinity'::timestamptz,
        updated_at = clock_timestamp()
