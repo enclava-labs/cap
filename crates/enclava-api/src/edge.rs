@@ -801,6 +801,15 @@ fn is_haproxy_section_header(line: &str) -> bool {
                 | "cache"
                 | "program"
                 | "ring"
+                | "userlist"
+                | "http-errors"
+                | "crt-store"
+                | "log-forward"
+                | "log-profile"
+                | "fcgi-app"
+                | "namespace_list"
+                | "traces"
+                | "acme"
         )
     )
 }
@@ -1604,6 +1613,49 @@ mod tests {
         assert!(out.contains("resolvers cluster_dns"));
         assert!(out.contains("backend be_reject"));
         assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn full_reconcile_preserves_every_haproxy_3_3_operator_section() {
+        for section in [
+            "global",
+            "defaults",
+            "frontend",
+            "backend",
+            "listen",
+            "userlist",
+            "peers",
+            "mailers",
+            "namespace_list",
+            "traces",
+            "ring",
+            "acme",
+            "fcgi-app",
+            "resolvers",
+            "crt-store",
+            "cache",
+            "log-forward",
+            "log-profile",
+            "http-errors",
+            // Retain compatibility with older HAProxy releases accepted by CAP.
+            "program",
+        ] {
+            let cfg = format!(
+                "frontend fe_443\n  use_backend be_cap_old_app if {{ req.ssl_sni -i stale.example }}\n\nbackend be_cap_old_app\n  server tenant 10.0.0.1:443 check\n\n{section} operator_owned\n  operator-directive preserved\n"
+            );
+
+            let out = remove_all_cap_managed_routes(&cfg);
+
+            assert!(!out.contains("be_cap_old_app"), "{section}: {out}");
+            assert!(
+                out.contains(&format!("{section} operator_owned")),
+                "{section}: {out}"
+            );
+            assert!(
+                out.contains("operator-directive preserved"),
+                "{section}: {out}"
+            );
+        }
     }
 
     #[test]

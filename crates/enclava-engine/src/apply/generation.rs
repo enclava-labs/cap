@@ -340,6 +340,12 @@ where
             MUTATION_GENERATION_ANNOTATION.to_string(),
             serde_json::json!(generation.get().to_string()),
         );
+        if let Some(authority_epoch) = generation.authority_epoch {
+            annotations.insert(
+                MUTATION_AUTHORITY_EPOCH_ANNOTATION.to_string(),
+                serde_json::json!(authority_epoch.to_string()),
+            );
+        }
 
         // A partial SSA document would make this field manager relinquish
         // fields it owns but the patch omits. Preserve the prior merge-patch
@@ -966,6 +972,7 @@ mod tests {
         let state = Arc::new(Mutex::new(FakeState::with_statefulset()));
         let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
         let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), "fence-test");
+        let authority_epoch = Uuid::parse_str("6aa62bb5-30c0-4e0d-aef6-9d9facde4a87").unwrap();
 
         apply_existing_partial(
             &api,
@@ -975,7 +982,7 @@ mod tests {
                 "kind": "StatefulSet",
                 "spec": { "replicas": 0 },
             }),
-            MutationGeneration::new(2).unwrap(),
+            MutationGeneration::with_authority(2, authority_epoch).unwrap(),
         )
         .await
         .expect("conditional scale merge applies");
@@ -995,7 +1002,7 @@ mod tests {
                     },
                 },
             }),
-            MutationGeneration::new(3).unwrap(),
+            MutationGeneration::with_authority(3, authority_epoch).unwrap(),
         )
         .await
         .expect("conditional restart merge applies");
@@ -1026,6 +1033,18 @@ mod tests {
                 .pointer("/metadata/annotations/unrelated-metadata")
                 .and_then(Value::as_str),
             Some("preserved")
+        );
+        let authority_epoch_text = authority_epoch.to_string();
+        assert_eq!(
+            resource
+                .pointer(&format!(
+                    "/metadata/annotations/{}",
+                    MUTATION_AUTHORITY_EPOCH_ANNOTATION
+                        .replace('~', "~0")
+                        .replace('/', "~1")
+                ))
+                .and_then(Value::as_str),
+            Some(authority_epoch_text.as_str())
         );
     }
 }

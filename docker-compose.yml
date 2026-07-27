@@ -21,6 +21,7 @@ services:
       dockerfile: crates/enclava-api/Dockerfile
     environment:
       DATABASE_URL: postgresql://enclava:enclava@postgres:5432/enclava
+      CAP_DATABASE_RESTORE_GENERATION: "1"
       API_URL: http://localhost:3000
       PLATFORM_DOMAIN: enclava.local
       ALLOW_EPHEMERAL_KEYS: "1"

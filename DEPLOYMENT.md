@@ -58,6 +58,7 @@ These variables are required for every persistent API process:
 | Variable | Purpose |
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string. Migrations run on startup. |
+| `CAP_DATABASE_RESTORE_GENERATION` | Required positive integer stored outside Postgres. Keep it stable for ordinary deploys and increase it before every database restore; startup atomically rotates retained-runtime authority when it advances and fails closed if it moves backwards. |
 | `API_SIGNING_KEY_PATH` or `API_SIGNING_KEY_PKCS8_BASE64` | Ed25519 PKCS#8 private key for config JWTs and deployment metadata. |
 | `SESSION_HMAC_KEY_PATH` or `SESSION_HMAC_KEY_BASE64` | 32-byte HMAC key for session JWTs and signer-rotation tokens. |
 

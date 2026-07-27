@@ -683,6 +683,14 @@ async fn main() {
     }
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let database_restore_generation = std::env::var("CAP_DATABASE_RESTORE_GENERATION")
+        .expect(
+            "CAP_DATABASE_RESTORE_GENERATION must be set to the out-of-database restore generation",
+        )
+        .parse::<i64>()
+        .ok()
+        .filter(|generation| *generation > 0)
+        .expect("CAP_DATABASE_RESTORE_GENERATION must be a positive integer");
     let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
     let dashboard_url = env_nonempty("ENCLAVA_DASHBOARD_URL");
     let platform_domain =
@@ -697,6 +705,16 @@ async fn main() {
     enclava_api::db::pool::run_migrations(&pool)
         .await
         .expect("failed to run migrations");
+
+    let runtime_authority =
+        enclava_api::runtime_authority::establish_epoch(&pool, database_restore_generation)
+            .await
+            .expect("failed to establish runtime authority");
+    tracing::info!(
+        authority_epoch = %runtime_authority.epoch,
+        restore_generation = runtime_authority.restore_generation,
+        "established runtime authority before provider reconciliation"
+    );
 
     let signing_key = load_signing_key().expect("failed to load API signing key");
     tracing::info!(
@@ -885,6 +903,7 @@ mod tests {
             .find("spawn_deployment_dispatcher")
             .expect("deployment dispatcher startup");
         for prerequisite in [
+            "runtime_authority::establish_epoch",
             "reconcile_signed_policy_once",
             "verify_trustee_kbs_connectivity",
             "reconcile_all_haproxy_routes",

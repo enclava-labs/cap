@@ -47,6 +47,11 @@ spec:
             secretKeyRef:
               name: api-secrets
               key: database-url
+        # This value lives outside Postgres and must increase before restoring
+        # a database backup. CAP rotates its runtime authority epoch when it
+        # advances and refuses startup if a rollout moves it backwards.
+        - name: CAP_DATABASE_RESTORE_GENERATION
+          value: "1"
         - name: API_URL
           value: "https://api.enclava.dev"
         - name: PLATFORM_DOMAIN
