@@ -1,6 +1,6 @@
 use enclava_cli::{
     api_client::{ApiClient, ApiError},
-    api_types::CreateTemplateInstanceRequest,
+    api_types::{CreateAppRequest, CreateTemplateInstanceRequest},
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -76,6 +76,69 @@ async fn sync_config_key_posts_metadata_callback() {
     assert!(request.contains("authorization: Bearer test-token"));
     assert!(request.contains(r#""key_name":"P0_KEY""#));
     assert!(request.contains(r#""deleted":false"#));
+}
+
+#[tokio::test]
+async fn create_app_forwards_rollout_idempotency_key() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).unwrap();
+        let body = r#"{"id":"app-1","name":"rollout-canary","namespace":"tenant-rollout","instance_id":"instance-1","domain":"rollout-canary.enclava.dev","custom_domain":null,"status":"pending","unlock_mode":"password","created_at":"2026-07-27T00:00:00Z"}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let request_body = CreateAppRequest {
+        name: "rollout-canary".to_string(),
+        port: 8080,
+        image: Some(
+            "ghcr.io/enclava-labs/e2e@sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"
+                .to_string(),
+        ),
+        unlock_mode: "password".to_string(),
+        bootstrap_pubkey_hash: Some("11".repeat(32)),
+        storage_size: "5Gi".to_string(),
+        tls_storage_size: "2Gi".to_string(),
+        storage_paths: vec!["/data".to_string()],
+        cpu: "1".to_string(),
+        memory: "1Gi".to_string(),
+        services: vec![],
+        health_path: Some("/health".to_string()),
+        health_interval: Some(30),
+        health_timeout: Some(5),
+        signer_identity_subject: None,
+        signer_identity_issuer: None,
+        egress_allowlist: vec![],
+        egress_mode: None,
+    };
+    let response = client
+        .create_app_with_idempotency_key(
+            &request_body,
+            Some("preprod-canary:11111111-2222-4333-8444-555555555555"),
+        )
+        .await
+        .unwrap();
+
+    let request = handle.join().unwrap();
+    assert!(request.starts_with("POST /apps "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert!(
+        request.contains("idempotency-key: preprod-canary:11111111-2222-4333-8444-555555555555")
+    );
+    assert_eq!(response.name, "rollout-canary");
 }
 
 #[tokio::test]

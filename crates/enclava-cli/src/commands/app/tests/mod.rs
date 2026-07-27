@@ -449,6 +449,27 @@ fn deploy_accepts_storage_password_file_flag() {
 }
 
 #[test]
+fn create_accepts_durable_idempotency_key() {
+    use clap::Parser as _;
+
+    let cli = crate::commands::Cli::try_parse_from([
+        "enclava",
+        "create",
+        "--idempotency-key",
+        "preprod-canary:11111111-2222-4333-8444-555555555555",
+    ])
+    .expect("create should accept a durable idempotency key");
+
+    let crate::commands::Command::Create(args) = cli.command else {
+        panic!("expected create command");
+    };
+    assert_eq!(
+        args.idempotency_key.as_deref(),
+        Some("preprod-canary:11111111-2222-4333-8444-555555555555")
+    );
+}
+
+#[test]
 fn deploy_bootstrap_probe_attests_before_calling_claim_endpoint() {
     let source = include_str!("../../app.rs");
     let fn_start = source

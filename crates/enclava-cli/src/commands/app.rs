@@ -271,6 +271,9 @@ pub struct CreateArgs {
         default_value = "https://token.actions.githubusercontent.com"
     )]
     pub signer_issuer: String,
+    /// Durable caller identity for safely retrying or correlating this create.
+    #[arg(long = "idempotency-key")]
+    pub idempotency_key: Option<String>,
 }
 
 pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -333,7 +336,9 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
     spinner.set_message("Creating app...");
     spinner.enable_steady_tick(Duration::from_millis(100));
 
-    let resp = api.create_app(&req).await?;
+    let resp = api
+        .create_app_with_idempotency_key(&req, args.idempotency_key.as_deref())
+        .await?;
 
     if let Some((org, private_key_hex, _)) = bootstrap_key {
         let key_path =

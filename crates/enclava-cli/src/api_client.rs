@@ -183,13 +183,28 @@ impl ApiClient {
     // --- Apps ---
 
     pub async fn create_app(&self, req: &CreateAppRequest) -> Result<AppResponse, ApiError> {
-        let resp = self
+        self.create_app_with_idempotency_key(req, None).await
+    }
+
+    /// Create an app with an optional caller-chosen durable operation identity.
+    ///
+    /// Normal interactive callers may omit this. Rollout verification supplies
+    /// a unique key and then binds worker dispatch to the matching durable PaaS
+    /// intent, eliminating app-name discovery races.
+    pub async fn create_app_with_idempotency_key(
+        &self,
+        req: &CreateAppRequest,
+        idempotency_key: Option<&str>,
+    ) -> Result<AppResponse, ApiError> {
+        let mut request = self
             .http
             .post(self.url("/apps"))
             .headers(self.auth_headers()?)
-            .json(req)
-            .send()
-            .await?;
+            .json(req);
+        if let Some(idempotency_key) = idempotency_key {
+            request = request.header("Idempotency-Key", idempotency_key);
+        }
+        let resp = request.send().await?;
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
     }
