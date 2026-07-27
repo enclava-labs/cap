@@ -12,7 +12,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::{OwnedSemaphorePermit, watch};
 use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::{runtime_authority::RuntimeAuthority, state::AppState};
 
 const LEASE_SECONDS: i64 = 180;
 // kube-client's default read/write timeout is 295s. Keep a full minute of
@@ -21,6 +21,21 @@ const LEASE_SECONDS: i64 = 180;
 const RECLAIM_QUARANTINE_SECONDS: i64 = 360;
 const HEARTBEAT_SECONDS: u64 = 30;
 const RENEW_TIMEOUT_SECONDS: u64 = 10;
+
+#[derive(Clone, Copy)]
+struct HeartbeatTiming {
+    interval: Duration,
+    renew_timeout: Duration,
+}
+
+impl HeartbeatTiming {
+    fn production() -> Self {
+        Self {
+            interval: Duration::from_secs(HEARTBEAT_SECONDS),
+            renew_timeout: Duration::from_secs(RENEW_TIMEOUT_SECONDS),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ResourceFence {
@@ -83,6 +98,7 @@ struct ClaimedResource {
 /// outcome after an uncertain provider response.
 pub struct AppMutationLease {
     pool: PgPool,
+    runtime_authority: RuntimeAuthority,
     app_id: Uuid,
     token: Uuid,
     generation: i64,
@@ -147,6 +163,7 @@ impl AppMutationLease {
         tx: &mut Transaction<'_, Postgres>,
     ) -> Result<(), MutationLeaseError> {
         self.stop_heartbeat();
+        require_current_runtime_authority(&self.runtime_authority, tx).await?;
         assert_current_rows(
             tx,
             self.app_id,
@@ -211,6 +228,7 @@ impl AppMutationLease {
         &self,
         tx: &mut Transaction<'_, Postgres>,
     ) -> Result<(), MutationLeaseError> {
+        require_current_runtime_authority(&self.runtime_authority, tx).await?;
         assert_current_rows(
             tx,
             self.app_id,
@@ -230,6 +248,7 @@ impl AppMutationLease {
         fence: &ResourceFence,
     ) -> Result<(), MutationLeaseError> {
         self.stop_heartbeat();
+        require_current_runtime_authority(&self.runtime_authority, tx).await?;
         assert_current_rows(
             tx,
             self.app_id,
@@ -252,8 +271,8 @@ impl AppMutationLease {
             self.token,
             self.generation,
             self.resources.clone(),
-            Duration::from_secs(HEARTBEAT_SECONDS),
-            Duration::from_secs(RENEW_TIMEOUT_SECONDS),
+            self.runtime_authority,
+            HeartbeatTiming::production(),
         );
         self.heartbeat = Some(heartbeat);
         self.heartbeat_lost = heartbeat_lost;
@@ -275,6 +294,7 @@ impl AppMutationLease {
         resource_scope: &str,
     ) -> Result<(), MutationLeaseError> {
         let mut tx = self.pool.begin().await?;
+        require_current_runtime_authority(&self.runtime_authority, &mut tx).await?;
         let retained =
             poison_resource_scope(&mut tx, self.token, &self.resources, resource_scope).await?;
         if retained == 0 {
@@ -294,6 +314,7 @@ impl AppMutationLease {
         resource_scope: &str,
     ) -> Result<(), MutationLeaseError> {
         self.stop_heartbeat();
+        require_current_runtime_authority(&self.runtime_authority, tx).await?;
         let retained =
             poison_resource_scope(tx, self.token, &self.resources, resource_scope).await?;
         if retained == 0 {
@@ -338,6 +359,7 @@ impl Drop for AppMutationLease {
 /// through the exact same resource rows.
 pub struct ResourceMutationLease {
     pool: PgPool,
+    runtime_authority: RuntimeAuthority,
     token: Uuid,
     resources: Vec<ClaimedResource>,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
@@ -373,6 +395,7 @@ impl ResourceMutationLease {
     pub async fn finish(mut self) -> Result<(), MutationLeaseError> {
         self.stop_heartbeat();
         let mut tx = self.pool.begin().await?;
+        require_current_runtime_authority(&self.runtime_authority, &mut tx).await?;
         assert_current_resource_rows(&mut tx, self.token, &self.resources).await?;
         clear_resource_rows(&mut tx, self.token, &self.resources).await?;
         tx.commit().await?;
@@ -418,12 +441,12 @@ fn spawn_app_heartbeat(
     token: Uuid,
     generation: i64,
     resources: Vec<ClaimedResource>,
-    heartbeat_interval: Duration,
-    renew_timeout: Duration,
+    runtime_authority: RuntimeAuthority,
+    timing: HeartbeatTiming,
 ) -> (tokio::task::JoinHandle<()>, watch::Receiver<bool>) {
     let (lost_tx, lost_rx) = watch::channel(false);
     let heartbeat = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(heartbeat_interval);
+        let mut interval = tokio::time::interval(timing.interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The claim transaction already authored the first deadline.
         interval.tick().await;
@@ -431,8 +454,15 @@ fn spawn_app_heartbeat(
             interval.tick().await;
             if !matches!(
                 tokio::time::timeout(
-                    renew_timeout,
-                    renew(&pool, app_id, token, generation, &resources),
+                    timing.renew_timeout,
+                    renew(
+                        &pool,
+                        app_id,
+                        token,
+                        generation,
+                        &resources,
+                        &runtime_authority,
+                    ),
                 )
                 .await,
                 Ok(Ok(()))
@@ -449,19 +479,22 @@ fn spawn_resource_heartbeat(
     pool: PgPool,
     token: Uuid,
     resources: Vec<ClaimedResource>,
-    heartbeat_interval: Duration,
-    renew_timeout: Duration,
+    runtime_authority: RuntimeAuthority,
+    timing: HeartbeatTiming,
 ) -> (tokio::task::JoinHandle<()>, watch::Receiver<bool>) {
     let (lost_tx, lost_rx) = watch::channel(false);
     let heartbeat = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(heartbeat_interval);
+        let mut interval = tokio::time::interval(timing.interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
         loop {
             interval.tick().await;
             if !matches!(
-                tokio::time::timeout(renew_timeout, renew_resources(&pool, token, &resources),)
-                    .await,
+                tokio::time::timeout(
+                    timing.renew_timeout,
+                    renew_resources(&pool, token, &resources, &runtime_authority),
+                )
+                .await,
                 Ok(Ok(()))
             ) {
                 let _ = lost_tx.send(true);
@@ -499,11 +532,12 @@ pub async fn claim_resources(
         state.db.clone(),
         token,
         claimed_resources.clone(),
-        Duration::from_secs(HEARTBEAT_SECONDS),
-        Duration::from_secs(RENEW_TIMEOUT_SECONDS),
+        state.runtime_authority,
+        HeartbeatTiming::production(),
     );
     Ok(ResourceMutationLease {
         pool: state.db.clone(),
+        runtime_authority: state.runtime_authority,
         token,
         resources: claimed_resources,
         heartbeat: Some(heartbeat),
@@ -593,12 +627,13 @@ pub async fn claim(
         token,
         generation,
         claimed_resources.clone(),
-        Duration::from_secs(HEARTBEAT_SECONDS),
-        Duration::from_secs(RENEW_TIMEOUT_SECONDS),
+        state.runtime_authority,
+        HeartbeatTiming::production(),
     );
 
     Ok(AppMutationLease {
         pool: state.db.clone(),
+        runtime_authority: state.runtime_authority,
         app_id,
         token,
         generation,
@@ -786,8 +821,10 @@ async fn renew(
     token: Uuid,
     generation: i64,
     resources: &[ClaimedResource],
+    runtime_authority: &RuntimeAuthority,
 ) -> Result<(), MutationLeaseError> {
     let mut tx = pool.begin().await?;
+    require_current_runtime_authority(runtime_authority, &mut tx).await?;
     let app = sqlx::query(
         "UPDATE app_mutation_leases
             SET locked_until = clock_timestamp()
@@ -848,8 +885,10 @@ async fn renew_resources(
     pool: &PgPool,
     token: Uuid,
     resources: &[ClaimedResource],
+    runtime_authority: &RuntimeAuthority,
 ) -> Result<(), MutationLeaseError> {
     let mut tx = pool.begin().await?;
+    require_current_runtime_authority(runtime_authority, &mut tx).await?;
     for resource in resources {
         let result = sqlx::query(
             "UPDATE external_resource_mutation_leases
@@ -881,6 +920,16 @@ async fn renew_resources(
         }
     }
     tx.commit().await?;
+    Ok(())
+}
+
+async fn require_current_runtime_authority(
+    runtime_authority: &RuntimeAuthority,
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), MutationLeaseError> {
+    if !runtime_authority.is_current_in_tx(tx).await? {
+        return Err(MutationLeaseError::StaleRuntimeAuthority);
+    }
     Ok(())
 }
 
@@ -1047,6 +1096,7 @@ mod tests {
             pool: PgPoolOptions::new()
                 .connect_lazy("postgresql://stack-size.invalid/enclava")
                 .expect("lazy pool does not connect"),
+            runtime_authority: crate::runtime_authority::TEST_RUNTIME_AUTHORITY,
             app_id: Uuid::nil(),
             token: Uuid::nil(),
             generation: 1,
@@ -1066,6 +1116,7 @@ mod tests {
             pool: PgPoolOptions::new()
                 .connect_lazy("postgresql://stack-size.invalid/enclava")
                 .expect("lazy pool does not connect"),
+            runtime_authority: crate::runtime_authority::TEST_RUNTIME_AUTHORITY,
             token: Uuid::nil(),
             resources: Vec::new(),
             heartbeat: None,
@@ -1335,6 +1386,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_runtime_authority_cannot_renew_or_guard_restored_leases() {
+        let pool = database_test_pool(4).await;
+        let hostname = format!("stale-renew-{}.example.test", Uuid::new_v4().simple());
+        let (org_id, app_id) = insert_app(&pool, &hostname).await;
+        let state = state_with_pool(pool.clone());
+        let mut app_owner = claim(
+            &state,
+            app_id,
+            "stale_renew_app",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("claim app lease before simulated restore");
+        let global_fence =
+            ResourceFence::new("stale_renew_test", Uuid::new_v4().simple().to_string());
+        let mut resource_owner = claim_resources(
+            &state,
+            "stale_renew_global",
+            Uuid::new_v4(),
+            vec![global_fence.clone()],
+        )
+        .await
+        .expect("claim resource lease before simulated restore");
+        app_owner.stop_heartbeat();
+        resource_owner.stop_heartbeat();
+
+        let app_deadline_before: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT locked_until FROM app_mutation_leases WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load app deadline before stale renewal");
+        let resource_deadline_before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT locked_until
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = $1 AND resource_key = $2",
+        )
+        .bind(&global_fence.scope)
+        .bind(&global_fence.key)
+        .fetch_one(&pool)
+        .await
+        .expect("load resource deadline before stale renewal");
+
+        // Model an old process surviving a database restore: its token and
+        // generation still match the restored lease rows, but its cached
+        // runtime authority no longer matches the new database lifetime.
+        let mut stale_authority = state.runtime_authority;
+        stale_authority.epoch = Uuid::new_v4();
+        app_owner.runtime_authority = stale_authority;
+        resource_owner.runtime_authority = stale_authority;
+
+        let app_renewal = renew(
+            &pool,
+            app_owner.app_id,
+            app_owner.token,
+            app_owner.generation,
+            &app_owner.resources,
+            &stale_authority,
+        )
+        .await
+        .expect_err("stale app heartbeat must not renew a restored lease");
+        assert!(matches!(
+            app_renewal,
+            MutationLeaseError::StaleRuntimeAuthority
+        ));
+        let resource_renewal = renew_resources(
+            &pool,
+            resource_owner.token,
+            &resource_owner.resources,
+            &stale_authority,
+        )
+        .await
+        .expect_err("stale global heartbeat must not renew a restored lease");
+        assert!(matches!(
+            resource_renewal,
+            MutationLeaseError::StaleRuntimeAuthority
+        ));
+        let poison = app_owner
+            .arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .expect_err("stale owner must not arm an unconditional DNS mutation");
+        assert!(matches!(poison, MutationLeaseError::StaleRuntimeAuthority));
+
+        let app_deadline_after: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT locked_until FROM app_mutation_leases WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(&pool)
+                .await
+                .expect("load app deadline after stale renewal");
+        let resource_deadline_after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT locked_until
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = $1 AND resource_key = $2",
+        )
+        .bind(&global_fence.scope)
+        .bind(&global_fence.key)
+        .fetch_one(&pool)
+        .await
+        .expect("load resource deadline after stale renewal");
+        assert_eq!(app_deadline_after, app_deadline_before);
+        assert_eq!(resource_deadline_after, resource_deadline_before);
+
+        let (app_heartbeat, app_lost) = spawn_app_heartbeat(
+            pool.clone(),
+            app_owner.app_id,
+            app_owner.token,
+            app_owner.generation,
+            app_owner.resources.clone(),
+            stale_authority,
+            HeartbeatTiming {
+                interval: Duration::from_millis(5),
+                renew_timeout: Duration::from_millis(100),
+            },
+        );
+        app_owner.heartbeat = Some(app_heartbeat);
+        app_owner.heartbeat_lost = app_lost;
+        let (resource_heartbeat, resource_lost) = spawn_resource_heartbeat(
+            pool.clone(),
+            resource_owner.token,
+            resource_owner.resources.clone(),
+            stale_authority,
+            HeartbeatTiming {
+                interval: Duration::from_millis(5),
+                renew_timeout: Duration::from_millis(100),
+            },
+        );
+        resource_owner.heartbeat = Some(resource_heartbeat);
+        resource_owner.heartbeat_lost = resource_lost;
+
+        let (app_guard, resource_guard) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                app_owner.guard_provider(std::future::pending::<()>()),
+                resource_owner.guard_provider(std::future::pending::<()>()),
+            )
+        })
+        .await
+        .expect("stale heartbeat must promptly cancel both provider futures");
+        assert!(matches!(app_guard, Err(MutationLeaseError::Lost)));
+        assert!(matches!(resource_guard, Err(MutationLeaseError::Lost)));
+
+        let app_token = app_owner.token;
+        let resource_token = resource_owner.token;
+        drop(app_owner);
+        drop(resource_owner);
+        sqlx::query("DELETE FROM external_resource_mutation_leases WHERE owner_token IN ($1, $2)")
+            .bind(app_token)
+            .bind(resource_token)
+            .execute(&pool)
+            .await
+            .expect("delete stale-renew resource fixtures");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete stale-renew organization fixture");
+    }
+
+    #[tokio::test]
     async fn pool_two_waiter_holds_no_connection_and_owner_can_renew() {
         let pool = database_test_pool(2).await;
         let (_, app_one) = insert_app(&pool, "pool-one.example.test").await;
@@ -1375,6 +1586,7 @@ mod tests {
                 first.token,
                 first.generation,
                 &first.resources,
+                &first.runtime_authority,
             ),
         )
         .await
@@ -1426,8 +1638,11 @@ mod tests {
             owner.token,
             owner.generation,
             owner.resources.clone(),
-            Duration::from_millis(5),
-            Duration::from_millis(20),
+            owner.runtime_authority,
+            HeartbeatTiming {
+                interval: Duration::from_millis(5),
+                renew_timeout: Duration::from_millis(20),
+            },
         );
         owner.heartbeat = Some(heartbeat);
         owner.heartbeat_lost = lost;
