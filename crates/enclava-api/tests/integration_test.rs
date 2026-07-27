@@ -206,6 +206,8 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
             signing_service_pubkey_hex: None,
         }),
         platform_release_envelope: None,
+        debug_trustee_kbs_url_override: None,
+        debug_trustee_kbs_ca_cert_pem_override: None,
         dns: None,
         acme: None,
         kbs_policy: None,

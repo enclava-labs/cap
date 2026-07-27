@@ -695,13 +695,17 @@ async fn process_claimed_setup_job(
     };
 
     let outcome = mutation
-        .guard_provider(with_lease_heartbeat(
-            &state.db,
-            job.deployment_id,
-            job.lock_token,
-            "setting_up",
-            setup,
-        ))
+        .guard_provider_in_tx(
+            &mut side_effect_lane,
+            with_lease_heartbeat(
+                &state.db,
+                state.runtime_authority,
+                job.deployment_id,
+                job.lock_token,
+                "setting_up",
+                setup,
+            ),
+        )
         .await??;
     match outcome {
         Ok(()) => {
@@ -1080,23 +1084,27 @@ async fn process_cleanup_job(state: &AppState, job: ClaimedJob) {
         return;
     }
     let outcome = mutation
-        .guard_provider(with_lease_heartbeat(
-            &state.db,
-            job.deployment_id,
-            job.lock_token,
-            "cleaning_up",
-            attempt_setup_cleanup(
-                state,
-                job.app_id,
-                job.org_id,
-                expected_app.as_ref().map(|app| {
-                    (
-                        app.domain.as_str(),
-                        app.tee_domain.as_deref().unwrap_or(&app.domain),
-                    )
-                }),
+        .guard_provider_in_tx(
+            &mut side_effect_lane,
+            with_lease_heartbeat(
+                &state.db,
+                state.runtime_authority,
+                job.deployment_id,
+                job.lock_token,
+                "cleaning_up",
+                attempt_setup_cleanup(
+                    state,
+                    job.app_id,
+                    job.org_id,
+                    expected_app.as_ref().map(|app| {
+                        (
+                            app.domain.as_str(),
+                            app.tee_domain.as_deref().unwrap_or(&app.domain),
+                        )
+                    }),
+                ),
             ),
-        ))
+        )
         .await;
     match outcome {
         Ok(Ok(true)) => {
@@ -1491,6 +1499,7 @@ async fn execute_rollout_cleanup_job(
     let payload = job.decode_payload()?;
     with_lease_heartbeat(
         &state.db,
+        state.runtime_authority,
         job.deployment_id,
         job.lock_token,
         "rollout_cleaning_up",
@@ -1511,8 +1520,11 @@ async fn reconcile_failed_rollout_cleanup(
     let expected_resources = deployment_apply_resource_fences(payload);
 
     // Validate both the live process incarnation and the exact retained
-    // deployment mutation before touching Trustee. This also rejects a stale
-    // pre-restore replica that happened to claim the durable cleanup row.
+    // deployment mutation before touching Trustee. Migration 0045 can recover
+    // a previous binary after it already reconciled and released only the KBS
+    // fence, so accept the exact retained subset but never an unrelated
+    // resource. This also rejects a stale pre-restore replica that happened to
+    // claim the durable cleanup row.
     let mut preflight = state.db.begin().await?;
     if !state
         .runtime_authority
@@ -1523,28 +1535,52 @@ async fn reconcile_failed_rollout_cleanup(
     }
     crate::deploy::lock_app_deployment_lane(&mut preflight, job.app_id).await?;
     lock_owned_rollout_cleanup_job(&mut preflight, job).await?;
-    crate::mutation_leases::assert_reconciliation_owner_in_tx(
+    let retained_resources = crate::mutation_leases::reconciliation_owner_resources_in_tx(
         &mut preflight,
         job.app_id,
         "deployment_apply",
         job.deployment_id,
-        &expected_resources,
     )
     .await?;
+    if retained_resources
+        .iter()
+        .any(|resource| !expected_resources.contains(resource))
+    {
+        return Err(crate::mutation_leases::MutationLeaseError::Lost.into());
+    }
+    let kbs_retained =
+        retained_resources.contains(&crate::mutation_leases::ResourceFence::kbs_policy());
     preflight.commit().await?;
 
-    crate::kbs::reconcile_pending_signed_policy_artifacts(
-        &state.db,
-        state.kbs_policy.as_ref(),
-        state.runtime_authority,
-    )
-    .await?;
+    // A missing KBS fence means the pre-upgrade worker already completed
+    // Trustee reconciliation before crashing. Standalone mode never enqueues
+    // signed-policy work and has no Trustee configuration, so it likewise
+    // releases the retained deployment authority without a provider call.
+    if kbs_retained && let Some(kbs_policy) = state.kbs_policy.as_ref() {
+        crate::mutation_leases::guard_provider_with_runtime_authority(
+            &state.db,
+            state.runtime_authority,
+            crate::kbs::reconcile_pending_signed_policy_artifacts(
+                &state.db,
+                Some(kbs_policy),
+                state.runtime_authority,
+            ),
+        )
+        .await??;
+    }
 
-    complete_reconciled_rollout_cleanup(&state.db, job, &expected_resources).await
+    complete_reconciled_rollout_cleanup(
+        &state.db,
+        state.runtime_authority,
+        job,
+        &retained_resources,
+    )
+    .await
 }
 
 async fn complete_reconciled_rollout_cleanup(
     pool: &PgPool,
+    runtime_authority: crate::runtime_authority::RuntimeAuthority,
     job: &ClaimedJob,
     expected_resources: &[crate::mutation_leases::ResourceFence],
 ) -> Result<(), DeploymentJobError> {
@@ -1552,6 +1588,9 @@ async fn complete_reconciled_rollout_cleanup(
     // complete are one transaction. A crash on either side leaves both for a
     // future worker to retry.
     let mut tx = pool.begin().await?;
+    if !runtime_authority.is_current_in_tx(&mut tx).await? {
+        return Err(crate::mutation_leases::MutationLeaseError::StaleRuntimeAuthority.into());
+    }
     crate::deploy::lock_app_deployment_lane(&mut tx, job.app_id).await?;
     lock_owned_rollout_cleanup_job(&mut tx, job).await?;
     crate::mutation_leases::release_reconciled_operation_in_tx(
@@ -1667,6 +1706,7 @@ async fn process_apply_job(
 
     let result = with_lease_heartbeat(
         &state.db,
+        state.runtime_authority,
         deployment_id,
         lock_token,
         "running",
@@ -1907,7 +1947,7 @@ async fn apply_claimed_job(
     // granted. The latest org keyring can change while this future waits.
     validate_apply_artifacts(state, job, payload, &primary_image_digest).await?;
 
-    let Some((apply_permit, mut mutation, authority_lane, validated)) =
+    let Some((apply_permit, mut mutation, mut authority_lane, validated)) =
         acquire_apply_permit_and_revalidate(state, job, payload).await?
     else {
         return Ok(JobApplyOutcome::AlreadyTerminal);
@@ -1923,32 +1963,34 @@ async fn apply_claimed_job(
         ))
         .ok_or(crate::mutation_leases::MutationLeaseError::Lost)?;
     let rollout = mutation
-        .guard_provider(crate::deploy::apply_deployment_manifests(
-            ApplyDeploymentManifestsRequest {
-                pool: state.db.clone(),
-                runtime_authority: state.runtime_authority,
-                app: payload.app.clone(),
-                snapshot: payload.snapshot.clone(),
-                // The operation deployment remains distinct from the historical
-                // source/artifact deployment used by rollback signatures. Manifests
-                // and encrypted log frame metadata report this new operation ID.
-                deployment_id: job.deployment_id,
-                attestation_config: payload.attestation_config.clone(),
-                kbs_policy_config: state.kbs_policy.clone(),
-                edge_config_generation,
-                kubernetes_mutation_generation,
-                api_signing_pubkey: payload.api_signing_pubkey.clone(),
-                api_url: payload.api_url.clone(),
-                workload_artifact_binding: validated.workload_artifact_binding,
-                signed_policy_artifact: validated.signed_policy_artifact,
-                local_workload_artifacts_json: validated.local_workload_artifacts_json,
-                local_trustee_policy_json: validated.local_trustee_policy_json,
-                log_encryption: payload.log_encryption.clone(),
-            },
-            &mutation,
-        ))
+        .guard_provider_in_tx(
+            &mut authority_lane,
+            crate::deploy::apply_deployment_manifests(
+                ApplyDeploymentManifestsRequest {
+                    pool: state.db.clone(),
+                    runtime_authority: state.runtime_authority,
+                    app: payload.app.clone(),
+                    snapshot: payload.snapshot.clone(),
+                    // The operation deployment remains distinct from the historical
+                    // source/artifact deployment used by rollback signatures. Manifests
+                    // and encrypted log frame metadata report this new operation ID.
+                    deployment_id: job.deployment_id,
+                    attestation_config: payload.attestation_config.clone(),
+                    kbs_policy_config: state.kbs_policy.clone(),
+                    edge_config_generation,
+                    kubernetes_mutation_generation,
+                    api_signing_pubkey: payload.api_signing_pubkey.clone(),
+                    api_url: payload.api_url.clone(),
+                    workload_artifact_binding: validated.workload_artifact_binding,
+                    signed_policy_artifact: validated.signed_policy_artifact,
+                    local_workload_artifacts_json: validated.local_workload_artifacts_json,
+                    local_trustee_policy_json: validated.local_trustee_policy_json,
+                    log_encryption: payload.log_encryption.clone(),
+                },
+                &mutation,
+            ),
+        )
         .await?;
-    let mut authority_lane = authority_lane;
     drop(apply_permit);
     let rollout = match rollout {
         Ok(rollout) => rollout,
@@ -2724,6 +2766,7 @@ async fn finish_job(
 
 fn with_lease_heartbeat<'a, F, T>(
     pool: &'a PgPool,
+    runtime_authority: crate::runtime_authority::RuntimeAuthority,
     deployment_id: Uuid,
     lock_token: Uuid,
     state: &'a str,
@@ -2737,7 +2780,7 @@ where
         // Renew immediately after the claim transaction commits and before the
         // future is first polled. `clock_timestamp()` is wall-clock time even in a
         // long transaction; `now()` would reuse the transaction start timestamp.
-        renew_job_lease_bounded(pool, deployment_id, lock_token, state).await?;
+        renew_job_lease_bounded(pool, runtime_authority, deployment_id, lock_token, state).await?;
         let mut heartbeat = tokio::time::interval_at(
             tokio::time::Instant::now() + HEARTBEAT_INTERVAL,
             HEARTBEAT_INTERVAL,
@@ -2748,7 +2791,14 @@ where
             tokio::select! {
                 output = &mut future => return Ok(output),
                 _ = heartbeat.tick() => {
-                    renew_job_lease_bounded(pool, deployment_id, lock_token, state).await?;
+                    renew_job_lease_bounded(
+                        pool,
+                        runtime_authority,
+                        deployment_id,
+                        lock_token,
+                        state,
+                    )
+                    .await?;
                 }
             }
         }
@@ -2757,13 +2807,14 @@ where
 
 async fn renew_job_lease_bounded(
     pool: &PgPool,
+    runtime_authority: crate::runtime_authority::RuntimeAuthority,
     deployment_id: Uuid,
     lock_token: Uuid,
     state: &str,
 ) -> Result<(), DeploymentJobError> {
     tokio::time::timeout(
         HEARTBEAT_RENEW_TIMEOUT,
-        renew_job_lease(pool, deployment_id, lock_token, state),
+        renew_job_lease(pool, runtime_authority, deployment_id, lock_token, state),
     )
     .await
     .map_err(|_| DeploymentJobError::LeaseLost)?
@@ -2771,10 +2822,15 @@ async fn renew_job_lease_bounded(
 
 async fn renew_job_lease(
     pool: &PgPool,
+    runtime_authority: crate::runtime_authority::RuntimeAuthority,
     deployment_id: Uuid,
     lock_token: Uuid,
     state: &str,
 ) -> Result<(), DeploymentJobError> {
+    let mut tx = pool.begin().await?;
+    if !runtime_authority.is_current_in_tx(&mut tx).await? {
+        return Err(crate::mutation_leases::MutationLeaseError::StaleRuntimeAuthority.into());
+    }
     let result = sqlx::query(
         "UPDATE deployment_apply_jobs
             SET locked_until = clock_timestamp() + $1::interval,
@@ -2787,11 +2843,12 @@ async fn renew_job_lease(
     .bind(deployment_id)
     .bind(state)
     .bind(lock_token)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     if result.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -2808,6 +2865,7 @@ mod tests {
     use enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH;
     use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
     use sqlx::types::Json;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
     async fn lease_heartbeat_does_not_duplicate_large_future_state() {
@@ -2825,7 +2883,14 @@ mod tests {
             "size canary must retain its {}-byte payload, got {operation_size}",
             payload.len()
         );
-        let heartbeat = with_lease_heartbeat(&pool, Uuid::nil(), Uuid::nil(), "running", operation);
+        let heartbeat = with_lease_heartbeat(
+            &pool,
+            crate::runtime_authority::TEST_RUNTIME_AUTHORITY,
+            Uuid::nil(),
+            Uuid::nil(),
+            "running",
+            operation,
+        );
         let heartbeat_size = std::mem::size_of_val(&heartbeat);
 
         fn assert_send<T: Send>(_: &T) {}
@@ -2847,6 +2912,65 @@ mod tests {
             .await
             .expect("migrate deployment job test database");
         pool
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_authority_rejects_job_heartbeat_before_polling_cleanup() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let claimed = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim setup job for stale heartbeat")
+            .expect("setup job exists");
+        let deadline_before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT locked_until
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load deadline before stale heartbeat");
+
+        let mut stale_authority = crate::runtime_authority::TEST_RUNTIME_AUTHORITY;
+        stale_authority.epoch = Uuid::new_v4();
+        let provider_polled = Arc::new(AtomicBool::new(false));
+        let mark_polled = provider_polled.clone();
+        let error = with_lease_heartbeat(
+            &pool,
+            stale_authority,
+            deployment_id,
+            claimed.lock_token,
+            "setting_up",
+            async move {
+                mark_polled.store(true, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("stale cleanup heartbeat must fail before provider work");
+        assert!(matches!(
+            error,
+            DeploymentJobError::Mutation(
+                crate::mutation_leases::MutationLeaseError::StaleRuntimeAuthority
+            )
+        ));
+        assert!(!provider_polled.load(Ordering::SeqCst));
+        let deadline_after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT locked_until
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load deadline after stale heartbeat");
+        assert_eq!(deadline_after, deadline_before);
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete stale heartbeat fixture");
     }
 
     fn test_app(org_id: Uuid, app_id: Uuid) -> App {
@@ -4038,9 +4162,31 @@ mod tests {
         .expect("crashed failed-rollout cleanup is reclaimable");
         assert_ne!(retry.lock_token, crashed.lock_token);
 
-        let stale_error = complete_reconciled_rollout_cleanup(&pool, &crashed, &expected_resources)
-            .await
-            .expect_err("stale cleanup owner cannot release provider fences");
+        let mut stale_authority = crate::runtime_authority::TEST_RUNTIME_AUTHORITY;
+        stale_authority.epoch = Uuid::new_v4();
+        let stale_authority_error = complete_reconciled_rollout_cleanup(
+            &pool,
+            stale_authority,
+            &retry,
+            &expected_resources,
+        )
+        .await
+        .expect_err("pre-restore cleanup authority cannot release retained provider fences");
+        assert!(matches!(
+            stale_authority_error,
+            DeploymentJobError::Mutation(
+                crate::mutation_leases::MutationLeaseError::StaleRuntimeAuthority
+            )
+        ));
+
+        let stale_error = complete_reconciled_rollout_cleanup(
+            &pool,
+            crate::runtime_authority::TEST_RUNTIME_AUTHORITY,
+            &crashed,
+            &expected_resources,
+        )
+        .await
+        .expect_err("stale cleanup owner cannot release provider fences");
         assert!(matches!(stale_error, DeploymentJobError::LeaseLost));
         let still_owned: i64 = sqlx::query_scalar(
             "SELECT count(*)
@@ -4076,9 +4222,9 @@ mod tests {
         .await
         .expect("claim retried failed-rollout cleanup")
         .expect("retried failed-rollout cleanup exists");
-        complete_reconciled_rollout_cleanup(&pool, &recovered, &expected_resources)
+        execute_rollout_cleanup_job(&state, &recovered)
             .await
-            .expect("atomically finish reconciled failed rollout");
+            .expect("standalone cleanup skips absent Trustee and releases full retained set");
 
         let (final_job_state, remaining_app_owner, remaining_resource_owners): (String, i64, i64) =
             sqlx::query_as(
@@ -4105,6 +4251,208 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete failed-rollout cleanup fixture");
+    }
+
+    #[tokio::test]
+    async fn migration_cleanup_accepts_previously_released_kbs_subset_in_standalone_mode() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        state.kbs_policy = None;
+
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim migration-subset setup")
+            .expect("migration-subset setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept migration-subset setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim migration-subset apply")
+            .expect("migration-subset apply exists");
+        let expected_resources = deployment_apply_resource_fences(&payload);
+        let mut mutation = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            expected_resources.clone(),
+        )
+        .await
+        .expect("claim migration-subset mutation");
+        mutation
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("retain migration-subset namespace");
+
+        let manifest_hash = "migration-partial-owner-manifest";
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = $2
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(manifest_hash)
+        .execute(&pool)
+        .await
+        .expect("stage migration-subset rollout watcher");
+        publish_rollout_outcome_with_mutation(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "failed",
+                app_status: "failed",
+                error_code: Some("rollout_failed"),
+                terminal: true,
+                manifest_hash: manifest_hash.to_string(),
+            },
+            Some(&mut mutation),
+        )
+        .await
+        .expect("publish migration-subset failed rollout");
+        drop(mutation);
+
+        // Reconstruct the previous-binary crash window: the terminal job was
+        // already completed and successful Trustee reconciliation released
+        // only the KBS fence, leaving the app and remaining provider subset.
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'completed',
+                    next_attempt_at = clock_timestamp(),
+                    updated_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("simulate pre-0045 completed rollout job");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET owner_token = NULL,
+                    operation_kind = NULL,
+                    operation_id = NULL,
+                    locked_until = NULL,
+                    reclaim_after = NULL,
+                    updated_at = clock_timestamp()
+              WHERE resource_scope = 'kbs_policy'
+                AND resource_key = 'global'
+                AND operation_kind = 'deployment_apply'
+                AND operation_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("simulate pre-upgrade KBS-only release");
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET reclaim_after = clock_timestamp() + interval '10 minutes'
+              WHERE app_id = $1",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("make pre-upgrade app owner finite");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET reclaim_after = clock_timestamp() + interval '10 minutes'
+              WHERE operation_kind = 'deployment_apply'
+                AND operation_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("make pre-upgrade provider subset finite");
+
+        sqlx::raw_sql(include_str!(
+            "../migrations/0045_failed_rollout_cleanup_jobs.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("run real migration-0045 partial-owner backfill");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0046_retain_failed_rollout_authority.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("run real migration-0046 subset retention");
+
+        let (job_state, retained_resources, retained_kbs): (String, i64, i64) = sqlx::query_as(
+            "SELECT job.state,
+                        (
+                            SELECT count(*)
+                              FROM external_resource_mutation_leases AS resource
+                             WHERE resource.operation_kind = 'deployment_apply'
+                               AND resource.operation_id = job.deployment_id
+                               AND resource.owner_token IS NOT NULL
+                               AND resource.reclaim_after = 'infinity'::timestamptz
+                        ),
+                        (
+                            SELECT count(*)
+                              FROM external_resource_mutation_leases AS resource
+                             WHERE resource.resource_scope = 'kbs_policy'
+                               AND resource.resource_key = 'global'
+                               AND resource.owner_token IS NOT NULL
+                        )
+                   FROM deployment_apply_jobs AS job
+                  WHERE job.deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load migrated partial cleanup authority");
+        assert_eq!(job_state, "rollout_cleanup_pending");
+        assert_eq!(retained_resources, expected_resources.len() as i64 - 1);
+        assert_eq!(retained_kbs, 0);
+
+        let cleanup = claim_job(
+            &pool,
+            "rollout_cleanup_pending",
+            "rollout_cleaning_up",
+            Some(deployment_id),
+        )
+        .await
+        .expect("claim migrated partial cleanup")
+        .expect("migrated partial cleanup exists");
+        execute_rollout_cleanup_job(&state, &cleanup)
+            .await
+            .expect("standalone cleanup releases exact retained subset without Trustee");
+
+        let (final_state, app_owners, provider_owners): (String, i64, i64) = sqlx::query_as(
+            "SELECT job.state,
+                    (
+                        SELECT count(*)
+                          FROM app_mutation_leases
+                         WHERE app_id = job.app_id
+                           AND owner_token IS NOT NULL
+                    ),
+                    (
+                        SELECT count(*)
+                          FROM external_resource_mutation_leases
+                         WHERE operation_kind = 'deployment_apply'
+                           AND operation_id = job.deployment_id
+                           AND owner_token IS NOT NULL
+                    )
+               FROM deployment_apply_jobs AS job
+              WHERE job.deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load completed partial cleanup");
+        assert_eq!(final_state, "completed");
+        assert_eq!(app_owners, 0);
+        assert_eq!(provider_owners, 0);
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete partial cleanup fixture");
     }
 
     #[tokio::test]
@@ -4624,9 +4972,15 @@ mod tests {
             .await
             .expect("request claim query")
             .expect("request bypasses recovery delay");
-        renew_job_lease(&pool, deployment_id, request_claim.lock_token, "setting_up")
-            .await
-            .expect("request renews setup lease");
+        renew_job_lease(
+            &pool,
+            crate::runtime_authority::TEST_RUNTIME_AUTHORITY,
+            deployment_id,
+            request_claim.lock_token,
+            "setting_up",
+        )
+        .await
+        .expect("request renews setup lease");
         let lease_is_live: bool = sqlx::query_scalar(
             "SELECT locked_until > clock_timestamp()
                FROM deployment_apply_jobs WHERE deployment_id = $1",

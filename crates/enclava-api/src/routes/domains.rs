@@ -453,20 +453,26 @@ pub async fn verify_challenge(
     }
 
     mutation
-        .guard_provider(crate::dns::record_custom_domain(&state.db, app.id, &domain))
+        .guard_provider_in_tx(
+            &mut app_lane,
+            crate::dns::record_custom_domain(&state.db, app.id, &domain),
+        )
         .await
         .map_err(|_| internal_error())?
         .map_err(dns_error_response)?;
 
     if app.custom_domain.as_deref() == Some(domain.as_str()) {
         mutation
-            .guard_provider(ensure_custom_domain_haproxy_route(
-                &state,
-                auth.org_id,
-                &app,
-                &domain,
-                edge_config_generation,
-            ))
+            .guard_provider_in_tx(
+                &mut app_lane,
+                ensure_custom_domain_haproxy_route(
+                    &state,
+                    auth.org_id,
+                    &app,
+                    &domain,
+                    edge_config_generation,
+                ),
+            )
             .await
             .map_err(|_| internal_error())??;
         mutation
@@ -501,15 +507,18 @@ pub async fn verify_challenge(
         )
         .map_err(|_| internal_error())?;
     let ingress_ready = match mutation
-        .guard_provider(crate::deploy::reapply_tenant_ingress(
-            &state.db,
-            &next_app,
-            state.attestation.as_ref(),
-            &api_signing_pubkey,
-            &state.api_url,
-            &mutation,
-            kubernetes_mutation_generation,
-        ))
+        .guard_provider_in_tx(
+            &mut app_lane,
+            crate::deploy::reapply_tenant_ingress(
+                &state.db,
+                &next_app,
+                state.attestation.as_ref(),
+                &api_signing_pubkey,
+                &state.api_url,
+                &mutation,
+                kubernetes_mutation_generation,
+            ),
+        )
         .await
         .map_err(|_| internal_error())?
     {
@@ -538,13 +547,16 @@ pub async fn verify_challenge(
     };
     let app_backend = if ingress_ready {
         mutation
-            .guard_provider(ensure_custom_domain_haproxy_route(
-                &state,
-                auth.org_id,
-                &app,
-                &domain,
-                edge_config_generation,
-            ))
+            .guard_provider_in_tx(
+                &mut app_lane,
+                ensure_custom_domain_haproxy_route(
+                    &state,
+                    auth.org_id,
+                    &app,
+                    &domain,
+                    edge_config_generation,
+                ),
+            )
             .await
             .map_err(|_| internal_error())??
     } else {
@@ -575,24 +587,30 @@ pub async fn verify_challenge(
         && old != domain
     {
         mutation
-            .guard_provider(crate::dns::delete_dns_record(
-                &state.db,
-                &state.http_client,
-                state.dns.as_ref(),
-                app.id,
-                old,
-            ))
+            .guard_provider_in_tx(
+                &mut app_lane,
+                crate::dns::delete_dns_record(
+                    &state.db,
+                    &state.http_client,
+                    state.dns.as_ref(),
+                    app.id,
+                    old,
+                ),
+            )
             .await
             .map_err(|_| internal_error())?
             .map_err(dns_error_response)?;
         if mutation
-            .guard_provider(crate::edge::remove_haproxy_routes(
-                &state.db,
-                &crate::edge::EdgeRouteConfig::from_env(),
-                state.runtime_authority,
-                Some(edge_config_generation),
-                &[(app_backend.clone(), old.to_string())],
-            ))
+            .guard_provider_in_tx(
+                &mut app_lane,
+                crate::edge::remove_haproxy_routes(
+                    &state.db,
+                    &crate::edge::EdgeRouteConfig::from_env(),
+                    state.runtime_authority,
+                    Some(edge_config_generation),
+                    &[(app_backend.clone(), old.to_string())],
+                ),
+            )
             .await
             .map_err(|_| internal_error())?
             .is_err()
@@ -708,13 +726,16 @@ pub async fn remove_custom_domain(
     }
 
     mutation
-        .guard_provider(crate::dns::delete_dns_record(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            app.id,
-            &domain,
-        ))
+        .guard_provider_in_tx(
+            &mut app_lane,
+            crate::dns::delete_dns_record(
+                &state.db,
+                &state.http_client,
+                state.dns.as_ref(),
+                app.id,
+                &domain,
+            ),
+        )
         .await
         .map_err(|_| internal_error())?
         .map_err(dns_error_response)?;
@@ -735,13 +756,16 @@ pub async fn remove_custom_domain(
         )?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
     if mutation
-        .guard_provider(crate::edge::remove_haproxy_routes(
-            &state.db,
-            &edge_config,
-            state.runtime_authority,
-            Some(edge_config_generation),
-            &[(app_backend, domain.clone())],
-        ))
+        .guard_provider_in_tx(
+            &mut app_lane,
+            crate::edge::remove_haproxy_routes(
+                &state.db,
+                &edge_config,
+                state.runtime_authority,
+                Some(edge_config_generation),
+                &[(app_backend, domain.clone())],
+            ),
+        )
         .await
         .map_err(|_| internal_error())?
         .is_err()

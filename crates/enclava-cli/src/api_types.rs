@@ -471,6 +471,10 @@ pub struct DeploymentContextResponse {
     pub current_platform_release_id: Option<String>,
     #[serde(default)]
     pub platform_release_envelope: Option<PlatformReleaseEnvelope>,
+    #[serde(default)]
+    pub debug_trustee_kbs_url_override: Option<String>,
+    #[serde(default)]
+    pub debug_trustee_kbs_ca_cert_pem_override: Option<String>,
 }
 
 // --- Status ---

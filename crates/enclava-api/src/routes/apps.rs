@@ -998,17 +998,20 @@ pub async fn create_app(
     }
 
     let dns_setup = dns_mutation
-        .guard_provider(crate::dns::ensure_dns_pair(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            app_id,
-            &app_candidate.domain,
-            app_candidate
-                .tee_domain
-                .as_deref()
-                .unwrap_or(&app_candidate.domain),
-        ))
+        .guard_provider_in_tx(
+            &mut dns_lane,
+            crate::dns::ensure_dns_pair(
+                &state.db,
+                &state.http_client,
+                state.dns.as_ref(),
+                app_id,
+                &app_candidate.domain,
+                app_candidate
+                    .tee_domain
+                    .as_deref()
+                    .unwrap_or(&app_candidate.domain),
+            ),
+        )
         .await
         .map_err(|_| internal_server_error())?;
     if let Err(e) = dns_setup {
@@ -1019,17 +1022,20 @@ pub async fn create_app(
         // the hostname generations through quarantine; DELETE retries perform
         // provider discovery by hostname before the app can disappear.
         let _cleanup_result = dns_mutation
-            .guard_provider(crate::dns::delete_managed_dns_pair_by_hostname(
-                &state.db,
-                &state.http_client,
-                state.dns.as_ref(),
-                app_id,
-                &app_candidate.domain,
-                app_candidate
-                    .tee_domain
-                    .as_deref()
-                    .unwrap_or(&app_candidate.domain),
-            ))
+            .guard_provider_in_tx(
+                &mut dns_lane,
+                crate::dns::delete_managed_dns_pair_by_hostname(
+                    &state.db,
+                    &state.http_client,
+                    state.dns.as_ref(),
+                    app_id,
+                    &app_candidate.domain,
+                    app_candidate
+                        .tee_domain
+                        .as_deref()
+                        .unwrap_or(&app_candidate.domain),
+                ),
+            )
             .await
             .map_err(|_| internal_server_error())?;
         dns_mutation
@@ -1356,7 +1362,10 @@ pub async fn delete_app(
     }
 
     delete_mutation
-        .guard_provider(request_workload_teardown(&state, &auth, &deleting_app))
+        .guard_provider_in_tx(
+            &mut delete_lane,
+            request_workload_teardown(&state, &auth, &deleting_app),
+        )
         .await
         .map_err(|_| internal_server_error())??;
 
@@ -1367,12 +1376,15 @@ pub async fn delete_app(
             .map_err(|_| internal_server_error())?;
     }
     let tracked_dns_cleanup = delete_mutation
-        .guard_provider(crate::dns::delete_all_dns_records_for_app(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            deleting_app.id,
-        ))
+        .guard_provider_in_tx(
+            &mut delete_lane,
+            crate::dns::delete_all_dns_records_for_app(
+                &state.db,
+                &state.http_client,
+                state.dns.as_ref(),
+                deleting_app.id,
+            ),
+        )
         .await
         .map_err(|_| internal_server_error())?;
     if let Err(error) = tracked_dns_cleanup {
@@ -1387,17 +1399,20 @@ pub async fn delete_app(
         return Err(app_delete_dns_failure(deleting_app.id, error));
     }
     let expected_dns_cleanup = delete_mutation
-        .guard_provider(crate::dns::delete_managed_dns_pair_by_hostname(
-            &state.db,
-            &state.http_client,
-            state.dns.as_ref(),
-            deleting_app.id,
-            &deleting_app.domain,
-            deleting_app
-                .tee_domain
-                .as_deref()
-                .unwrap_or(&deleting_app.domain),
-        ))
+        .guard_provider_in_tx(
+            &mut delete_lane,
+            crate::dns::delete_managed_dns_pair_by_hostname(
+                &state.db,
+                &state.http_client,
+                state.dns.as_ref(),
+                deleting_app.id,
+                &deleting_app.domain,
+                deleting_app
+                    .tee_domain
+                    .as_deref()
+                    .unwrap_or(&deleting_app.domain),
+            ),
+        )
         .await
         .map_err(|_| internal_server_error())?;
     if let Err(error) = expected_dns_cleanup {
@@ -1453,13 +1468,16 @@ pub async fn delete_app(
     routes_to_remove.sort();
     routes_to_remove.dedup();
     delete_mutation
-        .guard_provider(crate::edge::remove_haproxy_routes(
-            &state.db,
-            &crate::edge::EdgeRouteConfig::from_env(),
-            state.runtime_authority,
-            Some(edge_config_generation),
-            &routes_to_remove,
-        ))
+        .guard_provider_in_tx(
+            &mut delete_lane,
+            crate::edge::remove_haproxy_routes(
+                &state.db,
+                &crate::edge::EdgeRouteConfig::from_env(),
+                state.runtime_authority,
+                Some(edge_config_generation),
+                &routes_to_remove,
+            ),
+        )
         .await
         .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeRoute, error))?;
@@ -1481,11 +1499,14 @@ pub async fn delete_app(
         .await
         .map_err(|_| internal_server_error())?;
     delete_mutation
-        .guard_provider(delete_tenant_namespace(
-            kubernetes_namespaces,
-            &deleting_app.namespace,
-            kubernetes_mutation_generation,
-        ))
+        .guard_provider_in_tx(
+            &mut delete_lane,
+            delete_tenant_namespace(
+                kubernetes_namespaces,
+                &deleting_app.namespace,
+                kubernetes_mutation_generation,
+            ),
+        )
         .await
         .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::Namespace, error))?;
@@ -1500,11 +1521,14 @@ pub async fn delete_app(
             app_delete_failure(deleting_app.id, AppDeleteFailure::KbsTlsBinding, error)
         })?;
     delete_mutation
-        .guard_provider(crate::kbs::reconcile_policy(
-            &state.db,
-            state.kbs_policy.as_ref(),
-            state.runtime_authority,
-        ))
+        .guard_provider_in_tx(
+            &mut delete_lane,
+            crate::kbs::reconcile_policy(
+                &state.db,
+                state.kbs_policy.as_ref(),
+                state.runtime_authority,
+            ),
+        )
         .await
         .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::KbsPolicy, error))?;

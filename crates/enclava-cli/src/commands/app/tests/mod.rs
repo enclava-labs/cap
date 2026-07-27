@@ -86,6 +86,8 @@ fn test_deployment_context() -> DeploymentContextResponse {
         tls_certificate_broker_url: None,
         current_platform_release_id: None,
         platform_release_envelope: None,
+        debug_trustee_kbs_url_override: None,
+        debug_trustee_kbs_ca_cert_pem_override: None,
     }
 }
 
@@ -140,6 +142,8 @@ fn deployment_context_platform_release_is_verified_and_selected() {
         tls_certificate_broker_url: None,
         current_platform_release_id: Some(expected_release_id.clone()),
         platform_release_envelope: Some(envelope),
+        debug_trustee_kbs_url_override: None,
+        debug_trustee_kbs_ca_cert_pem_override: None,
     };
 
     let release =
@@ -150,6 +154,33 @@ fn deployment_context_platform_release_is_verified_and_selected() {
         .expect("context release present");
 
     assert_eq!(release.platform_release_version, expected_release_id);
+}
+
+#[test]
+fn debug_deployment_context_override_drives_effective_signed_cc_inputs() {
+    let envelope = PlatformReleaseEnvelope {
+        payload: test_release(),
+        signature: "33".repeat(64),
+        signing_pubkey: "44".repeat(32),
+    };
+    let deployment_context = DeploymentContextResponse {
+        api_signing_pubkey: "test-api-signing-pubkey".to_string(),
+        tls_certificate_broker_url: None,
+        current_platform_release_id: Some(envelope.payload.platform_release_version.clone()),
+        platform_release_envelope: Some(envelope),
+        debug_trustee_kbs_url_override: Some("http://trustee.local.test:8080".to_string()),
+        debug_trustee_kbs_ca_cert_pem_override: None,
+    };
+
+    let release =
+        platform_release_from_deployment_context_with_verifier(&deployment_context, |envelope| {
+            Ok::<_, &'static str>(envelope.payload)
+        })
+        .expect("debug context override is valid")
+        .expect("context release present");
+
+    assert_eq!(release.trustee_kbs_url, "http://trustee.local.test:8080");
+    assert!(release.trustee_kbs_ca_cert_pem.is_empty());
 }
 
 #[test]
@@ -164,6 +195,8 @@ fn deployment_context_platform_release_tampering_fails_closed() {
         tls_certificate_broker_url: None,
         current_platform_release_id: Some(envelope.payload.platform_release_version.clone()),
         platform_release_envelope: Some(envelope),
+        debug_trustee_kbs_url_override: None,
+        debug_trustee_kbs_ca_cert_pem_override: None,
     };
 
     let err =
@@ -245,6 +278,8 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
         ),
         current_platform_release_id: None,
         platform_release_envelope: None,
+        debug_trustee_kbs_url_override: None,
+        debug_trustee_kbs_ca_cert_pem_override: None,
     };
 
     let app = confidential_app_for_cc_hash(

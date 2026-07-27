@@ -200,6 +200,13 @@ pub struct AppState {
     /// Signed public platform release envelope used to derive
     /// runtime-sensitive descriptor inputs for this API instance.
     pub platform_release_envelope: Option<PlatformReleaseEnvelope>,
+    /// Debug-build-only effective Trustee URL advertised alongside the signed
+    /// release. Production binaries never populate this unsigned local-stack
+    /// override, and release CLIs reject it.
+    pub debug_trustee_kbs_url_override: Option<String>,
+    /// Effective PEM included in debug cc_init_data when the local Trustee URL
+    /// override is active.
+    pub debug_trustee_kbs_ca_cert_pem_override: Option<String>,
     /// Cloudflare DNS settings for CAP-managed tenant host records.
     pub dns: Option<DnsConfig>,
     /// ACME settings for the workload-attested DNS-01 certificate broker.

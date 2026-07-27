@@ -431,10 +431,13 @@ where
             });
         }
         let updated = mutate(&current);
-        let mutation_authority_changed = current_authority_epoch != Some(authority.epoch)
-            || current_authority_restore_generation != Some(authority.restore_generation)
-            || mutation_generation.is_some_and(|expected| current_mutation_generation != expected);
-        if updated == current && !mutation_authority_changed {
+        let runtime_authority_changed = current_authority_epoch != Some(authority.epoch)
+            || current_authority_restore_generation != Some(authority.restore_generation);
+        // A newly claimed periodic reconciliation generation does not represent
+        // new HAProxy intent when the rendered body and runtime authority are
+        // already identical. Avoid replacing a potentially large ConfigMap
+        // every 30 seconds merely to advance an internal lease annotation.
+        if updated == current && !runtime_authority_changed {
             converged = true;
             break;
         }
@@ -1503,6 +1506,39 @@ mod tests {
             converged.generation.as_deref(),
             Some(haproxy_config_generation(desired).as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn periodic_reconcile_skips_generation_only_configmap_publication() {
+        let config = "global\n  maxconn 4096\n";
+        let state = Arc::new(Mutex::new(FakeKubeState::new(config)));
+        {
+            let mut converged = state.lock().unwrap();
+            converged.mutation_generation = Some(1);
+            converged.configmap_authority_epoch = Some(test_runtime_authority().epoch);
+            converged.configmap_restore_generation =
+                Some(test_runtime_authority().restore_generation);
+            converged.daemonset_authority_epoch = Some(test_runtime_authority().epoch);
+            converged.daemonset_restore_generation =
+                Some(test_runtime_authority().restore_generation);
+        }
+        let client = fake_kube_client(Arc::clone(&state));
+
+        let changed = reconcile_haproxy_config(
+            client,
+            &edge_config(),
+            test_runtime_authority(),
+            Some(2),
+            |current| current.to_string(),
+        )
+        .await
+        .expect("unchanged periodic reconciliation converges");
+        assert!(!changed);
+
+        let converged = state.lock().unwrap();
+        assert_eq!(converged.mutation_generation, Some(1));
+        assert_eq!(converged.configmap_patch_attempts, 0);
+        assert_eq!(converged.daemonset_patch_attempts, 0);
     }
 
     #[tokio::test]

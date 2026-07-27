@@ -1,7 +1,8 @@
 -- Failed-rollout cleanup is the sole authority allowed to publish the pending
--- KBS revocation and release its exact app/provider mutation set. Preserve
--- backfilled migration-0045 owners indefinitely so generic KBS/edge startup
--- reconcilers cannot reclaim a finite provider fence first.
+-- KBS revocation (when its KBS fence is still present) and release its exact
+-- retained app/provider mutation subset. Preserve backfilled migration-0045
+-- owners indefinitely so generic KBS/edge startup reconcilers cannot reclaim
+-- a finite provider fence first.
 
 UPDATE app_mutation_leases AS mutation
    SET reclaim_after = 'infinity'::timestamptz,

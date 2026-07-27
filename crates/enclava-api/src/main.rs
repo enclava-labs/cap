@@ -102,13 +102,15 @@ fn trustee_kbs_url_matches_release(
     actual: &str,
     expected: &str,
     release_build: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let url = validate_trustee_kbs_url(actual, release_build)?;
     if !release_build && url.scheme() == "http" {
         // Debug/local stacks intentionally use a local HTTP Trustee while still
         // consuming the bundled signed release for every immutable image and
-        // policy setting. Release builds never reach this exemption.
-        return Ok(());
+        // policy setting. The effective value is advertised separately so a
+        // debug CLI hashes the exact same cc_init_data; release binaries never
+        // emit or accept this unsigned override.
+        return Ok(Some(actual.trim().to_string()));
     }
     if actual.trim() != expected.trim() {
         anyhow::bail!(
@@ -116,13 +118,13 @@ fn trustee_kbs_url_matches_release(
             expected.trim()
         );
     }
-    Ok(())
+    Ok(None)
 }
 
 fn require_trustee_kbs_url_matches_release(
     expected: &str,
     release_build: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let actual = env_nonempty("TRUSTEE_KBS_URL")
         .ok_or_else(|| anyhow::anyhow!("TRUSTEE_KBS_URL is required by signed platform release"))?;
     trustee_kbs_url_matches_release(&actual, expected, release_build)
@@ -631,6 +633,8 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+    let mut debug_trustee_kbs_url_override = None;
+    let mut debug_trustee_kbs_ca_cert_pem_override = None;
     if let Some(envelope) = &platform_release_envelope {
         let release = &envelope.payload;
         tracing::info!(
@@ -638,12 +642,22 @@ async fn main() {
             genpolicy_version = %release.genpolicy_version,
             "signed platform release loaded"
         );
-        if let Err(e) = require_trustee_kbs_url_matches_release(
+        match require_trustee_kbs_url_matches_release(
             &release.trustee_kbs_url,
             !cfg!(debug_assertions),
         ) {
-            eprintln!("startup refused: {e}");
-            std::process::exit(1);
+            Ok(debug_override) => {
+                debug_trustee_kbs_url_override = debug_override;
+                if debug_trustee_kbs_url_override.is_some() {
+                    debug_trustee_kbs_ca_cert_pem_override =
+                        env_nonempty("TRUSTEE_KBS_CA_CERT_PEM")
+                            .map(|value| value.replace("\\n", "\n"));
+                }
+            }
+            Err(e) => {
+                eprintln!("startup refused: {e}");
+                std::process::exit(1);
+            }
         }
         for (name, expected) in [
             (
@@ -660,7 +674,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        if !release.trustee_kbs_ca_cert_pem.trim().is_empty()
+        if debug_trustee_kbs_url_override.is_none()
+            && !release.trustee_kbs_ca_cert_pem.trim().is_empty()
             && let Err(e) = require_env_matches_release(
                 "TRUSTEE_KBS_CA_CERT_PEM",
                 &release.trustee_kbs_ca_cert_pem,
@@ -862,6 +877,8 @@ async fn main() {
         tee_http_client,
         attestation,
         platform_release_envelope,
+        debug_trustee_kbs_url_override,
+        debug_trustee_kbs_ca_cert_pem_override,
         dns,
         acme,
         kbs_policy,
@@ -1017,12 +1034,15 @@ mod tests {
 
     #[test]
     fn debug_http_trustee_can_override_bundled_release_url() {
-        trustee_kbs_url_matches_release(
-            "http://trustee.example.test:8080",
-            "https://trustee.preprod.example.test:8443",
-            false,
-        )
-        .expect("debug HTTP Trustee must remain reachable with the bundled signed release");
+        assert_eq!(
+            trustee_kbs_url_matches_release(
+                "http://trustee.example.test:8080",
+                "https://trustee.preprod.example.test:8443",
+                false,
+            )
+            .expect("debug HTTP Trustee must remain reachable with the bundled signed release"),
+            Some("http://trustee.example.test:8080".to_string())
+        );
     }
 
     #[test]

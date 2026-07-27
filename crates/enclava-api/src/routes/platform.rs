@@ -15,6 +15,10 @@ pub struct DeploymentContextResponse {
     pub current_platform_release_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform_release_envelope: Option<PlatformReleaseEnvelope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_trustee_kbs_url_override: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_trustee_kbs_ca_cert_pem_override: Option<String>,
 }
 
 /// GET /platform/deployment-context -- runtime values needed for descriptor signing.
@@ -39,6 +43,10 @@ pub(crate) fn deployment_context_response(state: &AppState) -> DeploymentContext
             .as_ref()
             .map(|envelope| envelope.payload.platform_release_version.clone()),
         platform_release_envelope: state.platform_release_envelope.clone(),
+        debug_trustee_kbs_url_override: state.debug_trustee_kbs_url_override.clone(),
+        debug_trustee_kbs_ca_cert_pem_override: state
+            .debug_trustee_kbs_ca_cert_pem_override
+            .clone(),
     }
 }
 
@@ -98,6 +106,8 @@ mod tests {
         let mut state = lazy_state();
         state.platform_release_envelope =
             Some(PlatformReleaseEnvelope::load_verified().expect("test platform release"));
+        state.debug_trustee_kbs_url_override = Some("http://trustee.local.test:8080".to_string());
+        state.debug_trustee_kbs_ca_cert_pem_override = None;
 
         let Json(response) = deployment_context(auth_context(Role::Admin, &[]), State(state))
             .await
@@ -112,5 +122,10 @@ mod tests {
         );
         assert!(!envelope.signature.is_empty());
         assert!(!envelope.signing_pubkey.is_empty());
+        assert_eq!(
+            response.debug_trustee_kbs_url_override.as_deref(),
+            Some("http://trustee.local.test:8080")
+        );
+        assert!(response.debug_trustee_kbs_ca_cert_pem_override.is_none());
     }
 }

@@ -574,6 +574,8 @@ pub(crate) mod test_support {
                 signing_service_pubkey_hex: Some("11".repeat(32)),
             }),
             platform_release_envelope: None,
+            debug_trustee_kbs_url_override: None,
+            debug_trustee_kbs_ca_cert_pem_override: None,
             dns: None,
             acme: None,
             kbs_policy: None,

@@ -5,8 +5,9 @@
 -- fence behind a job that already says completed.
 
 ALTER TABLE deployment_apply_jobs
-    DROP CONSTRAINT deployment_apply_jobs_state_check,
-    DROP CONSTRAINT deployment_apply_jobs_check1;
+    DROP CONSTRAINT IF EXISTS deployment_apply_jobs_state_check,
+    DROP CONSTRAINT IF EXISTS deployment_apply_jobs_check1,
+    DROP CONSTRAINT IF EXISTS deployment_apply_jobs_lock_state_check;
 
 ALTER TABLE deployment_apply_jobs
     ADD CONSTRAINT deployment_apply_jobs_state_check
@@ -50,7 +51,10 @@ CREATE INDEX idx_deployment_apply_jobs_dispatch
 -- publishing the failed deployment and releasing its retained mutation
 -- fences. Apply errors use job.state='failed', so completed+failed identifies
 -- the fully observed rollout path whose remaining KBS revocation is safe to
--- retry.
+-- retry. A previous binary may already have released only its KBS fence before
+-- crashing; cleanup loads and releases that exact retained provider subset,
+-- and treats the absent KBS owner as proof that Trustee reconciliation already
+-- completed.
 UPDATE deployment_apply_jobs AS job
    SET state = 'rollout_cleanup_pending',
        next_attempt_at = clock_timestamp(),

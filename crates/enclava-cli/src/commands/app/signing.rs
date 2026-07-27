@@ -31,7 +31,7 @@ where
     let Some(envelope) = deployment_context.platform_release_envelope.clone() else {
         return Ok(None);
     };
-    let release = verify(envelope).map_err(|err| {
+    let mut release = verify(envelope).map_err(|err| {
         format!("platform deployment context included an invalid platform_release_envelope: {err}")
     })?;
     let expected_release_id = deployment_context
@@ -47,6 +47,32 @@ where
             release.platform_release_version
         )
         .into());
+    }
+    match deployment_context.debug_trustee_kbs_url_override.as_deref() {
+        Some(_) if !cfg!(debug_assertions) => {
+            return Err("release CLI refused an unsigned debug Trustee transport override".into());
+        }
+        Some(url) => {
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|err| format!("invalid debug Trustee transport override: {err}"))?;
+            if parsed.scheme() != "http" {
+                return Err(
+                    "debug Trustee transport override must use the local HTTP scheme".into(),
+                );
+            }
+            release.trustee_kbs_url = url.to_string();
+            release.trustee_kbs_ca_cert_pem = deployment_context
+                .debug_trustee_kbs_ca_cert_pem_override
+                .clone()
+                .unwrap_or_default();
+        }
+        None if deployment_context
+            .debug_trustee_kbs_ca_cert_pem_override
+            .is_some() =>
+        {
+            return Err("debug Trustee CA override requires a Trustee URL override".into());
+        }
+        None => {}
     }
     Ok(Some(release))
 }

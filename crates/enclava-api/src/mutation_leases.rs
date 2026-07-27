@@ -18,7 +18,7 @@ const LEASE_SECONDS: i64 = 180;
 // kube-client's default read/write timeout is 295s. Keep a full minute of
 // margin after a canceled/accepted Kubernetes request before another durable
 // generation may reuse the same external resource.
-const RECLAIM_QUARANTINE_SECONDS: i64 = 360;
+pub(crate) const RECLAIM_QUARANTINE_SECONDS: i64 = 360;
 const HEARTBEAT_SECONDS: u64 = 30;
 const RENEW_TIMEOUT_SECONDS: u64 = 10;
 
@@ -152,7 +152,33 @@ impl AppMutationLease {
         F: Future<Output = T> + 'a,
         T: 'a,
     {
-        guard_provider_future(self.heartbeat_lost.clone(), future)
+        guard_provider_with_authority_lock(
+            &self.pool,
+            self.runtime_authority,
+            self.heartbeat_lost.clone(),
+            future,
+        )
+    }
+
+    /// Guard a provider future with the caller's existing publication
+    /// transaction. `FOR SHARE` on the runtime-authority singleton remains held
+    /// until that transaction commits or rolls back, so a restore rotation
+    /// cannot overtake an admitted provider call.
+    pub fn guard_provider_in_tx<'a, 'c, F, T>(
+        &'a self,
+        tx: &'a mut Transaction<'c, Postgres>,
+        future: F,
+    ) -> impl Future<Output = Result<T, MutationLeaseError>> + 'a + use<'a, 'c, F, T>
+    where
+        F: Future<Output = T> + 'a,
+        T: 'a,
+    {
+        guard_provider_in_authority_tx(
+            tx,
+            self.runtime_authority,
+            self.heartbeat_lost.clone(),
+            future,
+        )
     }
 
     /// Assert generation/token ownership and clear it in the caller's
@@ -450,7 +476,12 @@ impl ResourceMutationLease {
         F: Future<Output = T> + 'a,
         T: 'a,
     {
-        guard_provider_future(self.heartbeat_lost.clone(), future)
+        guard_provider_with_authority_lock(
+            &self.pool,
+            self.runtime_authority,
+            self.heartbeat_lost.clone(),
+            future,
+        )
     }
 
     pub async fn finish(mut self) -> Result<(), MutationLeaseError> {
@@ -493,6 +524,96 @@ where
                 output = &mut future => return Ok(output),
             }
         }
+    }
+}
+
+fn guard_provider_with_authority_lock<'a, F, T>(
+    pool: &'a PgPool,
+    runtime_authority: RuntimeAuthority,
+    mut heartbeat_lost: watch::Receiver<bool>,
+    future: F,
+) -> impl Future<Output = Result<T, MutationLeaseError>> + 'a + use<'a, F, T>
+where
+    F: Future<Output = T> + 'a,
+    T: 'a,
+{
+    // Keep large provider state behind one pointer across the nested
+    // connection-admission and authority-guard futures.
+    let future = Box::pin(future);
+    async move {
+        if *heartbeat_lost.borrow() {
+            return Err(MutationLeaseError::Lost);
+        }
+        let mut begin = Box::pin(pool.begin());
+        let mut tx = tokio::select! {
+            biased;
+            changed = heartbeat_lost.changed() => {
+                let _ = changed;
+                return Err(MutationLeaseError::Lost);
+            }
+            result = &mut begin => result?,
+        };
+        let result =
+            guard_provider_in_authority_tx(&mut tx, runtime_authority, heartbeat_lost, future)
+                .await;
+        tx.rollback().await?;
+        result
+    }
+}
+
+/// Hold the runtime-authority singleton lock across an external provider
+/// future that is owned by durable work other than an `AppMutationLease`.
+/// Restore rotation uses `FOR UPDATE` on the same row, so it drains this call
+/// before rotating and a call queued after rotation is never polled.
+pub(crate) fn guard_provider_with_runtime_authority<'a, F, T>(
+    pool: &'a PgPool,
+    runtime_authority: RuntimeAuthority,
+    future: F,
+) -> impl Future<Output = Result<T, MutationLeaseError>> + 'a + use<'a, F, T>
+where
+    F: Future<Output = T> + 'a,
+    T: 'a,
+{
+    let (_heartbeat_lost_tx, heartbeat_lost) = watch::channel(false);
+    guard_provider_with_authority_lock(pool, runtime_authority, heartbeat_lost, future)
+}
+
+async fn guard_provider_in_authority_tx<'a, 'c, F, T>(
+    tx: &'a mut Transaction<'c, Postgres>,
+    runtime_authority: RuntimeAuthority,
+    mut heartbeat_lost: watch::Receiver<bool>,
+    future: F,
+) -> Result<T, MutationLeaseError>
+where
+    F: Future<Output = T> + 'a,
+    T: 'a,
+{
+    // The shared singleton-row lock closes the gap between a one-time
+    // authority check and the provider side effect. Restore rotation uses
+    // `FOR UPDATE`, so it waits for this future and any caller-owned
+    // publication transaction to drain. A guard queued behind a completed
+    // rotation observes the new authority and refuses to poll `future`.
+    require_current_runtime_authority_or_lease_lost(&runtime_authority, tx, &mut heartbeat_lost)
+        .await?;
+    guard_provider_future(heartbeat_lost, future).await
+}
+
+async fn require_current_runtime_authority_or_lease_lost(
+    runtime_authority: &RuntimeAuthority,
+    tx: &mut Transaction<'_, Postgres>,
+    heartbeat_lost: &mut watch::Receiver<bool>,
+) -> Result<(), MutationLeaseError> {
+    if *heartbeat_lost.borrow() {
+        return Err(MutationLeaseError::Lost);
+    }
+    let mut authority_check = Box::pin(require_current_runtime_authority(runtime_authority, tx));
+    tokio::select! {
+        biased;
+        changed = heartbeat_lost.changed() => {
+            let _ = changed;
+            Err(MutationLeaseError::Lost)
+        }
+        result = &mut authority_check => result,
     }
 }
 
@@ -759,12 +880,11 @@ async fn claim_resource_rows(
     Ok(claimed_resources)
 }
 
-async fn load_reconciliation_owner(
+async fn load_reconciliation_owner_rows(
     tx: &mut Transaction<'_, Postgres>,
     app_id: Uuid,
     operation_kind: &str,
     operation_id: Uuid,
-    expected_resources: &[ResourceFence],
 ) -> Result<(Uuid, i64, Vec<ClaimedResource>), MutationLeaseError> {
     let Some((token, generation)) = sqlx::query_as::<_, (Uuid, i64)>(
         "SELECT owner_token, generation
@@ -806,6 +926,18 @@ async fn load_reconciliation_owner(
         });
     }
 
+    Ok((token, generation, resources))
+}
+
+async fn load_reconciliation_owner(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    operation_kind: &str,
+    operation_id: Uuid,
+    expected_resources: &[ResourceFence],
+) -> Result<(Uuid, i64, Vec<ClaimedResource>), MutationLeaseError> {
+    let (token, generation, resources) =
+        load_reconciliation_owner_rows(tx, app_id, operation_kind, operation_id).await?;
     let mut expected = expected_resources.to_vec();
     expected.sort();
     expected.dedup();
@@ -817,6 +949,24 @@ async fn load_reconciliation_owner(
         return Err(MutationLeaseError::Lost);
     }
     Ok((token, generation, resources))
+}
+
+/// Load and lock the exact provider-resource subset still owned by a durable
+/// reconciliation operation. Pre-0045 rollout cleanup could release the KBS
+/// fence before crashing, so migration recovery must accept that retained
+/// subset rather than inventing or requiring an already-released owner.
+pub async fn reconciliation_owner_resources_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    operation_kind: &str,
+    operation_id: Uuid,
+) -> Result<Vec<ResourceFence>, MutationLeaseError> {
+    let (_, _, resources) =
+        load_reconciliation_owner_rows(tx, app_id, operation_kind, operation_id).await?;
+    Ok(resources
+        .into_iter()
+        .map(|resource| resource.fence)
+        .collect())
 }
 
 /// Verify the exact durable mutation owner left by a terminal failed rollout.
@@ -1234,8 +1384,20 @@ mod tests {
 
     #[tokio::test]
     async fn public_provider_guard_preserves_completion_and_cancellation() {
-        let (_lost_tx, lost_rx) = watch::channel(false);
-        let app_lease = test_app_mutation_lease(lost_rx);
+        let pool = database_test_pool(4).await;
+        let hostname = format!("provider-guard-{}.example.test", Uuid::new_v4().simple());
+        let (org_id, app_id) = insert_app(&pool, &hostname).await;
+        let state = state_with_pool(pool.clone());
+        let app_lease = claim(
+            &state,
+            app_id,
+            "provider_guard_completion",
+            Uuid::new_v4(),
+            false,
+            Vec::new(),
+        )
+        .await
+        .expect("claim provider completion guard");
         assert_eq!(
             app_lease
                 .guard_provider(async { 7_u8 })
@@ -1243,6 +1405,10 @@ mod tests {
                 .expect("provider completion passes through"),
             7
         );
+        app_lease
+            .finish()
+            .await
+            .expect("release provider completion guard");
 
         struct DropSignal(Arc<AtomicBool>);
         impl Drop for DropSignal {
@@ -1252,7 +1418,18 @@ mod tests {
         }
 
         let (lost_tx, lost_rx) = watch::channel(false);
-        let app_lease = test_app_mutation_lease(lost_rx);
+        let mut app_lease = claim(
+            &state,
+            app_id,
+            "provider_guard_cancellation",
+            Uuid::new_v4(),
+            false,
+            Vec::new(),
+        )
+        .await
+        .expect("claim provider cancellation guard");
+        app_lease.stop_heartbeat();
+        app_lease.heartbeat_lost = lost_rx;
         let entered = Arc::new(Notify::new());
         let provider_entered = entered.clone();
         let dropped = Arc::new(AtomicBool::new(false));
@@ -1273,6 +1450,15 @@ mod tests {
         .expect("provider guard must react promptly to lease loss");
         assert!(matches!(guarded, Err(MutationLeaseError::Lost)));
         assert!(dropped.load(Ordering::SeqCst));
+        app_lease
+            .finish()
+            .await
+            .expect("release provider cancellation guard");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete provider guard organization fixture");
     }
 
     #[derive(Default)]
@@ -1555,43 +1741,36 @@ mod tests {
         assert_eq!(app_deadline_after, app_deadline_before);
         assert_eq!(resource_deadline_after, resource_deadline_before);
 
-        let (app_heartbeat, app_lost) = spawn_app_heartbeat(
-            pool.clone(),
-            app_owner.app_id,
-            app_owner.token,
-            app_owner.generation,
-            app_owner.resources.clone(),
-            stale_authority,
-            HeartbeatTiming {
-                interval: Duration::from_millis(5),
-                renew_timeout: Duration::from_millis(100),
-            },
-        );
-        app_owner.heartbeat = Some(app_heartbeat);
+        let (_app_lost_tx, app_lost) = watch::channel(false);
         app_owner.heartbeat_lost = app_lost;
-        let (resource_heartbeat, resource_lost) = spawn_resource_heartbeat(
-            pool.clone(),
-            resource_owner.token,
-            resource_owner.resources.clone(),
-            stale_authority,
-            HeartbeatTiming {
-                interval: Duration::from_millis(5),
-                renew_timeout: Duration::from_millis(100),
-            },
-        );
-        resource_owner.heartbeat = Some(resource_heartbeat);
+        let (_resource_lost_tx, resource_lost) = watch::channel(false);
         resource_owner.heartbeat_lost = resource_lost;
-
+        let app_polled = Arc::new(AtomicBool::new(false));
+        let resource_polled = Arc::new(AtomicBool::new(false));
+        let mark_app_polled = app_polled.clone();
+        let mark_resource_polled = resource_polled.clone();
         let (app_guard, resource_guard) = tokio::time::timeout(Duration::from_secs(1), async {
             tokio::join!(
-                app_owner.guard_provider(std::future::pending::<()>()),
-                resource_owner.guard_provider(std::future::pending::<()>()),
+                app_owner.guard_provider(async move {
+                    mark_app_polled.store(true, Ordering::SeqCst);
+                }),
+                resource_owner.guard_provider(async move {
+                    mark_resource_polled.store(true, Ordering::SeqCst);
+                }),
             )
         })
         .await
-        .expect("stale heartbeat must promptly cancel both provider futures");
-        assert!(matches!(app_guard, Err(MutationLeaseError::Lost)));
-        assert!(matches!(resource_guard, Err(MutationLeaseError::Lost)));
+        .expect("stale authority must promptly reject both provider futures");
+        assert!(matches!(
+            app_guard,
+            Err(MutationLeaseError::StaleRuntimeAuthority)
+        ));
+        assert!(matches!(
+            resource_guard,
+            Err(MutationLeaseError::StaleRuntimeAuthority)
+        ));
+        assert!(!app_polled.load(Ordering::SeqCst));
+        assert!(!resource_polled.load(Ordering::SeqCst));
 
         let app_token = app_owner.token;
         let resource_token = resource_owner.token;
@@ -1608,6 +1787,94 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete stale-renew organization fixture");
+    }
+
+    #[tokio::test]
+    async fn restore_rotation_waits_for_admitted_provider_and_publication_transaction() {
+        let pool = database_test_pool(4).await;
+        let hostname = format!("restore-drain-{}.example.test", Uuid::new_v4().simple());
+        let (org_id, app_id) = insert_app(&pool, &hostname).await;
+        let state = state_with_pool(pool.clone());
+        let mut owner = claim(
+            &state,
+            app_id,
+            "restore_drain_provider",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::dns(&hostname)],
+        )
+        .await
+        .expect("claim provider generation before restore");
+        let mut publication = pool.begin().await.expect("begin provider publication lane");
+        crate::deploy::lock_app_deployment_lane(&mut publication, app_id)
+            .await
+            .expect("lock provider publication lane");
+
+        let provider_entered = Arc::new(Notify::new());
+        let provider_release = Arc::new(Notify::new());
+        let entered = provider_entered.clone();
+        let release = provider_release.clone();
+        let provider = tokio::spawn(async move {
+            owner
+                .guard_provider_in_tx(&mut publication, async move {
+                    entered.notify_one();
+                    release.notified().await;
+                })
+                .await
+                .expect("admitted provider completes");
+            owner
+                .finish_in_tx(&mut publication)
+                .await
+                .expect("publish and release provider generation");
+            publication
+                .commit()
+                .await
+                .expect("commit provider publication");
+        });
+        provider_entered.notified().await;
+
+        let rotation_pool = pool.clone();
+        let mut rotation = tokio::spawn(async move {
+            crate::runtime_authority::establish_epoch(
+                &rotation_pool,
+                crate::runtime_authority::TEST_RUNTIME_AUTHORITY.restore_generation + 1,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut rotation)
+                .await
+                .is_err(),
+            "restore rotation must wait while an admitted provider is in flight"
+        );
+
+        provider_release.notify_one();
+        provider.await.expect("provider publication task joins");
+        let advanced = rotation
+            .await
+            .expect("restore rotation task joins")
+            .expect("restore rotation succeeds after provider publication drains");
+        assert_eq!(
+            advanced.restore_generation,
+            crate::runtime_authority::TEST_RUNTIME_AUTHORITY.restore_generation + 1
+        );
+
+        sqlx::query(
+            "UPDATE cap_runtime_authority
+                SET authority_epoch = $1,
+                    restore_generation = $2
+              WHERE singleton",
+        )
+        .bind(crate::runtime_authority::TEST_RUNTIME_AUTHORITY.epoch)
+        .bind(crate::runtime_authority::TEST_RUNTIME_AUTHORITY.restore_generation)
+        .execute(&pool)
+        .await
+        .expect("restore shared test authority");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete restore drain organization fixture");
     }
 
     #[tokio::test]
