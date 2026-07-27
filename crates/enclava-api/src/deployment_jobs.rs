@@ -2240,22 +2240,29 @@ async fn publish_rollout_outcome_with_mutation(
     if deployment_result.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
     }
+    // A nonterminal watch result is a worker projection, not a mutation of
+    // accepted app authority. Keep updated_at stable so the immutable payload
+    // remains valid when this same job is claimed for its observation retry.
     let app_result = sqlx::query(
         "UPDATE apps
             SET status = $1::app_status_enum,
-                updated_at = clock_timestamp()
-          WHERE id = $2
-            AND org_id = $3
+                updated_at = CASE
+                    WHEN $2 THEN clock_timestamp()
+                    ELSE updated_at
+                END
+          WHERE id = $3
+            AND org_id = $4
             AND status <> 'deleting'::app_status_enum
-            AND $4 = (
+            AND $5 = (
                 SELECT latest.deployment_id
                   FROM deployment_apply_jobs AS latest
-                 WHERE latest.app_id = $2
+                 WHERE latest.app_id = $3
                  ORDER BY latest.generation DESC
                  LIMIT 1
             )",
     )
     .bind(outcome.app_status)
+    .bind(outcome.terminal)
     .bind(job.app_id)
     .bind(job.org_id)
     .bind(job.deployment_id)
@@ -3559,9 +3566,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonterminal_password_rollout_stays_durably_pending_without_hot_retry() {
+    async fn nonterminal_password_rollout_preserves_authority_for_delayed_retry() {
         let pool = database_test_pool().await;
-        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
             .await
             .expect("claim setup")
@@ -3600,15 +3607,17 @@ mod tests {
         .await
         .expect("publish nonterminal observation atomically");
 
-        let (deployment_status, app_status, job_state, token, delayed): (
+        let (deployment_status, app_status, app_updated_at, job_state, token, delayed): (
             String,
             String,
+            chrono::DateTime<chrono::Utc>,
             String,
             Option<Uuid>,
             bool,
         ) = sqlx::query_as(
-            "SELECT deployment.status::text, app.status::text, job.state,
-                    job.lock_token, job.next_attempt_at > clock_timestamp()
+            "SELECT deployment.status::text, app.status::text, app.updated_at,
+                    job.state, job.lock_token,
+                    job.next_attempt_at > clock_timestamp()
                FROM deployments AS deployment
                JOIN apps AS app ON app.id = deployment.app_id
                JOIN deployment_apply_jobs AS job
@@ -3621,9 +3630,39 @@ mod tests {
         .expect("load nonterminal durable observation");
         assert_eq!(deployment_status, "watching");
         assert_eq!(app_status, "creating");
+        assert_eq!(app_updated_at, payload.app.updated_at);
         assert_eq!(job_state, "pending");
         assert!(token.is_none());
         assert!(delayed);
+
+        let retry = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim observation retry")
+            .expect("observation retry exists");
+        let retry_payload = retry.decode_payload().expect("decode observation retry");
+        let expected_authority = crate::deploy::ExistingAppAuthoritySnapshot::new(
+            retry_payload.app.updated_at,
+            retry_payload.snapshot.containers,
+            retry_payload.snapshot.resources,
+        );
+        let mut authority_lane = pool.begin().await.expect("begin retry authority check");
+        crate::deploy::lock_app_deployment_lane(&mut authority_lane, app.id)
+            .await
+            .expect("lock retry app lane");
+        assert!(
+            crate::deploy::verify_existing_app_authority(
+                &mut authority_lane,
+                app.id,
+                &expected_authority,
+            )
+            .await
+            .expect("verify retry authority"),
+            "nonterminal observation must preserve its immutable app authority"
+        );
+        authority_lane
+            .rollback()
+            .await
+            .expect("release retry authority lane");
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)
