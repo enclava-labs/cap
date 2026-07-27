@@ -44,7 +44,7 @@ tower = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-nostr = "0.37"
+nostr = "0.44.5"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
 dialoguer = "0.11"
