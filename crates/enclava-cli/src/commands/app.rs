@@ -48,6 +48,21 @@ use crate::commands::template::normalize_ngrok_tcp_url;
 
 const DEPLOY_HEALTH_TIMEOUT_SECONDS: u64 = 900;
 
+fn create_service_specs(app_config: &AppConfig) -> Vec<ServiceSpec> {
+    let mut services = app_config
+        .services
+        .iter()
+        .map(|(name, svc)| ServiceSpec {
+            name: name.clone(),
+            image: svc.image.clone(),
+            port: svc.port,
+            storage_paths: svc.storage_paths.clone().unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+    services.sort_by(|left, right| left.name.cmp(&right.name));
+    services
+}
+
 /// Resolve app name from --app flag or enclava.toml.
 fn resolve_app_name(explicit: &Option<String>) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(name) = explicit {
@@ -293,16 +308,7 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
         None
     };
 
-    let services: Vec<ServiceSpec> = app_config
-        .services
-        .iter()
-        .map(|(name, svc)| ServiceSpec {
-            name: name.clone(),
-            image: svc.image.clone(),
-            port: svc.port,
-            storage_paths: svc.storage_paths.clone().unwrap_or_default(),
-        })
-        .collect();
+    let services = create_service_specs(&app_config);
 
     let signer_identity_subject = args.signer_subject.clone();
     let signer_identity_issuer = signer_identity_subject

@@ -480,8 +480,9 @@ pub async fn process_setup_job(
     state: &AppState,
     lease: SetupJobLease,
 ) -> Result<(), DeploymentJobError> {
-    if let Some(job) = claim_job(
+    if let Some(job) = claim_job_with_runtime_authority(
         &state.db,
+        state.runtime_authority,
         "setup_pending",
         "setting_up",
         Some(lease.deployment_id),
@@ -523,8 +524,9 @@ pub async fn process_setup_job(
             Some((job_state, expired))
                 if job_state == "setup_pending" || (job_state == "setting_up" && expired) =>
             {
-                if let Some(job) = claim_job(
+                if let Some(job) = claim_job_with_runtime_authority(
                     &state.db,
+                    state.runtime_authority,
                     "setup_pending",
                     "setting_up",
                     Some(lease.deployment_id),
@@ -1246,7 +1248,7 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
             let mut found_work = false;
 
             if let Ok(worker_slot) = setup_worker_slots.clone().try_acquire_owned() {
-                match claim_setup_job(&state.db).await {
+                match claim_setup_job(&state.db, state.runtime_authority).await {
                     Ok(Some(job)) => {
                         found_work = true;
                         let worker_state = state.clone();
@@ -1263,7 +1265,7 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
                             }
                         });
                     }
-                    Ok(None) => match claim_cleanup_job(&state.db).await {
+                    Ok(None) => match claim_cleanup_job(&state.db, state.runtime_authority).await {
                         Ok(Some(job)) => {
                             found_work = true;
                             let worker_state = state.clone();
@@ -1292,7 +1294,7 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
             }
 
             if let Ok(worker_slot) = apply_worker_slots.clone().try_acquire_owned() {
-                match claim_rollout_cleanup_job(&state.db).await {
+                match claim_rollout_cleanup_job(&state.db, state.runtime_authority).await {
                     Ok(Some(job)) => {
                         found_work = true;
                         let worker_state = state.clone();
@@ -1300,7 +1302,7 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
                             process_rollout_cleanup_job(worker_state, job, worker_slot).await;
                         });
                     }
-                    Ok(None) => match claim_apply_job(&state.db).await {
+                    Ok(None) => match claim_apply_job(&state.db, state.runtime_authority).await {
                         Ok(Some(job)) => {
                             found_work = true;
                             let worker_state = state.clone();
@@ -1362,8 +1364,9 @@ pub async fn reconcile_failed_rollout_cleanup_at_startup(
         {
             return Err(DeploymentJobError::UnsupportedPayloadVersion);
         }
-        let Some(job) = claim_job(
+        let Some(job) = claim_job_with_runtime_authority(
             &state.db,
+            state.runtime_authority,
             "rollout_cleanup_pending",
             "rollout_cleaning_up",
             Some(deployment_id),
@@ -1400,33 +1403,67 @@ async fn oldest_rollout_cleanup_job(
     .map_err(DeploymentJobError::from)
 }
 
-async fn claim_setup_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
-    claim_job(pool, "setup_pending", "setting_up", None).await
+async fn claim_setup_job(
+    pool: &PgPool,
+    runtime_authority: crate::runtime_authority::RuntimeAuthority,
+) -> Result<Option<ClaimedJob>, DeploymentJobError> {
+    claim_job_with_runtime_authority(pool, runtime_authority, "setup_pending", "setting_up", None)
+        .await
 }
 
-async fn claim_apply_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
-    claim_job(pool, "pending", "running", None).await
+async fn claim_apply_job(
+    pool: &PgPool,
+    runtime_authority: crate::runtime_authority::RuntimeAuthority,
+) -> Result<Option<ClaimedJob>, DeploymentJobError> {
+    claim_job_with_runtime_authority(pool, runtime_authority, "pending", "running", None).await
 }
 
 async fn claim_rollout_cleanup_job(
     pool: &PgPool,
+    runtime_authority: crate::runtime_authority::RuntimeAuthority,
 ) -> Result<Option<ClaimedJob>, DeploymentJobError> {
-    claim_job(pool, "rollout_cleanup_pending", "rollout_cleaning_up", None).await
+    claim_job_with_runtime_authority(
+        pool,
+        runtime_authority,
+        "rollout_cleanup_pending",
+        "rollout_cleaning_up",
+        None,
+    )
+    .await
 }
 
-async fn claim_cleanup_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
-    claim_job(pool, "cleanup_pending", "cleaning_up", None).await
-}
-
-async fn claim_job(
+async fn claim_cleanup_job(
     pool: &PgPool,
+    runtime_authority: crate::runtime_authority::RuntimeAuthority,
+) -> Result<Option<ClaimedJob>, DeploymentJobError> {
+    claim_job_with_runtime_authority(
+        pool,
+        runtime_authority,
+        "cleanup_pending",
+        "cleaning_up",
+        None,
+    )
+    .await
+}
+
+async fn claim_job_with_runtime_authority(
+    pool: &PgPool,
+    runtime_authority: crate::runtime_authority::RuntimeAuthority,
     ready_state: &str,
     claimed_state: &str,
     only_deployment_id: Option<Uuid>,
 ) -> Result<Option<ClaimedJob>, DeploymentJobError> {
     let lock_token = Uuid::new_v4();
     let job = sqlx::query_as::<_, ClaimedJob>(
-        "WITH candidate AS (
+        "WITH current_authority AS MATERIALIZED (
+             SELECT 1
+              FROM cap_runtime_authority
+              WHERE singleton
+                AND authority_epoch = $8
+                AND restore_generation = $9
+              FOR SHARE
+         ),
+         candidate AS (
              SELECT deployment_id
                FROM deployment_apply_jobs
               WHERE payload_version BETWEEN $4 AND $5
@@ -1441,6 +1478,7 @@ async fn claim_job(
                     OR (state = $2 AND locked_until < clock_timestamp())
                 )
                 AND ($7::uuid IS NULL OR deployment_id = $7)
+                AND EXISTS (SELECT 1 FROM current_authority)
               ORDER BY created_at, deployment_id
               FOR UPDATE SKIP LOCKED
               LIMIT 1
@@ -1467,9 +1505,46 @@ async fn claim_job(
     .bind(MAX_SUPPORTED_JOB_PAYLOAD_VERSION)
     .bind(LEASE_INTERVAL_SQL)
     .bind(only_deployment_id)
+    .bind(runtime_authority.epoch)
+    .bind(runtime_authority.restore_generation)
     .fetch_optional(pool)
     .await?;
     Ok(job)
+}
+
+#[cfg(test)]
+async fn claim_job(
+    pool: &PgPool,
+    ready_state: &str,
+    claimed_state: &str,
+    only_deployment_id: Option<Uuid>,
+) -> Result<Option<ClaimedJob>, DeploymentJobError> {
+    let runtime_authority = current_test_runtime_authority(pool).await?;
+    claim_job_with_runtime_authority(
+        pool,
+        runtime_authority,
+        ready_state,
+        claimed_state,
+        only_deployment_id,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn current_test_runtime_authority(
+    pool: &PgPool,
+) -> Result<crate::runtime_authority::RuntimeAuthority, DeploymentJobError> {
+    let (epoch, restore_generation) = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT authority_epoch, restore_generation
+           FROM cap_runtime_authority
+          WHERE singleton",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(crate::runtime_authority::RuntimeAuthority {
+        epoch,
+        restore_generation,
+    })
 }
 
 async fn process_rollout_cleanup_job(
@@ -2925,6 +3000,44 @@ mod tests {
             .await
             .expect("migrate deployment job test database");
         pool
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_authority_cannot_claim_or_starve_a_durable_job() {
+        let pool = database_test_pool().await;
+        let (_app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let mut stale_authority = crate::runtime_authority::TEST_RUNTIME_AUTHORITY;
+        stale_authority.epoch = Uuid::new_v4();
+
+        let claimed = claim_job_with_runtime_authority(
+            &pool,
+            stale_authority,
+            "setup_pending",
+            "setting_up",
+            Some(deployment_id),
+        )
+        .await
+        .expect("stale claim is rejected without a database error");
+        assert!(claimed.is_none());
+
+        let job_state = sqlx::query_as::<
+            _,
+            (
+                String,
+                i32,
+                Option<Uuid>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            ),
+        >(
+            "SELECT state, attempts, lock_token, locked_until
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load unclaimed durable job");
+        assert_eq!(job_state, ("setup_pending".to_string(), 0, None, None));
     }
 
     #[tokio::test]
@@ -5347,7 +5460,7 @@ mod tests {
         assert!(lease.is_none());
         assert!(recovery_delayed);
         assert!(
-            claim_setup_job(&pool)
+            claim_setup_job(&pool, current_test_runtime_authority(&pool).await.unwrap())
                 .await
                 .expect("dispatcher claim query")
                 .is_none()
@@ -5396,10 +5509,11 @@ mod tests {
         .execute(&pool)
         .await
         .expect("make recovery setup due");
-        let dispatcher = claim_setup_job(&pool)
-            .await
-            .expect("dispatcher claim")
-            .expect("dispatcher wins setup");
+        let dispatcher =
+            claim_setup_job(&pool, current_test_runtime_authority(&pool).await.unwrap())
+                .await
+                .expect("dispatcher claim")
+                .expect("dispatcher wins setup");
         mark_setup_accepted(&pool, deployment_id, dispatcher.lock_token)
             .await
             .expect("dispatcher accepts setup");

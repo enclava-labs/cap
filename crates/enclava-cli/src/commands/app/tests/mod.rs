@@ -1,6 +1,8 @@
 use super::*;
 use crate::commands::app::signing::platform_release_from_deployment_context_with_verifier;
-use enclava_cli::app_config::{AppSection, ResourcesSection, StorageSection, UnlockSection};
+use enclava_cli::app_config::{
+    AppSection, ResourcesSection, ServiceSection, StorageSection, UnlockSection,
+};
 use enclava_cli::platform_release::PlatformReleaseEnvelope;
 
 fn test_release() -> PlatformRelease {
@@ -97,6 +99,34 @@ fn optional_app_name_uses_loaded_config() {
         .expect("valid config")
         .expect("app name");
     assert_eq!(app_name, "demo");
+}
+
+#[test]
+fn create_service_specs_are_sorted_for_stable_idempotent_requests() {
+    let mut config = test_app_config();
+    for (name, image, port) in [
+        ("zeta", "registry.example/zeta@sha256:22", Some(2222)),
+        ("alpha", "registry.example/alpha@sha256:11", Some(1111)),
+        ("middle", "registry.example/middle@sha256:33", None),
+    ] {
+        config.services.insert(
+            name.to_string(),
+            ServiceSection {
+                image: image.to_string(),
+                port,
+                storage_paths: None,
+            },
+        );
+    }
+
+    let services = create_service_specs(&config);
+    assert_eq!(
+        services
+            .iter()
+            .map(|service| service.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "middle", "zeta"]
+    );
 }
 
 #[test]

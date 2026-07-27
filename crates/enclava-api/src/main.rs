@@ -900,7 +900,7 @@ async fn main() {
         );
         std::process::exit(1);
     }
-    if let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await {
+    if let Err(error) = enclava_api::kbs::reconcile_policy_at_startup(&state).await {
         eprintln!("startup refused: KBS policy reconciliation failed: {error}");
         std::process::exit(1);
     }
@@ -910,20 +910,14 @@ async fn main() {
         eprintln!("startup refused: Trustee KBS connectivity check failed: {error}");
         std::process::exit(1);
     }
-    let hosted_edge_reconciliation = management_mode == CapManagementMode::PaasManaged
-        || env_flag("TENANT_HAPROXY_RECONCILIATION_REQUIRED");
-    if hosted_edge_reconciliation
-        && let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state).await
-    {
+    if let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state).await {
         eprintln!("startup refused: HAProxy route reconciliation failed: {error}");
         std::process::exit(1);
     }
 
     enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
-    if hosted_edge_reconciliation {
-        enclava_api::edge::spawn_haproxy_reconciler(state.clone());
-    }
+    enclava_api::edge::spawn_haproxy_reconciler(state.clone());
     let app = build_router(state);
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
@@ -973,7 +967,7 @@ mod tests {
         for prerequisite in [
             "runtime_authority::establish_epoch",
             "reconcile_failed_rollout_cleanup_at_startup",
-            "reconcile_signed_policy_at_startup",
+            "reconcile_policy_at_startup",
             "verify_trustee_kbs_connectivity",
             "reconcile_all_haproxy_routes",
         ] {
@@ -998,7 +992,7 @@ mod tests {
             .find("reconcile_failed_rollout_cleanup_at_startup")
             .expect("failed-rollout cleanup startup");
         for generic_reconciler in [
-            "reconcile_signed_policy_at_startup",
+            "reconcile_policy_at_startup",
             "reconcile_all_haproxy_routes_at_startup",
         ] {
             let generic = main_body
@@ -1009,6 +1003,27 @@ mod tests {
                 "exact failed-rollout cleanup must precede {generic_reconciler}"
             );
         }
+    }
+
+    #[test]
+    fn standalone_startup_always_reconciles_the_haproxy_integration_it_mutates() {
+        let source = include_str!("main.rs");
+        let main_body = source
+            .split("#[tokio::main]")
+            .nth(1)
+            .and_then(|s| s.split("#[cfg(test)]").next())
+            .expect("main body");
+        let reconcile = main_body
+            .find("reconcile_all_haproxy_routes_at_startup")
+            .expect("HAProxy startup reconciliation");
+        let dispatch = main_body
+            .find("spawn_deployment_dispatcher")
+            .expect("deployment dispatcher startup");
+        assert!(reconcile < dispatch);
+        assert!(
+            !main_body.contains("TENANT_HAPROXY_RECONCILIATION_REQUIRED"),
+            "standalone mode must not skip restoration fencing for an integration its routes mutate"
+        );
     }
 
     #[test]

@@ -745,6 +745,35 @@ pub async fn reconcile_signed_policy_once(
     Ok(())
 }
 
+/// Reconcile the effective KBS policy mode under the global provider fence.
+///
+/// Before the first accepted signed generation, the durable source of truth is
+/// still the legacy owner/TLS binding set. After signed mode activates,
+/// `reconcile_policy` delegates to the signed-generation reconciler.
+pub async fn reconcile_policy_once(
+    state: &crate::state::AppState,
+) -> Result<(), KbsPolicyReconciliationError> {
+    if state.kbs_policy.is_none() {
+        return Ok(());
+    }
+    let lease = crate::mutation_leases::claim_resources(
+        state,
+        "kbs_policy_reconcile",
+        Uuid::new_v4(),
+        vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+    )
+    .await?;
+    lease
+        .guard_provider(reconcile_policy(
+            &state.db,
+            state.kbs_policy.as_ref(),
+            state.runtime_authority,
+        ))
+        .await??;
+    lease.finish().await?;
+    Ok(())
+}
+
 async fn retry_busy_reconciliation<F, Fut>(
     mut reconcile: F,
     retry_delay: Duration,
@@ -768,14 +797,10 @@ where
 /// A healthy predecessor can hold the global KBS fence while finishing a
 /// rollout. That contention is transient and must delay startup rather than
 /// crash-looping the replacement process. Every other error remains fatal.
-pub async fn reconcile_signed_policy_at_startup(
+pub async fn reconcile_policy_at_startup(
     state: &crate::state::AppState,
 ) -> Result<(), KbsPolicyReconciliationError> {
-    retry_busy_reconciliation(
-        || reconcile_signed_policy_once(state),
-        Duration::from_secs(2),
-    )
-    .await
+    retry_busy_reconciliation(|| reconcile_policy_once(state), Duration::from_secs(2)).await
 }
 
 pub fn spawn_signed_policy_reconciler(state: crate::state::AppState) {
