@@ -1695,7 +1695,9 @@ pub async fn reapply_tenant_ingress(
 
     let engine = ApplyEngine::try_default().await?;
     ensure_statefulset_exists(&engine, &app_spec.namespace, &app_spec.name).await?;
-    let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
+    let authority_epoch = crate::runtime_authority::load_epoch(pool).await?;
+    let generation =
+        MutationGeneration::with_authority(kubernetes_mutation_generation, authority_epoch)?;
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")
         .await?;
@@ -1911,7 +1913,9 @@ pub async fn apply_deployment_manifests(
         crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref()).await?;
     }
 
-    let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
+    let authority_epoch = crate::runtime_authority::load_epoch(&pool).await?;
+    let generation =
+        MutationGeneration::with_authority(kubernetes_mutation_generation, authority_epoch)?;
     let engine = ApplyEngine::try_default().await?;
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")

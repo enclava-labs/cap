@@ -41,6 +41,7 @@ pub enum LiveObservationReason {
     PodEvidenceIncomplete,
     TeeUnavailable,
     TeeMalformed,
+    TeeKbsTokenUnavailable,
     TeeEvidenceIncomplete,
     EvidenceMismatch,
 }
@@ -110,6 +111,7 @@ struct TeeEvidenceFields {
     tee_status: Option<String>,
     storage_status: Option<String>,
     live_state: Option<String>,
+    kbs_token_unavailable: bool,
     supplemental_fields_malformed: bool,
 }
 
@@ -410,12 +412,13 @@ async fn probe_tee(state: &AppState, tee_status_url: &str) -> TeeEvidence {
 }
 
 fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
-    let supplemental_fields_malformed = ["pod_status", "tee_status", "storage_status"]
-        .into_iter()
-        .any(|field| {
-            body.get(field)
-                .is_some_and(|value| !value.is_null() && !value.is_string())
-        });
+    let supplemental_fields_malformed =
+        ["pod_status", "tee_status", "storage_status", "claims_error"]
+            .into_iter()
+            .any(|field| {
+                body.get(field)
+                    .is_some_and(|value| !value.is_null() && !value.is_string())
+            });
     TeeEvidenceFields {
         pod_status: body
             .get("pod_status")
@@ -434,6 +437,10 @@ fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
             .or_else(|| body.get("state"))
             .and_then(Value::as_str)
             .map(str::to_ascii_lowercase),
+        kbs_token_unavailable: body
+            .get("claims_error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| !error.trim().is_empty()),
         supplemental_fields_malformed,
     }
 }
@@ -554,6 +561,19 @@ fn classify_live_observation_for_deployment(
         }
         TeeEvidence::Available(fields) => fields,
     };
+    if fields.kbs_token_unavailable {
+        return incomplete_observation(
+            LiveObservationState::Partial,
+            LiveObservationReason::TeeKbsTokenUnavailable,
+            observed_at,
+            pod.deployment_id,
+            pod.phase,
+            fields.pod_status,
+            fields.tee_status,
+            fields.storage_status,
+            pod.runtime_failure,
+        );
+    }
     if !fields.live_state.as_deref().is_some_and(|state| {
         state.eq_ignore_ascii_case("locked") || state.eq_ignore_ascii_case("unlocked")
     }) {
@@ -925,6 +945,29 @@ mod tests {
             observed.observation.reason,
             Some(LiveObservationReason::TeeMalformed)
         );
+    }
+
+    #[test]
+    fn guest_kbs_token_failure_is_explicit_and_discards_raw_error() {
+        let tee = TeeEvidence::Available(tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "tee_status": "ready",
+            "storage_status": "unlocked",
+            "state": "unlocked",
+            "claims_error": "aa_token_fetch_failed:sensitive upstream diagnostics"
+        })));
+        let observed = classify_live_observation(complete_pod(Uuid::new_v4()), tee, observed_at());
+
+        assert_eq!(observed.observation.state, LiveObservationState::Partial);
+        assert_eq!(
+            observed.observation.reason,
+            Some(LiveObservationReason::TeeKbsTokenUnavailable)
+        );
+        let serialized =
+            serde_json::to_string(&observed.observation).expect("serialize safe observation");
+        assert!(serialized.contains("tee_kbs_token_unavailable"));
+        assert!(!serialized.contains("sensitive"));
+        assert!(!serialized.contains("aa_token_fetch_failed"));
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod platform_release;
 pub mod ratelimit;
 pub mod registry;
 pub mod routes;
+pub mod runtime_authority;
 pub mod signing_service;
 pub mod source_provider;
 pub mod state;

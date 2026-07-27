@@ -13,25 +13,47 @@ use kube::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::fmt::Debug;
+use uuid::Uuid;
 
 use super::engine::{ApplyEngine, ApplyError};
 
 pub const MUTATION_GENERATION_ANNOTATION: &str = "enclava.dev/cap-provider-mutation-generation";
+pub const MUTATION_AUTHORITY_EPOCH_ANNOTATION: &str = "enclava.dev/cap-provider-authority-epoch";
 const MAX_CONFLICT_RETRIES: usize = 12;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct MutationGeneration(i64);
+pub struct MutationGeneration {
+    value: i64,
+    authority_epoch: Option<Uuid>,
+}
 
 impl MutationGeneration {
+    /// Construct an epoch-less generation for legacy callers.
+    ///
+    /// CAP runtime paths use `with_authority`; an epoch-less writer is never
+    /// allowed to replace an object already owned by an epoch-aware authority.
     pub fn new(value: i64) -> Result<Self, ApplyError> {
         if value <= 0 {
             return Err(ApplyError::InvalidMutationGeneration(value));
         }
-        Ok(Self(value))
+        Ok(Self {
+            value,
+            authority_epoch: None,
+        })
+    }
+
+    pub fn with_authority(value: i64, authority_epoch: Uuid) -> Result<Self, ApplyError> {
+        if authority_epoch.is_nil() {
+            return Err(ApplyError::InvalidMutationGeneration(value));
+        }
+        Ok(Self {
+            value: Self::new(value)?.value,
+            authority_epoch: Some(authority_epoch),
+        })
     }
 
     pub const fn get(self) -> i64 {
-        self.0
+        self.value
     }
 }
 
@@ -69,11 +91,53 @@ where
     }
 }
 
+fn live_authority_epoch<K>(resource: &K) -> Result<Option<Uuid>, ApplyError>
+where
+    K: Resource,
+{
+    resource
+        .meta()
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(MUTATION_AUTHORITY_EPOCH_ANNOTATION))
+        .map(|raw| {
+            raw.parse::<Uuid>()
+                .map_err(|_| ApplyError::InvalidLiveMutationGeneration {
+                    kind: kind::<K>(),
+                    name: resource
+                        .meta()
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "<unnamed>".to_string()),
+                })
+        })
+        .transpose()
+}
+
 fn ensure_not_stale<K>(resource: &K, desired: MutationGeneration) -> Result<(), ApplyError>
 where
     K: Resource,
 {
     let actual = live_generation(resource)?;
+    let actual_authority_epoch = live_authority_epoch(resource)?;
+    if desired.authority_epoch.is_some() && actual_authority_epoch != desired.authority_epoch {
+        // Generations are comparable only inside the database lifetime that
+        // issued them. A fresh/restored CAP authority may replace a retained
+        // object even when its first generation is numerically lower.
+        return Ok(());
+    }
+    if desired.authority_epoch.is_none() && actual_authority_epoch.is_some() {
+        return Err(ApplyError::StaleMutationGeneration {
+            kind: kind::<K>(),
+            name: resource
+                .meta()
+                .name
+                .clone()
+                .unwrap_or_else(|| "<unnamed>".to_string()),
+            desired: desired.get(),
+            actual,
+        });
+    }
     if actual > desired.get() {
         return Err(ApplyError::StaleMutationGeneration {
             kind: kind::<K>(),
@@ -101,6 +165,16 @@ where
             MUTATION_GENERATION_ANNOTATION.to_string(),
             generation.get().to_string(),
         );
+    if let Some(authority_epoch) = generation.authority_epoch {
+        resource
+            .meta_mut()
+            .annotations
+            .get_or_insert_with(Default::default)
+            .insert(
+                MUTATION_AUTHORITY_EPOCH_ANNOTATION.to_string(),
+                authority_epoch.to_string(),
+            );
+    }
 }
 
 fn verify_applied_generation<K>(
@@ -111,7 +185,11 @@ where
     K: Resource,
 {
     let actual = live_generation(resource)?;
-    if actual != generation.get() {
+    let actual_authority_epoch = live_authority_epoch(resource)?;
+    if actual != generation.get()
+        || generation.authority_epoch.is_some()
+            && actual_authority_epoch != generation.authority_epoch
+    {
         return Err(ApplyError::ProviderGenerationNotApplied {
             kind: kind::<K>(),
             name: resource
@@ -652,6 +730,58 @@ mod tests {
                 "code": status.as_u16(),
             }),
         )
+    }
+
+    #[test]
+    fn authority_epoch_scopes_retained_kubernetes_generations() {
+        let retained_epoch = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let restored_epoch = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let mut retained = desired("retained");
+        retained.metadata.annotations = Some(
+            [
+                (MUTATION_GENERATION_ANNOTATION.to_string(), "99".to_string()),
+                (
+                    MUTATION_AUTHORITY_EPOCH_ANNOTATION.to_string(),
+                    retained_epoch.to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        assert!(matches!(
+            ensure_not_stale(
+                &retained,
+                MutationGeneration::with_authority(1, retained_epoch).unwrap()
+            ),
+            Err(ApplyError::StaleMutationGeneration {
+                desired: 1,
+                actual: 99,
+                ..
+            })
+        ));
+        assert!(
+            ensure_not_stale(
+                &retained,
+                MutationGeneration::with_authority(1, restored_epoch).unwrap()
+            )
+            .is_ok(),
+            "a generation from another database lifetime is not newer authority"
+        );
+        assert!(
+            ensure_not_stale(&retained, MutationGeneration::new(100).unwrap()).is_err(),
+            "an epoch-less writer cannot replace an epoch-aware object"
+        );
+
+        annotate(
+            &mut retained,
+            MutationGeneration::with_authority(1, restored_epoch).unwrap(),
+        );
+        assert_eq!(live_generation(&retained).unwrap(), 1);
+        assert_eq!(
+            live_authority_epoch(&retained).unwrap(),
+            Some(restored_epoch)
+        );
     }
 
     async fn wait_for_rejection(state: &Arc<Mutex<FakeState>>) {

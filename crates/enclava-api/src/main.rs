@@ -180,6 +180,38 @@ fn build_trustee_http_client() -> anyhow::Result<reqwest::Client> {
         .map_err(|err| anyhow::anyhow!("failed to build Trustee HTTP client: {err}"))
 }
 
+async fn verify_trustee_kbs_connectivity(
+    client: &reqwest::Client,
+    required: bool,
+) -> anyhow::Result<()> {
+    if !required {
+        return Ok(());
+    }
+    let raw_url = env_nonempty("TRUSTEE_KBS_URL")
+        .ok_or_else(|| anyhow::anyhow!("TRUSTEE_KBS_URL is required"))?;
+    let url = reqwest::Url::parse(&raw_url)
+        .map_err(|err| anyhow::anyhow!("invalid TRUSTEE_KBS_URL: {err}"))?;
+    if url.scheme() != "https" {
+        anyhow::bail!("TRUSTEE_KBS_URL must use https when Trustee is required");
+    }
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| anyhow::anyhow!("trusted Trustee KBS request failed: {err}"))?;
+    if response.status().is_server_error() {
+        anyhow::bail!(
+            "Trustee KBS returned an unhealthy HTTP status: {}",
+            response.status()
+        );
+    }
+    tracing::info!(
+        status = %response.status(),
+        "verified trusted TLS connectivity to Trustee KBS"
+    );
+    Ok(())
+}
+
 fn read_key_file(path: &str) -> anyhow::Result<Vec<u8>> {
     std::fs::read(path).map_err(|e| anyhow::anyhow!("failed to read key file {path}: {e}"))
 }
@@ -782,8 +814,30 @@ async fn main() {
         internal_auth,
     };
 
+    if let Err(error) = enclava_api::kbs::reconcile_signed_policy_once(&state).await {
+        eprintln!("startup refused: KBS policy reconciliation failed: {error}");
+        std::process::exit(1);
+    }
+    if let Err(error) =
+        verify_trustee_kbs_connectivity(&state.trustee_http_client, trustee_required).await
+    {
+        eprintln!("startup refused: Trustee KBS connectivity check failed: {error}");
+        std::process::exit(1);
+    }
+    let hosted_edge_reconciliation = management_mode == CapManagementMode::PaasManaged
+        || env_flag("TENANT_HAPROXY_RECONCILIATION_REQUIRED");
+    if hosted_edge_reconciliation
+        && let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes(&state).await
+    {
+        eprintln!("startup refused: HAProxy route reconciliation failed: {error}");
+        std::process::exit(1);
+    }
+
     enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
+    if hosted_edge_reconciliation {
+        enclava_api::edge::spawn_haproxy_reconciler(state.clone());
+    }
     let app = build_router(state);
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
@@ -817,6 +871,31 @@ mod tests {
             main_body.contains(expected),
             "API startup must install a rustls CryptoProvider before building ACME/HTTP clients"
         );
+    }
+
+    #[test]
+    fn provider_authority_converges_before_deployment_dispatch_starts() {
+        let source = include_str!("main.rs");
+        let main_body = source
+            .split("#[tokio::main]")
+            .nth(1)
+            .and_then(|s| s.split("#[cfg(test)]").next())
+            .expect("main body");
+        let dispatch = main_body
+            .find("spawn_deployment_dispatcher")
+            .expect("deployment dispatcher startup");
+        for prerequisite in [
+            "reconcile_signed_policy_once",
+            "verify_trustee_kbs_connectivity",
+            "reconcile_all_haproxy_routes",
+        ] {
+            assert!(
+                main_body
+                    .find(prerequisite)
+                    .is_some_and(|index| index < dispatch),
+                "{prerequisite} must complete before durable deployment dispatch"
+            );
+        }
     }
 
     #[test]

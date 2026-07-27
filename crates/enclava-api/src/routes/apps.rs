@@ -1462,9 +1462,15 @@ pub async fn delete_app(
         .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeRoute, error))?;
 
+    let authority_epoch = crate::runtime_authority::load_epoch(&state.db)
+        .await
+        .map_err(|_| internal_server_error())?;
     let kubernetes_mutation_generation =
-        enclava_engine::apply::generation::MutationGeneration::new(kubernetes_mutation_generation)
-            .map_err(|_| internal_server_error())?;
+        enclava_engine::apply::generation::MutationGeneration::with_authority(
+            kubernetes_mutation_generation,
+            authority_epoch,
+        )
+        .map_err(|_| internal_server_error())?;
     let kubernetes_client = kube::Client::try_default()
         .await
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::Namespace, error))?;

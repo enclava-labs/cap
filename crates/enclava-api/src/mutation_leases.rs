@@ -344,6 +344,13 @@ pub struct ResourceMutationLease {
 }
 
 impl ResourceMutationLease {
+    pub fn resource_generation(&self, fence: &ResourceFence) -> Option<i64> {
+        self.resources
+            .iter()
+            .find(|resource| &resource.fence == fence)
+            .map(|resource| resource.generation)
+    }
+
     fn stop_heartbeat(&mut self) {
         if let Some(task) = self.heartbeat.take() {
             task.abort();
