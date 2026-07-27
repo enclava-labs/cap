@@ -94,6 +94,10 @@ For production deploys with policy-read mode enabled:
 | `CLOUDFLARE_ZONE_NAME` | Managed DNS zone name. Defaults to `enclava.dev`. |
 | `CLOUDFLARE_ZONE_ID` | Optional zone ID to skip zone lookup. |
 | `TENANT_DNS_TARGET` | A/AAAA target for tenant DNS records. |
+| `TENANT_HAPROXY_ENABLED` | Enables the Kubernetes HAProxy route integration. Defaults to `false`; deployment and route mutations fail closed while disabled. |
+| `TENANT_HAPROXY_NAMESPACE` | HAProxy ConfigMap/DaemonSet namespace. Defaults to `tenant-envoy`. |
+| `TENANT_HAPROXY_CONFIGMAP` | HAProxy ConfigMap name. Defaults to `haproxy-tenant`. |
+| `TENANT_HAPROXY_DAEMONSET` | HAProxy DaemonSet name. Defaults to `haproxy-tenant`. |
 | `TLS_CERTIFICATE_BROKER_URL` | Required when `TENANT_CADDY_TLS_MODE=dns01-broker`. |
 | `ACME_DIRECTORY_URL` | ACME directory for DNS-01 broker certificates. |
 | `ACME_ACCOUNT_CREDENTIALS_PATH` | Optional persisted ACME account credentials path. |

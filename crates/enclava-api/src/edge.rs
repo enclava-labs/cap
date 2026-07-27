@@ -37,6 +37,10 @@ const HAPROXY_ROLLOUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EdgeRouteError {
+    #[error("TENANT_HAPROXY_ENABLED must be a boolean value")]
+    InvalidIntegrationFlag,
+    #[error("tenant HAProxy route integration is not enabled")]
+    NotConfigured,
     #[error("database error")]
     Database(#[from] sqlx::Error),
     #[error("Kubernetes client error: {0}")]
@@ -110,6 +114,31 @@ impl EdgeRouteConfig {
     }
 }
 
+fn haproxy_integration_enabled_with_env(
+    get_env: impl Fn(&str) -> Option<String>,
+) -> Result<bool, EdgeRouteError> {
+    let Some(raw) = get_env("TENANT_HAPROXY_ENABLED") else {
+        return Ok(false);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => Err(EdgeRouteError::InvalidIntegrationFlag),
+    }
+}
+
+pub fn haproxy_integration_enabled() -> Result<bool, EdgeRouteError> {
+    haproxy_integration_enabled_with_env(|name| std::env::var(name).ok())
+}
+
+pub fn require_haproxy_integration_enabled() -> Result<(), EdgeRouteError> {
+    if haproxy_integration_enabled()? {
+        Ok(())
+    } else {
+        Err(EdgeRouteError::NotConfigured)
+    }
+}
+
 /// A single SNI -> backend route to add to the tenant HAProxy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SniRoute {
@@ -171,6 +200,7 @@ pub async fn ensure_haproxy_routes(
     mutation_generation: Option<i64>,
     routes: &[SniRoute],
 ) -> Result<(), EdgeRouteError> {
+    require_haproxy_integration_enabled()?;
     mutate_haproxy_config(pool, config, authority, mutation_generation, |current| {
         let mut out = current.to_string();
         for r in routes {
@@ -193,6 +223,7 @@ pub async fn remove_haproxy_routes(
     mutation_generation: Option<i64>,
     routes: &[(String, String)],
 ) -> Result<(), EdgeRouteError> {
+    require_haproxy_integration_enabled()?;
     let changed = mutate_haproxy_config(pool, config, authority, mutation_generation, |current| {
         let mut out = current.to_string();
         for (backend, host) in routes {
@@ -217,6 +248,7 @@ pub async fn remove_haproxy_routes(
 /// repairs partial route mutations without disturbing operator-owned HAProxy
 /// configuration or the fail-closed default backend.
 pub async fn reconcile_all_haproxy_routes(state: &AppState) -> Result<(), EdgeReconciliationError> {
+    require_haproxy_integration_enabled()?;
     let fence = crate::mutation_leases::ResourceFence::edge_config();
     let lease = crate::mutation_leases::claim_resources(
         state,
@@ -1113,6 +1145,61 @@ mod tests {
 
     const CONFIGMAP_PATH: &str = "/api/v1/namespaces/tenant-envoy/configmaps/haproxy-tenant";
     const DAEMONSET_PATH: &str = "/apis/apps/v1/namespaces/tenant-envoy/daemonsets/haproxy-tenant";
+
+    #[test]
+    fn haproxy_integration_requires_an_explicit_valid_enable_flag() {
+        assert!(
+            !haproxy_integration_enabled_with_env(|_| None)
+                .expect("an absent flag disables the optional integration")
+        );
+        for value in ["1", "true", "TRUE", " yes "] {
+            assert!(
+                haproxy_integration_enabled_with_env(|_| Some(value.to_string()))
+                    .expect("valid enabled flag"),
+                "{value} must enable the integration"
+            );
+        }
+        for value in ["0", "false", "FALSE", " no "] {
+            assert!(
+                !haproxy_integration_enabled_with_env(|_| Some(value.to_string()))
+                    .expect("valid disabled flag"),
+                "{value} must disable the integration"
+            );
+        }
+        assert!(matches!(
+            haproxy_integration_enabled_with_env(|_| Some("enabled".to_string())),
+            Err(EdgeRouteError::InvalidIntegrationFlag)
+        ));
+    }
+
+    #[test]
+    fn every_haproxy_mutation_and_reconciler_requires_the_integration_gate() {
+        let source = include_str!("edge.rs");
+        for (function, next_function) in [
+            (
+                "pub async fn ensure_haproxy_routes(",
+                "pub async fn remove_haproxy_routes(",
+            ),
+            (
+                "pub async fn remove_haproxy_routes(",
+                "pub async fn reconcile_all_haproxy_routes(",
+            ),
+            (
+                "pub async fn reconcile_all_haproxy_routes(",
+                "async fn retry_busy_reconciliation",
+            ),
+        ] {
+            let body = source
+                .split(function)
+                .nth(1)
+                .and_then(|remaining| remaining.split(next_function).next())
+                .unwrap_or_else(|| panic!("{function} body"));
+            assert!(
+                body.contains("require_haproxy_integration_enabled()?"),
+                "{function} must fail closed unless the integration is explicitly enabled"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn startup_reconciliation_retries_busy_fence_until_available() {

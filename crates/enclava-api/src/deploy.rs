@@ -1840,6 +1840,7 @@ pub async fn apply_deployment_manifests(
         log_encryption,
     } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
+    crate::edge::require_haproxy_integration_enabled()?;
 
     let mut app_spec = build_confidential_app_from_rows(
         &app,

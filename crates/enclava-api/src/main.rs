@@ -910,14 +910,30 @@ async fn main() {
         eprintln!("startup refused: Trustee KBS connectivity check failed: {error}");
         std::process::exit(1);
     }
-    if let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state).await {
-        eprintln!("startup refused: HAProxy route reconciliation failed: {error}");
-        std::process::exit(1);
+    let haproxy_integration_enabled = match enclava_api::edge::haproxy_integration_enabled() {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            eprintln!("startup refused: invalid HAProxy integration configuration: {error}");
+            std::process::exit(1);
+        }
+    };
+    if haproxy_integration_enabled {
+        if let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state).await
+        {
+            eprintln!("startup refused: HAProxy route reconciliation failed: {error}");
+            std::process::exit(1);
+        }
+    } else {
+        tracing::info!(
+            "tenant HAProxy integration is disabled; HAProxy-dependent mutations will fail closed"
+        );
     }
 
     enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
-    enclava_api::edge::spawn_haproxy_reconciler(state.clone());
+    if haproxy_integration_enabled {
+        enclava_api::edge::spawn_haproxy_reconciler(state.clone());
+    }
     let app = build_router(state);
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
@@ -1006,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_startup_always_reconciles_the_haproxy_integration_it_mutates() {
+    fn configured_haproxy_startup_reconciles_before_dispatch_in_every_mode() {
         let source = include_str!("main.rs");
         let main_body = source
             .split("#[tokio::main]")
@@ -1022,7 +1038,11 @@ mod tests {
         assert!(reconcile < dispatch);
         assert!(
             !main_body.contains("TENANT_HAPROXY_RECONCILIATION_REQUIRED"),
-            "standalone mode must not skip restoration fencing for an integration its routes mutate"
+            "reconciliation must be tied to the integration itself, not management mode"
+        );
+        assert!(
+            main_body.contains("haproxy_integration_enabled"),
+            "optional API deployments must be able to start without HAProxy credentials"
         );
     }
 

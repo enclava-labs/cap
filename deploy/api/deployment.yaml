@@ -60,6 +60,8 @@ spec:
           value: "true"
         - name: CLOUDFLARE_ZONE_NAME
           value: "enclava.dev"
+        - name: TENANT_HAPROXY_ENABLED
+          value: "false"
         - name: CLOUDFLARE_API_TOKEN
           valueFrom:
             secretKeyRef:
