@@ -1253,7 +1253,7 @@ fn should_retry_template_config_sync_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
         ApiError::Api { status, .. } => matches!(*status, 408 | 409 | 425 | 429) || *status >= 500,
-        ApiError::NotAuthenticated => false,
+        ApiError::NotAuthenticated | ApiError::HostedCreateIdempotencyUnsupported => false,
     }
 }
 
@@ -1868,7 +1868,7 @@ fn should_retry_template_deployment_status_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
         ApiError::Api { status, .. } => matches!(*status, 408 | 409 | 425 | 429) || *status >= 500,
-        ApiError::NotAuthenticated => false,
+        ApiError::NotAuthenticated | ApiError::HostedCreateIdempotencyUnsupported => false,
     }
 }
 
@@ -2215,7 +2215,7 @@ fn should_retry_paas_ssh_command_error(error: &ApiError) -> bool {
             }
             matches!(*status, 408 | 425 | 429 | 500..=599)
         }
-        ApiError::NotAuthenticated => false,
+        ApiError::NotAuthenticated | ApiError::HostedCreateIdempotencyUnsupported => false,
     }
 }
 

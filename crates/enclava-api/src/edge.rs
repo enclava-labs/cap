@@ -12,7 +12,10 @@ use kube::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::net::IpAddr;
+use std::{
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
 use crate::{runtime_authority::RuntimeAuthority, state::AppState};
@@ -26,6 +29,11 @@ const HAPROXY_AUTHORITY_RESTORE_GENERATION_ANNOTATION: &str =
 const HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES: usize = 900 * 1024;
 const KUBERNETES_CAS_ATTEMPTS: usize = 8;
 const KUBERNETES_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const HAPROXY_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(180);
+#[cfg(not(test))]
+const HAPROXY_ROLLOUT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const HAPROXY_ROLLOUT_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EdgeRouteError {
@@ -70,6 +78,8 @@ pub enum EdgeRouteError {
         expected: String,
         actual: Option<String>,
     },
+    #[error("HAProxy DaemonSet rollout did not converge within 180 seconds")]
+    RolloutTimedOut,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -540,6 +550,8 @@ where
             && daemonset_authority_epoch == Some(authority.epoch)
             && daemonset_restore_generation == Some(authority.restore_generation)
         {
+            wait_for_daemonset_rollout(&ds_api, &config.daemonset_name, authority, &generation)
+                .await?;
             return Ok(changed);
         }
         daemonset
@@ -579,17 +591,68 @@ where
                 let applied = daemonset_config_generation(&replaced);
                 if applied != Some(generation.as_str()) {
                     return Err(EdgeRouteError::GenerationNotApplied {
-                        expected: generation,
+                        expected: generation.clone(),
                         actual: applied.map(str::to_string),
                     });
                 }
                 changed = true;
+                wait_for_daemonset_rollout(&ds_api, &config.daemonset_name, authority, &generation)
+                    .await?;
+                return Ok(changed);
             }
             Err(EdgeRouteError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
             Err(error) => return Err(error),
         }
     }
     Err(EdgeRouteError::CasExhausted)
+}
+
+async fn wait_for_daemonset_rollout(
+    ds_api: &Api<DaemonSet>,
+    name: &str,
+    authority: RuntimeAuthority,
+    expected_config_generation: &str,
+) -> Result<(), EdgeRouteError> {
+    let start = Instant::now();
+    loop {
+        let daemonset = ds_api.get(name).await?;
+        let daemonset_authority_epoch = daemonset_authority_epoch(&daemonset)?;
+        let daemonset_restore_generation = daemonset_authority_restore_generation(&daemonset)?;
+        ensure_current_authority_is_not_newer(
+            daemonset_authority_epoch,
+            daemonset_restore_generation,
+            authority,
+        )?;
+        let applied = daemonset_config_generation(&daemonset);
+        if daemonset_authority_epoch != Some(authority.epoch)
+            || daemonset_restore_generation != Some(authority.restore_generation)
+            || applied != Some(expected_config_generation)
+        {
+            return Err(EdgeRouteError::GenerationNotApplied {
+                expected: expected_config_generation.to_string(),
+                actual: applied.map(str::to_string),
+            });
+        }
+
+        let object_generation = daemonset.metadata.generation.unwrap_or(0);
+        if let Some(status) = daemonset.status.as_ref() {
+            let desired = status.desired_number_scheduled;
+            if desired > 0
+                && status.observed_generation.unwrap_or(0) >= object_generation
+                && status.current_number_scheduled == desired
+                && status.updated_number_scheduled.unwrap_or(0) == desired
+                && status.number_ready >= desired
+                && status.number_available.unwrap_or(0) >= desired
+                && status.number_misscheduled == 0
+            {
+                return Ok(());
+            }
+        }
+        if start.elapsed() >= HAPROXY_ROLLOUT_TIMEOUT {
+            return Err(EdgeRouteError::RolloutTimedOut);
+        }
+        tokio::time::sleep(HAPROXY_ROLLOUT_POLL_INTERVAL).await;
+    }
 }
 
 async fn bounded_kube_write<F, T>(future: F) -> Result<T, EdgeRouteError>
@@ -1092,8 +1155,11 @@ mod tests {
         daemonset_patch_outcomes: VecDeque<FakePatchOutcome>,
         configmap_patch_attempts: usize,
         daemonset_patch_attempts: usize,
+        daemonset_get_attempts: usize,
         configmap_resource_version: u64,
         daemonset_resource_version: u64,
+        daemonset_object_generation: i64,
+        daemonset_rollout_reads_remaining: usize,
         pause_next_configmap_replace: bool,
         configmap_replace_entered: Arc<tokio::sync::Notify>,
         configmap_replace_release: Arc<tokio::sync::Notify>,
@@ -1113,8 +1179,11 @@ mod tests {
                 daemonset_patch_outcomes: VecDeque::new(),
                 configmap_patch_attempts: 0,
                 daemonset_patch_attempts: 0,
+                daemonset_get_attempts: 0,
                 configmap_resource_version: 1,
                 daemonset_resource_version: 1,
+                daemonset_object_generation: 1,
+                daemonset_rollout_reads_remaining: 0,
                 pause_next_configmap_replace: false,
                 configmap_replace_entered: Arc::new(tokio::sync::Notify::new()),
                 configmap_replace_release: Arc::new(tokio::sync::Notify::new()),
@@ -1183,6 +1252,7 @@ mod tests {
                     "name": "haproxy-tenant",
                     "namespace": "tenant-envoy",
                     "resourceVersion": self.daemonset_resource_version.to_string(),
+                    "generation": self.daemonset_object_generation,
                 },
                 "spec": {
                     "selector": { "matchLabels": { "app": "haproxy-tenant" } },
@@ -1195,6 +1265,19 @@ mod tests {
                             "containers": [{ "name": "haproxy", "image": "haproxy:3" }],
                         },
                     },
+                },
+                "status": {
+                    "observedGeneration": if self.daemonset_rollout_reads_remaining == 0 {
+                        self.daemonset_object_generation
+                    } else {
+                        self.daemonset_object_generation.saturating_sub(1)
+                    },
+                    "desiredNumberScheduled": 1,
+                    "currentNumberScheduled": 1,
+                    "updatedNumberScheduled": if self.daemonset_rollout_reads_remaining == 0 { 1 } else { 0 },
+                    "numberReady": 1,
+                    "numberAvailable": 1,
+                    "numberMisscheduled": 0,
                 },
             })
         }
@@ -1225,12 +1308,14 @@ mod tests {
                     .expect("fake Kubernetes state poisoned")
                     .configmap(),
             )),
-            (Method::GET, DAEMONSET_PATH) => Ok(json_response(
-                state
-                    .lock()
-                    .expect("fake Kubernetes state poisoned")
-                    .daemonset(),
-            )),
+            (Method::GET, DAEMONSET_PATH) => {
+                let mut locked = state.lock().expect("fake Kubernetes state poisoned");
+                locked.daemonset_get_attempts += 1;
+                let response = locked.daemonset();
+                locked.daemonset_rollout_reads_remaining =
+                    locked.daemonset_rollout_reads_remaining.saturating_sub(1);
+                Ok(json_response(response))
+            }
             (Method::PUT, CONFIGMAP_PATH) => {
                 let replacement: Value =
                     serde_json::from_slice(&body).expect("valid ConfigMap replacement");
@@ -1363,6 +1448,7 @@ mod tests {
                     .and_then(Value::as_str)
                     .and_then(|generation| generation.parse().ok());
                 locked.daemonset_resource_version += 1;
+                locked.daemonset_object_generation += 1;
                 if outcome == FakePatchOutcome::LoseResponseAfterApply {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -1539,6 +1625,37 @@ mod tests {
         assert_eq!(converged.mutation_generation, Some(1));
         assert_eq!(converged.configmap_patch_attempts, 0);
         assert_eq!(converged.daemonset_patch_attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_waits_for_daemonset_rollout_before_returning() {
+        let config = "global\n  maxconn 4096\n";
+        let state = Arc::new(Mutex::new(FakeKubeState::new(config)));
+        {
+            let mut pending = state.lock().unwrap();
+            pending.configmap_authority_epoch = Some(test_runtime_authority().epoch);
+            pending.configmap_restore_generation =
+                Some(test_runtime_authority().restore_generation);
+            pending.daemonset_authority_epoch = Some(test_runtime_authority().epoch);
+            pending.daemonset_restore_generation =
+                Some(test_runtime_authority().restore_generation);
+            pending.daemonset_rollout_reads_remaining = 2;
+        }
+
+        let changed = reconcile_haproxy_config(
+            fake_kube_client(Arc::clone(&state)),
+            &edge_config(),
+            test_runtime_authority(),
+            Some(2),
+            |current| current.to_string(),
+        )
+        .await
+        .expect("reconciliation waits for the existing DaemonSet rollout");
+        assert!(!changed);
+        let converged = state.lock().unwrap();
+        assert_eq!(converged.daemonset_patch_attempts, 0);
+        assert_eq!(converged.daemonset_get_attempts, 3);
+        assert_eq!(converged.daemonset_rollout_reads_remaining, 0);
     }
 
     #[tokio::test]

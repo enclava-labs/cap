@@ -271,7 +271,8 @@ pub struct CreateArgs {
         default_value = "https://token.actions.githubusercontent.com"
     )]
     pub signer_issuer: String,
-    /// Durable caller identity for safely retrying or correlating this create.
+    /// Durable caller identity for safely retrying or correlating a hosted
+    /// PaaS create. Refused when the configured endpoint is direct CAP.
     #[arg(long = "idempotency-key")]
     pub idempotency_key: Option<String>,
 }

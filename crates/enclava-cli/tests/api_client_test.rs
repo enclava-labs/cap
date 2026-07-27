@@ -79,25 +79,31 @@ async fn sync_config_key_posts_metadata_callback() {
 }
 
 #[tokio::test]
-async fn create_app_forwards_rollout_idempotency_key() {
+async fn create_app_forwards_rollout_idempotency_key_only_after_hosted_discovery() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let handle = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut buf = [0u8; 8192];
-        let n = stream.read(&mut buf).unwrap();
-        let body = r#"{"id":"app-1","name":"rollout-canary","namespace":"tenant-rollout","instance_id":"instance-1","domain":"rollout-canary.enclava.dev","custom_domain":null,"status":"pending","unlock_mode":"password","created_at":"2026-07-27T00:00:00Z"}"#;
-        stream
-            .write_all(
-                format!(
-                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-        String::from_utf8_lossy(&buf[..n]).to_string()
+        let discovery_body = r#"{"api_mode":"hosted-paas"}"#;
+        let app_body = r#"{"id":"app-1","name":"rollout-canary","namespace":"tenant-rollout","instance_id":"instance-1","domain":"rollout-canary.enclava.dev","custom_domain":null,"status":"pending","unlock_mode":"password","created_at":"2026-07-27T00:00:00Z"}"#;
+        let responses = [("200 OK", discovery_body), ("201 Created", app_body)];
+        responses
+            .into_iter()
+            .map(|(status, body)| {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len(),
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+                String::from_utf8_lossy(&buf[..n]).to_string()
+            })
+            .collect::<Vec<_>>()
     });
 
     let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
@@ -132,13 +138,70 @@ async fn create_app_forwards_rollout_idempotency_key() {
         .await
         .unwrap();
 
-    let request = handle.join().unwrap();
-    assert!(request.starts_with("POST /apps "));
-    assert!(request.contains("authorization: Bearer test-token"));
+    let requests = handle.join().unwrap();
+    assert!(requests[0].starts_with("GET /.well-known/enclava "));
+    assert!(requests[1].starts_with("POST /apps "));
+    assert!(requests[1].contains("authorization: Bearer test-token"));
     assert!(
-        request.contains("idempotency-key: preprod-canary:11111111-2222-4333-8444-555555555555")
+        requests[1]
+            .contains("idempotency-key: preprod-canary:11111111-2222-4333-8444-555555555555")
     );
     assert_eq!(response.name, "rollout-canary");
+}
+
+#[tokio::test]
+async fn create_app_refuses_caller_key_against_direct_cap_before_posting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 8192];
+        let n = stream.read(&mut buf).unwrap();
+        let body = r#"{"api_mode":"core"}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len(),
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let request_body = CreateAppRequest {
+        name: "direct-cap".to_string(),
+        port: 8080,
+        image: None,
+        unlock_mode: "auto".to_string(),
+        bootstrap_pubkey_hash: None,
+        storage_size: "5Gi".to_string(),
+        tls_storage_size: "2Gi".to_string(),
+        storage_paths: vec![],
+        cpu: "1".to_string(),
+        memory: "1Gi".to_string(),
+        services: vec![],
+        health_path: None,
+        health_interval: None,
+        health_timeout: None,
+        signer_identity_subject: None,
+        signer_identity_issuer: None,
+        egress_allowlist: vec![],
+        egress_mode: None,
+    };
+    let error = client
+        .create_app_with_idempotency_key(&request_body, Some("direct-cap-retry"))
+        .await
+        .expect_err("direct CAP cannot accept a caller-chosen create identity");
+    assert!(matches!(
+        error,
+        ApiError::HostedCreateIdempotencyUnsupported
+    ));
+    let request = handle.join().unwrap();
+    assert!(request.starts_with("GET /.well-known/enclava "));
+    assert!(!request.contains("POST /apps"));
 }
 
 #[tokio::test]

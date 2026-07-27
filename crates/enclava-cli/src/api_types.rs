@@ -8,6 +8,20 @@ use std::{collections::HashMap, net::IpAddr};
 
 use crate::platform_release::PlatformReleaseEnvelope;
 
+// --- Discovery ---
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiMode {
+    Core,
+    HostedPaas,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EnclavaDiscoveryResponse {
+    pub api_mode: ApiMode,
+}
+
 // --- Auth ---
 
 #[derive(Debug, Serialize)]

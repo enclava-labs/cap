@@ -22,6 +22,10 @@ pub enum ApiError {
     },
     #[error("not authenticated -- run `enclava login` first")]
     NotAuthenticated,
+    #[error(
+        "caller-chosen app-create idempotency keys require a hosted PaaS API endpoint; direct CAP does not implement this contract"
+    )]
+    HostedCreateIdempotencyUnsupported,
 }
 
 impl ApiClient {
@@ -196,6 +200,9 @@ impl ApiClient {
         req: &CreateAppRequest,
         idempotency_key: Option<&str>,
     ) -> Result<AppResponse, ApiError> {
+        if idempotency_key.is_some() {
+            self.require_hosted_app_create_idempotency().await?;
+        }
         let mut request = self
             .http
             .post(self.url("/apps"))
@@ -207,6 +214,25 @@ impl ApiClient {
         let resp = request.send().await?;
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
+    }
+
+    async fn require_hosted_app_create_idempotency(&self) -> Result<(), ApiError> {
+        let response = self
+            .http
+            .get(self.url("/.well-known/enclava"))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(ApiError::HostedCreateIdempotencyUnsupported);
+        }
+        let discovery = response
+            .json::<EnclavaDiscoveryResponse>()
+            .await
+            .map_err(|_| ApiError::HostedCreateIdempotencyUnsupported)?;
+        if discovery.api_mode != ApiMode::HostedPaas {
+            return Err(ApiError::HostedCreateIdempotencyUnsupported);
+        }
+        Ok(())
     }
 
     pub async fn list_apps(&self) -> Result<Vec<AppResponse>, ApiError> {

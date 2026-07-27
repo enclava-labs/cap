@@ -1353,9 +1353,15 @@ pub async fn reconcile_failed_rollout_cleanup_at_startup(
     state: &AppState,
 ) -> Result<(), DeploymentJobError> {
     loop {
-        let Some(deployment_id) = oldest_rollout_cleanup_job_id(&state.db).await? else {
+        let Some((deployment_id, payload_version)) = oldest_rollout_cleanup_job(&state.db).await?
+        else {
             return Ok(());
         };
+        if !(MIN_SUPPORTED_JOB_PAYLOAD_VERSION..=MAX_SUPPORTED_JOB_PAYLOAD_VERSION)
+            .contains(&payload_version)
+        {
+            return Err(DeploymentJobError::UnsupportedPayloadVersion);
+        }
         let Some(job) = claim_job(
             &state.db,
             "rollout_cleanup_pending",
@@ -1379,9 +1385,11 @@ pub async fn reconcile_failed_rollout_cleanup_at_startup(
     }
 }
 
-async fn oldest_rollout_cleanup_job_id(pool: &PgPool) -> Result<Option<Uuid>, DeploymentJobError> {
-    sqlx::query_scalar(
-        "SELECT deployment_id
+async fn oldest_rollout_cleanup_job(
+    pool: &PgPool,
+) -> Result<Option<(Uuid, i32)>, DeploymentJobError> {
+    sqlx::query_as(
+        "SELECT deployment_id, payload_version
            FROM deployment_apply_jobs
           WHERE state IN ('rollout_cleanup_pending', 'rollout_cleaning_up')
           ORDER BY created_at, deployment_id
@@ -5143,6 +5151,63 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete malformed payload fixture");
+    }
+
+    #[tokio::test]
+    async fn unsupported_cleanup_payload_fails_startup_without_claiming() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'failed'::deploy_status_enum,
+                    error_message = 'future-cleanup-payload',
+                    completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("make future cleanup deployment terminal");
+        let mut future_payload = serde_json::to_value(payload).expect("serialize future payload");
+        future_payload["version"] = serde_json::json!(JOB_PAYLOAD_VERSION + 1);
+        replace_job_with_raw_payload(
+            &pool,
+            deployment_id,
+            future_payload,
+            JOB_PAYLOAD_VERSION + 1,
+            false,
+            "rollout_cleanup_pending",
+        )
+        .await;
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+        let error = reconcile_failed_rollout_cleanup_at_startup(&state)
+            .await
+            .expect_err("unsupported cleanup payload must refuse startup explicitly");
+        assert!(matches!(
+            error,
+            DeploymentJobError::UnsupportedPayloadVersion
+        ));
+        let (state, lock_token, attempts): (String, Option<Uuid>, i32) = sqlx::query_as(
+            "SELECT state, lock_token, attempts
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load unsupported cleanup after startup refusal");
+        assert_eq!(state, "rollout_cleanup_pending");
+        assert!(lock_token.is_none());
+        assert_eq!(attempts, 0);
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete unsupported cleanup fixture");
     }
 
     #[tokio::test]
