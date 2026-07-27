@@ -66,6 +66,8 @@ pub enum MutationLeaseError {
     AppUnavailable,
     #[error("application mutation lease was lost")]
     Lost,
+    #[error("this process no longer holds the current runtime authority")]
+    StaleRuntimeAuthority,
     #[error("side-effect admission limiter closed")]
     AdmissionClosed,
 }
@@ -487,6 +489,9 @@ pub async fn claim_resources(
     resources.dedup();
     let token = Uuid::new_v4();
     let mut tx = state.db.begin().await?;
+    if !state.runtime_authority.is_current_in_tx(&mut tx).await? {
+        return Err(MutationLeaseError::StaleRuntimeAuthority);
+    }
     let claimed_resources =
         claim_resource_rows(&mut tx, token, operation_kind, operation_id, resources).await?;
     tx.commit().await?;
@@ -524,6 +529,9 @@ pub async fn claim(
 
     let token = Uuid::new_v4();
     let mut tx = state.db.begin().await?;
+    if !state.runtime_authority.is_current_in_tx(&mut tx).await? {
+        return Err(MutationLeaseError::StaleRuntimeAuthority);
+    }
     crate::deploy::lock_app_deployment_lane(&mut tx, app_id).await?;
     let app_available: bool = sqlx::query_scalar(
         "SELECT EXISTS(
@@ -653,6 +661,123 @@ async fn claim_resource_rows(
         });
     }
     Ok(claimed_resources)
+}
+
+async fn load_reconciliation_owner(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    operation_kind: &str,
+    operation_id: Uuid,
+    expected_resources: &[ResourceFence],
+) -> Result<(Uuid, i64, Vec<ClaimedResource>), MutationLeaseError> {
+    let Some((token, generation)) = sqlx::query_as::<_, (Uuid, i64)>(
+        "SELECT owner_token, generation
+           FROM app_mutation_leases
+          WHERE app_id = $1
+            AND operation_kind = $2
+            AND operation_id = $3
+            AND owner_token IS NOT NULL
+          FOR UPDATE",
+    )
+    .bind(app_id)
+    .bind(operation_kind)
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Err(MutationLeaseError::Lost);
+    };
+
+    let rows = sqlx::query_as::<_, (String, String, i64, Option<String>, Option<Uuid>)>(
+        "SELECT resource_scope, resource_key, generation,
+                operation_kind, operation_id
+           FROM external_resource_mutation_leases
+          WHERE owner_token = $1
+          ORDER BY resource_scope, resource_key
+          FOR UPDATE",
+    )
+    .bind(token)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut resources = Vec::with_capacity(rows.len());
+    for (scope, key, generation, observed_kind, observed_id) in rows {
+        if observed_kind.as_deref() != Some(operation_kind) || observed_id != Some(operation_id) {
+            return Err(MutationLeaseError::Lost);
+        }
+        resources.push(ClaimedResource {
+            fence: ResourceFence::new(scope, key),
+            generation,
+        });
+    }
+
+    let mut expected = expected_resources.to_vec();
+    expected.sort();
+    expected.dedup();
+    let observed: Vec<_> = resources
+        .iter()
+        .map(|resource| resource.fence.clone())
+        .collect();
+    if observed != expected {
+        return Err(MutationLeaseError::Lost);
+    }
+    Ok((token, generation, resources))
+}
+
+/// Verify the exact durable mutation owner left by a terminal failed rollout.
+/// The caller must hold the app advisory lane. Deadlines are intentionally not
+/// consulted: this recovery path is authorized by the still-owned operation
+/// identity and must remain usable after a process crash or long Trustee
+/// outage.
+pub async fn assert_reconciliation_owner_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    operation_kind: &str,
+    operation_id: Uuid,
+    expected_resources: &[ResourceFence],
+) -> Result<(), MutationLeaseError> {
+    load_reconciliation_owner(tx, app_id, operation_kind, operation_id, expected_resources).await?;
+    Ok(())
+}
+
+/// Release a previously verified terminal-rollout mutation only after its
+/// provider reconciliation has succeeded. The caller updates the durable job
+/// to completed in this same transaction, so neither half can commit alone.
+pub async fn release_reconciled_operation_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    operation_kind: &str,
+    operation_id: Uuid,
+    expected_resources: &[ResourceFence],
+) -> Result<(), MutationLeaseError> {
+    let (token, generation, resources) =
+        load_reconciliation_owner(tx, app_id, operation_kind, operation_id, expected_resources)
+            .await?;
+    clear_resource_rows(tx, token, &resources).await?;
+    let app = sqlx::query(
+        "UPDATE app_mutation_leases
+            SET owner_token = NULL,
+                operation_kind = NULL,
+                operation_id = NULL,
+                locked_until = NULL,
+                reclaim_after = NULL,
+                updated_at = clock_timestamp()
+          WHERE app_id = $1
+            AND owner_token = $2
+            AND generation = $3
+            AND operation_kind = $4
+            AND operation_id = $5",
+    )
+    .bind(app_id)
+    .bind(token)
+    .bind(generation)
+    .bind(operation_kind)
+    .bind(operation_id)
+    .execute(&mut **tx)
+    .await?;
+    if app.rows_affected() != 1 {
+        return Err(MutationLeaseError::Lost);
+    }
+    Ok(())
 }
 
 async fn renew(
@@ -1148,6 +1273,65 @@ mod tests {
         state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
         state.db = pool;
         state
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_authority_cannot_claim_app_or_provider_generations() {
+        let pool = database_test_pool(4).await;
+        let (org_id, app_id) = insert_app(&pool, "stale-authority.example.test").await;
+        let mut stale = state_with_pool(pool.clone());
+        stale.runtime_authority.epoch = Uuid::new_v4();
+
+        let app_error = claim(
+            &stale,
+            app_id,
+            "stale_app_writer",
+            Uuid::new_v4(),
+            false,
+            vec![ResourceFence::dns("stale-authority.example.test")],
+        )
+        .await
+        .expect_err("a pre-restore replica must not claim an app mutation");
+        assert!(matches!(
+            app_error,
+            MutationLeaseError::StaleRuntimeAuthority
+        ));
+
+        let resource_error = match claim_resources(
+            &stale,
+            "stale_global_writer",
+            Uuid::new_v4(),
+            vec![ResourceFence::kbs_policy()],
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a pre-restore replica must not claim a provider mutation"),
+        };
+        assert!(matches!(
+            resource_error,
+            MutationLeaseError::StaleRuntimeAuthority
+        ));
+
+        let claimed_rows: i64 = sqlx::query_scalar(
+            "SELECT
+                 (SELECT count(*) FROM app_mutation_leases
+                   WHERE app_id = $1 AND owner_token IS NOT NULL)
+               + (SELECT count(*) FROM external_resource_mutation_leases
+                   WHERE owner_token IS NOT NULL
+                     AND operation_kind IN ('stale_app_writer', 'stale_global_writer'))",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count stale-writer claims");
+        assert_eq!(claimed_rows, 0);
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete stale-authority fixture");
     }
 
     #[tokio::test]

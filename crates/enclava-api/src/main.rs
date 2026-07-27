@@ -189,11 +189,7 @@ async fn verify_trustee_kbs_connectivity(
     }
     let raw_url = env_nonempty("TRUSTEE_KBS_URL")
         .ok_or_else(|| anyhow::anyhow!("TRUSTEE_KBS_URL is required"))?;
-    let url = reqwest::Url::parse(&raw_url)
-        .map_err(|err| anyhow::anyhow!("invalid TRUSTEE_KBS_URL: {err}"))?;
-    if url.scheme() != "https" {
-        anyhow::bail!("TRUSTEE_KBS_URL must use https when Trustee is required");
-    }
+    let url = validate_trustee_kbs_url(&raw_url, !cfg!(debug_assertions))?;
     let response = client
         .get(url)
         .send()
@@ -210,6 +206,15 @@ async fn verify_trustee_kbs_connectivity(
         "verified trusted TLS connectivity to Trustee KBS"
     );
     Ok(())
+}
+
+fn validate_trustee_kbs_url(raw_url: &str, release_build: bool) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw_url)
+        .map_err(|err| anyhow::anyhow!("invalid TRUSTEE_KBS_URL: {err}"))?;
+    if release_build && url.scheme() != "https" {
+        anyhow::bail!("TRUSTEE_KBS_URL must use https in release builds");
+    }
+    Ok(url)
 }
 
 fn read_key_file(path: &str) -> anyhow::Result<Vec<u8>> {
@@ -930,5 +935,21 @@ mod tests {
             err.to_string().contains("TENANT_TEE_CA_CERT_PEM"),
             "error should name the invalid tenant TEE CA env var: {err}"
         );
+    }
+
+    #[test]
+    fn debug_build_allows_http_trustee_for_local_stacks() {
+        let url = validate_trustee_kbs_url("http://trustee.example.test:8080", false)
+            .expect("debug builds retain documented local HTTP Trustee support");
+        assert_eq!(url.scheme(), "http");
+    }
+
+    #[test]
+    fn release_build_requires_https_trustee() {
+        let error = validate_trustee_kbs_url("http://trustee.example.test:8080", true)
+            .expect_err("release builds must reject plaintext Trustee");
+        assert!(error.to_string().contains("release builds"));
+        validate_trustee_kbs_url("https://trustee.example.test:8443", true)
+            .expect("release builds accept HTTPS Trustee");
     }
 }

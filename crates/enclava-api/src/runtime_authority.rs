@@ -28,6 +28,33 @@ pub struct RuntimeAuthority {
     pub restore_generation: i64,
 }
 
+impl RuntimeAuthority {
+    /// Lock and compare the singleton authority in a mutation-claim
+    /// transaction. The shared row lock prevents a concurrent restore
+    /// generation rotation from committing until that claim either commits or
+    /// rolls back.
+    pub async fn is_current_in_tx(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<bool, sqlx::Error> {
+        let observed: (Uuid, i64) = sqlx::query_as(
+            "SELECT authority_epoch, restore_generation
+              FROM cap_runtime_authority
+              WHERE singleton
+              FOR SHARE",
+        )
+        .fetch_one(&mut **transaction)
+        .await?;
+        Ok(observed == (self.epoch, self.restore_generation))
+    }
+}
+
+#[cfg(test)]
+pub const TEST_RUNTIME_AUTHORITY: RuntimeAuthority = RuntimeAuthority {
+    epoch: Uuid::from_u128(0x44444444444444448444444444444444),
+    restore_generation: 1,
+};
+
 pub async fn establish_epoch(
     pool: &PgPool,
     restore_generation: i64,
@@ -125,12 +152,34 @@ mod tests {
         .execute(&mut *tx)
         .await
         .expect("set isolated baseline authority");
+        let baseline = RuntimeAuthority {
+            epoch: baseline_epoch,
+            restore_generation: baseline_generation,
+        };
+        assert!(
+            baseline
+                .is_current_in_tx(&mut tx)
+                .await
+                .expect("validate baseline authority")
+        );
 
         let advanced = establish_epoch_with(&mut tx, baseline_generation + 1)
             .await
             .expect("advance restore generation");
         assert_ne!(advanced.epoch, baseline_epoch);
         assert_eq!(advanced.restore_generation, baseline_generation + 1);
+        assert!(
+            !baseline
+                .is_current_in_tx(&mut tx)
+                .await
+                .expect("reject cached pre-restore authority")
+        );
+        assert!(
+            advanced
+                .is_current_in_tx(&mut tx)
+                .await
+                .expect("validate rotated authority")
+        );
 
         let stable = establish_epoch_with(&mut tx, baseline_generation + 1)
             .await
