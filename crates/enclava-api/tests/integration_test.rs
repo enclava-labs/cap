@@ -166,6 +166,10 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
     let side_effect_admission = enclava_api::state::side_effect_admission_for_pool(&pool);
     let state = AppState {
         db: pool.clone(),
+        runtime_authority: enclava_api::runtime_authority::RuntimeAuthority {
+            epoch: Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
+            restore_generation: 1,
+        },
         management_mode,
         signing_key,
         hmac_key,

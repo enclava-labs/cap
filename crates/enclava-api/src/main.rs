@@ -807,6 +807,7 @@ async fn main() {
     let side_effect_admission = enclava_api::state::side_effect_admission_for_pool(&pool);
     let state = AppState {
         db: pool,
+        runtime_authority,
         management_mode,
         signing_key: Arc::new(signing_key),
         hmac_key: Arc::new(hmac_key),
@@ -832,7 +833,7 @@ async fn main() {
         internal_auth,
     };
 
-    if let Err(error) = enclava_api::kbs::reconcile_signed_policy_once(&state).await {
+    if let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await {
         eprintln!("startup refused: KBS policy reconciliation failed: {error}");
         std::process::exit(1);
     }
@@ -904,7 +905,7 @@ mod tests {
             .expect("deployment dispatcher startup");
         for prerequisite in [
             "runtime_authority::establish_epoch",
-            "reconcile_signed_policy_once",
+            "reconcile_signed_policy_at_startup",
             "verify_trustee_kbs_connectivity",
             "reconcile_all_haproxy_routes",
         ] {

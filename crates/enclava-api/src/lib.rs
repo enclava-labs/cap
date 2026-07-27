@@ -537,6 +537,10 @@ pub(crate) mod test_support {
         let side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
         AppState {
             db: pool,
+            runtime_authority: crate::runtime_authority::RuntimeAuthority {
+                epoch: Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
+                restore_generation: 1,
+            },
             management_mode: crate::state::CapManagementMode::Standalone,
             signing_key: Arc::new(SigningKey::generate(&mut OsRng)),
             hmac_key: Arc::new([7u8; 32]),

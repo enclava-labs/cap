@@ -166,6 +166,10 @@ pub fn side_effect_admission_for_pool(pool: &PgPool) -> Arc<Semaphore> {
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
+    /// Immutable provider authority captured before this process can perform
+    /// external mutations. A process must never adopt a newer authority from
+    /// a restored database while it is still carrying older intent.
+    pub runtime_authority: crate::runtime_authority::RuntimeAuthority,
     /// Instance-level management ownership mode.
     pub management_mode: CapManagementMode,
     /// Ed25519 signing key for config JWTs.

@@ -97,6 +97,7 @@ async fn ensure_custom_domain_haproxy_route(
     crate::edge::ensure_haproxy_routes(
         &state.db,
         &crate::edge::EdgeRouteConfig::from_env(),
+        state.runtime_authority,
         Some(edge_config_generation),
         &[route],
     )
@@ -492,6 +493,13 @@ pub async fn verify_challenge(
         custom_domain: Some(domain.clone()),
         ..app.clone()
     };
+    let kubernetes_mutation_generation =
+        enclava_engine::apply::generation::MutationGeneration::with_authority(
+            kubernetes_mutation_generation,
+            state.runtime_authority.epoch,
+            state.runtime_authority.restore_generation,
+        )
+        .map_err(|_| internal_error())?;
     let ingress_ready = match mutation
         .guard_provider(crate::deploy::reapply_tenant_ingress(
             &state.db,
@@ -581,6 +589,7 @@ pub async fn verify_challenge(
             .guard_provider(crate::edge::remove_haproxy_routes(
                 &state.db,
                 &crate::edge::EdgeRouteConfig::from_env(),
+                state.runtime_authority,
                 Some(edge_config_generation),
                 &[(app_backend.clone(), old.to_string())],
             ))
@@ -729,6 +738,7 @@ pub async fn remove_custom_domain(
         .guard_provider(crate::edge::remove_haproxy_routes(
             &state.db,
             &edge_config,
+            state.runtime_authority,
             Some(edge_config_generation),
             &[(app_backend, domain.clone())],
         ))

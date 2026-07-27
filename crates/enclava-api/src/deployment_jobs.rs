@@ -1669,6 +1669,7 @@ async fn apply_claimed_job(
         .guard_provider(crate::deploy::apply_deployment_manifests(
             ApplyDeploymentManifestsRequest {
                 pool: state.db.clone(),
+                runtime_authority: state.runtime_authority,
                 app: payload.app.clone(),
                 snapshot: payload.snapshot.clone(),
                 // The operation deployment remains distinct from the historical
@@ -2078,6 +2079,7 @@ async fn reconcile_pending_kbs_with_mutation(
         .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
             &state.db,
             state.kbs_policy.as_ref(),
+            state.runtime_authority,
         ))
         .await??;
     Ok(())

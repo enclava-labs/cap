@@ -19,12 +19,15 @@ use super::engine::{ApplyEngine, ApplyError};
 
 pub const MUTATION_GENERATION_ANNOTATION: &str = "enclava.dev/cap-provider-mutation-generation";
 pub const MUTATION_AUTHORITY_EPOCH_ANNOTATION: &str = "enclava.dev/cap-provider-authority-epoch";
+pub const MUTATION_AUTHORITY_RESTORE_GENERATION_ANNOTATION: &str =
+    "enclava.dev/cap-provider-restore-generation";
 const MAX_CONFLICT_RETRIES: usize = 12;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MutationGeneration {
     value: i64,
     authority_epoch: Option<Uuid>,
+    authority_restore_generation: Option<i64>,
 }
 
 impl MutationGeneration {
@@ -39,16 +42,22 @@ impl MutationGeneration {
         Ok(Self {
             value,
             authority_epoch: None,
+            authority_restore_generation: None,
         })
     }
 
-    pub fn with_authority(value: i64, authority_epoch: Uuid) -> Result<Self, ApplyError> {
-        if authority_epoch.is_nil() {
+    pub fn with_authority(
+        value: i64,
+        authority_epoch: Uuid,
+        authority_restore_generation: i64,
+    ) -> Result<Self, ApplyError> {
+        if authority_epoch.is_nil() || authority_restore_generation < 0 {
             return Err(ApplyError::InvalidMutationGeneration(value));
         }
         Ok(Self {
             value: Self::new(value)?.value,
             authority_epoch: Some(authority_epoch),
+            authority_restore_generation: Some(authority_restore_generation),
         })
     }
 
@@ -114,41 +123,92 @@ where
         .transpose()
 }
 
+fn live_authority_restore_generation<K>(resource: &K) -> Result<Option<i64>, ApplyError>
+where
+    K: Resource,
+{
+    resource
+        .meta()
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(MUTATION_AUTHORITY_RESTORE_GENERATION_ANNOTATION))
+        .map(|raw| {
+            raw.parse::<i64>()
+                .ok()
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| ApplyError::InvalidLiveMutationGeneration {
+                    kind: kind::<K>(),
+                    name: resource
+                        .meta()
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| "<unnamed>".to_string()),
+                })
+        })
+        .transpose()
+}
+
+fn stale_generation_error<K>(resource: &K, desired: MutationGeneration, actual: i64) -> ApplyError
+where
+    K: Resource,
+{
+    ApplyError::StaleMutationGeneration {
+        kind: kind::<K>(),
+        name: resource
+            .meta()
+            .name
+            .clone()
+            .unwrap_or_else(|| "<unnamed>".to_string()),
+        desired: desired.get(),
+        actual,
+    }
+}
+
 fn ensure_not_stale<K>(resource: &K, desired: MutationGeneration) -> Result<(), ApplyError>
 where
     K: Resource,
 {
     let actual = live_generation(resource)?;
     let actual_authority_epoch = live_authority_epoch(resource)?;
-    if desired.authority_epoch.is_some() && actual_authority_epoch != desired.authority_epoch {
-        // Generations are comparable only inside the database lifetime that
-        // issued them. A fresh/restored CAP authority may replace a retained
-        // object even when its first generation is numerically lower.
-        return Ok(());
+    let actual_restore_generation = live_authority_restore_generation(resource)?;
+    if actual_restore_generation.is_some() && actual_authority_epoch.is_none() {
+        return Err(stale_generation_error(resource, desired, actual));
     }
-    if desired.authority_epoch.is_none() && actual_authority_epoch.is_some() {
-        return Err(ApplyError::StaleMutationGeneration {
-            kind: kind::<K>(),
-            name: resource
-                .meta()
-                .name
-                .clone()
-                .unwrap_or_else(|| "<unnamed>".to_string()),
-            desired: desired.get(),
-            actual,
-        });
+
+    match (
+        desired.authority_restore_generation,
+        actual_restore_generation,
+    ) {
+        (Some(desired_restore), Some(actual_restore)) if desired_restore < actual_restore => {
+            return Err(stale_generation_error(resource, desired, actual));
+        }
+        (Some(desired_restore), Some(actual_restore)) if desired_restore > actual_restore => {
+            // Restore generations are deployment-owned and globally
+            // comparable. Only a strictly newer incarnation may adopt an
+            // object stamped by another authority epoch.
+            return Ok(());
+        }
+        (Some(_), Some(_)) if actual_authority_epoch != desired.authority_epoch => {
+            // Two epochs for one restore incarnation indicate divergent
+            // authority. Neither is allowed to overwrite the other.
+            return Err(stale_generation_error(resource, desired, actual));
+        }
+        (Some(_), None) => {
+            // One-way upgrade for objects written before comparable restore
+            // metadata existed. Once rewritten, old writers cannot write back.
+            return Ok(());
+        }
+        (None, Some(_)) => {
+            return Err(stale_generation_error(resource, desired, actual));
+        }
+        (None, None) if actual_authority_epoch.is_some() => {
+            return Err(stale_generation_error(resource, desired, actual));
+        }
+        _ => {}
     }
+
     if actual > desired.get() {
-        return Err(ApplyError::StaleMutationGeneration {
-            kind: kind::<K>(),
-            name: resource
-                .meta()
-                .name
-                .clone()
-                .unwrap_or_else(|| "<unnamed>".to_string()),
-            desired: desired.get(),
-            actual,
-        });
+        return Err(stale_generation_error(resource, desired, actual));
     }
     Ok(())
 }
@@ -166,14 +226,21 @@ where
             generation.get().to_string(),
         );
     if let Some(authority_epoch) = generation.authority_epoch {
-        resource
+        let annotations = resource
             .meta_mut()
             .annotations
-            .get_or_insert_with(Default::default)
-            .insert(
-                MUTATION_AUTHORITY_EPOCH_ANNOTATION.to_string(),
-                authority_epoch.to_string(),
-            );
+            .get_or_insert_with(Default::default);
+        annotations.insert(
+            MUTATION_AUTHORITY_EPOCH_ANNOTATION.to_string(),
+            authority_epoch.to_string(),
+        );
+        annotations.insert(
+            MUTATION_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+            generation
+                .authority_restore_generation
+                .expect("authority generation is constructed atomically")
+                .to_string(),
+        );
     }
 }
 
@@ -186,9 +253,12 @@ where
 {
     let actual = live_generation(resource)?;
     let actual_authority_epoch = live_authority_epoch(resource)?;
+    let actual_restore_generation = live_authority_restore_generation(resource)?;
     if actual != generation.get()
         || generation.authority_epoch.is_some()
             && actual_authority_epoch != generation.authority_epoch
+        || generation.authority_restore_generation.is_some()
+            && actual_restore_generation != generation.authority_restore_generation
     {
         return Err(ApplyError::ProviderGenerationNotApplied {
             kind: kind::<K>(),
@@ -344,6 +414,15 @@ where
             annotations.insert(
                 MUTATION_AUTHORITY_EPOCH_ANNOTATION.to_string(),
                 serde_json::json!(authority_epoch.to_string()),
+            );
+            annotations.insert(
+                MUTATION_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+                serde_json::json!(
+                    generation
+                        .authority_restore_generation
+                        .expect("authority generation is constructed atomically")
+                        .to_string()
+                ),
             );
         }
 
@@ -750,6 +829,10 @@ mod tests {
                     MUTATION_AUTHORITY_EPOCH_ANNOTATION.to_string(),
                     retained_epoch.to_string(),
                 ),
+                (
+                    MUTATION_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+                    "4".to_string(),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -758,7 +841,7 @@ mod tests {
         assert!(matches!(
             ensure_not_stale(
                 &retained,
-                MutationGeneration::with_authority(1, retained_epoch).unwrap()
+                MutationGeneration::with_authority(1, retained_epoch, 4).unwrap()
             ),
             Err(ApplyError::StaleMutationGeneration {
                 desired: 1,
@@ -769,24 +852,44 @@ mod tests {
         assert!(
             ensure_not_stale(
                 &retained,
-                MutationGeneration::with_authority(1, restored_epoch).unwrap()
+                MutationGeneration::with_authority(1, restored_epoch, 5).unwrap()
             )
             .is_ok(),
-            "a generation from another database lifetime is not newer authority"
+            "a strictly newer restore incarnation can adopt a retained object"
         );
         assert!(
             ensure_not_stale(&retained, MutationGeneration::new(100).unwrap()).is_err(),
             "an epoch-less writer cannot replace an epoch-aware object"
         );
+        assert!(
+            ensure_not_stale(
+                &retained,
+                MutationGeneration::with_authority(100, restored_epoch, 4).unwrap()
+            )
+            .is_err(),
+            "a different epoch in the same restore incarnation fails closed"
+        );
 
         annotate(
             &mut retained,
-            MutationGeneration::with_authority(1, restored_epoch).unwrap(),
+            MutationGeneration::with_authority(1, restored_epoch, 5).unwrap(),
         );
         assert_eq!(live_generation(&retained).unwrap(), 1);
         assert_eq!(
             live_authority_epoch(&retained).unwrap(),
             Some(restored_epoch)
+        );
+        assert_eq!(
+            live_authority_restore_generation(&retained).unwrap(),
+            Some(5)
+        );
+        assert!(
+            ensure_not_stale(
+                &retained,
+                MutationGeneration::with_authority(100, retained_epoch, 4).unwrap()
+            )
+            .is_err(),
+            "a delayed writer from a superseded restore incarnation cannot write back"
         );
     }
 
@@ -982,7 +1085,7 @@ mod tests {
                 "kind": "StatefulSet",
                 "spec": { "replicas": 0 },
             }),
-            MutationGeneration::with_authority(2, authority_epoch).unwrap(),
+            MutationGeneration::with_authority(2, authority_epoch, 7).unwrap(),
         )
         .await
         .expect("conditional scale merge applies");
@@ -1002,7 +1105,7 @@ mod tests {
                     },
                 },
             }),
-            MutationGeneration::with_authority(3, authority_epoch).unwrap(),
+            MutationGeneration::with_authority(3, authority_epoch, 7).unwrap(),
         )
         .await
         .expect("conditional restart merge applies");
@@ -1045,6 +1148,17 @@ mod tests {
                 ))
                 .and_then(Value::as_str),
             Some(authority_epoch_text.as_str())
+        );
+        assert_eq!(
+            resource
+                .pointer(&format!(
+                    "/metadata/annotations/{}",
+                    MUTATION_AUTHORITY_RESTORE_GENERATION_ANNOTATION
+                        .replace('~', "~0")
+                        .replace('/', "~1")
+                ))
+                .and_then(Value::as_str),
+            Some("7")
         );
     }
 }

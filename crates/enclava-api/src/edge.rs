@@ -15,12 +15,14 @@ use sqlx::PgPool;
 use std::net::IpAddr;
 use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::{runtime_authority::RuntimeAuthority, state::AppState};
 
 const HAPROXY_CONFIG_GENERATION_ANNOTATION: &str = "config.enclava.dev/haproxy-sha256";
 const HAPROXY_MUTATION_GENERATION_ANNOTATION: &str =
     "config.enclava.dev/haproxy-mutation-generation";
 const HAPROXY_AUTHORITY_EPOCH_ANNOTATION: &str = "config.enclava.dev/cap-authority-epoch";
+const HAPROXY_AUTHORITY_RESTORE_GENERATION_ANNOTATION: &str =
+    "config.enclava.dev/cap-restore-generation";
 const HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES: usize = 900 * 1024;
 const KUBERNETES_CAS_ATTEMPTS: usize = 8;
 const KUBERNETES_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -45,6 +47,10 @@ pub enum EdgeRouteError {
         "HAProxy mutation generation {expected} was superseded by generation {actual} in the same authority epoch"
     )]
     SupersededMutationGeneration { expected: i64, actual: i64 },
+    #[error("HAProxy restore generation {expected} was superseded by restore generation {actual}")]
+    SupersededAuthorityRestoreGeneration { expected: i64, actual: i64 },
+    #[error("HAProxy has a divergent authority epoch in restore generation {restore_generation}")]
+    DivergentAuthorityEpoch { restore_generation: i64 },
     #[error("invalid hostname for HAProxy route: {0}")]
     InvalidHostname(#[from] ValidateError),
     #[error("invalid app name for HAProxy backend: {0}")]
@@ -151,10 +157,11 @@ impl SniRoute {
 pub async fn ensure_haproxy_routes(
     pool: &PgPool,
     config: &EdgeRouteConfig,
+    authority: RuntimeAuthority,
     mutation_generation: Option<i64>,
     routes: &[SniRoute],
 ) -> Result<(), EdgeRouteError> {
-    mutate_haproxy_config(pool, config, mutation_generation, |current| {
+    mutate_haproxy_config(pool, config, authority, mutation_generation, |current| {
         let mut out = current.to_string();
         for r in routes {
             out = render_route_into(&out, r);
@@ -172,10 +179,11 @@ pub async fn ensure_haproxy_routes(
 pub async fn remove_haproxy_routes(
     pool: &PgPool,
     config: &EdgeRouteConfig,
+    authority: RuntimeAuthority,
     mutation_generation: Option<i64>,
     routes: &[(String, String)],
 ) -> Result<(), EdgeRouteError> {
-    let changed = mutate_haproxy_config(pool, config, mutation_generation, |current| {
+    let changed = mutate_haproxy_config(pool, config, authority, mutation_generation, |current| {
         let mut out = current.to_string();
         for (backend, host) in routes {
             out = remove_route_from(&out, backend, host);
@@ -219,6 +227,7 @@ pub async fn reconcile_all_haproxy_routes(state: &AppState) -> Result<(), EdgeRe
                 &state.db,
                 client,
                 &config,
+                state.runtime_authority,
                 Some(generation),
                 |current| {
                     let mut desired = remove_all_cap_managed_routes(current);
@@ -312,6 +321,7 @@ async fn load_desired_haproxy_routes(
 async fn mutate_haproxy_config<F>(
     pool: &PgPool,
     config: &EdgeRouteConfig,
+    authority: RuntimeAuthority,
     mutation_generation: Option<i64>,
     mutate: F,
 ) -> Result<bool, EdgeRouteError>
@@ -322,27 +332,28 @@ where
     // Do not hold a second PostgreSQL connection across Kubernetes I/O: with a
     // two-connection pool that would starve both job and mutation heartbeats.
     let client = Client::try_default().await?;
-    mutate_haproxy_config_with_client(pool, client, config, mutation_generation, mutate).await
+    mutate_haproxy_config_with_client(pool, client, config, authority, mutation_generation, mutate)
+        .await
 }
 
 async fn mutate_haproxy_config_with_client<F>(
-    pool: &PgPool,
+    _pool: &PgPool,
     client: Client,
     config: &EdgeRouteConfig,
+    authority: RuntimeAuthority,
     mutation_generation: Option<i64>,
     mutate: F,
 ) -> Result<bool, EdgeRouteError>
 where
     F: Fn(&str) -> String,
 {
-    let authority_epoch = crate::runtime_authority::load_epoch(pool).await?;
-    reconcile_haproxy_config(client, config, authority_epoch, mutation_generation, mutate).await
+    reconcile_haproxy_config(client, config, authority, mutation_generation, mutate).await
 }
 
 async fn reconcile_haproxy_config<F>(
     client: Client,
     config: &EdgeRouteConfig,
-    authority_epoch: Uuid,
+    authority: RuntimeAuthority,
     mutation_generation: Option<i64>,
     mutate: F,
 ) -> Result<bool, EdgeRouteError>
@@ -363,10 +374,19 @@ where
                 namespace: config.namespace.clone(),
                 name: config.configmap_name.clone(),
             })?;
-        let (current_authority_epoch, current_mutation_generation) =
-            configmap_mutation_authority(&cm)?;
+        let (
+            current_authority_epoch,
+            current_authority_restore_generation,
+            current_mutation_generation,
+        ) = configmap_mutation_authority(&cm)?;
+        ensure_current_authority_is_not_newer(
+            current_authority_epoch,
+            current_authority_restore_generation,
+            authority,
+        )?;
         if let Some(expected_generation) = mutation_generation
-            && current_authority_epoch == Some(authority_epoch)
+            && current_authority_epoch == Some(authority.epoch)
+            && current_authority_restore_generation == Some(authority.restore_generation)
             && current_mutation_generation > expected_generation
         {
             // This closure belongs to an older durable resource owner. Never
@@ -377,7 +397,8 @@ where
             });
         }
         let updated = mutate(&current);
-        let mutation_authority_changed = current_authority_epoch != Some(authority_epoch)
+        let mutation_authority_changed = current_authority_epoch != Some(authority.epoch)
+            || current_authority_restore_generation != Some(authority.restore_generation)
             || mutation_generation.is_some_and(|expected| current_mutation_generation != expected);
         if updated == current && !mutation_authority_changed {
             converged = true;
@@ -399,7 +420,11 @@ where
         let annotations = cm.metadata.annotations.get_or_insert_default();
         annotations.insert(
             HAPROXY_AUTHORITY_EPOCH_ANNOTATION.to_string(),
-            authority_epoch.to_string(),
+            authority.epoch.to_string(),
+        );
+        annotations.insert(
+            HAPROXY_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+            authority.restore_generation.to_string(),
         );
         if let Some(expected_generation) = mutation_generation {
             annotations.insert(
@@ -449,10 +474,34 @@ where
                 namespace: config.namespace.clone(),
                 name: config.configmap_name.clone(),
             })?;
+        let (cm_authority_epoch, cm_restore_generation, _) = configmap_mutation_authority(&cm)?;
+        ensure_current_authority_is_not_newer(
+            cm_authority_epoch,
+            cm_restore_generation,
+            authority,
+        )?;
+        if cm_authority_epoch != Some(authority.epoch)
+            || cm_restore_generation != Some(authority.restore_generation)
+        {
+            return Err(EdgeRouteError::DivergentAuthorityEpoch {
+                restore_generation: authority.restore_generation,
+            });
+        }
         let generation = haproxy_config_generation(current);
         let mut daemonset = ds_api.get(&config.daemonset_name).await?;
+        let daemonset_authority_epoch = daemonset_authority_epoch(&daemonset)?;
+        let daemonset_restore_generation = daemonset_authority_restore_generation(&daemonset)?;
+        if daemonset_restore_generation.is_some() && daemonset_authority_epoch.is_none() {
+            return Err(EdgeRouteError::InvalidAuthorityEpoch);
+        }
+        ensure_current_authority_is_not_newer(
+            daemonset_authority_epoch,
+            daemonset_restore_generation,
+            authority,
+        )?;
         if daemonset_config_generation(&daemonset) == Some(generation.as_str())
-            && daemonset_authority_epoch(&daemonset)? == Some(authority_epoch)
+            && daemonset_authority_epoch == Some(authority.epoch)
+            && daemonset_restore_generation == Some(authority.restore_generation)
         {
             return Ok(changed);
         }
@@ -475,7 +524,11 @@ where
                 ),
                 (
                     HAPROXY_AUTHORITY_EPOCH_ANNOTATION.to_string(),
-                    authority_epoch.to_string(),
+                    authority.epoch.to_string(),
+                ),
+                (
+                    HAPROXY_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+                    authority.restore_generation.to_string(),
                 ),
             ]);
         match bounded_kube_write(ds_api.replace(
@@ -522,7 +575,7 @@ fn haproxy_config_generation(config: &str) -> String {
 
 fn configmap_mutation_authority(
     configmap: &ConfigMap,
-) -> Result<(Option<Uuid>, i64), EdgeRouteError> {
+) -> Result<(Option<Uuid>, Option<i64>, i64), EdgeRouteError> {
     let authority_epoch = configmap
         .metadata
         .annotations
@@ -534,6 +587,22 @@ fn configmap_mutation_authority(
                 .map_err(|_| EdgeRouteError::InvalidAuthorityEpoch)
         })
         .transpose()?;
+    let restore_generation = configmap
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(HAPROXY_AUTHORITY_RESTORE_GENERATION_ANNOTATION))
+        .map(|generation| {
+            generation
+                .parse::<i64>()
+                .ok()
+                .filter(|generation| *generation >= 0)
+                .ok_or(EdgeRouteError::InvalidMutationGeneration)
+        })
+        .transpose()?;
+    if restore_generation.is_some() && authority_epoch.is_none() {
+        return Err(EdgeRouteError::InvalidAuthorityEpoch);
+    }
     let generation = configmap
         .metadata
         .annotations
@@ -548,7 +617,30 @@ fn configmap_mutation_authority(
         })
         .transpose()
         .map(|generation| generation.unwrap_or(0))?;
-    Ok((authority_epoch, generation))
+    Ok((authority_epoch, restore_generation, generation))
+}
+
+fn ensure_current_authority_is_not_newer(
+    current_epoch: Option<Uuid>,
+    current_restore_generation: Option<i64>,
+    desired: RuntimeAuthority,
+) -> Result<(), EdgeRouteError> {
+    match current_restore_generation {
+        Some(current) if current > desired.restore_generation => {
+            Err(EdgeRouteError::SupersededAuthorityRestoreGeneration {
+                expected: desired.restore_generation,
+                actual: current,
+            })
+        }
+        Some(current)
+            if current == desired.restore_generation && current_epoch != Some(desired.epoch) =>
+        {
+            Err(EdgeRouteError::DivergentAuthorityEpoch {
+                restore_generation: current,
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 fn daemonset_config_generation(daemonset: &DaemonSet) -> Option<&str> {
@@ -575,6 +667,25 @@ fn daemonset_authority_epoch(daemonset: &DaemonSet) -> Result<Option<Uuid>, Edge
             epoch
                 .parse::<Uuid>()
                 .map_err(|_| EdgeRouteError::InvalidAuthorityEpoch)
+        })
+        .transpose()
+}
+
+fn daemonset_authority_restore_generation(
+    daemonset: &DaemonSet,
+) -> Result<Option<i64>, EdgeRouteError> {
+    daemonset
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.metadata.as_ref())
+        .and_then(|metadata| metadata.annotations.as_ref())
+        .and_then(|annotations| annotations.get(HAPROXY_AUTHORITY_RESTORE_GENERATION_ANNOTATION))
+        .map(|generation| {
+            generation
+                .parse::<i64>()
+                .ok()
+                .filter(|generation| *generation >= 0)
+                .ok_or(EdgeRouteError::InvalidMutationGeneration)
         })
         .transpose()
 }
@@ -781,10 +892,8 @@ fn remove_all_cap_managed_routes(config: &str) -> String {
 }
 
 fn is_haproxy_section_header(line: &str) -> bool {
-    if line.is_empty()
-        || line.chars().next().is_some_and(char::is_whitespace)
-        || line.starts_with('#')
-    {
+    let line = line.trim_start();
+    if line.is_empty() || line.starts_with('#') {
         return false;
     }
     matches!(
@@ -918,7 +1027,9 @@ mod tests {
         generation: Option<String>,
         mutation_generation: Option<i64>,
         configmap_authority_epoch: Option<Uuid>,
+        configmap_restore_generation: Option<i64>,
         daemonset_authority_epoch: Option<Uuid>,
+        daemonset_restore_generation: Option<i64>,
         configmap_patch_outcomes: VecDeque<FakePatchOutcome>,
         daemonset_patch_outcomes: VecDeque<FakePatchOutcome>,
         configmap_patch_attempts: usize,
@@ -937,7 +1048,9 @@ mod tests {
                 generation: Some(haproxy_config_generation(config)),
                 mutation_generation: None,
                 configmap_authority_epoch: None,
+                configmap_restore_generation: None,
                 daemonset_authority_epoch: None,
+                daemonset_restore_generation: None,
                 configmap_patch_outcomes: VecDeque::new(),
                 daemonset_patch_outcomes: VecDeque::new(),
                 configmap_patch_attempts: 0,
@@ -962,6 +1075,12 @@ mod tests {
                 annotations.insert(
                     HAPROXY_AUTHORITY_EPOCH_ANNOTATION.to_string(),
                     json!(epoch.to_string()),
+                );
+            }
+            if let Some(generation) = self.configmap_restore_generation {
+                annotations.insert(
+                    HAPROXY_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+                    json!(generation.to_string()),
                 );
             }
             json!({
@@ -991,6 +1110,12 @@ mod tests {
                 annotations.insert(
                     HAPROXY_AUTHORITY_EPOCH_ANNOTATION.to_string(),
                     json!(epoch.to_string()),
+                );
+            }
+            if let Some(generation) = self.daemonset_restore_generation {
+                annotations.insert(
+                    HAPROXY_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+                    json!(generation.to_string()),
                 );
             }
             json!({
@@ -1109,6 +1234,15 @@ mod tests {
                     ))
                     .and_then(Value::as_str)
                     .and_then(|epoch| epoch.parse().ok());
+                locked.configmap_restore_generation = replacement
+                    .pointer(&format!(
+                        "/metadata/annotations/{}",
+                        HAPROXY_AUTHORITY_RESTORE_GENERATION_ANNOTATION
+                            .replace('~', "~0")
+                            .replace('/', "~1")
+                    ))
+                    .and_then(Value::as_str)
+                    .and_then(|generation| generation.parse().ok());
                 locked.configmap_resource_version += 1;
                 if outcome == FakePatchOutcome::LoseResponseAfterApply {
                     return Err(io::Error::new(
@@ -1161,6 +1295,15 @@ mod tests {
                     ))
                     .and_then(Value::as_str)
                     .and_then(|epoch| epoch.parse().ok());
+                locked.daemonset_restore_generation = replacement
+                    .pointer(&format!(
+                        "/spec/template/metadata/annotations/{}",
+                        HAPROXY_AUTHORITY_RESTORE_GENERATION_ANNOTATION
+                            .replace('~', "~0")
+                            .replace('/', "~1")
+                    ))
+                    .and_then(Value::as_str)
+                    .and_then(|generation| generation.parse().ok());
                 locked.daemonset_resource_version += 1;
                 if outcome == FakePatchOutcome::LoseResponseAfterApply {
                     return Err(io::Error::new(
@@ -1215,15 +1358,18 @@ mod tests {
         reconcile_haproxy_config(
             client,
             &edge_config(),
-            test_authority_epoch(),
+            test_runtime_authority(),
             Some(1),
             |_| desired.to_string(),
         )
         .await
     }
 
-    fn test_authority_epoch() -> Uuid {
-        Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap()
+    fn test_runtime_authority() -> RuntimeAuthority {
+        RuntimeAuthority {
+            epoch: Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap(),
+            restore_generation: 7,
+        }
     }
 
     #[tokio::test]
@@ -1323,11 +1469,19 @@ mod tests {
         assert_eq!(converged.mutation_generation, Some(1));
         assert_eq!(
             converged.configmap_authority_epoch,
-            Some(test_authority_epoch())
+            Some(test_runtime_authority().epoch)
         );
         assert_eq!(
             converged.daemonset_authority_epoch,
-            Some(test_authority_epoch())
+            Some(test_runtime_authority().epoch)
+        );
+        assert_eq!(
+            converged.configmap_restore_generation,
+            Some(test_runtime_authority().restore_generation)
+        );
+        assert_eq!(
+            converged.daemonset_restore_generation,
+            Some(test_runtime_authority().restore_generation)
         );
     }
 
@@ -1351,7 +1505,7 @@ mod tests {
             reconcile_haproxy_config(
                 old_client,
                 &edge_config(),
-                test_authority_epoch(),
+                test_runtime_authority(),
                 Some(1),
                 |current| render_route_into(current, &old_route),
             )
@@ -1363,7 +1517,7 @@ mod tests {
         reconcile_haproxy_config(
             new_client,
             &edge_config(),
-            test_authority_epoch(),
+            test_runtime_authority(),
             Some(2),
             |current| remove_route_from(current, &route.backend_name, &route.host),
         )
@@ -1390,6 +1544,72 @@ mod tests {
             Some(haproxy_config_generation(&converged.config).as_str())
         );
         assert_eq!(converged.configmap_patch_attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn delayed_writer_from_superseded_restore_generation_cannot_write_back() {
+        let route = SniRoute::new("stale.example.test", "be_stale_app", "10.0.0.1:443")
+            .expect("valid stale-writer route");
+        let state = Arc::new(Mutex::new(FakeKubeState::new("global\n")));
+        let (entered, release) = {
+            let mut locked = state.lock().unwrap();
+            locked.pause_next_configmap_replace = true;
+            (
+                locked.configmap_replace_entered.clone(),
+                locked.configmap_replace_release.clone(),
+            )
+        };
+        let old_route = route.clone();
+        let old_client = fake_kube_client(Arc::clone(&state));
+        let old = tokio::spawn(async move {
+            reconcile_haproxy_config(
+                old_client,
+                &edge_config(),
+                test_runtime_authority(),
+                Some(1),
+                |current| render_route_into(current, &old_route),
+            )
+            .await
+        });
+        entered.notified().await;
+
+        let restored_authority = RuntimeAuthority {
+            epoch: Uuid::new_v4(),
+            restore_generation: test_runtime_authority().restore_generation + 1,
+        };
+        reconcile_haproxy_config(
+            fake_kube_client(Arc::clone(&state)),
+            &edge_config(),
+            restored_authority,
+            Some(1),
+            |current| current.to_string(),
+        )
+        .await
+        .expect("restored authority publishes its comparable incarnation");
+        release.notify_one();
+
+        let old_error = old
+            .await
+            .expect("old writer joins")
+            .expect_err("old writer is fenced after its resourceVersion conflict");
+        assert!(matches!(
+            old_error,
+            EdgeRouteError::SupersededAuthorityRestoreGeneration {
+                expected: 7,
+                actual: 8
+            }
+        ));
+
+        let converged = state.lock().unwrap();
+        assert!(!converged.config.contains(&route.host));
+        assert_eq!(
+            converged.configmap_restore_generation,
+            Some(restored_authority.restore_generation)
+        );
+        assert_eq!(
+            converged.configmap_authority_epoch,
+            Some(restored_authority.epoch)
+        );
     }
 
     #[tokio::test]
@@ -1421,6 +1641,7 @@ mod tests {
                 &reconcile_pool,
                 client,
                 &edge_config(),
+                test_runtime_authority(),
                 Some(1),
                 |_| "global\n  maxconn 4096\n".to_string(),
             )
@@ -1640,21 +1861,26 @@ mod tests {
             // Retain compatibility with older HAProxy releases accepted by CAP.
             "program",
         ] {
-            let cfg = format!(
-                "frontend fe_443\n  use_backend be_cap_old_app if {{ req.ssl_sni -i stale.example }}\n\nbackend be_cap_old_app\n  server tenant 10.0.0.1:443 check\n\n{section} operator_owned\n  operator-directive preserved\n"
-            );
+            for indentation in ["", "  "] {
+                let cfg = format!(
+                    "frontend fe_443\n  use_backend be_cap_old_app if {{ req.ssl_sni -i stale.example }}\n\nbackend be_cap_old_app\n  server tenant 10.0.0.1:443 check\n\n{indentation}{section} operator_owned\n  operator-directive preserved\n"
+                );
 
-            let out = remove_all_cap_managed_routes(&cfg);
+                let out = remove_all_cap_managed_routes(&cfg);
 
-            assert!(!out.contains("be_cap_old_app"), "{section}: {out}");
-            assert!(
-                out.contains(&format!("{section} operator_owned")),
-                "{section}: {out}"
-            );
-            assert!(
-                out.contains("operator-directive preserved"),
-                "{section}: {out}"
-            );
+                assert!(
+                    !out.contains("be_cap_old_app"),
+                    "{section} with {indentation:?}: {out}"
+                );
+                assert!(
+                    out.contains(&format!("{indentation}{section} operator_owned")),
+                    "{section} with {indentation:?}: {out}"
+                );
+                assert!(
+                    out.contains("operator-directive preserved"),
+                    "{section} with {indentation:?}: {out}"
+                );
+            }
         }
     }
 

@@ -369,6 +369,7 @@ async fn apply_all_with_tenant_image_pull_secret(
 
 pub struct ApplyDeploymentManifestsRequest {
     pub pool: PgPool,
+    pub runtime_authority: crate::runtime_authority::RuntimeAuthority,
     pub app: App,
     pub snapshot: DeploymentApplySnapshot,
     pub deployment_id: Uuid,
@@ -1672,7 +1673,7 @@ pub async fn reapply_tenant_ingress(
     api_signing_pubkey: &str,
     api_url: &str,
     mutation: &crate::mutation_leases::AppMutationLease,
-    kubernetes_mutation_generation: i64,
+    generation: MutationGeneration,
 ) -> Result<(), DeployError> {
     let Some(attestation_config) = attestation_config else {
         return Err(DeployError::MissingAttestationConfig);
@@ -1695,9 +1696,6 @@ pub async fn reapply_tenant_ingress(
 
     let engine = ApplyEngine::try_default().await?;
     ensure_statefulset_exists(&engine, &app_spec.namespace, &app_spec.name).await?;
-    let authority_epoch = crate::runtime_authority::load_epoch(pool).await?;
-    let generation =
-        MutationGeneration::with_authority(kubernetes_mutation_generation, authority_epoch)?;
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")
         .await?;
@@ -1825,6 +1823,7 @@ pub async fn apply_deployment_manifests(
 ) -> Result<Option<DeploymentRollout>, DeployError> {
     let ApplyDeploymentManifestsRequest {
         pool,
+        runtime_authority,
         app,
         snapshot,
         deployment_id,
@@ -1898,6 +1897,7 @@ pub async fn apply_deployment_manifests(
             crate::kbs::reconcile_pending_signed_policy_artifacts(
                 &pool,
                 kbs_policy_config.as_ref(),
+                runtime_authority,
             )
             .await?;
         } else {
@@ -1910,12 +1910,14 @@ pub async fn apply_deployment_manifests(
     } else {
         crate::kbs::ensure_owner_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
         crate::kbs::ensure_tls_binding(&pool, kbs_policy_config.as_ref(), &app_spec).await?;
-        crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref()).await?;
+        crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref(), runtime_authority).await?;
     }
 
-    let authority_epoch = crate::runtime_authority::load_epoch(&pool).await?;
-    let generation =
-        MutationGeneration::with_authority(kubernetes_mutation_generation, authority_epoch)?;
+    let generation = MutationGeneration::with_authority(
+        kubernetes_mutation_generation,
+        runtime_authority.epoch,
+        runtime_authority.restore_generation,
+    )?;
     let engine = ApplyEngine::try_default().await?;
     mutation
         .arm_resource_scope_until_reconciled("kubernetes_namespace")
@@ -1954,8 +1956,14 @@ pub async fn apply_deployment_manifests(
             &app_target,
         )?);
     }
-    crate::edge::ensure_haproxy_routes(&pool, &edge_config, Some(edge_config_generation), &routes)
-        .await?;
+    crate::edge::ensure_haproxy_routes(
+        &pool,
+        &edge_config,
+        runtime_authority,
+        Some(edge_config_generation),
+        &routes,
+    )
+    .await?;
     set_deployment_status(&pool, deployment_id, "watching", Some(&hash), None, false).await?;
 
     Ok(Some(DeploymentRollout {

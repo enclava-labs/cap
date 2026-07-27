@@ -1314,6 +1314,7 @@ pub async fn delete_app(
             .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
                 &state.db,
                 state.kbs_policy.as_ref(),
+                state.runtime_authority,
             ))
             .await
             .map_err(|_| internal_server_error())?
@@ -1455,6 +1456,7 @@ pub async fn delete_app(
         .guard_provider(crate::edge::remove_haproxy_routes(
             &state.db,
             &crate::edge::EdgeRouteConfig::from_env(),
+            state.runtime_authority,
             Some(edge_config_generation),
             &routes_to_remove,
         ))
@@ -1462,13 +1464,11 @@ pub async fn delete_app(
         .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeRoute, error))?;
 
-    let authority_epoch = crate::runtime_authority::load_epoch(&state.db)
-        .await
-        .map_err(|_| internal_server_error())?;
     let kubernetes_mutation_generation =
         enclava_engine::apply::generation::MutationGeneration::with_authority(
             kubernetes_mutation_generation,
-            authority_epoch,
+            state.runtime_authority.epoch,
+            state.runtime_authority.restore_generation,
         )
         .map_err(|_| internal_server_error())?;
     let kubernetes_client = kube::Client::try_default()
@@ -1503,6 +1503,7 @@ pub async fn delete_app(
         .guard_provider(crate::kbs::reconcile_policy(
             &state.db,
             state.kbs_policy.as_ref(),
+            state.runtime_authority,
         ))
         .await
         .map_err(|_| internal_server_error())?

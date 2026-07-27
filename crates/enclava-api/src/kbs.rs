@@ -13,11 +13,14 @@ use uuid::Uuid;
 use enclava_engine::manifest::cc_init_data::compute_cc_init_data;
 use enclava_engine::types::ConfidentialApp;
 
+use crate::runtime_authority::RuntimeAuthority;
+
 const DEFAULT_SIGNED_POLICY_RETENTION: i64 = 6;
 const DEFAULT_SIGNED_POLICY_MAX_BYTES: usize = 900 * 1024;
 const SIGNED_POLICY_SET_SCHEMA_VERSION_V1: &str = "enclava-signed-policy-set-v1";
 const SIGNED_POLICY_SET_SCHEMA_VERSION: &str = "enclava-signed-policy-set-v2";
 const POLICY_AUTHORITY_EPOCH_ANNOTATION: &str = "enclava.dev/cap-authority-epoch";
+const POLICY_AUTHORITY_RESTORE_GENERATION_ANNOTATION: &str = "enclava.dev/cap-restore-generation";
 const POLICY_GENERATION_ANNOTATION: &str = "enclava.dev/cap-policy-generation";
 const POLICY_SHA256_ANNOTATION: &str = "enclava.dev/cap-policy-sha256";
 const POLICY_PUBLICATION_TOKEN_ANNOTATION: &str = "enclava.dev/cap-policy-publication-token";
@@ -162,7 +165,6 @@ struct SignedPolicyArtifactCandidate {
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct SignedPolicyReconciliationRow {
-    authority_epoch: Uuid,
     desired_generation: i64,
     applied_generation: i64,
 }
@@ -170,6 +172,7 @@ struct SignedPolicyReconciliationRow {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct AnnotatedPolicyGeneration<'a> {
     authority_epoch: Option<Uuid>,
+    authority_restore_generation: Option<i64>,
     generation: i64,
     policy_hash: &'a str,
 }
@@ -303,6 +306,7 @@ pub async fn soft_delete_tls_binding(
 pub async fn reconcile_policy(
     db: &PgPool,
     config: Option<&KbsPolicyConfig>,
+    authority: RuntimeAuthority,
 ) -> Result<(), KbsPolicyError> {
     let Some(config) = config else {
         return Err(KbsPolicyError::NotConfigured);
@@ -315,8 +319,10 @@ pub async fn reconcile_policy(
             configmap = %config.configmap_name,
             "durable signed KBS authority supersedes legacy marker reconciliation"
         );
-        return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
-            .await;
+        return reconcile_pending_signed_policy_artifacts_with_client(
+            db, config, authority, None, client,
+        )
+        .await;
     }
 
     let bindings: Vec<KbsOwnerBinding> = sqlx::query_as(
@@ -345,8 +351,10 @@ pub async fn reconcile_policy(
         // initial read must fence this legacy writer before it can retry a
         // resourceVersion conflict with stale Rego.
         if signed_policy_mode_active(db).await? {
-            return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
-                .await;
+            return reconcile_pending_signed_policy_artifacts_with_client(
+                db, config, authority, None, client,
+            )
+            .await;
         }
 
         let mut configmap = cm_api.get(&config.configmap_name).await?;
@@ -364,12 +372,16 @@ pub async fn reconcile_policy(
             let mut tx = db.begin().await?;
             enqueue_signed_policy_bootstrap_if_idle(&mut tx).await?;
             tx.commit().await?;
-            return reconcile_pending_signed_policy_artifacts_with_client(db, config, None, client)
-                .await;
+            return reconcile_pending_signed_policy_artifacts_with_client(
+                db, config, authority, None, client,
+            )
+            .await;
         }
+        let authority_metadata_current =
+            authority_metadata_is_current(configmap.metadata.annotations.as_ref(), authority)?;
         let next_policy = replace_tls_resource_bindings_block(current_policy, &tls_bindings)?;
         let next_policy = replace_owner_bindings_block(&next_policy, &bindings)?;
-        if next_policy == *current_policy {
+        if next_policy == *current_policy && authority_metadata_current {
             return Ok(());
         }
 
@@ -377,6 +389,18 @@ pub async fn reconcile_policy(
             .data
             .get_or_insert_with(BTreeMap::new)
             .insert(config.policy_key.clone(), next_policy);
+        let annotations = configmap
+            .metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new);
+        annotations.insert(
+            POLICY_AUTHORITY_EPOCH_ANNOTATION.to_string(),
+            authority.epoch.to_string(),
+        );
+        annotations.insert(
+            POLICY_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+            authority.restore_generation.to_string(),
+        );
         match bounded_kube_write(cm_api.replace(
             &config.configmap_name,
             &PostParams::default(),
@@ -389,11 +413,11 @@ pub async fn reconcile_policy(
                 // it repair the brief legacy write before this call returns.
                 if signed_policy_mode_active(db).await? {
                     return reconcile_pending_signed_policy_artifacts_with_client(
-                        db, config, None, client,
+                        db, config, authority, None, client,
                     )
                     .await;
                 }
-                restart_trustee_deployment(client, config).await?;
+                restart_trustee_deployment(client, config, authority).await?;
                 return Ok(());
             }
             Err(KbsPolicyError::Kube(error)) if is_kubernetes_conflict(&error) => continue,
@@ -462,13 +486,10 @@ async fn load_signed_policy_reconciliation(
     db: &PgPool,
 ) -> Result<SignedPolicyReconciliationRow, KbsPolicyError> {
     Ok(sqlx::query_as(
-        "SELECT authority.authority_epoch,
-                reconciliation.desired_generation,
+        "SELECT reconciliation.desired_generation,
                 reconciliation.applied_generation
            FROM kbs_signed_policy_reconciliation AS reconciliation
-           CROSS JOIN cap_runtime_authority AS authority
-          WHERE reconciliation.singleton
-            AND authority.singleton",
+          WHERE reconciliation.singleton",
     )
     .fetch_one(db)
     .await?)
@@ -649,6 +670,7 @@ async fn load_signed_policy_candidates(
 pub async fn reconcile_signed_policy_artifacts(
     db: &PgPool,
     config: Option<&KbsPolicyConfig>,
+    authority: RuntimeAuthority,
     extra_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
 ) -> Result<(), KbsPolicyError> {
     let Some(config) = config else {
@@ -658,7 +680,7 @@ pub async fn reconcile_signed_policy_artifacts(
     let mut tx = db.begin().await?;
     enqueue_signed_policy_reconciliation(&mut tx).await?;
     tx.commit().await?;
-    reconcile_pending_signed_policy_artifacts_inner(db, config, extra_artifact).await
+    reconcile_pending_signed_policy_artifacts_inner(db, config, authority, extra_artifact).await
 }
 
 /// Converge every currently pending desired generation.  This is safe to call
@@ -667,11 +689,12 @@ pub async fn reconcile_signed_policy_artifacts(
 pub async fn reconcile_pending_signed_policy_artifacts(
     db: &PgPool,
     config: Option<&KbsPolicyConfig>,
+    authority: RuntimeAuthority,
 ) -> Result<(), KbsPolicyError> {
     let Some(config) = config else {
         return Err(KbsPolicyError::NotConfigured);
     };
-    reconcile_pending_signed_policy_artifacts_inner(db, config, None).await
+    reconcile_pending_signed_policy_artifacts_inner(db, config, authority, None).await
 }
 
 /// Recover a committed desired generation after process or provider failure.
@@ -694,10 +717,44 @@ pub async fn reconcile_signed_policy_once(
         .guard_provider(reconcile_pending_signed_policy_artifacts(
             &state.db,
             state.kbs_policy.as_ref(),
+            state.runtime_authority,
         ))
         .await??;
     lease.finish().await?;
     Ok(())
+}
+
+async fn retry_busy_reconciliation<F, Fut>(
+    mut reconcile: F,
+    retry_delay: Duration,
+) -> Result<(), KbsPolicyReconciliationError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), KbsPolicyReconciliationError>>,
+{
+    loop {
+        match reconcile().await {
+            Err(KbsPolicyReconciliationError::Mutation(
+                crate::mutation_leases::MutationLeaseError::Busy,
+            )) => tokio::time::sleep(retry_delay).await,
+            result => return result,
+        }
+    }
+}
+
+/// Converge KBS authority before accepting traffic or dispatching jobs.
+///
+/// A healthy predecessor can hold the global KBS fence while finishing a
+/// rollout. That contention is transient and must delay startup rather than
+/// crash-looping the replacement process. Every other error remains fatal.
+pub async fn reconcile_signed_policy_at_startup(
+    state: &crate::state::AppState,
+) -> Result<(), KbsPolicyReconciliationError> {
+    retry_busy_reconciliation(
+        || reconcile_signed_policy_once(state),
+        Duration::from_secs(2),
+    )
+    .await
 }
 
 pub fn spawn_signed_policy_reconciler(state: crate::state::AppState) {
@@ -728,23 +785,31 @@ pub fn spawn_signed_policy_reconciler(state: crate::state::AppState) {
 async fn reconcile_pending_signed_policy_artifacts_inner(
     db: &PgPool,
     config: &KbsPolicyConfig,
+    authority: RuntimeAuthority,
     expected_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
 ) -> Result<(), KbsPolicyError> {
     let client = kube::Client::try_default().await?;
-    reconcile_pending_signed_policy_artifacts_with_client(db, config, expected_artifact, client)
-        .await
+    reconcile_pending_signed_policy_artifacts_with_client(
+        db,
+        config,
+        authority,
+        expected_artifact,
+        client,
+    )
+    .await
 }
 
 async fn reconcile_pending_signed_policy_artifacts_with_client(
     db: &PgPool,
     config: &KbsPolicyConfig,
+    authority: RuntimeAuthority,
     expected_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
     client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
-        let state = load_signed_policy_reconciliation(db).await?;
-        if state.desired_generation == 0 {
+        let reconciliation = load_signed_policy_reconciliation(db).await?;
+        if reconciliation.desired_generation == 0 {
             // A pre-0041 installation may have deleted every artifact while a
             // stale signed policy remained live in Trustee. Do not convert a
             // genuine legacy Rego install, but durably enter signed mode when
@@ -775,9 +840,8 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             }
             return Ok(());
         }
-        let generation = state.desired_generation;
-        let authority_epoch = state.authority_epoch;
-        let previously_applied = state.applied_generation >= generation;
+        let generation = reconciliation.desired_generation;
+        let previously_applied = reconciliation.applied_generation >= generation;
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
         if let Some(expected) = expected_artifact
             && !candidates.iter().any(|candidate| {
@@ -808,7 +872,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         let cm_result = converge_signed_policy_configmap(
             &cm_api,
             config,
-            authority_epoch,
+            authority,
             generation,
             &next_policy,
             &policy_sha256_hex,
@@ -832,7 +896,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         match converge_trustee_policy_generation(
             client.clone(),
             config,
-            authority_epoch,
+            authority,
             generation,
             &policy_sha256_hex,
             &publication_token,
@@ -850,7 +914,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         match converge_signed_policy_configmap(
             &cm_api,
             config,
-            authority_epoch,
+            authority,
             generation,
             &next_policy,
             &policy_sha256_hex,
@@ -902,12 +966,15 @@ enum ConfigMapConvergence {
 fn annotated_policy_generation(
     annotations: Option<&BTreeMap<String, String>>,
 ) -> Result<Option<AnnotatedPolicyGeneration<'_>>, KbsPolicyError> {
-    let authority_epoch =
-        annotations.and_then(|values| values.get(POLICY_AUTHORITY_EPOCH_ANNOTATION));
+    let (authority_epoch, authority_restore_generation) = annotated_runtime_authority(annotations)?;
     let generation = annotations.and_then(|values| values.get(POLICY_GENERATION_ANNOTATION));
     let policy_hash = annotations.and_then(|values| values.get(POLICY_SHA256_ANNOTATION));
     match (generation, policy_hash) {
-        (None, None) if authority_epoch.is_none() => Ok(None),
+        // Legacy Rego reconciliation now carries runtime authority metadata
+        // too. Absence of the signed generation/hash still means "not yet
+        // signed"; callers separately fence the comparable authority before
+        // adopting this object.
+        (None, None) => Ok(None),
         (Some(generation), Some(policy_hash)) => {
             let generation = generation
                 .parse::<i64>()
@@ -917,15 +984,9 @@ fn annotated_policy_generation(
             if policy_hash.len() != 64 || hex::decode(policy_hash).is_err() {
                 return Err(KbsPolicyError::InvalidPolicyGeneration);
             }
-            let authority_epoch = authority_epoch
-                .map(|epoch| {
-                    epoch
-                        .parse::<Uuid>()
-                        .map_err(|_| KbsPolicyError::InvalidPolicyGeneration)
-                })
-                .transpose()?;
             Ok(Some(AnnotatedPolicyGeneration {
                 authority_epoch,
+                authority_restore_generation,
                 generation,
                 policy_hash: policy_hash.as_str(),
             }))
@@ -934,18 +995,83 @@ fn annotated_policy_generation(
     }
 }
 
+fn annotated_runtime_authority(
+    annotations: Option<&BTreeMap<String, String>>,
+) -> Result<(Option<Uuid>, Option<i64>), KbsPolicyError> {
+    let authority_epoch = annotations
+        .and_then(|values| values.get(POLICY_AUTHORITY_EPOCH_ANNOTATION))
+        .map(|epoch| {
+            epoch
+                .parse::<Uuid>()
+                .map_err(|_| KbsPolicyError::InvalidPolicyGeneration)
+        })
+        .transpose()?;
+    let authority_restore_generation = annotations
+        .and_then(|values| values.get(POLICY_AUTHORITY_RESTORE_GENERATION_ANNOTATION))
+        .map(|generation| {
+            generation
+                .parse::<i64>()
+                .ok()
+                .filter(|generation| *generation >= 0)
+                .ok_or(KbsPolicyError::InvalidPolicyGeneration)
+        })
+        .transpose()?;
+    if authority_restore_generation.is_some() && authority_epoch.is_none() {
+        return Err(KbsPolicyError::InvalidPolicyGeneration);
+    }
+    Ok((authority_epoch, authority_restore_generation))
+}
+
+fn authority_metadata_is_current(
+    annotations: Option<&BTreeMap<String, String>>,
+    desired: RuntimeAuthority,
+) -> Result<bool, KbsPolicyError> {
+    let (current_epoch, current_restore_generation) = annotated_runtime_authority(annotations)?;
+    match current_restore_generation {
+        Some(current) if current > desired.restore_generation => {
+            Err(KbsPolicyError::PolicyGenerationConflict)
+        }
+        Some(current)
+            if current == desired.restore_generation && current_epoch != Some(desired.epoch) =>
+        {
+            Err(KbsPolicyError::PolicyGenerationConflict)
+        }
+        Some(current)
+            if current == desired.restore_generation && current_epoch == Some(desired.epoch) =>
+        {
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn generation_decision(
     existing: Option<AnnotatedPolicyGeneration<'_>>,
     existing_content_hash: Option<&str>,
-    desired_authority_epoch: Uuid,
+    desired_authority: RuntimeAuthority,
     desired_generation: i64,
     desired_hash: &str,
 ) -> Result<GenerationDecision, KbsPolicyError> {
     let Some(existing) = existing else {
         return Ok(GenerationDecision::Replace);
     };
-    if existing.authority_epoch != Some(desired_authority_epoch) {
-        return Ok(GenerationDecision::Replace);
+    match existing.authority_restore_generation {
+        Some(existing_restore) if existing_restore > desired_authority.restore_generation => {
+            return Ok(GenerationDecision::Superseded);
+        }
+        Some(existing_restore) if existing_restore < desired_authority.restore_generation => {
+            return Ok(GenerationDecision::Replace);
+        }
+        Some(_) if existing.authority_epoch != Some(desired_authority.epoch) => {
+            return Err(KbsPolicyError::PolicyGenerationConflict);
+        }
+        None => {
+            // Adopt policy objects written before the monotonic restore
+            // incarnation existed. The replacement makes this one-way:
+            // older writers are rejected after the first current write.
+            return Ok(GenerationDecision::Replace);
+        }
+        Some(_) => {}
     }
     if existing.generation > desired_generation {
         return Ok(GenerationDecision::Superseded);
@@ -972,7 +1098,7 @@ fn is_kubernetes_conflict(error: &kube::Error) -> bool {
 async fn converge_signed_policy_configmap(
     cm_api: &Api<ConfigMap>,
     config: &KbsPolicyConfig,
-    authority_epoch: Uuid,
+    authority: RuntimeAuthority,
     generation: i64,
     policy: &str,
     policy_sha256_hex: &str,
@@ -990,6 +1116,7 @@ async fn converge_signed_policy_configmap(
             .and_then(|data| data.get(&config.policy_key))
             .ok_or_else(|| KbsPolicyError::MissingPolicyKey(config.policy_key.clone()))?;
         let current_content_hash = hex::encode(Sha256::digest(current_policy.as_bytes()));
+        authority_metadata_is_current(configmap.metadata.annotations.as_ref(), authority)?;
         let existing = annotated_policy_generation(configmap.metadata.annotations.as_ref())?;
         let existing_publication_token = configmap
             .metadata
@@ -1001,7 +1128,7 @@ async fn converge_signed_policy_configmap(
         match generation_decision(
             existing,
             Some(&current_content_hash),
-            authority_epoch,
+            authority,
             generation,
             policy_sha256_hex,
         )? {
@@ -1027,7 +1154,11 @@ async fn converge_signed_policy_configmap(
             .get_or_insert_with(BTreeMap::new);
         annotations.insert(
             POLICY_AUTHORITY_EPOCH_ANNOTATION.to_string(),
-            authority_epoch.to_string(),
+            authority.epoch.to_string(),
+        );
+        annotations.insert(
+            POLICY_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+            authority.restore_generation.to_string(),
         );
         annotations.insert(
             POLICY_GENERATION_ANNOTATION.to_string(),
@@ -1119,7 +1250,7 @@ async fn record_applied_generation(
 async fn converge_trustee_policy_generation(
     client: kube::Client,
     config: &KbsPolicyConfig,
-    authority_epoch: Uuid,
+    authority: RuntimeAuthority,
     generation: i64,
     policy_sha256_hex: &str,
     publication_token: &str,
@@ -1132,11 +1263,12 @@ async fn converge_trustee_policy_generation(
             .as_ref()
             .and_then(|spec| spec.template.metadata.as_ref())
             .and_then(|metadata| metadata.annotations.as_ref());
+        authority_metadata_is_current(template_annotations, authority)?;
         let existing = annotated_policy_generation(template_annotations)?;
         let mut decision = generation_decision(
             existing,
             existing.map(|annotated| annotated.policy_hash),
-            authority_epoch,
+            authority,
             generation,
             policy_sha256_hex,
         )?;
@@ -1154,7 +1286,7 @@ async fn converge_trustee_policy_generation(
                 return wait_for_deployment_policy_generation(
                     &deploy_api,
                     &config.deployment_name,
-                    authority_epoch,
+                    authority,
                     generation,
                     policy_sha256_hex,
                     publication_token,
@@ -1176,7 +1308,11 @@ async fn converge_trustee_policy_generation(
             .get_or_insert_with(BTreeMap::new);
         annotations.insert(
             POLICY_AUTHORITY_EPOCH_ANNOTATION.to_string(),
-            authority_epoch.to_string(),
+            authority.epoch.to_string(),
+        );
+        annotations.insert(
+            POLICY_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+            authority.restore_generation.to_string(),
         );
         annotations.insert(
             POLICY_GENERATION_ANNOTATION.to_string(),
@@ -1201,7 +1337,7 @@ async fn converge_trustee_policy_generation(
                 let readiness = wait_for_deployment_policy_generation(
                     &deploy_api,
                     &config.deployment_name,
-                    authority_epoch,
+                    authority,
                     generation,
                     policy_sha256_hex,
                     publication_token,
@@ -1222,7 +1358,7 @@ async fn converge_trustee_policy_generation(
 async fn wait_for_deployment_policy_generation(
     deploy_api: &Api<Deployment>,
     name: &str,
-    desired_authority_epoch: Uuid,
+    desired_authority: RuntimeAuthority,
     desired_generation: i64,
     desired_hash: &str,
     desired_publication_token: &str,
@@ -1237,11 +1373,12 @@ async fn wait_for_deployment_policy_generation(
             .as_ref()
             .and_then(|spec| spec.template.metadata.as_ref())
             .and_then(|metadata| metadata.annotations.as_ref());
+        authority_metadata_is_current(template_annotations, desired_authority)?;
         let annotated = annotated_policy_generation(template_annotations)?;
         let decision = generation_decision(
             annotated,
             annotated.map(|metadata| metadata.policy_hash),
-            desired_authority_epoch,
+            desired_authority,
             desired_generation,
             desired_hash,
         )?;
@@ -1350,12 +1487,13 @@ fn is_signed_policy_artifact_body(policy: &str) -> bool {
 async fn restart_trustee_deployment(
     client: kube::Client,
     config: &KbsPolicyConfig,
+    authority: RuntimeAuthority,
 ) -> Result<(), KbsPolicyError> {
     let deploy_api: Api<Deployment> = Api::namespaced(client, &config.namespace);
     let restarted_at = Utc::now().to_rfc3339();
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
         let mut deployment = deploy_api.get(&config.deployment_name).await?;
-        deployment
+        let annotations = deployment
             .spec
             .as_mut()
             .ok_or(KbsPolicyError::InvalidPolicyGeneration)?
@@ -1363,11 +1501,20 @@ async fn restart_trustee_deployment(
             .metadata
             .get_or_insert_with(Default::default)
             .annotations
-            .get_or_insert_with(BTreeMap::new)
-            .insert(
-                "enclava.dev/cap-policy-restarted-at".to_string(),
-                restarted_at.clone(),
-            );
+            .get_or_insert_with(BTreeMap::new);
+        authority_metadata_is_current(Some(annotations), authority)?;
+        annotations.insert(
+            "enclava.dev/cap-policy-restarted-at".to_string(),
+            restarted_at.clone(),
+        );
+        annotations.insert(
+            POLICY_AUTHORITY_EPOCH_ANNOTATION.to_string(),
+            authority.epoch.to_string(),
+        );
+        annotations.insert(
+            POLICY_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+            authority.restore_generation.to_string(),
+        );
         match bounded_kube_write(deploy_api.replace(
             &config.deployment_name,
             &PostParams::default(),
@@ -1645,6 +1792,72 @@ pub fn config_from_env() -> Option<KbsPolicyConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_reconciliation_retries_busy_fence_until_available() {
+        let mut attempts = 0;
+        retry_busy_reconciliation(
+            || {
+                attempts += 1;
+                std::future::ready(if attempts < 3 {
+                    Err(KbsPolicyReconciliationError::Mutation(
+                        crate::mutation_leases::MutationLeaseError::Busy,
+                    ))
+                } else {
+                    Ok(())
+                })
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect("startup reconciliation succeeds after contention clears");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn runtime_authority_metadata_is_monotonic_for_legacy_policy_writes() {
+        let authority = RuntimeAuthority {
+            epoch: Uuid::new_v4(),
+            restore_generation: 7,
+        };
+        let annotations = |epoch: Uuid, restore_generation: i64| {
+            [
+                (
+                    POLICY_AUTHORITY_EPOCH_ANNOTATION.to_string(),
+                    epoch.to_string(),
+                ),
+                (
+                    POLICY_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+                    restore_generation.to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+        };
+
+        assert!(
+            authority_metadata_is_current(Some(&annotations(authority.epoch, 7)), authority)
+                .unwrap()
+        );
+        assert_eq!(
+            annotated_policy_generation(Some(&annotations(authority.epoch, 7))).unwrap(),
+            None,
+            "legacy policy authority metadata is adoptable by signed reconciliation"
+        );
+        assert!(
+            !authority_metadata_is_current(Some(&annotations(Uuid::new_v4(), 6)), authority)
+                .unwrap(),
+            "a newer process may adopt a lower restore incarnation"
+        );
+        assert!(matches!(
+            authority_metadata_is_current(Some(&annotations(Uuid::new_v4(), 8)), authority),
+            Err(KbsPolicyError::PolicyGenerationConflict)
+        ));
+        assert!(matches!(
+            authority_metadata_is_current(Some(&annotations(Uuid::new_v4(), 7)), authority),
+            Err(KbsPolicyError::PolicyGenerationConflict)
+        ));
+    }
 
     fn binding(key: &str) -> KbsOwnerBinding {
         KbsOwnerBinding {
@@ -1983,19 +2196,24 @@ owner_resource_bindings := {}
     #[test]
     fn policy_generation_decisions_are_monotonic_and_content_bound() {
         let authority_epoch = Uuid::new_v4();
+        let authority = RuntimeAuthority {
+            epoch: authority_epoch,
+            restore_generation: 7,
+        };
         assert_eq!(
-            generation_decision(None, None, authority_epoch, 3, &"aa".repeat(32)).unwrap(),
+            generation_decision(None, None, authority, 3, &"aa".repeat(32)).unwrap(),
             GenerationDecision::Replace
         );
         assert_eq!(
             generation_decision(
                 Some(AnnotatedPolicyGeneration {
                     authority_epoch: Some(authority_epoch),
+                    authority_restore_generation: Some(7),
                     generation: 4,
                     policy_hash: &"bb".repeat(32),
                 }),
                 Some(&"bb".repeat(32)),
-                authority_epoch,
+                authority,
                 3,
                 &"aa".repeat(32),
             )
@@ -2006,11 +2224,12 @@ owner_resource_bindings := {}
             generation_decision(
                 Some(AnnotatedPolicyGeneration {
                     authority_epoch: Some(authority_epoch),
+                    authority_restore_generation: Some(7),
                     generation: 3,
                     policy_hash: &"bb".repeat(32),
                 }),
                 Some(&"bb".repeat(32)),
-                authority_epoch,
+                authority,
                 3,
                 &"aa".repeat(32),
             ),
@@ -2020,11 +2239,12 @@ owner_resource_bindings := {}
             generation_decision(
                 Some(AnnotatedPolicyGeneration {
                     authority_epoch: Some(authority_epoch),
+                    authority_restore_generation: Some(7),
                     generation: 3,
                     policy_hash: &"aa".repeat(32),
                 }),
                 Some(&"bb".repeat(32)),
-                authority_epoch,
+                authority,
                 3,
                 &"aa".repeat(32),
             )
@@ -2036,17 +2256,67 @@ owner_resource_bindings := {}
             generation_decision(
                 Some(AnnotatedPolicyGeneration {
                     authority_epoch: Some(Uuid::new_v4()),
+                    authority_restore_generation: Some(6),
                     generation: 99,
                     policy_hash: &"bb".repeat(32),
                 }),
                 Some(&"bb".repeat(32)),
-                authority_epoch,
+                authority,
                 1,
                 &"aa".repeat(32),
             )
             .unwrap(),
             GenerationDecision::Replace,
-            "a retained generation from another database lifetime is not newer authority"
+            "a lower restore incarnation is not newer authority"
+        );
+        assert_eq!(
+            generation_decision(
+                Some(AnnotatedPolicyGeneration {
+                    authority_epoch: Some(Uuid::new_v4()),
+                    authority_restore_generation: Some(8),
+                    generation: 1,
+                    policy_hash: &"bb".repeat(32),
+                }),
+                Some(&"bb".repeat(32)),
+                authority,
+                99,
+                &"aa".repeat(32),
+            )
+            .unwrap(),
+            GenerationDecision::Superseded,
+            "a delayed writer cannot replace a higher restore incarnation"
+        );
+        assert!(matches!(
+            generation_decision(
+                Some(AnnotatedPolicyGeneration {
+                    authority_epoch: Some(Uuid::new_v4()),
+                    authority_restore_generation: Some(7),
+                    generation: 1,
+                    policy_hash: &"bb".repeat(32),
+                }),
+                Some(&"bb".repeat(32)),
+                authority,
+                99,
+                &"aa".repeat(32),
+            ),
+            Err(KbsPolicyError::PolicyGenerationConflict)
+        ));
+        assert_eq!(
+            generation_decision(
+                Some(AnnotatedPolicyGeneration {
+                    authority_epoch: Some(authority_epoch),
+                    authority_restore_generation: None,
+                    generation: 99,
+                    policy_hash: &"bb".repeat(32),
+                }),
+                Some(&"bb".repeat(32)),
+                authority,
+                1,
+                &"aa".repeat(32),
+            )
+            .unwrap(),
+            GenerationDecision::Replace,
+            "legacy authority metadata is upgraded once"
         );
     }
 
