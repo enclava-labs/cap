@@ -1328,6 +1328,62 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
     });
 }
 
+/// Finish retained failed-rollout authority before a generic startup
+/// reconciler is allowed to claim any of its provider fences.
+///
+/// Migration 0045 can turn a terminal job from an older binary into
+/// `rollout_cleanup_pending`, and migration 0046 preserves its exact app and
+/// provider mutation rows indefinitely. Running a generic reconciler before
+/// that exact cleanup would either block startup forever or, on an installation
+/// that has not yet applied 0046, reclaim a finite global fence and make exact
+/// cleanup impossible.
+///
+/// This startup path intentionally claims no setup or apply work. It waits for
+/// an already-claimed cleanup job to finish or become reclaimable, drains every
+/// retained cleanup in creation order, and fails closed on a provider error.
+pub async fn reconcile_failed_rollout_cleanup_at_startup(
+    state: &AppState,
+) -> Result<(), DeploymentJobError> {
+    loop {
+        let Some(deployment_id) = oldest_rollout_cleanup_job_id(&state.db).await? else {
+            return Ok(());
+        };
+        let Some(job) = claim_job(
+            &state.db,
+            "rollout_cleanup_pending",
+            "rollout_cleaning_up",
+            Some(deployment_id),
+        )
+        .await?
+        else {
+            // Another startup or a surviving dispatcher still owns this exact
+            // job. Keep provider reconciliation behind it until it either
+            // completes or its durable job lease expires.
+            tokio::time::sleep(IDLE_POLL_INTERVAL).await;
+            continue;
+        };
+
+        if let Err(error) = execute_rollout_cleanup_job(state, &job).await {
+            let error_code = error.code();
+            requeue_rollout_cleanup_job(&state.db, &job, error_code).await?;
+            return Err(error);
+        }
+    }
+}
+
+async fn oldest_rollout_cleanup_job_id(pool: &PgPool) -> Result<Option<Uuid>, DeploymentJobError> {
+    sqlx::query_scalar(
+        "SELECT deployment_id
+           FROM deployment_apply_jobs
+          WHERE state IN ('rollout_cleanup_pending', 'rollout_cleaning_up')
+          ORDER BY created_at, deployment_id
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(DeploymentJobError::from)
+}
+
 async fn claim_setup_job(pool: &PgPool) -> Result<Option<ClaimedJob>, DeploymentJobError> {
     claim_job(pool, "setup_pending", "setting_up", None).await
 }
@@ -1406,29 +1462,9 @@ async fn process_rollout_cleanup_job(
     _worker_slot: tokio::sync::OwnedSemaphorePermit,
 ) {
     let deployment_id = job.deployment_id;
-    let lock_token = job.lock_token;
-    let payload = match job.decode_payload() {
-        Ok(payload) => payload,
+    match execute_rollout_cleanup_job(&state, &job).await {
+        Ok(()) => {}
         Err(error) => {
-            tracing::error!(
-                deployment_id = %deployment_id,
-                error_code = error.code(),
-                "durable failed-rollout cleanup payload is unreadable"
-            );
-            return;
-        }
-    };
-    let result = with_lease_heartbeat(
-        &state.db,
-        deployment_id,
-        lock_token,
-        "rollout_cleaning_up",
-        reconcile_failed_rollout_cleanup(&state, &job, &payload),
-    )
-    .await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
             if let Err(requeue_error) =
                 requeue_rollout_cleanup_job(&state.db, &job, error.code()).await
             {
@@ -1445,12 +1481,22 @@ async fn process_rollout_cleanup_job(
                 );
             }
         }
-        Err(error) => tracing::error!(
-            deployment_id = %deployment_id,
-            error_code = error.code(),
-            "durable failed-rollout cleanup lost its job lease"
-        ),
     }
+}
+
+async fn execute_rollout_cleanup_job(
+    state: &AppState,
+    job: &ClaimedJob,
+) -> Result<(), DeploymentJobError> {
+    let payload = job.decode_payload()?;
+    with_lease_heartbeat(
+        &state.db,
+        job.deployment_id,
+        job.lock_token,
+        "rollout_cleaning_up",
+        reconcile_failed_rollout_cleanup(state, job, &payload),
+    )
+    .await?
 }
 
 async fn reconcile_failed_rollout_cleanup(
@@ -2518,9 +2564,11 @@ async fn publish_rollout_outcome_with_mutation(
     }
     if let Some(mutation) = mutation {
         if failed {
-            // Keep the global/provider generations until the newly-enqueued
-            // signed-policy revocation has converged after commit.
-            mutation.assert_current_in_tx(&mut tx).await?;
+            // Make the durable cleanup job the only authority that can release
+            // this exact app/provider generation set. In particular, generic
+            // KBS and edge reconcilers must never steal the retained global
+            // fences merely because a process-level quarantine elapsed.
+            mutation.retain_all_until_reconciled_in_tx(&mut tx).await?;
         } else {
             mutation.finish_in_tx(&mut tx).await?;
         }
@@ -3845,21 +3893,85 @@ mod tests {
         .expect("publish failed rollout into durable cleanup");
         drop(mutation);
 
-        let (job_state, deployment_status, app_status, namespace_poisoned): (
+        let (published_app_retained, published_resources_retained): (bool, i64) = sqlx::query_as(
+            "SELECT mutation.reclaim_after = 'infinity'::timestamptz,
+                        (
+                            SELECT count(*)
+                              FROM external_resource_mutation_leases AS resource
+                             WHERE resource.owner_token = mutation.owner_token
+                               AND resource.operation_kind = mutation.operation_kind
+                               AND resource.operation_id = mutation.operation_id
+                               AND resource.reclaim_after = 'infinity'::timestamptz
+                        )
+                   FROM app_mutation_leases AS mutation
+                  WHERE mutation.app_id = $1
+                    AND mutation.operation_kind = 'deployment_apply'
+                    AND mutation.operation_id = $2",
+        )
+        .bind(app.id)
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load newly retained failed-rollout authority");
+        assert!(published_app_retained);
+        assert_eq!(
+            published_resources_retained,
+            expected_resources.len() as i64
+        );
+
+        // Simulate the finite owner rows left by a pre-0046 binary and execute
+        // the idempotent backfill itself. This validates the real upgrade SQL,
+        // not merely the new publication path.
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET reclaim_after = clock_timestamp() + interval '5 minutes'
+              WHERE app_id = $1",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("simulate finite pre-0046 app authority");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET reclaim_after = clock_timestamp() + interval '5 minutes'
+              WHERE operation_kind = 'deployment_apply'
+                AND operation_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("simulate finite pre-0046 provider authority");
+        sqlx::raw_sql(include_str!(
+            "../migrations/0046_retain_failed_rollout_authority.sql"
+        ))
+        .execute(&pool)
+        .await
+        .expect("run failed-rollout authority retention backfill");
+
+        let (job_state, deployment_status, app_status, app_retained, retained_resources): (
             String,
             DeployStatus,
             crate::models::AppStatus,
             bool,
+            i64,
         ) = sqlx::query_as(
             "SELECT job.state, deployment.status, app.status,
-                    namespace_fence.reclaim_after = 'infinity'::timestamptz
+                    mutation.reclaim_after = 'infinity'::timestamptz,
+                    (
+                        SELECT count(*)
+                          FROM external_resource_mutation_leases AS resource
+                         WHERE resource.owner_token = mutation.owner_token
+                           AND resource.operation_kind = mutation.operation_kind
+                           AND resource.operation_id = mutation.operation_id
+                           AND resource.reclaim_after = 'infinity'::timestamptz
+                    )
                FROM deployment_apply_jobs AS job
                JOIN deployments AS deployment ON deployment.id = job.deployment_id
                JOIN apps AS app ON app.id = job.app_id
-               JOIN external_resource_mutation_leases AS namespace_fence
-                 ON namespace_fence.operation_kind = 'deployment_apply'
-                AND namespace_fence.operation_id = job.deployment_id
-                AND namespace_fence.resource_scope = 'kubernetes_namespace'
+               JOIN app_mutation_leases AS mutation
+                 ON mutation.app_id = job.app_id
+                AND mutation.operation_kind = 'deployment_apply'
+                AND mutation.operation_id = job.deployment_id
               WHERE job.deployment_id = $1",
         )
         .bind(deployment_id)
@@ -3869,7 +3981,24 @@ mod tests {
         assert_eq!(job_state, "rollout_cleanup_pending");
         assert_eq!(deployment_status, DeployStatus::Failed);
         assert_eq!(app_status, crate::models::AppStatus::Failed);
-        assert!(namespace_poisoned);
+        assert!(app_retained);
+        assert_eq!(retained_resources, expected_resources.len() as i64);
+
+        let generic_reconcile = match crate::mutation_leases::claim_resources(
+            &state,
+            "kbs_policy_reconcile",
+            Uuid::new_v4(),
+            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("generic KBS reconciliation must not steal cleanup authority"),
+        };
+        assert!(matches!(
+            generic_reconcile,
+            crate::mutation_leases::MutationLeaseError::Busy
+        ));
 
         sqlx::query(
             "UPDATE deployment_apply_jobs

@@ -244,6 +244,40 @@ pub async fn reconcile_all_haproxy_routes(state: &AppState) -> Result<(), EdgeRe
     Ok(())
 }
 
+async fn retry_busy_reconciliation<F, Fut>(
+    mut reconcile: F,
+    retry_delay: std::time::Duration,
+) -> Result<(), EdgeReconciliationError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), EdgeReconciliationError>>,
+{
+    loop {
+        match reconcile().await {
+            Err(EdgeReconciliationError::Mutation(
+                crate::mutation_leases::MutationLeaseError::Busy,
+            )) => tokio::time::sleep(retry_delay).await,
+            result => return result,
+        }
+    }
+}
+
+/// Converge edge authority before accepting traffic or dispatching jobs.
+///
+/// A previous process can leave the global edge fence in its bounded reclaim
+/// quarantine after an ordinary restart. Treat only that contention as
+/// transient; every database, Kubernetes, authority, or provider error remains
+/// fatal to startup.
+pub async fn reconcile_all_haproxy_routes_at_startup(
+    state: &AppState,
+) -> Result<(), EdgeReconciliationError> {
+    retry_busy_reconciliation(
+        || reconcile_all_haproxy_routes(state),
+        std::time::Duration::from_secs(2),
+    )
+    .await
+}
+
 pub fn spawn_haproxy_reconciler(state: AppState) {
     tokio::spawn(async move {
         loop {
@@ -1013,6 +1047,27 @@ mod tests {
 
     const CONFIGMAP_PATH: &str = "/api/v1/namespaces/tenant-envoy/configmaps/haproxy-tenant";
     const DAEMONSET_PATH: &str = "/apis/apps/v1/namespaces/tenant-envoy/daemonsets/haproxy-tenant";
+
+    #[tokio::test]
+    async fn startup_reconciliation_retries_busy_fence_until_available() {
+        let mut attempts = 0;
+        retry_busy_reconciliation(
+            || {
+                attempts += 1;
+                std::future::ready(if attempts < 3 {
+                    Err(EdgeReconciliationError::Mutation(
+                        crate::mutation_leases::MutationLeaseError::Busy,
+                    ))
+                } else {
+                    Ok(())
+                })
+            },
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect("startup reconciliation succeeds after contention clears");
+        assert_eq!(attempts, 3);
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum FakePatchOutcome {

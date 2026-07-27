@@ -98,6 +98,36 @@ fn require_env_matches_release(
     Ok(())
 }
 
+fn trustee_kbs_url_matches_release(
+    actual: &str,
+    expected: &str,
+    release_build: bool,
+) -> anyhow::Result<()> {
+    let url = validate_trustee_kbs_url(actual, release_build)?;
+    if !release_build && url.scheme() == "http" {
+        // Debug/local stacks intentionally use a local HTTP Trustee while still
+        // consuming the bundled signed release for every immutable image and
+        // policy setting. Release builds never reach this exemption.
+        return Ok(());
+    }
+    if actual.trim() != expected.trim() {
+        anyhow::bail!(
+            "TRUSTEE_KBS_URL conflicts with signed platform release: env `{actual}` != release `{}`",
+            expected.trim()
+        );
+    }
+    Ok(())
+}
+
+fn require_trustee_kbs_url_matches_release(
+    expected: &str,
+    release_build: bool,
+) -> anyhow::Result<()> {
+    let actual = env_nonempty("TRUSTEE_KBS_URL")
+        .ok_or_else(|| anyhow::anyhow!("TRUSTEE_KBS_URL is required by signed platform release"))?;
+    trustee_kbs_url_matches_release(&actual, expected, release_build)
+}
+
 fn build_tenant_tee_http_client() -> anyhow::Result<reqwest::Client> {
     build_tenant_tee_http_client_with_env(|name| std::env::var(name).ok())
 }
@@ -608,8 +638,14 @@ async fn main() {
             genpolicy_version = %release.genpolicy_version,
             "signed platform release loaded"
         );
+        if let Err(e) = require_trustee_kbs_url_matches_release(
+            &release.trustee_kbs_url,
+            !cfg!(debug_assertions),
+        ) {
+            eprintln!("startup refused: {e}");
+            std::process::exit(1);
+        }
         for (name, expected) in [
-            ("TRUSTEE_KBS_URL", release.trustee_kbs_url.as_str()),
             (
                 "TENANT_CADDY_TLS_MODE",
                 release.tenant_caddy_tls_mode.as_str(),
@@ -838,6 +874,15 @@ async fn main() {
         internal_auth,
     };
 
+    if let Err(error) =
+        enclava_api::deployment_jobs::reconcile_failed_rollout_cleanup_at_startup(&state).await
+    {
+        eprintln!(
+            "startup refused: failed-rollout cleanup reconciliation failed: error_code={}",
+            error.code()
+        );
+        std::process::exit(1);
+    }
     if let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await {
         eprintln!("startup refused: KBS policy reconciliation failed: {error}");
         std::process::exit(1);
@@ -851,7 +896,7 @@ async fn main() {
     let hosted_edge_reconciliation = management_mode == CapManagementMode::PaasManaged
         || env_flag("TENANT_HAPROXY_RECONCILIATION_REQUIRED");
     if hosted_edge_reconciliation
-        && let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes(&state).await
+        && let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state).await
     {
         eprintln!("startup refused: HAProxy route reconciliation failed: {error}");
         std::process::exit(1);
@@ -910,6 +955,7 @@ mod tests {
             .expect("deployment dispatcher startup");
         for prerequisite in [
             "runtime_authority::establish_epoch",
+            "reconcile_failed_rollout_cleanup_at_startup",
             "reconcile_signed_policy_at_startup",
             "verify_trustee_kbs_connectivity",
             "reconcile_all_haproxy_routes",
@@ -919,6 +965,31 @@ mod tests {
                     .find(prerequisite)
                     .is_some_and(|index| index < dispatch),
                 "{prerequisite} must complete before durable deployment dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_rollout_cleanup_precedes_generic_provider_reconciliation() {
+        let source = include_str!("main.rs");
+        let main_body = source
+            .split("#[tokio::main]")
+            .nth(1)
+            .and_then(|s| s.split("#[cfg(test)]").next())
+            .expect("main body");
+        let cleanup = main_body
+            .find("reconcile_failed_rollout_cleanup_at_startup")
+            .expect("failed-rollout cleanup startup");
+        for generic_reconciler in [
+            "reconcile_signed_policy_at_startup",
+            "reconcile_all_haproxy_routes_at_startup",
+        ] {
+            let generic = main_body
+                .find(generic_reconciler)
+                .unwrap_or_else(|| panic!("{generic_reconciler} startup"));
+            assert!(
+                cleanup < generic,
+                "exact failed-rollout cleanup must precede {generic_reconciler}"
             );
         }
     }
@@ -942,6 +1013,31 @@ mod tests {
         let url = validate_trustee_kbs_url("http://trustee.example.test:8080", false)
             .expect("debug builds retain documented local HTTP Trustee support");
         assert_eq!(url.scheme(), "http");
+    }
+
+    #[test]
+    fn debug_http_trustee_can_override_bundled_release_url() {
+        trustee_kbs_url_matches_release(
+            "http://trustee.example.test:8080",
+            "https://trustee.preprod.example.test:8443",
+            false,
+        )
+        .expect("debug HTTP Trustee must remain reachable with the bundled signed release");
+    }
+
+    #[test]
+    fn release_trustee_must_match_signed_release() {
+        let error = trustee_kbs_url_matches_release(
+            "https://other-trustee.example.test:8443",
+            "https://trustee.preprod.example.test:8443",
+            true,
+        )
+        .expect_err("release Trustee authority cannot override the signed release");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with signed platform release")
+        );
     }
 
     #[test]

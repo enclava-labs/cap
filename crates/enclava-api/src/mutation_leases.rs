@@ -239,6 +239,67 @@ impl AppMutationLease {
         .await
     }
 
+    /// Convert this exact mutation into durable reconciliation authority.
+    ///
+    /// Once a terminal failed rollout has committed a cleanup job, elapsed
+    /// time must not let an unrelated app or global reconciler reclaim any
+    /// member of its resource set. The durable cleanup job validates and
+    /// releases these rows atomically after provider convergence.
+    pub async fn retain_all_until_reconciled_in_tx(
+        &mut self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), MutationLeaseError> {
+        self.stop_heartbeat();
+        require_current_runtime_authority(&self.runtime_authority, tx).await?;
+        assert_current_rows(
+            tx,
+            self.app_id,
+            self.token,
+            self.generation,
+            &self.resources,
+        )
+        .await?;
+
+        let app = sqlx::query(
+            "UPDATE app_mutation_leases
+                SET reclaim_after = 'infinity'::timestamptz,
+                    updated_at = clock_timestamp()
+              WHERE app_id = $1
+                AND owner_token = $2
+                AND generation = $3",
+        )
+        .bind(self.app_id)
+        .bind(self.token)
+        .bind(self.generation)
+        .execute(&mut **tx)
+        .await?;
+        if app.rows_affected() != 1 {
+            return Err(MutationLeaseError::Lost);
+        }
+
+        for resource in &self.resources {
+            let retained = sqlx::query(
+                "UPDATE external_resource_mutation_leases
+                    SET reclaim_after = 'infinity'::timestamptz,
+                        updated_at = clock_timestamp()
+                  WHERE resource_scope = $1
+                    AND resource_key = $2
+                    AND owner_token = $3
+                    AND generation = $4",
+            )
+            .bind(&resource.fence.scope)
+            .bind(&resource.fence.key)
+            .bind(self.token)
+            .bind(resource.generation)
+            .execute(&mut **tx)
+            .await?;
+            if retained.rows_affected() != 1 {
+                return Err(MutationLeaseError::Lost);
+            }
+        }
+        Ok(())
+    }
+
     /// Release one globally shared resource after its durable reconciliation
     /// succeeds while retaining app/other-resource quarantine for a different
     /// uncertain provider operation.
@@ -829,8 +890,12 @@ async fn renew(
         "UPDATE app_mutation_leases
             SET locked_until = clock_timestamp()
                     + ($4::bigint * interval '1 second'),
-                reclaim_after = clock_timestamp()
-                    + (($4 + $5)::bigint * interval '1 second'),
+                reclaim_after = CASE
+                    WHEN reclaim_after = 'infinity'::timestamptz
+                        THEN reclaim_after
+                    ELSE clock_timestamp()
+                        + (($4 + $5)::bigint * interval '1 second')
+                END,
                 updated_at = clock_timestamp()
           WHERE app_id = $1
             AND owner_token = $2
