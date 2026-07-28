@@ -108,7 +108,8 @@ pub(crate) async fn establish_epoch_with(
     if stored_generation == 0 && restore_generation == 1 {
         let adopted_generation: i64 = sqlx::query_scalar(
             "UPDATE cap_runtime_authority
-                SET restore_generation = $1
+                SET restore_generation = $1,
+                    kubernetes_reconciled_restore_generation = $1
               WHERE singleton
           RETURNING restore_generation",
         )
@@ -212,6 +213,23 @@ pub(crate) async fn establish_epoch_with(
     })
 }
 
+pub async fn kubernetes_reconciliation_required(
+    pool: &PgPool,
+    authority: RuntimeAuthority,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT kubernetes_reconciled_restore_generation < restore_generation
+           FROM cap_runtime_authority
+          WHERE singleton
+            AND authority_epoch = $1
+            AND restore_generation = $2",
+    )
+    .bind(authority.epoch)
+    .bind(authority.restore_generation)
+    .fetch_one(pool)
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +296,18 @@ mod tests {
                 .await
                 .expect("validate rotated authority")
         );
+        let reconciled_generation: i64 = sqlx::query_scalar(
+            "SELECT kubernetes_reconciled_restore_generation
+               FROM cap_runtime_authority
+              WHERE singleton",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("load Kubernetes restore witness");
+        assert_eq!(
+            reconciled_generation, baseline_generation,
+            "authority rotation must remain unready until Kubernetes is reconciled"
+        );
 
         let stable = establish_epoch_with(&mut tx, baseline_generation + 1)
             .await
@@ -308,7 +338,8 @@ mod tests {
         sqlx::query(
             "UPDATE cap_runtime_authority
                 SET authority_epoch = $1,
-                    restore_generation = 0
+                    restore_generation = 0,
+                    kubernetes_reconciled_restore_generation = 0
               WHERE singleton",
         )
         .bind(migration_epoch)
@@ -349,6 +380,18 @@ mod tests {
                 epoch: migration_epoch,
                 restore_generation: 1,
             }
+        );
+        let reconciled_generation: i64 = sqlx::query_scalar(
+            "SELECT kubernetes_reconciled_restore_generation
+               FROM cap_runtime_authority
+              WHERE singleton",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .expect("load initial Kubernetes restore witness");
+        assert_eq!(
+            reconciled_generation, 1,
+            "the initial 0-to-1 adoption is not a database restore"
         );
         let retained: (i64, Option<Uuid>, Option<String>, Option<Uuid>) = sqlx::query_as(
             "SELECT generation, owner_token, operation_kind, operation_id

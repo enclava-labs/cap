@@ -16,7 +16,8 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
     sqlx::query(
         "UPDATE cap_runtime_authority
             SET authority_epoch = $1,
-                restore_generation = $2
+                restore_generation = $2,
+                kubernetes_reconciled_restore_generation = $2
           WHERE singleton",
     )
     .bind(crate::runtime_authority::TEST_RUNTIME_AUTHORITY.epoch)

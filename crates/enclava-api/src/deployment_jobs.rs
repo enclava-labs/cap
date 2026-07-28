@@ -5,6 +5,7 @@
 //! process termination after commit cannot strand an accepted deployment in an
 //! in-memory Tokio task.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +43,8 @@ const ROLLOUT_CLEANUP_RETRY_INTERVAL_SQL: &str = "30 seconds";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const RESTORE_KUBERNETES_ADVISORY_LOCK: i64 = 0x454e_434c_5253_5452;
+const RESTORE_NAMESPACE_DELETE_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_SETUP_WORKERS: usize = 8;
 const MAX_APPLY_WORKERS: usize = 32;
 
@@ -229,16 +232,13 @@ pub(crate) struct StoredDeploymentApplyAuthority {
     pub payload_sha256: [u8; 32],
 }
 
-/// Load an accepted deployment's exact immutable worker snapshot. Rollback
-/// uses this instead of reconstructing historical runtime state from the
-/// partial human-facing deployment spec snapshot.
-pub(crate) async fn load_stored_deployment_apply_authority(
+async fn load_stored_deployment_job(
     pool: &PgPool,
     deployment_id: Uuid,
     app_id: Uuid,
     org_id: Uuid,
-) -> Result<StoredDeploymentApplyAuthority, DeploymentJobError> {
-    let job = sqlx::query_as::<_, ClaimedJob>(
+) -> Result<ClaimedJob, DeploymentJobError> {
+    sqlx::query_as::<_, ClaimedJob>(
         "SELECT deployment_id, app_id, org_id, source_deployment_id,
                 payload_version,
                 COALESCE(lock_token, '00000000-0000-0000-0000-000000000000'::uuid)
@@ -256,7 +256,19 @@ pub(crate) async fn load_stored_deployment_apply_authority(
     .bind(org_id)
     .fetch_optional(pool)
     .await?
-    .ok_or(DeploymentJobError::InvalidPayload)?;
+    .ok_or(DeploymentJobError::InvalidPayload)
+}
+
+/// Load an accepted deployment's exact immutable worker snapshot. Rollback
+/// uses this instead of reconstructing historical runtime state from the
+/// partial human-facing deployment spec snapshot.
+pub(crate) async fn load_stored_deployment_apply_authority(
+    pool: &PgPool,
+    deployment_id: Uuid,
+    app_id: Uuid,
+    org_id: Uuid,
+) -> Result<StoredDeploymentApplyAuthority, DeploymentJobError> {
+    let job = load_stored_deployment_job(pool, deployment_id, app_id, org_id).await?;
     let payload = job.decode_payload()?;
     validate_canonical_source_snapshot(pool, &job, &payload).await?;
     Ok(StoredDeploymentApplyAuthority {
@@ -345,6 +357,9 @@ impl DeploymentJobError {
                 | Self::ApplyLimiterClosed
                 | Self::SideEffectAdmissionClosed
                 | Self::Mutation(_)
+                | Self::Apply(crate::deploy::DeployError::EdgeRoute(
+                    crate::edge::EdgeRouteError::NotConfigured
+                ))
         )
     }
 }
@@ -1388,6 +1403,324 @@ pub async fn reconcile_failed_rollout_cleanup_at_startup(
     }
 }
 
+fn restore_payload_matches_current_app(accepted: &App, current: &App) -> bool {
+    accepted.id == current.id
+        && accepted.org_id == current.org_id
+        && accepted.name == current.name
+        && accepted.namespace == current.namespace
+        && accepted.instance_id == current.instance_id
+        && accepted.tenant_id == current.tenant_id
+        && accepted.service_account == current.service_account
+        && accepted.bootstrap_owner_pubkey_hash == current.bootstrap_owner_pubkey_hash
+        && accepted.tenant_instance_identity_hash == current.tenant_instance_identity_hash
+        && accepted.unlock_mode == current.unlock_mode
+        && accepted.domain == current.domain
+        && accepted.tee_domain == current.tee_domain
+        && accepted.signer_identity_subject == current.signer_identity_subject
+        && accepted.signer_identity_issuer == current.signer_identity_issuer
+        && accepted.signer_identity_set_at == current.signer_identity_set_at
+        && accepted.source_provider == current.source_provider
+        && accepted.source_repository == current.source_repository
+        && accepted.egress_allowlist == current.egress_allowlist
+        && accepted.egress_mode == current.egress_mode
+        && accepted.created_at == current.created_at
+}
+
+fn cap_owned_orphan_namespaces(
+    database_namespaces: &BTreeSet<String>,
+    reconciled_namespaces: &BTreeSet<String>,
+    namespaces: Vec<k8s_openapi::api::core::v1::Namespace>,
+) -> Result<Vec<String>, DeploymentJobError> {
+    let mut orphans = Vec::new();
+    let mut live_cap_namespaces = BTreeSet::new();
+    for namespace in namespaces {
+        let name = namespace
+            .metadata
+            .name
+            .ok_or(DeploymentJobError::Authority)?;
+        let labels = namespace.metadata.labels.unwrap_or_default();
+        let cap_owned = labels
+            .get("app.kubernetes.io/managed-by")
+            .is_some_and(|value| value == "enclava-platform");
+        let tenant_owned = labels
+            .get("enclava.dev/tenant")
+            .is_some_and(|value| !value.is_empty());
+        let has_tenant_marker = labels.contains_key("enclava.dev/tenant");
+        let has_cap_marker = name.starts_with("cap-") || cap_owned || has_tenant_marker;
+        if !has_cap_marker {
+            continue;
+        }
+        if !cap_owned || !tenant_owned || !name.starts_with("cap-") {
+            return Err(DeploymentJobError::Authority);
+        }
+        live_cap_namespaces.insert(name.clone());
+        if !database_namespaces.contains(&name) {
+            orphans.push(name);
+        } else if !reconciled_namespaces.contains(&name) {
+            // A failed, stopped, or incomplete app may own PVC data. Its
+            // precise desired Kubernetes state is not proven by a healthy
+            // completed apply snapshot, so preserve it and fail closed for
+            // explicit operator reconciliation rather than deleting data or
+            // accepting post-backup state.
+            return Err(DeploymentJobError::Authority);
+        }
+    }
+    if !reconciled_namespaces.is_subset(&live_cap_namespaces) {
+        return Err(DeploymentJobError::Authority);
+    }
+    orphans.sort();
+    orphans.dedup();
+    Ok(orphans)
+}
+
+async fn reserve_restore_namespace_generation(
+    transaction: &mut Transaction<'_, Postgres>,
+    namespace: &str,
+) -> Result<i64, DeploymentJobError> {
+    sqlx::query(
+        "INSERT INTO external_resource_mutation_leases(
+             resource_scope,
+             resource_key
+         )
+         VALUES ('kubernetes_namespace', $1)
+         ON CONFLICT (resource_scope, resource_key) DO NOTHING",
+    )
+    .bind(namespace)
+    .execute(&mut **transaction)
+    .await?;
+    let generation = sqlx::query_scalar(
+        "UPDATE external_resource_mutation_leases
+            SET generation = generation + 1,
+                updated_at = clock_timestamp()
+          WHERE resource_scope = 'kubernetes_namespace'
+            AND resource_key = $1
+            AND owner_token IS NULL
+        RETURNING generation",
+    )
+    .bind(namespace)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    generation.ok_or_else(|| {
+        DeploymentJobError::Mutation(crate::mutation_leases::MutationLeaseError::Busy)
+    })
+}
+
+pub async fn reconcile_kubernetes_after_restore_at_startup(
+    state: &AppState,
+) -> Result<(), DeploymentJobError> {
+    if !crate::runtime_authority::kubernetes_reconciliation_required(
+        &state.db,
+        state.runtime_authority,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let engine = enclava_engine::apply::engine::ApplyEngine::try_default()
+        .await
+        .map_err(crate::deploy::DeployError::from)?;
+    reconcile_kubernetes_after_restore_with_engine(state, &engine).await
+}
+
+async fn reconcile_kubernetes_after_restore_with_engine(
+    state: &AppState,
+    engine: &enclava_engine::apply::engine::ApplyEngine,
+) -> Result<(), DeploymentJobError> {
+    let mut transaction = state.db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(RESTORE_KUBERNETES_ADVISORY_LOCK)
+        .execute(&mut *transaction)
+        .await?;
+    let authority_state: (Uuid, i64, i64) = sqlx::query_as(
+        "SELECT authority_epoch,
+                restore_generation,
+                kubernetes_reconciled_restore_generation
+           FROM cap_runtime_authority
+          WHERE singleton
+          FOR SHARE",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    if authority_state.0 != state.runtime_authority.epoch
+        || authority_state.1 != state.runtime_authority.restore_generation
+    {
+        return Err(crate::mutation_leases::MutationLeaseError::StaleRuntimeAuthority.into());
+    }
+    if authority_state.2 == authority_state.1 {
+        transaction.commit().await?;
+        return Ok(());
+    }
+
+    let app_namespaces: Vec<(String, crate::models::AppStatus)> = sqlx::query_as(
+        "SELECT namespace, status
+           FROM apps
+          ORDER BY namespace",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    if app_namespaces
+        .iter()
+        .any(|(namespace, _)| !namespace.starts_with("cap-"))
+    {
+        return Err(DeploymentJobError::Authority);
+    }
+
+    // A running app is authoritative only when its newest accepted generation
+    // is both durably completed and healthy. A newer failed or incomplete
+    // generation changes the app status away from running. Refuse an
+    // inconsistent restored snapshot instead of falling back to an older
+    // healthy generation.
+    let restored_workloads: Vec<(Uuid, Uuid, String, Uuid)> = sqlx::query_as(
+        "SELECT app.id, app.org_id, app.namespace, latest.deployment_id
+           FROM apps AS app
+           JOIN LATERAL (
+               SELECT job.deployment_id, job.state
+                 FROM deployment_apply_jobs AS job
+                WHERE job.app_id = app.id
+                ORDER BY job.generation DESC
+                LIMIT 1
+           ) AS latest ON true
+           JOIN deployments AS deployment
+             ON deployment.id = latest.deployment_id
+            AND deployment.app_id = app.id
+            AND deployment.org_id = app.org_id
+          WHERE app.status = 'running'::app_status_enum
+            AND deployment.status = 'healthy'::deploy_status_enum
+            AND latest.state = 'completed'
+          ORDER BY app.namespace, app.id",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    let running_app_count = app_namespaces
+        .iter()
+        .filter(|(_, status)| *status == crate::models::AppStatus::Running)
+        .count();
+    if restored_workloads.len() != running_app_count {
+        return Err(DeploymentJobError::Authority);
+    }
+    let database_namespaces: BTreeSet<String> = app_namespaces
+        .iter()
+        .map(|(namespace, _)| namespace.clone())
+        .collect();
+    let reconciled_namespaces: BTreeSet<String> = restored_workloads
+        .iter()
+        .map(|(_, _, namespace, _)| namespace.clone())
+        .collect();
+
+    for (app_id, org_id, _namespace, deployment_id) in restored_workloads {
+        let app: App = sqlx::query_as(
+            "SELECT *
+               FROM apps
+              WHERE id = $1
+                AND org_id = $2",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        let job = load_stored_deployment_job(&state.db, deployment_id, app_id, org_id).await?;
+        let payload = job.decode_payload()?;
+        if !restore_payload_matches_current_app(&payload.app, &app) {
+            return Err(DeploymentJobError::Authority);
+        }
+        let primary_image_digest =
+            validate_canonical_source_snapshot(&state.db, &job, &payload).await?;
+        let validated =
+            validate_apply_artifacts(state, &job, &payload, &primary_image_digest).await?;
+
+        crate::deploy::lock_app_deployment_lane(&mut transaction, app_id).await?;
+        let namespace_generation =
+            reserve_restore_namespace_generation(&mut transaction, &app.namespace).await?;
+        let generation = enclava_engine::apply::generation::MutationGeneration::with_authority(
+            namespace_generation,
+            state.runtime_authority.epoch,
+            state.runtime_authority.restore_generation,
+        )
+        .map_err(crate::deploy::DeployError::from)?;
+        crate::deploy::apply_restored_kubernetes_manifests(
+            engine,
+            crate::deploy::RestoreKubernetesManifestsRequest {
+                app: payload.app,
+                current_custom_domain: app.custom_domain,
+                snapshot: payload.snapshot,
+                deployment_id,
+                attestation_config: payload.attestation_config,
+                api_signing_pubkey: payload.api_signing_pubkey,
+                api_url: payload.api_url,
+                workload_artifact_binding: validated.workload_artifact_binding,
+                signed_policy_artifact: validated.signed_policy_artifact,
+                local_workload_artifacts_json: validated.local_workload_artifacts_json,
+                local_trustee_policy_json: validated.local_trustee_policy_json,
+                log_encryption: payload.log_encryption,
+            },
+            generation,
+        )
+        .await?;
+        tracing::info!(
+            app_id = %app_id,
+            deployment_id = %deployment_id,
+            "re-applied restored Kubernetes workload authority"
+        );
+    }
+
+    let namespace_api =
+        kube::Api::<k8s_openapi::api::core::v1::Namespace>::all(engine.client().clone());
+    let live_owned_namespaces = namespace_api
+        .list(&kube::api::ListParams::default())
+        .await
+        .map_err(enclava_engine::apply::engine::ApplyError::from)
+        .map_err(crate::deploy::DeployError::from)?;
+    let orphan_namespaces = cap_owned_orphan_namespaces(
+        &database_namespaces,
+        &reconciled_namespaces,
+        live_owned_namespaces.items,
+    )?;
+    for namespace in orphan_namespaces {
+        let namespace_generation =
+            reserve_restore_namespace_generation(&mut transaction, &namespace).await?;
+        let generation = enclava_engine::apply::generation::MutationGeneration::with_authority(
+            namespace_generation,
+            state.runtime_authority.epoch,
+            state.runtime_authority.restore_generation,
+        )
+        .map_err(crate::deploy::DeployError::from)?;
+        enclava_engine::apply::cleanup::delete_namespace_and_wait(
+            engine,
+            &namespace,
+            RESTORE_NAMESPACE_DELETE_TIMEOUT,
+            generation,
+        )
+        .await
+        .map_err(crate::deploy::DeployError::from)?;
+        tracing::info!(
+            namespace = %namespace,
+            "removed CAP-owned namespace absent from restored database authority"
+        );
+    }
+
+    let marked = sqlx::query(
+        "UPDATE cap_runtime_authority
+            SET kubernetes_reconciled_restore_generation = restore_generation
+          WHERE singleton
+            AND authority_epoch = $1
+            AND restore_generation = $2
+            AND kubernetes_reconciled_restore_generation < restore_generation",
+    )
+    .bind(state.runtime_authority.epoch)
+    .bind(state.runtime_authority.restore_generation)
+    .execute(&mut *transaction)
+    .await?;
+    if marked.rows_affected() != 1 {
+        return Err(crate::mutation_leases::MutationLeaseError::StaleRuntimeAuthority.into());
+    }
+    transaction.commit().await?;
+    tracing::info!(
+        restore_generation = state.runtime_authority.restore_generation,
+        "restored Kubernetes desired state converged before API startup"
+    );
+    Ok(())
+}
+
 async fn oldest_rollout_cleanup_job(
     pool: &PgPool,
 ) -> Result<Option<(Uuid, i32)>, DeploymentJobError> {
@@ -2025,6 +2358,9 @@ async fn apply_claimed_job(
     job: &ClaimedJob,
     payload: &DeploymentApplyJobPayload,
 ) -> Result<JobApplyOutcome, DeploymentJobError> {
+    crate::edge::require_haproxy_integration_enabled()
+        .map_err(crate::deploy::DeployError::from)
+        .map_err(DeploymentJobError::from)?;
     payload.validate_for_app(job.app_id, job.org_id)?;
     let primary_image_digest = validate_canonical_source_snapshot(&state.db, job, payload).await?;
     if deployment_is_terminal(&state.db, job.deployment_id).await? {
@@ -2943,6 +3279,7 @@ async fn renew_job_lease(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{Request, Response};
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     use ed25519_dalek::{Signer, SigningKey};
     use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
@@ -2952,8 +3289,283 @@ mod tests {
     };
     use enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH;
     use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
+    use kube::client::Body;
     use sqlx::types::Json;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        io,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    use tower::service_fn;
+
+    #[test]
+    fn disabled_haproxy_keeps_apply_work_nonterminal() {
+        let error = DeploymentJobError::Apply(crate::deploy::DeployError::EdgeRoute(
+            crate::edge::EdgeRouteError::NotConfigured,
+        ));
+        assert_eq!(error.code(), "edge_route_error");
+        assert!(
+            error.should_requeue_without_terminal_failure(),
+            "missing optional HAProxy credentials must preserve durable apply work"
+        );
+    }
+
+    #[test]
+    fn restore_namespace_plan_deletes_only_strict_cap_owned_orphans() {
+        fn owned_namespace(name: &str) -> k8s_openapi::api::core::v1::Namespace {
+            let mut labels = std::collections::BTreeMap::new();
+            labels.insert(
+                "app.kubernetes.io/managed-by".to_string(),
+                "enclava-platform".to_string(),
+            );
+            labels.insert("enclava.dev/tenant".to_string(), "tenant-1".to_string());
+            k8s_openapi::api::core::v1::Namespace {
+                metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                    name: Some(name.to_string()),
+                    labels: Some(labels),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        let database_namespaces = BTreeSet::from(["cap-restored-app".to_string()]);
+        let reconciled_namespaces = database_namespaces.clone();
+        let orphans = cap_owned_orphan_namespaces(
+            &database_namespaces,
+            &reconciled_namespaces,
+            vec![
+                owned_namespace("cap-restored-app"),
+                owned_namespace("cap-post-backup-app"),
+            ],
+        )
+        .expect("strictly CAP-owned namespace inventory");
+        assert_eq!(orphans, vec!["cap-post-backup-app"]);
+
+        let unrelated = k8s_openapi::api::core::v1::Namespace {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("kube-system".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            cap_owned_orphan_namespaces(&BTreeSet::new(), &BTreeSet::new(), vec![unrelated],)
+                .expect("unrelated namespaces are outside CAP authority"),
+            Vec::<String>::new()
+        );
+        assert!(
+            cap_owned_orphan_namespaces(
+                &database_namespaces,
+                &reconciled_namespaces,
+                vec![owned_namespace("kube-system")],
+            )
+            .is_err(),
+            "restore reconciliation must refuse an ambiguously labeled non-CAP namespace"
+        );
+        let ambiguous_cap_namespace = k8s_openapi::api::core::v1::Namespace {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some("cap-stripped-labels".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            cap_owned_orphan_namespaces(
+                &database_namespaces,
+                &reconciled_namespaces,
+                vec![ambiguous_cap_namespace],
+            )
+            .is_err(),
+            "a CAP-prefixed namespace with stripped authority labels must block restore"
+        );
+        let incomplete_database_namespaces = BTreeSet::from(["cap-incomplete-app".to_string()]);
+        assert!(
+            cap_owned_orphan_namespaces(
+                &incomplete_database_namespaces,
+                &BTreeSet::new(),
+                vec![owned_namespace("cap-incomplete-app")],
+            )
+            .is_err(),
+            "live state without a proven healthy snapshot must be preserved but block restore"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_restored_cluster_marks_kubernetes_authority_only_after_inventory() {
+        let pool = database_test_pool().await;
+        let app_count: i64 = sqlx::query_scalar("SELECT count(*) FROM apps")
+            .fetch_one(&pool)
+            .await
+            .expect("count restore test apps");
+        assert_eq!(
+            app_count, 0,
+            "restore witness test requires an empty fixture"
+        );
+        sqlx::query(
+            "UPDATE cap_runtime_authority
+                SET kubernetes_reconciled_restore_generation =
+                    restore_generation - 1
+              WHERE singleton
+                AND restore_generation > 0",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark Kubernetes restore reconciliation pending");
+
+        let client = kube::Client::new(
+            service_fn(|request: Request<Body>| async move {
+                if request.method() != axum::http::Method::GET
+                    || request.uri().path() != "/api/v1/namespaces"
+                {
+                    return Err(io::Error::other("unexpected Kubernetes request"));
+                }
+                Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "NamespaceList",
+                            "metadata": {"resourceVersion": "1"},
+                            "items": [],
+                        })
+                        .to_string()
+                        .into_bytes(),
+                    ))
+                    .map_err(io::Error::other)
+            }),
+            "default",
+        );
+        let engine = enclava_engine::apply::engine::ApplyEngine::new(client, Default::default());
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.runtime_authority = current_test_runtime_authority(&pool)
+            .await
+            .expect("load restore test runtime authority");
+
+        reconcile_kubernetes_after_restore_with_engine(&state, &engine)
+            .await
+            .expect("reconcile empty restored Kubernetes inventory");
+
+        let converged: bool = sqlx::query_scalar(
+            "SELECT kubernetes_reconciled_restore_generation = restore_generation
+               FROM cap_runtime_authority
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load converged Kubernetes restore witness");
+        assert!(converged);
+    }
+
+    #[tokio::test]
+    async fn failed_restore_inventory_keeps_kubernetes_authority_pending() {
+        let pool = database_test_pool().await;
+        sqlx::query(
+            "UPDATE cap_runtime_authority
+                SET kubernetes_reconciled_restore_generation =
+                    restore_generation - 1
+              WHERE singleton
+                AND restore_generation > 0",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark Kubernetes restore reconciliation pending");
+
+        let client = kube::Client::new(
+            service_fn(|_request: Request<Body>| async move {
+                Result::<Response<Body>, io::Error>::Err(io::Error::other(
+                    "simulated Kubernetes inventory failure",
+                ))
+            }),
+            "default",
+        );
+        let engine = enclava_engine::apply::engine::ApplyEngine::new(client, Default::default());
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.runtime_authority = current_test_runtime_authority(&pool)
+            .await
+            .expect("load restore test runtime authority");
+
+        assert!(
+            reconcile_kubernetes_after_restore_with_engine(&state, &engine)
+                .await
+                .is_err(),
+            "provider failure must block restored Kubernetes authority"
+        );
+        let converged: bool = sqlx::query_scalar(
+            "SELECT kubernetes_reconciled_restore_generation = restore_generation
+               FROM cap_runtime_authority
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load pending Kubernetes restore witness");
+        assert!(
+            !converged,
+            "a failed Kubernetes inventory must remain retryable on next startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn inconsistent_running_restore_refuses_older_generation_fallback() {
+        let pool = database_test_pool().await;
+        let (app, _deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE apps
+                SET status = 'running'::app_status_enum
+              WHERE id = $1",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("make incomplete restored app inconsistent");
+        sqlx::query(
+            "UPDATE cap_runtime_authority
+                SET kubernetes_reconciled_restore_generation =
+                    restore_generation - 1
+              WHERE singleton
+                AND restore_generation > 0",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark Kubernetes restore reconciliation pending");
+
+        let client = kube::Client::new(
+            service_fn(|_request: Request<Body>| async move {
+                Result::<Response<Body>, io::Error>::Err(io::Error::other(
+                    "inconsistent authority must fail before Kubernetes",
+                ))
+            }),
+            "default",
+        );
+        let engine = enclava_engine::apply::engine::ApplyEngine::new(client, Default::default());
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.runtime_authority = current_test_runtime_authority(&pool)
+            .await
+            .expect("load restore test runtime authority");
+
+        let error = reconcile_kubernetes_after_restore_with_engine(&state, &engine)
+            .await
+            .expect_err("running app without a completed healthy latest job must fail closed");
+        assert!(matches!(error, DeploymentJobError::Authority));
+        let converged: bool = sqlx::query_scalar(
+            "SELECT kubernetes_reconciled_restore_generation = restore_generation
+               FROM cap_runtime_authority
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load pending Kubernetes restore witness");
+        assert!(!converged);
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete inconsistent restore fixture");
+    }
 
     #[tokio::test]
     async fn lease_heartbeat_does_not_duplicate_large_future_state() {

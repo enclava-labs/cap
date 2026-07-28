@@ -59,6 +59,15 @@ fn internal_error() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+fn require_haproxy_domain_mutations() -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    crate::edge::require_haproxy_integration_enabled().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "tenant edge integration unavailable"})),
+        )
+    })
+}
+
 async fn ensure_custom_domain_haproxy_route(
     state: &AppState,
     org_id: Uuid,
@@ -258,6 +267,7 @@ pub async fn verify_challenge(
 ) -> Result<Json<VerifyResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    require_haproxy_domain_mutations()?;
 
     let mut app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -644,6 +654,7 @@ pub async fn remove_custom_domain(
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    require_haproxy_domain_mutations()?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -890,6 +901,45 @@ mod tests {
                     Err(DomainError::InvalidDomain(_))
                 ),
                 "expected invalid for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_domain_writes_gate_haproxy_before_durable_or_provider_mutation() {
+        let source = include_str!("domains.rs");
+        let verify = source
+            .split("pub async fn verify_challenge")
+            .nth(1)
+            .and_then(|body| body.split("pub async fn remove_custom_domain").next())
+            .expect("verify challenge body");
+        let remove = source
+            .split("pub async fn remove_custom_domain")
+            .nth(1)
+            .and_then(|body| body.split("pub struct DomainResponse").next())
+            .expect("remove custom domain body");
+
+        let verify_gate = verify
+            .find("require_haproxy_domain_mutations")
+            .expect("verify HAProxy preflight");
+        for mutation in [
+            "record_custom_domain",
+            "UPDATE custom_domain_challenges",
+            "UPDATE apps SET custom_domain",
+        ] {
+            assert!(
+                verify_gate < verify.find(mutation).expect("verify mutation"),
+                "verify must gate HAProxy before {mutation}"
+            );
+        }
+
+        let remove_gate = remove
+            .find("require_haproxy_domain_mutations")
+            .expect("remove HAProxy preflight");
+        for mutation in ["delete_dns_record", "UPDATE apps SET custom_domain"] {
+            assert!(
+                remove_gate < remove.find(mutation).expect("remove mutation"),
+                "remove must gate HAProxy before {mutation}"
             );
         }
     }

@@ -36,6 +36,35 @@ const TEST_KBS_POLICY: &str = "package policy\n\ndefault allow := false\n";
 const TEST_AGENT_POLICY: &str = "package agent_policy\n\ndefault CreateContainerRequest := true\n";
 const TEST_GENPOLICY_PIN: &str = "kata-containers/genpolicy@3.28.0+test";
 
+struct ScopedEnvVar {
+    name: &'static str,
+    previous: Option<String>,
+}
+
+impl ScopedEnvVar {
+    fn set(name: &'static str, value: &str) -> Self {
+        let previous = std::env::var(name).ok();
+        // CI serializes this PostgreSQL-backed integration test binary with
+        // `--test-threads=1`; the guard restores the prior process value.
+        unsafe {
+            std::env::set_var(name, value);
+        }
+        Self { name, previous }
+    }
+}
+
+impl Drop for ScopedEnvVar {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(previous) = self.previous.as_deref() {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct TestPolicyService {
     signing_key: Arc<SigningKey>,
@@ -1962,11 +1991,85 @@ async fn paas_internal_app_logs_fail_closed_after_actor_validation() {
 }
 
 #[tokio::test]
+async fn custom_domain_mutation_is_side_effect_free_when_haproxy_is_disabled() {
+    let _haproxy_disabled = ScopedEnvVar::set("TENANT_HAPROXY_ENABLED", "false");
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("disabled-domain-{}", &suffix[..12]);
+    let domain = format!("disabled-{}.example.com", &suffix[..12]);
+    let (session_token, _org_id) = signup_owner(&server, "domain-disabled").await;
+
+    let create = server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await;
+    create.assert_status(StatusCode::CREATED);
+    let create_body: Value = create.json();
+    let app_id = Uuid::parse_str(create_body["id"].as_str().expect("app id")).unwrap();
+    let planted_verified_at = chrono::DateTime::from_timestamp_micros(
+        (Utc::now() - Duration::minutes(5)).timestamp_micros(),
+    )
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO custom_domain_challenges (
+             id, app_id, domain, challenge_token, expires_at, verified_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(app_id)
+    .bind(&domain)
+    .bind("verified-before-disabled-mode")
+    .bind(Utc::now() + Duration::hours(1))
+    .bind(planted_verified_at)
+    .execute(&pool)
+    .await
+    .expect("insert disabled-mode domain challenge");
+
+    let verify = server
+        .post(&format!("/apps/{app_name}/domains/{domain}/verify"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    verify.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+
+    let retained: (Option<String>, Option<chrono::DateTime<Utc>>, i64) = sqlx::query_as(
+        "SELECT app.custom_domain,
+                challenge.verified_at,
+                (
+                    SELECT count(*)
+                      FROM dns_records
+                     WHERE app_id = app.id
+                       AND hostname = $2
+                )
+           FROM apps AS app
+           JOIN custom_domain_challenges AS challenge
+             ON challenge.app_id = app.id
+            AND challenge.domain = $2
+          WHERE app.id = $1",
+    )
+    .bind(app_id)
+    .bind(&domain)
+    .fetch_one(&pool)
+    .await
+    .expect("load disabled-mode domain authority");
+    assert_eq!(retained, (None, Some(planted_verified_at), 0));
+}
+
+#[tokio::test]
 async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
     // Expiry is absolute: a challenge past `expires_at` is refused even when
     // `verified_at` was already captured, and the live TXT lookup never runs
     // (this env has no DNS, so a 409 -- not a 502 -- proves the lookup was
     // skipped). No domain is attached and no DNS record is tracked.
+    let _haproxy_enabled = ScopedEnvVar::set("TENANT_HAPROXY_ENABLED", "true");
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);
@@ -2038,6 +2141,7 @@ async fn custom_domain_verified_challenge_rechecks_txt_within_window() {
     // live TXT lookup -- it may not skip straight to applying the domain. This
     // env has no DNS, so the lookup surfaces as a 502 lookup error (not a 200
     // skip-to-apply), and no domain is attached.
+    let _haproxy_enabled = ScopedEnvVar::set("TENANT_HAPROXY_ENABLED", "true");
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);

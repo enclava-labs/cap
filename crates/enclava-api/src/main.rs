@@ -905,6 +905,15 @@ async fn main() {
         std::process::exit(1);
     }
     if let Err(error) =
+        enclava_api::deployment_jobs::reconcile_kubernetes_after_restore_at_startup(&state).await
+    {
+        eprintln!(
+            "startup refused: restored Kubernetes reconciliation failed: error_code={}",
+            error.code()
+        );
+        std::process::exit(1);
+    }
+    if let Err(error) =
         verify_trustee_kbs_connectivity(&state.trustee_http_client, trustee_required).await
     {
         eprintln!("startup refused: Trustee KBS connectivity check failed: {error}");
@@ -929,10 +938,14 @@ async fn main() {
         );
     }
 
-    enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
     if haproxy_integration_enabled {
+        enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
         enclava_api::edge::spawn_haproxy_reconciler(state.clone());
+    } else {
+        tracing::info!(
+            "durable deployment dispatch is disabled while tenant HAProxy integration is disabled"
+        );
     }
     let app = build_router(state);
 
@@ -984,6 +997,7 @@ mod tests {
             "runtime_authority::establish_epoch",
             "reconcile_failed_rollout_cleanup_at_startup",
             "reconcile_policy_at_startup",
+            "reconcile_kubernetes_after_restore_at_startup",
             "verify_trustee_kbs_connectivity",
             "reconcile_all_haproxy_routes",
         ] {
@@ -1007,18 +1021,27 @@ mod tests {
         let cleanup = main_body
             .find("reconcile_failed_rollout_cleanup_at_startup")
             .expect("failed-rollout cleanup startup");
-        for generic_reconciler in [
-            "reconcile_policy_at_startup",
-            "reconcile_all_haproxy_routes_at_startup",
-        ] {
-            let generic = main_body
-                .find(generic_reconciler)
-                .unwrap_or_else(|| panic!("{generic_reconciler} startup"));
-            assert!(
-                cleanup < generic,
-                "exact failed-rollout cleanup must precede {generic_reconciler}"
-            );
-        }
+        let kubernetes_restore = main_body
+            .find("reconcile_kubernetes_after_restore_at_startup")
+            .expect("restored Kubernetes reconciliation startup");
+        let kbs_restore = main_body
+            .find("reconcile_policy_at_startup")
+            .expect("restored KBS reconciliation startup");
+        assert!(
+            cleanup < kbs_restore,
+            "exact failed-rollout cleanup must precede restored KBS reconciliation"
+        );
+        assert!(
+            kbs_restore < kubernetes_restore,
+            "restored KBS authority must converge before Kubernetes workloads"
+        );
+        let edge_restore = main_body
+            .find("reconcile_all_haproxy_routes_at_startup")
+            .expect("restored HAProxy reconciliation startup");
+        assert!(
+            kubernetes_restore < edge_restore,
+            "restored Kubernetes state must converge before HAProxy routes"
+        );
     }
 
     #[test]
@@ -1043,6 +1066,19 @@ mod tests {
         assert!(
             main_body.contains("haproxy_integration_enabled"),
             "optional API deployments must be able to start without HAProxy credentials"
+        );
+        let background_workers = main_body
+            .split("enclava_api::kbs::spawn_signed_policy_reconciler")
+            .nth(1)
+            .and_then(|body| body.split("let app = build_router").next())
+            .expect("background worker startup block");
+        let enabled_branch = background_workers
+            .split("if haproxy_integration_enabled {")
+            .nth(1)
+            .expect("HAProxy-enabled worker branch");
+        assert!(
+            enabled_branch.contains("spawn_deployment_dispatcher"),
+            "durable deployment dispatch must start only in the HAProxy-enabled branch"
         );
     }
 

@@ -386,6 +386,24 @@ pub struct ApplyDeploymentManifestsRequest {
     pub log_encryption: Option<LogEncryptionConfig>,
 }
 
+pub(crate) struct RestoreKubernetesManifestsRequest {
+    /// Exact app row captured in the immutable accepted apply payload.
+    pub app: App,
+    /// Custom-domain authority can change after a healthy deployment without
+    /// changing its signed workload snapshot.
+    pub current_custom_domain: Option<String>,
+    pub snapshot: DeploymentApplySnapshot,
+    pub deployment_id: Uuid,
+    pub attestation_config: Option<AttestationConfig>,
+    pub api_signing_pubkey: String,
+    pub api_url: String,
+    pub workload_artifact_binding: Option<WorkloadArtifactBinding>,
+    pub signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
+    pub local_workload_artifacts_json: Option<String>,
+    pub local_trustee_policy_json: Option<String>,
+    pub log_encryption: Option<LogEncryptionConfig>,
+}
+
 /// Immutable database-row inputs captured for one queued deployment apply.
 ///
 /// The API can accept another deployment while this one waits for the apply
@@ -1814,6 +1832,120 @@ impl DeploymentRollout {
             manifest_hash: self.manifest_hash,
         }
     }
+}
+
+/// Re-apply only Kubernetes desired state after an explicit database restore.
+///
+/// The caller holds the runtime-authority row and a transaction-scoped global
+/// restore lock across this operation. KBS authority is reconciled before this
+/// path so no post-backup policy remains permissive while workloads converge;
+/// edge state is reconciled afterward. This path never rewrites
+/// deployment/app status: it restores the cluster to the exact durable
+/// workload snapshot before the API starts serving.
+pub(crate) async fn apply_restored_kubernetes_manifests(
+    engine: &ApplyEngine,
+    request: RestoreKubernetesManifestsRequest,
+    generation: MutationGeneration,
+) -> Result<(), DeployError> {
+    let RestoreKubernetesManifestsRequest {
+        app,
+        current_custom_domain,
+        snapshot,
+        deployment_id,
+        attestation_config,
+        api_signing_pubkey,
+        api_url,
+        workload_artifact_binding,
+        signed_policy_artifact,
+        local_workload_artifacts_json,
+        local_trustee_policy_json,
+        log_encryption,
+    } = request;
+    let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
+    let mut app_spec = build_confidential_app_from_rows(
+        &app,
+        deployment_id,
+        &attestation_config,
+        &api_signing_pubkey,
+        &api_url,
+        &snapshot.containers,
+        &snapshot.resources,
+    )?;
+    app_spec.workload_artifact_binding = workload_artifact_binding;
+    app_spec.log_encryption = log_encryption;
+    if let (Some(workload_artifacts), Some(trustee_policy)) =
+        (local_workload_artifacts_json, local_trustee_policy_json)
+    {
+        app_spec.attestation.local_workload_artifacts_json = Some(workload_artifacts);
+        app_spec.attestation.local_trustee_policy_json = Some(trustee_policy);
+    }
+    if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
+        let policy_sha256: [u8; 32] = hex::decode(&signed_policy_artifact.agent_policy_sha256)
+            .map_err(|error| DeployError::Validation(format!("agent_policy_sha256: {error}")))?
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                DeployError::Validation(format!(
+                    "agent_policy_sha256 must be 32 bytes, got {}",
+                    bytes.len()
+                ))
+            })?;
+        app_spec.generated_agent_policy = Some(enclava_engine::types::GeneratedAgentPolicy {
+            policy_text: signed_policy_artifact.agent_policy_text.clone(),
+            policy_sha256,
+            genpolicy_version_pin: signed_policy_artifact
+                .metadata
+                .genpolicy_version_pin
+                .clone(),
+        });
+    }
+    enclava_engine::validate::validate_app(&app_spec)
+        .map_err(|error| DeployError::Validation(error.to_string()))?;
+
+    let tenant_image_pull_secret_config =
+        tenant_image_pull_secret_config_for_containers(&app_spec.containers);
+    let manifests = generate_all_manifests(&app_spec);
+    let hash = manifest_hash(&manifests);
+    apply_all_with_tenant_image_pull_secret(
+        engine,
+        &manifests,
+        &hash,
+        tenant_image_pull_secret_config.as_ref(),
+        generation,
+    )
+    .await?;
+
+    // A verified custom domain is deliberately mutable without re-signing the
+    // workload descriptor. Keep the full workload/cc_init_data render bound to
+    // the accepted app snapshot above, then restore only the mutable ingress
+    // projection from the current database row.
+    if app_spec.domain.custom_domain != current_custom_domain {
+        app_spec.domain.custom_domain = current_custom_domain;
+        enclava_engine::validate::validate_app(&app_spec)
+            .map_err(|error| DeployError::Validation(error.to_string()))?;
+        let ingress = enclava_engine::manifest::ingress::generate_ingress_configmap(&app_spec);
+        enclava_engine::apply::resources::apply_namespaced_resource(
+            engine,
+            &app_spec.namespace,
+            &ingress,
+            generation,
+        )
+        .await?;
+        restart_statefulset_for_ingress(engine, &app_spec.namespace, &app_spec.name, generation)
+            .await?;
+        let status = watch_rollout(engine, &app_spec.namespace, &app_spec.name).await?;
+        if status.phase != DeployPhase::Running {
+            return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
+                status.message.unwrap_or_else(|| {
+                    format!(
+                        "restored tenant ingress rollout ended in {:?}",
+                        status.phase
+                    )
+                }),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Apply manifests and return durable rollout-observation context.
