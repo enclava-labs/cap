@@ -312,6 +312,28 @@ impl AppMutationLease {
         Ok(())
     }
 
+    /// Stop renewal after a provider future has returned, but preserve the
+    /// existing quarantine before this exact app/resource generation may be
+    /// reclaimed. This converts any pre-send infinite ambiguity fence back to
+    /// the same bounded quarantine used by ordinary canceled provider calls.
+    pub async fn release_after_provider_quarantine(mut self) -> Result<(), MutationLeaseError> {
+        self.stop_heartbeat();
+        let mut tx = self.pool.begin().await?;
+        crate::deploy::lock_app_deployment_lane(&mut tx, self.app_id).await?;
+        let bounded = bound_resource_scope_for_reclaim(
+            &mut tx,
+            self.token,
+            &self.resources,
+            "kubernetes_namespace",
+        )
+        .await?;
+        if bounded == 0 {
+            return Err(MutationLeaseError::Lost);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Release a successful mutation when there is no other database
     /// publication to make.
     pub async fn finish(mut self) -> Result<(), MutationLeaseError> {
@@ -811,6 +833,92 @@ async fn clear_resource_rows(
         }
     }
     Ok(())
+}
+
+async fn bound_resource_scope_for_reclaim(
+    tx: &mut Transaction<'_, Postgres>,
+    token: Uuid,
+    resources: &[ClaimedResource],
+    resource_scope: &str,
+) -> Result<usize, MutationLeaseError> {
+    let mut bounded = 0usize;
+    for resource in resources
+        .iter()
+        .filter(|resource| resource.fence.scope == resource_scope)
+    {
+        let result = sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET reclaim_after = locked_until
+                        + ($5::bigint * interval '1 second')
+              WHERE resource_scope = $1
+                AND resource_key = $2
+                AND owner_token = $3
+                AND generation = $4",
+        )
+        .bind(&resource.fence.scope)
+        .bind(&resource.fence.key)
+        .bind(token)
+        .bind(resource.generation)
+        .bind(RECLAIM_QUARANTINE_SECONDS)
+        .execute(&mut **tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(MutationLeaseError::Lost);
+        }
+        bounded += 1;
+    }
+    Ok(bounded)
+}
+
+/// Repair an exact deployment apply whose worker no longer owns either lease.
+/// Only its infinitely poisoned Kubernetes namespace is changed; app and
+/// other provider rows retain their normal finite reclaim deadlines.
+pub async fn reconcile_orphaned_deployment_apply_leases(
+    pool: &PgPool,
+) -> Result<u64, MutationLeaseError> {
+    let resources = sqlx::query(
+        "UPDATE external_resource_mutation_leases AS resource
+            SET reclaim_after = resource.locked_until
+                    + ($1::bigint * interval '1 second')
+           FROM app_mutation_leases AS app,
+                deployment_apply_jobs AS job,
+                deployments AS deployment
+          WHERE app.operation_kind = 'deployment_apply'
+            AND app.operation_id = job.deployment_id
+            AND app.owner_token IS NOT NULL
+            AND job.app_id = app.app_id
+            AND deployment.id = job.deployment_id
+            AND deployment.app_id = job.app_id
+            AND deployment.org_id = job.org_id
+            AND app.locked_until <= clock_timestamp()
+            AND (
+                (
+                    job.state IN ('completed', 'failed')
+                    AND deployment.status = 'failed'::deploy_status_enum
+                )
+                OR (
+                    job.state IN ('pending', 'running')
+                    AND deployment.status IN (
+                        'pending'::deploy_status_enum,
+                        'applying'::deploy_status_enum,
+                        'watching'::deploy_status_enum
+                    )
+                    AND (
+                        job.lock_token IS NULL
+                        OR job.locked_until <= clock_timestamp()
+                    )
+                )
+            )
+            AND resource.resource_scope = 'kubernetes_namespace'
+            AND resource.owner_token = app.owner_token
+            AND resource.operation_kind = app.operation_kind
+            AND resource.operation_id = app.operation_id
+            AND resource.reclaim_after = 'infinity'::timestamptz",
+    )
+    .bind(RECLAIM_QUARANTINE_SECONDS)
+    .execute(pool)
+    .await?;
+    Ok(resources.rows_affected())
 }
 
 async fn poison_resource_scope(
@@ -1701,6 +1809,121 @@ mod tests {
             .execute(&pool)
             .await
             .expect("remove successful Kubernetes organization fixture");
+    }
+
+    #[tokio::test]
+    async fn terminal_release_preserves_bounded_provider_quarantine() {
+        let pool = database_test_pool(4).await;
+        let namespace = format!("failed-kube-{}", Uuid::new_v4().simple());
+        let hostname = format!("{namespace}.example.test");
+        let (org_id, app_id) = insert_app(&pool, &hostname).await;
+        let state = state_with_pool(pool.clone());
+        let operation_id = Uuid::new_v4();
+        let owner = claim(
+            &state,
+            app_id,
+            "deployment_apply",
+            operation_id,
+            false,
+            vec![ResourceFence::new("kubernetes_namespace", &namespace)],
+        )
+        .await
+        .expect("claim failed deployment generation");
+        let generation = owner.resources[0].generation;
+        owner
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("pre-arm namespace provider fence");
+        owner
+            .release_after_provider_quarantine()
+            .await
+            .expect("bound failed provider generation");
+
+        let app_quarantine: i64 = sqlx::query_scalar(
+            "SELECT extract(epoch FROM (reclaim_after - locked_until))::bigint
+               FROM app_mutation_leases
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load bounded app quarantine");
+        let resource_quarantine: i64 = sqlx::query_scalar(
+            "SELECT extract(epoch FROM (reclaim_after - locked_until))::bigint
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .fetch_one(&pool)
+        .await
+        .expect("load bounded namespace quarantine");
+        assert_eq!(app_quarantine, RECLAIM_QUARANTINE_SECONDS);
+        assert_eq!(resource_quarantine, RECLAIM_QUARANTINE_SECONDS);
+
+        let blocked = claim(
+            &state,
+            app_id,
+            "delete_app",
+            Uuid::new_v4(),
+            true,
+            vec![ResourceFence::new("kubernetes_namespace", &namespace)],
+        )
+        .await
+        .expect_err("provider quarantine must still reject immediate reuse");
+        assert!(matches!(blocked, MutationLeaseError::Busy));
+
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("expire app quarantine");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("expire namespace quarantine");
+        let reclaimed = claim(
+            &state,
+            app_id,
+            "delete_app",
+            Uuid::new_v4(),
+            true,
+            vec![ResourceFence::new("kubernetes_namespace", &namespace)],
+        )
+        .await
+        .expect("reclaim failed deployment generation after quarantine");
+        assert_eq!(reclaimed.resources[0].generation, generation + 1);
+        reclaimed
+            .finish()
+            .await
+            .expect("finish reclaimed generation");
+
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .execute(&pool)
+        .await
+        .expect("remove bounded namespace fixture");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("remove bounded quarantine fixture");
     }
 
     #[tokio::test]
