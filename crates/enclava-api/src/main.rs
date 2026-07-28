@@ -40,6 +40,18 @@ fn load_deployment_dispatch_enabled() -> anyhow::Result<bool> {
     parse_fail_closed_switch("CAP_DEPLOYMENT_DISPATCH_ENABLED", value.as_deref())
 }
 
+fn validate_edge_reconciliation_mode(
+    deployment_dispatch_enabled: bool,
+    edge_reconciliation_disabled: bool,
+) -> anyhow::Result<()> {
+    if deployment_dispatch_enabled && edge_reconciliation_disabled {
+        anyhow::bail!(
+            "CAP_DISABLE_EDGE_RECONCILIATION cannot be enabled while deployment dispatch is enabled"
+        );
+    }
+    Ok(())
+}
+
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -580,6 +592,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let edge_reconciliation_disabled = env_flag("CAP_DISABLE_EDGE_RECONCILIATION");
+    if let Err(error) =
+        validate_edge_reconciliation_mode(deployment_dispatch_enabled, edge_reconciliation_disabled)
+    {
+        eprintln!("startup refused: invalid edge reconciliation configuration: {error}");
+        std::process::exit(1);
+    }
 
     let trustee_policy_read_available = env_flag("TRUSTEE_POLICY_READ_AVAILABLE");
     let platform_release_envelope =
@@ -833,12 +852,17 @@ async fn main() {
         eprintln!("startup refused: KBS policy reconciliation failed: {error}");
         std::process::exit(1);
     }
-    if let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state).await {
-        eprintln!("startup refused: HAProxy route reconciliation failed: {error}");
-        std::process::exit(1);
+    if edge_reconciliation_disabled {
+        tracing::warn!("tenant HAProxy reconciliation disabled for local development");
+    } else {
+        if let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state).await
+        {
+            eprintln!("startup refused: HAProxy route reconciliation failed: {error}");
+            std::process::exit(1);
+        }
+        enclava_api::edge::spawn_haproxy_reconciler(state.clone());
     }
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
-    enclava_api::edge::spawn_haproxy_reconciler(state.clone());
     if deployment_dispatch_enabled {
         enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
     } else {
@@ -888,6 +912,14 @@ mod tests {
     }
 
     #[test]
+    fn edge_reconciliation_can_only_be_disabled_without_dispatch() {
+        validate_edge_reconciliation_mode(false, false).unwrap();
+        validate_edge_reconciliation_mode(true, false).unwrap();
+        validate_edge_reconciliation_mode(false, true).unwrap();
+        assert!(validate_edge_reconciliation_mode(true, true).is_err());
+    }
+
+    #[test]
     fn edge_authority_converges_before_dispatch_and_readiness() {
         let source = include_str!("main.rs");
         let main_body = source
@@ -898,13 +930,16 @@ mod tests {
         let edge = main_body
             .find("reconcile_all_haproxy_routes_at_startup")
             .expect("startup edge reconciliation");
+        let local_disable = main_body
+            .find("CAP_DISABLE_EDGE_RECONCILIATION")
+            .expect("explicit local-only edge disable");
         let dispatch = main_body
             .find("spawn_deployment_dispatcher")
             .expect("deployment dispatcher");
         let ready = main_body
             .find("mark_startup_ready")
             .expect("readiness gate");
-        assert!(edge < dispatch && dispatch < ready);
+        assert!(local_disable < edge && edge < dispatch && dispatch < ready);
     }
 
     #[test]
