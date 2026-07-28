@@ -167,6 +167,8 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
     let state = AppState {
         db: pool.clone(),
         management_mode,
+        deployment_dispatch_enabled: true,
+        startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         signing_key,
         hmac_key,
         api_url: "http://localhost:3000".to_string(),

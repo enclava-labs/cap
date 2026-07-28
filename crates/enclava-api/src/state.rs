@@ -9,7 +9,10 @@ use enclava_engine::types::AttestationConfig;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
@@ -168,6 +171,10 @@ pub struct AppState {
     pub db: PgPool,
     /// Instance-level management ownership mode.
     pub management_mode: CapManagementMode,
+    /// Immutable process-lifetime workload admission decision.
+    pub deployment_dispatch_enabled: bool,
+    /// False until startup provider reconciliation has completed.
+    pub startup_ready: Arc<AtomicBool>,
     /// Ed25519 signing key for config JWTs.
     pub signing_key: Arc<SigningKey>,
     /// HMAC key for session JWT signing.
@@ -231,6 +238,14 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn startup_is_ready(&self) -> bool {
+        self.startup_ready.load(Ordering::Acquire)
+    }
+
+    pub fn mark_startup_ready(&self) {
+        self.startup_ready.store(true, Ordering::Release);
+    }
+
     pub async fn admit_side_effect(
         &self,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {

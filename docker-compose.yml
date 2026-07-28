@@ -24,6 +24,7 @@ services:
       API_URL: http://localhost:3000
       PLATFORM_DOMAIN: enclava.local
       ALLOW_EPHEMERAL_KEYS: "1"
+      CAP_DEPLOYMENT_DISPATCH_ENABLED: "true"
     ports:
       - "3000:3000"
     depends_on:
