@@ -1026,6 +1026,32 @@ mod tests {
         SecurityContext, Sidecars, SignerIdentity,
     };
 
+    #[test]
+    fn restored_kubernetes_apply_always_waits_for_running_rollout() {
+        let source = include_str!("deploy.rs");
+        let restore_body = source
+            .rsplit("pub(crate) async fn apply_restored_kubernetes_manifests")
+            .next()
+            .and_then(|body| {
+                body.split("/// Apply manifests and return durable rollout-observation context.")
+                    .next()
+            })
+            .expect("restored Kubernetes apply body");
+        assert_eq!(
+            restore_body.matches("watch_rollout(").count(),
+            1,
+            "restore must have exactly one common rollout gate"
+        );
+        assert!(
+            restore_body.contains("    }\n    let status = watch_rollout("),
+            "rollout observation must run after the optional custom-domain branch"
+        );
+        assert!(
+            restore_body.contains("status.phase != DeployPhase::Running"),
+            "only a fully running restored StatefulSet may advance authority"
+        );
+    }
+
     fn test_attestation_config() -> AttestationConfig {
         AttestationConfig {
             proxy_image: ImageRef::parse(
@@ -1932,18 +1958,15 @@ pub(crate) async fn apply_restored_kubernetes_manifests(
         .await?;
         restart_statefulset_for_ingress(engine, &app_spec.namespace, &app_spec.name, generation)
             .await?;
-        let status = watch_rollout(engine, &app_spec.namespace, &app_spec.name).await?;
-        if status.phase != DeployPhase::Running {
-            return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
-                status.message.unwrap_or_else(|| {
-                    format!(
-                        "restored tenant ingress rollout ended in {:?}",
-                        status.phase
-                    )
-                }),
-            )
-            .into());
-        }
+    }
+    let status = watch_rollout(engine, &app_spec.namespace, &app_spec.name).await?;
+    if status.phase != DeployPhase::Running {
+        return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
+            status
+                .message
+                .unwrap_or_else(|| format!("restored tenant rollout ended in {:?}", status.phase)),
+        )
+        .into());
     }
     Ok(())
 }

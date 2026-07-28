@@ -1143,6 +1143,12 @@ pub async fn delete_app(
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
     ensure_management_write_allowed(&state, &auth).await?;
+    crate::edge::require_haproxy_integration_enabled().map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "tenant edge integration unavailable"})),
+        )
+    })?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)

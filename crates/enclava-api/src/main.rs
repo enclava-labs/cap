@@ -623,6 +623,13 @@ async fn main() {
         eprintln!("startup refused: {e}");
         std::process::exit(1);
     }
+    let haproxy_integration_enabled = match enclava_api::edge::haproxy_integration_enabled() {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            eprintln!("startup refused: invalid HAProxy integration configuration: {error}");
+            std::process::exit(1);
+        }
+    };
 
     let trustee_policy_read_available = env_flag("TRUSTEE_POLICY_READ_AVAILABLE");
     let platform_release_envelope =
@@ -919,13 +926,6 @@ async fn main() {
         eprintln!("startup refused: Trustee KBS connectivity check failed: {error}");
         std::process::exit(1);
     }
-    let haproxy_integration_enabled = match enclava_api::edge::haproxy_integration_enabled() {
-        Ok(enabled) => enabled,
-        Err(error) => {
-            eprintln!("startup refused: invalid HAProxy integration configuration: {error}");
-            std::process::exit(1);
-        }
-    };
     if haproxy_integration_enabled {
         if let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state).await
         {
@@ -1006,6 +1006,32 @@ mod tests {
                     .find(prerequisite)
                     .is_some_and(|index| index < dispatch),
                 "{prerequisite} must complete before durable deployment dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn haproxy_flag_is_validated_before_database_or_provider_authority() {
+        let source = include_str!("main.rs");
+        let main_body = source
+            .split("#[tokio::main]")
+            .nth(1)
+            .and_then(|s| s.split("#[cfg(test)]").next())
+            .expect("main body");
+        let haproxy_flag = main_body
+            .find("edge::haproxy_integration_enabled")
+            .expect("HAProxy integration flag validation");
+        for side_effect in [
+            "db::pool::create_pool",
+            "db::pool::run_migrations",
+            "runtime_authority::establish_epoch",
+            "reconcile_failed_rollout_cleanup_at_startup",
+            "reconcile_policy_at_startup",
+            "reconcile_kubernetes_after_restore_at_startup",
+        ] {
+            assert!(
+                haproxy_flag < main_body.find(side_effect).expect(side_effect),
+                "HAProxy integration config must be valid before {side_effect}"
             );
         }
     }

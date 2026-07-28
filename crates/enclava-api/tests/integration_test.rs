@@ -2064,6 +2064,81 @@ async fn custom_domain_mutation_is_side_effect_free_when_haproxy_is_disabled() {
 }
 
 #[tokio::test]
+async fn app_delete_is_side_effect_free_when_haproxy_is_disabled() {
+    let _haproxy_disabled = ScopedEnvVar::set("TENANT_HAPROXY_ENABLED", "false");
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("disabled-delete-{}", &suffix[..12]);
+    let (session_token, _org_id) = signup_owner(&server, "delete-disabled").await;
+
+    let create = server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await;
+    create.assert_status(StatusCode::CREATED);
+    let create_body: Value = create.json();
+    let app_id = Uuid::parse_str(create_body["id"].as_str().expect("app id")).unwrap();
+    let initial_generations: (i64, i64) = sqlx::query_as(
+        "SELECT (
+                    SELECT generation
+                      FROM app_mutation_leases
+                     WHERE app_id = $1
+                ),
+                (
+                    SELECT COALESCE(sum(generation), 0)::bigint
+                      FROM external_resource_mutation_leases
+                )",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load mutation generations before disabled deletion");
+
+    let delete = server
+        .delete(&format!("/apps/{app_name}"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    delete.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let delete_body: Value = delete.json();
+    assert_eq!(delete_body["error"], "tenant edge integration unavailable");
+
+    let retained: (String, i64, i64) = sqlx::query_as(
+        "SELECT app.status::text,
+                (
+                    SELECT generation
+                      FROM app_mutation_leases
+                     WHERE app_id = app.id
+                ),
+                (
+                    SELECT COALESCE(sum(generation), 0)::bigint
+                      FROM external_resource_mutation_leases
+                )
+           FROM apps AS app
+          WHERE app.id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load side-effect-free disabled deletion");
+    assert_eq!(
+        retained,
+        (
+            "creating".to_string(),
+            initial_generations.0,
+            initial_generations.1,
+        )
+    );
+}
+
+#[tokio::test]
 async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
     // Expiry is absolute: a challenge past `expires_at` is refused even when
     // `verified_at` was already captured, and the live TXT lookup never runs
