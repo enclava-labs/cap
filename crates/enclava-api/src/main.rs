@@ -843,12 +843,7 @@ async fn main() {
         .await
     });
 
-    if state
-        .kbs_policy
-        .as_ref()
-        .is_some_and(|config| config.required)
-        && let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await
-    {
+    if let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await {
         eprintln!("startup refused: KBS policy reconciliation failed: {error}");
         std::process::exit(1);
     }
@@ -920,13 +915,16 @@ mod tests {
     }
 
     #[test]
-    fn edge_authority_converges_before_dispatch_and_readiness() {
+    fn cluster_authority_converges_before_dispatch_and_readiness() {
         let source = include_str!("main.rs");
         let main_body = source
             .split("#[tokio::main]")
             .nth(1)
             .and_then(|body| body.split("#[cfg(test)]").next())
             .expect("main body");
+        let kbs = main_body
+            .find("if let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup")
+            .expect("unconditional startup KBS reconciliation");
         let edge = main_body
             .find("reconcile_all_haproxy_routes_at_startup")
             .expect("startup edge reconciliation");
@@ -939,7 +937,7 @@ mod tests {
         let ready = main_body
             .find("mark_startup_ready")
             .expect("readiness gate");
-        assert!(local_disable < edge && edge < dispatch && dispatch < ready);
+        assert!(local_disable < kbs && kbs < edge && edge < dispatch && dispatch < ready);
     }
 
     #[test]
