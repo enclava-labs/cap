@@ -21,6 +21,25 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn parse_fail_closed_switch(name: &str, value: Option<&str>) -> anyhow::Result<bool> {
+    match value {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => anyhow::bail!("{name} must be exactly `true` or `false`"),
+    }
+}
+
+fn load_deployment_dispatch_enabled() -> anyhow::Result<bool> {
+    let value = match std::env::var("CAP_DEPLOYMENT_DISPATCH_ENABLED") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("CAP_DEPLOYMENT_DISPATCH_ENABLED must be valid UTF-8")
+        }
+    };
+    parse_fail_closed_switch("CAP_DEPLOYMENT_DISPATCH_ENABLED", value.as_deref())
+}
+
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -554,6 +573,13 @@ async fn main() {
         eprintln!("startup refused: {e}");
         std::process::exit(1);
     }
+    let deployment_dispatch_enabled = match load_deployment_dispatch_enabled() {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            eprintln!("startup refused: invalid deployment dispatch configuration: {error}");
+            std::process::exit(1);
+        }
+    };
 
     let trustee_policy_read_available = env_flag("TRUSTEE_POLICY_READ_AVAILABLE");
     let platform_release_envelope =
@@ -758,6 +784,8 @@ async fn main() {
     let state = AppState {
         db: pool,
         management_mode,
+        deployment_dispatch_enabled,
+        startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         signing_key: Arc::new(signing_key),
         hmac_key: Arc::new(hmac_key),
         api_url,
@@ -782,22 +810,44 @@ async fn main() {
         internal_auth,
     };
 
-    enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
-    enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
-    let app = build_router(state);
-
+    let app = build_router(state.clone());
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .expect("failed to bind");
-    tracing::info!("listening on {}", bind_addr);
+    tracing::info!("startup liveness listening on {}", bind_addr);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .expect("server error");
+    if state
+        .kbs_policy
+        .as_ref()
+        .is_some_and(|config| config.required)
+        && let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await
+    {
+        eprintln!("startup refused: KBS policy reconciliation failed: {error}");
+        std::process::exit(1);
+    }
+    enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
+    if deployment_dispatch_enabled {
+        enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
+    } else {
+        tracing::info!(
+            "workload mutation and durable deployment dispatch are disabled by CAP_DEPLOYMENT_DISPATCH_ENABLED"
+        );
+    }
+    state.mark_startup_ready();
+    tracing::info!("startup reconciliation complete; API is ready");
+
+    server
+        .await
+        .expect("server task panicked")
+        .expect("server error");
 }
 
 #[cfg(test)]
@@ -817,6 +867,19 @@ mod tests {
             main_body.contains(expected),
             "API startup must install a rustls CryptoProvider before building ACME/HTTP clients"
         );
+    }
+
+    #[test]
+    fn deployment_dispatch_switch_is_strict_and_fail_closed() {
+        assert!(!parse_fail_closed_switch("SWITCH", None).unwrap());
+        assert!(!parse_fail_closed_switch("SWITCH", Some("false")).unwrap());
+        assert!(parse_fail_closed_switch("SWITCH", Some("true")).unwrap());
+        for invalid in ["", "1", "TRUE", "yes", " true", "false "] {
+            assert!(
+                parse_fail_closed_switch("SWITCH", Some(invalid)).is_err(),
+                "{invalid:?} must not activate dispatch"
+            );
+        }
     }
 
     #[test]

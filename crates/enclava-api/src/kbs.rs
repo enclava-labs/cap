@@ -71,6 +71,14 @@ pub enum KbsPolicyError {
     RolloutTimedOut,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum KbsPolicyReconciliationError {
+    #[error("durable KBS mutation fence failed")]
+    Mutation(#[from] crate::mutation_leases::MutationLeaseError),
+    #[error("KBS policy reconciliation failed")]
+    Policy(#[from] KbsPolicyError),
+}
+
 async fn bounded_kube_write<F, T>(future: F) -> Result<T, KbsPolicyError>
 where
     F: std::future::Future<Output = Result<T, kube::Error>>,
@@ -653,6 +661,46 @@ pub async fn reconcile_pending_signed_policy_artifacts(
     reconcile_pending_signed_policy_artifacts_inner(db, config, None).await
 }
 
+pub async fn reconcile_signed_policy_once(
+    state: &crate::state::AppState,
+) -> Result<(), KbsPolicyReconciliationError> {
+    if state.kbs_policy.is_none() {
+        return Ok(());
+    }
+    let lease = crate::mutation_leases::claim_resources(
+        state,
+        "kbs_policy_reconcile",
+        Uuid::new_v4(),
+        vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+    )
+    .await?;
+    lease
+        .guard_provider(reconcile_pending_signed_policy_artifacts(
+            &state.db,
+            state.kbs_policy.as_ref(),
+        ))
+        .await??;
+    lease.finish().await?;
+    Ok(())
+}
+
+/// Converge KBS authority before readiness or deployment dispatch.
+///
+/// Another starting replica may briefly own the global fence, so startup
+/// waits for that replica instead of crash-looping.
+pub async fn reconcile_signed_policy_at_startup(
+    state: &crate::state::AppState,
+) -> Result<(), KbsPolicyReconciliationError> {
+    loop {
+        match reconcile_signed_policy_once(state).await {
+            Err(KbsPolicyReconciliationError::Mutation(
+                crate::mutation_leases::MutationLeaseError::Busy,
+            )) => tokio::time::sleep(Duration::from_secs(2)).await,
+            result => return result,
+        }
+    }
+}
+
 /// Recover a committed desired generation after process or provider failure.
 /// The resource-only lease is shared with app apply/delete paths, so this loop
 /// also works after the final app row and its artifacts have cascaded away.
@@ -662,44 +710,18 @@ pub fn spawn_signed_policy_reconciler(state: crate::state::AppState) {
     }
     tokio::spawn(async move {
         loop {
-            match crate::mutation_leases::claim_resources(
-                &state,
-                "kbs_policy_reconcile",
-                Uuid::new_v4(),
-                vec![crate::mutation_leases::ResourceFence::kbs_policy()],
-            )
-            .await
-            {
-                Ok(lease) => {
-                    let outcome = lease
-                        .guard_provider(reconcile_pending_signed_policy_artifacts(
-                            &state.db,
-                            state.kbs_policy.as_ref(),
-                        ))
-                        .await;
-                    match outcome {
-                        Ok(Ok(())) => {
-                            if lease.finish().await.is_err() {
-                                tracing::warn!(
-                                    error_code = "kbs_policy_fence_lost",
-                                    "could not release completed global KBS reconciliation"
-                                );
-                            }
-                        }
-                        Ok(Err(_)) => tracing::warn!(
-                            error_code = "kbs_policy_reconciliation_failed",
-                            "durable global KBS policy reconciliation remains pending"
-                        ),
-                        Err(_) => tracing::warn!(
-                            error_code = "kbs_policy_fence_lost",
-                            "global KBS reconciliation lost durable mutation authority"
-                        ),
-                    }
-                }
-                Err(crate::mutation_leases::MutationLeaseError::Busy) => {}
-                Err(_) => tracing::warn!(
+            match reconcile_signed_policy_once(&state).await {
+                Ok(()) => {}
+                Err(KbsPolicyReconciliationError::Mutation(
+                    crate::mutation_leases::MutationLeaseError::Busy,
+                )) => {}
+                Err(KbsPolicyReconciliationError::Mutation(_)) => tracing::warn!(
                     error_code = "kbs_policy_fence_unavailable",
                     "could not claim durable global KBS reconciliation"
+                ),
+                Err(KbsPolicyReconciliationError::Policy(_)) => tracing::warn!(
+                    error_code = "kbs_policy_reconciliation_failed",
+                    "durable global KBS policy reconciliation remains pending"
                 ),
             }
             tokio::time::sleep(Duration::from_secs(30)).await;
