@@ -655,6 +655,7 @@ fn daemonset_rollout_complete(daemonset: &DaemonSet, expected_generation: &str) 
         && status.number_ready == desired
         && status.number_available == Some(desired)
         && status.number_unavailable.unwrap_or_default() == 0
+        && status.number_misscheduled == 0
 }
 
 fn serialized_configmap_size_with_config(
@@ -1349,6 +1350,10 @@ mod tests {
         let mut not_available = ready.clone();
         not_available.status.as_mut().unwrap().number_available = Some(0);
         assert!(!daemonset_rollout_complete(&not_available, &expected));
+
+        let mut misscheduled = ready.clone();
+        misscheduled.status.as_mut().unwrap().number_misscheduled = 1;
+        assert!(!daemonset_rollout_complete(&misscheduled, &expected));
 
         let mut zero_desired = ready;
         zero_desired
