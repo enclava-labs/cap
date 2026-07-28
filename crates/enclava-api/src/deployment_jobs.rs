@@ -1675,9 +1675,12 @@ async fn require_clean_cut_restore_jobs(
         "SELECT EXISTS (
              SELECT 1
                FROM deployment_apply_jobs AS job
-              WHERE NOT job.signed_required
-                 OR job.artifact_deployment_id IS NULL
-                 OR job.artifact_descriptor_core_hash IS NULL
+              WHERE job.state NOT IN ('completed', 'failed')
+                AND (
+                    NOT job.signed_required
+                    OR job.artifact_deployment_id IS NULL
+                    OR job.artifact_descriptor_core_hash IS NULL
+                )
          )",
     )
     .fetch_one(&mut **transaction)
@@ -1686,6 +1689,30 @@ async fn require_clean_cut_restore_jobs(
         return Err(DeploymentJobError::LegacyRestoreAuthority);
     }
     Ok(())
+}
+
+async fn explicit_clean_cut_authority_exists(state: &AppState) -> Result<bool, DeploymentJobError> {
+    let authority_marker = serde_json::json!({
+        "status": "authority_retired",
+        "provider_cleanup_state": "provider_cleanup_pending",
+        "runtime_authority": {
+            "epoch": state.runtime_authority.epoch,
+            "restore_generation": state.runtime_authority.restore_generation,
+        }
+    });
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM audit_log
+              WHERE action = 'app.clean_cut_retire'
+                AND app_id IS NOT NULL
+                AND detail @> $1::jsonb
+         )",
+    )
+    .bind(authority_marker)
+    .fetch_one(&state.db)
+    .await
+    .map_err(DeploymentJobError::from)
 }
 
 /// Lock a fully applied signed-policy generation in a dedicated short
@@ -1775,9 +1802,26 @@ async fn lock_clean_cut_startup_authority(
     Ok(witness)
 }
 
-/// Enforce the signed-only clean-cut invariant on every startup, including the
-/// migration-0044 `0 -> 1` initial generation adoption that intentionally does
-/// not run database-restore reconciliation.
+/// Reject unsupported clean-cut cleanup jobs before exact retained cleanup is
+/// allowed to call Trustee.
+///
+/// This is deliberately a database-only witness and claims no provider fence:
+/// migration 0045/0046 may have preserved the global KBS fence for the exact
+/// signed cleanup job that must run next. The same invariant is rechecked
+/// under the global fence after that cleanup drains.
+pub async fn validate_clean_cut_jobs_before_cleanup_at_startup(
+    state: &AppState,
+) -> Result<(), DeploymentJobError> {
+    if !explicit_clean_cut_authority_exists(state).await? {
+        return Ok(());
+    }
+    let witness = lock_clean_cut_startup_authority(&state.db).await?;
+    witness.rollback().await?;
+    Ok(())
+}
+
+/// Enforce the signed-only invariant for the exact runtime authority recorded
+/// by an explicit clean-cut receipt.
 ///
 /// The global KBS resource fence prevents a setup/delete worker from changing
 /// Trustee authority while the singleton row lock serializes deployment
@@ -1786,6 +1830,9 @@ async fn lock_clean_cut_startup_authority(
 pub async fn validate_clean_cut_authority_at_startup(
     state: &AppState,
 ) -> Result<(), DeploymentJobError> {
+    if !explicit_clean_cut_authority_exists(state).await? {
+        return Ok(());
+    }
     let kbs_mutation = crate::mutation_leases::claim_resources(
         state,
         "startup_clean_cut_validation",
@@ -4262,6 +4309,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("prepare unsigned rollout cleanup");
+        let clean_cut_marker = insert_explicit_clean_cut_authority_marker(&pool, &app).await;
         let desired_generation_before: i64 = sqlx::query_scalar(
             "SELECT desired_generation
                FROM kbs_signed_policy_reconciliation
@@ -4276,12 +4324,9 @@ mod tests {
         state.runtime_authority = current_test_runtime_authority(&pool)
             .await
             .expect("load startup ordering authority");
-        let error = async {
-            validate_clean_cut_authority_at_startup(&state).await?;
-            reconcile_failed_rollout_cleanup_at_startup(&state).await
-        }
-        .await
-        .expect_err("clean-cut validation must stop unsupported cleanup");
+        let error = validate_clean_cut_jobs_before_cleanup_at_startup(&state)
+            .await
+            .expect_err("database-only clean-cut validation must stop unsupported cleanup");
         assert!(matches!(error, DeploymentJobError::LegacyRestoreAuthority));
 
         let (job_state, attempts, lock_token): (String, i32, Option<Uuid>) = sqlx::query_as(
@@ -4312,6 +4357,7 @@ mod tests {
             "unsupported cleanup must not enqueue or reconcile Trustee authority"
         );
 
+        delete_explicit_clean_cut_authority_marker(&pool, clean_cut_marker).await;
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)
             .execute(&pool)
@@ -4322,6 +4368,8 @@ mod tests {
     #[tokio::test]
     async fn clean_cut_transient_validation_error_releases_kbs_resource_fence() {
         let pool = database_test_pool().await;
+        let (app, _deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let clean_cut_marker = insert_explicit_clean_cut_authority_marker(&pool, &app).await;
         let mut blocker = pool.begin().await.expect("begin clean-cut blocker");
         sqlx::query("LOCK TABLE deployment_apply_jobs IN ACCESS EXCLUSIVE MODE")
             .execute(&mut *blocker)
@@ -4375,9 +4423,15 @@ mod tests {
             .await
             .expect("release clean-cut table blocker");
         timeout_pool.close().await;
+        delete_explicit_clean_cut_authority_marker(&pool, clean_cut_marker).await;
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete transient clean-cut fixture");
     }
 
-    async fn assert_terminal_unsigned_job_blocks_restore_before_provider(
+    async fn assert_terminal_unsigned_job_is_not_live_restore_authority(
         deployment_status: &str,
         job_state: &str,
     ) {
@@ -4410,41 +4464,17 @@ mod tests {
             .commit()
             .await
             .expect("commit terminal legacy fixture");
-        mark_restore_kubernetes_reconciliation_pending(&pool).await;
 
-        let desired_generation_before: i64 = sqlx::query_scalar(
-            "SELECT desired_generation
-               FROM kbs_signed_policy_reconciliation
-              WHERE singleton",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("load signed-policy generation before clean-cut rejection");
-        let kubernetes_mutation_attempted = Arc::new(AtomicBool::new(false));
-        let engine = restore_test_engine(Vec::new(), Arc::clone(&kubernetes_mutation_attempted));
-        let error = restore_error_before_kubernetes_mutation(
-            &pool,
-            &engine,
-            kubernetes_mutation_attempted.as_ref(),
-            true,
-        )
-        .await;
-        assert!(
-            matches!(error, DeploymentJobError::LegacyRestoreAuthority),
-            "terminal unsigned durable history must block clean-cut startup, got {error:?}"
-        );
-        let desired_generation_after: i64 = sqlx::query_scalar(
-            "SELECT desired_generation
-               FROM kbs_signed_policy_reconciliation
-              WHERE singleton",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("load signed-policy generation after clean-cut rejection");
-        assert_eq!(
-            desired_generation_after, desired_generation_before,
-            "clean-cut rejection must precede KBS reconciliation intent"
-        );
+        let mut scan = pool
+            .begin()
+            .await
+            .expect("begin live restore-authority scan");
+        require_clean_cut_restore_jobs(&mut scan)
+            .await
+            .expect("terminal unsigned history is not dispatch or restore authority");
+        scan.rollback()
+            .await
+            .expect("rollback terminal history scan");
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)
@@ -4454,17 +4484,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_cut_restore_rejects_failed_unsigned_history_before_provider_mutation() {
-        assert_terminal_unsigned_job_blocks_restore_before_provider("failed", "failed").await;
+    async fn clean_cut_scan_ignores_failed_unsigned_history() {
+        assert_terminal_unsigned_job_is_not_live_restore_authority("failed", "failed").await;
     }
 
     #[tokio::test]
-    async fn clean_cut_restore_rejects_completed_unsigned_history_before_provider_mutation() {
-        assert_terminal_unsigned_job_blocks_restore_before_provider("healthy", "completed").await;
+    async fn clean_cut_scan_ignores_completed_unsigned_history() {
+        assert_terminal_unsigned_job_is_not_live_restore_authority("healthy", "completed").await;
     }
 
     #[tokio::test]
-    async fn clean_cut_validation_covers_initial_zero_to_one_authority_adoption() {
+    async fn explicit_clean_cut_validation_covers_initial_zero_to_one_authority_adoption() {
         let pool = database_test_pool().await;
         let original_authority: (Uuid, i64, i64) = sqlx::query_as(
             "SELECT authority_epoch, restore_generation,
@@ -4506,6 +4536,7 @@ mod tests {
         );
 
         let (app, _deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let clean_cut_marker = insert_explicit_clean_cut_authority_marker(&pool, &app).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
         state.runtime_authority = adopted;
@@ -4514,6 +4545,7 @@ mod tests {
             .expect_err("initial adoption must still reject unsigned durable authority");
         assert!(matches!(error, DeploymentJobError::LegacyRestoreAuthority));
 
+        delete_explicit_clean_cut_authority_marker(&pool, clean_cut_marker).await;
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(app.org_id)
             .execute(&pool)
@@ -4532,6 +4564,85 @@ mod tests {
         .execute(&pool)
         .await
         .expect("restore original initial-adoption authority");
+    }
+
+    #[tokio::test]
+    async fn ordinary_unsigned_history_does_not_activate_clean_cut_startup_validation() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE apps
+                SET status = 'running'::app_status_enum
+              WHERE id = $1",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("make ordinary unsigned app running");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'healthy'::deploy_status_enum,
+                    completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("complete ordinary unsigned deployment");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'completed',
+                    updated_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("complete ordinary unsigned job");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.runtime_authority = current_test_runtime_authority(&pool)
+            .await
+            .expect("load ordinary startup authority");
+        validate_clean_cut_authority_at_startup(&state)
+            .await
+            .expect("historical unsigned jobs outside explicit clean-cut authority are irrelevant");
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete ordinary unsigned history fixture");
+    }
+
+    #[tokio::test]
+    async fn ordinary_startup_does_not_contend_with_a_retained_kbs_fence() {
+        let pool = database_test_pool().await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.runtime_authority = current_test_runtime_authority(&pool)
+            .await
+            .expect("load ordinary startup authority");
+        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
+
+        let retained_cleanup = crate::mutation_leases::claim_resources(
+            &state,
+            "migration_recovered_rollout_cleanup",
+            Uuid::new_v4(),
+            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+        )
+        .await
+        .expect("retain the migration cleanup KBS fence");
+
+        validate_clean_cut_authority_at_startup(&state)
+            .await
+            .expect("no exact clean-cut receipt means no competing global KBS claim");
+
+        retained_cleanup
+            .finish()
+            .await
+            .expect("release retained cleanup fence");
     }
 
     #[tokio::test]
@@ -5221,6 +5332,38 @@ mod tests {
             .await
             .expect("migrate deployment job test database");
         pool
+    }
+
+    async fn insert_explicit_clean_cut_authority_marker(pool: &PgPool, app: &App) -> i64 {
+        let authority = current_test_runtime_authority(pool)
+            .await
+            .expect("load explicit clean-cut test authority");
+        sqlx::query_scalar(
+            "INSERT INTO audit_log(org_id, app_id, user_id, action, detail)
+             VALUES ($1, $2, NULL, 'app.clean_cut_retire', $3)
+             RETURNING id",
+        )
+        .bind(app.org_id)
+        .bind(app.id)
+        .bind(serde_json::json!({
+            "status": "authority_retired",
+            "provider_cleanup_state": "provider_cleanup_pending",
+            "runtime_authority": {
+                "epoch": authority.epoch,
+                "restore_generation": authority.restore_generation,
+            }
+        }))
+        .fetch_one(pool)
+        .await
+        .expect("insert explicit clean-cut authority marker")
+    }
+
+    async fn delete_explicit_clean_cut_authority_marker(pool: &PgPool, audit_id: i64) {
+        sqlx::query("DELETE FROM audit_log WHERE id = $1")
+            .bind(audit_id)
+            .execute(pool)
+            .await
+            .expect("delete explicit clean-cut authority marker");
     }
 
     #[tokio::test]

@@ -955,7 +955,8 @@ async fn main() {
     });
 
     if let Err(error) =
-        enclava_api::deployment_jobs::validate_clean_cut_authority_at_startup(&state).await
+        enclava_api::deployment_jobs::validate_clean_cut_jobs_before_cleanup_at_startup(&state)
+            .await
     {
         eprintln!(
             "startup refused: legacy or unsigned deployment authority remains: error_code={}",
@@ -968,6 +969,15 @@ async fn main() {
     {
         eprintln!(
             "startup refused: failed-rollout cleanup reconciliation failed: error_code={}",
+            error.code()
+        );
+        std::process::exit(1);
+    }
+    if let Err(error) =
+        enclava_api::deployment_jobs::validate_clean_cut_authority_at_startup(&state).await
+    {
+        eprintln!(
+            "startup refused: legacy or unsigned deployment authority remains: error_code={}",
             error.code()
         );
         std::process::exit(1);
@@ -1168,9 +1178,12 @@ mod tests {
         let cleanup = main_body
             .find("reconcile_failed_rollout_cleanup_at_startup")
             .expect("failed-rollout cleanup startup");
+        let clean_cut_preflight = main_body
+            .find("validate_clean_cut_jobs_before_cleanup_at_startup")
+            .expect("database-only clean-cut cleanup preflight");
         let clean_cut = main_body
             .find("validate_clean_cut_authority_at_startup")
-            .expect("signed-only clean-cut startup validation");
+            .expect("fenced signed-only clean-cut startup validation");
         let kubernetes_restore = main_body
             .find("reconcile_kubernetes_after_restore_at_startup")
             .expect("restored Kubernetes reconciliation startup");
@@ -1182,8 +1195,8 @@ mod tests {
             "exact failed-rollout cleanup must precede restored Kubernetes reconciliation"
         );
         assert!(
-            clean_cut < cleanup && cleanup < kubernetes_restore,
-            "clean-cut validation must reject unsupported authority before cleanup can reach Trustee"
+            clean_cut_preflight < cleanup && cleanup < clean_cut && clean_cut < kubernetes_restore,
+            "database-only clean-cut validation must precede exact retained cleanup, while the competing global KBS fence is claimed only after cleanup drains"
         );
         assert!(
             kubernetes_restore < generic_kbs,

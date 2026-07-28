@@ -171,7 +171,7 @@ where
     let actual = live_generation(resource)?;
     let actual_authority_epoch = live_authority_epoch(resource)?;
     let actual_restore_generation = live_authority_restore_generation(resource)?;
-    if actual_restore_generation.is_some() && actual_authority_epoch.is_none() {
+    if actual_restore_generation.is_some() != actual_authority_epoch.is_some() {
         return Err(stale_generation_error(resource, desired, actual));
     }
 
@@ -890,6 +890,57 @@ mod tests {
             )
             .is_err(),
             "a delayed writer from a superseded restore incarnation cannot write back"
+        );
+    }
+
+    #[test]
+    fn partial_authority_metadata_never_uses_the_legacy_upgrade_path() {
+        let retained_epoch = Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let restored_epoch = Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let desired_generation =
+            MutationGeneration::with_authority(100, restored_epoch, 5).unwrap();
+
+        for annotations in [
+            [
+                (MUTATION_GENERATION_ANNOTATION.to_string(), "99".to_string()),
+                (
+                    MUTATION_AUTHORITY_EPOCH_ANNOTATION.to_string(),
+                    retained_epoch.to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            [
+                (MUTATION_GENERATION_ANNOTATION.to_string(), "99".to_string()),
+                (
+                    MUTATION_AUTHORITY_RESTORE_GENERATION_ANNOTATION.to_string(),
+                    "4".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ] {
+            let mut malformed = desired("malformed-authority");
+            malformed.metadata.annotations = Some(annotations);
+            assert!(matches!(
+                ensure_not_stale(&malformed, desired_generation),
+                Err(ApplyError::StaleMutationGeneration {
+                    desired: 100,
+                    actual: 99,
+                    ..
+                })
+            ));
+        }
+
+        let mut legacy = desired("legacy");
+        legacy.metadata.annotations = Some(
+            [(MUTATION_GENERATION_ANNOTATION.to_string(), "99".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(
+            ensure_not_stale(&legacy, desired_generation).is_ok(),
+            "only an object with neither authority annotation may use the one-way legacy upgrade"
         );
     }
 

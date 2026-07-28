@@ -258,7 +258,7 @@ async fn tenant_namespace_delete_is_bounded_when_provider_read_hangs() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn unreachable_running_workload_teardown_is_best_effort_and_diagnostics_are_bounded() {
+async fn unreachable_running_or_deleting_workload_teardown_is_best_effort_and_bounded() {
     const SECRET_APP_NAME: &str = "secret-app-name-sentinel";
     const SECRET_NAMESPACE: &str = "secret-namespace-sentinel";
     const SECRET_DOMAIN: &str = "secret-teardown-host.invalid";
@@ -270,7 +270,7 @@ async fn unreachable_running_workload_teardown_is_best_effort_and_diagnostics_ar
         .build()
         .unwrap();
     let auth = crate::test_support::auth_context(Role::Admin, &["apps:write"]);
-    let app = App {
+    let mut app = App {
         id: uuid::Uuid::new_v4(),
         org_id: auth.org_id,
         name: SECRET_APP_NAME.to_string(),
@@ -297,9 +297,12 @@ async fn unreachable_running_workload_teardown_is_best_effort_and_diagnostics_ar
     };
 
     let (logs, guard) = captured_warn_logs();
-    request_workload_teardown(&state, &auth, &app)
-        .await
-        .expect("unreachable workload teardown endpoint must not block deletion");
+    for status in [AppStatus::Running, AppStatus::Deleting] {
+        app.status = status;
+        request_workload_teardown(&state, &auth, &app, true)
+            .await
+            .expect("an absent route or workload endpoint must not block provider cleanup");
+    }
     drop(guard);
 
     let diagnostics = captured_log_text(&logs);
@@ -430,6 +433,31 @@ fn app_delete_releases_confirmed_unconditional_scopes_before_later_providers() {
         .find("crate::kbs::soft_delete_owner_binding")
         .expect("KBS cleanup exists");
     assert!(namespace_delete < namespace_release && namespace_release < kbs_cleanup);
+}
+
+#[test]
+fn clean_cut_delete_decides_teardown_from_the_pre_transition_status() {
+    let source = include_str!("../../apps.rs");
+    let deletion = source
+        .split("pub async fn delete_app")
+        .nth(1)
+        .expect("app deletion route exists")
+        .split("#[derive(Debug, Deserialize)]\npub struct RotateSignerRequest")
+        .next()
+        .expect("app deletion route body");
+    let decision = deletion
+        .find("let workload_teardown_required = requires_workload_teardown(phase_app.status)")
+        .expect("pre-transition teardown decision");
+    let deleting_transition = deletion
+        .find("SET status = 'deleting'::app_status_enum")
+        .expect("durable deleting transition");
+    let request = deletion
+        .find("request_workload_teardown(")
+        .expect("best-effort workload teardown");
+    assert!(
+        decision < deleting_transition && deleting_transition < request,
+        "a clean-cut failed target must skip the removed route on its first DELETE"
+    );
 }
 
 #[tokio::test]

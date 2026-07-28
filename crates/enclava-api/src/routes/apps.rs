@@ -248,8 +248,9 @@ async fn request_workload_teardown(
     state: &AppState,
     auth: &AuthContext,
     app: &App,
+    teardown_required: bool,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if !requires_workload_teardown(app.status) {
+    if !teardown_required {
         tracing::info!(
             app_id = %app.id,
             status = ?app.status,
@@ -1274,6 +1275,13 @@ pub async fn delete_app(
             Json(serde_json::json!({"error": "app resource authority changed; retry deletion"})),
         ));
     }
+    // Decide from the durable pre-transition lifecycle. Clean-cut retirement
+    // has already proved that a failed target has no live workload process, so
+    // its first ordinary DELETE must not depend on a route that startup
+    // reconciliation intentionally removed. If a later provider step fails
+    // and DELETE is retried from `deleting`, transport/non-success responses
+    // remain explicitly best-effort in `request_workload_teardown`.
+    let workload_teardown_required = requires_workload_teardown(phase_app.status);
     sqlx::query(
         "UPDATE apps
             SET status = 'deleting'::app_status_enum,
@@ -1371,7 +1379,7 @@ pub async fn delete_app(
     delete_mutation
         .guard_provider_in_tx(
             &mut delete_lane,
-            request_workload_teardown(&state, &auth, &deleting_app),
+            request_workload_teardown(&state, &auth, &deleting_app, workload_teardown_required),
         )
         .await
         .map_err(|_| internal_server_error())??;
