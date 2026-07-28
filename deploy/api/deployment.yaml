@@ -47,6 +47,10 @@ spec:
             secretKeyRef:
               name: api-secrets
               key: database-url
+        # Keep false through migration, clean-cut proof, provider convergence,
+        # and smoke tests. Enable only in a later activation rollout.
+        - name: CAP_DEPLOYMENT_DISPATCH_ENABLED
+          value: "false"
         - name: API_URL
           value: "https://api.enclava.dev"
         - name: PLATFORM_DOMAIN
@@ -72,15 +76,22 @@ spec:
           limits:
             cpu: 1000m
             memory: 1Gi
+        startupProbe:
+          httpGet:
+            path: /livez
+            port: 3000
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 180
         livenessProbe:
           httpGet:
-            path: /health
+            path: /livez
             port: 3000
           initialDelaySeconds: 5
           periodSeconds: 30
         readinessProbe:
           httpGet:
-            path: /health
+            path: /readyz
             port: 3000
           initialDelaySeconds: 5
           periodSeconds: 10
