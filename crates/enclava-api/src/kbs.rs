@@ -4,6 +4,7 @@ use chrono::Utc;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::api::{Api, PostParams};
+use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -37,9 +38,9 @@ pub struct KbsPolicyConfig {
 pub enum KbsPolicyError {
     #[error("KBS policy management is required but not configured")]
     NotConfigured,
-    #[error("database error: {0}")]
+    #[error("database error")]
     Db(#[from] sqlx::Error),
-    #[error("Kubernetes API error: {0}")]
+    #[error("Kubernetes API error")]
     Kube(#[from] kube::Error),
     #[error("Kubernetes mutating request exceeded its 30 second deadline")]
     ProviderWriteTimeout,
@@ -73,9 +74,9 @@ pub enum KbsPolicyError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum KbsPolicyReconciliationError {
-    #[error("durable KBS mutation fence failed")]
+    #[error("durable KBS mutation fence failed: {0}")]
     Mutation(#[from] crate::mutation_leases::MutationLeaseError),
-    #[error("KBS policy reconciliation failed")]
+    #[error("KBS policy reconciliation failed: {0}")]
     Policy(#[from] KbsPolicyError),
 }
 
@@ -119,6 +120,43 @@ struct SignedPolicyArtifactSet<'a> {
     artifacts: Vec<CompactSignedPolicyArtifact<'a>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PostgresJsonb<'a>(&'a serde_json::Value);
+
+impl Serialize for PostgresJsonb<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.0 {
+            serde_json::Value::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(&PostgresJsonb(value))?;
+                }
+                sequence.end()
+            }
+            serde_json::Value::Object(values) => {
+                let mut entries = values.iter().collect::<Vec<_>>();
+                // PostgreSQL JSONB emits object keys by byte length, then by
+                // byte value. Reproduce that order only for the persisted
+                // org_keyring fragment whose bytes bind the KBS policy hash.
+                entries.sort_unstable_by(|(left, _), (right, _)| {
+                    left.len()
+                        .cmp(&right.len())
+                        .then_with(|| left.as_bytes().cmp(right.as_bytes()))
+                });
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, &PostgresJsonb(value))?;
+                }
+                map.end()
+            }
+            value => value.serialize(serializer),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct CompactSignedPolicyArtifact<'a> {
     metadata: &'a crate::signing_service::PolicyMetadata,
@@ -128,7 +166,7 @@ struct CompactSignedPolicyArtifact<'a> {
     signature: &'a str,
     verify_pubkey_b64: &'a str,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    org_keyring: Option<&'a serde_json::Value>,
+    org_keyring: Option<PostgresJsonb<'a>>,
 }
 
 impl<'a> From<&'a crate::signing_service::SignedPolicyArtifact>
@@ -142,7 +180,7 @@ impl<'a> From<&'a crate::signing_service::SignedPolicyArtifact>
             agent_policy_sha256: &artifact.agent_policy_sha256,
             signature: &artifact.signature,
             verify_pubkey_b64: &artifact.verify_pubkey_b64,
-            org_keyring: artifact.org_keyring.as_ref(),
+            org_keyring: artifact.org_keyring.as_ref().map(PostgresJsonb),
         }
     }
 }
@@ -716,11 +754,13 @@ pub fn spawn_signed_policy_reconciler(state: crate::state::AppState) {
                 Err(KbsPolicyReconciliationError::Mutation(
                     crate::mutation_leases::MutationLeaseError::Busy,
                 )) => {}
-                Err(KbsPolicyReconciliationError::Mutation(_)) => tracing::warn!(
+                Err(error @ KbsPolicyReconciliationError::Mutation(_)) => tracing::warn!(
+                    %error,
                     error_code = "kbs_policy_fence_unavailable",
                     "could not claim durable global KBS reconciliation"
                 ),
-                Err(KbsPolicyReconciliationError::Policy(_)) => tracing::warn!(
+                Err(error @ KbsPolicyReconciliationError::Policy(_)) => tracing::warn!(
+                    %error,
                     error_code = "kbs_policy_reconciliation_failed",
                     "durable global KBS policy reconciliation remains pending"
                 ),
@@ -1643,6 +1683,45 @@ pub fn config_from_env() -> Option<KbsPolicyConfig> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reconciliation_error_display_preserves_typed_cause() {
+        let policy = KbsPolicyReconciliationError::from(KbsPolicyError::PolicyGenerationConflict);
+        assert_eq!(
+            policy.to_string(),
+            "KBS policy reconciliation failed: signed KBS policy generation has conflicting content"
+        );
+
+        let mutation =
+            KbsPolicyReconciliationError::from(crate::mutation_leases::MutationLeaseError::Lost);
+        assert_eq!(
+            mutation.to_string(),
+            "durable KBS mutation fence failed: application mutation lease was lost"
+        );
+
+        let db = KbsPolicyReconciliationError::from(KbsPolicyError::Db(sqlx::Error::Protocol(
+            "tenant-sensitive database detail".to_string(),
+        )));
+        assert_eq!(
+            db.to_string(),
+            "KBS policy reconciliation failed: database error"
+        );
+        assert!(!db.to_string().contains("tenant-sensitive"));
+
+        let kube = KbsPolicyReconciliationError::from(KbsPolicyError::Kube(kube::Error::Api(
+            kube::core::Status::failure(
+                "tenant-sensitive Kubernetes detail",
+                "tenant-sensitive reason",
+            )
+            .with_code(500)
+            .boxed(),
+        )));
+        assert_eq!(
+            kube.to_string(),
+            "KBS policy reconciliation failed: Kubernetes API error"
+        );
+        assert!(!kube.to_string().contains("tenant-sensitive"));
+    }
+
     fn binding(key: &str) -> KbsOwnerBinding {
         KbsOwnerBinding {
             binding_key: key.to_string(),
@@ -1832,6 +1911,31 @@ owner_resource_bindings := {}
         );
         assert!(compact.get("agent_policy_text").is_none());
         assert!(!body.contains("BEGIN CAP MANAGED"));
+    }
+
+    #[test]
+    fn signed_policy_body_preserves_persisted_org_keyring_order() {
+        let mut artifact = test_signed_policy_artifact("aa", 16);
+        artifact.org_keyring = Some(
+            serde_json::from_str(
+                r#"{"bravo":{"bb":[null,{"cc":3,"a":4}],"a":2},"alpha":2,"zeta":1}"#,
+            )
+            .unwrap(),
+        );
+
+        let ordered_keyring =
+            serde_json::to_string(&PostgresJsonb(artifact.org_keyring.as_ref().unwrap())).unwrap();
+        let body = signed_policy_artifact_policy_body(&[artifact]).unwrap();
+
+        assert_eq!(
+            ordered_keyring,
+            r#"{"zeta":1,"alpha":2,"bravo":{"a":2,"bb":[null,{"a":4,"cc":3}]}}"#
+        );
+        assert!(body.contains(&format!(r#""org_keyring":{ordered_keyring}"#)));
+        assert_eq!(
+            hex::encode(Sha256::digest(body.as_bytes())),
+            "ec0959fbc891dca2a47b97f51a9b851ae7504c099e3714eaa161eb6787503a33"
+        );
     }
 
     #[test]
