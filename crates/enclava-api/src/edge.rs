@@ -23,6 +23,8 @@ const HAPROXY_MUTATION_GENERATION_ANNOTATION: &str =
 const HAPROXY_CONFIGMAP_SERIALIZED_BUDGET_BYTES: usize = 900 * 1024;
 const KUBERNETES_CAS_ATTEMPTS: usize = 8;
 const KUBERNETES_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const HAPROXY_ROLLOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const HAPROXY_ROLLOUT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EdgeRouteError {
@@ -57,6 +59,8 @@ pub enum EdgeRouteError {
         expected: String,
         actual: Option<String>,
     },
+    #[error("HAProxy DaemonSet rollout did not converge within 5 minutes")]
+    DaemonSetRolloutTimeout,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -216,10 +220,12 @@ async fn reconcile_all_haproxy_routes_for_generation(
     let routes = load_desired_haproxy_routes(&state.db, client.clone()).await?;
     // This full rebuild owns the global fence and reloads authoritative state
     // on every claim, so reset authority must survive a failed first lease.
-    reconcile_haproxy_config(client, &config, Some(generation), true, |current| {
+    reconcile_haproxy_config(client.clone(), &config, Some(generation), true, |current| {
         render_authoritative_haproxy_config(current, &routes)
     })
     .await?;
+    let expected_generation = current_haproxy_config_generation(client.clone(), &config).await?;
+    wait_for_haproxy_daemonset_rollout(client, &config, &expected_generation).await?;
     Ok(())
 }
 
@@ -293,10 +299,10 @@ async fn haproxy_routes_need_reconciliation(state: &AppState) -> Result<bool, Ed
 
     let ds_api: Api<DaemonSet> = Api::namespaced(client, &config.namespace);
     let daemonset = ds_api.get(&config.daemonset_name).await?;
-    Ok(
-        daemonset_config_generation(&daemonset)
-            != Some(haproxy_config_generation(current).as_str()),
-    )
+    Ok(!daemonset_rollout_complete(
+        &daemonset,
+        &haproxy_config_generation(current),
+    ))
 }
 
 async fn load_desired_haproxy_routes(
@@ -592,6 +598,63 @@ fn daemonset_config_generation(daemonset: &DaemonSet) -> Option<&str> {
         .as_ref()?
         .get(HAPROXY_CONFIG_GENERATION_ANNOTATION)
         .map(String::as_str)
+}
+
+async fn wait_for_haproxy_daemonset_rollout(
+    client: Client,
+    config: &EdgeRouteConfig,
+    expected_generation: &str,
+) -> Result<(), EdgeRouteError> {
+    let daemonsets: Api<DaemonSet> = Api::namespaced(client, &config.namespace);
+    tokio::time::timeout(HAPROXY_ROLLOUT_TIMEOUT, async {
+        loop {
+            let daemonset = daemonsets.get(&config.daemonset_name).await?;
+            if daemonset_rollout_complete(&daemonset, expected_generation) {
+                return Ok(());
+            }
+            tokio::time::sleep(HAPROXY_ROLLOUT_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .map_err(|_| EdgeRouteError::DaemonSetRolloutTimeout)?
+}
+
+async fn current_haproxy_config_generation(
+    client: Client,
+    config: &EdgeRouteConfig,
+) -> Result<String, EdgeRouteError> {
+    let configmaps: Api<ConfigMap> = Api::namespaced(client, &config.namespace);
+    let configmap = configmaps.get(&config.configmap_name).await?;
+    let current = configmap
+        .data
+        .as_ref()
+        .and_then(|data| data.get("haproxy.cfg"))
+        .ok_or_else(|| EdgeRouteError::MissingConfig {
+            namespace: config.namespace.clone(),
+            name: config.configmap_name.clone(),
+        })?;
+    Ok(haproxy_config_generation(current))
+}
+
+fn daemonset_rollout_complete(daemonset: &DaemonSet, expected_generation: &str) -> bool {
+    if daemonset_config_generation(daemonset) != Some(expected_generation) {
+        return false;
+    }
+    let Some(generation) = daemonset.metadata.generation else {
+        return false;
+    };
+    let Some(status) = daemonset.status.as_ref() else {
+        return false;
+    };
+    let desired = status.desired_number_scheduled;
+    desired > 0
+        && status
+            .observed_generation
+            .is_some_and(|observed| observed >= generation)
+        && status.updated_number_scheduled == Some(desired)
+        && status.number_ready == desired
+        && status.number_available == Some(desired)
+        && status.number_unavailable.unwrap_or_default() == 0
 }
 
 fn serialized_configmap_size_with_config(
@@ -1034,6 +1097,7 @@ mod tests {
                     "name": "haproxy-tenant",
                     "namespace": "tenant-envoy",
                     "resourceVersion": self.daemonset_resource_version.to_string(),
+                    "generation": self.daemonset_resource_version,
                 },
                 "spec": {
                     "selector": { "matchLabels": { "app": "haproxy-tenant" } },
@@ -1046,6 +1110,16 @@ mod tests {
                             "containers": [{ "name": "haproxy", "image": "haproxy:3" }],
                         },
                     },
+                },
+                "status": {
+                    "currentNumberScheduled": 1,
+                    "desiredNumberScheduled": 1,
+                    "numberAvailable": 1,
+                    "numberMisscheduled": 0,
+                    "numberReady": 1,
+                    "numberUnavailable": 0,
+                    "observedGeneration": self.daemonset_resource_version,
+                    "updatedNumberScheduled": 1,
                 },
             })
         }
@@ -1225,6 +1299,64 @@ mod tests {
             configmap_name: "haproxy-tenant".to_string(),
             daemonset_name: "haproxy-tenant".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn rollout_wait_requires_observed_updated_ready_and_available_pods() {
+        let state = Arc::new(Mutex::new(FakeKubeState::new("global\n")));
+        let ready: DaemonSet = serde_json::from_value(state.lock().unwrap().daemonset())
+            .expect("valid ready DaemonSet");
+        let expected = haproxy_config_generation("global\n");
+        assert!(daemonset_rollout_complete(&ready, &expected));
+        wait_for_haproxy_daemonset_rollout(fake_kube_client(state), &edge_config(), &expected)
+            .await
+            .expect("ready rollout converges");
+
+        let mut wrong_config = ready.clone();
+        wrong_config
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .metadata
+            .as_mut()
+            .unwrap()
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(
+                HAPROXY_CONFIG_GENERATION_ANNOTATION.to_string(),
+                "wrong".to_string(),
+            );
+        assert!(!daemonset_rollout_complete(&wrong_config, &expected));
+
+        let mut stale = ready.clone();
+        stale.status.as_mut().unwrap().observed_generation = Some(0);
+        assert!(!daemonset_rollout_complete(&stale, &expected));
+
+        let mut not_updated = ready.clone();
+        not_updated
+            .status
+            .as_mut()
+            .unwrap()
+            .updated_number_scheduled = Some(0);
+        assert!(!daemonset_rollout_complete(&not_updated, &expected));
+
+        let mut not_ready = ready.clone();
+        not_ready.status.as_mut().unwrap().number_ready = 0;
+        assert!(!daemonset_rollout_complete(&not_ready, &expected));
+
+        let mut not_available = ready.clone();
+        not_available.status.as_mut().unwrap().number_available = Some(0);
+        assert!(!daemonset_rollout_complete(&not_available, &expected));
+
+        let mut zero_desired = ready;
+        zero_desired
+            .status
+            .as_mut()
+            .unwrap()
+            .desired_number_scheduled = 0;
+        assert!(!daemonset_rollout_complete(&zero_desired, &expected));
     }
 
     async fn edge_database_test_pool() -> PgPool {

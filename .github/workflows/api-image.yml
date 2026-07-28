@@ -11,6 +11,7 @@ on:
       - "scripts/test-verify-api-image-ref.sh"
       - "scripts/verify-api-image-ref.bash"
       - "scripts/verify-api-image-ref.sh"
+      - "deploy/api/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/enclava-api/**"
@@ -25,6 +26,7 @@ on:
       - "scripts/test-verify-api-image-ref.sh"
       - "scripts/verify-api-image-ref.bash"
       - "scripts/verify-api-image-ref.sh"
+      - "deploy/api/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/enclava-api/**"
@@ -64,6 +66,15 @@ jobs:
           bash -n scripts/verify-api-image-ref.bash
           bash -n scripts/test-verify-api-image-ref.sh
           scripts/test-verify-api-image-ref.sh
+
+      - name: Set up Kustomize
+        uses: imranismail/setup-kustomize@2ba527d4d055ab63514ba50a99456fc35684947f # v2
+
+      - name: Validate release manifest
+        run: |
+          scripts/render-api-release-manifest.sh \
+            ghcr.io/enclava-labs/enclava-api@sha256:0000000000000000000000000000000000000000000000000000000000000000 \
+            /tmp/enclava-api-deploy.yaml
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0

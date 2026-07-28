@@ -4,6 +4,9 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="$ROOT_DIR/.github/workflows/api-image.yml"
 DOCKERFILE="$ROOT_DIR/crates/enclava-api/Dockerfile"
+DEPLOYMENT="$ROOT_DIR/deploy/api/deployment.yaml"
+KUSTOMIZATION="$ROOT_DIR/deploy/api/kustomization.yaml"
+RBAC="$ROOT_DIR/deploy/api/rbac.yaml"
 
 fail() {
   echo "error: $*" >&2
@@ -77,6 +80,26 @@ for required in \
   "sh -n scripts/verify-api-image-ref.sh" \
   "bash -n scripts/verify-api-image-ref.bash"; do
   assert_contains "$required"
+done
+
+grep -Fq -- '      - "deploy/api/**"' "$WORKFLOW" \
+  || fail "API manifest changes must trigger image validation"
+grep -Fq -- "serviceAccountName: enclava-api" "$DEPLOYMENT" \
+  || fail "API Deployment must use its Kubernetes reconciliation identity"
+grep -Fq -- "automountServiceAccountToken: true" "$DEPLOYMENT" \
+  || fail "API Deployment must mount Kubernetes credentials"
+grep -Fq -- "- rbac.yaml" "$KUSTOMIZATION" \
+  || fail "API release manifest must include reconciliation RBAC"
+for required in \
+  "kind: ServiceAccount" \
+  "name: enclava-api-edge-reconciler" \
+  'resources: ["services"]' \
+  'resources: ["configmaps"]' \
+  'resources: ["daemonsets"]' \
+  'resourceNames: ["haproxy-tenant"]' \
+  'verbs: ["get", "update"]'; do
+  grep -Fq -- "$required" "$RBAC" \
+    || fail "API release RBAC is missing: $required"
 done
 
 for required in \
