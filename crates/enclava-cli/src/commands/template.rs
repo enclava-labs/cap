@@ -973,12 +973,8 @@ async fn wait_for_template_bootstrap_endpoint(
     poll_interval: Duration,
     pb: &ProgressBar,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let endpoint = api.get_unlock_endpoint(app_name).await?;
-    let tee = TeeClient::new_for_ownership_probe_with_resolve_ip(
-        &endpoint.tee_url,
-        endpoint.tee_resolve_ip,
-    );
     let start = Instant::now();
+    let mut tee = None;
 
     loop {
         fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
@@ -987,6 +983,26 @@ async fn wait_for_template_bootstrap_endpoint(
             return Err("deploy timed out waiting for TEE ownership claim endpoint".into());
         }
 
+        if tee.is_none() {
+            match api.get_unlock_endpoint(app_name).await {
+                Ok(endpoint) => {
+                    tee = Some(TeeClient::new_for_ownership_probe_with_resolve_ip(
+                        &endpoint.tee_url,
+                        endpoint.tee_resolve_ip,
+                    ));
+                }
+                Err(error) if should_retry_template_bootstrap_endpoint_error(&error) => {
+                    pb.set_message("Waiting for ownership claim endpoint...");
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let tee = tee
+            .as_ref()
+            .expect("TEE client must exist after endpoint acquisition");
         match tee.attest_receipt_key().await {
             Ok((_attestation, attested_tee)) => match attested_tee.bootstrap_challenge().await {
                 Ok(_) => {
@@ -1013,6 +1029,18 @@ async fn wait_for_template_bootstrap_endpoint(
         }
 
         tokio::time::sleep(poll_interval).await;
+    }
+}
+
+fn should_retry_template_bootstrap_endpoint_error(error: &ApiError) -> bool {
+    match error {
+        ApiError::Http(_) => true,
+        ApiError::Api { status, code, .. } => match code.as_deref() {
+            Some("cap_app_sync_pending") => true,
+            Some("cap_response_invalid" | "not_implemented_hosted") => false,
+            _ => matches!(*status, 408 | 425 | 429 | 500..=599),
+        },
+        ApiError::NotAuthenticated => false,
     }
 }
 
@@ -1867,7 +1895,15 @@ fn template_deployment_failure_message(
 fn should_retry_template_deployment_status_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
-        ApiError::Api { status, .. } => matches!(*status, 408 | 409 | 425 | 429) || *status >= 500,
+        ApiError::Api { status, code, .. } => {
+            if matches!(
+                code.as_deref(),
+                Some("cap_response_invalid" | "not_implemented_hosted")
+            ) {
+                return false;
+            }
+            matches!(*status, 404 | 408 | 409 | 425 | 429 | 500..=599)
+        }
         ApiError::NotAuthenticated => false,
     }
 }
@@ -3185,6 +3221,65 @@ mod tests {
                 && wait_managed_config < config,
             "template deploy must prepare tenant log encryption before deployment, then make the config store writable before writing customer config"
         );
+    }
+
+    #[test]
+    fn template_bootstrap_endpoint_retries_without_redeploying() {
+        let body = include_str!("template.rs")
+            .split_once("async fn wait_for_template_bootstrap_endpoint")
+            .unwrap();
+        let body = body
+            .1
+            .split_once("async fn deliver_template_config_with_retry")
+            .unwrap()
+            .0;
+        let wait_loop = body.find("loop {").unwrap();
+        let failure_check = body.find("fail_if_template_deployment_failed").unwrap();
+        let endpoint = body.find("get_unlock_endpoint").unwrap();
+        let retry = body[endpoint..].find("continue;").unwrap() + endpoint;
+
+        assert!(wait_loop < failure_check && failure_check < endpoint && endpoint < retry);
+        assert!(body.contains("should_retry_template_bootstrap_endpoint_error"));
+        assert!(body.contains("tokio::time::sleep(poll_interval).await"));
+        assert!(!body.contains("create_template_instance"));
+        assert!(!body.contains(".deploy("));
+    }
+
+    #[test]
+    fn template_bootstrap_endpoint_retries_only_transient_api_errors() {
+        let api_error = |status, code: Option<&str>| ApiError::Api {
+            status,
+            code: code.map(str::to_string),
+            message: "test error".to_string(),
+        };
+        let endpoint_retries =
+            |status, code| should_retry_template_bootstrap_endpoint_error(&api_error(status, code));
+        let status_retries =
+            |status| should_retry_template_deployment_status_error(&api_error(status, None));
+
+        assert!(endpoint_retries(409, Some("cap_app_sync_pending")));
+        for status in [408, 425, 429, 500, 503] {
+            assert!(endpoint_retries(status, None));
+        }
+        for (status, code) in [
+            (401, "unauthenticated"),
+            (403, "org_permission_denied"),
+            (404, "app_not_found"),
+            (409, "hosted_operation_failed_drift"),
+            (502, "cap_response_invalid"),
+            (501, "not_implemented_hosted"),
+        ] {
+            assert!(!endpoint_retries(status, Some(code)));
+        }
+        assert!(!should_retry_template_bootstrap_endpoint_error(
+            &ApiError::NotAuthenticated
+        ));
+        for status in [404, 409, 425] {
+            assert!(status_retries(status));
+        }
+        for status in [400, 401, 403, 422] {
+            assert!(!status_retries(status));
+        }
     }
 
     #[test]
