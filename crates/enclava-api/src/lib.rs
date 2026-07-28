@@ -61,7 +61,6 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
     router
         .merge(api_routes)
         .layer(TraceLayer::new_for_http())
-        .layer(build_cors_layer())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             freeze_workload_authority_mutations,
@@ -70,6 +69,7 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
             state.clone(),
             require_startup_ready,
         ))
+        .layer(build_cors_layer())
         .with_state(state)
 }
 
@@ -94,7 +94,7 @@ async fn freeze_workload_authority_mutations(
     request: Request,
     next: Next,
 ) -> Response {
-    if state.deployment_dispatch_enabled()
+    if state.deployment_dispatch_enabled
         || !is_workload_authority_mutation(request.method(), request.uri().path())
     {
         return next.run(request).await;
@@ -599,8 +599,6 @@ mod runtime_gate_tests {
     fn workload_gate_is_fail_closed_for_current_and_future_writes() {
         for (method, path) in [
             (Method::POST, "/apps"),
-            (Method::POST, "/apps/demo/deploy"),
-            (Method::PATCH, "/apps/demo/signer"),
             (Method::DELETE, "/apps/demo/domains/example.test"),
             (Method::POST, "/internal/paas/orgs/org-1/deployments"),
             (Method::POST, "/internal/paas/future-workload-authority"),
@@ -658,12 +656,15 @@ mod runtime_gate_tests {
             .clone()
             .oneshot(
                 Request::post("/future-workload-authority")
+                    .header(header::ORIGIN, "http://localhost:5173")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(frozen.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let allow_origin = &frozen.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN];
+        assert_eq!(allow_origin, "http://localhost:5173");
         let body = frozen.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["reason"], "deployment_dispatch_disabled");

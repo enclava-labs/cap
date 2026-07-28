@@ -238,10 +238,6 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn deployment_dispatch_enabled(&self) -> bool {
-        self.deployment_dispatch_enabled
-    }
-
     pub fn startup_is_ready(&self) -> bool {
         self.startup_ready.load(Ordering::Acquire)
     }

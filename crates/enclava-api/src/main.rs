@@ -30,17 +30,14 @@ fn parse_fail_closed_switch(name: &str, value: Option<&str>) -> anyhow::Result<b
 }
 
 fn load_deployment_dispatch_enabled() -> anyhow::Result<bool> {
-    match std::env::var("CAP_DEPLOYMENT_DISPATCH_ENABLED") {
-        Ok(value) => {
-            parse_fail_closed_switch("CAP_DEPLOYMENT_DISPATCH_ENABLED", Some(value.as_str()))
-        }
-        Err(std::env::VarError::NotPresent) => {
-            parse_fail_closed_switch("CAP_DEPLOYMENT_DISPATCH_ENABLED", None)
-        }
+    let value = match std::env::var("CAP_DEPLOYMENT_DISPATCH_ENABLED") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
         Err(std::env::VarError::NotUnicode(_)) => {
             anyhow::bail!("CAP_DEPLOYMENT_DISPATCH_ENABLED must be valid UTF-8")
         }
-    }
+    };
+    parse_fail_closed_switch("CAP_DEPLOYMENT_DISPATCH_ENABLED", value.as_deref())
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -827,7 +824,12 @@ async fn main() {
         .await
     });
 
-    if let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await {
+    if state
+        .kbs_policy
+        .as_ref()
+        .is_some_and(|config| config.required)
+        && let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await
+    {
         eprintln!("startup refused: KBS policy reconciliation failed: {error}");
         std::process::exit(1);
     }
