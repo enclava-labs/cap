@@ -1876,6 +1876,20 @@ owner_resource_bindings := {}
     }
 
     #[test]
+    fn signed_policy_body_preserves_persisted_org_keyring_order() {
+        let mut artifact = test_signed_policy_artifact("aa", 16);
+        artifact.org_keyring = Some(serde_json::from_str(r#"{"zeta":1,"alpha":2}"#).unwrap());
+
+        let body = signed_policy_artifact_policy_body(&[artifact]).unwrap();
+
+        assert!(body.contains(r#""org_keyring":{"zeta":1,"alpha":2}"#));
+        assert_eq!(
+            hex::encode(Sha256::digest(body.as_bytes())),
+            "77d93a86e10afad51c085586c27d47ed4d1839f1f2d8128e642cdee4f1bb7a2a"
+        );
+    }
+
+    #[test]
     fn multiple_signed_policy_artifacts_are_written_as_policy_set() {
         let artifact = crate::signing_service::SignedPolicyArtifact {
             metadata: crate::signing_service::PolicyMetadata {
