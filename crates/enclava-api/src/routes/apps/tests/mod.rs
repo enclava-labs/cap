@@ -398,6 +398,40 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
     }
 }
 
+#[test]
+fn app_delete_releases_confirmed_unconditional_scopes_before_later_providers() {
+    let source = include_str!("../../apps.rs");
+    let deletion = source
+        .split("pub async fn delete_app")
+        .nth(1)
+        .expect("app deletion route exists")
+        .split("#[derive(Debug, Deserialize)]\npub struct RotateSignerRequest")
+        .next()
+        .expect("app deletion route body");
+
+    let expected_dns = deletion
+        .find("let expected_dns_cleanup")
+        .expect("expected DNS cleanup exists");
+    let dns_release = deletion
+        .find("release_confirmed_resource_scope(\"dns_hostname\")")
+        .expect("confirmed DNS scope is released");
+    let edge_cleanup = deletion
+        .find("crate::edge::remove_haproxy_routes")
+        .expect("edge cleanup exists");
+    assert!(expected_dns < dns_release && dns_release < edge_cleanup);
+
+    let namespace_delete = deletion
+        .find("delete_tenant_namespace(")
+        .expect("namespace delete exists");
+    let namespace_release = deletion
+        .find("release_confirmed_resource_scope(\"kubernetes_namespace\")")
+        .expect("confirmed namespace scope is released");
+    let kbs_cleanup = deletion
+        .find("crate::kbs::soft_delete_owner_binding")
+        .expect("KBS cleanup exists");
+    assert!(namespace_delete < namespace_release && namespace_release < kbs_cleanup);
+}
+
 #[tokio::test]
 async fn create_app_rejects_member_before_database_access() {
     let result = create_app(

@@ -1432,6 +1432,10 @@ pub async fn delete_app(
             .map_err(|_| internal_server_error())?;
         return Err(app_delete_dns_failure(deleting_app.id, error));
     }
+    delete_mutation
+        .release_confirmed_resource_scope("dns_hostname")
+        .await
+        .map_err(|_| internal_server_error())?;
     let org_slug: String = sqlx::query_scalar("SELECT cust_slug FROM organizations WHERE id = $1")
         .bind(auth.org_id)
         .fetch_one(&state.db)
@@ -1516,6 +1520,10 @@ pub async fn delete_app(
         .await
         .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::Namespace, error))?;
+    delete_mutation
+        .release_confirmed_resource_scope("kubernetes_namespace")
+        .await
+        .map_err(|_| internal_server_error())?;
     crate::kbs::soft_delete_owner_binding(&state.db, deleting_app.id)
         .await
         .map_err(|error| {

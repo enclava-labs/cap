@@ -320,7 +320,12 @@ pub async fn reconcile_policy(
             "durable signed KBS authority supersedes legacy marker reconciliation"
         );
         return reconcile_pending_signed_policy_artifacts_with_client(
-            db, config, authority, None, client,
+            db,
+            config,
+            authority,
+            None,
+            &[],
+            client,
         )
         .await;
     }
@@ -352,7 +357,12 @@ pub async fn reconcile_policy(
         // resourceVersion conflict with stale Rego.
         if signed_policy_mode_active(db).await? {
             return reconcile_pending_signed_policy_artifacts_with_client(
-                db, config, authority, None, client,
+                db,
+                config,
+                authority,
+                None,
+                &[],
+                client,
             )
             .await;
         }
@@ -373,7 +383,12 @@ pub async fn reconcile_policy(
             enqueue_signed_policy_bootstrap_if_idle(&mut tx).await?;
             tx.commit().await?;
             return reconcile_pending_signed_policy_artifacts_with_client(
-                db, config, authority, None, client,
+                db,
+                config,
+                authority,
+                None,
+                &[],
+                client,
             )
             .await;
         }
@@ -413,7 +428,12 @@ pub async fn reconcile_policy(
                 // it repair the brief legacy write before this call returns.
                 if signed_policy_mode_active(db).await? {
                     return reconcile_pending_signed_policy_artifacts_with_client(
-                        db, config, authority, None, client,
+                        db,
+                        config,
+                        authority,
+                        None,
+                        &[],
+                        client,
                     )
                     .await;
                 }
@@ -704,6 +724,39 @@ pub async fn reconcile_signed_policy_artifacts(
     reconcile_pending_signed_policy_artifacts_inner(db, config, authority, extra_artifact).await
 }
 
+/// Publish an explicit, validated set of artifacts as required restore
+/// authority before re-applying retained workloads.
+///
+/// These artifacts may belong to a healthy predecessor while a newer durable
+/// job is still pending, so normal "latest operation" candidate selection is
+/// intentionally insufficient during restore.
+pub(crate) async fn reconcile_signed_policy_artifacts_with_required_restore_artifacts(
+    db: &PgPool,
+    config: Option<&KbsPolicyConfig>,
+    authority: RuntimeAuthority,
+    required_artifacts: &[crate::signing_service::SignedPolicyArtifact],
+) -> Result<(), KbsPolicyError> {
+    if required_artifacts.is_empty() {
+        return Ok(());
+    }
+    let Some(config) = config else {
+        return Err(KbsPolicyError::NotConfigured);
+    };
+    let mut tx = db.begin().await?;
+    enqueue_signed_policy_reconciliation(&mut tx).await?;
+    tx.commit().await?;
+    let client = kube::Client::try_default().await?;
+    reconcile_pending_signed_policy_artifacts_with_client(
+        db,
+        config,
+        authority,
+        None,
+        required_artifacts,
+        client,
+    )
+    .await
+}
+
 /// Converge every currently pending desired generation.  This is safe to call
 /// periodically and after a process restart; Kubernetes resourceVersion plus
 /// monotonic generation annotations fence late older writers.
@@ -840,6 +893,7 @@ async fn reconcile_pending_signed_policy_artifacts_inner(
         config,
         authority,
         expected_artifact,
+        &[],
         client,
     )
     .await
@@ -850,6 +904,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
     config: &KbsPolicyConfig,
     authority: RuntimeAuthority,
     expected_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
+    required_restore_artifacts: &[crate::signing_service::SignedPolicyArtifact],
     client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
@@ -888,7 +943,10 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         }
         let generation = reconciliation.desired_generation;
         let previously_applied = reconciliation.applied_generation >= generation;
-        let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
+        let candidates = merge_required_signed_policy_artifacts(
+            load_signed_policy_candidates(db, config.signed_policy_retention).await?,
+            required_restore_artifacts,
+        );
         if let Some(expected) = expected_artifact
             && !candidates.iter().any(|candidate| {
                 candidate.artifact.metadata.descriptor_core_hash
@@ -1480,6 +1538,35 @@ fn signed_policy_artifact_policy_body(
         schema_version: SIGNED_POLICY_SET_SCHEMA_VERSION,
         artifacts,
     })?)
+}
+
+fn merge_required_signed_policy_artifacts(
+    mut candidates: Vec<SignedPolicyArtifactCandidate>,
+    required_artifacts: &[crate::signing_service::SignedPolicyArtifact],
+) -> Vec<SignedPolicyArtifactCandidate> {
+    let mut required = Vec::new();
+    let mut seen = HashSet::new();
+    for artifact in required_artifacts {
+        let descriptor_core_hash = artifact.metadata.descriptor_core_hash.clone();
+        if !seen.insert(descriptor_core_hash.clone()) {
+            continue;
+        }
+        if let Some(index) = candidates.iter().position(|candidate| {
+            candidate.artifact.metadata.descriptor_core_hash == descriptor_core_hash
+        }) {
+            let mut candidate = candidates.remove(index);
+            candidate.artifact = artifact.clone();
+            candidate.required = true;
+            required.push(candidate);
+        } else {
+            required.push(SignedPolicyArtifactCandidate {
+                artifact: artifact.clone(),
+                required: true,
+            });
+        }
+    }
+    required.extend(candidates);
+    required
 }
 
 fn select_signed_policy_artifacts_for_policy_body(
@@ -2208,6 +2295,52 @@ owner_resource_bindings := {}
                 max_policy_bytes: 1,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn restored_required_artifact_is_reinserted_ahead_of_retention_candidates() {
+        let latest = test_signed_policy_artifact("aa", 16);
+        let restored_predecessor = test_signed_policy_artifact("bb", 16);
+        let candidates = merge_required_signed_policy_artifacts(
+            vec![signed_policy_candidate(latest.clone(), true)],
+            std::slice::from_ref(&restored_predecessor),
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates[0].required);
+        assert_eq!(candidates[0].artifact, restored_predecessor);
+        assert!(candidates[1].required);
+        assert_eq!(candidates[1].artifact, latest);
+
+        let selected =
+            select_signed_policy_artifacts_for_policy_body(candidates, usize::MAX).unwrap();
+        assert_eq!(selected, vec![restored_predecessor, latest]);
+    }
+
+    #[test]
+    fn restored_required_artifact_fails_closed_when_both_generations_do_not_fit() {
+        let latest = test_signed_policy_artifact("aa", 4096);
+        let restored_predecessor = test_signed_policy_artifact("bb", 16);
+        let predecessor_only_budget =
+            signed_policy_artifact_policy_body(std::slice::from_ref(&restored_predecessor))
+                .unwrap()
+                .len();
+        let candidates = merge_required_signed_policy_artifacts(
+            vec![signed_policy_candidate(latest, true)],
+            std::slice::from_ref(&restored_predecessor),
+        );
+
+        let err =
+            select_signed_policy_artifacts_for_policy_body(candidates, predecessor_only_budget)
+                .unwrap_err();
+        assert!(matches!(
+            err,
+            KbsPolicyError::SignedPolicyBudgetExceeded {
+                required_artifacts: 2,
+                max_policy_bytes,
+                ..
+            } if max_policy_bytes == predecessor_only_budget
         ));
     }
 

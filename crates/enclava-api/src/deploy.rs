@@ -107,6 +107,17 @@ fn classify_rollout_result(
     }
 }
 
+fn restored_rollout_is_startup_safe(
+    phase: DeployPhase,
+    previous_app_status: AppStatus,
+    unlock_mode: crate::models::UnlockMode,
+) -> bool {
+    phase == DeployPhase::Running
+        || (phase == DeployPhase::TimedOut
+            && previous_app_status == AppStatus::Running
+            && unlock_mode == crate::models::UnlockMode::Password)
+}
+
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().and_then(|value| {
         let trimmed = value.trim();
@@ -1027,7 +1038,7 @@ mod tests {
     };
 
     #[test]
-    fn restored_kubernetes_apply_always_waits_for_running_rollout() {
+    fn restored_kubernetes_apply_observes_rollout_and_allows_manual_unlock() {
         let source = include_str!("deploy.rs");
         let restore_body = source
             .rsplit("pub(crate) async fn apply_restored_kubernetes_manifests")
@@ -1047,9 +1058,29 @@ mod tests {
             "rollout observation must run after the optional custom-domain branch"
         );
         assert!(
-            restore_body.contains("status.phase != DeployPhase::Running"),
-            "only a fully running restored StatefulSet may advance authority"
+            restore_body.contains("restored_rollout_is_startup_safe("),
+            "restore must use the explicit password-unlock readiness exception"
         );
+        assert!(restored_rollout_is_startup_safe(
+            DeployPhase::Running,
+            AppStatus::Running,
+            crate::models::UnlockMode::Auto,
+        ));
+        assert!(restored_rollout_is_startup_safe(
+            DeployPhase::TimedOut,
+            AppStatus::Running,
+            crate::models::UnlockMode::Password,
+        ));
+        assert!(!restored_rollout_is_startup_safe(
+            DeployPhase::TimedOut,
+            AppStatus::Running,
+            crate::models::UnlockMode::Auto,
+        ));
+        assert!(!restored_rollout_is_startup_safe(
+            DeployPhase::TimedOut,
+            AppStatus::Creating,
+            crate::models::UnlockMode::Password,
+        ));
     }
 
     fn test_attestation_config() -> AttestationConfig {
@@ -1887,6 +1918,8 @@ pub(crate) async fn apply_restored_kubernetes_manifests(
         local_trustee_policy_json,
         log_encryption,
     } = request;
+    let previous_app_status = app.status;
+    let unlock_mode = app.unlock_mode;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
     let mut app_spec = build_confidential_app_from_rows(
         &app,
@@ -1960,7 +1993,7 @@ pub(crate) async fn apply_restored_kubernetes_manifests(
             .await?;
     }
     let status = watch_rollout(engine, &app_spec.namespace, &app_spec.name).await?;
-    if status.phase != DeployPhase::Running {
+    if !restored_rollout_is_startup_safe(status.phase, previous_app_status, unlock_mode) {
         return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
             status
                 .message

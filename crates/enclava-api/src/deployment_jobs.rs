@@ -5,7 +5,7 @@
 //! process termination after commit cannot strand an accepted deployment in an
 //! in-memory Tokio task.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1437,7 +1437,7 @@ enum RestoreNamespaceInventoryPhase {
 }
 
 fn cap_owned_orphan_namespaces(
-    database_namespaces: &BTreeSet<String>,
+    database_namespaces: &BTreeMap<String, String>,
     reconciled_namespaces: &BTreeSet<String>,
     namespaces: Vec<k8s_openapi::api::core::v1::Namespace>,
     phase: RestoreNamespaceInventoryPhase,
@@ -1453,9 +1453,8 @@ fn cap_owned_orphan_namespaces(
         let cap_owned = labels
             .get("app.kubernetes.io/managed-by")
             .is_some_and(|value| value == "enclava-platform");
-        let tenant_owned = labels
-            .get("enclava.dev/tenant")
-            .is_some_and(|value| !value.is_empty());
+        let tenant_label = labels.get("enclava.dev/tenant");
+        let tenant_owned = tenant_label.is_some_and(|value| !value.is_empty());
         let has_tenant_marker = labels.contains_key("enclava.dev/tenant");
         let has_cap_marker = name.starts_with("cap-") || cap_owned || has_tenant_marker;
         if !has_cap_marker {
@@ -1464,8 +1463,14 @@ fn cap_owned_orphan_namespaces(
         if !cap_owned || !tenant_owned || !name.starts_with("cap-") {
             return Err(DeploymentJobError::Authority);
         }
+        if database_namespaces
+            .get(&name)
+            .is_some_and(|expected_tenant| tenant_label != Some(expected_tenant))
+        {
+            return Err(DeploymentJobError::Authority);
+        }
         live_cap_namespaces.insert(name.clone());
-        if !database_namespaces.contains(&name) {
+        if !database_namespaces.contains_key(&name) {
             orphans.push(name);
         } else if !reconciled_namespaces.contains(&name) {
             // A failed, stopped, or incomplete app may own PVC data. Its
@@ -1487,6 +1492,13 @@ fn cap_owned_orphan_namespaces(
 }
 
 type RestoredWorkload = (Uuid, Uuid, String, Uuid, Uuid, bool);
+
+struct PreparedRestoredWorkload {
+    app_id: Uuid,
+    deployment_id: Uuid,
+    request: crate::deploy::RestoreKubernetesManifestsRequest,
+    generation: enclava_engine::apply::generation::MutationGeneration,
+}
 
 async fn select_restored_workloads(
     transaction: &mut Transaction<'_, Postgres>,
@@ -1644,8 +1656,8 @@ async fn reconcile_kubernetes_after_restore_with_engine(
         return Ok(());
     }
 
-    let app_namespaces: Vec<(String, crate::models::AppStatus)> = sqlx::query_as(
-        "SELECT namespace, status
+    let app_namespaces: Vec<(String, String, crate::models::AppStatus)> = sqlx::query_as(
+        "SELECT namespace, tenant_id, status
            FROM apps
           ORDER BY namespace",
     )
@@ -1653,7 +1665,7 @@ async fn reconcile_kubernetes_after_restore_with_engine(
     .await?;
     if app_namespaces
         .iter()
-        .any(|(namespace, _)| !namespace.starts_with("cap-"))
+        .any(|(namespace, _, _)| !namespace.starts_with("cap-"))
     {
         return Err(DeploymentJobError::Authority);
     }
@@ -1667,14 +1679,14 @@ async fn reconcile_kubernetes_after_restore_with_engine(
     let restored_workloads = select_restored_workloads(&mut transaction).await?;
     let running_app_count = app_namespaces
         .iter()
-        .filter(|(_, status)| *status == crate::models::AppStatus::Running)
+        .filter(|(_, _, status)| *status == crate::models::AppStatus::Running)
         .count();
     if restored_workloads.len() != running_app_count {
         return Err(DeploymentJobError::Authority);
     }
-    let database_namespaces: BTreeSet<String> = app_namespaces
+    let database_namespaces: BTreeMap<String, String> = app_namespaces
         .iter()
-        .map(|(namespace, _)| namespace.clone())
+        .map(|(namespace, tenant_id, _)| (namespace.clone(), tenant_id.clone()))
         .collect();
     let reconciled_namespaces: BTreeSet<String> = restored_workloads
         .iter()
@@ -1698,6 +1710,8 @@ async fn reconcile_kubernetes_after_restore_with_engine(
         RestoreNamespaceInventoryPhase::BeforeApply,
     )?;
 
+    let mut prepared_workloads = Vec::with_capacity(restored_workloads.len());
+    let mut required_restore_policy_artifacts = Vec::new();
     for (app_id, org_id, _namespace, deployment_id, latest_deployment_id, has_newer_in_flight) in
         restored_workloads
     {
@@ -1763,9 +1777,13 @@ async fn reconcile_kubernetes_after_restore_with_engine(
             state.runtime_authority.restore_generation,
         )
         .map_err(crate::deploy::DeployError::from)?;
-        crate::deploy::apply_restored_kubernetes_manifests(
-            engine,
-            crate::deploy::RestoreKubernetesManifestsRequest {
+        if let Some(artifact) = validated.signed_policy_artifact.as_ref() {
+            required_restore_policy_artifacts.push(artifact.clone());
+        }
+        prepared_workloads.push(PreparedRestoredWorkload {
+            app_id,
+            deployment_id,
+            request: crate::deploy::RestoreKubernetesManifestsRequest {
                 app: payload.app,
                 current_custom_domain: app.custom_domain,
                 snapshot: payload.snapshot,
@@ -1780,13 +1798,51 @@ async fn reconcile_kubernetes_after_restore_with_engine(
                 log_encryption: payload.log_encryption,
             },
             generation,
+        });
+    }
+
+    let restore_kbs_mutation = if !required_restore_policy_artifacts.is_empty() {
+        let kbs_mutation = crate::mutation_leases::claim_resources(
+            state,
+            "restore_retained_kbs_policy",
+            Uuid::new_v4(),
+            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+        )
+        .await?;
+        kbs_mutation
+            .guard_provider(
+                crate::kbs::reconcile_signed_policy_artifacts_with_required_restore_artifacts(
+                    &state.db,
+                    state.kbs_policy.as_ref(),
+                    state.runtime_authority,
+                    &required_restore_policy_artifacts,
+                ),
+            )
+            .await??;
+        Some(kbs_mutation)
+    } else {
+        None
+    };
+
+    for prepared in prepared_workloads {
+        crate::deploy::apply_restored_kubernetes_manifests(
+            engine,
+            prepared.request,
+            prepared.generation,
         )
         .await?;
         tracing::info!(
-            app_id = %app_id,
-            deployment_id = %deployment_id,
+            app_id = %prepared.app_id,
+            deployment_id = %prepared.deployment_id,
             "re-applied restored Kubernetes workload authority"
         );
+    }
+    if let Some(kbs_mutation) = restore_kbs_mutation {
+        // Keep the exact required artifact set fenced until every retained
+        // workload has been observed startup-safe. Otherwise a pending newer
+        // deployment could win the KBS lane between policy publication and
+        // the predecessor's Kubernetes apply.
+        kbs_mutation.finish().await?;
     }
 
     let live_owned_namespaces = namespace_api
@@ -3436,13 +3492,13 @@ mod tests {
 
     #[test]
     fn restore_namespace_plan_deletes_only_strict_cap_owned_orphans() {
-        fn owned_namespace(name: &str) -> k8s_openapi::api::core::v1::Namespace {
+        fn owned_namespace(name: &str, tenant_id: &str) -> k8s_openapi::api::core::v1::Namespace {
             let mut labels = std::collections::BTreeMap::new();
             labels.insert(
                 "app.kubernetes.io/managed-by".to_string(),
                 "enclava-platform".to_string(),
             );
-            labels.insert("enclava.dev/tenant".to_string(), "tenant-1".to_string());
+            labels.insert("enclava.dev/tenant".to_string(), tenant_id.to_string());
             k8s_openapi::api::core::v1::Namespace {
                 metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
                     name: Some(name.to_string()),
@@ -3453,14 +3509,15 @@ mod tests {
             }
         }
 
-        let database_namespaces = BTreeSet::from(["cap-restored-app".to_string()]);
-        let reconciled_namespaces = database_namespaces.clone();
+        let database_namespaces =
+            BTreeMap::from([("cap-restored-app".to_string(), "tenant-1".to_string())]);
+        let reconciled_namespaces = BTreeSet::from(["cap-restored-app".to_string()]);
         let orphans = cap_owned_orphan_namespaces(
             &database_namespaces,
             &reconciled_namespaces,
             vec![
-                owned_namespace("cap-restored-app"),
-                owned_namespace("cap-post-backup-app"),
+                owned_namespace("cap-restored-app", "tenant-1"),
+                owned_namespace("cap-post-backup-app", "tenant-post-backup"),
             ],
             RestoreNamespaceInventoryPhase::AfterApply,
         )
@@ -3476,7 +3533,7 @@ mod tests {
         };
         assert_eq!(
             cap_owned_orphan_namespaces(
-                &BTreeSet::new(),
+                &BTreeMap::new(),
                 &BTreeSet::new(),
                 vec![unrelated],
                 RestoreNamespaceInventoryPhase::BeforeApply,
@@ -3488,7 +3545,7 @@ mod tests {
             cap_owned_orphan_namespaces(
                 &database_namespaces,
                 &reconciled_namespaces,
-                vec![owned_namespace("kube-system")],
+                vec![owned_namespace("kube-system", "tenant-1")],
                 RestoreNamespaceInventoryPhase::BeforeApply,
             )
             .is_err(),
@@ -3511,12 +3568,23 @@ mod tests {
             .is_err(),
             "a CAP-prefixed namespace with stripped authority labels must block restore"
         );
-        let incomplete_database_namespaces = BTreeSet::from(["cap-incomplete-app".to_string()]);
+        assert!(
+            cap_owned_orphan_namespaces(
+                &database_namespaces,
+                &reconciled_namespaces,
+                vec![owned_namespace("cap-restored-app", "different-tenant")],
+                RestoreNamespaceInventoryPhase::BeforeApply,
+            )
+            .is_err(),
+            "a database-present namespace must carry the exact restored tenant identity"
+        );
+        let incomplete_database_namespaces =
+            BTreeMap::from([("cap-incomplete-app".to_string(), "tenant-1".to_string())]);
         assert!(
             cap_owned_orphan_namespaces(
                 &incomplete_database_namespaces,
                 &BTreeSet::new(),
-                vec![owned_namespace("cap-incomplete-app")],
+                vec![owned_namespace("cap-incomplete-app", "tenant-1")],
                 RestoreNamespaceInventoryPhase::BeforeApply,
             )
             .is_err(),

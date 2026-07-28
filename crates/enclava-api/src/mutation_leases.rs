@@ -366,6 +366,56 @@ impl AppMutationLease {
         Ok(())
     }
 
+    /// Durably release every claimed resource in one provider scope after the
+    /// provider has confirmed that scope's mutation succeeded.
+    ///
+    /// This commits independently of a caller's longer app publication
+    /// transaction. A later provider failure must not roll back the proof and
+    /// leave already-converged unconditional resources poisoned forever.
+    pub async fn release_confirmed_resource_scope(
+        &mut self,
+        resource_scope: &str,
+    ) -> Result<(), MutationLeaseError> {
+        self.stop_heartbeat();
+        let released: Vec<ClaimedResource> = self
+            .resources
+            .iter()
+            .filter(|resource| resource.fence.scope == resource_scope)
+            .cloned()
+            .collect();
+        if released.is_empty() {
+            return Err(MutationLeaseError::Lost);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        require_current_runtime_authority(&self.runtime_authority, &mut tx).await?;
+        assert_current_rows(
+            &mut tx,
+            self.app_id,
+            self.token,
+            self.generation,
+            &self.resources,
+        )
+        .await?;
+        clear_resource_rows(&mut tx, self.token, &released).await?;
+        tx.commit().await?;
+
+        self.resources
+            .retain(|resource| resource.fence.scope != resource_scope);
+        let (heartbeat, heartbeat_lost) = spawn_app_heartbeat(
+            self.pool.clone(),
+            self.app_id,
+            self.token,
+            self.generation,
+            self.resources.clone(),
+            self.runtime_authority,
+            HeartbeatTiming::production(),
+        );
+        self.heartbeat = Some(heartbeat);
+        self.heartbeat_lost = heartbeat_lost;
+        Ok(())
+    }
+
     /// Arm every claimed resource in `resource_scope` before sending an
     /// unconditional provider mutation. Cloudflare does not expose a
     /// generation precondition, so a caller crash or lost response must leave
@@ -1634,6 +1684,115 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete stale-authority fixture");
+    }
+
+    #[tokio::test]
+    async fn confirmed_scope_release_commits_independently_and_preserves_other_poison() {
+        let pool = database_test_pool(4).await;
+        let hostname = format!("confirmed-release-{}.example.test", Uuid::new_v4().simple());
+        let tee_hostname = format!("tee-{hostname}");
+        let namespace = format!("cap-confirmed-release-{}", Uuid::new_v4().simple());
+        let (org_id, app_id) = insert_app(&pool, &hostname).await;
+        sqlx::query("UPDATE apps SET namespace = $1 WHERE id = $2")
+            .bind(&namespace)
+            .bind(app_id)
+            .execute(&pool)
+            .await
+            .expect("set confirmed-release namespace fixture");
+        let state = state_with_pool(pool.clone());
+        let mut owner = claim(
+            &state,
+            app_id,
+            "confirmed_scope_release",
+            Uuid::new_v4(),
+            false,
+            vec![
+                ResourceFence::dns(&hostname),
+                ResourceFence::dns(&tee_hostname),
+                ResourceFence::new("kubernetes_namespace", &namespace),
+                ResourceFence::kbs_policy(),
+            ],
+        )
+        .await
+        .expect("claim multi-provider delete authority");
+        owner
+            .arm_resource_scope_until_reconciled("dns_hostname")
+            .await
+            .expect("pre-arm unconditional DNS writes");
+        owner
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("pre-arm unconditional namespace write");
+
+        // Model the longer delete publication transaction. Its later rollback
+        // must not resurrect ambiguity for provider work already confirmed.
+        let mut publication = pool.begin().await.expect("begin delete publication");
+        crate::deploy::lock_app_deployment_lane(&mut publication, app_id)
+            .await
+            .expect("lock delete publication lane");
+        owner
+            .release_confirmed_resource_scope("dns_hostname")
+            .await
+            .expect("durably release confirmed DNS scope");
+        publication
+            .rollback()
+            .await
+            .expect("roll back later delete publication");
+
+        let dns_rows: Vec<(String, bool, bool)> = sqlx::query_as(
+            "SELECT resource_key,
+                    owner_token IS NULL,
+                    reclaim_after IS NULL
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'dns_hostname'
+                AND resource_key IN ($1, $2)
+              ORDER BY resource_key",
+        )
+        .bind(&hostname)
+        .bind(&tee_hostname)
+        .fetch_all(&pool)
+        .await
+        .expect("load independently released DNS rows");
+        assert_eq!(dns_rows.len(), 2);
+        assert!(
+            dns_rows
+                .iter()
+                .all(|(_, owner_released, poison_cleared)| *owner_released && *poison_cleared)
+        );
+        let namespace_row: (bool, bool) = sqlx::query_as(
+            "SELECT owner_token = $2,
+                    reclaim_after = 'infinity'::timestamptz
+               FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace'
+                AND resource_key = $1",
+        )
+        .bind(&namespace)
+        .bind(owner.token)
+        .fetch_one(&pool)
+        .await
+        .expect("load still-poisoned namespace row");
+        assert_eq!(namespace_row, (true, true));
+        let app_still_owned: bool = sqlx::query_scalar(
+            "SELECT owner_token = $2
+               FROM app_mutation_leases
+              WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .bind(owner.token)
+        .fetch_one(&pool)
+        .await
+        .expect("load retained app mutation owner");
+        assert!(app_still_owned);
+
+        owner
+            .finish()
+            .await
+            .expect("finish remaining delete authority");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete confirmed-release fixture");
     }
 
     #[tokio::test]
