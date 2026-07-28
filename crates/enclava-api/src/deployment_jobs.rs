@@ -39,6 +39,7 @@ const APPLY_RETRY_INTERVAL_SQL: &str = "5 seconds";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HEARTBEAT_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const TERMINAL_LEASE_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_SETUP_WORKERS: usize = 8;
 const MAX_APPLY_WORKERS: usize = 32;
 
@@ -1223,6 +1224,28 @@ async fn release_cleanup_for_retry_in_tx(
 /// have loaded.  Every API replica may run this loop; `FOR UPDATE SKIP LOCKED`
 /// and lease tokens ensure that only one owns a job at a time.
 pub fn spawn_deployment_dispatcher(state: AppState) {
+    let repair_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            match crate::mutation_leases::reconcile_orphaned_deployment_apply_leases(
+                &repair_state.db,
+            )
+            .await
+            {
+                Ok(repaired) if repaired > 0 => tracing::warn!(
+                    repaired,
+                    "bounded orphaned deployment namespace mutation leases"
+                ),
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    error_code = "orphaned_deployment_lease_repair_failed",
+                    "failed to repair orphaned deployment namespace mutation leases"
+                ),
+            }
+            tokio::time::sleep(TERMINAL_LEASE_REPAIR_INTERVAL).await;
+        }
+    });
+
     let setup_worker_slots = Arc::new(tokio::sync::Semaphore::new(MAX_SETUP_WORKERS));
     let configured_apply_workers =
         apply_worker_limit(state.deployment_apply_permits.available_permits());
@@ -1399,36 +1422,55 @@ async fn process_apply_job(
 
     match result {
         Ok(Ok(JobApplyOutcome::Applied(outcome, mut mutation))) => {
-            let publication = publish_rollout_outcome_with_mutation(
+            let published = match publish_rollout_outcome_with_mutation(
                 &state.db,
                 &job,
                 &outcome,
                 Some(&mut mutation),
             )
-            .await;
-            if let Err(error) = publication {
-                tracing::error!(
-                    deployment_id = %deployment_id,
-                    error_code = error.code(),
-                    "failed to publish durable deployment rollout outcome"
-                );
-            } else if outcome.deploy_status == "failed" {
-                match reconcile_pending_kbs_with_mutation(&state, &mutation).await {
-                    Ok(()) => {
-                        if let Err(error) = release_kbs_resource(&state.db, &mut mutation).await {
-                            tracing::error!(
-                                deployment_id = %deployment_id,
-                                error_code = error.code(),
-                                "failed to release reconciled rollout KBS fence"
-                            );
-                        }
-                    }
-                    Err(error) => tracing::error!(
+            .await
+            {
+                Err(error) => {
+                    tracing::error!(
                         deployment_id = %deployment_id,
                         error_code = error.code(),
-                        "failed rollout revocation remains durably pending"
-                    ),
+                        "failed to publish durable deployment rollout outcome"
+                    );
+                    false
                 }
+                Ok(()) => {
+                    if outcome.deploy_status == "failed" {
+                        match reconcile_pending_kbs_with_mutation(&state, &mutation).await {
+                            Ok(()) => {
+                                if let Err(error) =
+                                    release_kbs_resource(&state.db, &mut mutation).await
+                                {
+                                    tracing::error!(
+                                        deployment_id = %deployment_id,
+                                        error_code = error.code(),
+                                        "failed to release reconciled rollout KBS fence"
+                                    );
+                                }
+                            }
+                            Err(error) => tracing::error!(
+                                deployment_id = %deployment_id,
+                                error_code = error.code(),
+                                "failed rollout revocation remains durably pending"
+                            ),
+                        }
+                    }
+                    true
+                }
+            };
+            if published
+                && outcome.deploy_status == "failed"
+                && let Err(error) = mutation.release_after_provider_quarantine().await
+            {
+                tracing::error!(
+                    deployment_id = %deployment_id,
+                    error_code = DeploymentJobError::from(error).code(),
+                    "failed to bound terminal deployment mutation leases"
+                );
             }
         }
         Ok(Ok(JobApplyOutcome::AlreadyTerminal)) => {
@@ -1442,8 +1484,8 @@ async fn process_apply_job(
                 );
             }
         }
-        Ok(Ok(JobApplyOutcome::ApplyFailed(error, mut mutation))) => {
-            fail_apply_job_with_mutation(&state, &job, &error, Some(&mut mutation)).await;
+        Ok(Ok(JobApplyOutcome::ApplyFailed(error, mutation))) => {
+            fail_apply_job_with_mutation(&state, &job, &error, Some(mutation)).await;
         }
         Ok(Err(error)) if error.should_requeue_without_terminal_failure() => {
             if let Err(requeue_error) = requeue_apply_job(&state.db, &job, error.code()).await {
@@ -2100,10 +2142,10 @@ async fn fail_apply_job_with_mutation(
     state: &AppState,
     job: &ClaimedJob,
     error: &DeploymentJobError,
-    mut mutation: Option<&mut crate::mutation_leases::AppMutationLease>,
+    mut mutation: Option<crate::mutation_leases::AppMutationLease>,
 ) {
     let published =
-        match publish_apply_failure_with_mutation(&state.db, job, mutation.as_deref_mut()).await {
+        match publish_apply_failure_with_mutation(&state.db, job, mutation.as_mut()).await {
             Ok(()) => true,
             Err(db_error) => {
                 tracing::error!(
@@ -2114,7 +2156,7 @@ async fn fail_apply_job_with_mutation(
                 false
             }
         };
-    if published && let Some(mutation) = mutation {
+    if published && let Some(mutation) = mutation.as_mut() {
         if reconcile_pending_kbs_with_mutation(state, mutation)
             .await
             .is_ok()
@@ -2133,6 +2175,16 @@ async fn fail_apply_job_with_mutation(
                 "terminal deployment revocation remains durably pending"
             );
         }
+    }
+    if published
+        && let Some(mutation) = mutation
+        && let Err(release_error) = mutation.release_after_provider_quarantine().await
+    {
+        tracing::error!(
+            deployment_id = %job.deployment_id,
+            error_code = DeploymentJobError::from(release_error).code(),
+            "failed to bound failed deployment mutation leases"
+        );
     }
     tracing::error!(
         app_id = %job.app_id,
@@ -4542,6 +4594,222 @@ mod tests {
             .execute(&pool)
             .await
             .expect("clean stale apply fixture");
+    }
+
+    #[tokio::test]
+    async fn orphan_reconciler_repairs_only_exact_inactive_deployment_owner() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+        let resources = vec![
+            crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &app.namespace),
+            crate::mutation_leases::ResourceFence::edge_config(),
+        ];
+        let owner = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            resources.clone(),
+        )
+        .await
+        .expect("claim interrupted deployment resources");
+        owner
+            .arm_resource_scope_until_reconciled("kubernetes_namespace")
+            .await
+            .expect("pre-arm interrupted namespace");
+        let owner_token: Uuid = sqlx::query_scalar(
+            "SELECT owner_token
+               FROM app_mutation_leases
+              WHERE app_id = $1",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load interrupted deployment owner");
+        drop(owner);
+
+        let unrelated_token = Uuid::new_v4();
+        let unrelated_operation = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO external_resource_mutation_leases(
+                 resource_scope, resource_key, generation, owner_token,
+                 operation_kind, operation_id, locked_until, reclaim_after
+             ) VALUES (
+                 'kubernetes_namespace', $1, 1, $2, 'deployment_apply', $3,
+                 clock_timestamp() - interval '1 second', 'infinity'::timestamptz
+             )",
+        )
+        .bind(format!("unrelated-{}", Uuid::new_v4().simple()))
+        .bind(unrelated_token)
+        .bind(unrelated_operation)
+        .execute(&pool)
+        .await
+        .expect("insert unrelated provider poison");
+
+        let mut stalled = pool
+            .begin()
+            .await
+            .expect("begin stalled deployment fixture");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&mut *stalled)
+        .await
+        .expect("stage interrupted watching deployment");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'pending'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&mut *stalled)
+        .await
+        .expect("stage retryable pending apply job");
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE app_id = $1
+                AND owner_token = $2",
+        )
+        .bind(app.id)
+        .bind(owner_token)
+        .execute(&mut *stalled)
+        .await
+        .expect("expire interrupted app owner");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = CASE
+                        WHEN resource_scope = 'kubernetes_namespace'
+                            THEN 'infinity'::timestamptz
+                        ELSE clock_timestamp() - interval '1 second'
+                    END
+              WHERE owner_token = $1",
+        )
+        .bind(owner_token)
+        .execute(&mut *stalled)
+        .await
+        .expect("expire interrupted provider owners");
+        stalled
+            .commit()
+            .await
+            .expect("commit stalled deployment fixture");
+
+        let repaired = crate::mutation_leases::reconcile_orphaned_deployment_apply_leases(&pool)
+            .await
+            .expect("repair inactive deployment owner");
+        assert_eq!(
+            repaired, 1,
+            "only the exact infinite namespace poison is bounded"
+        );
+
+        let (app_infinite, namespace_infinite, edge_infinite, unrelated_infinite): (
+            bool,
+            bool,
+            bool,
+            bool,
+        ) = sqlx::query_as(
+            "SELECT
+                (SELECT reclaim_after = 'infinity'::timestamptz
+                   FROM app_mutation_leases WHERE app_id = $1),
+                (SELECT reclaim_after = 'infinity'::timestamptz
+                   FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'kubernetes_namespace'
+                    AND resource_key = $2),
+                (SELECT reclaim_after = 'infinity'::timestamptz
+                   FROM external_resource_mutation_leases
+                  WHERE resource_scope = 'edge_config'
+                    AND resource_key = 'global'),
+                (SELECT reclaim_after = 'infinity'::timestamptz
+                   FROM external_resource_mutation_leases
+                  WHERE owner_token = $3)",
+        )
+        .bind(app.id)
+        .bind(&app.namespace)
+        .bind(unrelated_token)
+        .fetch_one(&pool)
+        .await
+        .expect("verify exact inactive repair");
+        assert!(!app_infinite);
+        assert!(!namespace_infinite);
+        assert!(!edge_infinite);
+        assert!(unrelated_infinite);
+
+        let blocked = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "delete_app",
+            Uuid::new_v4(),
+            true,
+            resources.clone(),
+        )
+        .await
+        .expect_err("bounded quarantine still blocks immediate delete");
+        assert!(matches!(
+            blocked,
+            crate::mutation_leases::MutationLeaseError::Busy
+        ));
+
+        sqlx::query(
+            "UPDATE app_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE app_id = $1 AND owner_token = $2",
+        )
+        .bind(app.id)
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire repaired app owner");
+        sqlx::query(
+            "UPDATE external_resource_mutation_leases
+                SET locked_until = clock_timestamp() - interval '2 seconds',
+                    reclaim_after = clock_timestamp() - interval '1 second'
+              WHERE owner_token = $1",
+        )
+        .bind(owner_token)
+        .execute(&pool)
+        .await
+        .expect("expire repaired provider owners");
+        let delete = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "delete_app",
+            Uuid::new_v4(),
+            true,
+            resources,
+        )
+        .await
+        .expect("delete reclaims exact inactive owner after quarantine");
+        delete.finish().await.expect("finish delete generation");
+
+        sqlx::query("DELETE FROM external_resource_mutation_leases WHERE owner_token = $1")
+            .bind(unrelated_token)
+            .execute(&pool)
+            .await
+            .expect("remove unrelated poison fixture");
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope IN ('kubernetes_namespace', 'edge_config')
+                AND resource_key IN ($1, 'global')",
+        )
+        .bind(&app.namespace)
+        .execute(&pool)
+        .await
+        .expect("remove inactive provider fixtures");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean inactive repair fixture");
     }
 
     #[tokio::test]
