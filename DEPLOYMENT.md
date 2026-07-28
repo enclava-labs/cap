@@ -17,7 +17,10 @@ curl http://localhost:3000/health
 
 This mode starts PostgreSQL and the API with `ALLOW_EPHEMERAL_KEYS=1`. Do not
 use it for any persistent environment: API signing and session keys are rotated
-on restart.
+on restart. Compose also sets `CAP_DISABLE_EDGE_RECONCILIATION=true` because it
+does not run Kubernetes or tenant HAProxy, and keeps deployment dispatch
+disabled. Startup rejects combining the opt-out with enabled dispatch, and
+release builds reject the opt-out entirely.
 
 ## Production Model
 
@@ -136,6 +139,7 @@ Release builds refuse to start when dangerous development settings are enabled:
 SKIP_COSIGN_VERIFY
 COSIGN_ALLOW_HTTP_REGISTRY
 ALLOW_EPHEMERAL_KEYS
+CAP_DISABLE_EDGE_RECONCILIATION
 TENANT_TEE_ACCEPT_INVALID_CERTS
 ENCLAVA_TEE_ACCEPT_INVALID_CERTS
 LEGACY_BOOTSTRAP_SCRIPT

@@ -57,4 +57,16 @@ if grep -Eq 'image: ghcr\.io/enclava-labs/enclava-api:[^@ ]+' "${output_path}"; 
   exit 1
 fi
 
+for required in \
+  "serviceAccountName: enclava-api" \
+  "automountServiceAccountToken: true" \
+  "name: enclava-api-edge-reconciler" \
+  "name: enclava-api-service-reader" \
+  "namespace: tenant-envoy"; do
+  if ! grep -Fq "${required}" "${output_path}"; then
+    echo "error: rendered manifest is missing required Kubernetes access: ${required}" >&2
+    exit 1
+  fi
+done
+
 echo "${output_path}"

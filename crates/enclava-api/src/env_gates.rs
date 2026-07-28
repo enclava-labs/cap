@@ -23,6 +23,7 @@ const DEBUG_ONLY_FLAGS: &[&str] = &[
     "SKIP_COSIGN_VERIFY",
     "COSIGN_ALLOW_HTTP_REGISTRY",
     "ALLOW_EPHEMERAL_KEYS",
+    "CAP_DISABLE_EDGE_RECONCILIATION",
     "TENANT_TEE_ACCEPT_INVALID_CERTS",
     "ENCLAVA_TEE_ACCEPT_INVALID_CERTS",
     "LEGACY_BOOTSTRAP_SCRIPT",
@@ -161,6 +162,17 @@ mod tests {
     }
 
     #[test]
+    fn release_rejects_disabled_edge_reconciliation() {
+        let mut env = ok_required();
+        env.insert("CAP_DISABLE_EDGE_RECONCILIATION", "true");
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::DebugOnlyFlagInRelease("CAP_DISABLE_EDGE_RECONCILIATION")
+        ));
+    }
+
+    #[test]
     fn release_rejects_tee_accept_invalid_certs() {
         for flag in [
             "TENANT_TEE_ACCEPT_INVALID_CERTS",
@@ -195,6 +207,7 @@ mod tests {
         let mut env = ok_required();
         env.insert("SKIP_COSIGN_VERIFY", "1");
         env.insert("ALLOW_EPHEMERAL_KEYS", "1");
+        env.insert("CAP_DISABLE_EDGE_RECONCILIATION", "true");
         run(env, true).expect("debug build should permit dev flags");
     }
 

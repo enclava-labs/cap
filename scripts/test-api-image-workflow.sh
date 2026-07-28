@@ -3,6 +3,11 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="$ROOT_DIR/.github/workflows/api-image.yml"
+DOCKERFILE="$ROOT_DIR/crates/enclava-api/Dockerfile"
+COMPOSE="$ROOT_DIR/docker-compose.yml"
+DEPLOYMENT="$ROOT_DIR/deploy/api/deployment.yaml"
+KUSTOMIZATION="$ROOT_DIR/deploy/api/kustomization.yaml"
+RBAC="$ROOT_DIR/deploy/api/rbac.yaml"
 
 fail() {
   echo "error: $*" >&2
@@ -76,6 +81,51 @@ for required in \
   "sh -n scripts/verify-api-image-ref.sh" \
   "bash -n scripts/verify-api-image-ref.bash"; do
   assert_contains "$required"
+done
+
+grep -Fq -- '      - "deploy/api/**"' "$WORKFLOW" \
+  || fail "API manifest changes must trigger image validation"
+grep -Fq -- "serviceAccountName: enclava-api" "$DEPLOYMENT" \
+  || fail "API Deployment must use its Kubernetes reconciliation identity"
+grep -Fq -- "automountServiceAccountToken: true" "$DEPLOYMENT" \
+  || fail "API Deployment must mount Kubernetes credentials"
+grep -Fq -- 'CAP_DISABLE_EDGE_RECONCILIATION: "true"' "$COMPOSE" \
+  || fail "non-Kubernetes Compose must explicitly disable edge reconciliation"
+grep -Fq -- 'CAP_DEPLOYMENT_DISPATCH_ENABLED: "false"' "$COMPOSE" \
+  || fail "non-Kubernetes Compose must keep deployment dispatch disabled"
+if grep -Fq -- "CAP_DISABLE_EDGE_RECONCILIATION" "$DEPLOYMENT"; then
+  fail "release API Deployment must not disable edge reconciliation"
+fi
+grep -Fq -- "- rbac.yaml" "$KUSTOMIZATION" \
+  || fail "API release manifest must include reconciliation RBAC"
+if grep -Eq '^namespace:' "$KUSTOMIZATION"; then
+  fail "API kustomization must preserve the tenant-envoy Role namespace"
+fi
+for required in \
+  "kind: ServiceAccount" \
+  "kind: Role" \
+  "kind: RoleBinding" \
+  "name: enclava-api-edge-reconciler" \
+  "name: enclava-api-service-reader" \
+  "namespace: tenant-envoy" \
+  'resources: ["services"]' \
+  'resources: ["configmaps"]' \
+  'resources: ["pods"]' \
+  'resources: ["daemonsets"]' \
+  'resourceNames: ["haproxy-tenant"]' \
+  'verbs: ["list"]' \
+  'verbs: ["get", "update"]'; do
+  grep -Fq -- "$required" "$RBAC" \
+    || fail "API release RBAC is missing: $required"
+done
+
+for required in \
+  "cargo build --bin enclava-api --bin cap-migrate" \
+  "COPY --from=debug-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate" \
+  "cargo build --release --bin enclava-api --bin cap-migrate" \
+  "COPY --from=release-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate"; do
+  grep -Fq -- "$required" "$DOCKERFILE" \
+    || fail "API image Dockerfile is missing: $required"
 done
 
 if grep -Fq "id-token: write" <<<"$validate_block" \

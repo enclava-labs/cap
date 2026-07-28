@@ -18,7 +18,8 @@ spec:
       labels:
         app: enclava-api
     spec:
-      automountServiceAccountToken: false
+      serviceAccountName: enclava-api
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
