@@ -7,27 +7,51 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: enclava-api-edge-reconciler
+  name: enclava-api-service-reader
 rules:
 - apiGroups: [""]
   resources: ["services"]
   verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: enclava-api-service-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: enclava-api-service-reader
+subjects:
+- kind: ServiceAccount
+  name: enclava-api
+  namespace: enclava-platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: enclava-api-edge-reconciler
+  namespace: tenant-envoy
+rules:
 - apiGroups: [""]
   resources: ["configmaps"]
   resourceNames: ["haproxy-tenant"]
   verbs: ["get", "update"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["list"]
 - apiGroups: ["apps"]
   resources: ["daemonsets"]
   resourceNames: ["haproxy-tenant"]
   verbs: ["get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
   name: enclava-api-edge-reconciler
+  namespace: tenant-envoy
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
+  kind: Role
   name: enclava-api-edge-reconciler
 subjects:
 - kind: ServiceAccount

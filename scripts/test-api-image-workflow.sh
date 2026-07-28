@@ -90,13 +90,22 @@ grep -Fq -- "automountServiceAccountToken: true" "$DEPLOYMENT" \
   || fail "API Deployment must mount Kubernetes credentials"
 grep -Fq -- "- rbac.yaml" "$KUSTOMIZATION" \
   || fail "API release manifest must include reconciliation RBAC"
+if grep -Eq '^namespace:' "$KUSTOMIZATION"; then
+  fail "API kustomization must preserve the tenant-envoy Role namespace"
+fi
 for required in \
   "kind: ServiceAccount" \
+  "kind: Role" \
+  "kind: RoleBinding" \
   "name: enclava-api-edge-reconciler" \
+  "name: enclava-api-service-reader" \
+  "namespace: tenant-envoy" \
   'resources: ["services"]' \
   'resources: ["configmaps"]' \
+  'resources: ["pods"]' \
   'resources: ["daemonsets"]' \
   'resourceNames: ["haproxy-tenant"]' \
+  'verbs: ["list"]' \
   'verbs: ["get", "update"]'; do
   grep -Fq -- "$required" "$RBAC" \
     || fail "API release RBAC is missing: $required"

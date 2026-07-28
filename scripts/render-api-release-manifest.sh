@@ -60,7 +60,9 @@ fi
 for required in \
   "serviceAccountName: enclava-api" \
   "automountServiceAccountToken: true" \
-  "name: enclava-api-edge-reconciler"; do
+  "name: enclava-api-edge-reconciler" \
+  "name: enclava-api-service-reader" \
+  "namespace: tenant-envoy"; do
   if ! grep -Fq "${required}" "${output_path}"; then
     echo "error: rendered manifest is missing required Kubernetes access: ${required}" >&2
     exit 1
