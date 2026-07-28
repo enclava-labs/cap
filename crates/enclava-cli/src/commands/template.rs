@@ -1034,14 +1034,21 @@ async fn wait_for_template_bootstrap_endpoint(
 
 fn should_retry_template_bootstrap_endpoint_error(error: &ApiError) -> bool {
     match error {
-        ApiError::Http(_) => true,
-        ApiError::Api { status, code, .. } => match code.as_deref() {
-            Some("cap_app_sync_pending") => true,
-            Some("cap_response_invalid" | "not_implemented_hosted") => false,
-            _ => matches!(*status, 408 | 425 | 429 | 500..=599),
+        ApiError::Http(error) => should_retry_api_transport_error(error),
+        ApiError::Api { status, code, .. } => match (*status, code.as_deref()) {
+            (409, Some("cap_app_sync_pending")) => true,
+            (
+                _,
+                Some("cap_app_sync_pending" | "cap_response_invalid" | "not_implemented_hosted"),
+            ) => false,
+            (status, _) => matches!(status, 408 | 425 | 429 | 500..=599),
         },
         ApiError::NotAuthenticated => false,
     }
+}
+
+fn should_retry_api_transport_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
 }
 
 async fn deliver_template_config_with_retry(
@@ -1894,7 +1901,7 @@ fn template_deployment_failure_message(
 
 fn should_retry_template_deployment_status_error(error: &ApiError) -> bool {
     match error {
-        ApiError::Http(_) => true,
+        ApiError::Http(error) => should_retry_api_transport_error(error),
         ApiError::Api { status, code, .. } => {
             if matches!(
                 code.as_deref(),
@@ -3262,6 +3269,9 @@ mod tests {
             assert!(endpoint_retries(status, None));
         }
         for (status, code) in [
+            (401, "cap_app_sync_pending"),
+            (403, "cap_app_sync_pending"),
+            (500, "cap_app_sync_pending"),
             (401, "unauthenticated"),
             (403, "org_permission_denied"),
             (404, "app_not_found"),
@@ -3280,6 +3290,33 @@ mod tests {
         for status in [400, 401, 403, 422] {
             assert!(!status_retries(status));
         }
+    }
+
+    #[tokio::test]
+    async fn template_bootstrap_endpoint_rejects_decode_errors() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 8\r\n\r\nnot-json",
+                )
+                .await
+                .unwrap();
+        });
+
+        let error = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()))
+            .get_unlock_endpoint("shell")
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, ApiError::Http(error) if error.is_decode()));
+        assert!(!should_retry_template_bootstrap_endpoint_error(&error));
+        assert!(!should_retry_template_deployment_status_error(&error));
     }
 
     #[test]
