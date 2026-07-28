@@ -260,29 +260,41 @@ pub async fn reconcile_all_haproxy_routes(state: &AppState) -> Result<(), EdgeRe
     let generation = lease
         .resource_generation(&fence)
         .ok_or(crate::mutation_leases::MutationLeaseError::Lost)?;
-    let client = Client::try_default().await.map_err(EdgeRouteError::Kube)?;
-    let config = EdgeRouteConfig::from_env();
     lease
-        .guard_provider(async {
-            let routes = load_desired_haproxy_routes(&state.db, client.clone()).await?;
-            mutate_haproxy_config_with_client(
-                &state.db,
-                client,
-                &config,
-                state.runtime_authority,
-                Some(generation),
-                |current| {
-                    let mut desired = remove_all_cap_managed_routes(current);
-                    for route in &routes {
-                        desired = render_route_into(&desired, route);
-                    }
-                    desired
-                },
-            )
-            .await
-        })
+        .guard_provider(reconcile_all_haproxy_routes_for_claimed_generation(
+            state, generation,
+        ))
         .await??;
     lease.finish().await?;
+    Ok(())
+}
+
+/// Rebuild every CAP-owned route using an already-claimed global edge
+/// generation. Restore uses this to share one sorted resource lease with the
+/// KBS fence instead of nesting side-effect admission while authority is held.
+pub(crate) async fn reconcile_all_haproxy_routes_for_claimed_generation(
+    state: &AppState,
+    generation: i64,
+) -> Result<(), EdgeRouteError> {
+    require_haproxy_integration_enabled()?;
+    let client = Client::try_default().await.map_err(EdgeRouteError::Kube)?;
+    let config = EdgeRouteConfig::from_env();
+    let routes = load_desired_haproxy_routes(&state.db, client.clone()).await?;
+    mutate_haproxy_config_with_client(
+        &state.db,
+        client,
+        &config,
+        state.runtime_authority,
+        Some(generation),
+        |current| {
+            let mut desired = remove_all_cap_managed_routes(current);
+            for route in &routes {
+                desired = render_route_into(&desired, route);
+            }
+            desired
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -346,17 +358,20 @@ async fn load_desired_haproxy_routes(
     pool: &PgPool,
     client: Client,
 ) -> Result<Vec<SniRoute>, EdgeRouteError> {
-    let apps = sqlx::query_as::<_, DesiredEdgeApp>(
+    const DESIRED_EDGE_APPS_SQL: &str =
         "SELECT app.id AS app_id, app.name, app.namespace, app.domain,
                 app.tee_domain, app.custom_domain,
                 organization.cust_slug AS org_slug
            FROM apps AS app
            JOIN organizations AS organization ON organization.id = app.org_id
-          WHERE app.status <> 'deleting'::app_status_enum
-          ORDER BY app.id",
-    )
-    .fetch_all(pool)
-    .await?;
+          WHERE app.status IN (
+                    'creating'::app_status_enum,
+                    'running'::app_status_enum
+                )
+          ORDER BY app.id";
+    let apps = sqlx::query_as::<_, DesiredEdgeApp>(DESIRED_EDGE_APPS_SQL)
+        .fetch_all(pool)
+        .await?;
     let mut routes = Vec::new();
     for app in apps {
         let Some(address) =
@@ -1186,6 +1201,10 @@ mod tests {
             ),
             (
                 "pub async fn reconcile_all_haproxy_routes(",
+                "pub(crate) async fn reconcile_all_haproxy_routes_for_claimed_generation(",
+            ),
+            (
+                "pub(crate) async fn reconcile_all_haproxy_routes_for_claimed_generation(",
                 "async fn retry_busy_reconciliation",
             ),
         ] {
@@ -2129,6 +2148,23 @@ mod tests {
         assert!(out.contains("resolvers cluster_dns"));
         assert!(out.contains("backend be_reject"));
         assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn full_reconcile_never_republishes_terminal_or_stopped_apps() {
+        let source = include_str!("edge.rs");
+        let desired_query = source
+            .split("const DESIRED_EDGE_APPS_SQL")
+            .nth(1)
+            .and_then(|source| source.split(".fetch_all(pool)").next())
+            .expect("full-reconcile desired-app query remains explicit");
+
+        assert!(desired_query.contains("'creating'::app_status_enum"));
+        assert!(desired_query.contains("'running'::app_status_enum"));
+        assert!(!desired_query.contains("'failed'::app_status_enum"));
+        assert!(!desired_query.contains("'stopped'::app_status_enum"));
+        assert!(!desired_query.contains("'deleting'::app_status_enum"));
+        assert!(!desired_query.contains("<>"));
     }
 
     #[test]

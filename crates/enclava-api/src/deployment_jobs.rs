@@ -303,6 +303,8 @@ pub enum DeploymentJobError {
     LeaseLost,
     #[error("deployment authority changed before apply")]
     Authority,
+    #[error("legacy deployment or KBS authority is unsupported during restore")]
+    LegacyRestoreAuthority,
     #[error("deployment apply failed: {0}")]
     Apply(#[from] crate::deploy::DeployError),
     #[error("KBS policy authority update failed: {0}")]
@@ -328,6 +330,7 @@ impl DeploymentJobError {
             Self::Artifact => "artifact_invalid",
             Self::LeaseLost => "lease_lost",
             Self::Authority => "deployment_authority_changed",
+            Self::LegacyRestoreAuthority => "legacy_restore_authority",
             Self::Apply(error) => error.public_code(),
             Self::Kbs(_) => "kbs_policy_error",
             Self::ApplyLimiterClosed => "apply_limiter_closed",
@@ -1254,6 +1257,12 @@ async fn release_cleanup_for_retry_in_tx(
 /// have loaded.  Every API replica may run this loop; `FOR UPDATE SKIP LOCKED`
 /// and lease tokens ensure that only one owns a job at a time.
 pub fn spawn_deployment_dispatcher(state: AppState) {
+    if !state.deployment_dispatch_enabled {
+        tracing::warn!(
+            "refusing to spawn durable deployment dispatcher while dispatch is disabled"
+        );
+        return;
+    }
     let setup_worker_slots = Arc::new(tokio::sync::Semaphore::new(MAX_SETUP_WORKERS));
     let configured_apply_workers =
         apply_worker_limit(state.deployment_apply_permits.available_permits());
@@ -1610,6 +1619,195 @@ async fn reserve_restore_namespace_generation(
     })
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RestoreKbsAuthorityEvidence {
+    kbs_policy_configured: bool,
+    signed_policy_mode_active: bool,
+    retained_workload_count: usize,
+    orphan_namespace_count: usize,
+    required_signed_artifact_count: usize,
+}
+
+impl RestoreKbsAuthorityEvidence {
+    fn requires_reconciliation(self) -> bool {
+        // A configured installation and durable signed mode can both have
+        // live Trustee authority that must be rolled back before Kubernetes
+        // is mutated. Retained workloads and CAP-owned namespace inventory
+        // independently prove that a backup may have omitted a post-backup
+        // Trustee grant. Every such proof must enter the signed-policy fence
+        // even without configuration so reconciliation fails closed with
+        // NotConfigured.
+        self.kbs_policy_configured
+            || self.signed_policy_mode_active
+            || self.retained_workload_count > 0
+            || self.orphan_namespace_count > 0
+            || self.required_signed_artifact_count > 0
+    }
+}
+
+async fn load_durable_restore_kbs_authority(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(bool, bool), DeploymentJobError> {
+    sqlx::query_as(
+        "SELECT reconciliation.desired_generation > 0,
+                EXISTS (
+                    SELECT 1
+                      FROM kbs_owner_bindings
+                     WHERE deleted_at IS NULL
+                )
+                OR EXISTS (
+                    SELECT 1
+                      FROM kbs_tls_bindings
+                     WHERE deleted_at IS NULL
+                )
+           FROM kbs_signed_policy_reconciliation AS reconciliation
+          WHERE reconciliation.singleton",
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(DeploymentJobError::from)
+}
+
+async fn require_clean_cut_restore_jobs(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<(), DeploymentJobError> {
+    let unsupported_authority: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM deployment_apply_jobs AS job
+              WHERE NOT job.signed_required
+                 OR job.artifact_deployment_id IS NULL
+                 OR job.artifact_descriptor_core_hash IS NULL
+         )",
+    )
+    .fetch_one(&mut **transaction)
+    .await?;
+    if unsupported_authority {
+        return Err(DeploymentJobError::LegacyRestoreAuthority);
+    }
+    Ok(())
+}
+
+/// Lock a fully applied signed-policy generation in a dedicated short
+/// transaction.
+///
+/// Deployment acceptance updates this singleton in the same transaction as
+/// its durable job. Holding `FOR SHARE` therefore prevents a generation from
+/// committing between this final clean-cut scan and the Kubernetes mutations
+/// it authorizes. This lock must never live in the outer restore transaction:
+/// restore reconciliation advances the singleton through a different pool
+/// connection and would otherwise wait on its own row lock.
+async fn lock_converged_restore_kbs_authority(
+    pool: &PgPool,
+    require_signed_policy: bool,
+) -> Result<Transaction<'static, Postgres>, DeploymentJobError> {
+    let mut witness = pool.begin().await?;
+    let (desired_generation, policy_converged, active_legacy_binding): (i64, bool, bool) =
+        sqlx::query_as(
+            "SELECT reconciliation.desired_generation,
+                    reconciliation.desired_generation =
+                        reconciliation.configmap_generation
+                    AND reconciliation.desired_generation =
+                        reconciliation.applied_generation
+                    AND (
+                        reconciliation.desired_generation = 0
+                        OR (
+                            reconciliation.configmap_policy_sha256 IS NOT NULL
+                            AND reconciliation.applied_policy_sha256 =
+                                reconciliation.configmap_policy_sha256
+                            AND NULLIF(
+                                reconciliation.configmap_resource_version,
+                                ''
+                            ) IS NOT NULL
+                        )
+                    ),
+                    EXISTS (
+                        SELECT 1
+                          FROM kbs_owner_bindings
+                         WHERE deleted_at IS NULL
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                          FROM kbs_tls_bindings
+                         WHERE deleted_at IS NULL
+                    )
+               FROM kbs_signed_policy_reconciliation AS reconciliation
+              WHERE reconciliation.singleton
+              FOR SHARE OF reconciliation",
+        )
+        .fetch_one(&mut *witness)
+        .await?;
+    if active_legacy_binding {
+        return Err(DeploymentJobError::LegacyRestoreAuthority);
+    }
+    if !policy_converged || (require_signed_policy && desired_generation == 0) {
+        return Err(DeploymentJobError::Authority);
+    }
+    require_clean_cut_restore_jobs(&mut witness).await?;
+    Ok(witness)
+}
+
+async fn lock_clean_cut_startup_authority(
+    pool: &PgPool,
+) -> Result<Transaction<'static, Postgres>, DeploymentJobError> {
+    let mut witness = pool.begin().await?;
+    let active_legacy_binding: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+                    SELECT 1
+                      FROM kbs_owner_bindings
+                     WHERE deleted_at IS NULL
+                )
+                OR EXISTS (
+                    SELECT 1
+                      FROM kbs_tls_bindings
+                     WHERE deleted_at IS NULL
+                )
+           FROM kbs_signed_policy_reconciliation AS reconciliation
+          WHERE reconciliation.singleton
+          FOR SHARE OF reconciliation",
+    )
+    .fetch_one(&mut *witness)
+    .await?;
+    if active_legacy_binding {
+        return Err(DeploymentJobError::LegacyRestoreAuthority);
+    }
+    require_clean_cut_restore_jobs(&mut witness).await?;
+    Ok(witness)
+}
+
+/// Enforce the signed-only clean-cut invariant on every startup, including the
+/// migration-0044 `0 -> 1` initial generation adoption that intentionally does
+/// not run database-restore reconciliation.
+///
+/// The global KBS resource fence prevents a setup/delete worker from changing
+/// Trustee authority while the singleton row lock serializes deployment
+/// acceptance. Pending signed generations are allowed here and converge in the
+/// normal startup reconciler; only legacy/unsigned durable authority is fatal.
+pub async fn validate_clean_cut_authority_at_startup(
+    state: &AppState,
+) -> Result<(), DeploymentJobError> {
+    let kbs_mutation = crate::mutation_leases::claim_resources(
+        state,
+        "startup_clean_cut_validation",
+        Uuid::new_v4(),
+        vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+    )
+    .await?;
+    let witness = match lock_clean_cut_startup_authority(&state.db).await {
+        Ok(witness) => witness,
+        Err(error) => {
+            // Validation has made no provider call. Release the exact claim
+            // for every local proof failure; if authority was lost, `finish`
+            // fails closed and that stronger mutation error is returned.
+            kbs_mutation.finish().await?;
+            return Err(error);
+        }
+    };
+    witness.rollback().await?;
+    kbs_mutation.finish().await?;
+    Ok(())
+}
+
 pub async fn reconcile_kubernetes_after_restore_at_startup(
     state: &AppState,
 ) -> Result<(), DeploymentJobError> {
@@ -1703,7 +1901,7 @@ async fn reconcile_kubernetes_after_restore_with_engine(
         .await
         .map_err(enclava_engine::apply::engine::ApplyError::from)
         .map_err(crate::deploy::DeployError::from)?;
-    cap_owned_orphan_namespaces(
+    let initial_orphan_namespaces = cap_owned_orphan_namespaces(
         &database_namespaces,
         &reconciled_namespaces,
         initial_owned_namespaces.items,
@@ -1728,12 +1926,18 @@ async fn reconcile_kubernetes_after_restore_with_engine(
         .await?;
         let job = load_stored_deployment_job(&state.db, deployment_id, app_id, org_id).await?;
         let payload = job.decode_payload()?;
+        if !job.signed_required || job.artifact_deployment_id.is_none() {
+            return Err(DeploymentJobError::LegacyRestoreAuthority);
+        }
         if has_newer_in_flight {
             if !restore_payload_has_stable_app_identity(&payload.app, &app) {
                 return Err(DeploymentJobError::Authority);
             }
             let latest_job =
                 load_stored_deployment_job(&state.db, latest_deployment_id, app_id, org_id).await?;
+            if !latest_job.signed_required || latest_job.artifact_deployment_id.is_none() {
+                return Err(DeploymentJobError::LegacyRestoreAuthority);
+            }
             let latest_payload = latest_job.decode_payload()?;
             if !restore_payload_matches_current_app(&latest_payload.app, &app) {
                 return Err(DeploymentJobError::Authority);
@@ -1802,31 +2006,117 @@ async fn reconcile_kubernetes_after_restore_with_engine(
         });
     }
 
-    let restore_kbs_mutation = if !required_restore_policy_artifacts.is_empty() {
-        let kbs_mutation = crate::mutation_leases::claim_resources(
-            state,
-            "restore_retained_kbs_policy",
-            Uuid::new_v4(),
-            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
-        )
-        .await?;
-        kbs_mutation
-            .guard_provider(
-                crate::kbs::reconcile_signed_policy_artifacts_with_required_restore_artifacts(
+    let has_required_restore_policy_artifacts = !required_restore_policy_artifacts.is_empty();
+    // Claim before reading durable KBS state. Every supported deployment,
+    // deletion, and reconciler uses this same global resource fence, so a
+    // mistakenly overlapping old pod cannot insert legacy bindings or advance
+    // signed authority between our proof and the first Kubernetes write.
+    // When edge routing is enabled, claim its global generation in the same
+    // sorted lease so restore never nests side-effect admission while holding
+    // KBS authority.
+    let edge_fence = crate::mutation_leases::ResourceFence::edge_config();
+    let mut restore_resource_fences = vec![crate::mutation_leases::ResourceFence::kbs_policy()];
+    if state.edge_integration_enabled {
+        restore_resource_fences.push(edge_fence.clone());
+    }
+    let kbs_mutation = crate::mutation_leases::claim_resources(
+        state,
+        "restore_retained_kbs_policy",
+        Uuid::new_v4(),
+        restore_resource_fences,
+    )
+    .await?;
+    if let Err(error) = require_clean_cut_restore_jobs(&mut transaction).await {
+        // This scan performs no provider call. Release the exact clean
+        // resource claim so a corrected database can retry immediately.
+        kbs_mutation.finish().await?;
+        return Err(error);
+    }
+    let (signed_policy_mode_active, active_legacy_binding) =
+        match load_durable_restore_kbs_authority(&mut transaction).await {
+            Ok(authority) => authority,
+            Err(error) => {
+                // The durable evidence read also precedes every provider
+                // call. Do not quarantine a clean resource generation for a
+                // transient database failure.
+                kbs_mutation.finish().await?;
+                return Err(error);
+            }
+        };
+    if active_legacy_binding {
+        // Clean-cut signed restore never republishes legacy owner/TLS
+        // bindings. The rollout must remove them under the old authority
+        // before this binary is allowed to mutate either Trustee or workload
+        // Kubernetes state.
+        kbs_mutation.finish().await?;
+        return Err(DeploymentJobError::LegacyRestoreAuthority);
+    }
+    let restore_kbs_authority = RestoreKbsAuthorityEvidence {
+        kbs_policy_configured: state.kbs_policy.is_some(),
+        signed_policy_mode_active,
+        retained_workload_count: prepared_workloads.len(),
+        orphan_namespace_count: initial_orphan_namespaces.len(),
+        required_signed_artifact_count: required_restore_policy_artifacts.len(),
+    };
+    let kbs_reconciliation_required = restore_kbs_authority.requires_reconciliation();
+    if kbs_reconciliation_required {
+        let reconciliation = if has_required_restore_policy_artifacts {
+            kbs_mutation
+                .guard_provider(
+                    crate::kbs::reconcile_signed_policy_artifacts_with_required_restore_artifacts(
+                        &state.db,
+                        state.kbs_policy.as_ref(),
+                        state.runtime_authority,
+                        &required_restore_policy_artifacts,
+                    ),
+                )
+                .await?
+        } else {
+            kbs_mutation
+                .guard_provider(crate::kbs::reconcile_signed_policy_artifacts(
                     &state.db,
                     state.kbs_policy.as_ref(),
                     state.runtime_authority,
-                    &required_restore_policy_artifacts,
-                ),
-            )
-            .await??;
-        Some(kbs_mutation)
-    } else {
-        None
-    };
+                    None,
+                ))
+                .await?
+        };
+        if let Err(error) = reconciliation {
+            if matches!(error, crate::kbs::KbsPolicyError::NotConfigured) {
+                // Configuration absence is proven before any Trustee request
+                // is constructed or polled. Release this unmutated resource
+                // claim so the next corrected startup can retry immediately;
+                // every provider/authority error keeps the claim quarantined.
+                kbs_mutation.finish().await?;
+            }
+            return Err(error.into());
+        }
+    }
 
+    // Reconciliation above is deliberately lock-free with respect to the
+    // signed-policy singleton because it must advance that row through another
+    // pool connection. Only after it returns do we take a dedicated shared
+    // witness lock and repeat the clean-cut scan. A deployment acceptance that
+    // committed before this lock either advanced an unapplied generation or is
+    // visible to the scan; one queued behind it cannot commit until the
+    // restored Kubernetes state has been applied.
+    let initial_policy_witness =
+        match lock_converged_restore_kbs_authority(&state.db, kbs_reconciliation_required).await {
+            Ok(witness) => witness,
+            Err(error) => {
+                if matches!(
+                    error,
+                    DeploymentJobError::Authority | DeploymentJobError::LegacyRestoreAuthority
+                ) {
+                    kbs_mutation.finish().await?;
+                }
+                return Err(error);
+            }
+        };
+
+    let mut restored_rollouts = Vec::with_capacity(prepared_workloads.len());
     for prepared in prepared_workloads {
-        crate::deploy::apply_restored_kubernetes_manifests(
+        let rollout = crate::deploy::apply_restored_kubernetes_manifests(
             engine,
             prepared.request,
             prepared.generation,
@@ -1837,8 +2127,40 @@ async fn reconcile_kubernetes_after_restore_with_engine(
             deployment_id = %prepared.deployment_id,
             "re-applied restored Kubernetes workload authority"
         );
+        restored_rollouts.push((prepared.app_id, prepared.deployment_id, rollout));
     }
-    if let Some(kbs_mutation) = restore_kbs_mutation {
+
+    // Every restored Service now exists and the initial signed-policy
+    // generation is still fenced and witnessed. Repair the full edge
+    // projection before a password-locked rollout relies on its public TEE
+    // hostname; never expose a route before the pre-restore KBS authority has
+    // been revoked.
+    if state.edge_integration_enabled {
+        let edge_generation = kbs_mutation
+            .resource_generation(&edge_fence)
+            .ok_or(crate::mutation_leases::MutationLeaseError::Lost)?;
+        kbs_mutation
+            .guard_provider(
+                crate::edge::reconcile_all_haproxy_routes_for_claimed_generation(
+                    state,
+                    edge_generation,
+                ),
+            )
+            .await?
+            .map_err(crate::deploy::DeployError::from)?;
+    }
+
+    for (app_id, deployment_id, rollout) in restored_rollouts {
+        crate::deploy::observe_restored_kubernetes_rollout(state, engine, rollout).await?;
+        tracing::info!(
+            app_id = %app_id,
+            deployment_id = %deployment_id,
+            "observed restored Kubernetes workload as startup-safe"
+        );
+    }
+    initial_policy_witness.rollback().await?;
+
+    if kbs_reconciliation_required {
         // Keep the exact required artifact set fenced until every retained
         // workload has been observed startup-safe. Otherwise a pending newer
         // deployment could win the KBS lane between policy publication and
@@ -1848,16 +2170,43 @@ async fn reconcile_kubernetes_after_restore_with_engine(
         // retention. Advance and converge a new normal generation before
         // releasing the fence; publishing different content at the augmented
         // generation would be rejected by the content-bound CAS.
-        kbs_mutation
-            .guard_provider(crate::kbs::reconcile_signed_policy_artifacts(
-                &state.db,
-                state.kbs_policy.as_ref(),
-                state.runtime_authority,
-                None,
-            ))
-            .await??;
-        kbs_mutation.finish().await?;
+        if has_required_restore_policy_artifacts {
+            kbs_mutation
+                .guard_provider(crate::kbs::reconcile_signed_policy_artifacts(
+                    &state.db,
+                    state.kbs_policy.as_ref(),
+                    state.runtime_authority,
+                    None,
+                ))
+                .await??;
+        } else {
+            kbs_mutation
+                .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
+                    &state.db,
+                    state.kbs_policy.as_ref(),
+                    state.runtime_authority,
+                ))
+                .await??;
+        }
     }
+
+    // Lock the normal post-restore generation before orphan inventory and keep
+    // it through the durable restore-witness commit. This is the final proof
+    // that no unsupported or unapplied deployment authority can reach the
+    // dispatcher after readiness opens.
+    let final_policy_witness =
+        match lock_converged_restore_kbs_authority(&state.db, kbs_reconciliation_required).await {
+            Ok(witness) => witness,
+            Err(error) => {
+                if matches!(
+                    error,
+                    DeploymentJobError::Authority | DeploymentJobError::LegacyRestoreAuthority
+                ) {
+                    kbs_mutation.finish().await?;
+                }
+                return Err(error);
+            }
+        };
 
     let live_owned_namespaces = namespace_api
         .list(&kube::api::ListParams::default())
@@ -1870,6 +2219,12 @@ async fn reconcile_kubernetes_after_restore_with_engine(
         live_owned_namespaces.items,
         RestoreNamespaceInventoryPhase::AfterApply,
     )?;
+    if orphan_namespaces != initial_orphan_namespaces {
+        // Only the initial inventory was covered by the pre-apply Trustee
+        // revocation. A namespace that appears later must never be adopted or
+        // deleted under an authority snapshot that did not authorize it.
+        return Err(DeploymentJobError::Authority);
+    }
     for namespace in orphan_namespaces {
         let namespace_generation =
             reserve_restore_namespace_generation(&mut transaction, &namespace).await?;
@@ -1909,6 +2264,8 @@ async fn reconcile_kubernetes_after_restore_with_engine(
         return Err(crate::mutation_leases::MutationLeaseError::StaleRuntimeAuthority.into());
     }
     transaction.commit().await?;
+    kbs_mutation.finish().await?;
+    final_policy_witness.rollback().await?;
     tracing::info!(
         restore_generation = state.runtime_authority.restore_generation,
         "restored Kubernetes desired state converged before API startup"
@@ -3505,24 +3862,96 @@ mod tests {
     }
 
     #[test]
-    fn restore_namespace_plan_deletes_only_strict_cap_owned_orphans() {
-        fn owned_namespace(name: &str, tenant_id: &str) -> k8s_openapi::api::core::v1::Namespace {
-            let mut labels = std::collections::BTreeMap::new();
-            labels.insert(
-                "app.kubernetes.io/managed-by".to_string(),
-                "enclava-platform".to_string(),
+    fn restore_kbs_fence_covers_every_signed_restore_signal() {
+        let no_evidence = RestoreKbsAuthorityEvidence::default();
+        assert!(!no_evidence.requires_reconciliation());
+        for evidence in [
+            RestoreKbsAuthorityEvidence {
+                kbs_policy_configured: true,
+                ..no_evidence
+            },
+            RestoreKbsAuthorityEvidence {
+                signed_policy_mode_active: true,
+                ..no_evidence
+            },
+            RestoreKbsAuthorityEvidence {
+                retained_workload_count: 1,
+                ..no_evidence
+            },
+            RestoreKbsAuthorityEvidence {
+                orphan_namespace_count: 1,
+                ..no_evidence
+            },
+            RestoreKbsAuthorityEvidence {
+                required_signed_artifact_count: 1,
+                ..no_evidence
+            },
+        ] {
+            assert!(
+                evidence.requires_reconciliation(),
+                "every effective Trustee authority signal must enter the restore fence"
             );
-            labels.insert("enclava.dev/tenant".to_string(), tenant_id.to_string());
-            k8s_openapi::api::core::v1::Namespace {
-                metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-                    name: Some(name.to_string()),
-                    labels: Some(labels),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
         }
 
+        let source = include_str!("deployment_jobs.rs");
+        let restore_body = source
+            .split("async fn reconcile_kubernetes_after_restore_with_engine")
+            .nth(1)
+            .and_then(|body| body.split("async fn oldest_rollout_cleanup_job").next())
+            .expect("restore reconciliation body");
+        let kbs_fence = restore_body
+            .find("restore_kbs_authority.requires_reconciliation")
+            .expect("effective KBS restore fence");
+        let kubernetes_apply = restore_body
+            .find("apply_restored_kubernetes_manifests")
+            .expect("restored Kubernetes mutation");
+        assert!(
+            kbs_fence < kubernetes_apply,
+            "effective KBS authority must converge before any restored workload apply"
+        );
+    }
+
+    #[test]
+    fn restore_repairs_edge_after_services_and_before_locked_tee_observation() {
+        let source = include_str!("deployment_jobs.rs");
+        let restore_body = source
+            .split("async fn reconcile_kubernetes_after_restore_with_engine")
+            .nth(1)
+            .and_then(|body| body.split("async fn oldest_rollout_cleanup_job").next())
+            .expect("restore reconciliation body");
+        let kbs_witness = restore_body
+            .find("let initial_policy_witness")
+            .expect("converged KBS witness");
+        let combined_edge_fence = restore_body
+            .find("restore_resource_fences.push(edge_fence.clone())")
+            .expect("edge generation joined to restore resource lease");
+        let workload_apply = restore_body
+            .find("apply_restored_kubernetes_manifests")
+            .expect("restored workload apply");
+        let edge_reconcile = restore_body
+            .find("reconcile_all_haproxy_routes_for_claimed_generation")
+            .expect("restore edge reconciliation");
+        let rollout_observation = restore_body
+            .find("observe_restored_kubernetes_rollout")
+            .expect("restored rollout observation");
+
+        assert!(
+            combined_edge_fence < kbs_witness
+                && kbs_witness < workload_apply
+                && workload_apply < edge_reconcile
+                && edge_reconcile < rollout_observation,
+            "restore must fence KBS, apply every Service, repair edge routing, then probe exact TEE locked state"
+        );
+        assert!(
+            restore_body[..edge_reconcile]
+                .rfind("kbs_mutation")
+                .is_some_and(|guard| workload_apply < guard),
+            "edge repair must reuse the combined restore mutation guard"
+        );
+    }
+
+    #[test]
+    fn restore_namespace_plan_deletes_only_strict_cap_owned_orphans() {
         let database_namespaces =
             BTreeMap::from([("cap-restored-app".to_string(), "tenant-1".to_string())]);
         let reconciled_namespaces = BTreeSet::from(["cap-restored-app".to_string()]);
@@ -3530,8 +3959,8 @@ mod tests {
             &database_namespaces,
             &reconciled_namespaces,
             vec![
-                owned_namespace("cap-restored-app", "tenant-1"),
-                owned_namespace("cap-post-backup-app", "tenant-post-backup"),
+                restore_test_owned_namespace("cap-restored-app", "tenant-1"),
+                restore_test_owned_namespace("cap-post-backup-app", "tenant-post-backup"),
             ],
             RestoreNamespaceInventoryPhase::AfterApply,
         )
@@ -3559,7 +3988,7 @@ mod tests {
             cap_owned_orphan_namespaces(
                 &database_namespaces,
                 &reconciled_namespaces,
-                vec![owned_namespace("kube-system", "tenant-1")],
+                vec![restore_test_owned_namespace("kube-system", "tenant-1")],
                 RestoreNamespaceInventoryPhase::BeforeApply,
             )
             .is_err(),
@@ -3586,7 +4015,10 @@ mod tests {
             cap_owned_orphan_namespaces(
                 &database_namespaces,
                 &reconciled_namespaces,
-                vec![owned_namespace("cap-restored-app", "different-tenant")],
+                vec![restore_test_owned_namespace(
+                    "cap-restored-app",
+                    "different-tenant",
+                )],
                 RestoreNamespaceInventoryPhase::BeforeApply,
             )
             .is_err(),
@@ -3598,7 +4030,10 @@ mod tests {
             cap_owned_orphan_namespaces(
                 &incomplete_database_namespaces,
                 &BTreeSet::new(),
-                vec![owned_namespace("cap-incomplete-app", "tenant-1")],
+                vec![restore_test_owned_namespace(
+                    "cap-incomplete-app",
+                    "tenant-1",
+                )],
                 RestoreNamespaceInventoryPhase::BeforeApply,
             )
             .is_err(),
@@ -3623,6 +4058,748 @@ mod tests {
             )
             .is_err(),
             "the restored namespace must exist with strict ownership after apply"
+        );
+    }
+
+    fn restore_test_owned_namespace(
+        name: &str,
+        tenant_id: &str,
+    ) -> k8s_openapi::api::core::v1::Namespace {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert(
+            "app.kubernetes.io/managed-by".to_string(),
+            "enclava-platform".to_string(),
+        );
+        labels.insert("enclava.dev/tenant".to_string(), tenant_id.to_string());
+        k8s_openapi::api::core::v1::Namespace {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some(name.to_string()),
+                labels: Some(labels),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn restore_test_engine(
+        namespaces: Vec<k8s_openapi::api::core::v1::Namespace>,
+        kubernetes_mutation_attempted: Arc<AtomicBool>,
+    ) -> enclava_engine::apply::engine::ApplyEngine {
+        let namespace_list = Arc::new(
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "NamespaceList",
+                "metadata": {"resourceVersion": "1"},
+                "items": namespaces,
+            })
+            .to_string()
+            .into_bytes(),
+        );
+        let client = kube::Client::new(
+            service_fn(move |request: Request<Body>| {
+                let namespace_list = namespace_list.clone();
+                let kubernetes_mutation_attempted = kubernetes_mutation_attempted.clone();
+                async move {
+                    if request.method() == axum::http::Method::GET
+                        && request.uri().path() == "/api/v1/namespaces"
+                    {
+                        return Response::builder()
+                            .status(axum::http::StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(namespace_list.as_ref().clone()))
+                            .map_err(io::Error::other);
+                    }
+                    kubernetes_mutation_attempted.store(true, Ordering::SeqCst);
+                    Err(io::Error::other(
+                        "restore attempted Kubernetes mutation before KBS fail-closed gate",
+                    ))
+                }
+            }),
+            "default",
+        );
+        enclava_engine::apply::engine::ApplyEngine::new(client, Default::default())
+    }
+
+    async fn mark_restore_kubernetes_reconciliation_pending(pool: &PgPool) {
+        sqlx::query(
+            "UPDATE cap_runtime_authority
+                SET kubernetes_reconciled_restore_generation =
+                    restore_generation - 1
+              WHERE singleton
+                AND restore_generation > 0",
+        )
+        .execute(pool)
+        .await
+        .expect("mark Kubernetes restore reconciliation pending");
+    }
+
+    async fn restore_error_before_kubernetes_mutation(
+        pool: &PgPool,
+        engine: &enclava_engine::apply::engine::ApplyEngine,
+        kubernetes_mutation_attempted: &AtomicBool,
+        kbs_policy_configured: bool,
+    ) -> DeploymentJobError {
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.kbs_policy = kbs_policy_configured.then(|| crate::kbs::KbsPolicyConfig {
+            namespace: "trustee-operator-system".to_string(),
+            configmap_name: "resource-policy".to_string(),
+            policy_key: "policy.rego".to_string(),
+            deployment_name: "trustee-deployment".to_string(),
+            required: true,
+            signed_policy_retention: 6,
+            signed_policy_max_bytes: 900 * 1024,
+        });
+        state.runtime_authority = current_test_runtime_authority(pool)
+            .await
+            .expect("load restore test runtime authority");
+
+        let error = reconcile_kubernetes_after_restore_with_engine(&state, engine)
+            .await
+            .expect_err("restore authority must fail closed before Kubernetes mutation");
+        assert!(
+            !kubernetes_mutation_attempted.load(Ordering::SeqCst),
+            "restore prerequisite failure must be detected before KBS or workload mutation"
+        );
+        let converged: bool = sqlx::query_scalar(
+            "SELECT kubernetes_reconciled_restore_generation = restore_generation
+               FROM cap_runtime_authority
+              WHERE singleton",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("load pending Kubernetes restore witness");
+        assert!(
+            !converged,
+            "failed KBS reconciliation must leave restore retryable"
+        );
+        error
+    }
+
+    #[tokio::test]
+    async fn configured_restore_reconciliation_can_advance_before_policy_witness_lock() {
+        let pool = database_test_pool().await;
+        let mut restore_snapshot = pool.begin().await.expect("begin restore snapshot");
+        let evidence = RestoreKbsAuthorityEvidence {
+            kbs_policy_configured: true,
+            ..RestoreKbsAuthorityEvidence::default()
+        };
+        assert!(evidence.requires_reconciliation());
+
+        // This is the exact durable read that precedes configured restore
+        // reconciliation. It must not retain a row lock: the reconciler
+        // advances the singleton through another pool connection before a
+        // dedicated post-reconcile witness transaction takes FOR SHARE.
+        load_durable_restore_kbs_authority(&mut restore_snapshot)
+            .await
+            .expect("load unlocked restore KBS evidence");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut reconciliation = pool
+                .begin()
+                .await
+                .expect("begin configured restore reconciliation");
+            crate::kbs::enqueue_signed_policy_reconciliation(&mut reconciliation)
+                .await
+                .expect("configured restore reconciliation must advance");
+            reconciliation
+                .rollback()
+                .await
+                .expect("rollback reconciliation probe");
+        })
+        .await
+        .expect("restore snapshot must not self-deadlock configured KBS reconciliation");
+        restore_snapshot
+            .rollback()
+            .await
+            .expect("rollback restore snapshot");
+    }
+
+    #[tokio::test]
+    async fn clean_cut_restore_rejects_unsigned_creating_job_before_dispatch() {
+        let pool = database_test_pool().await;
+        let (app, _deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        assert_eq!(app.status, crate::models::AppStatus::Creating);
+
+        let mut restore_snapshot = pool.begin().await.expect("begin clean-cut scan");
+        let error = require_clean_cut_restore_jobs(&mut restore_snapshot)
+            .await
+            .expect_err("unsigned creating job must not survive clean-cut restore");
+        assert!(matches!(error, DeploymentJobError::LegacyRestoreAuthority));
+        restore_snapshot
+            .rollback()
+            .await
+            .expect("rollback clean-cut scan");
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete clean-cut creating fixture");
+    }
+
+    #[tokio::test]
+    async fn clean_cut_rejects_unsigned_rollout_cleanup_before_cleanup_claim() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'failed'::deploy_status_enum,
+                    completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("terminalize unsigned rollout");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'rollout_cleanup_pending',
+                    next_attempt_at = clock_timestamp() - interval '1 second',
+                    updated_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("prepare unsigned rollout cleanup");
+        let desired_generation_before: i64 = sqlx::query_scalar(
+            "SELECT desired_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load KBS intent before startup ordering proof");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.runtime_authority = current_test_runtime_authority(&pool)
+            .await
+            .expect("load startup ordering authority");
+        let error = async {
+            validate_clean_cut_authority_at_startup(&state).await?;
+            reconcile_failed_rollout_cleanup_at_startup(&state).await
+        }
+        .await
+        .expect_err("clean-cut validation must stop unsupported cleanup");
+        assert!(matches!(error, DeploymentJobError::LegacyRestoreAuthority));
+
+        let (job_state, attempts, lock_token): (String, i32, Option<Uuid>) = sqlx::query_as(
+            "SELECT state, attempts, lock_token
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load rejected unsigned rollout cleanup");
+        assert_eq!(job_state, "rollout_cleanup_pending");
+        assert_eq!(attempts, 0, "unsupported cleanup must never be claimed");
+        assert!(
+            lock_token.is_none(),
+            "unsupported cleanup must never acquire a job lease"
+        );
+        let desired_generation_after: i64 = sqlx::query_scalar(
+            "SELECT desired_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load KBS intent after startup ordering proof");
+        assert_eq!(
+            desired_generation_after, desired_generation_before,
+            "unsupported cleanup must not enqueue or reconcile Trustee authority"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete unsigned rollout cleanup fixture");
+    }
+
+    #[tokio::test]
+    async fn clean_cut_transient_validation_error_releases_kbs_resource_fence() {
+        let pool = database_test_pool().await;
+        let mut blocker = pool.begin().await.expect("begin clean-cut blocker");
+        sqlx::query("LOCK TABLE deployment_apply_jobs IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .expect("lock clean-cut job authority");
+
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let timeout_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .after_connect(|connection, _metadata| {
+                Box::pin(async move {
+                    sqlx::query("SET statement_timeout = '200ms'")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .connect(&database_url)
+            .await
+            .expect("connect bounded clean-cut pool");
+        let mut state = crate::test_support::lazy_state();
+        state.db = timeout_pool.clone();
+        state.runtime_authority = current_test_runtime_authority(&pool)
+            .await
+            .expect("load clean-cut runtime authority");
+
+        let error = validate_clean_cut_authority_at_startup(&state)
+            .await
+            .expect_err("blocked clean-cut scan must time out");
+        assert!(
+            matches!(error, DeploymentJobError::Db(_)),
+            "transient validation failure must retain its database classification, got {error:?}"
+        );
+
+        let reclaimed = crate::mutation_leases::claim_resources(
+            &state,
+            "startup_clean_cut_validation_retry",
+            Uuid::new_v4(),
+            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+        )
+        .await
+        .expect("pre-provider validation failure must release the KBS fence immediately");
+        reclaimed
+            .finish()
+            .await
+            .expect("release reclaimed clean-cut KBS fence");
+
+        blocker
+            .rollback()
+            .await
+            .expect("release clean-cut table blocker");
+        timeout_pool.close().await;
+    }
+
+    async fn assert_terminal_unsigned_job_blocks_restore_before_provider(
+        deployment_status: &str,
+        job_state: &str,
+    ) {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let mut terminal = pool.begin().await.expect("begin terminal legacy fixture");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = $2::deploy_status_enum,
+                    completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind(deployment_status)
+        .execute(&mut *terminal)
+        .await
+        .expect("terminalize legacy deployment");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = $2,
+                    updated_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .bind(job_state)
+        .execute(&mut *terminal)
+        .await
+        .expect("terminalize legacy job");
+        terminal
+            .commit()
+            .await
+            .expect("commit terminal legacy fixture");
+        mark_restore_kubernetes_reconciliation_pending(&pool).await;
+
+        let desired_generation_before: i64 = sqlx::query_scalar(
+            "SELECT desired_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load signed-policy generation before clean-cut rejection");
+        let kubernetes_mutation_attempted = Arc::new(AtomicBool::new(false));
+        let engine = restore_test_engine(Vec::new(), Arc::clone(&kubernetes_mutation_attempted));
+        let error = restore_error_before_kubernetes_mutation(
+            &pool,
+            &engine,
+            kubernetes_mutation_attempted.as_ref(),
+            true,
+        )
+        .await;
+        assert!(
+            matches!(error, DeploymentJobError::LegacyRestoreAuthority),
+            "terminal unsigned durable history must block clean-cut startup, got {error:?}"
+        );
+        let desired_generation_after: i64 = sqlx::query_scalar(
+            "SELECT desired_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load signed-policy generation after clean-cut rejection");
+        assert_eq!(
+            desired_generation_after, desired_generation_before,
+            "clean-cut rejection must precede KBS reconciliation intent"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete terminal legacy fixture");
+    }
+
+    #[tokio::test]
+    async fn clean_cut_restore_rejects_failed_unsigned_history_before_provider_mutation() {
+        assert_terminal_unsigned_job_blocks_restore_before_provider("failed", "failed").await;
+    }
+
+    #[tokio::test]
+    async fn clean_cut_restore_rejects_completed_unsigned_history_before_provider_mutation() {
+        assert_terminal_unsigned_job_blocks_restore_before_provider("healthy", "completed").await;
+    }
+
+    #[tokio::test]
+    async fn clean_cut_validation_covers_initial_zero_to_one_authority_adoption() {
+        let pool = database_test_pool().await;
+        let original_authority: (Uuid, i64, i64) = sqlx::query_as(
+            "SELECT authority_epoch, restore_generation,
+                    kubernetes_reconciled_restore_generation
+               FROM cap_runtime_authority
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load original initial-adoption authority");
+        let initial_epoch = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE cap_runtime_authority
+                SET authority_epoch = $1,
+                    restore_generation = 0,
+                    kubernetes_reconciled_restore_generation = 0
+              WHERE singleton",
+        )
+        .bind(initial_epoch)
+        .execute(&pool)
+        .await
+        .expect("prepare zero-generation authority");
+        let adopted = crate::runtime_authority::establish_epoch(&pool, 1)
+            .await
+            .expect("adopt initial restore generation");
+        assert_eq!(adopted.epoch, initial_epoch);
+        assert_eq!(adopted.restore_generation, 1);
+        let reconciled_generation: i64 = sqlx::query_scalar(
+            "SELECT kubernetes_reconciled_restore_generation
+               FROM cap_runtime_authority
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load adopted Kubernetes witness");
+        assert_eq!(
+            reconciled_generation, 1,
+            "initial adoption intentionally skips explicit restore reconciliation"
+        );
+
+        let (app, _deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.runtime_authority = adopted;
+        let error = validate_clean_cut_authority_at_startup(&state)
+            .await
+            .expect_err("initial adoption must still reject unsigned durable authority");
+        assert!(matches!(error, DeploymentJobError::LegacyRestoreAuthority));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete initial-adoption fixture");
+        sqlx::query(
+            "UPDATE cap_runtime_authority
+                SET authority_epoch = $1,
+                    restore_generation = $2,
+                    kubernetes_reconciled_restore_generation = $3
+              WHERE singleton",
+        )
+        .bind(original_authority.0)
+        .bind(original_authority.1)
+        .bind(original_authority.2)
+        .execute(&pool)
+        .await
+        .expect("restore original initial-adoption authority");
+    }
+
+    #[tokio::test]
+    async fn missing_kbs_config_blocks_empty_signed_restore_before_kubernetes_mutation() {
+        let pool = database_test_pool().await;
+        let app_count: i64 = sqlx::query_scalar("SELECT count(*) FROM apps")
+            .fetch_one(&pool)
+            .await
+            .expect("count empty signed restore apps");
+        assert_eq!(
+            app_count, 0,
+            "signed restore test requires an empty fixture"
+        );
+        let applied_policy_hash = vec![0x7c_u8; 32];
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 1,
+                    configmap_generation = 1,
+                    applied_generation = 1,
+                    configmap_policy_sha256 = $1,
+                    applied_policy_sha256 = $1,
+                    configmap_resource_version = 'empty-signed-restore-test',
+                    updated_at = clock_timestamp()
+              WHERE singleton",
+        )
+        .bind(applied_policy_hash)
+        .execute(&pool)
+        .await
+        .expect("activate fully applied empty signed-policy authority");
+        mark_restore_kubernetes_reconciliation_pending(&pool).await;
+
+        let kubernetes_mutation_attempted = Arc::new(AtomicBool::new(false));
+        let engine = restore_test_engine(Vec::new(), Arc::clone(&kubernetes_mutation_attempted));
+        let error = restore_error_before_kubernetes_mutation(
+            &pool,
+            &engine,
+            kubernetes_mutation_attempted.as_ref(),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(
+                error,
+                DeploymentJobError::Kbs(crate::kbs::KbsPolicyError::NotConfigured)
+            ),
+            "empty signed authority must require configured KBS management, got {error:?}"
+        );
+
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL,
+                    updated_at = clock_timestamp()
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("reset empty signed-policy test authority");
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_legacy_owner_kbs_authority_before_kubernetes_mutation() {
+        let pool = database_test_pool().await;
+        let (app, _deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        sqlx::query(
+            "INSERT INTO kbs_owner_bindings (
+                 app_id, binding_key, namespace, service_account,
+                 tenant_instance_identity_hash
+             )
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(app.id)
+        .bind(format!("legacy-restore-{}", app.id))
+        .bind(&app.namespace)
+        .bind(&app.service_account)
+        .bind(&app.tenant_instance_identity_hash)
+        .execute(&pool)
+        .await
+        .expect("insert active legacy KBS authority");
+        mark_restore_kubernetes_reconciliation_pending(&pool).await;
+
+        let kubernetes_mutation_attempted = Arc::new(AtomicBool::new(false));
+        let engine = restore_test_engine(Vec::new(), Arc::clone(&kubernetes_mutation_attempted));
+        let error = restore_error_before_kubernetes_mutation(
+            &pool,
+            &engine,
+            kubernetes_mutation_attempted.as_ref(),
+            true,
+        )
+        .await;
+        assert!(
+            matches!(error, DeploymentJobError::LegacyRestoreAuthority),
+            "legacy bindings must be rejected, never reconciled, got {error:?}"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete legacy restore fixture");
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_legacy_tls_kbs_authority_before_kubernetes_mutation() {
+        let pool = database_test_pool().await;
+        let (app, _deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings (
+                 app_id, binding_key, namespace, service_account,
+                 tenant_instance_identity_hash
+             )
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(app.id)
+        .bind(format!("legacy-tls-restore-{}", app.id))
+        .bind(&app.namespace)
+        .bind(&app.service_account)
+        .bind(&app.tenant_instance_identity_hash)
+        .execute(&pool)
+        .await
+        .expect("insert active legacy TLS KBS authority");
+        mark_restore_kubernetes_reconciliation_pending(&pool).await;
+
+        let kubernetes_mutation_attempted = Arc::new(AtomicBool::new(false));
+        let engine = restore_test_engine(Vec::new(), Arc::clone(&kubernetes_mutation_attempted));
+        let error = restore_error_before_kubernetes_mutation(
+            &pool,
+            &engine,
+            kubernetes_mutation_attempted.as_ref(),
+            true,
+        )
+        .await;
+        assert!(
+            matches!(error, DeploymentJobError::LegacyRestoreAuthority),
+            "legacy TLS bindings must be rejected, never reconciled, got {error:?}"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete legacy TLS restore fixture");
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_unsigned_retained_workload_before_kubernetes_mutation() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE apps
+                SET status = 'running'::app_status_enum
+              WHERE id = $1",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("make restore workload retained");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'healthy'::deploy_status_enum,
+                    completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("make retained restore deployment healthy");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'completed',
+                    updated_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("complete retained restore job");
+        mark_restore_kubernetes_reconciliation_pending(&pool).await;
+
+        let kubernetes_mutation_attempted = Arc::new(AtomicBool::new(false));
+        let engine = restore_test_engine(Vec::new(), Arc::clone(&kubernetes_mutation_attempted));
+        let error = restore_error_before_kubernetes_mutation(
+            &pool,
+            &engine,
+            kubernetes_mutation_attempted.as_ref(),
+            true,
+        )
+        .await;
+        assert!(
+            matches!(error, DeploymentJobError::LegacyRestoreAuthority),
+            "unsigned retained workload must not be revived, got {error:?}"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete retained restore fixture");
+    }
+
+    #[tokio::test]
+    async fn restore_rejects_unreconciled_current_namespace_before_kubernetes_mutation() {
+        let pool = database_test_pool().await;
+        let (app, _deployment_id, _setup_handle, _payload) = insert_job_fixture(&pool).await;
+        mark_restore_kubernetes_reconciliation_pending(&pool).await;
+
+        let kubernetes_mutation_attempted = Arc::new(AtomicBool::new(false));
+        let engine = restore_test_engine(
+            vec![restore_test_owned_namespace(&app.namespace, &app.tenant_id)],
+            Arc::clone(&kubernetes_mutation_attempted),
+        );
+        let error = restore_error_before_kubernetes_mutation(
+            &pool,
+            &engine,
+            kubernetes_mutation_attempted.as_ref(),
+            true,
+        )
+        .await;
+        assert!(
+            matches!(error, DeploymentJobError::Authority),
+            "a live namespace without a healthy signed restore snapshot must block, got {error:?}"
+        );
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete unreconciled current namespace fixture");
+    }
+
+    #[tokio::test]
+    async fn missing_kbs_config_blocks_orphan_restore_before_kubernetes_mutation() {
+        let pool = database_test_pool().await;
+        let app_count: i64 = sqlx::query_scalar("SELECT count(*) FROM apps")
+            .fetch_one(&pool)
+            .await
+            .expect("count orphan restore apps");
+        assert_eq!(
+            app_count, 0,
+            "orphan restore test requires an empty fixture"
+        );
+        mark_restore_kubernetes_reconciliation_pending(&pool).await;
+
+        let kubernetes_mutation_attempted = Arc::new(AtomicBool::new(false));
+        let engine = restore_test_engine(
+            vec![restore_test_owned_namespace(
+                "cap-post-backup-app",
+                "tenant-post-backup",
+            )],
+            Arc::clone(&kubernetes_mutation_attempted),
+        );
+        let error = restore_error_before_kubernetes_mutation(
+            &pool,
+            &engine,
+            kubernetes_mutation_attempted.as_ref(),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(
+                error,
+                DeploymentJobError::Kbs(crate::kbs::KbsPolicyError::NotConfigured)
+            ),
+            "orphan inventory must require signed-policy revocation, got {error:?}"
         );
     }
 
@@ -3675,6 +4852,8 @@ mod tests {
         let engine = enclava_engine::apply::engine::ApplyEngine::new(client, Default::default());
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
+        state.edge_integration_enabled = false;
+        state.deployment_dispatch_enabled = false;
         state.runtime_authority = current_test_runtime_authority(&pool)
             .await
             .expect("load restore test runtime authority");
@@ -4009,6 +5188,26 @@ mod tests {
         assert!(
             heartbeat_size <= 8 * 1024,
             "lease heartbeat amplified future state from {operation_size} to {heartbeat_size} bytes"
+        );
+    }
+
+    #[test]
+    fn dispatcher_refuses_to_spawn_when_activation_gate_is_closed() {
+        let source = include_str!("deployment_jobs.rs");
+        let dispatcher = source
+            .split("pub fn spawn_deployment_dispatcher")
+            .nth(1)
+            .and_then(|body| body.split("async fn claim_job").next())
+            .expect("dispatcher implementation remains explicit");
+        let gate = dispatcher
+            .find("if !state.deployment_dispatch_enabled")
+            .expect("dispatcher activation gate");
+        let spawn = dispatcher
+            .find("tokio::spawn")
+            .expect("dispatcher loop spawn");
+        assert!(
+            gate < spawn,
+            "dispatcher must fail closed before spawning any worker loop"
         );
     }
 

@@ -124,6 +124,7 @@ pub async fn rollback(
 ) -> Result<(StatusCode, Json<RollbackResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    super::require_deployment_dispatch_enabled(&state)?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)

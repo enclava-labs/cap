@@ -21,6 +21,28 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn parse_fail_closed_switch(name: &str, value: Option<&str>) -> anyhow::Result<bool> {
+    match value {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => anyhow::bail!("{name} must be exactly `true` or `false`"),
+    }
+}
+
+fn load_deployment_dispatch_enabled() -> anyhow::Result<bool> {
+    match std::env::var("CAP_DEPLOYMENT_DISPATCH_ENABLED") {
+        Ok(value) => {
+            parse_fail_closed_switch("CAP_DEPLOYMENT_DISPATCH_ENABLED", Some(value.as_str()))
+        }
+        Err(std::env::VarError::NotPresent) => {
+            parse_fail_closed_switch("CAP_DEPLOYMENT_DISPATCH_ENABLED", None)
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("CAP_DEPLOYMENT_DISPATCH_ENABLED must be valid UTF-8")
+        }
+    }
+}
+
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -630,6 +652,19 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let deployment_dispatch_enabled = match load_deployment_dispatch_enabled() {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            eprintln!("startup refused: invalid deployment dispatch configuration: {error}");
+            std::process::exit(1);
+        }
+    };
+    if deployment_dispatch_enabled && !haproxy_integration_enabled {
+        eprintln!(
+            "startup refused: CAP_DEPLOYMENT_DISPATCH_ENABLED=true requires tenant HAProxy integration"
+        );
+        std::process::exit(1);
+    }
 
     let trustee_policy_read_available = env_flag("TRUSTEE_POLICY_READ_AVAILABLE");
     let platform_release_envelope =
@@ -872,6 +907,9 @@ async fn main() {
         db: pool,
         runtime_authority,
         management_mode,
+        edge_integration_enabled: haproxy_integration_enabled,
+        deployment_dispatch_enabled,
+        startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         signing_key: Arc::new(signing_key),
         hmac_key: Arc::new(hmac_key),
         api_url,
@@ -898,6 +936,33 @@ async fn main() {
         internal_auth,
     };
 
+    // Bind before provider reconciliation so Kubernetes can probe process
+    // liveness during a bounded, potentially long database-restore recovery.
+    // Router middleware exposes only /livez until every startup authority has
+    // converged; /health, /readyz, and all API routes remain unavailable.
+    let app = build_router(state.clone());
+    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .expect("failed to bind");
+    tracing::info!("startup liveness listening on {}", bind_addr);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
+
+    if let Err(error) =
+        enclava_api::deployment_jobs::validate_clean_cut_authority_at_startup(&state).await
+    {
+        eprintln!(
+            "startup refused: legacy or unsigned deployment authority remains: error_code={}",
+            error.code()
+        );
+        std::process::exit(1);
+    }
     if let Err(error) =
         enclava_api::deployment_jobs::reconcile_failed_rollout_cleanup_at_startup(&state).await
     {
@@ -939,28 +1004,27 @@ async fn main() {
     }
 
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
-    if haproxy_integration_enabled {
+    if deployment_dispatch_enabled {
         enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
+    } else {
+        tracing::info!(
+            "durable deployment acceptance and dispatch are disabled by CAP_DEPLOYMENT_DISPATCH_ENABLED"
+        );
+    }
+    if haproxy_integration_enabled {
         enclava_api::edge::spawn_haproxy_reconciler(state.clone());
     } else {
         tracing::info!(
-            "durable deployment dispatch is disabled while tenant HAProxy integration is disabled"
+            "tenant HAProxy integration and background route reconciliation are disabled"
         );
     }
-    let app = build_router(state);
+    state.mark_startup_ready();
+    tracing::info!("startup reconciliation complete; API is ready");
 
-    let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
+    server
         .await
-        .expect("failed to bind");
-    tracing::info!("listening on {}", bind_addr);
-
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .expect("server error");
+        .expect("server task panicked")
+        .expect("server error");
 }
 
 #[cfg(test)]
@@ -996,6 +1060,7 @@ mod tests {
         for prerequisite in [
             "runtime_authority::establish_epoch",
             "reconcile_failed_rollout_cleanup_at_startup",
+            "validate_clean_cut_authority_at_startup",
             "reconcile_policy_at_startup",
             "reconcile_kubernetes_after_restore_at_startup",
             "verify_trustee_kbs_connectivity",
@@ -1011,6 +1076,51 @@ mod tests {
     }
 
     #[test]
+    fn startup_listener_serves_separate_liveness_until_authority_is_ready() {
+        let source = include_str!("main.rs");
+        let main_body = source
+            .split("#[tokio::main]")
+            .nth(1)
+            .and_then(|s| s.split("#[cfg(test)]").next())
+            .expect("main body");
+        let bind = main_body
+            .find("TcpListener::bind")
+            .expect("startup listener bind");
+        let first_reconciliation = main_body
+            .find("reconcile_failed_rollout_cleanup_at_startup")
+            .expect("first startup reconciliation");
+        let ready = main_body
+            .find("mark_startup_ready")
+            .expect("startup readiness publication");
+        let dispatch = main_body
+            .find("spawn_deployment_dispatcher")
+            .expect("deployment dispatcher startup");
+        assert!(
+            bind < first_reconciliation,
+            "liveness listener must bind before potentially long restore reconciliation"
+        );
+        assert!(
+            dispatch < ready,
+            "readiness must remain closed until provider convergence and dispatcher startup"
+        );
+
+        let deployment = include_str!("../../../deploy/api/deployment.yaml");
+        assert!(
+            deployment.contains("startupProbe:\n          httpGet:\n            path: /livez")
+                && deployment.contains("failureThreshold: 180"),
+            "Kubernetes startup must allow a bounded migration-safe window before /livez exists"
+        );
+        assert!(
+            deployment.contains("livenessProbe:\n          httpGet:\n            path: /livez"),
+            "Kubernetes liveness must use the startup-safe endpoint"
+        );
+        assert!(
+            deployment.contains("readinessProbe:\n          httpGet:\n            path: /readyz"),
+            "Kubernetes readiness must remain distinct from process liveness"
+        );
+    }
+
+    #[test]
     fn haproxy_flag_is_validated_before_database_or_provider_authority() {
         let source = include_str!("main.rs");
         let main_body = source
@@ -1021,6 +1131,9 @@ mod tests {
         let haproxy_flag = main_body
             .find("edge::haproxy_integration_enabled")
             .expect("HAProxy integration flag validation");
+        let dispatch_flag = main_body
+            .find("load_deployment_dispatch_enabled")
+            .expect("deployment dispatch flag validation");
         for side_effect in [
             "db::pool::create_pool",
             "db::pool::run_migrations",
@@ -1033,7 +1146,15 @@ mod tests {
                 haproxy_flag < main_body.find(side_effect).expect(side_effect),
                 "HAProxy integration config must be valid before {side_effect}"
             );
+            assert!(
+                dispatch_flag < main_body.find(side_effect).expect(side_effect),
+                "deployment dispatch config must be valid before {side_effect}"
+            );
         }
+        assert!(
+            main_body.contains("if deployment_dispatch_enabled && !haproxy_integration_enabled"),
+            "dispatch activation must require a configured edge integration"
+        );
     }
 
     #[test]
@@ -1047,6 +1168,9 @@ mod tests {
         let cleanup = main_body
             .find("reconcile_failed_rollout_cleanup_at_startup")
             .expect("failed-rollout cleanup startup");
+        let clean_cut = main_body
+            .find("validate_clean_cut_authority_at_startup")
+            .expect("signed-only clean-cut startup validation");
         let kubernetes_restore = main_body
             .find("reconcile_kubernetes_after_restore_at_startup")
             .expect("restored Kubernetes reconciliation startup");
@@ -1056,6 +1180,10 @@ mod tests {
         assert!(
             cleanup < kubernetes_restore,
             "exact failed-rollout cleanup must precede restored Kubernetes reconciliation"
+        );
+        assert!(
+            clean_cut < cleanup && cleanup < kubernetes_restore,
+            "clean-cut validation must reject unsupported authority before cleanup can reach Trustee"
         );
         assert!(
             kubernetes_restore < generic_kbs,
@@ -1071,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_haproxy_startup_reconciles_before_dispatch_in_every_mode() {
+    fn edge_reconciliation_and_dispatch_activation_are_independent() {
         let source = include_str!("main.rs");
         let main_body = source
             .split("#[tokio::main]")
@@ -1098,14 +1226,37 @@ mod tests {
             .nth(1)
             .and_then(|body| body.split("let app = build_router").next())
             .expect("background worker startup block");
-        let enabled_branch = background_workers
+        let dispatch_branch = background_workers
+            .split("if deployment_dispatch_enabled {")
+            .nth(1)
+            .and_then(|body| body.split("if haproxy_integration_enabled {").next())
+            .expect("deployment-dispatch worker branch");
+        assert!(
+            dispatch_branch.contains("spawn_deployment_dispatcher"),
+            "durable deployment dispatch must require explicit activation"
+        );
+        let edge_branch = background_workers
             .split("if haproxy_integration_enabled {")
             .nth(1)
             .expect("HAProxy-enabled worker branch");
         assert!(
-            enabled_branch.contains("spawn_deployment_dispatcher"),
-            "durable deployment dispatch must start only in the HAProxy-enabled branch"
+            edge_branch.contains("spawn_haproxy_reconciler")
+                && !edge_branch.contains("spawn_deployment_dispatcher"),
+            "edge reconciliation must remain active without enabling deployment dispatch"
         );
+    }
+
+    #[test]
+    fn deployment_dispatch_switch_is_strict_and_fail_closed() {
+        assert!(!parse_fail_closed_switch("SWITCH", None).unwrap());
+        assert!(!parse_fail_closed_switch("SWITCH", Some("false")).unwrap());
+        assert!(parse_fail_closed_switch("SWITCH", Some("true")).unwrap());
+        for invalid in ["", "1", "TRUE", "yes", " true", "false "] {
+            assert!(
+                parse_fail_closed_switch("SWITCH", Some(invalid)).is_err(),
+                "{invalid:?} must not activate dispatch"
+            );
+        }
     }
 
     #[test]

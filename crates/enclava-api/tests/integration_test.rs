@@ -200,6 +200,9 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
         db: pool.clone(),
         runtime_authority,
         management_mode,
+        edge_integration_enabled: true,
+        deployment_dispatch_enabled: true,
+        startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         signing_key,
         hmac_key,
         api_url: "http://localhost:3000".to_string(),
@@ -631,6 +634,43 @@ async fn health_endpoint_returns_ok() {
 
     response.assert_status_ok();
     response.assert_text("ok");
+}
+
+#[tokio::test]
+async fn startup_gate_exposes_liveness_without_serving_unreconciled_authority() {
+    let (mut state, _pool) = setup_test_state().await;
+    state.startup_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readiness = state.clone();
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    server
+        .get("/livez")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .await
+        .assert_status_ok();
+    server
+        .get("/readyz")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .await
+        .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    server
+        .get("/health")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .await
+        .assert_status(StatusCode::SERVICE_UNAVAILABLE);
+
+    readiness.mark_startup_ready();
+    server
+        .get("/readyz")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .await
+        .assert_status_ok();
+    server
+        .get("/health")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .await
+        .assert_status_ok();
 }
 
 #[tokio::test]
@@ -1988,6 +2028,93 @@ async fn paas_internal_app_logs_fail_closed_after_actor_validation() {
     let body: Value = logs.json();
     assert_eq!(body["error"], "encrypted_logs_required");
     assert_eq!(body["code"], "encrypted_logs_required");
+}
+
+#[tokio::test]
+async fn workload_authority_admission_is_side_effect_free_when_dispatch_is_disabled() {
+    let (mut state, pool) = setup_test_state().await;
+    let enabled_server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(test_router(state.clone()));
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("existing-before-freeze-{}", &suffix[..8]);
+    let blocked_app_name = format!("blocked-after-freeze-{}", &suffix[..8]);
+    let (session_token, org_id) = signup_owner(&enabled_server, "workload-freeze").await;
+
+    enabled_server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    state.deployment_dispatch_enabled = false;
+    let frozen_server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(test_router(state));
+
+    let create = frozen_server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": blocked_app_name,
+            "unlock_mode": "auto",
+        }))
+        .await;
+    create.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let create_body: Value = create.json();
+    assert_eq!(create_body["error"], "deploy_blocked");
+    assert_eq!(
+        create_body["reason"], "deployment_dispatch_disabled",
+        "the rollout gate must freeze app and provider authority, not only the dispatcher"
+    );
+
+    let deploy = frozen_server
+        .post(&format!("/apps/{app_name}/deploy"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "image": "ghcr.io/acme/never-dispatched@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }))
+        .await;
+    deploy.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = deploy.json();
+    assert_eq!(body["error"], "deploy_blocked");
+    assert_eq!(body["reason"], "deployment_dispatch_disabled");
+
+    let accepted: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (
+                    SELECT count(*)
+                      FROM apps
+                     WHERE org_id = $1
+                ),
+                (
+                    SELECT count(*)
+                      FROM deployments AS deployment
+                      JOIN apps AS app ON app.id = deployment.app_id
+                     WHERE app.org_id = $1
+                ),
+                (
+                    SELECT count(*)
+                      FROM deployment_apply_jobs AS job
+                      JOIN apps AS app ON app.id = job.app_id
+                     WHERE app.org_id = $1
+                )",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count disabled deployment acceptance");
+    assert_eq!(
+        accepted,
+        (1, 0, 0),
+        "the freeze must not create a second app or accept deployment authority"
+    );
 }
 
 #[tokio::test]

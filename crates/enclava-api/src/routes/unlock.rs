@@ -914,6 +914,7 @@ pub async fn update_unlock_mode(
     scopes::require_owner(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    crate::routes::deployments::require_deployment_dispatch_enabled(&state)?;
 
     let requested = RequestedUnlockMode::parse(&body.mode).map_err(|e| {
         (

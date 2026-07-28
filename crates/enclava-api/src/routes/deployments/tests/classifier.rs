@@ -450,6 +450,243 @@ fn signed_deploy_path_ensures_app_and_tee_dns_pair() {
 }
 
 #[test]
+fn every_durable_deployment_entrypoint_gates_the_dispatcher_before_acceptance() {
+    let deploy_source = include_str!("../../deployments.rs");
+    let deploy_candidate = deploy_source
+        .split("async fn deploy_app_candidate")
+        .nth(1)
+        .and_then(|body| body.split("/// GET /apps/{name}/deployments").next())
+        .expect("deployment candidate body");
+    assert!(
+        deploy_candidate
+            .find("require_deployment_dispatch_enabled")
+            .is_some_and(|gate| {
+                deploy_candidate
+                    .find("let mut tx = state.db.begin()")
+                    .is_some_and(|transaction| gate < transaction)
+            }),
+        "deploy and generic-deploy acceptance must fail before opening the durable transaction"
+    );
+
+    let rollback_source = include_str!("../rollback.rs");
+    let rollback = rollback_source
+        .split("pub async fn rollback")
+        .nth(1)
+        .and_then(|body| body.split("#[cfg(test)]").next())
+        .expect("rollback route body");
+    assert!(
+        rollback
+            .find("require_deployment_dispatch_enabled")
+            .is_some_and(|gate| {
+                rollback
+                    .find("let mut tx = state.db.begin()")
+                    .is_some_and(|transaction| gate < transaction)
+            }),
+        "rollback acceptance must fail before opening the durable transaction"
+    );
+
+    let unlock_source = include_str!("../../unlock.rs");
+    let unlock = unlock_source
+        .split("pub async fn update_unlock_mode")
+        .nth(1)
+        .and_then(|body| body.split("/// GET /apps/{name}/ownership").next())
+        .expect("unlock-mode route body");
+    assert!(
+        unlock
+            .find("require_deployment_dispatch_enabled")
+            .is_some_and(|gate| {
+                unlock
+                    .find("commit_unlock_mode_transition")
+                    .is_some_and(|acceptance| gate < acceptance)
+            }),
+        "unlock-mode deployment acceptance must fail before its durable commit"
+    );
+
+    let internal_source = include_str!("../../internal.rs");
+    for entrypoint in [
+        "deploy_paas_app",
+        "rollback_paas_app",
+        "create_paas_generic_deployment",
+        "update_paas_unlock_mode",
+    ] {
+        let marker = format!("pub async fn {entrypoint}");
+        let body = internal_source
+            .split(&marker)
+            .nth(1)
+            .and_then(|body| body.split("\npub async fn ").next())
+            .unwrap_or_else(|| panic!("{entrypoint} internal route body"));
+        let gate = body
+            .find("require_deployment_dispatch_enabled")
+            .unwrap_or_else(|| panic!("{entrypoint} dispatcher gate"));
+        let idempotency = body
+            .find("begin_actor_idempotent_request")
+            .unwrap_or_else(|| panic!("{entrypoint} idempotency acceptance"));
+
+        assert!(
+            gate < idempotency,
+            "{entrypoint} must reject a disabled dispatcher before reserving durable idempotency state"
+        );
+    }
+}
+
+#[test]
+fn rollout_freeze_covers_workload_authority_writes_and_preserves_normal_delete() {
+    fn body_before_next_public_handler<'a>(source: &'a str, marker: &str) -> &'a str {
+        source
+            .split(marker)
+            .nth(1)
+            .and_then(|body| body.split("\npub async fn ").next())
+            .unwrap_or_else(|| panic!("{marker} handler body"))
+    }
+
+    for (source, marker, first_authority_access) in [
+        (
+            include_str!("../../apps.rs"),
+            "pub async fn create_app",
+            "prepare_app_candidate",
+        ),
+        (
+            include_str!("../../apps.rs"),
+            "pub async fn issue_signer_rotation_token_route",
+            "let app_lookup",
+        ),
+        (
+            include_str!("../../apps.rs"),
+            "pub async fn rotate_signer",
+            "let app_lookup",
+        ),
+        (
+            include_str!("../../config.rs"),
+            "async fn issue_config_token_route_inner",
+            "let app:",
+        ),
+        (
+            include_str!("../../config.rs"),
+            "pub async fn config_sync",
+            "sync_config_metadata_for_org",
+        ),
+        (
+            include_str!("../../config.rs"),
+            "pub async fn delete_config_meta",
+            "delete_config_metadata_for_org",
+        ),
+        (
+            include_str!("../../domains.rs"),
+            "pub async fn create_challenge",
+            "let app:",
+        ),
+        (
+            include_str!("../../domains.rs"),
+            "pub async fn verify_challenge",
+            "require_haproxy_domain_mutations",
+        ),
+        (
+            include_str!("../../domains.rs"),
+            "pub async fn remove_custom_domain",
+            "require_haproxy_domain_mutations",
+        ),
+        (
+            include_str!("../../orgs.rs"),
+            "pub async fn put_keyring",
+            "active_membership",
+        ),
+        (
+            include_str!("../../orgs.rs"),
+            "pub async fn bootstrap_signing_service_owner",
+            "active_membership",
+        ),
+        (
+            include_str!("../../users.rs"),
+            "pub async fn register_public_key",
+            "decode_hex32",
+        ),
+        (
+            include_str!("../generic.rs"),
+            "pub async fn generate_agent_policy",
+            "let app:",
+        ),
+        (
+            include_str!("../generic.rs"),
+            "pub async fn create_generic_deployment",
+            "validate_external_id",
+        ),
+        (
+            include_str!("../generic.rs"),
+            "async fn generic_config_token_inner",
+            "fetch_deployment_with_app",
+        ),
+        (
+            include_str!("../../workload_tls.rs"),
+            "pub async fn dns01_certificate",
+            "attestation_bearer",
+        ),
+    ] {
+        let body = body_before_next_public_handler(source, marker);
+        let gate = body
+            .find("require_workload_mutations_enabled")
+            .unwrap_or_else(|| panic!("{marker} workload freeze"));
+        let authority = body
+            .find(first_authority_access)
+            .unwrap_or_else(|| panic!("{marker} authority access"));
+        assert!(
+            gate < authority,
+            "{marker} must freeze before {first_authority_access}"
+        );
+    }
+
+    let internal_source = include_str!("../../internal.rs");
+    for marker in [
+        "pub async fn create_paas_app",
+        "pub async fn generate_paas_agent_policy",
+        "pub async fn register_paas_public_key",
+        "pub async fn put_paas_keyring",
+        "pub async fn bootstrap_paas_keyring_signing_service",
+        "pub async fn issue_paas_signer_rotation_token",
+        "pub async fn rotate_paas_signer",
+        "pub async fn create_paas_domain_challenge",
+        "pub async fn verify_paas_domain_challenge",
+        "pub async fn remove_paas_custom_domain",
+        "pub async fn issue_paas_config_token",
+        "pub async fn sync_paas_config_metadata",
+        "pub async fn delete_paas_config_metadata",
+        "pub async fn issue_paas_generic_config_token",
+    ] {
+        let body = body_before_next_public_handler(internal_source, marker);
+        let gate = body
+            .find("require_workload_mutations_enabled")
+            .unwrap_or_else(|| panic!("{marker} workload freeze"));
+        let first_durable_access = body
+            .find("internal_actor_context")
+            .or_else(|| body.find("idempotency_key"))
+            .unwrap_or_else(|| panic!("{marker} first durable access"));
+        assert!(
+            gate < first_durable_access,
+            "{marker} must freeze before actor/idempotency database access"
+        );
+    }
+
+    let app_source = include_str!("../../apps.rs");
+    let delete_body = app_source
+        .split("pub async fn delete_app")
+        .nth(1)
+        .and_then(|body| body.split("#[derive(Debug, Deserialize)]").next())
+        .expect("ordinary delete handler");
+    assert!(
+        !delete_body.contains("require_workload_mutations_enabled")
+            && !delete_body.contains("require_deployment_dispatch_enabled"),
+        "ordinary app DELETE must remain available for contained cleanup"
+    );
+
+    let router_source = include_str!("../../../lib.rs");
+    assert!(
+        router_source.contains("freeze_workload_authority_mutations")
+            && router_source.contains("ordinary_public_delete")
+            && router_source.contains("ordinary_paas_delete"),
+        "router-level defense must cover future workload writes while preserving exact app DELETE"
+    );
+}
+
+#[test]
 fn signed_deploy_validation_precedes_atomic_candidate_commit() {
     let source = include_str!("../../deployments.rs");
     let deploy_body = source

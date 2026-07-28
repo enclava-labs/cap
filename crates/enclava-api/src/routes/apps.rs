@@ -786,6 +786,7 @@ pub async fn create_app(
 ) -> Result<(StatusCode, Json<AppResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     ensure_management_write_allowed(&state, &auth).await?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
 
     let app_candidate = prepare_app_candidate(&state, &auth, &body).await?;
     let app_id = app_candidate.id;
@@ -1622,6 +1623,7 @@ pub async fn issue_signer_rotation_token_route(
         ));
     }
     ensure_management_write_allowed(&state, &auth).await?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
 
     let subject = body.subject.trim().to_string();
     let issuer = body.issuer.trim().to_string();
@@ -1767,6 +1769,7 @@ pub async fn rotate_signer(
     scopes::require_owner(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
     ensure_management_write_allowed(&state, &auth).await?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
 
     let subject = body.subject.trim().to_string();
     let issuer = body.issuer.trim().to_string();

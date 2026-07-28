@@ -111,11 +111,13 @@ fn restored_rollout_is_startup_safe(
     phase: DeployPhase,
     previous_app_status: AppStatus,
     unlock_mode: crate::models::UnlockMode,
+    confirmed_locked_runtime: bool,
 ) -> bool {
     phase == DeployPhase::Running
         || (phase == DeployPhase::TimedOut
             && previous_app_status == AppStatus::Running
-            && unlock_mode == crate::models::UnlockMode::Password)
+            && unlock_mode == crate::models::UnlockMode::Password
+            && confirmed_locked_runtime)
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -1046,46 +1048,63 @@ mod tests {
     #[test]
     fn restored_kubernetes_apply_observes_rollout_and_allows_manual_unlock() {
         let source = include_str!("deploy.rs");
-        let restore_body = source
+        let apply_body = source
             .rsplit("pub(crate) async fn apply_restored_kubernetes_manifests")
+            .next()
+            .and_then(|body| body.split("/// Observe a restored rollout").next())
+            .expect("restored Kubernetes apply body");
+        let observe_body = source
+            .rsplit("pub(crate) async fn observe_restored_kubernetes_rollout")
             .next()
             .and_then(|body| {
                 body.split("/// Apply manifests and return durable rollout-observation context.")
                     .next()
             })
-            .expect("restored Kubernetes apply body");
+            .expect("restored Kubernetes observation body");
+        assert!(
+            apply_body.contains("apply_all_with_tenant_image_pull_secret")
+                && !apply_body.contains("watch_rollout("),
+            "restore apply must return after Services exist so edge can reconcile before observation"
+        );
         assert_eq!(
-            restore_body.matches("watch_rollout(").count(),
+            observe_body.matches("watch_rollout(").count(),
             1,
             "restore must have exactly one common rollout gate"
         );
         assert!(
-            restore_body.contains("    }\n    let status = watch_rollout("),
-            "rollout observation must run after the optional custom-domain branch"
-        );
-        assert!(
-            restore_body.contains("restored_rollout_is_startup_safe("),
+            observe_body.contains("restored_rollout_is_startup_safe(")
+                && observe_body.contains("is_fresh_locked_for_deployment(deployment_id)"),
             "restore must use the explicit password-unlock readiness exception"
         );
         assert!(restored_rollout_is_startup_safe(
             DeployPhase::Running,
             AppStatus::Running,
             crate::models::UnlockMode::Auto,
+            false,
         ));
         assert!(restored_rollout_is_startup_safe(
             DeployPhase::TimedOut,
             AppStatus::Running,
             crate::models::UnlockMode::Password,
+            true,
+        ));
+        assert!(!restored_rollout_is_startup_safe(
+            DeployPhase::TimedOut,
+            AppStatus::Running,
+            crate::models::UnlockMode::Password,
+            false,
         ));
         assert!(!restored_rollout_is_startup_safe(
             DeployPhase::TimedOut,
             AppStatus::Running,
             crate::models::UnlockMode::Auto,
+            true,
         ));
         assert!(!restored_rollout_is_startup_safe(
             DeployPhase::TimedOut,
             AppStatus::Creating,
             crate::models::UnlockMode::Password,
+            true,
         ));
     }
 
@@ -1901,15 +1920,22 @@ impl DeploymentRollout {
 ///
 /// The caller holds the runtime-authority row and a transaction-scoped global
 /// restore lock across this operation. KBS authority is reconciled before this
-/// path so no post-backup policy remains permissive while workloads converge;
-/// edge state is reconciled afterward. This path never rewrites
-/// deployment/app status: it restores the cluster to the exact durable
-/// workload snapshot before the API starts serving.
+/// path so no post-backup policy remains permissive. This phase returns after
+/// Services and workload manifests exist but before observing rollout status,
+/// allowing the caller to reconcile global edge routing before an exact TEE
+/// locked-state probe. This path never rewrites deployment/app status.
+pub(crate) struct RestoredDeploymentRollout {
+    app_spec: ConfidentialApp,
+    current_app_status: AppStatus,
+    unlock_mode: crate::models::UnlockMode,
+    deployment_id: Uuid,
+}
+
 pub(crate) async fn apply_restored_kubernetes_manifests(
     engine: &ApplyEngine,
     request: RestoreKubernetesManifestsRequest,
     generation: MutationGeneration,
-) -> Result<(), DeployError> {
+) -> Result<RestoredDeploymentRollout, DeployError> {
     let RestoreKubernetesManifestsRequest {
         app,
         current_app_status,
@@ -1998,8 +2024,54 @@ pub(crate) async fn apply_restored_kubernetes_manifests(
         restart_statefulset_for_ingress(engine, &app_spec.namespace, &app_spec.name, generation)
             .await?;
     }
+
+    Ok(RestoredDeploymentRollout {
+        app_spec,
+        current_app_status,
+        unlock_mode,
+        deployment_id,
+    })
+}
+
+/// Observe a restored rollout only after the caller has reconciled edge
+/// routing for every restored Service under the still-held KBS fence.
+pub(crate) async fn observe_restored_kubernetes_rollout(
+    state: &crate::state::AppState,
+    engine: &ApplyEngine,
+    rollout: RestoredDeploymentRollout,
+) -> Result<(), DeployError> {
+    let RestoredDeploymentRollout {
+        app_spec,
+        current_app_status,
+        unlock_mode,
+        deployment_id,
+    } = rollout;
     let status = watch_rollout(engine, &app_spec.namespace, &app_spec.name).await?;
-    if !restored_rollout_is_startup_safe(status.phase, current_app_status, unlock_mode) {
+    let confirmed_locked_runtime = if status.phase == DeployPhase::TimedOut
+        && current_app_status == AppStatus::Running
+        && unlock_mode == crate::models::UnlockMode::Password
+    {
+        let tee_domain =
+            (!app_spec.domain.tee_domain.is_empty()).then_some(app_spec.domain.tee_domain.as_str());
+        crate::routes::status::observe_app_status_fields_for_deployment(
+            state,
+            &app_spec.namespace,
+            &app_spec.name,
+            app_spec.primary_domain(),
+            tee_domain,
+            Some(deployment_id),
+        )
+        .await
+        .is_fresh_locked_for_deployment(deployment_id)
+    } else {
+        false
+    };
+    if !restored_rollout_is_startup_safe(
+        status.phase,
+        current_app_status,
+        unlock_mode,
+        confirmed_locked_runtime,
+    ) {
         return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
             status
                 .message

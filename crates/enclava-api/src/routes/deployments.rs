@@ -45,6 +45,25 @@ fn deploy_blocked_response(
     )
 }
 
+pub(crate) fn require_workload_mutations_enabled(
+    state: &AppState,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.deployment_dispatch_enabled {
+        return Ok(());
+    }
+    Err(deploy_blocked_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "deployment_dispatch_disabled",
+        "tenant workload mutation is disabled by the deployment activation gate".to_string(),
+    ))
+}
+
+pub(crate) fn require_deployment_dispatch_enabled(
+    state: &AppState,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    require_workload_mutations_enabled(state)
+}
+
 fn resource_limit_error_response(
     error: crate::entitlements::ResourceLimitError,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -623,6 +642,7 @@ pub async fn deploy(
 ) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    require_workload_mutations_enabled(&state)?;
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
         .bind(&app_name)
@@ -649,6 +669,7 @@ async fn deploy_app_candidate(
     body: DeployRequest,
     app_mutation: AppMutation,
 ) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
+    require_deployment_dispatch_enabled(&state)?;
     let workload_security_profile =
         validate_workload_security_profile(body.workload_security_profile.as_deref())?;
     let log_encryption = validate_log_encryption_config(body.log_encryption.clone())?;

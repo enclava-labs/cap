@@ -122,6 +122,7 @@ pub async fn register_public_key(
     State(state): State<AppState>,
     Json(body): Json<RegisterPublicKeyRequest>,
 ) -> Result<(StatusCode, Json<RegisterPublicKeyResponse>), (StatusCode, Json<serde_json::Value>)> {
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let pubkey = decode_hex32(&body.public_key)?;
     let id = Uuid::new_v4();
     let row: (Uuid, Vec<u8>) = sqlx::query_as(

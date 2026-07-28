@@ -143,6 +143,20 @@ impl ObservedAppStatus {
         )
     }
 
+    pub(crate) fn is_fresh_locked_for_deployment(&self, deployment_id: Uuid) -> bool {
+        self.observation.state == LiveObservationState::Fresh
+            && self.observation.deployment_id == Some(deployment_id)
+            && self
+                .pod_phase
+                .as_deref()
+                .is_some_and(|phase| phase.eq_ignore_ascii_case("running"))
+            && self
+                .live_state
+                .as_deref()
+                .is_some_and(|state| state.eq_ignore_ascii_case("locked"))
+            && self.runtime_failure.is_none()
+    }
+
     pub(crate) fn runtime_failure_public_message(&self) -> Option<String> {
         self.runtime_failure
             .as_ref()
@@ -1075,6 +1089,7 @@ mod tests {
 
         assert_eq!(observed.observation.state, LiveObservationState::Fresh);
         assert_eq!(observed.effective_status("running"), "locked");
+        assert!(observed.is_fresh_locked_for_deployment(deployment_id));
     }
 
     #[tokio::test]
@@ -1203,6 +1218,7 @@ mod tests {
             Some(LiveObservationReason::PodEvidenceIncomplete)
         );
         assert_eq!(observed.effective_status("running"), "partial");
+        assert!(!observed.is_fresh_locked_for_deployment(Uuid::new_v4()));
     }
 
     #[test]
@@ -1229,6 +1245,7 @@ mod tests {
             Some(LiveObservationReason::PodEvidenceIncomplete)
         );
         assert_eq!(observed.effective_status("running"), "partial");
+        assert!(!observed.is_fresh_locked_for_deployment(deployment_id));
     }
 
     #[test]

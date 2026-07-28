@@ -201,6 +201,7 @@ pub async fn create_challenge(
 ) -> Result<Json<ChallengeResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -267,6 +268,7 @@ pub async fn verify_challenge(
 ) -> Result<Json<VerifyResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     require_haproxy_domain_mutations()?;
 
     let mut app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
@@ -654,6 +656,7 @@ pub async fn remove_custom_domain(
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "apps:write")?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     require_haproxy_domain_mutations()?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")

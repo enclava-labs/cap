@@ -29,6 +29,9 @@ pub async fn dns01_certificate(
     headers: HeaderMap,
     Json(body): Json<CertificateRequest>,
 ) -> impl IntoResponse {
+    if let Err(response) = crate::routes::deployments::require_workload_mutations_enabled(&state) {
+        return response.into_response();
+    }
     let Some(token) = crate::routes::workload::attestation_bearer(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,

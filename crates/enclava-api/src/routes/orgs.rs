@@ -346,6 +346,7 @@ pub async fn put_keyring(
     Json(body): Json<PutOrgKeyringRequest>,
 ) -> Result<(StatusCode, Json<OrgKeyringResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_scope(&auth, "org:admin")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let (org_id, caller_role) = active_membership(&state, &auth, &org_name).await?;
     scopes::require_owner_role(caller_role)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
@@ -594,6 +595,7 @@ pub async fn bootstrap_signing_service_owner(
     Json(body): Json<BootstrapSigningServiceRequest>,
 ) -> Result<Json<BootstrapSigningServiceResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_scope(&auth, "org:admin")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let (org_id, caller_role) = active_membership(&state, &auth, &org_name).await?;
     scopes::require_admin_role(caller_role)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;

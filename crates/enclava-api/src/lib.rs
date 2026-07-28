@@ -1,5 +1,6 @@
 pub mod acme;
 pub mod auth;
+pub mod clean_cut;
 pub mod clients;
 pub mod cosign;
 pub mod db;
@@ -21,8 +22,13 @@ pub mod signing_service;
 pub mod source_provider;
 pub mod state;
 
-use axum::Router;
-use axum::http::{HeaderValue, Method, header};
+use axum::{
+    Router,
+    extract::{Request, State},
+    http::{HeaderValue, Method, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+};
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
@@ -58,7 +64,93 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         .merge(api_routes)
         .layer(TraceLayer::new_for_http())
         .layer(build_cors_layer())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            freeze_workload_authority_mutations,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_startup_ready,
+        ))
         .with_state(state)
+}
+
+async fn require_startup_ready(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path() == "/livez" || state.startup_is_ready() {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("cache-control", "no-store")],
+        "startup reconciliation in progress",
+    )
+        .into_response()
+}
+
+async fn freeze_workload_authority_mutations(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if is_workload_authority_mutation(request.method(), request.uri().path())
+        && let Err(response) = routes::deployments::require_workload_mutations_enabled(&state)
+    {
+        return response.into_response();
+    }
+    next.run(request).await
+}
+
+fn is_workload_authority_mutation(method: &Method, path: &str) -> bool {
+    if matches!(method, &Method::GET | &Method::HEAD | &Method::OPTIONS) {
+        return false;
+    }
+
+    let segments: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    // Ordinary app DELETE is the exact cleanup primitive used while the
+    // admission gate is closed. Custom-domain/config deletes have deeper
+    // paths and remain frozen.
+    let ordinary_public_delete =
+        method == Method::DELETE && matches!(segments.as_slice(), ["apps", _]);
+    let ordinary_paas_delete = method == Method::DELETE
+        && matches!(
+            segments.as_slice(),
+            ["internal", "paas", "orgs", _, "apps", _]
+        );
+    if ordinary_public_delete || ordinary_paas_delete {
+        return false;
+    }
+
+    // PaaS identity/entitlement synchronization is control-plane state and
+    // may continue while workload authority is frozen. Every other present or
+    // future internal PaaS write fails closed unless explicitly added here.
+    if matches!(segments.as_slice(), ["internal", "paas", ..]) {
+        let allowed_control_plane_sync = method == Method::PUT
+            && matches!(
+                segments.as_slice(),
+                ["internal", "paas", "orgs", _]
+                    | ["internal", "paas", "orgs", _, "entitlements"]
+                    | ["internal", "paas", "orgs", _, "members", _]
+            );
+        return !allowed_control_plane_sync;
+    }
+
+    // Authentication and organization membership are control-plane concerns;
+    // they cannot create provider/workload authority while this middleware
+    // freezes every other current or future non-read route by default.
+    let allowed_public_control_plane = matches!(segments.first(), Some(&"auth"))
+        || (method == Method::POST && matches!(segments.as_slice(), ["orgs"]))
+        || (method == Method::POST && matches!(segments.as_slice(), ["orgs", _, "invite"]))
+        || (method == Method::DELETE && matches!(segments.as_slice(), ["orgs", _, "members", _]));
+    !allowed_public_control_plane
 }
 
 fn internal_routes() -> Router<AppState> {
@@ -70,6 +162,10 @@ fn internal_routes() -> Router<AppState> {
         .route(
             "/internal/paas/platform/deployment-context",
             axum::routing::get(routes::internal::paas_deployment_context),
+        )
+        .route(
+            "/internal/paas/clean-cut-retirements/{plan_sha256}",
+            axum::routing::get(routes::internal::get_clean_cut_retirement),
         )
         .route(
             "/internal/paas/orgs/{paas_org_id}",
@@ -438,7 +534,10 @@ fn workload_routes() -> Router<AppState> {
 }
 
 fn health_routes() -> Router<AppState> {
-    Router::new().route("/health", axum::routing::get(|| async { "ok" }))
+    Router::new()
+        .route("/livez", axum::routing::get(|| async { "ok" }))
+        .route("/readyz", axum::routing::get(|| async { "ok" }))
+        .route("/health", axum::routing::get(|| async { "ok" }))
 }
 
 /// Build the CORS layer from `CORS_ALLOWED_ORIGINS` (comma-separated).
@@ -496,6 +595,89 @@ pub fn test_router(state: AppState) -> Router {
 }
 
 #[cfg(test)]
+mod workload_authority_gate_tests {
+    use super::is_workload_authority_mutation;
+    use axum::http::Method;
+
+    #[test]
+    fn gate_covers_every_workload_authority_route_and_only_allows_normal_app_delete() {
+        for (method, path) in [
+            (Method::POST, "/apps"),
+            (Method::POST, "/apps/demo/deploy"),
+            (Method::POST, "/apps/demo/agent-policy"),
+            (Method::POST, "/apps/demo/rollback"),
+            (Method::PATCH, "/apps/demo/signer"),
+            (Method::POST, "/apps/demo/signer/rotation-token"),
+            (Method::POST, "/apps/demo/domains"),
+            (Method::POST, "/apps/demo/domains/example.test/verify"),
+            (Method::DELETE, "/apps/demo/domains/example.test"),
+            (Method::POST, "/apps/demo/config-token"),
+            (Method::POST, "/apps/demo/config/sync"),
+            (Method::DELETE, "/apps/demo/config/KEY/meta"),
+            (Method::PUT, "/apps/demo/unlock/mode"),
+            (Method::POST, "/deployments"),
+            (
+                Method::POST,
+                "/deployments/00000000-0000-0000-0000-000000000001/config-token",
+            ),
+            (Method::POST, "/users/me/public-keys"),
+            (Method::PUT, "/orgs/acme/keyring"),
+            (Method::POST, "/orgs/acme/keyring/bootstrap-signing-service"),
+            (Method::POST, "/api/v1/workload/tls/dns01-certificate"),
+            (Method::POST, "/workload/tls/dns01-certificate"),
+            (Method::POST, "/internal/paas/orgs/org-1/apps"),
+            (Method::POST, "/internal/paas/orgs/org-1/apps/demo/deploy"),
+            (
+                Method::POST,
+                "/internal/paas/orgs/org-1/apps/demo/agent-policy",
+            ),
+            (Method::POST, "/internal/paas/orgs/org-1/apps/demo/domains"),
+            (
+                Method::DELETE,
+                "/internal/paas/orgs/org-1/apps/demo/config/KEY/meta",
+            ),
+            (Method::POST, "/internal/paas/orgs/org-1/deployments"),
+            (
+                Method::POST,
+                "/internal/paas/orgs/org-1/deployments/00000000-0000-0000-0000-000000000001/config-token",
+            ),
+            (Method::PUT, "/internal/paas/orgs/org-1/keyring"),
+            (
+                Method::POST,
+                "/internal/paas/orgs/org-1/users/me/public-keys",
+            ),
+            (Method::POST, "/internal/paas/future-workload-authority"),
+            (Method::POST, "/api/v2/workload/tls/dns01-certificate"),
+            (Method::PATCH, "/future-workload-authority"),
+        ] {
+            assert!(
+                is_workload_authority_mutation(&method, path),
+                "{method} {path} must be frozen"
+            );
+        }
+
+        for (method, path) in [
+            (Method::DELETE, "/apps/demo"),
+            (Method::DELETE, "/internal/paas/orgs/org-1/apps/demo"),
+            (Method::GET, "/apps"),
+            (Method::GET, "/apps/demo/status"),
+            (Method::GET, "/internal/paas/clean-cut-retirements/abc"),
+            (Method::POST, "/auth/login"),
+            (Method::POST, "/orgs"),
+            (Method::POST, "/orgs/acme/invite"),
+            (Method::DELETE, "/orgs/acme/members/user-1"),
+            (Method::PUT, "/internal/paas/orgs/org-1/entitlements"),
+            (Method::PUT, "/internal/paas/orgs/org-1/members/user-1"),
+        ] {
+            assert!(
+                !is_workload_authority_mutation(&method, path),
+                "{method} {path} must remain available"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod test_support {
     use crate::auth::api_key::ValidatedApiKey;
     use crate::auth::middleware::{AuthContext, ManagementOrigin};
@@ -539,6 +721,9 @@ pub(crate) mod test_support {
             db: pool,
             runtime_authority: crate::runtime_authority::TEST_RUNTIME_AUTHORITY,
             management_mode: crate::state::CapManagementMode::Standalone,
+            edge_integration_enabled: true,
+            deployment_dispatch_enabled: true,
+            startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             signing_key: Arc::new(SigningKey::generate(&mut OsRng)),
             hmac_key: Arc::new([7u8; 32]),
             api_url: "https://api.example.test".to_string(),

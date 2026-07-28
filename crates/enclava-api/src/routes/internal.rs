@@ -345,6 +345,39 @@ pub async fn paas_deployment_context(
     Json(deployment_context_response(&state))
 }
 
+pub async fn get_clean_cut_retirement(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Path(plan_sha256): Path<String>,
+) -> Result<Json<crate::clean_cut::CleanCutRetirementStatus>, InternalRouteError> {
+    let client = kube::Client::try_default().await.map_err(|_| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "clean_cut_kubernetes_unavailable",
+        )
+    })?;
+    match crate::clean_cut::retirement_status(&state.db, client, &plan_sha256).await {
+        Ok(Some(receipt)) => Ok(Json(receipt)),
+        Ok(None) => Err(json_error(
+            StatusCode::NOT_FOUND,
+            "clean_cut_retirement_not_found",
+        )),
+        Err(crate::clean_cut::CleanCutError::InvalidPlan(_)) => Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_clean_cut_plan_sha256",
+        )),
+        Err(crate::clean_cut::CleanCutError::Precondition(_)) => Err(json_error(
+            StatusCode::CONFLICT,
+            "clean_cut_receipt_inconsistent",
+        )),
+        Err(crate::clean_cut::CleanCutError::Database(_)) => Err(db_error()),
+        Err(crate::clean_cut::CleanCutError::Kubernetes(_)) => Err(json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "clean_cut_kubernetes_unavailable",
+        )),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpsertPaaSOrgRequest {
     pub name: String,
@@ -3110,6 +3143,7 @@ pub async fn create_paas_app(
     Json(body): Json<InternalCreateAppRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     crate::routes::apps::validate_app_name(&body.name)
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
     let key = idempotency_key(&headers)?;
@@ -3904,6 +3938,7 @@ pub async fn deploy_paas_app(
     Json(body): Json<InternalDeployRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_deployment_dispatch_enabled(&state)?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/deploy");
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     require_deploy_entitlement(&state, auth.org_id).await?;
@@ -3992,6 +4027,7 @@ pub async fn generate_paas_agent_policy(
     (StatusCode, Json<serde_json::Value>),
 > {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     require_deploy_entitlement(&state, auth.org_id).await?;
     crate::routes::deployments::generate_agent_policy(
@@ -4011,6 +4047,7 @@ pub async fn register_paas_public_key(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/users/me/public-keys");
     let idempotency = match begin_actor_idempotent_request(
@@ -4062,6 +4099,7 @@ pub async fn put_paas_keyring(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/keyring");
     let idempotency = match begin_actor_idempotent_request(
@@ -4104,6 +4142,7 @@ pub async fn bootstrap_paas_keyring_signing_service(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/keyring/bootstrap-signing-service");
     let idempotency = match begin_actor_idempotent_request(
@@ -4146,6 +4185,7 @@ pub async fn issue_paas_signer_rotation_token(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/signer/rotation-token");
     let idempotency = match begin_actor_idempotent_request(
@@ -4189,6 +4229,7 @@ pub async fn rotate_paas_signer(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/signer");
     let idempotency = match begin_actor_idempotent_request(
@@ -4243,6 +4284,7 @@ pub async fn create_paas_domain_challenge(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domains");
     let idempotency = match begin_actor_idempotent_request(
@@ -4283,6 +4325,7 @@ pub async fn verify_paas_domain_challenge(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domains/{domain}/verify");
     let idempotency = match begin_actor_idempotent_request(
@@ -4321,6 +4364,7 @@ pub async fn remove_paas_custom_domain(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domains/{domain}");
     let idempotency = match begin_actor_idempotent_request(
@@ -4372,6 +4416,7 @@ pub async fn issue_paas_config_token(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config-token");
     let key = idempotency_key(&headers)?;
@@ -4430,6 +4475,7 @@ pub async fn sync_paas_config_metadata(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config/sync");
     let idempotency = match begin_actor_idempotent_request(
@@ -4471,6 +4517,7 @@ pub async fn delete_paas_config_metadata(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config/{key_name}/meta");
     let idempotency = match begin_actor_idempotent_request(
@@ -4511,6 +4558,7 @@ pub async fn rollback_paas_app(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_deployment_dispatch_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     require_deploy_entitlement(&state, auth.org_id).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/rollback");
@@ -4552,6 +4600,7 @@ pub async fn create_paas_generic_deployment(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_deployment_dispatch_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     require_deploy_entitlement(&state, auth.org_id).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/deployments");
@@ -4629,6 +4678,7 @@ pub async fn issue_paas_generic_config_token(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path =
         format!("/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/config-token");
@@ -4714,6 +4764,7 @@ pub async fn update_paas_unlock_mode(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::deployments::require_deployment_dispatch_enabled(&state)?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     require_deploy_entitlement(&state, auth.org_id).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/mode");

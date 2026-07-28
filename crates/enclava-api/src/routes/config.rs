@@ -67,6 +67,7 @@ async fn issue_config_token_route_inner(
 ) -> Result<Json<ConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "config:write")?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -314,6 +315,7 @@ pub async fn config_sync(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_config_metadata_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     sync_config_metadata_for_org(&state, auth.org_id, &app_name, &body).await
 }
 
@@ -325,6 +327,7 @@ pub async fn delete_config_meta(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_config_metadata_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    crate::routes::deployments::require_workload_mutations_enabled(&state)?;
     delete_config_metadata_for_org(&state, auth.org_id, &app_name, &key_name).await
 }
 

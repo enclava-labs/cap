@@ -16,8 +16,10 @@ COPY crates/ crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --bin enclava-api && \
-    cp /build/target/debug/enclava-api /usr/local/bin/enclava-api
+    cargo build --bin enclava-api --bin cap-clean-cut-retire --bin cap-migrate && \
+    cp /build/target/debug/enclava-api /usr/local/bin/enclava-api && \
+    cp /build/target/debug/cap-clean-cut-retire /usr/local/bin/cap-clean-cut-retire && \
+    cp /build/target/debug/cap-migrate /usr/local/bin/cap-migrate
 
 FROM debian:bookworm-slim AS runtime-debug
 
@@ -28,7 +30,12 @@ RUN apt-get update && \
     useradd -u 1000 -g enclava -M -s /usr/sbin/nologin enclava
 
 COPY --from=debug-builder /usr/local/bin/enclava-api /usr/local/bin/enclava-api
-RUN chown enclava:enclava /usr/local/bin/enclava-api
+COPY --from=debug-builder /usr/local/bin/cap-clean-cut-retire /usr/local/bin/cap-clean-cut-retire
+COPY --from=debug-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate
+RUN chown enclava:enclava \
+    /usr/local/bin/enclava-api \
+    /usr/local/bin/cap-clean-cut-retire \
+    /usr/local/bin/cap-migrate
 
 USER enclava
 EXPOSE 3000
@@ -55,9 +62,14 @@ COPY crates/ crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --bin enclava-api && \
+    cargo build --release --bin enclava-api --bin cap-clean-cut-retire --bin cap-migrate && \
     cp /build/target/release/enclava-api /usr/local/bin/enclava-api && \
-    strip /usr/local/bin/enclava-api
+    cp /build/target/release/cap-clean-cut-retire /usr/local/bin/cap-clean-cut-retire && \
+    cp /build/target/release/cap-migrate /usr/local/bin/cap-migrate && \
+    strip \
+        /usr/local/bin/enclava-api \
+        /usr/local/bin/cap-clean-cut-retire \
+        /usr/local/bin/cap-migrate
 
 FROM alpine:3.20 AS runtime-release
 
@@ -66,7 +78,12 @@ RUN apk add --no-cache ca-certificates tzdata wget && \
     adduser -D -u 1000 -G enclava enclava
 
 COPY --from=release-builder /usr/local/bin/enclava-api /usr/local/bin/enclava-api
-RUN chown enclava:enclava /usr/local/bin/enclava-api
+COPY --from=release-builder /usr/local/bin/cap-clean-cut-retire /usr/local/bin/cap-clean-cut-retire
+COPY --from=release-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate
+RUN chown enclava:enclava \
+    /usr/local/bin/enclava-api \
+    /usr/local/bin/cap-clean-cut-retire \
+    /usr/local/bin/cap-migrate
 
 USER enclava
 EXPOSE 3000

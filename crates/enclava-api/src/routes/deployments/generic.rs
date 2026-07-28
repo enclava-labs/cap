@@ -165,6 +165,7 @@ pub async fn generate_agent_policy(
     Json(body): Json<AgentPolicyRequest>,
 ) -> Result<Json<AgentPolicyResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
+    super::require_workload_mutations_enabled(&state)?;
 
     let app: App = sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
         .bind(auth.org_id)
@@ -233,6 +234,7 @@ pub async fn create_generic_deployment(
 ) -> Result<(StatusCode, Json<GenericDeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
     crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    super::require_workload_mutations_enabled(&state)?;
     validate_external_id(body.external_id.as_deref())?;
 
     validate_source_context(
@@ -386,6 +388,7 @@ async fn generic_config_token_inner(
 ) -> Result<Json<GenericConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "config:write")?;
+    super::require_workload_mutations_enabled(&state)?;
 
     let (_deployment, app) = fetch_deployment_with_app(&state, auth.org_id, deployment_id)
         .await?
