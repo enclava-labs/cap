@@ -2499,6 +2499,46 @@ owner_resource_bindings := {}
         );
     }
 
+    #[test]
+    fn restore_only_policy_content_requires_a_new_normal_generation() {
+        let authority_epoch = Uuid::new_v4();
+        let authority = RuntimeAuthority {
+            epoch: authority_epoch,
+            restore_generation: 7,
+        };
+        let restore_hash = "aa".repeat(32);
+        let normal_hash = "bb".repeat(32);
+        let restored = AnnotatedPolicyGeneration {
+            authority_epoch: Some(authority_epoch),
+            authority_restore_generation: Some(authority.restore_generation),
+            generation: 12,
+            policy_hash: &restore_hash,
+        };
+
+        assert!(matches!(
+            generation_decision(
+                Some(restored),
+                Some(&restore_hash),
+                authority,
+                12,
+                &normal_hash,
+            ),
+            Err(KbsPolicyError::PolicyGenerationConflict)
+        ));
+        assert_eq!(
+            generation_decision(
+                Some(restored),
+                Some(&restore_hash),
+                authority,
+                13,
+                &normal_hash,
+            )
+            .unwrap(),
+            GenerationDecision::Replace,
+            "normal post-restore policy must advance before the restore fence is released"
+        );
+    }
+
     async fn database_test_pool() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());

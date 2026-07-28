@@ -907,10 +907,6 @@ async fn main() {
         );
         std::process::exit(1);
     }
-    if let Err(error) = enclava_api::kbs::reconcile_policy_at_startup(&state).await {
-        eprintln!("startup refused: KBS policy reconciliation failed: {error}");
-        std::process::exit(1);
-    }
     if let Err(error) =
         enclava_api::deployment_jobs::reconcile_kubernetes_after_restore_at_startup(&state).await
     {
@@ -918,6 +914,10 @@ async fn main() {
             "startup refused: restored Kubernetes reconciliation failed: error_code={}",
             error.code()
         );
+        std::process::exit(1);
+    }
+    if let Err(error) = enclava_api::kbs::reconcile_policy_at_startup(&state).await {
+        eprintln!("startup refused: KBS policy reconciliation failed: {error}");
         std::process::exit(1);
     }
     if let Err(error) =
@@ -1037,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_rollout_cleanup_precedes_generic_provider_reconciliation() {
+    fn restore_specific_kbs_fence_precedes_generic_provider_reconciliation() {
         let source = include_str!("main.rs");
         let main_body = source
             .split("#[tokio::main]")
@@ -1050,16 +1050,16 @@ mod tests {
         let kubernetes_restore = main_body
             .find("reconcile_kubernetes_after_restore_at_startup")
             .expect("restored Kubernetes reconciliation startup");
-        let kbs_restore = main_body
+        let generic_kbs = main_body
             .find("reconcile_policy_at_startup")
-            .expect("restored KBS reconciliation startup");
+            .expect("generic KBS reconciliation startup");
         assert!(
-            cleanup < kbs_restore,
-            "exact failed-rollout cleanup must precede restored KBS reconciliation"
+            cleanup < kubernetes_restore,
+            "exact failed-rollout cleanup must precede restored Kubernetes reconciliation"
         );
         assert!(
-            kbs_restore < kubernetes_restore,
-            "restored KBS authority must converge before Kubernetes workloads"
+            kubernetes_restore < generic_kbs,
+            "restore reconciliation must acquire and normalize its continuous KBS fence before generic reconciliation"
         );
         let edge_restore = main_body
             .find("reconcile_all_haproxy_routes_at_startup")

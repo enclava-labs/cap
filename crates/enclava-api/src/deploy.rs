@@ -400,6 +400,12 @@ pub struct ApplyDeploymentManifestsRequest {
 pub(crate) struct RestoreKubernetesManifestsRequest {
     /// Exact app row captured in the immutable accepted apply payload.
     pub app: App,
+    /// Current durable app status restored from the authoritative app row.
+    ///
+    /// The immutable payload can still say `creating` after a password-unlock
+    /// workload became healthy, so rollout safety must not be classified from
+    /// that historical status.
+    pub current_app_status: AppStatus,
     /// Custom-domain authority can change after a healthy deployment without
     /// changing its signed workload snapshot.
     pub current_custom_domain: Option<String>,
@@ -1906,6 +1912,7 @@ pub(crate) async fn apply_restored_kubernetes_manifests(
 ) -> Result<(), DeployError> {
     let RestoreKubernetesManifestsRequest {
         app,
+        current_app_status,
         current_custom_domain,
         snapshot,
         deployment_id,
@@ -1918,7 +1925,6 @@ pub(crate) async fn apply_restored_kubernetes_manifests(
         local_trustee_policy_json,
         log_encryption,
     } = request;
-    let previous_app_status = app.status;
     let unlock_mode = app.unlock_mode;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
     let mut app_spec = build_confidential_app_from_rows(
@@ -1993,7 +1999,7 @@ pub(crate) async fn apply_restored_kubernetes_manifests(
             .await?;
     }
     let status = watch_rollout(engine, &app_spec.namespace, &app_spec.name).await?;
-    if !restored_rollout_is_startup_safe(status.phase, previous_app_status, unlock_mode) {
+    if !restored_rollout_is_startup_safe(status.phase, current_app_status, unlock_mode) {
         return Err(enclava_engine::apply::engine::ApplyError::RolloutFailed(
             status
                 .message

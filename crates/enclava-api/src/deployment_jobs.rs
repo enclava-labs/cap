@@ -1785,6 +1785,7 @@ async fn reconcile_kubernetes_after_restore_with_engine(
             deployment_id,
             request: crate::deploy::RestoreKubernetesManifestsRequest {
                 app: payload.app,
+                current_app_status: app.status,
                 current_custom_domain: app.custom_domain,
                 snapshot: payload.snapshot,
                 deployment_id,
@@ -1842,6 +1843,19 @@ async fn reconcile_kubernetes_after_restore_with_engine(
         // workload has been observed startup-safe. Otherwise a pending newer
         // deployment could win the KBS lane between policy publication and
         // the predecessor's Kubernetes apply.
+        //
+        // The restore-only artifact set can differ from normal bounded
+        // retention. Advance and converge a new normal generation before
+        // releasing the fence; publishing different content at the augmented
+        // generation would be rejected by the content-bound CAS.
+        kbs_mutation
+            .guard_provider(crate::kbs::reconcile_signed_policy_artifacts(
+                &state.db,
+                state.kbs_policy.as_ref(),
+                state.runtime_authority,
+                None,
+            ))
+            .await??;
         kbs_mutation.finish().await?;
     }
 
