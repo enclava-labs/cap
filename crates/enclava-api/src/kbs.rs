@@ -37,9 +37,9 @@ pub struct KbsPolicyConfig {
 pub enum KbsPolicyError {
     #[error("KBS policy management is required but not configured")]
     NotConfigured,
-    #[error("database error: {0}")]
+    #[error("database error")]
     Db(#[from] sqlx::Error),
-    #[error("Kubernetes API error: {0}")]
+    #[error("Kubernetes API error")]
     Kube(#[from] kube::Error),
     #[error("Kubernetes mutating request exceeded its 30 second deadline")]
     ProviderWriteTimeout,
@@ -73,9 +73,9 @@ pub enum KbsPolicyError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum KbsPolicyReconciliationError {
-    #[error("durable KBS mutation fence failed")]
+    #[error("durable KBS mutation fence failed: {0}")]
     Mutation(#[from] crate::mutation_leases::MutationLeaseError),
-    #[error("KBS policy reconciliation failed")]
+    #[error("KBS policy reconciliation failed: {0}")]
     Policy(#[from] KbsPolicyError),
 }
 
@@ -716,11 +716,13 @@ pub fn spawn_signed_policy_reconciler(state: crate::state::AppState) {
                 Err(KbsPolicyReconciliationError::Mutation(
                     crate::mutation_leases::MutationLeaseError::Busy,
                 )) => {}
-                Err(KbsPolicyReconciliationError::Mutation(_)) => tracing::warn!(
+                Err(error @ KbsPolicyReconciliationError::Mutation(_)) => tracing::warn!(
+                    %error,
                     error_code = "kbs_policy_fence_unavailable",
                     "could not claim durable global KBS reconciliation"
                 ),
-                Err(KbsPolicyReconciliationError::Policy(_)) => tracing::warn!(
+                Err(error @ KbsPolicyReconciliationError::Policy(_)) => tracing::warn!(
+                    %error,
                     error_code = "kbs_policy_reconciliation_failed",
                     "durable global KBS policy reconciliation remains pending"
                 ),
@@ -1642,6 +1644,45 @@ pub fn config_from_env() -> Option<KbsPolicyConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_error_display_preserves_typed_cause() {
+        let policy = KbsPolicyReconciliationError::from(KbsPolicyError::PolicyGenerationConflict);
+        assert_eq!(
+            policy.to_string(),
+            "KBS policy reconciliation failed: signed KBS policy generation has conflicting content"
+        );
+
+        let mutation =
+            KbsPolicyReconciliationError::from(crate::mutation_leases::MutationLeaseError::Lost);
+        assert_eq!(
+            mutation.to_string(),
+            "durable KBS mutation fence failed: application mutation lease was lost"
+        );
+
+        let db = KbsPolicyReconciliationError::from(KbsPolicyError::Db(sqlx::Error::Protocol(
+            "tenant-sensitive database detail".to_string(),
+        )));
+        assert_eq!(
+            db.to_string(),
+            "KBS policy reconciliation failed: database error"
+        );
+        assert!(!db.to_string().contains("tenant-sensitive"));
+
+        let kube = KbsPolicyReconciliationError::from(KbsPolicyError::Kube(kube::Error::Api(
+            kube::core::Status::failure(
+                "tenant-sensitive Kubernetes detail",
+                "tenant-sensitive reason",
+            )
+            .with_code(500)
+            .boxed(),
+        )));
+        assert_eq!(
+            kube.to_string(),
+            "KBS policy reconciliation failed: Kubernetes API error"
+        );
+        assert!(!kube.to_string().contains("tenant-sensitive"));
+    }
 
     fn binding(key: &str) -> KbsOwnerBinding {
         KbsOwnerBinding {
