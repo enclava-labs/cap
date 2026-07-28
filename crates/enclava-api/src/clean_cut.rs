@@ -13,7 +13,7 @@ use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
     core::v1::{Namespace, PersistentVolume, PersistentVolumeClaim, Pod},
 };
-use kube::{Api, Client, ResourceExt, api::ListParams};
+use kube::{Api, Client, ResourceExt, api::ListParams, core::Selector};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
@@ -796,6 +796,7 @@ async fn verify_containment(
 ) -> Result<(), CleanCutError> {
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), &containment.namespace);
     let deployment = deployments.get(&containment.deployment_name).await?;
+    let pod_selector = contained_deployment_pod_selector(&deployment)?;
     let uid = deployment
         .metadata
         .uid
@@ -832,7 +833,7 @@ async fn verify_containment(
 
     let pods: Api<Pod> = Api::namespaced(client, &containment.namespace);
     let active_pods: Vec<String> = pods
-        .list(&ListParams::default().labels(&containment.pod_label_selector))
+        .list(&ListParams::default().labels_from(&pod_selector))
         .await?
         .items
         .into_iter()
@@ -853,6 +854,27 @@ async fn verify_containment(
         )));
     }
     Ok(())
+}
+
+fn contained_deployment_pod_selector(deployment: &Deployment) -> Result<Selector, CleanCutError> {
+    let selector: Selector = deployment
+        .spec
+        .as_ref()
+        .ok_or_else(|| CleanCutError::Precondition("contained CAP Deployment has no spec".into()))?
+        .selector
+        .clone()
+        .try_into()
+        .map_err(|error| {
+            CleanCutError::Precondition(format!(
+                "contained CAP Deployment has an invalid pod selector: {error}"
+            ))
+        })?;
+    if selector.selects_all() {
+        return Err(CleanCutError::Precondition(
+            "contained CAP Deployment pod selector must not select every pod".into(),
+        ));
+    }
+    Ok(selector)
 }
 
 async fn inspect_namespaces(
@@ -1197,6 +1219,38 @@ async fn verify_database_authority(
         ));
     }
 
+    let active_owner_binding_app_ids: BTreeSet<Uuid> = sqlx::query_scalar(
+        "SELECT app_id
+           FROM kbs_owner_bindings
+          WHERE deleted_at IS NULL
+          ORDER BY app_id
+          FOR UPDATE",
+    )
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect();
+    let active_tls_binding_app_ids: BTreeSet<Uuid> = sqlx::query_scalar(
+        "SELECT app_id
+           FROM kbs_tls_bindings
+          WHERE deleted_at IS NULL
+          ORDER BY app_id
+          FOR UPDATE",
+    )
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect();
+    let active_legacy_binding_app_ids: BTreeSet<Uuid> = active_owner_binding_app_ids
+        .union(&active_tls_binding_app_ids)
+        .copied()
+        .collect();
+    if !active_legacy_binding_app_ids.is_subset(&expected_app_ids) {
+        return Err(CleanCutError::Precondition(
+            "active legacy KBS authority exists outside the complete clean-cut target set".into(),
+        ));
+    }
+
     for target in &plan.targets {
         let observed: DatabaseTarget = sqlx::query_as(
             "SELECT app.id AS app_id,
@@ -1396,6 +1450,27 @@ async fn retire_exact_database_authority(
         .fetch_one(&mut **tx)
         .await?;
     for target in &plan.targets {
+        sqlx::query(
+            "UPDATE kbs_owner_bindings
+                SET deleted_at = COALESCE(deleted_at, clock_timestamp()),
+                    updated_at = clock_timestamp()
+              WHERE app_id = $1
+                AND deleted_at IS NULL",
+        )
+        .bind(target.app_id)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            "UPDATE kbs_tls_bindings
+                SET deleted_at = COALESCE(deleted_at, clock_timestamp()),
+                    updated_at = clock_timestamp()
+              WHERE app_id = $1
+                AND deleted_at IS NULL",
+        )
+        .bind(target.app_id)
+        .execute(&mut **tx)
+        .await?;
+
         let owner_token: Uuid = sqlx::query_scalar(
             "SELECT owner_token
                FROM app_mutation_leases
@@ -1543,7 +1618,9 @@ async fn retire_exact_database_authority(
                WHERE state <> 'failed')
            + (SELECT count(*) FROM app_mutation_leases WHERE owner_token IS NOT NULL)
            + (SELECT count(*) FROM external_resource_mutation_leases
-               WHERE owner_token IS NOT NULL)",
+               WHERE owner_token IS NOT NULL)
+           + (SELECT count(*) FROM kbs_owner_bindings WHERE deleted_at IS NULL)
+           + (SELECT count(*) FROM kbs_tls_bindings WHERE deleted_at IS NULL)",
     )
     .fetch_one(&mut **tx)
     .await?;
@@ -2417,6 +2494,38 @@ mod tests {
     }
 
     #[test]
+    fn containment_derives_a_nonempty_pod_selector_from_the_deployment() {
+        let deployment = Deployment {
+            spec: Some(k8s_openapi::api::apps::v1::DeploymentSpec {
+                selector: k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector {
+                    match_labels: Some(std::collections::BTreeMap::from([
+                        ("app".to_string(), "enclava-api".to_string()),
+                        ("component".to_string(), "control-plane".to_string()),
+                    ])),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let selector =
+            contained_deployment_pod_selector(&deployment).expect("derive Deployment selector");
+        assert_eq!(
+            selector.to_string(),
+            "app=enclava-api,component=control-plane"
+        );
+
+        let select_all = Deployment {
+            spec: Some(Default::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            contained_deployment_pod_selector(&select_all),
+            Err(CleanCutError::Precondition(_))
+        ));
+    }
+
+    #[test]
     fn exact_clean_cut_plan_requires_full_quarantine_and_poisoned_namespace() {
         let mut value = plan();
         value.validate().expect("valid exact plan");
@@ -2593,6 +2702,34 @@ mod tests {
         .execute(&mut *tx)
         .await
         .expect("insert clean-cut app");
+        sqlx::query(
+            "INSERT INTO kbs_owner_bindings(
+                 app_id, binding_key, namespace, service_account,
+                 tenant_instance_identity_hash
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(target.app_id)
+        .bind(format!("clean-cut-owner-{}", target.app_id))
+        .bind(&target.namespace)
+        .bind(format!("{}-sa", target.app_name))
+        .bind("55".repeat(32))
+        .execute(&mut *tx)
+        .await
+        .expect("insert target legacy KBS owner binding");
+        sqlx::query(
+            "INSERT INTO kbs_tls_bindings(
+                 app_id, binding_key, namespace, service_account,
+                 tenant_instance_identity_hash
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(target.app_id)
+        .bind(format!("clean-cut-tls-{}", target.app_id))
+        .bind(&target.namespace)
+        .bind(format!("{}-sa", target.app_name))
+        .bind("55".repeat(32))
+        .execute(&mut *tx)
+        .await
+        .expect("insert target legacy KBS TLS binding");
         sqlx::query(
             "INSERT INTO deployments(
                  id, org_id, app_id, trigger, status, spec_snapshot,
@@ -2784,6 +2921,24 @@ mod tests {
                 true,
                 true
             )
+        );
+        let legacy_kbs_retired: (bool, bool) = sqlx::query_as(
+            "SELECT
+                 (SELECT deleted_at IS NOT NULL
+                    FROM kbs_owner_bindings
+                   WHERE app_id = $1),
+                 (SELECT deleted_at IS NOT NULL
+                    FROM kbs_tls_bindings
+                   WHERE app_id = $1)",
+        )
+        .bind(target.app_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("load retired legacy KBS bindings");
+        assert_eq!(
+            legacy_kbs_retired,
+            (true, true),
+            "clean-cut must retire legacy Trustee authority atomically"
         );
         let audit: serde_json::Value = sqlx::query_scalar(
             "SELECT detail

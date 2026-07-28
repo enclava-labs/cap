@@ -806,9 +806,6 @@ pub async fn reconcile_signed_policy_once(
 pub async fn reconcile_policy_once(
     state: &crate::state::AppState,
 ) -> Result<(), KbsPolicyReconciliationError> {
-    if state.kbs_policy.is_none() {
-        return Ok(());
-    }
     let lease = crate::mutation_leases::claim_resources(
         state,
         "kbs_policy_reconcile",
@@ -816,6 +813,15 @@ pub async fn reconcile_policy_once(
         vec![crate::mutation_leases::ResourceFence::kbs_policy()],
     )
     .await?;
+    if state.kbs_policy.is_none() {
+        let proof = require_no_durable_kbs_authority(&state.db).await;
+        // No provider call was possible without configuration. Release the
+        // exact claim on both the empty proof and the fail-closed authority
+        // finding so a corrected startup can retry immediately.
+        lease.finish().await?;
+        proof?;
+        return Ok(());
+    }
     lease
         .guard_provider(reconcile_policy(
             &state.db,
@@ -825,6 +831,39 @@ pub async fn reconcile_policy_once(
         .await??;
     lease.finish().await?;
     Ok(())
+}
+
+async fn require_no_durable_kbs_authority(db: &PgPool) -> Result<(), KbsPolicyError> {
+    let mut transaction = db.begin().await?;
+    let durable_authority_exists = durable_kbs_authority_exists(&mut transaction).await?;
+    transaction.rollback().await?;
+    if durable_authority_exists {
+        return Err(KbsPolicyError::NotConfigured);
+    }
+    Ok(())
+}
+
+async fn durable_kbs_authority_exists(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<bool, KbsPolicyError> {
+    Ok(sqlx::query_scalar(
+        "SELECT reconciliation.desired_generation > 0
+                OR EXISTS (
+                    SELECT 1
+                      FROM kbs_owner_bindings
+                     WHERE deleted_at IS NULL
+                )
+                OR EXISTS (
+                    SELECT 1
+                      FROM kbs_tls_bindings
+                     WHERE deleted_at IS NULL
+                )
+           FROM kbs_signed_policy_reconciliation AS reconciliation
+          WHERE reconciliation.singleton
+          FOR SHARE OF reconciliation",
+    )
+    .fetch_one(&mut **transaction)
+    .await?)
 }
 
 async fn retry_busy_reconciliation<F, Fut>(
@@ -2549,6 +2588,82 @@ owner_resource_bindings := {}
             .await
             .expect("migrate KBS authority test database");
         pool
+    }
+
+    #[tokio::test]
+    async fn missing_configuration_proof_detects_active_or_pending_signed_authority() {
+        let pool = database_test_pool().await;
+        let mut tx = pool.begin().await.expect("begin KBS authority proof");
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("clear signed-policy authority in test transaction");
+        sqlx::query(
+            "UPDATE kbs_owner_bindings
+                SET deleted_at = COALESCE(deleted_at, clock_timestamp())
+              WHERE deleted_at IS NULL",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("hide active owner bindings in test transaction");
+        sqlx::query(
+            "UPDATE kbs_tls_bindings
+                SET deleted_at = COALESCE(deleted_at, clock_timestamp())
+              WHERE deleted_at IS NULL",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("hide active TLS bindings in test transaction");
+        assert!(
+            !durable_kbs_authority_exists(&mut tx)
+                .await
+                .expect("prove empty KBS authority"),
+            "a pristine database may start without KBS management"
+        );
+
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 1
+              WHERE singleton",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("seed pending signed-policy authority");
+        assert!(
+            durable_kbs_authority_exists(&mut tx)
+                .await
+                .expect("detect pending KBS authority"),
+            "a pending signed generation requires configured startup reconciliation"
+        );
+
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET configmap_generation = 1,
+                    applied_generation = 1,
+                    configmap_policy_sha256 = decode(repeat('11', 32), 'hex'),
+                    applied_policy_sha256 = decode(repeat('11', 32), 'hex'),
+                    configmap_resource_version = 'test-resource-version'
+              WHERE singleton",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("mark signed-policy authority applied");
+        assert!(
+            durable_kbs_authority_exists(&mut tx)
+                .await
+                .expect("detect active KBS authority"),
+            "an applied signed generation still requires configured startup reconciliation"
+        );
+        tx.rollback().await.expect("roll back KBS authority proof");
     }
 
     #[tokio::test]
