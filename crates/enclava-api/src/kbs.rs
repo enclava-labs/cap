@@ -162,6 +162,7 @@ struct SignedPolicyArtifactCandidate {
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct SignedPolicyReconciliationRow {
     desired_generation: i64,
+    configmap_generation: i64,
     applied_generation: i64,
 }
 
@@ -453,7 +454,7 @@ async fn load_signed_policy_reconciliation(
     db: &PgPool,
 ) -> Result<SignedPolicyReconciliationRow, KbsPolicyError> {
     Ok(sqlx::query_as(
-        "SELECT desired_generation, applied_generation
+        "SELECT desired_generation, configmap_generation, applied_generation
            FROM kbs_signed_policy_reconciliation
           WHERE singleton",
     )
@@ -780,6 +781,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             return Ok(());
         }
         let generation = state.desired_generation;
+        let reset_bootstrap = state.configmap_generation == 0 && state.applied_generation == 0;
         let previously_applied = state.applied_generation >= generation;
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
         if let Some(expected) = expected_artifact
@@ -814,6 +816,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             generation,
             &next_policy,
             &policy_sha256_hex,
+            reset_bootstrap,
         )
         .await?;
         let (configmap_replaced, resource_version, publication_token) = match cm_result {
@@ -827,7 +830,10 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             } => (true, resource_version, publication_token),
             ConfigMapConvergence::Superseded => continue,
         };
-        if !record_configmap_generation(db, generation, &policy_sha256, &resource_version).await? {
+        if !reset_bootstrap
+            && !record_configmap_generation(db, generation, &policy_sha256, &resource_version)
+                .await?
+        {
             continue;
         }
 
@@ -837,6 +843,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             generation,
             &policy_sha256_hex,
             &publication_token,
+            reset_bootstrap,
         )
         .await?
         {
@@ -854,6 +861,7 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             generation,
             &next_policy,
             &policy_sha256_hex,
+            reset_bootstrap,
         )
         .await?
         {
@@ -866,6 +874,12 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             ConfigMapConvergence::Current { .. } => continue,
         }
 
+        if reset_bootstrap
+            && !record_configmap_generation(db, generation, &policy_sha256, &resource_version)
+                .await?
+        {
+            continue;
+        }
         let applied = record_applied_generation(db, generation, &policy_sha256).await?;
         if applied {
             if !previously_applied {
@@ -926,18 +940,26 @@ fn generation_decision(
     existing_content_hash: Option<&str>,
     desired_generation: i64,
     desired_hash: &str,
+    allow_generation_reset: bool,
 ) -> Result<GenerationDecision, KbsPolicyError> {
     let Some((existing_generation, annotated_hash)) = existing else {
         return Ok(GenerationDecision::Replace);
     };
-    if existing_generation > desired_generation {
+    // A new database has no durable ConfigMap or applied history. During that
+    // one bootstrap, Kubernetes annotations from the retired database are not
+    // authority; every later generation remains strictly monotonic.
+    if existing_generation > desired_generation && !allow_generation_reset {
         return Ok(GenerationDecision::Superseded);
     }
-    if existing_generation < desired_generation {
+    if existing_generation != desired_generation {
         return Ok(GenerationDecision::Replace);
     }
     if annotated_hash != desired_hash {
-        return Err(KbsPolicyError::PolicyGenerationConflict);
+        return if allow_generation_reset {
+            Ok(GenerationDecision::Replace)
+        } else {
+            Err(KbsPolicyError::PolicyGenerationConflict)
+        };
     }
     // The generation annotation is content-bound. If a stale legacy writer
     // changed only data while preserving that annotation, the durable desired
@@ -958,6 +980,7 @@ async fn converge_signed_policy_configmap(
     generation: i64,
     policy: &str,
     policy_sha256_hex: &str,
+    allow_generation_reset: bool,
 ) -> Result<ConfigMapConvergence, KbsPolicyError> {
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
         let mut configmap = cm_api.get(&config.configmap_name).await?;
@@ -985,6 +1008,7 @@ async fn converge_signed_policy_configmap(
             Some(&current_content_hash),
             generation,
             policy_sha256_hex,
+            allow_generation_reset,
         )? {
             GenerationDecision::Current => {
                 if let Some(publication_token) = existing_publication_token {
@@ -1099,6 +1123,7 @@ async fn converge_trustee_policy_generation(
     generation: i64,
     policy_sha256_hex: &str,
     publication_token: &str,
+    allow_generation_reset: bool,
 ) -> Result<GenerationDecision, KbsPolicyError> {
     let deploy_api: Api<Deployment> = Api::namespaced(client, &config.namespace);
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
@@ -1114,6 +1139,7 @@ async fn converge_trustee_policy_generation(
             existing.map(|(_, policy_hash)| policy_hash),
             generation,
             policy_sha256_hex,
+            allow_generation_reset,
         )?;
         let existing_publication_token = template_annotations
             .and_then(|annotations| annotations.get(POLICY_PUBLICATION_TOKEN_ANNOTATION))
@@ -1132,6 +1158,7 @@ async fn converge_trustee_policy_generation(
                     generation,
                     policy_sha256_hex,
                     publication_token,
+                    allow_generation_reset,
                 )
                 .await;
             }
@@ -1174,6 +1201,7 @@ async fn converge_trustee_policy_generation(
                     generation,
                     policy_sha256_hex,
                     publication_token,
+                    allow_generation_reset,
                 )
                 .await?;
                 if readiness == GenerationDecision::Superseded {
@@ -1194,6 +1222,7 @@ async fn wait_for_deployment_policy_generation(
     desired_generation: i64,
     desired_hash: &str,
     desired_publication_token: &str,
+    allow_generation_reset: bool,
 ) -> Result<GenerationDecision, KbsPolicyError> {
     let start = Instant::now();
     let timeout = Duration::from_secs(180);
@@ -1211,6 +1240,7 @@ async fn wait_for_deployment_policy_generation(
             annotated.map(|(_, policy_hash)| policy_hash),
             desired_generation,
             desired_hash,
+            allow_generation_reset,
         )?;
         if decision == GenerationDecision::Superseded {
             return Ok(decision);
@@ -1950,7 +1980,7 @@ owner_resource_bindings := {}
     #[test]
     fn policy_generation_decisions_are_monotonic_and_content_bound() {
         assert_eq!(
-            generation_decision(None, None, 3, &"aa".repeat(32)).unwrap(),
+            generation_decision(None, None, 3, &"aa".repeat(32), false).unwrap(),
             GenerationDecision::Replace
         );
         assert_eq!(
@@ -1959,9 +1989,34 @@ owner_resource_bindings := {}
                 Some(&"bb".repeat(32)),
                 3,
                 &"aa".repeat(32),
+                false,
             )
             .unwrap(),
             GenerationDecision::Superseded
+        );
+        assert_eq!(
+            generation_decision(
+                Some((4, &"bb".repeat(32))),
+                Some(&"bb".repeat(32)),
+                1,
+                &"aa".repeat(32),
+                true,
+            )
+            .unwrap(),
+            GenerationDecision::Replace,
+            "durable no-history bootstrap replaces a stale prior-cluster generation"
+        );
+        assert_eq!(
+            generation_decision(
+                Some((1, &"bb".repeat(32))),
+                Some(&"bb".repeat(32)),
+                1,
+                &"aa".repeat(32),
+                true,
+            )
+            .unwrap(),
+            GenerationDecision::Replace,
+            "reset bootstrap replaces an equal generation from a retired database"
         );
         assert!(matches!(
             generation_decision(
@@ -1969,6 +2024,7 @@ owner_resource_bindings := {}
                 Some(&"bb".repeat(32)),
                 3,
                 &"aa".repeat(32),
+                false,
             ),
             Err(KbsPolicyError::PolicyGenerationConflict)
         ));
@@ -1978,6 +2034,7 @@ owner_resource_bindings := {}
                 Some(&"bb".repeat(32)),
                 3,
                 &"aa".repeat(32),
+                false,
             )
             .unwrap(),
             GenerationDecision::Replace,

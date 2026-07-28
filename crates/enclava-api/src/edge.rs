@@ -12,7 +12,10 @@ use kube::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::net::IpAddr;
+use std::{collections::HashSet, net::IpAddr};
+use uuid::Uuid;
+
+use crate::state::AppState;
 
 const HAPROXY_CONFIG_GENERATION_ANNOTATION: &str = "config.enclava.dev/haproxy-sha256";
 const HAPROXY_MUTATION_GENERATION_ANNOTATION: &str =
@@ -23,6 +26,8 @@ const KUBERNETES_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 #[derive(Debug, thiserror::Error)]
 pub enum EdgeRouteError {
+    #[error("database error")]
+    Database(#[from] sqlx::Error),
     #[error("Kubernetes client error: {0}")]
     Kube(#[from] kube::Error),
     #[error("haproxy ConfigMap {namespace}/{name} is missing data key 'haproxy.cfg'")]
@@ -54,6 +59,14 @@ pub enum EdgeRouteError {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum EdgeReconciliationError {
+    #[error("durable edge mutation fence failed")]
+    Mutation(#[from] crate::mutation_leases::MutationLeaseError),
+    #[error("edge runtime reconciliation failed")]
+    Edge(#[from] EdgeRouteError),
+}
+
 #[derive(Clone, Debug)]
 pub struct EdgeRouteConfig {
     pub namespace: String,
@@ -83,6 +96,17 @@ pub struct SniRoute {
     pub backend_name: String,
     /// Backend target `ip_or_hostname:port` -- not user input.
     pub target: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DesiredEdgeApp {
+    app_id: Uuid,
+    name: String,
+    namespace: String,
+    domain: String,
+    tee_domain: Option<String>,
+    custom_domain: Option<String>,
+    org_slug: String,
 }
 
 impl SniRoute {
@@ -161,6 +185,192 @@ pub async fn remove_haproxy_routes(
     Ok(())
 }
 
+/// Rebuild every CAP-owned route from current Postgres and Kubernetes state.
+pub async fn reconcile_all_haproxy_routes(state: &AppState) -> Result<(), EdgeReconciliationError> {
+    let fence = crate::mutation_leases::ResourceFence::edge_config();
+    let lease = crate::mutation_leases::claim_resources(
+        state,
+        "edge_config_reconcile",
+        Uuid::new_v4(),
+        vec![fence.clone()],
+    )
+    .await?;
+    let generation = lease
+        .resource_generation(&fence)
+        .ok_or(crate::mutation_leases::MutationLeaseError::Lost)?;
+    lease
+        .guard_provider(reconcile_all_haproxy_routes_for_generation(
+            state, generation,
+        ))
+        .await??;
+    lease.finish().await?;
+    Ok(())
+}
+
+async fn reconcile_all_haproxy_routes_for_generation(
+    state: &AppState,
+    generation: i64,
+) -> Result<(), EdgeRouteError> {
+    let client = Client::try_default().await?;
+    let config = EdgeRouteConfig::from_env();
+    let routes = load_desired_haproxy_routes(&state.db, client.clone()).await?;
+    // This full rebuild owns the global fence and reloads authoritative state
+    // on every claim, so reset authority must survive a failed first lease.
+    reconcile_haproxy_config(client, &config, Some(generation), true, |current| {
+        render_authoritative_haproxy_config(current, &routes)
+    })
+    .await?;
+    Ok(())
+}
+
+/// Startup waits out only an existing bounded mutation lease. Every provider
+/// or database failure remains fatal and keeps readiness false.
+pub async fn reconcile_all_haproxy_routes_at_startup(
+    state: &AppState,
+) -> Result<(), EdgeReconciliationError> {
+    loop {
+        match reconcile_all_haproxy_routes(state).await {
+            Err(EdgeReconciliationError::Mutation(
+                crate::mutation_leases::MutationLeaseError::Busy,
+            )) => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+            result => return result,
+        }
+    }
+}
+
+pub fn spawn_haproxy_reconciler(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            match haproxy_routes_need_reconciliation(&state).await {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "could not inspect tenant HAProxy convergence");
+                    continue;
+                }
+            }
+            match reconcile_all_haproxy_routes(&state).await {
+                Ok(()) => {}
+                Err(EdgeReconciliationError::Mutation(
+                    crate::mutation_leases::MutationLeaseError::Busy,
+                )) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "tenant HAProxy reconciliation remains pending")
+                }
+            }
+        }
+    });
+}
+
+async fn haproxy_routes_need_reconciliation(state: &AppState) -> Result<bool, EdgeRouteError> {
+    let client = Client::try_default().await?;
+    let config = EdgeRouteConfig::from_env();
+    let routes = load_desired_haproxy_routes(&state.db, client.clone()).await?;
+    let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
+    let cm = cm_api.get(&config.configmap_name).await?;
+    let current = cm
+        .data
+        .as_ref()
+        .and_then(|data| data.get("haproxy.cfg"))
+        .ok_or_else(|| EdgeRouteError::MissingConfig {
+            namespace: config.namespace.clone(),
+            name: config.configmap_name.clone(),
+        })?;
+    let durable_generation: Option<i64> = sqlx::query_scalar(
+        "SELECT generation
+           FROM external_resource_mutation_leases
+          WHERE resource_scope = 'edge_config'
+            AND resource_key = 'global'",
+    )
+    .fetch_optional(&state.db)
+    .await?;
+    if durable_generation != Some(configmap_mutation_generation(&cm)?)
+        || render_authoritative_haproxy_config(current, &routes) != *current
+    {
+        return Ok(true);
+    }
+
+    let ds_api: Api<DaemonSet> = Api::namespaced(client, &config.namespace);
+    let daemonset = ds_api.get(&config.daemonset_name).await?;
+    Ok(
+        daemonset_config_generation(&daemonset)
+            != Some(haproxy_config_generation(current).as_str()),
+    )
+}
+
+async fn load_desired_haproxy_routes(
+    pool: &PgPool,
+    client: Client,
+) -> Result<Vec<SniRoute>, EdgeRouteError> {
+    let apps = load_desired_edge_apps(pool).await?;
+    let mut routes = Vec::new();
+    for app in apps {
+        let Some(address) =
+            resolve_existing_service_address(client.clone(), &app.name, &app.namespace).await?
+        else {
+            tracing::warn!(
+                app_id = %app.app_id,
+                "excluding HAProxy route because its workload Service is absent"
+            );
+            continue;
+        };
+        let app_backend = backend_name_for(&app.org_slug, &app.name, BackendTag::App)?;
+        let tee_backend = backend_name_for(&app.org_slug, &app.name, BackendTag::Tee)?;
+        routes.push(SniRoute::new(
+            &app.domain,
+            &app_backend,
+            &format!("{address}:443"),
+        )?);
+        if let Some(tee_domain) = app.tee_domain.as_deref() {
+            routes.push(SniRoute::new(
+                tee_domain,
+                &tee_backend,
+                &format!("{address}:8081"),
+            )?);
+        }
+        if let Some(custom_domain) = app.custom_domain.as_deref() {
+            routes.push(SniRoute::new(
+                custom_domain,
+                &app_backend,
+                &format!("{address}:443"),
+            )?);
+        }
+    }
+    Ok(routes)
+}
+
+async fn load_desired_edge_apps(pool: &PgPool) -> Result<Vec<DesiredEdgeApp>, sqlx::Error> {
+    sqlx::query_as::<_, DesiredEdgeApp>(
+        "SELECT app.id AS app_id, app.name, app.namespace, app.domain,
+                app.tee_domain, app.custom_domain,
+                organization.cust_slug AS org_slug
+           FROM apps AS app
+           JOIN organizations AS organization ON organization.id = app.org_id
+           JOIN LATERAL (
+                SELECT deployment.status
+                  FROM deployment_apply_jobs AS job
+                  JOIN deployments AS deployment
+                    ON deployment.id = job.deployment_id
+                   AND deployment.app_id = job.app_id
+                 WHERE job.app_id = app.id
+                   AND deployment.status IN (
+                        'watching'::deploy_status_enum,
+                        'healthy'::deploy_status_enum
+                   )
+                 ORDER BY job.generation DESC
+                 LIMIT 1
+           ) AS latest ON true
+          WHERE app.status IN (
+                'creating'::app_status_enum,
+                'running'::app_status_enum
+          )
+          ORDER BY app.id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 async fn mutate_haproxy_config<F>(
     _pool: &PgPool,
     config: &EdgeRouteConfig,
@@ -187,13 +397,14 @@ async fn mutate_haproxy_config_with_client<F>(
 where
     F: Fn(&str) -> String,
 {
-    reconcile_haproxy_config(client, config, mutation_generation, mutate).await
+    reconcile_haproxy_config(client, config, mutation_generation, false, mutate).await
 }
 
 async fn reconcile_haproxy_config<F>(
     client: Client,
     config: &EdgeRouteConfig,
     mutation_generation: Option<i64>,
+    allow_generation_reset: bool,
     mutate: F,
 ) -> Result<bool, EdgeRouteError>
 where
@@ -216,6 +427,7 @@ where
         let current_mutation_generation = configmap_mutation_generation(&cm)?;
         if let Some(expected_generation) = mutation_generation
             && current_mutation_generation > expected_generation
+            && !allow_generation_reset
         {
             // This closure belongs to an older durable resource owner. Never
             // recompute it atop the newer intent after an RV conflict.
@@ -443,6 +655,28 @@ pub async fn resolve_backend_target(
     Ok(format!("{cluster_ip}:{port}"))
 }
 
+async fn resolve_existing_service_address(
+    client: Client,
+    app_name: &str,
+    namespace: &str,
+) -> Result<Option<String>, EdgeRouteError> {
+    validate_app_name(app_name)
+        .map_err(|_| EdgeRouteError::InvalidAppName(format!("invalid app name: {app_name}")))?;
+    let service_api: Api<Service> = Api::namespaced(client, namespace);
+    let service = match service_api.get(app_name).await {
+        Ok(service) => service,
+        Err(kube::Error::Api(error)) if error.code == 404 => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(
+        service
+            .spec
+            .and_then(|spec| spec.cluster_ip)
+            .filter(|ip| !ip.is_empty() && ip != "None")
+            .unwrap_or_else(|| format!("{app_name}.{namespace}.svc.cluster.local")),
+    ))
+}
+
 fn gateway_api_resource() -> ApiResource {
     ApiResource {
         group: "gateway.networking.k8s.io".to_string(),
@@ -527,6 +761,114 @@ fn render_route_into(config: &str, route: &SniRoute) -> String {
     }
 
     out
+}
+
+fn render_authoritative_haproxy_config(config: &str, routes: &[SniRoute]) -> String {
+    let mut rendered = remove_all_cap_managed_routes(config);
+    for route in routes {
+        rendered = render_route_into(&rendered, route);
+    }
+    rendered
+}
+
+fn remove_all_cap_managed_routes(config: &str) -> String {
+    let lines: Vec<&str> = config.lines().collect();
+    let mut managed_backends = HashSet::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(name) = line.trim().strip_prefix("backend ") else {
+            continue;
+        };
+        let name = name.split_ascii_whitespace().next().unwrap_or_default();
+        let end = lines[index + 1..]
+            .iter()
+            .position(|candidate| is_haproxy_section_header(candidate))
+            .map_or(lines.len(), |offset| index + 1 + offset);
+        let generated_marker = lines[index + 1..end]
+            .iter()
+            .any(|candidate| candidate.contains("Generated from CAP caddy-sni-route ConfigMap."));
+        if is_cap_managed_backend_name(name) || generated_marker {
+            managed_backends.insert(name.to_string());
+        }
+    }
+
+    let mut out = Vec::with_capacity(lines.len());
+    let mut skipping_backend = false;
+    for line in lines {
+        if skipping_backend {
+            if is_haproxy_section_header(line) {
+                skipping_backend = false;
+            } else {
+                continue;
+            }
+        }
+        let tokens: Vec<&str> = line.split_ascii_whitespace().collect();
+        if tokens.first() == Some(&"backend")
+            && tokens
+                .get(1)
+                .is_some_and(|backend| managed_backends.contains(*backend))
+        {
+            skipping_backend = true;
+            continue;
+        }
+        if tokens.first() == Some(&"use_backend")
+            && tokens
+                .get(1)
+                .is_some_and(|backend| managed_backends.contains(*backend))
+        {
+            continue;
+        }
+        if tokens.first() == Some(&"acl")
+            && tokens
+                .get(1)
+                .is_some_and(|acl| acl.starts_with("acl_cap_") || acl.starts_with("acl_flowforge_"))
+        {
+            continue;
+        }
+        out.push(line);
+    }
+
+    let mut rendered = out.join("\n");
+    if config.ends_with('\n') {
+        rendered.push('\n');
+    }
+    rendered
+}
+
+fn is_cap_managed_backend_name(name: &str) -> bool {
+    name.starts_with("be_cap_")
+        || (name.starts_with("be_flowforge_") && name.contains("_sni_route_"))
+}
+
+fn is_haproxy_section_header(line: &str) -> bool {
+    let line = line.trim_start();
+    if line.is_empty() || line.starts_with('#') {
+        return false;
+    }
+    matches!(
+        line.split_ascii_whitespace().next(),
+        Some(
+            "global"
+                | "defaults"
+                | "frontend"
+                | "backend"
+                | "listen"
+                | "peers"
+                | "resolvers"
+                | "mailers"
+                | "cache"
+                | "program"
+                | "ring"
+                | "userlist"
+                | "http-errors"
+                | "crt-store"
+                | "log-forward"
+                | "log-profile"
+                | "fcgi-app"
+                | "namespace_list"
+                | "traces"
+                | "acme"
+        )
+    )
 }
 
 fn remove_route_from(config: &str, backend_name: &str, domain: &str) -> String {
@@ -885,8 +1227,65 @@ mod tests {
         }
     }
 
+    async fn edge_database_test_pool() -> PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect edge authority test database");
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate edge authority test database");
+        pool
+    }
+
+    async fn insert_edge_deployment_job(
+        pool: &PgPool,
+        org_id: Uuid,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        deployment_status: &str,
+        job_state: &str,
+    ) {
+        let mut tx = pool.begin().await.expect("begin edge deployment fixture");
+        sqlx::query(
+            "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
+             VALUES ($1, $2, $3, $4::deploy_status_enum, '{}'::jsonb)",
+        )
+        .bind(deployment_id)
+        .bind(org_id)
+        .bind(app_id)
+        .bind(deployment_status)
+        .execute(&mut *tx)
+        .await
+        .expect("insert edge test deployment");
+        sqlx::query(
+            "INSERT INTO deployment_apply_jobs (
+                 deployment_id, app_id, org_id, source_deployment_id,
+                 payload_version, payload, payload_sha256,
+                 cleanup_app_on_setup_failure, signed_required, state
+             ) VALUES (
+                 $1, $2, $3, $1, 1,
+                 '{\"version\":1,\"log_encryption\":null}'::jsonb,
+                 $4, false, false, $5
+             )",
+        )
+        .bind(deployment_id)
+        .bind(app_id)
+        .bind(org_id)
+        .bind(vec![7_u8; 32])
+        .bind(job_state)
+        .execute(&mut *tx)
+        .await
+        .expect("insert edge test apply job");
+        tx.commit().await.expect("commit edge deployment fixture");
+    }
+
     async fn reconcile_to(client: Client, desired: &str) -> Result<bool, EdgeRouteError> {
-        reconcile_haproxy_config(client, &edge_config(), Some(1), |_| desired.to_string()).await
+        reconcile_haproxy_config(client, &edge_config(), Some(1), false, |_| {
+            desired.to_string()
+        })
+        .await
     }
 
     #[tokio::test]
@@ -984,7 +1383,7 @@ mod tests {
         let old_route = route.clone();
         let old_client = fake_kube_client(Arc::clone(&state));
         let old = tokio::spawn(async move {
-            reconcile_haproxy_config(old_client, &edge_config(), Some(1), |current| {
+            reconcile_haproxy_config(old_client, &edge_config(), Some(1), false, |current| {
                 render_route_into(current, &old_route)
             })
             .await
@@ -992,7 +1391,7 @@ mod tests {
         entered.notified().await;
 
         let new_client = fake_kube_client(Arc::clone(&state));
-        reconcile_haproxy_config(new_client, &edge_config(), Some(2), |current| {
+        reconcile_haproxy_config(new_client, &edge_config(), Some(2), false, |current| {
             remove_route_from(current, &route.backend_name, &route.host)
         })
         .await
@@ -1012,6 +1411,122 @@ mod tests {
             Some(haproxy_config_generation(&converged.config).as_str())
         );
         assert_eq!(converged.configmap_patch_attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn authoritative_retry_replaces_stale_configmap_after_first_lease_fails() {
+        let current = "global\n  maxconn 4096\n";
+        let desired = "global\n  maxconn 2048\n";
+        let state = Arc::new(Mutex::new(FakeKubeState::new(current)));
+        {
+            let mut initial = state.lock().unwrap();
+            initial.mutation_generation = Some(4);
+            initial
+                .configmap_patch_outcomes
+                .push_back(FakePatchOutcome::FailBeforeApply);
+        }
+        let client = fake_kube_client(Arc::clone(&state));
+
+        assert!(
+            reconcile_haproxy_config(client.clone(), &edge_config(), Some(1), true, |_| {
+                desired.to_string()
+            })
+            .await
+            .is_err(),
+            "the first durable lease can fail before changing Kubernetes"
+        );
+        assert!(
+            reconcile_haproxy_config(client, &edge_config(), Some(2), true, |_| {
+                desired.to_string()
+            })
+            .await
+            .expect("a later authoritative retry resets stale cluster metadata")
+        );
+
+        let converged = state.lock().unwrap();
+        assert_eq!(converged.config, desired);
+        assert_eq!(converged.mutation_generation, Some(2));
+        assert_eq!(
+            converged.generation.as_deref(),
+            Some(haproxy_config_generation(desired).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_replacement_keeps_latest_routable_app_selected() {
+        let pool = edge_database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let suffix = app_id.simple().to_string();
+        sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+            .bind(org_id)
+            .bind(format!("edge-{suffix}"))
+            .bind(&suffix[..8])
+            .execute(&pool)
+            .await
+            .expect("insert edge test organization");
+        sqlx::query(
+            "INSERT INTO apps (
+                 id, org_id, name, namespace, instance_id, tenant_id,
+                 service_account, bootstrap_owner_pubkey_hash,
+                 tenant_instance_identity_hash, domain, tee_domain, status
+             ) VALUES (
+                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'running'
+             )",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .bind(format!("edge-{}", &suffix[..12]))
+        .bind(format!("cap-edge-{}", &suffix[..12]))
+        .bind(format!("instance-{suffix}"))
+        .bind(&suffix[..8])
+        .bind(format!("cap-edge-{}-sa", &suffix[..12]))
+        .bind("11".repeat(32))
+        .bind("22".repeat(32))
+        .bind(format!("edge-{}.example.test", &suffix[..12]))
+        .bind(format!("edge-{}.tee.example.test", &suffix[..12]))
+        .execute(&pool)
+        .await
+        .expect("insert edge test app");
+
+        let healthy_id = Uuid::new_v4();
+        insert_edge_deployment_job(&pool, org_id, app_id, healthy_id, "healthy", "completed").await;
+        insert_edge_deployment_job(
+            &pool,
+            org_id,
+            app_id,
+            Uuid::new_v4(),
+            "pending",
+            "setup_pending",
+        )
+        .await;
+
+        let selected = load_desired_edge_apps(&pool)
+            .await
+            .expect("select latest routable apps");
+        assert!(
+            selected.iter().any(|app| app.app_id == app_id),
+            "a newer pending replacement must not purge the serving route"
+        );
+
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'failed'::deploy_status_enum
+              WHERE id = $1",
+        )
+        .bind(healthy_id)
+        .execute(&pool)
+        .await
+        .expect("make old deployment non-routable");
+        let selected = load_desired_edge_apps(&pool)
+            .await
+            .expect("reselect without a routable deployment");
+        assert!(!selected.iter().any(|app| app.app_id == app_id));
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete edge selection fixture");
     }
 
     #[tokio::test]
@@ -1209,6 +1724,105 @@ mod tests {
         ));
         assert!(out.contains("server tenant 10.0.0.1:443 check"));
         assert!(out.contains("server tenant 10.0.0.1:8081 check"));
+    }
+
+    #[test]
+    fn authoritative_rebuild_repairs_routes_and_purges_retired_deployments() {
+        let current = "global\n  maxconn 4096\n\nfrontend fe_443\n  bind :443\n  acl is_mgmt_sni req.ssl_sni -i management.example.test\n  acl acl_flowforge_stale req.ssl_sni -i stale.example.test\n  use_backend be_reject if is_mgmt_sni\n  use_backend be_cap_old_app if is_mgmt_sni\n  use_backend be_cap_old_app if { req.ssl_sni -i stale-cap.example.test }\n  use_backend be_flowforge_1_retired_sni_route_app if acl_flowforge_stale\n  default_backend be_reject\n\nbackend be_cap_old_app\n  # Generated from CAP caddy-sni-route ConfigMap.\n  server tenant 10.0.0.1:443 check\n\nbackend be_flowforge_1_retired_sni_route_app\n  server tenant 10.0.0.2:443 check\n\nresolvers cluster_dns\n  nameserver dns 10.43.0.10:53\n\nbackend be_reject\n  tcp-request content reject\n";
+        let routes = vec![
+            SniRoute::new(
+                "api.abcd1234.enclava.dev",
+                "be_cap_abcd1234_api_app",
+                "10.43.1.2:443",
+            )
+            .unwrap(),
+            SniRoute::new(
+                "api.abcd1234.tee.enclava.dev",
+                "be_cap_abcd1234_api_tee",
+                "10.43.1.2:8081",
+            )
+            .unwrap(),
+            SniRoute::new(
+                "web.ef567890.enclava.dev",
+                "be_cap_ef567890_web_app",
+                "10.43.1.3:443",
+            )
+            .unwrap(),
+            SniRoute::new(
+                "web.ef567890.tee.enclava.dev",
+                "be_cap_ef567890_web_tee",
+                "10.43.1.3:8081",
+            )
+            .unwrap(),
+        ];
+
+        let rebuilt = render_authoritative_haproxy_config(current, &routes);
+
+        for retired in [
+            "be_cap_old_app",
+            "be_flowforge_1_retired_sni_route_app",
+            "acl_flowforge_stale",
+            "stale-cap.example.test",
+            "stale.example.test",
+        ] {
+            assert!(
+                !rebuilt.contains(retired),
+                "{retired} remained in:\n{rebuilt}"
+            );
+        }
+        for preserved in [
+            "acl is_mgmt_sni",
+            "use_backend be_reject if is_mgmt_sni",
+            "resolvers cluster_dns",
+            "backend be_reject",
+        ] {
+            assert!(
+                rebuilt.contains(preserved),
+                "{preserved} was removed from:\n{rebuilt}"
+            );
+        }
+        assert!(rebuilt.contains("use_backend be_cap_abcd1234_api_app"));
+        assert!(rebuilt.contains("use_backend be_cap_abcd1234_api_tee"));
+        let backends: Vec<&str> = rebuilt
+            .lines()
+            .filter_map(|line| line.strip_prefix("backend "))
+            .collect();
+        let mappings: Vec<&str> = rebuilt
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("use_backend "))
+            .filter_map(|line| line.split_ascii_whitespace().next())
+            .collect();
+        assert_eq!(
+            backends
+                .iter()
+                .filter(|backend| backend.starts_with("be_cap_"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            mappings
+                .iter()
+                .filter(|backend| backend.starts_with("be_cap_"))
+                .count(),
+            4
+        );
+        assert_eq!(backends.len(), 5);
+        assert_eq!(mappings.len(), 5);
+        assert_eq!(
+            backends.iter().copied().collect::<HashSet<_>>(),
+            mappings.iter().copied().collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            backends
+                .iter()
+                .filter(|backend| **backend == "be_reject")
+                .count(),
+            1
+        );
+        assert_eq!(
+            render_authoritative_haproxy_config(&rebuilt, &routes),
+            rebuilt
+        );
     }
 
     #[test]

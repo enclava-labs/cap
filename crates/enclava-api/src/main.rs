@@ -833,7 +833,12 @@ async fn main() {
         eprintln!("startup refused: KBS policy reconciliation failed: {error}");
         std::process::exit(1);
     }
+    if let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state).await {
+        eprintln!("startup refused: HAProxy route reconciliation failed: {error}");
+        std::process::exit(1);
+    }
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
+    enclava_api::edge::spawn_haproxy_reconciler(state.clone());
     if deployment_dispatch_enabled {
         enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
     } else {
@@ -880,6 +885,26 @@ mod tests {
                 "{invalid:?} must not activate dispatch"
             );
         }
+    }
+
+    #[test]
+    fn edge_authority_converges_before_dispatch_and_readiness() {
+        let source = include_str!("main.rs");
+        let main_body = source
+            .split("#[tokio::main]")
+            .nth(1)
+            .and_then(|body| body.split("#[cfg(test)]").next())
+            .expect("main body");
+        let edge = main_body
+            .find("reconcile_all_haproxy_routes_at_startup")
+            .expect("startup edge reconciliation");
+        let dispatch = main_body
+            .find("spawn_deployment_dispatcher")
+            .expect("deployment dispatcher");
+        let ready = main_body
+            .find("mark_startup_ready")
+            .expect("readiness gate");
+        assert!(edge < dispatch && dispatch < ready);
     }
 
     #[test]

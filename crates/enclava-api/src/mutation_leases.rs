@@ -372,6 +372,13 @@ impl ResourceMutationLease {
         }
     }
 
+    pub fn resource_generation(&self, fence: &ResourceFence) -> Option<i64> {
+        self.resources
+            .iter()
+            .find(|resource| &resource.fence == fence)
+            .map(|resource| resource.generation)
+    }
+
     pub fn guard_provider<'a, F, T>(
         &'a self,
         future: F,

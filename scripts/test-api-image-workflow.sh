@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="$ROOT_DIR/.github/workflows/api-image.yml"
+DOCKERFILE="$ROOT_DIR/crates/enclava-api/Dockerfile"
 
 fail() {
   echo "error: $*" >&2
@@ -76,6 +77,15 @@ for required in \
   "sh -n scripts/verify-api-image-ref.sh" \
   "bash -n scripts/verify-api-image-ref.bash"; do
   assert_contains "$required"
+done
+
+for required in \
+  "cargo build --bin enclava-api --bin cap-migrate" \
+  "COPY --from=debug-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate" \
+  "cargo build --release --bin enclava-api --bin cap-migrate" \
+  "COPY --from=release-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate"; do
+  grep -Fq -- "$required" "$DOCKERFILE" \
+    || fail "API image Dockerfile is missing: $required"
 done
 
 if grep -Fq "id-token: write" <<<"$validate_block" \
