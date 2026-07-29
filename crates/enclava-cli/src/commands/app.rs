@@ -250,7 +250,8 @@ mod signing;
 pub(crate) use signing::{ConfidentialAppForCcHash, confidential_app_for_cc_hash};
 pub(crate) use signing::{
     SignedDeployBlobParams, build_signed_deploy_blobs, ensure_manual_deploy_keyring,
-    load_or_derive_bootstrap_private_key, resolve_current_user_org,
+    fetch_verified_platform_release, load_or_derive_bootstrap_private_key,
+    resolve_current_user_org,
 };
 
 #[derive(Args)]
