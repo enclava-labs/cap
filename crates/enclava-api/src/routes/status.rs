@@ -13,7 +13,7 @@ use kube::Api;
 use kube::api::ListParams;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{future::Future, time::Duration};
+use std::{future::Future, net::SocketAddr, time::Duration};
 use uuid::Uuid;
 
 use crate::auth::{middleware::AuthContext, scopes};
@@ -236,10 +236,9 @@ pub(crate) async fn observe_app_status_fields_for_deployment(
     tee_domain: Option<&str>,
     expected_deployment_id: Option<Uuid>,
 ) -> ObservedAppStatus {
-    let tee_status_url = confidential_status_url(domain, tee_domain);
     let (kubernetes, tee) = tokio::join!(
         probe_kubernetes(namespace, app_name, expected_deployment_id),
-        probe_tee(state, &tee_status_url)
+        probe_tee(state, namespace, app_name, domain, tee_domain)
     );
     classify_live_observation_for_deployment(kubernetes, tee, Utc::now(), expected_deployment_id)
 }
@@ -390,9 +389,66 @@ fn select_runtime_failure(
     selected.and_then(|index| failures.into_iter().nth(index))
 }
 
-async fn probe_tee(state: &AppState, tee_status_url: &str) -> TeeEvidence {
-    let Ok(response) = state
-        .tee_http_client
+async fn probe_tee(
+    state: &AppState,
+    namespace: &str,
+    app_name: &str,
+    domain: &str,
+    tee_domain: Option<&str>,
+) -> TeeEvidence {
+    bounded_tee_probe(
+        probe_tee_unbounded(state, namespace, app_name, domain, tee_domain),
+        TEE_STATUS_PROBE_TIMEOUT,
+    )
+    .await
+}
+
+async fn bounded_tee_probe<F>(probe: F, deadline: Duration) -> TeeEvidence
+where
+    F: Future<Output = TeeEvidence>,
+{
+    tokio::time::timeout(deadline, probe)
+        .await
+        .unwrap_or(TeeEvidence::Unavailable)
+}
+
+async fn probe_tee_unbounded(
+    state: &AppState,
+    namespace: &str,
+    app_name: &str,
+    domain: &str,
+    tee_domain: Option<&str>,
+) -> TeeEvidence {
+    let confidential_domain = tee_domain.unwrap_or(domain);
+    let internal_transport = state.attestation.as_ref().is_some_and(|attestation| {
+        enclava_engine::manifest::network_policy::cap_api_namespace_for_attestation(
+            attestation,
+            &state.api_url,
+        )
+        .is_some()
+    });
+    let (client, tee_status_url) = if internal_transport {
+        let Some(socket) =
+            crate::routes::logs::resolve_internal_tee_socket(app_name, namespace).await
+        else {
+            return TeeEvidence::Unavailable;
+        };
+        let Ok(client) =
+            crate::routes::logs::build_resolved_tenant_tee_http_client(confidential_domain, socket)
+        else {
+            return TeeEvidence::Unavailable;
+        };
+        (
+            client,
+            confidential_status_url(domain, tee_domain, Some(socket)),
+        )
+    } else {
+        (
+            state.tee_http_client.clone(),
+            confidential_status_url(domain, tee_domain, None),
+        )
+    };
+    let Ok(response) = client
         .get(tee_status_url)
         .timeout(TEE_STATUS_PROBE_TIMEOUT)
         .send()
@@ -732,9 +788,19 @@ fn effective_app_status(
     }
 }
 
-fn confidential_status_url(domain: &str, tee_domain: Option<&str>) -> String {
+fn confidential_status_url(
+    domain: &str,
+    tee_domain: Option<&str>,
+    socket: Option<SocketAddr>,
+) -> String {
     let confidential_domain = tee_domain.unwrap_or(domain);
-    format!("https://{confidential_domain}/.well-known/confidential/status")
+    match socket {
+        Some(socket) => format!(
+            "https://{confidential_domain}:{}/.well-known/confidential/status",
+            socket.port()
+        ),
+        None => format!("https://{confidential_domain}/.well-known/confidential/status"),
+    }
 }
 
 /// GET /apps/{name}/logs -- proxied container logs.
@@ -782,7 +848,7 @@ pub async fn app_logs(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, time::Duration};
 
     use chrono::{TimeZone, Utc};
     use k8s_openapi::api::core::v1::{
@@ -795,9 +861,10 @@ mod tests {
 
     use super::{
         KubernetesEvidence, LiveObservationReason, LiveObservationState, PodEvidence,
-        RuntimeFailureEvidence, TeeEvidence, bounded_kubernetes_probe, classify_live_observation,
-        classify_live_observation_for_deployment, confidential_status_url, effective_app_status,
-        pod_is_ready, runtime_failure_evidence, select_runtime_failure, tee_evidence_fields,
+        RuntimeFailureEvidence, TeeEvidence, bounded_kubernetes_probe, bounded_tee_probe,
+        classify_live_observation, classify_live_observation_for_deployment,
+        confidential_status_url, effective_app_status, pod_is_ready, runtime_failure_evidence,
+        select_runtime_failure, tee_evidence_fields,
     };
 
     const WAITING_SECRET: &str = "waiting-message-secret=tenant-api-key";
@@ -1460,10 +1527,30 @@ mod tests {
     }
 
     #[test]
-    fn confidential_status_probe_uses_tee_domain() {
+    fn confidential_status_probe_pins_tee_domain_to_internal_service() {
+        let socket = "10.43.13.109:8081".parse().unwrap();
         assert_eq!(
-            confidential_status_url("app.example.test", Some("app.tee.example.test")),
+            confidential_status_url(
+                "app.example.test",
+                Some("app.tee.example.test"),
+                Some(socket)
+            ),
+            "https://app.tee.example.test:8081/.well-known/confidential/status"
+        );
+        assert_eq!(
+            confidential_status_url("app.example.test", Some("app.tee.example.test"), None),
             "https://app.tee.example.test/.well-known/confidential/status"
         );
+    }
+
+    #[tokio::test]
+    async fn tee_probe_deadline_covers_internal_service_resolution() {
+        let evidence = bounded_tee_probe(
+            std::future::pending::<TeeEvidence>(),
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert_eq!(evidence, TeeEvidence::Unavailable);
     }
 }

@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use crate::types::{ConfidentialApp, EgressMode, EgressRule};
+use crate::types::{AttestationConfig, ConfidentialApp, EgressMode, EgressRule};
 
 /// Platform-default FQDN egress allowlist.
 ///
@@ -261,7 +261,7 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
 }
 
 fn cap_api_tee_ingress_rule(app: &ConfidentialApp) -> Option<Value> {
-    let namespace = cap_api_namespace_for_app(app)?;
+    let namespace = cap_api_namespace_for_attestation(&app.attestation, &app.api_url)?;
     Some(json!({
         "fromEndpoints": [
             {
@@ -281,12 +281,19 @@ fn cap_api_tee_ingress_rule(app: &ConfidentialApp) -> Option<Value> {
     }))
 }
 
-fn cap_api_namespace_for_app(app: &ConfidentialApp) -> Option<&str> {
+/// Return the CAP namespace only when workload configuration explicitly uses
+/// the internal `cap-api` Service. Tenant policy generation and CAP status
+/// observation share this predicate so the direct TEE path is selected only
+/// when its ingress rule is present.
+pub fn cap_api_namespace_for_attestation<'a>(
+    attestation: &'a AttestationConfig,
+    api_url: &'a str,
+) -> Option<&'a str> {
     [
-        app.attestation.tls_certificate_broker_url.as_deref(),
-        app.attestation.workload_artifacts_url.as_deref(),
-        app.attestation.trustee_policy_url.as_deref(),
-        Some(app.api_url.as_str()),
+        attestation.tls_certificate_broker_url.as_deref(),
+        attestation.workload_artifacts_url.as_deref(),
+        attestation.trustee_policy_url.as_deref(),
+        Some(api_url),
     ]
     .into_iter()
     .flatten()

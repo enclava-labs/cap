@@ -89,6 +89,8 @@ grep -Fq -- "serviceAccountName: enclava-api" "$DEPLOYMENT" \
   || fail "API Deployment must use its Kubernetes reconciliation identity"
 grep -Fq -- "automountServiceAccountToken: true" "$DEPLOYMENT" \
   || fail "API Deployment must mount Kubernetes credentials"
+[[ "$(grep -Fc -- "app.kubernetes.io/name: cap-api" "$DEPLOYMENT")" -ge 2 ]] \
+  || fail "API Deployment and pod template must carry the tenant-policy CAP identity"
 grep -Fq -- 'CAP_DISABLE_EDGE_RECONCILIATION: "true"' "$COMPOSE" \
   || fail "non-Kubernetes Compose must explicitly disable edge reconciliation"
 grep -Fq -- 'CAP_DEPLOYMENT_DISPATCH_ENABLED: "false"' "$COMPOSE" \

@@ -258,7 +258,7 @@ async fn tenant_tee_logs_client(
     namespace: &str,
     confidential_domain: &str,
 ) -> (reqwest::Client, String) {
-    match internal_tee_socket(app_name, namespace).await {
+    match resolve_internal_tee_socket(app_name, namespace).await {
         Some(socket) => match build_resolved_tenant_tee_http_client(confidential_domain, socket) {
             Ok(client) => (
                 client,
@@ -287,7 +287,10 @@ async fn tenant_tee_logs_client(
     }
 }
 
-async fn internal_tee_socket(app_name: &str, namespace: &str) -> Option<SocketAddr> {
+pub(crate) async fn resolve_internal_tee_socket(
+    app_name: &str,
+    namespace: &str,
+) -> Option<SocketAddr> {
     let target = match crate::edge::resolve_backend_target(app_name, namespace, 8081).await {
         Ok(target) => target,
         Err(err) => {
@@ -295,7 +298,7 @@ async fn internal_tee_socket(app_name: &str, namespace: &str) -> Option<SocketAd
                 app = %app_name,
                 namespace = %namespace,
                 error = %err,
-                "failed to resolve internal TEE log endpoint; falling back to public TEE DNS"
+                "failed to resolve internal tenant TEE endpoint"
             );
             return None;
         }
@@ -305,7 +308,7 @@ async fn internal_tee_socket(app_name: &str, namespace: &str) -> Option<SocketAd
             app = %app_name,
             namespace = %namespace,
             target = %target,
-            "internal TEE log endpoint did not resolve to an IP socket; falling back to public TEE DNS"
+            "internal tenant TEE endpoint did not resolve to an IP socket"
         );
         None
     })
@@ -318,15 +321,33 @@ fn parse_socket_addr(target: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-fn build_resolved_tenant_tee_http_client(
+pub(crate) fn build_resolved_tenant_tee_http_client(
     confidential_domain: &str,
     socket: SocketAddr,
 ) -> Result<reqwest::Client, reqwest::Error> {
-    let mut builder = reqwest::Client::builder()
+    build_resolved_tenant_tee_http_client_with_builder(
+        reqwest::Client::builder(),
+        confidential_domain,
+        socket,
+    )
+}
+
+fn build_resolved_tenant_tee_http_client_with_builder(
+    builder: reqwest::ClientBuilder,
+    confidential_domain: &str,
+    socket: SocketAddr,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let mut builder = builder
         .https_only(true)
+        .no_proxy()
         .resolve(confidential_domain, socket)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
         .danger_accept_invalid_certs(accepts_invalid_tenant_tee_certs());
 
+    // Startup already validates the same CA inputs while constructing the
+    // shared TEE client. Re-read them only because reqwest resolution is fixed
+    // on a client builder rather than configurable per request.
     if let Ok(cert_pem) = std::env::var("TENANT_TEE_CA_CERT_PEM") {
         let cert_pem = cert_pem.replace("\\n", "\n");
         if let Ok(certs) = reqwest::Certificate::from_pem_bundle(cert_pem.as_bytes()) {
@@ -437,5 +458,42 @@ mod tests {
         );
         assert!(parse_socket_addr("tenant-app.ns.svc.cluster.local:8081").is_none());
         assert!(parse_socket_addr("10.43.13.109").is_none());
+    }
+
+    #[tokio::test]
+    async fn resolved_tenant_tee_client_bypasses_configured_proxy() {
+        let direct = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_socket = direct.local_addr().unwrap();
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let builder = reqwest::Client::builder().proxy(reqwest::Proxy::all(proxy_url).unwrap());
+        let client = build_resolved_tenant_tee_http_client_with_builder(
+            builder,
+            "tenant.example.test",
+            direct_socket,
+        )
+        .unwrap();
+
+        let request = tokio::spawn(async move {
+            client
+                .get(format!(
+                    "https://tenant.example.test:{}/healthz",
+                    direct_socket.port()
+                ))
+                .send()
+                .await
+        });
+        let (stream, _) = tokio::time::timeout(std::time::Duration::from_secs(1), direct.accept())
+            .await
+            .expect("client bypassed the configured proxy")
+            .unwrap();
+        drop(stream);
+
+        assert!(request.await.unwrap().is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), proxy.accept())
+                .await
+                .is_err()
+        );
     }
 }
