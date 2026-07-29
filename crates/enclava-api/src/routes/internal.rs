@@ -41,6 +41,7 @@ struct IdempotencyRow {
     capability_receipt_version: Option<i16>,
     capability_resource_id: Option<Uuid>,
     capability_instance_id: Option<String>,
+    known_not_applied: bool,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
@@ -701,6 +702,15 @@ async fn set_idempotency_completion_owner(
     Ok(())
 }
 
+fn idempotency_recovery_required_body() -> serde_json::Value {
+    serde_json::json!({
+        "error": "idempotency_recovery_required",
+        "retryable": false,
+        "disposition": "reconcile_then_retry_with_new_key",
+        "idempotency_disposition": "completed",
+    })
+}
+
 async fn complete_unrecoverable_idempotency_request(
     pool: &sqlx::PgPool,
     key: &str,
@@ -711,17 +721,9 @@ async fn complete_unrecoverable_idempotency_request(
 ) -> Result<IdempotencyBegin, InternalRouteError> {
     let mut tx = pool.begin().await.map_err(|_| db_error())?;
     set_idempotency_completion_owner(&mut tx, previous_token.unwrap_or(token)).await?;
-    let body = serde_json::json!({
-        "error": "idempotency_recovery_required",
-        "retryable": false,
-        "disposition": "reconcile_then_retry_with_new_key",
-        // Stamp the disposition-driven terminal marker so PaaS terminalizes
-        // through the completed channel: the key is consumed, the outcome is
-        // terminal, and the cached row is replayable. The `error` + legacy
-        // `disposition` carry the operator-facing recovery nuance. This single
-        // body serves both the cached row and the immediate `Replay` response.
-        "idempotency_disposition": "completed",
-    });
+    // The same body is cached and returned so a disposition-driven caller
+    // always terminalizes the consumed key through the completed channel.
+    let body = idempotency_recovery_required_body();
     let updated = sqlx::query(
         "UPDATE cap_internal_idempotency
             SET reservation_token = $2,
@@ -1082,6 +1084,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                 reservation_token, operation_id, lease_expires_at,
                 recovery_kind, capability_receipt_version,
                 capability_resource_id, capability_instance_id,
+                known_not_applied,
                 completed_at, created_at, updated_at,
                 clock_timestamp() AS database_now
            FROM cap_internal_idempotency
@@ -1138,15 +1141,20 @@ async fn begin_idempotent_request_with_recovery_and_binding(
         return Ok(IdempotencyBegin::Replay(response));
     }
 
-    let reclaimable = match row.reservation_token {
-        None => {
-            row.updated_at
-                <= row.database_now - chrono::Duration::seconds(IDEMPOTENCY_LEGACY_STALE_SECONDS)
-        }
-        Some(_) => row
+    let reclaimable = (row.known_not_applied
+        && row
             .lease_expires_at
-            .is_some_and(|lease_expires_at| lease_expires_at <= row.database_now),
-    };
+            .is_some_and(|lease_expires_at| lease_expires_at <= row.database_now))
+        || match row.reservation_token {
+            None => {
+                row.updated_at
+                    <= row.database_now
+                        - chrono::Duration::seconds(IDEMPOTENCY_LEGACY_STALE_SECONDS)
+            }
+            Some(_) => row
+                .lease_expires_at
+                .is_some_and(|lease_expires_at| lease_expires_at <= row.database_now),
+        };
     if !reclaimable && recovery != IdempotencyRecovery::DeterministicExpiringCapability {
         return Err(idempotency_in_progress_error());
     }
@@ -1235,9 +1243,10 @@ async fn begin_idempotent_request_with_recovery_and_binding(
             legacy_identity_bound: false
         }
     ) && legacy_unbound;
-    if policy_changed
-        || deterministic_legacy_is_unsafe
-        || recovery == IdempotencyRecovery::FailClosed
+    if !row.known_not_applied
+        && (policy_changed
+            || deterministic_legacy_is_unsafe
+            || recovery == IdempotencyRecovery::FailClosed)
     {
         return complete_unrecoverable_idempotency_request(
             &state.db,
@@ -1283,16 +1292,28 @@ async fn begin_idempotent_request_with_recovery_and_binding(
                 operation_id = COALESCE(operation_id, $3),
                 lease_expires_at = clock_timestamp()
                     + ($4::bigint * interval '1 second'),
-                recovery_kind = COALESCE(recovery_kind, $5),
+                recovery_kind = CASE
+                    WHEN $8 THEN $5
+                    ELSE COALESCE(recovery_kind, $5)
+                END,
+                known_not_applied = false,
                 updated_at = clock_timestamp(),
                 attempt_count = attempt_count + 1
           WHERE idempotency_key = $1
             AND completed_at IS NULL
             AND reservation_token IS NOT DISTINCT FROM $6
             AND (
-                ($6::uuid IS NULL AND updated_at <= clock_timestamp()
-                    - ($7::bigint * interval '1 second'))
-                OR ($6::uuid IS NOT NULL AND lease_expires_at <= clock_timestamp())
+                ($8 AND known_not_applied
+                    AND lease_expires_at <= clock_timestamp())
+                OR (
+                    NOT $8
+                    AND (
+                        ($6::uuid IS NULL AND updated_at <= clock_timestamp()
+                            - ($7::bigint * interval '1 second'))
+                        OR ($6::uuid IS NOT NULL
+                            AND lease_expires_at <= clock_timestamp())
+                    )
+                )
             )",
     )
     .bind(key)
@@ -1302,6 +1323,7 @@ async fn begin_idempotent_request_with_recovery_and_binding(
     .bind(recovery.kind())
     .bind(row.reservation_token)
     .bind(IDEMPOTENCY_LEGACY_STALE_SECONDS)
+    .bind(row.known_not_applied)
     .execute(&state.db)
     .await
     .map_err(|_| db_error())?;
@@ -1401,6 +1423,7 @@ async fn begin_membership_idempotent_request_in_tx(
                 reservation_token, operation_id, lease_expires_at,
                 recovery_kind, capability_receipt_version,
                 capability_resource_id, capability_instance_id,
+                known_not_applied,
                 completed_at, created_at, updated_at,
                 clock_timestamp() AS database_now
            FROM cap_internal_idempotency
@@ -1472,45 +1495,9 @@ async fn finish_idempotent_request(
     Ok(())
 }
 
-/// `true` for a transient, *known-not-applied* `409` conflict returned by an
-/// idempotency-wrapped route. Every such conflict must cancel the reservation
-/// (not cache it) so a same-key retry re-executes under every recovery policy
-/// — FailClosed included — instead of being terminalized as recovery-required
-/// or replaying a stale conflict forever.
-///
-/// Classification is an **exact-match whitelist**: a `409` cancels only when
-/// its `error` string is byte-equal to an entry in
-/// [`TRANSIENT_RETRY_CONFLICT_MESSAGES`]; every other `409` defaults to
-/// terminal (stamped `completed` and cached). This replaces the former
-/// substring inference (`"in progress"` / `"retry"` / `"authority changed"`),
-/// which mis-classified deterministically-terminal conflicts as retryable.
-///
-/// Those substrings also appear on conflicts a same-key retry *always*
-/// re-fails, so cancelling/re-running them would spin or replay a stale
-/// block (now all terminal-by-default):
-/// - CAS-guard `"... changed while ...; retry ..."` families (deploy/rollback/
-///   unlock inputs, metadata, runtime, generation, target, resource-authority)
-///   read divergent state under a lane lock — a same-key retry re-reads the
-///   same divergence.
-/// - `"app authority changed"` / `"custom domain authority changed"`
-///   (`domains.rs` CAS guards) re-fail on a same-key retry.
-/// - `"app deletion is in progress"` is a one-way status — a retry re-sees it
-///   or the app `404`s.
-///
-/// The whitelist holds only the two genuine busy-lease families (the lane
-/// claim fails before the handler body runs; `?`-propagated busy errors roll
-/// back an uncommitted transaction) plus two in-flight-operation guards —
-/// all emitted before the handler commits, so a same-key retry can succeed:
-/// - `MutationLeaseError::Busy` -> `"app mutation already in progress"`
-///   (`apps.rs`, `domains.rs`).
-/// - `SupersedeDeploymentError::Busy` -> the three
-///   `"deployment mutation is still in progress"` variants (`deployments.rs`,
-///   `rollback.rs`, `unlock.rs`, `apps.rs`).
-/// - `"current deployment generation is still in progress"` (`unlock.rs`) and
-///   `"an earlier deployment is still completing setup; retry after setup is
-///   reconciled"` (`deployments.rs`, `rollback.rs`) — a prior rollout / DNS
-///   setup job is mid-flight; both re-check a precondition (not
-///   effect-determining state), so a retry proceeds once it reconciles.
+/// Exact known-not-applied outcomes. Every other post-lease failure defaults
+/// to either completed (non-5xx) or outcome-unknown (5xx); status text alone
+/// never grants re-execution authority.
 const TRANSIENT_RETRY_CONFLICT_MESSAGES: &[&str] = &[
     "app mutation already in progress",
     "deployment mutation is still in progress",
@@ -1520,14 +1507,29 @@ const TRANSIENT_RETRY_CONFLICT_MESSAGES: &[&str] = &[
     "an earlier deployment is still completing setup; retry after setup is reconciled",
 ];
 
-fn is_transient_retry_conflict(status: StatusCode, body: &serde_json::Value) -> bool {
-    if status != StatusCode::CONFLICT {
-        return false;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdempotencyErrorDisposition {
+    KnownNotApplied,
+    OutcomeUnknown,
+    Completed,
+}
+
+fn idempotency_error_disposition(
+    status: StatusCode,
+    body: &serde_json::Value,
+) -> IdempotencyErrorDisposition {
+    if status == StatusCode::CONFLICT
+        && body
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| TRANSIENT_RETRY_CONFLICT_MESSAGES.contains(&message))
+    {
+        return IdempotencyErrorDisposition::KnownNotApplied;
     }
-    let Some(message) = body.get("error").and_then(serde_json::Value::as_str) else {
-        return false;
-    };
-    TRANSIENT_RETRY_CONFLICT_MESSAGES.contains(&message)
+    if status.is_server_error() {
+        return IdempotencyErrorDisposition::OutcomeUnknown;
+    }
+    IdempotencyErrorDisposition::Completed
 }
 
 /// Stamp a durably-cached error body as a completed idempotent result. PaaS
@@ -1571,6 +1573,30 @@ async fn defer_idempotent_request(mut lease: IdempotencyLease) -> InternalRouteE
     }
 }
 
+async fn release_known_not_applied_idempotent_request(
+    mut lease: IdempotencyLease,
+) -> Result<(), InternalRouteError> {
+    lease.stop_heartbeat();
+    let updated = sqlx::query(
+        "UPDATE cap_internal_idempotency
+            SET known_not_applied = true,
+                lease_expires_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+          WHERE idempotency_key = $1
+            AND reservation_token = $2
+            AND completed_at IS NULL",
+    )
+    .bind(&lease.key)
+    .bind(lease.token)
+    .execute(&lease.pool)
+    .await
+    .map_err(|_| db_error())?;
+    if updated.rows_affected() != 1 {
+        return Err(idempotency_in_progress_error());
+    }
+    Ok(())
+}
+
 async fn complete_idempotent_result(
     lease: IdempotencyLease,
     result: Result<IdempotencyResponse, InternalRouteError>,
@@ -1581,31 +1607,17 @@ async fn complete_idempotent_result(
             Ok((status, body))
         }
         Err((status, Json(mut body))) => {
-            // Two outcomes must never be durably cached as a completed result:
-            //
-            // 1. A transient retry/authority conflict (a 409 whose error carries
-            //    "in progress", "retry", or "authority changed") is a
-            //    *known-not-applied* outcome -- the lane claim failed before the
-            //    handler body ran, or the uncommitted transaction rolled back,
-            //    or only the lease-release compensation committed. Cancel the
-            //    reservation so a same-key retry starts fresh and re-executes
-            //    under every recovery policy, FailClosed included. Leaving a
-            //    reclaimable row would let FailClosed terminalize it as
-            //    recovery-required (losing the intent); caching it would make
-            //    RetrySafe/Deterministic replay the conflict forever.
-            //
-            // 2. A 5xx server error is an *unknown* outcome -- the side effect
-            //    may or may not have applied -- so defer (leave the lease
-            //    incomplete). The per-recovery-policy split then happens at
-            //    reclaim time in the re-begin path: RetrySafe and
-            //    DeterministicResource re-execute, FailClosed terminalizes as
-            //    recovery-required (AGREED with maintainer).
-            if is_transient_retry_conflict(status, &body) {
-                cancel_idempotency_reservation(lease).await?;
-                return Err(idempotency_in_progress_error());
-            }
-            if status.is_server_error() {
-                return Err(defer_idempotent_request(lease).await);
+            match idempotency_error_disposition(status, &body) {
+                IdempotencyErrorDisposition::KnownNotApplied => {
+                    release_known_not_applied_idempotent_request(lease).await?;
+                    return Err(idempotency_in_progress_error());
+                }
+                IdempotencyErrorDisposition::OutcomeUnknown => {
+                    let terminal = idempotency_recovery_required_body();
+                    finish_idempotent_request(lease, StatusCode::CONFLICT, &terminal).await?;
+                    return Err((StatusCode::CONFLICT, Json(terminal)));
+                }
+                IdempotencyErrorDisposition::Completed => {}
             }
             stamp_idempotency_completion(&mut body);
             finish_idempotent_request(lease, status, &body).await?;
@@ -2709,6 +2721,7 @@ async fn preflight_existing_config_token_request(
                 reservation_token, operation_id, lease_expires_at,
                 recovery_kind, capability_receipt_version,
                 capability_resource_id, capability_instance_id,
+                known_not_applied,
                 completed_at, created_at, updated_at,
                 clock_timestamp() AS database_now
            FROM cap_internal_idempotency
@@ -5183,6 +5196,7 @@ mod tests {
                     NULL::smallint AS capability_receipt_version,
                     NULL::uuid AS capability_resource_id,
                     NULL::text AS capability_instance_id,
+                    false AS known_not_applied,
                     completed_at, created_at, updated_at,
                     clock_timestamp() AS database_now
                FROM cap_internal_idempotency
@@ -5225,6 +5239,7 @@ mod tests {
                     NULL::smallint AS capability_receipt_version,
                     NULL::uuid AS capability_resource_id,
                     NULL::text AS capability_instance_id,
+                    false AS known_not_applied,
                     completed_at, created_at, updated_at,
                     clock_timestamp() AS database_now
                FROM cap_internal_idempotency
@@ -5304,6 +5319,15 @@ mod tests {
             })
             .cloned()
             .expect("find deterministic config-token receipt migration");
+        let known_not_applied_migration = migrations
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("0045_"))
+            })
+            .cloned()
+            .expect("find known-not-applied migration");
         for migration in migrations.iter().filter(|path| *path < &receipt_migration) {
             let sql = std::fs::read_to_string(migration).expect("read prerequisite migration");
             sqlx::raw_sql(&sql)
@@ -5447,6 +5471,12 @@ mod tests {
             .execute(&mut connection)
             .await
             .expect("apply deterministic config-token receipt migration");
+        let known_not_applied_sql = std::fs::read_to_string(&known_not_applied_migration)
+            .expect("read known-not-applied migration");
+        sqlx::raw_sql(&known_not_applied_sql)
+            .execute(&mut connection)
+            .await
+            .expect("apply known-not-applied migration");
 
         for (key, secret) in [
             (app_key.as_str(), app_secret.as_str()),
@@ -7371,6 +7401,7 @@ mod tests {
                         reservation_token, operation_id, lease_expires_at,
                         recovery_kind, capability_receipt_version,
                         capability_resource_id, capability_instance_id,
+                        known_not_applied,
                         completed_at, created_at, updated_at,
                         clock_timestamp() AS database_now
                    FROM cap_internal_idempotency
@@ -7473,6 +7504,7 @@ mod tests {
                     reservation_token, operation_id, lease_expires_at,
                     recovery_kind, capability_receipt_version,
                     capability_resource_id, capability_instance_id,
+                    known_not_applied,
                     completed_at, created_at, updated_at,
                     clock_timestamp() AS database_now
                FROM cap_internal_idempotency
@@ -7687,182 +7719,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn app_mutation_busy_cancels_reservation_and_re_executes() {
-        // The app-mutation-lease conflict (MutationLeaseError::Busy) is a
-        // known-not-applied outcome: the lane claim failed before the handler
-        // body ran. Cancel the reservation so a same-key retry starts fresh,
-        // rather than leaving a reclaimable/cached row. RetrySafe here; the
-        // FailClosed case is the headline test below.
+    async fn known_not_applied_retry_preserves_original_key_binding() {
         let pool = database_test_pool().await;
         let state = idempotency_test_state(pool.clone());
         let suffix = Uuid::new_v4().simple().to_string();
-        let key = format!("app-busy-cancel-{suffix}");
-        let path = format!("/internal/test/app-busy-cancel/{suffix}");
-        let hash = Sha256::digest(b"app-busy-cancel-request").to_vec();
+        let key = format!("known-not-applied-binding-{suffix}");
+        let path = format!("/internal/test/known-not-applied-binding/{suffix}");
+        let original_hash = Sha256::digest(b"original-request").to_vec();
+        let different_hash = Sha256::digest(b"different-request").to_vec();
 
         let lease = expect_idempotency_execution(
-            begin_idempotent_request(&state, &key, "POST", &path, &hash)
-                .await
-                .expect("reserve app-busy handler"),
-        );
-        let result: Result<IdempotencyResponse, InternalRouteError> = async {
-            Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "app mutation already in progress"})),
-            ))
-        }
-        .await;
-        let deferred = complete_idempotent_result(lease, result)
-            .await
-            .expect_err("busy-409 cancels and returns the deferred body");
-        assert_eq!(deferred.0, StatusCode::CONFLICT);
-        assert_eq!(deferred.1["idempotency_disposition"], "deferred");
-        assert_eq!(deferred.1["retryable"], true);
-        assert_eq!(deferred.1["disposition"], "retry_same_key");
-        assert_ne!(deferred.1["error"], "app mutation already in progress");
-
-        // The reservation was canceled (row deleted), not cached or deferred.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM cap_internal_idempotency WHERE idempotency_key = $1",
-        )
-        .bind(&key)
-        .fetch_one(&pool)
-        .await
-        .expect("inspect canceled row");
-        assert_eq!(count, 0, "busy-409 must cancel (delete) the reservation");
-
-        // A same-key retry starts fresh (re-executes) -- no lease expiry needed,
-        // since there is no row to reclaim or replay.
-        match begin_idempotent_request(&state, &key, "POST", &path, &hash)
-            .await
-            .expect("re-begin after cancel")
-        {
-            IdempotencyBegin::Execute(_) => { /* re-executed as intended */ }
-            IdempotencyBegin::Replay((status, body)) => {
-                panic!("same-key retry should re-execute, not replay {status}: {body}");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn deployment_mutation_busy_cancels_reservation_across_all_variants() {
-        // The second busy family -- SupersedeDeploymentError::Busy, emitted as
-        // "deployment mutation is still in progress"[...] (3 variants) -- is
-        // also known-not-applied (?-propagated from an uncommitted transaction
-        // that rolls back). Same cancel treatment; the predicate prefix-matches
-        // so all variants are covered.
-        let pool = database_test_pool().await;
-        let state = idempotency_test_state(pool.clone());
-        let suffix = Uuid::new_v4().simple().to_string();
-        let hash = Sha256::digest(b"deploy-busy-cancel-request").to_vec();
-        let variants = [
-            "deployment mutation is still in progress",
-            "deployment mutation is still in progress; retry after its lease completes",
-            "deployment mutation is still in progress; retry rollback",
-        ];
-        for (i, message) in variants.iter().enumerate() {
-            let key = format!("deploy-busy-cancel-{suffix}-{i}");
-            let path = format!("/internal/test/deploy-busy-cancel-{suffix}/{i}");
-            let lease = expect_idempotency_execution(
-                begin_idempotent_request(&state, &key, "POST", &path, &hash)
-                    .await
-                    .expect("reserve deploy-busy handler"),
-            );
-            let result: Result<IdempotencyResponse, InternalRouteError> = async {
-                Err((
-                    StatusCode::CONFLICT,
-                    Json(serde_json::json!({"error": message})),
-                ))
-            }
-            .await;
-            let deferred = complete_idempotent_result(lease, result)
-                .await
-                .expect_err("deployment busy-409 cancels and returns the deferred body");
-            assert_eq!(deferred.1["idempotency_disposition"], "deferred");
-            assert_eq!(deferred.1["retryable"], true);
-            assert_ne!(deferred.1["error"], *message);
-
-            let count: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM cap_internal_idempotency WHERE idempotency_key = $1",
+            begin_idempotent_request_with_recovery(
+                &state,
+                &key,
+                "POST",
+                &path,
+                &original_hash,
+                IdempotencyRecovery::FailClosed,
             )
-            .bind(&key)
-            .fetch_one(&pool)
             .await
-            .expect("inspect canceled row");
-            assert_eq!(count, 0, "deployment busy-409 must cancel the reservation");
-        }
-    }
-
-    #[tokio::test]
-    async fn app_mutation_busy_fail_closed_cancels_and_re_executes() {
-        // HEADLINE regression test (review Finding A): a FailClosed route that
-        // hits a busy-409 must cancel, not defer. Under the old defer, the
-        // incomplete fail_closed row would persist and a same-key retry after
-        // lease expiry would hit the FailClosed reclaim branch (~internal.rs
-        // :1220) and terminalize as idempotency_recovery_required -- a client
-        // following retry_same_key would lose the intent. Cancel deletes the
-        // row, so the retry re-executes under FailClosed exactly as under
-        // RetrySafe. Reachable via verify_paas_domain_challenge (FailClosed)
-        // -> domains::verify_challenge, and the deployment-busy FailClosed
-        // routes (update_paas_unlock_mode, rollback_paas_app).
-        let pool = database_test_pool().await;
-        let state = idempotency_test_state(pool.clone());
-        let suffix = Uuid::new_v4().simple().to_string();
-        let key = format!("app-busy-failclosed-{suffix}");
-        let path = format!("/internal/test/app-busy-failclosed/{suffix}");
-        let hash = Sha256::digest(b"app-busy-failclosed-request").to_vec();
-        let recovery = IdempotencyRecovery::FailClosed;
-
-        let lease = expect_idempotency_execution(
-            begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
-                .await
-                .expect("reserve fail-closed handler"),
+            .expect("reserve original request"),
         );
-        let result: Result<IdempotencyResponse, InternalRouteError> = async {
-            Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": "app mutation already in progress"})),
-            ))
-        }
-        .await;
-        let deferred = complete_idempotent_result(lease, result)
+        let known_not_applied: Result<IdempotencyResponse, InternalRouteError> = Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "app mutation already in progress"})),
+        ));
+        let deferred = complete_idempotent_result(lease, known_not_applied)
             .await
-            .expect_err("fail-closed busy-409 cancels, returning the deferred body");
-        assert_eq!(deferred.0, StatusCode::CONFLICT);
+            .expect_err("known-not-applied conflict asks for a same-key retry");
         assert_eq!(deferred.1["idempotency_disposition"], "deferred");
-        assert_eq!(deferred.1["disposition"], "retry_same_key");
 
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        let rebound = begin_idempotent_request_with_recovery(
+            &state,
+            &key,
+            "POST",
+            &path,
+            &different_hash,
+            IdempotencyRecovery::FailClosed,
         )
-        .bind(&key)
-        .fetch_one(&pool)
         .await
-        .expect("inspect canceled fail-closed row");
-        assert_eq!(
-            count, 0,
-            "fail-closed busy-409 must cancel, leaving no row to reclaim"
-        );
+        .err()
+        .expect("a released key remains bound to its original request");
+        assert_eq!(rebound.1.0["error"], "idempotency_key_reused");
 
-        // The retry re-executes (fresh reservation), NOT recovery_required.
-        match begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
-            .await
-            .expect("re-begin after fail-closed cancel")
+        match begin_idempotent_request_with_recovery(
+            &state,
+            &key,
+            "POST",
+            &path,
+            &original_hash,
+            IdempotencyRecovery::FailClosed,
+        )
+        .await
+        .expect("the exact original request can re-acquire immediately")
         {
-            IdempotencyBegin::Execute(_) => { /* re-executed under FailClosed as intended */ }
+            IdempotencyBegin::Execute(_) => {}
             IdempotencyBegin::Replay((status, body)) => {
-                panic!(
-                    "fail-closed same-key retry should re-execute after cancel, not replay \
-                     {status}: {body}"
-                );
+                panic!("known-not-applied retry must execute, not replay {status}: {body}");
             }
         }
     }
 
     #[tokio::test]
-    async fn whitelisted_transients_cancel_and_re_execute() {
+    async fn whitelisted_known_not_applied_outcomes_preserve_binding_and_re_execute() {
         // The exact-match whitelist is the complete set of known-not-applied
-        // 409s that cancel the reservation so a same-key retry re-executes.
+        // 409s that release the bound reservation so a same-key retry
+        // re-executes.
         // Iterating the const pins the contract: add an entry here only by
         // editing TRANSIENT_RETRY_CONFLICT_MESSAGES. Every former substring
         // match ("... changed ...; retry", "authority changed", deletion) is
@@ -7895,28 +7817,32 @@ mod tests {
             .await;
             let deferred = complete_idempotent_result(lease, result)
                 .await
-                .expect_err("whitelisted transient 409 cancels and returns the deferred body");
+                .expect_err("known-not-applied 409 releases and returns the deferred body");
             assert_eq!(deferred.0, StatusCode::CONFLICT);
             assert_eq!(deferred.1["idempotency_disposition"], "deferred");
             assert_eq!(deferred.1["retryable"], true);
             assert_ne!(deferred.1["error"], *message);
 
-            let count: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM cap_internal_idempotency WHERE idempotency_key = $1",
+            let marker: (bool, Vec<u8>) = sqlx::query_as(
+                "SELECT known_not_applied, request_hash
+                   FROM cap_internal_idempotency
+                  WHERE idempotency_key = $1",
             )
             .bind(&key)
             .fetch_one(&pool)
             .await
-            .expect("inspect canceled row");
+            .expect("inspect released bound row");
+            assert!(marker.0, "known-not-applied authority marker must persist");
             assert_eq!(
-                count, 0,
-                "whitelisted transient 409 must cancel (delete) the reservation"
+                marker.1.as_slice(),
+                hash.as_slice(),
+                "the original request hash must persist"
             );
 
             // A same-key retry re-executes, never replays a cached conflict.
             match begin_idempotent_request(&state, &key, "POST", &path, &hash)
                 .await
-                .expect("re-begin after cancel")
+                .expect("re-begin released exact request")
             {
                 IdempotencyBegin::Execute(_) => { /* re-executed as intended */ }
                 IdempotencyBegin::Replay((status, body)) => {
@@ -8005,203 +7931,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn five_xx_deferred_retry_safe_re_executes_on_reclaim() {
-        // A post-lease handler 5xx is an unknown outcome: defer (leave the row
-        // incomplete) rather than cache, so a same-key retry re-executes once
-        // the lease frees. RetrySafe reclaims by re-executing.
+    async fn untyped_post_lease_five_xx_fails_closed_without_reexecution() {
         let pool = database_test_pool().await;
         let state = idempotency_test_state(pool.clone());
         let suffix = Uuid::new_v4().simple().to_string();
-        let key = format!("five-xx-retry-safe-{suffix}");
-        let path = format!("/internal/test/five-xx-retry-safe/{suffix}");
-        let hash = Sha256::digest(b"five-xx-retry-safe-request").to_vec();
-
-        let lease = expect_idempotency_execution(
-            begin_idempotent_request_with_recovery(
-                &state,
-                &key,
-                "POST",
-                &path,
-                &hash,
-                IdempotencyRecovery::RetrySafe,
-            )
-            .await
-            .expect("reserve retry-safe handler"),
-        );
-        let result: Result<IdempotencyResponse, InternalRouteError> =
-            async { Err(json_error(StatusCode::BAD_GATEWAY, "upstream 5xx")) }.await;
-        let deferred = complete_idempotent_result(lease, result)
-            .await
-            .expect_err("5xx defers instead of being cached");
-        // The client sees the stamped defer body, not the raw 502.
-        assert_eq!(deferred.0, StatusCode::CONFLICT);
-        assert_eq!(deferred.1["idempotency_disposition"], "deferred");
-        assert_eq!(deferred.1["retryable"], true);
-        assert_ne!(deferred.1["error"], "upstream 5xx");
-
-        let completed: bool = sqlx::query_scalar(
-            "SELECT completed_at IS NOT NULL
-               FROM cap_internal_idempotency
-              WHERE idempotency_key = $1",
-        )
-        .bind(&key)
-        .fetch_one(&pool)
-        .await
-        .expect("inspect deferred row");
-        assert!(!completed, "5xx must not be durably cached");
-
-        // Once the deferred lease has freed, a same-key retry re-executes.
-        expire_idempotency_lease(&pool, &key).await;
-        match begin_idempotent_request_with_recovery(
-            &state,
-            &key,
-            "POST",
-            &path,
-            &hash,
+        let hash = Sha256::digest(b"untyped-five-xx-request").to_vec();
+        let recoveries = [
             IdempotencyRecovery::RetrySafe,
-        )
-        .await
-        .expect("re-begin after retry-safe defer")
-        {
-            IdempotencyBegin::Execute(_) => { /* re-executed as intended */ }
-            IdempotencyBegin::Replay((status, body)) => {
-                panic!("RetrySafe same-key retry should re-execute, not replay {status}: {body}");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn five_xx_deferred_deterministic_resource_re_executes_on_reclaim() {
-        // DeterministicResource (identity-bound) reclaims by re-executing/adopting
-        // the same operation, so a deferred 5xx is retried on the same key.
-        let pool = database_test_pool().await;
-        let state = idempotency_test_state(pool.clone());
-        let suffix = Uuid::new_v4().simple().to_string();
-        let key = format!("five-xx-det-res-{suffix}");
-        let path = format!("/internal/test/five-xx-det-res/{suffix}");
-        let hash = Sha256::digest(b"five-xx-det-res-request").to_vec();
-        let recovery = IdempotencyRecovery::DeterministicResource {
-            legacy_identity_bound: true,
-        };
-
-        let lease = expect_idempotency_execution(
-            begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
+            IdempotencyRecovery::DeterministicResource {
+                legacy_identity_bound: true,
+            },
+            IdempotencyRecovery::FailClosed,
+        ];
+        for (index, recovery) in recoveries.into_iter().enumerate() {
+            let key = format!("untyped-five-xx-fail-closed-{suffix}-{index}");
+            let path = format!("/internal/test/untyped-five-xx-fail-closed/{suffix}/{index}");
+            let side_effects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let lease = expect_idempotency_execution(
+                begin_idempotent_request_with_recovery(
+                    &state, &key, "POST", &path, &hash, recovery,
+                )
                 .await
-                .expect("reserve deterministic-resource handler"),
-        );
-        let result: Result<IdempotencyResponse, InternalRouteError> =
-            async { Err(json_error(StatusCode::BAD_GATEWAY, "upstream 5xx")) }.await;
-        let deferred = complete_idempotent_result(lease, result)
-            .await
-            .expect_err("5xx defers instead of being cached");
-        assert_eq!(deferred.1["idempotency_disposition"], "deferred");
-
-        let completed: bool = sqlx::query_scalar(
-            "SELECT completed_at IS NOT NULL
-               FROM cap_internal_idempotency
-              WHERE idempotency_key = $1",
-        )
-        .bind(&key)
-        .fetch_one(&pool)
-        .await
-        .expect("inspect deferred row");
-        assert!(!completed, "5xx must not be durably cached");
-
-        expire_idempotency_lease(&pool, &key).await;
-        match begin_idempotent_request_with_recovery(&state, &key, "POST", &path, &hash, recovery)
-            .await
-            .expect("re-begin after deterministic-resource defer")
-        {
-            IdempotencyBegin::Execute(_) => { /* re-executed/adopted as intended */ }
-            IdempotencyBegin::Replay((status, body)) => {
-                panic!(
-                    "DeterministicResource same-key retry should re-execute, not replay {status}: {body}"
-                );
+                .expect("reserve generic post-lease handler"),
+            );
+            let attempt_side_effects = side_effects.clone();
+            let result: Result<IdempotencyResponse, InternalRouteError> = async move {
+                attempt_side_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "untyped post-lease failure",
+                ))
             }
+            .await;
+            let terminal = complete_idempotent_result(lease, result)
+                .await
+                .expect_err("an untyped 5xx must fail closed");
+            assert_eq!(terminal.0, StatusCode::CONFLICT);
+            assert_eq!(terminal.1["error"], "idempotency_recovery_required");
+            assert_eq!(terminal.1["retryable"], false);
+            assert_eq!(terminal.1["idempotency_disposition"], "completed");
+
+            let replay = expect_idempotency_replay(
+                begin_idempotent_request_with_recovery(
+                    &state, &key, "POST", &path, &hash, recovery,
+                )
+                .await
+                .expect("the unknown outcome is terminal and replayable"),
+            );
+            assert_eq!(replay, (terminal.0, terminal.1.0.clone()));
+            assert_eq!(
+                side_effects.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "an untyped unknown outcome must never be re-executed"
+            );
         }
-    }
-
-    #[tokio::test]
-    async fn five_xx_deferred_fail_closed_terminalizes_without_side_effect_retry() {
-        // FailClosed never re-executes an unknown-outcome side effect: on reclaim
-        // it terminalizes the key as recovery-required, leaving the operator to
-        // reconcile, so the handler side effect is invoked exactly once.
-        let pool = database_test_pool().await;
-        let state = idempotency_test_state(pool.clone());
-        let suffix = Uuid::new_v4().simple().to_string();
-        let key = format!("five-xx-fail-closed-{suffix}");
-        let path = format!("/internal/test/five-xx-fail-closed/{suffix}");
-        let hash = Sha256::digest(b"five-xx-fail-closed-request").to_vec();
-        let side_effects = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-        let lease = expect_idempotency_execution(
-            begin_idempotent_request_with_recovery(
-                &state,
-                &key,
-                "POST",
-                &path,
-                &hash,
-                IdempotencyRecovery::FailClosed,
-            )
-            .await
-            .expect("reserve fail-closed handler"),
-        );
-        let attempt_side_effects = side_effects.clone();
-        let result: Result<IdempotencyResponse, InternalRouteError> = async move {
-            attempt_side_effects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Err(json_error(StatusCode::BAD_GATEWAY, "upstream 5xx"))
-        }
-        .await;
-        let deferred = complete_idempotent_result(lease, result)
-            .await
-            .expect_err("5xx defers instead of being cached");
-        assert_eq!(deferred.1["idempotency_disposition"], "deferred");
-        assert_eq!(
-            side_effects.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "handler invoked exactly once on the failing attempt"
-        );
-
-        // FailClosed reclaims by terminalizing (no re-execute).
-        expire_idempotency_lease(&pool, &key).await;
-        let terminal = expect_idempotency_replay(
-            begin_idempotent_request_with_recovery(
-                &state,
-                &key,
-                "POST",
-                &path,
-                &hash,
-                IdempotencyRecovery::FailClosed,
-            )
-            .await
-            .expect("FailClosed reclaims by terminalizing"),
-        );
-        assert_eq!(terminal.0, StatusCode::CONFLICT);
-        assert_eq!(terminal.1["error"], "idempotency_recovery_required");
-        assert_eq!(terminal.1["retryable"], false);
-        assert_eq!(
-            terminal.1["disposition"],
-            "reconcile_then_retry_with_new_key"
-        );
-        // Fix 2 (#53): the recovery_required terminal body carries the
-        // completed disposition marker so a disposition-driven PaaS terminalizes
-        // through the completed channel on this 5xx-defer -> FailClosed path.
-        assert_eq!(terminal.1["idempotency_disposition"], "completed");
-        assert_eq!(
-            side_effects.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "FailClosed reclaim must not re-invoke the handler side effect"
-        );
-        let persisted: (bool, String) = sqlx::query_as(
-            "SELECT completed_at IS NOT NULL, recovery_kind
-               FROM cap_internal_idempotency
-              WHERE idempotency_key = $1",
-        )
-        .bind(&key)
-        .fetch_one(&pool)
-        .await
-        .expect("inspect terminalized row");
-        assert_eq!(persisted, (true, "fail_closed".to_string()));
     }
 
     #[tokio::test]
