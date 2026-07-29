@@ -29,7 +29,8 @@ use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
     SignedDeployBlobParams, StoragePasswordInput, build_signed_deploy_blobs,
-    claim_initial_ownership, ensure_manual_deploy_keyring, generate_log_key_for_app,
+    claim_initial_ownership, ensure_manual_deploy_keyring, fetch_verified_platform_release,
+    generate_log_key_for_app,
 };
 use crate::commands::ownership::MnemonicCapture;
 
@@ -238,6 +239,8 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     if template.unlock_mode == "password" {
         storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
     }
+    // Authenticate platform authority before keyring registration or app creation.
+    fetch_verified_platform_release(api).await?;
     let capture = if args.no_store_mnemonic {
         MnemonicCapture::Skip
     } else {
@@ -3227,6 +3230,32 @@ mod tests {
                 && managed_config < wait_managed_config
                 && wait_managed_config < config,
             "template deploy must prepare tenant log encryption before deployment, then make the config store writable before writing customer config"
+        );
+    }
+
+    #[test]
+    fn template_deploy_verifies_platform_trust_before_remote_mutation() {
+        let source = include_str!("template.rs");
+        let deploy_start = source.find("async fn deploy").expect("deploy exists");
+        let deploy_end = source[deploy_start..]
+            .find("async fn ssh_command")
+            .expect("ssh_command follows deploy")
+            + deploy_start;
+        let body = &source[deploy_start..deploy_end];
+
+        let verify_platform = body
+            .find("fetch_verified_platform_release(api).await?")
+            .expect("template deploy verifies the signed platform release");
+        let bootstrap = body
+            .find("template_bootstrap_pubkey_hash")
+            .expect("template deploy may bootstrap remote keyring state");
+        let ensure_app = body
+            .find("ensure_template_app")
+            .expect("template deploy may create a remote app");
+
+        assert!(
+            verify_platform < bootstrap && verify_platform < ensure_app,
+            "template deploy must verify platform trust before remote mutation"
         );
     }
 

@@ -20,6 +20,17 @@ pub(crate) fn platform_release_from_deployment_context(
     platform_release_from_deployment_context_with_verifier(deployment_context, verify_envelope)
 }
 
+pub(crate) async fn fetch_verified_platform_release(
+    api: &ApiClient,
+) -> Result<(DeploymentContextResponse, PlatformRelease), Box<dyn std::error::Error>> {
+    let deployment_context = api.deployment_context().await?;
+    let release = match platform_release_from_deployment_context(&deployment_context)? {
+        Some(release) => release,
+        None => PlatformRelease::load_verified()?,
+    };
+    Ok((deployment_context, release))
+}
+
 pub(crate) fn platform_release_from_deployment_context_with_verifier<Verify, Err>(
     deployment_context: &DeploymentContextResponse,
     verify: Verify,
@@ -518,11 +529,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         );
     }
 
-    let deployment_context = api.deployment_context().await?;
-    let release = match platform_release_from_deployment_context(&deployment_context)? {
-        Some(release) => release,
-        None => PlatformRelease::load_verified()?,
-    };
+    let (deployment_context, release) = fetch_verified_platform_release(api).await?;
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
     let _signing_service_pubkey = release.signing_service_pubkey_bytes()?;
     let proxy_image = enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?;
