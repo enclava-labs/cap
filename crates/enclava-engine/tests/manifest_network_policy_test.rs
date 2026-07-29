@@ -1,4 +1,6 @@
-use enclava_engine::manifest::network_policy::generate_network_policy;
+use enclava_engine::manifest::network_policy::{
+    cap_api_namespace_for_attestation, generate_network_policy,
+};
 use enclava_engine::testutil::sample_app;
 
 #[test]
@@ -58,6 +60,22 @@ fn network_policy_ingress_allows_cap_api_to_tee_tls_port() {
     assert_eq!(from[0]["matchLabels"]["app.kubernetes.io/name"], "cap-api");
     assert_eq!(ingress["toPorts"][0]["ports"][0]["port"], "8443");
     assert_eq!(ingress["toPorts"][0]["ports"][0]["protocol"], "TCP");
+}
+
+#[test]
+fn cap_api_namespace_requires_an_explicit_internal_service_url() {
+    let mut app = sample_app();
+    assert_eq!(
+        cap_api_namespace_for_attestation(&app.attestation, &app.api_url),
+        None
+    );
+
+    app.attestation.workload_artifacts_url =
+        Some("http://cap-api.cap-test01.svc.cluster.local/api/v1/workload/artifacts".to_string());
+    assert_eq!(
+        cap_api_namespace_for_attestation(&app.attestation, &app.api_url),
+        Some("cap-test01")
+    );
 }
 
 #[test]

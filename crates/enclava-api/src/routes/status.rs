@@ -229,7 +229,7 @@ pub(crate) async fn observe_app_status_for_deployment(
 }
 
 pub(crate) async fn observe_app_status_fields_for_deployment(
-    _state: &AppState,
+    state: &AppState,
     namespace: &str,
     app_name: &str,
     domain: &str,
@@ -238,7 +238,7 @@ pub(crate) async fn observe_app_status_fields_for_deployment(
 ) -> ObservedAppStatus {
     let (kubernetes, tee) = tokio::join!(
         probe_kubernetes(namespace, app_name, expected_deployment_id),
-        probe_tee(namespace, app_name, domain, tee_domain)
+        probe_tee(state, namespace, app_name, domain, tee_domain)
     );
     classify_live_observation_for_deployment(kubernetes, tee, Utc::now(), expected_deployment_id)
 }
@@ -390,13 +390,14 @@ fn select_runtime_failure(
 }
 
 async fn probe_tee(
+    state: &AppState,
     namespace: &str,
     app_name: &str,
     domain: &str,
     tee_domain: Option<&str>,
 ) -> TeeEvidence {
     bounded_tee_probe(
-        probe_tee_unbounded(namespace, app_name, domain, tee_domain),
+        probe_tee_unbounded(state, namespace, app_name, domain, tee_domain),
         TEE_STATUS_PROBE_TIMEOUT,
     )
     .await
@@ -412,22 +413,41 @@ where
 }
 
 async fn probe_tee_unbounded(
+    state: &AppState,
     namespace: &str,
     app_name: &str,
     domain: &str,
     tee_domain: Option<&str>,
 ) -> TeeEvidence {
-    let Some(socket) = crate::routes::logs::resolve_internal_tee_socket(app_name, namespace).await
-    else {
-        return TeeEvidence::Unavailable;
-    };
     let confidential_domain = tee_domain.unwrap_or(domain);
-    let Ok(client) =
-        crate::routes::logs::build_resolved_tenant_tee_http_client(confidential_domain, socket)
-    else {
-        return TeeEvidence::Unavailable;
+    let internal_transport = state.attestation.as_ref().is_some_and(|attestation| {
+        enclava_engine::manifest::network_policy::cap_api_namespace_for_attestation(
+            attestation,
+            &state.api_url,
+        )
+        .is_some()
+    });
+    let (client, tee_status_url) = if internal_transport {
+        let Some(socket) =
+            crate::routes::logs::resolve_internal_tee_socket(app_name, namespace).await
+        else {
+            return TeeEvidence::Unavailable;
+        };
+        let Ok(client) =
+            crate::routes::logs::build_resolved_tenant_tee_http_client(confidential_domain, socket)
+        else {
+            return TeeEvidence::Unavailable;
+        };
+        (
+            client,
+            confidential_status_url(domain, tee_domain, Some(socket)),
+        )
+    } else {
+        (
+            state.tee_http_client.clone(),
+            confidential_status_url(domain, tee_domain, None),
+        )
     };
-    let tee_status_url = confidential_status_url(domain, tee_domain, socket);
     let Ok(response) = client
         .get(tee_status_url)
         .timeout(TEE_STATUS_PROBE_TIMEOUT)
@@ -768,12 +788,19 @@ fn effective_app_status(
     }
 }
 
-fn confidential_status_url(domain: &str, tee_domain: Option<&str>, socket: SocketAddr) -> String {
+fn confidential_status_url(
+    domain: &str,
+    tee_domain: Option<&str>,
+    socket: Option<SocketAddr>,
+) -> String {
     let confidential_domain = tee_domain.unwrap_or(domain);
-    format!(
-        "https://{confidential_domain}:{}/.well-known/confidential/status",
-        socket.port()
-    )
+    match socket {
+        Some(socket) => format!(
+            "https://{confidential_domain}:{}/.well-known/confidential/status",
+            socket.port()
+        ),
+        None => format!("https://{confidential_domain}/.well-known/confidential/status"),
+    }
 }
 
 /// GET /apps/{name}/logs -- proxied container logs.
@@ -1503,8 +1530,16 @@ mod tests {
     fn confidential_status_probe_pins_tee_domain_to_internal_service() {
         let socket = "10.43.13.109:8081".parse().unwrap();
         assert_eq!(
-            confidential_status_url("app.example.test", Some("app.tee.example.test"), socket),
+            confidential_status_url(
+                "app.example.test",
+                Some("app.tee.example.test"),
+                Some(socket)
+            ),
             "https://app.tee.example.test:8081/.well-known/confidential/status"
+        );
+        assert_eq!(
+            confidential_status_url("app.example.test", Some("app.tee.example.test"), None),
+            "https://app.tee.example.test/.well-known/confidential/status"
         );
     }
 

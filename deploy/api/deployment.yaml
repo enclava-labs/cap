@@ -3,6 +3,8 @@ kind: Deployment
 metadata:
   name: enclava-api
   namespace: enclava-platform
+  labels:
+    app.kubernetes.io/name: cap-api
 spec:
   replicas: 2
   # Deterministic config-token receipts can be replayed for five minutes.
@@ -17,6 +19,7 @@ spec:
     metadata:
       labels:
         app: enclava-api
+        app.kubernetes.io/name: cap-api
     spec:
       serviceAccountName: enclava-api
       automountServiceAccountToken: true
