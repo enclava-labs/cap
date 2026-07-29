@@ -1577,9 +1577,11 @@ async fn release_known_not_applied_idempotent_request(
     mut lease: IdempotencyLease,
 ) -> Result<(), InternalRouteError> {
     lease.stop_heartbeat();
+    let released_token = Uuid::new_v4();
     let updated = sqlx::query(
         "UPDATE cap_internal_idempotency
-            SET known_not_applied = true,
+            SET reservation_token = $3,
+                known_not_applied = true,
                 lease_expires_at = clock_timestamp(),
                 updated_at = clock_timestamp()
           WHERE idempotency_key = $1
@@ -1588,6 +1590,7 @@ async fn release_known_not_applied_idempotent_request(
     )
     .bind(&lease.key)
     .bind(lease.token)
+    .bind(released_token)
     .execute(&lease.pool)
     .await
     .map_err(|_| db_error())?;
@@ -7808,6 +7811,7 @@ mod tests {
                     .await
                     .expect("reserve transient-retry handler"),
             );
+            let active_token = lease.token;
             let result: Result<IdempotencyResponse, InternalRouteError> = async {
                 Err((
                     StatusCode::CONFLICT,
@@ -7823,8 +7827,8 @@ mod tests {
             assert_eq!(deferred.1["retryable"], true);
             assert_ne!(deferred.1["error"], *message);
 
-            let marker: (bool, Vec<u8>) = sqlx::query_as(
-                "SELECT known_not_applied, request_hash
+            let marker: (bool, Vec<u8>, Uuid) = sqlx::query_as(
+                "SELECT known_not_applied, request_hash, reservation_token
                    FROM cap_internal_idempotency
                   WHERE idempotency_key = $1",
             )
@@ -7837,6 +7841,10 @@ mod tests {
                 marker.1.as_slice(),
                 hash.as_slice(),
                 "the original request hash must persist"
+            );
+            assert_ne!(
+                marker.2, active_token,
+                "release must revoke any in-flight heartbeat authority"
             );
 
             // A same-key retry re-executes, never replays a cached conflict.
