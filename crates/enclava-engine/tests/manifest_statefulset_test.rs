@@ -75,6 +75,23 @@ fn statefulset_pod_spec_disables_service_links() {
 }
 
 #[test]
+fn statefulset_resolves_external_names_without_node_search_suffixes() {
+    let sts = generate_statefulset(&sample_app());
+    let options = sts
+        .spec
+        .unwrap()
+        .template
+        .spec
+        .unwrap()
+        .dns_config
+        .unwrap()
+        .options
+        .unwrap();
+    assert_eq!(options[0].name.as_deref(), Some("ndots"));
+    assert_eq!(options[0].value.as_deref(), Some("1"));
+}
+
+#[test]
 fn statefulset_shares_process_namespace_for_in_guest_bind_mounts() {
     let app = sample_app();
     let sts = generate_statefulset(&app);
