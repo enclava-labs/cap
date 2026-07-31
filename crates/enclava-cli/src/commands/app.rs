@@ -30,7 +30,7 @@ use enclava_cli::keyring::{
 };
 use enclava_cli::keys;
 use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, verify_envelope};
-use enclava_cli::tee_client::TeeClient;
+use enclava_cli::tee_client::{TeeClient, TeeError};
 use enclava_common::log_encryption::{
     EncryptedLogFrame, LOG_ENCRYPTION_ALGORITHM, decrypt_log_frame, generate_log_keypair,
     log_keypair_from_private_key,
@@ -557,7 +557,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         let (_attestation, tee) = tee.attest_receipt_key().await?;
 
         for (key, value) in &config_pairs {
-            tee.config_set(key, value, &token_resp.token).await?;
+            set_deploy_config(&tee, key, value, &token_resp.token).await?;
             api.sync_config_key(&app_name, key, false).await?;
         }
     }
@@ -587,6 +587,27 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     Ok(())
+}
+
+async fn set_deploy_config(
+    tee: &TeeClient,
+    key: &str,
+    value: &str,
+    token: &str,
+) -> Result<(), TeeError> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match tee.config_set(key, value, token).await {
+            Err(error) if should_retry_deploy_config(&error) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn should_retry_deploy_config(error: &TeeError) -> bool {
+    matches!(error, TeeError::Tee { status: 423, .. })
 }
 
 pub(crate) async fn wait_for_bootstrap_endpoint(
@@ -648,13 +669,6 @@ async fn wait_for_deploy_runtime(
     target: DeployRuntimeTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
-    let direct_tee = api
-        .get_unlock_endpoint(app_name)
-        .await
-        .ok()
-        .map(|endpoint| {
-            TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip)
-        });
 
     loop {
         if start.elapsed() > max_wait {
@@ -708,7 +722,11 @@ async fn wait_for_deploy_runtime(
         };
 
         if direct_tee_allowed
-            && let Some(tee) = direct_tee.as_ref()
+            && let Ok(endpoint) = api.get_unlock_endpoint(app_name).await
+            && let tee = TeeClient::new_for_ownership_with_resolve_ip(
+                &endpoint.tee_url,
+                endpoint.tee_resolve_ip,
+            )
             && let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
             && let Ok(status) = attested_tee.status_json().await
         {
