@@ -43,7 +43,7 @@ fn network_policy_ingress_allows_envoy_gateway() {
 }
 
 #[test]
-fn network_policy_ingress_allows_cap_api_to_tee_tls_port() {
+fn network_policy_ingress_allows_cap_api_to_confidential_tls_ports() {
     let mut app = sample_app();
     app.attestation.tls_certificate_broker_url = Some(
         "http://cap-api.cap-test01.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
@@ -58,8 +58,17 @@ fn network_policy_ingress_allows_cap_api_to_tee_tls_port() {
         "cap-test01"
     );
     assert_eq!(from[0]["matchLabels"]["app.kubernetes.io/name"], "cap-api");
-    assert_eq!(ingress["toPorts"][0]["ports"][0]["port"], "8443");
-    assert_eq!(ingress["toPorts"][0]["ports"][0]["protocol"], "TCP");
+    let ports = ingress["toPorts"][0]["ports"].as_array().unwrap();
+    let ports = ports
+        .iter()
+        .map(|port| {
+            (
+                port["port"].as_str().unwrap(),
+                port["protocol"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ports, vec![("10443", "TCP"), ("8443", "TCP")]);
 }
 
 #[test]
@@ -115,9 +124,9 @@ fn network_policy_egress_has_dns() {
     assert_eq!(dns_ports[0]["protocol"], "UDP");
     assert_eq!(dns_ports[1]["port"], "53");
     assert_eq!(dns_ports[1]["protocol"], "TCP");
-    assert_eq!(
-        egress[0]["toPorts"][0]["rules"]["dns"][0]["matchPattern"],
-        "*"
+    assert!(
+        egress[0]["toPorts"][0].get("rules").is_none(),
+        "Kata guests require direct L4 DNS because Cilium's DNS proxy does not relay responses"
     );
 }
 
