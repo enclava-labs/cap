@@ -115,9 +115,9 @@ fn network_policy_egress_has_dns() {
     assert_eq!(dns_ports[0]["protocol"], "UDP");
     assert_eq!(dns_ports[1]["port"], "53");
     assert_eq!(dns_ports[1]["protocol"], "TCP");
-    assert_eq!(
-        egress[0]["toPorts"][0]["rules"]["dns"][0]["matchPattern"],
-        "*"
+    assert!(
+        egress[0]["toPorts"][0].get("rules").is_none(),
+        "Kata guests require direct L4 DNS because Cilium's DNS proxy does not relay responses"
     );
 }
 
