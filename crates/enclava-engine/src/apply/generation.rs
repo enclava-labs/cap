@@ -103,6 +103,23 @@ where
         );
 }
 
+fn only_trusted_field_managers<K>(resource: &K, field_manager: &str) -> bool
+where
+    K: Resource,
+{
+    resource
+        .meta()
+        .managed_fields
+        .as_ref()
+        .is_some_and(|entries| {
+            !entries.is_empty()
+                && entries.iter().all(|entry| {
+                    entry.subresource.as_deref() == Some("status")
+                        || entry.manager.as_deref() == Some(field_manager)
+                })
+        })
+}
+
 fn verify_applied_generation<K>(
     resource: &K,
     generation: MutationGeneration,
@@ -130,10 +147,13 @@ where
 ///
 /// Initial creation uses POST rather than SSA's create-or-update behavior. A
 /// concurrent creator therefore gets `AlreadyExists` and must re-read before
-/// it can update. Existing objects are SSA-patched with the exact observed
-/// resourceVersion. Callers must durably prevent generation reclaim while an
-/// initial create response is ambiguous, because an absent resource cannot
-/// itself hold a tombstone.
+/// it can update. A POST records Update ownership, so a later SSA may force only
+/// when every non-status field manager is the configured, trusted CAP manager.
+/// An external manager therefore still makes attestation-critical updates fail
+/// closed. Existing objects are SSA-patched with the exact observed resourceVersion.
+/// Callers must durably prevent generation reclaim while an initial create
+/// response is ambiguous, because an absent resource cannot itself hold a
+/// tombstone.
 pub async fn apply_resource<K>(
     engine: &ApplyEngine,
     api: &Api<K>,
@@ -153,12 +173,6 @@ where
         field_manager: Some(engine.config().field_manager.clone()),
         ..PostParams::default()
     };
-    let patch_params = if force {
-        PatchParams::apply(&engine.config().field_manager).force()
-    } else {
-        PatchParams::apply(&engine.config().field_manager)
-    };
-
     for _ in 0..MAX_CONFLICT_RETRIES {
         let current = match api.get(name).await {
             Ok(current) => Some(current),
@@ -168,6 +182,12 @@ where
 
         if let Some(current) = current {
             ensure_not_stale(&current, generation)?;
+            let patch_params =
+                if force || only_trusted_field_managers(&current, &engine.config().field_manager) {
+                    PatchParams::apply(&engine.config().field_manager).force()
+                } else {
+                    PatchParams::apply(&engine.config().field_manager)
+                };
             let resource_version = current
                 .meta()
                 .resource_version
@@ -829,6 +849,36 @@ mod tests {
                 .and_then(Value::as_str),
             Some("created-after-cancel")
         );
+    }
+
+    #[test]
+    fn trusted_update_owner_can_be_reclaimed_without_ignoring_external_managers() {
+        let trusted: ConfigMap = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "fenced",
+                "managedFields": [
+                    {"manager": "enclava-platform", "operation": "Update", "apiVersion": "v1", "fieldsType": "FieldsV1", "fieldsV1": {}},
+                    {"manager": "controller", "operation": "Update", "apiVersion": "v1", "fieldsType": "FieldsV1", "fieldsV1": {}, "subresource": "status"}
+                ]
+            }
+        }))
+        .unwrap();
+        assert!(only_trusted_field_managers(&trusted, "enclava-platform"));
+
+        let mut external = trusted;
+        external.metadata.managed_fields.as_mut().unwrap().push(
+            serde_json::from_value(json!({
+                "manager": "kubectl",
+                "operation": "Update",
+                "apiVersion": "v1",
+                "fieldsType": "FieldsV1",
+                "fieldsV1": {}
+            }))
+            .unwrap(),
+        );
+        assert!(!only_trusted_field_managers(&external, "enclava-platform"));
     }
 
     #[tokio::test]
