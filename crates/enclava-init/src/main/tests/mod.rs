@@ -101,6 +101,16 @@ fn caddy_tls_bind_source_is_below_tls_state_root() {
 }
 
 #[test]
+fn static_broker_tls_does_not_back_sync_ephemeral_caddy_runtime() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config_with_signed_cc(dir.path(), "");
+
+    assert!(caddy_runtime_back_sync_required(&cfg));
+    cfg.tls_certificate_broker_url = Some("https://broker.example.test".to_string());
+    assert!(!caddy_runtime_back_sync_required(&cfg));
+}
+
+#[test]
 fn managed_config_dir_is_prepared_for_proxy_writes_and_workload_reads() {
     let dir = tempdir().unwrap();
     let state_root = dir.path().join("state");
