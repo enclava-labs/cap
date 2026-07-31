@@ -512,8 +512,9 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
 
 /// Select policy authority from the latest operation generation, not from the
 /// historical deployment that owns an artifact.  A rollback therefore makes
-/// its exact source artifact required.  Apps whose latest operation is failed,
-/// unsigned, stopped, or deleting contribute no retained authorization.
+/// its exact source artifact required.  The active operation is authoritative
+/// even while the app row still projects the preceding failed/stopped state.
+/// Failed, unsigned, or deleting latest operations contribute no authorization.
 async fn load_signed_policy_candidates(
     db: &PgPool,
     retention: i64,
@@ -545,7 +546,7 @@ async fn load_signed_policy_candidates(
             SELECT *
               FROM ranked_job_operations
              WHERE current_operation_rank = 1
-               AND app_status IN ('creating', 'running')
+               AND app_status <> 'deleting'
                AND deployment_status IN ('pending', 'applying', 'watching', 'healthy')
                AND job_state IN ('setup_pending', 'setting_up', 'pending', 'running', 'completed')
                AND artifact_deployment_id IS NOT NULL
@@ -2395,8 +2396,42 @@ owner_resource_bindings := {}
         insert_test_deployment(&pool, legacy_org, legacy_app, legacy, "healthy", now).await;
         let legacy_artifact = insert_test_artifact(&pool, legacy_app, legacy, "cc").await;
 
-        // Failed/deleting apps, failed operation jobs, and an app whose current
-        // generation is unsigned must contribute no historical authorization.
+        // A retry is current authority even before its stale failed app
+        // projection advances to creating.
+        let (retry_org, retry_app) = insert_test_app(&pool, "failed").await;
+        let retry = Uuid::new_v4();
+        insert_test_deployment(&pool, retry_org, retry_app, retry, "healthy", now).await;
+        let retry_artifact = insert_test_artifact(&pool, retry_app, retry, "34").await;
+        insert_test_job(
+            &pool,
+            retry_org,
+            retry_app,
+            retry,
+            retry,
+            Some((retry, &retry_artifact)),
+        )
+        .await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'pending'
+              WHERE deployment_id = $1",
+        )
+        .bind(retry)
+        .execute(&pool)
+        .await
+        .expect("make signed retry job pending");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'pending'::deploy_status_enum
+              WHERE id = $1",
+        )
+        .bind(retry)
+        .execute(&pool)
+        .await
+        .expect("make signed retry pending");
+
+        // Failed/deleting latest operations, and an app whose current
+        // generation is unsigned, must contribute no historical authorization.
         let (failed_org, failed_app) = insert_test_app(&pool, "failed").await;
         let failed = Uuid::new_v4();
         insert_test_deployment(&pool, failed_org, failed_app, failed, "failed", now).await;
@@ -2497,14 +2532,16 @@ owner_resource_bindings := {}
             .iter()
             .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
             .collect();
-        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes.len(), 3);
         assert!(hashes.contains(source_artifact.metadata.descriptor_core_hash.as_str()));
         assert!(hashes.contains(legacy_artifact.metadata.descriptor_core_hash.as_str()));
+        assert!(hashes.contains(retry_artifact.metadata.descriptor_core_hash.as_str()));
         assert!(candidates.iter().all(|candidate| candidate.required));
 
         for org_id in [
             rollback_org,
             legacy_org,
+            retry_org,
             failed_org,
             deleting_org,
             failed_job_org,
