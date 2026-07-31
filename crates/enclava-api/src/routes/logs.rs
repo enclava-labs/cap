@@ -291,7 +291,7 @@ pub(crate) async fn resolve_internal_tee_socket(
     app_name: &str,
     namespace: &str,
 ) -> Option<SocketAddr> {
-    let target = match crate::edge::resolve_backend_target(app_name, namespace, 8081).await {
+    let target = match crate::edge::resolve_backend_target(app_name, namespace, 443).await {
         Ok(target) => target,
         Err(err) => {
             tracing::warn!(

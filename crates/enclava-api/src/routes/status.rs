@@ -1528,14 +1528,14 @@ mod tests {
 
     #[test]
     fn confidential_status_probe_pins_tee_domain_to_internal_service() {
-        let socket = "10.43.13.109:8081".parse().unwrap();
+        let socket = "10.43.13.109:443".parse().unwrap();
         assert_eq!(
             confidential_status_url(
                 "app.example.test",
                 Some("app.tee.example.test"),
                 Some(socket)
             ),
-            "https://app.tee.example.test:8081/.well-known/confidential/status"
+            "https://app.tee.example.test:443/.well-known/confidential/status"
         );
         assert_eq!(
             confidential_status_url("app.example.test", Some("app.tee.example.test"), None),
