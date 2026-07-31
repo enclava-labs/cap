@@ -382,6 +382,15 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
         !deletion.contains("format!("),
         "app deletion must not format dependency errors into responses"
     );
+    assert!(
+        deletion
+            .find("request_workload_teardown")
+            .expect("app deletion requests workload teardown")
+            < deletion
+                .find("enqueue_signed_policy_revocation_if_active")
+                .expect("app deletion enqueues signed-policy revocation"),
+        "app deletion must preserve KBS authorization until workload teardown completes"
+    );
     for failure in [
         "app_delete_dns_failure",
         "AppDeleteFailure::EdgeBackend",
