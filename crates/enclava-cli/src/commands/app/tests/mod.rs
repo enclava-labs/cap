@@ -479,9 +479,14 @@ fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
     let status = body
         .find("status_json")
         .expect("runtime wait must read direct TEE status");
+    let poll_loop = body.find("loop {").expect("runtime wait must poll");
     assert!(
-        endpoint < tee && tee < attest && attest < status && body.contains("tee_unlock_state"),
-        "deploy runtime wait must not depend only on API status when the direct TEE status is available"
+        poll_loop < endpoint
+            && endpoint < tee
+            && tee < attest
+            && attest < status
+            && body.contains("tee_unlock_state"),
+        "deploy runtime wait must refresh and attest the direct TEE endpoint while polling"
     );
     assert!(
         body.contains("observation_is_fresh")
@@ -574,6 +579,18 @@ fn deploy_runtime_direct_tee_fallback_rejects_pod_gaps_wrong_or_drifted_deployme
             "partial observation reason {reason:?} must retain the pod-evidence fence"
         );
     }
+}
+
+#[test]
+fn deploy_config_retries_only_locked_tee_responses() {
+    assert!(should_retry_deploy_config(&TeeError::Tee {
+        status: 423,
+        message: "init_not_ready".to_string()
+    }));
+    assert!(!should_retry_deploy_config(&TeeError::Tee {
+        status: 401,
+        message: "unauthorized".to_string()
+    }));
 }
 
 #[test]
