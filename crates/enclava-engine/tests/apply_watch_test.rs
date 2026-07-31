@@ -218,6 +218,44 @@ fn running_container_ignores_recovered_last_start_error() {
 }
 
 #[test]
+fn terminating_pod_does_not_fail_replacement_rollout() {
+    let pod = Pod {
+        metadata: ObjectMeta {
+            deletion_timestamp: Some(Time(
+                "2026-07-31T10:31:09Z"
+                    .parse::<Timestamp>()
+                    .expect("timestamp parses"),
+            )),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Failed".to_string()),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                image: "example.test/web@sha256:abc".to_string(),
+                image_id: "example.test/web@sha256:abc".to_string(),
+                ready: false,
+                restart_count: 0,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        reason: Some("Error".to_string()),
+                        exit_code: 137,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert!(pod_runtime_failure_message(&pod).is_none());
+    assert!(pod_terminal_failure_code(&pod).is_none());
+}
+
+#[test]
 fn pod_label_selector_matches_generated_statefulset_labels() {
     assert_eq!(pod_label_selector("my-app"), "app=my-app");
 }

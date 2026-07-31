@@ -258,6 +258,9 @@ fn container_runtime_failure(status: &ContainerStatus) -> Option<PodRuntimeFailu
 /// `CrashLoopBackOff` or has a runtime `StartError`, so callers must inspect
 /// container states rather than relying on pod phase alone.
 pub fn pod_runtime_failure(pod: &Pod) -> Option<PodRuntimeFailure> {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return None;
+    }
     let status = pod.status.as_ref()?;
     for container in status
         .init_container_statuses
@@ -285,6 +288,9 @@ pub fn pod_runtime_failure_message(pod: &Pod) -> Option<String> {
 
 /// Return the fixed code for a terminal pod phase without retaining pod names.
 pub fn pod_terminal_failure_code(pod: &Pod) -> Option<&'static str> {
+    if pod.metadata.deletion_timestamp.is_some() {
+        return None;
+    }
     matches!(
         classify_pod_phase(&PodSnapshot::from_pod(pod)),
         DeployPhase::Failed
