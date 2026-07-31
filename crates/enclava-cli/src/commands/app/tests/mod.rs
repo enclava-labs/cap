@@ -1152,7 +1152,7 @@ fn deploy_config_push_attests_before_setting_values() {
         .find("attest_receipt_key")
         .expect("deploy config push must attest the TEE TLS leaf");
     let set = body
-        .find("config_set")
+        .find("set_deploy_config")
         .expect("deploy config push must set config values");
     assert!(
         attest < set,
