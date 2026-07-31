@@ -46,7 +46,7 @@ pub async fn paas_app_logs(
     }
     require_log_entitlement(&state, &auth).await?;
     let app = sqlx::query(
-        "SELECT id::text AS id, name, namespace, domain, tee_domain FROM apps WHERE org_id = $1 AND name = $2",
+        "SELECT id::text AS id, name, namespace, domain FROM apps WHERE org_id = $1 AND name = $2",
     )
     .bind(auth.org_id)
     .bind(&app_name)
@@ -60,7 +60,6 @@ pub async fn paas_app_logs(
     let app_name: String = app.try_get("name").map_err(|_| db_error())?;
     let namespace: String = app.try_get("namespace").map_err(|_| db_error())?;
     let domain: String = app.try_get("domain").map_err(|_| db_error())?;
-    let tee_domain: Option<String> = app.try_get("tee_domain").map_err(|_| db_error())?;
     let encrypted_logs_configured = sqlx::query_scalar::<_, bool>(
         r#"
         SELECT COALESCE((
@@ -80,15 +79,7 @@ pub async fn paas_app_logs(
     if !encrypted_logs_configured {
         return Ok(encrypted_logs_required_response());
     }
-    proxy_encrypted_logs_from_tee(
-        &state,
-        &app_name,
-        &namespace,
-        &domain,
-        tee_domain.as_deref(),
-        &query,
-    )
-    .await
+    proxy_encrypted_logs_from_tee(&state, &app_name, &namespace, &domain, &query).await
 }
 
 async fn require_log_entitlement(state: &AppState, auth: &AuthContext) -> Result<(), RouteError> {
@@ -214,12 +205,9 @@ async fn proxy_encrypted_logs_from_tee(
     app_name: &str,
     namespace: &str,
     domain: &str,
-    tee_domain: Option<&str>,
     query: &ValidatedLogQuery,
 ) -> Result<Response, RouteError> {
-    let confidential_domain = tee_domain.unwrap_or(domain);
-    let (client, url) =
-        tenant_tee_logs_client(state, app_name, namespace, confidential_domain).await;
+    let (client, url) = tenant_tee_logs_client(state, app_name, namespace, domain).await;
     let upstream = client
         .get(url)
         .query(&query.tee_query_pairs())

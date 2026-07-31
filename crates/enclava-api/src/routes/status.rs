@@ -419,7 +419,6 @@ async fn probe_tee_unbounded(
     domain: &str,
     tee_domain: Option<&str>,
 ) -> TeeEvidence {
-    let confidential_domain = tee_domain.unwrap_or(domain);
     let internal_transport = state.attestation.as_ref().is_some_and(|attestation| {
         enclava_engine::manifest::network_policy::cap_api_namespace_for_attestation(
             attestation,
@@ -433,8 +432,7 @@ async fn probe_tee_unbounded(
         else {
             return TeeEvidence::Unavailable;
         };
-        let Ok(client) =
-            crate::routes::logs::build_resolved_tenant_tee_http_client(confidential_domain, socket)
+        let Ok(client) = crate::routes::logs::build_resolved_tenant_tee_http_client(domain, socket)
         else {
             return TeeEvidence::Unavailable;
         };
@@ -793,13 +791,15 @@ fn confidential_status_url(
     tee_domain: Option<&str>,
     socket: Option<SocketAddr>,
 ) -> String {
-    let confidential_domain = tee_domain.unwrap_or(domain);
     match socket {
         Some(socket) => format!(
-            "https://{confidential_domain}:{}/.well-known/confidential/status",
+            "https://{domain}:{}/.well-known/confidential/status",
             socket.port()
         ),
-        None => format!("https://{confidential_domain}/.well-known/confidential/status"),
+        None => format!(
+            "https://{}/.well-known/confidential/status",
+            tee_domain.unwrap_or(domain)
+        ),
     }
 }
 
@@ -1527,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn confidential_status_probe_pins_tee_domain_to_internal_service() {
+    fn confidential_status_probe_pins_ingress_domain_to_internal_service() {
         let socket = "10.43.13.109:443".parse().unwrap();
         assert_eq!(
             confidential_status_url(
@@ -1535,7 +1535,7 @@ mod tests {
                 Some("app.tee.example.test"),
                 Some(socket)
             ),
-            "https://app.tee.example.test:443/.well-known/confidential/status"
+            "https://app.example.test:443/.well-known/confidential/status"
         );
         assert_eq!(
             confidential_status_url("app.example.test", Some("app.tee.example.test"), None),
