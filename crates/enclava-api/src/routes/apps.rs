@@ -1299,28 +1299,10 @@ pub async fn delete_app(
             return Err(internal_server_error());
         }
     }
-    let signed_policy_revocation =
-        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut phase_tx)
-            .await
-            .map_err(|_| internal_server_error())?
-            .is_some();
     phase_tx
         .commit()
         .await
         .map_err(|_| internal_server_error())?;
-
-    if signed_policy_revocation {
-        delete_mutation
-            .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
-                &state.db,
-                state.kbs_policy.as_ref(),
-            ))
-            .await
-            .map_err(|_| internal_server_error())?
-            .map_err(|error| {
-                app_delete_failure(phase_app.id, AppDeleteFailure::KbsPolicy, error)
-            })?;
-    }
 
     // Hold the generation lane across all external teardown steps. Workers and
     // new deployment acceptance either finish before this point or observe the
@@ -1358,6 +1340,35 @@ pub async fn delete_app(
         .guard_provider(request_workload_teardown(&state, &auth, &deleting_app))
         .await
         .map_err(|_| internal_server_error())??;
+
+    // The running workload needs its current KBS authorization to erase the
+    // owner seed. Revoke that authorization only after teardown has completed.
+    let mut revocation_tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| internal_server_error())?;
+    let signed_policy_revocation =
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut revocation_tx)
+            .await
+            .map_err(|_| internal_server_error())?
+            .is_some();
+    revocation_tx
+        .commit()
+        .await
+        .map_err(|_| internal_server_error())?;
+    if signed_policy_revocation {
+        delete_mutation
+            .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
+                &state.db,
+                state.kbs_policy.as_ref(),
+            ))
+            .await
+            .map_err(|_| internal_server_error())?
+            .map_err(|error| {
+                app_delete_failure(deleting_app.id, AppDeleteFailure::KbsPolicy, error)
+            })?;
+    }
 
     if state.dns.is_some() {
         delete_mutation
