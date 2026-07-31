@@ -281,11 +281,17 @@ fn write_ready_file_state(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn stay_alive_forever(cfg: &Config) -> ! {
     loop {
-        if let Err(err) = sync_caddy_runtime_back(cfg) {
+        if caddy_runtime_back_sync_required(cfg)
+            && let Err(err) = sync_caddy_runtime_back(cfg)
+        {
             tracing::warn!(error = %err, "caddy runtime persistence sync failed");
         }
         std::thread::sleep(Duration::from_secs(CADDY_RUNTIME_SYNC_INTERVAL_SECONDS));
     }
+}
+
+fn caddy_runtime_back_sync_required(cfg: &Config) -> bool {
+    cfg.tls_certificate_broker_url.is_none()
 }
 
 fn stay_alive_after_failure() -> ! {
