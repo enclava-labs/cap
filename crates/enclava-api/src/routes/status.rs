@@ -112,6 +112,8 @@ pub struct AppStatusResponse {
     /// it never influences status, readiness, or freshness semantics.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_init_stage: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tee_error: Option<String>,
     pub observation: LiveObservation,
     /// Durable lifecycle diagnosis for the active deployment (#90): phase,
     /// condition, reason, and retry/lease timing projected from the apply
@@ -150,6 +152,7 @@ struct TeeEvidenceFields {
     storage_status: Option<String>,
     live_state: Option<String>,
     last_init_stage: Option<&'static str>,
+    tee_error: Option<String>,
     supplemental_fields_malformed: bool,
 }
 
@@ -169,6 +172,7 @@ pub(crate) struct ObservedAppStatus {
     storage_status: Option<String>,
     live_state: Option<String>,
     pub(crate) last_init_stage: Option<&'static str>,
+    tee_error: Option<String>,
     runtime_failure: Option<RuntimeFailureEvidence>,
 }
 
@@ -251,6 +255,7 @@ pub async fn app_status(
         tee_status: observed.tee_status,
         storage_status: observed.storage_status,
         last_init_stage: observed.last_init_stage,
+        tee_error: observed.tee_error,
         observation: observed.observation,
         deployment,
     }))
@@ -775,6 +780,10 @@ fn tee_evidence_fields(body: &Value) -> TeeEvidenceFields {
                     .find(|known| **known == stage)
                     .copied()
             }),
+        tee_error: body
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         supplemental_fields_malformed,
     }
 }
@@ -1012,6 +1021,7 @@ fn classify_live_observation_for_deployment(
             storage_status: fields.storage_status,
             live_state: fields.live_state,
             last_init_stage: fields.last_init_stage,
+            tee_error: fields.tee_error,
             runtime_failure: pod.runtime_failure,
         };
     }
@@ -1028,6 +1038,7 @@ fn classify_live_observation_for_deployment(
         storage_status: fields.storage_status,
         live_state: fields.live_state,
         last_init_stage: fields.last_init_stage,
+        tee_error: fields.tee_error,
         runtime_failure: pod.runtime_failure,
     }
 }
@@ -1058,6 +1069,7 @@ fn incomplete_observation(
         storage_status,
         live_state: None,
         last_init_stage,
+        tee_error: None,
         runtime_failure,
     }
 }
@@ -1443,6 +1455,32 @@ mod tests {
             "unlock_state": "unlocked"
         }));
         assert_eq!(fields.live_state.as_deref(), Some("unlocked"));
+    }
+
+    #[test]
+    fn tee_error_is_captured_from_proxy_status_error_field() {
+        let fields = tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "tee_status": "error",
+            "storage_status": "error",
+            "unlock_state": "error",
+            "error": "enclava_init_failed:last_stage=binding workload mount namespaces"
+        }));
+        assert_eq!(
+            fields.tee_error.as_deref(),
+            Some("enclava_init_failed:last_stage=binding workload mount namespaces")
+        );
+    }
+
+    #[test]
+    fn tee_error_is_none_when_proxy_status_has_no_error_field() {
+        let fields = tee_evidence_fields(&json!({
+            "pod_status": "Running",
+            "tee_status": "ready",
+            "storage_status": "unlocked",
+            "unlock_state": "unlocked"
+        }));
+        assert!(fields.tee_error.is_none());
     }
 
     #[test]
