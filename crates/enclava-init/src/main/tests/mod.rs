@@ -1,4 +1,5 @@
 use super::*;
+use enclava_init::config::AppBindMountConfig;
 use tempfile::tempdir;
 
 #[test]
@@ -260,6 +261,37 @@ fn tenant_ingress_bind_plan_uses_shared_tls_mount_not_namespace_bind() {
     let mounts = bind_mount_plan_for_workload(&cfg, 42, &workload).unwrap();
 
     assert!(mounts.is_empty());
+}
+
+#[test]
+fn attestation_proxy_bind_plan_is_empty_even_with_app_data_binds() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config_with_signed_cc(dir.path(), "");
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: "app-data".to_string(),
+        mount_path: "/app/data".to_string(),
+    });
+
+    let proxy = WorkloadNamespace {
+        name: "attestation-proxy".to_string(),
+        pid: 1234,
+    };
+    assert!(
+        bind_mount_plan_for_workload(&cfg, 42, &proxy)
+            .unwrap()
+            .is_empty()
+    );
+
+    let primary = WorkloadNamespace {
+        name: "web".to_string(),
+        pid: 1234,
+    };
+    assert_eq!(
+        bind_mount_plan_for_workload(&cfg, 42, &primary)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
