@@ -1072,6 +1072,12 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
                     .and_then(|value| value.as_str())
                     .map(str::to_string);
             }
+            if status.tee_error.is_none() {
+                status.tee_error = tee_status_json
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+            }
         }
     }
 
@@ -1110,6 +1116,9 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
     if let Some(unlock) = &status.unlock_status {
         println!("Unlock:   {unlock}");
+    }
+    if let Some(tee_error) = &status.tee_error {
+        println!("TEE error: {}", tee_error.red());
     }
     if let Some(deployed) = &status.last_deployed {
         println!("Deployed: {deployed}");
