@@ -504,6 +504,8 @@ pub struct AppStatus {
     pub domain: String,
     pub last_deployed: Option<String>,
     #[serde(default)]
+    pub tee_error: Option<String>,
+    #[serde(default)]
     pub observation: Option<AppStatusObservation>,
 }
 
@@ -557,6 +559,26 @@ mod app_status_contract_tests {
         .expect("parse legacy hosted status");
 
         assert!(status.observation.is_none());
+    }
+
+    #[test]
+    fn app_status_captures_tee_error_when_present() {
+        let status: AppStatus = serde_json::from_value(serde_json::json!({
+            "app_name": "demo",
+            "status": "failed",
+            "pod_phase": null,
+            "tee_status": null,
+            "unlock_status": null,
+            "domain": "demo.example.test",
+            "last_deployed": null,
+            "tee_error": "enclava_init_failed:last_stage=binding workload mount namespaces"
+        }))
+        .expect("parse status with tee error");
+
+        assert_eq!(
+            status.tee_error.as_deref(),
+            Some("enclava_init_failed:last_stage=binding workload mount namespaces")
+        );
     }
 }
 
