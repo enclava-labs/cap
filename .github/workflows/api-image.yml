@@ -90,7 +90,7 @@ jobs:
 
   publish:
     name: Publish signed API image
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -193,7 +193,19 @@ jobs:
         run: cosign sign --yes "$IMAGE@$DIGEST"
 
       - name: Verify signed digest
+        if: github.event_name != 'workflow_dispatch'
         run: scripts/verify-api-image-ref.sh --cosign dist/enclava-api-image.txt
+
+      - name: Verify manually dispatched candidate digest
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          IMAGE: ghcr.io/enclava-labs/enclava-api
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SIGNER_SUBJECT: https://github.com/${{ github.workflow_ref }}
+        run: |
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-identity "${SIGNER_SUBJECT}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
       - name: Upload release manifest artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

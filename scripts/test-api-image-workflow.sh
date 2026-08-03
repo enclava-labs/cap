@@ -58,7 +58,7 @@ for required in \
   "validate:" \
   "publish:" \
   "if: github.event_name == 'pull_request'" \
-  "if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')" \
+  "if: github.event_name == 'workflow_dispatch' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag'))" \
   "contents: read" \
   "id-token: write" \
   "packages: write" \
