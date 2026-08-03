@@ -115,6 +115,7 @@ pub fn report_data_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use enclava_common::canonical::ce_v1_bytes;
 
     #[test]
@@ -164,5 +165,45 @@ mod tests {
             expected,
             expected_report_data(origin, &nonce, &spki, &[6; 32]).unwrap()
         );
+    }
+
+    #[test]
+    fn receipt_key_rotation_requires_replacement_report_data() {
+        let origin = "https://app.example";
+        let nonce = [1; 32];
+        let spki = [2; 32];
+        let old_key = [3; 32];
+        let new_key = [4; 32];
+        let mut report_bytes = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("../tests/fixtures/genoa-snp-report.b64").trim())
+            .unwrap();
+        report_bytes[0x50..0x90]
+            .copy_from_slice(&expected_report_data(origin, &nonce, &spki, &old_key).unwrap());
+        let old_report = crate::parse_snp_report(&report_bytes).unwrap();
+        assert!(report_data_matches(
+            &old_report,
+            origin,
+            &nonce,
+            &spki,
+            &old_key
+        ));
+        assert!(!report_data_matches(
+            &old_report,
+            origin,
+            &nonce,
+            &spki,
+            &new_key
+        ));
+
+        report_bytes[0x50..0x90]
+            .copy_from_slice(&expected_report_data(origin, &nonce, &spki, &new_key).unwrap());
+        let replacement_report = crate::parse_snp_report(&report_bytes).unwrap();
+        assert!(report_data_matches(
+            &replacement_report,
+            origin,
+            &nonce,
+            &spki,
+            &new_key
+        ));
     }
 }
