@@ -4,7 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-enclava-common = { path = "../enclava-common", default-features = false }
+base64 = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+enclava-common = { path = "../enclava-common", default-features = false, features = ["descriptor"] }
 hex = { workspace = true }
 p384 = { workspace = true }
 num-bigint = { workspace = true }
@@ -14,6 +17,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
+uuid = { version = "1", default-features = false, features = ["serde"] }
 x509-cert = { workspace = true }
 
 [dev-dependencies]

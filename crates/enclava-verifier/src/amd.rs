@@ -6,6 +6,7 @@ use pkcs1::RsaPublicKey;
 use sha2::{Digest, Sha256, Sha384};
 use x509_cert::{
     Certificate,
+    crl::CertificateList,
     der::{Decode, Encode},
 };
 
@@ -27,6 +28,110 @@ pub enum AmdVerificationError {
     UntrustedArk,
     #[error("SNP report signature is invalid")]
     InvalidReportSignature,
+    #[error("AMD certificate is outside its validity interval")]
+    CertificateTimeInvalid,
+    #[error("AMD revocation list is invalid")]
+    InvalidRevocationList,
+    #[error("AMD VCEK is revoked")]
+    Revoked,
+    #[error("AMD revocation data has no signed nextUpdate")]
+    RevocationTimeMissing,
+    #[error("AMD revocation data is stale")]
+    RevocationDataStale,
+    #[error("AMD revocation data is expired")]
+    RevocationDataExpired,
+}
+
+pub fn verify_amd_revocation(
+    ark_der: &[u8],
+    ask_der: &[u8],
+    vcek_der: &[u8],
+    crl_der: &[u8],
+    now_unix_seconds: u64,
+    maximum_age_seconds: u64,
+) -> Result<(), AmdVerificationError> {
+    let ark =
+        Certificate::from_der(ark_der).map_err(|_| AmdVerificationError::InvalidCertificate)?;
+    let ask =
+        Certificate::from_der(ask_der).map_err(|_| AmdVerificationError::InvalidCertificate)?;
+    let vcek =
+        Certificate::from_der(vcek_der).map_err(|_| AmdVerificationError::InvalidCertificate)?;
+    for certificate in [&ark, &ask, &vcek] {
+        let validity = &certificate.tbs_certificate.validity;
+        if now_unix_seconds < validity.not_before.to_unix_duration().as_secs()
+            || now_unix_seconds > validity.not_after.to_unix_duration().as_secs()
+        {
+            return Err(AmdVerificationError::CertificateTimeInvalid);
+        }
+    }
+    let crl = CertificateList::from_der(crl_der)
+        .map_err(|_| AmdVerificationError::InvalidRevocationList)?;
+    if crl.signature_algorithm != crl.tbs_cert_list.signature
+        || crl.signature_algorithm.oid.to_string() != "1.2.840.113549.1.1.10"
+    {
+        return Err(AmdVerificationError::InvalidRevocationList);
+    }
+    let signed = crl
+        .tbs_cert_list
+        .to_der()
+        .map_err(|_| AmdVerificationError::InvalidRevocationList)?;
+    let signature = crl
+        .signature
+        .as_bytes()
+        .ok_or(AmdVerificationError::InvalidRevocationList)?;
+    if !verify_rsa_certificate_list_signature(&ark, &signed, signature)
+        && !verify_rsa_certificate_list_signature(&ask, &signed, signature)
+    {
+        return Err(AmdVerificationError::InvalidRevocationList);
+    }
+    let this_update = crl.tbs_cert_list.this_update.to_unix_duration().as_secs();
+    let next_update = crl
+        .tbs_cert_list
+        .next_update
+        .ok_or(AmdVerificationError::RevocationTimeMissing)?
+        .to_unix_duration()
+        .as_secs();
+    if now_unix_seconds > next_update {
+        return Err(AmdVerificationError::RevocationDataExpired);
+    }
+    if this_update > now_unix_seconds
+        || now_unix_seconds.saturating_sub(this_update) > maximum_age_seconds
+    {
+        return Err(AmdVerificationError::RevocationDataStale);
+    }
+    if crl
+        .tbs_cert_list
+        .revoked_certificates
+        .as_ref()
+        .is_some_and(|revoked| {
+            revoked
+                .iter()
+                .any(|entry| entry.serial_number == vcek.tbs_certificate.serial_number)
+        })
+    {
+        return Err(AmdVerificationError::Revoked);
+    }
+    Ok(())
+}
+
+fn verify_rsa_certificate_list_signature(
+    issuer: &Certificate,
+    signed: &[u8],
+    signature: &[u8],
+) -> bool {
+    let spki = issuer.tbs_certificate.subject_public_key_info.to_der().ok();
+    spki.as_deref()
+        .and_then(|spki| x509_cert::spki::SubjectPublicKeyInfoRef::from_der(spki).ok())
+        .and_then(|spki| spki.subject_public_key.as_bytes())
+        .and_then(|bytes| RsaPublicKey::from_der(bytes).ok())
+        .is_some_and(|key| {
+            verify_rsa_pss_sha384(
+                key.modulus.as_bytes(),
+                key.public_exponent.as_bytes(),
+                signed,
+                signature,
+            )
+        })
 }
 
 pub fn verify_amd_certificate_chain(

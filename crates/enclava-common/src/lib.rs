@@ -1,6 +1,6 @@
 pub mod canonical;
 pub mod crypto;
-#[cfg(feature = "runtime")]
+#[cfg(feature = "descriptor")]
 pub mod descriptor;
 pub mod hostnames;
 #[cfg(feature = "runtime")]

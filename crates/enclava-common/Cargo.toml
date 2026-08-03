@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true }
+uuid = { version = "1", default-features = false, features = ["serde"], optional = true }
 chrono = { workspace = true, optional = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
@@ -19,6 +19,7 @@ x25519-dalek = { workspace = true, optional = true }
 
 [features]
 default = ["runtime"]
+descriptor = ["dep:chrono", "dep:serde", "dep:uuid"]
 runtime = [
     "dep:base64",
     "dep:chacha20poly1305",
@@ -29,5 +30,6 @@ runtime = [
     "dep:serde_json",
     "dep:uuid",
     "dep:x25519-dalek",
+    "descriptor",
 ]
 prod-strict = []

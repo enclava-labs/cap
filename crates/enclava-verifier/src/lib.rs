@@ -1,18 +1,32 @@
 //! Deterministic, I/O-free verification primitives shared by native and WASM adapters.
 
 mod amd;
+mod artifacts;
 mod bundle;
+mod evidence;
+mod policy;
 mod result;
 mod snp;
+mod supply_chain;
 
-pub use amd::{AmdVerificationError, verify_amd_certificate_chain, verify_snp_signature};
-pub use bundle::{BundleError, PROOF_BUNDLE_MEDIA_TYPE, ProofBundle, parse_proof_bundle};
+pub use amd::{
+    AmdVerificationError, verify_amd_certificate_chain, verify_amd_revocation, verify_snp_signature,
+};
+pub use artifacts::{ArtifactError, VerifiedArtifacts, verify_workload_artifacts};
+pub use bundle::{
+    BundleError, MAX_PROOF_BUNDLE_BYTES, PROOF_BUNDLE_MEDIA_TYPE, ProofBundle, parse_proof_bundle,
+};
+pub use evidence::{
+    AmdEndorsements, EvidenceError, expected_report_data, parse_amd_endorsements,
+    report_data_matches, tls_leaf_spki_sha256,
+};
 pub use result::{
     AppraisalResult, CheckOutcome, CheckResult, Verdict, canonical_result_bytes,
     canonical_result_sha256,
 };
 use sha2::{Digest, Sha256};
 pub use snp::{SNP_REPORT_BYTES, SnpReport, SnpReportError, parse_snp_report};
+pub use supply_chain::{SupplyChainError, verify_portable_material};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerificationContext {
@@ -57,7 +71,7 @@ pub fn verify(
         }
     };
 
-    if let Some(bundle) = bundle {
+    if let Some(bundle) = bundle.as_ref() {
         checks.push(equality_check(
             "binding.challenge_nonce",
             bundle.challenge_nonce == context.challenge_nonce,
@@ -74,27 +88,10 @@ pub fn verify(
         ));
     }
 
-    if policy_bytes.is_empty() {
+    let policy = if policy_bytes.is_empty() {
         warnings.push("NO_POLICY_SUPPLIED".into());
-    } else if serde_json::from_slice::<serde_json::Value>(policy_bytes)
-        .ok()
-        .and_then(|policy| {
-            policy
-                .get("schema_version")
-                .and_then(|value| value.as_str())
-                .map(str::to_owned)
-        })
-        .as_deref()
-        != Some("enclava-trust-policy-v1")
-    {
-        checks.push(CheckResult {
-            id: "policy.structure".into(),
-            outcome: CheckOutcome::Fail,
-            observed: None,
-            expected: Some("enclava-trust-policy-v1".into()),
-            reason_code: "MALFORMED_POLICY".into(),
-        });
-    } else {
+        None
+    } else if let Some(policy) = policy::TrustPolicy::parse(policy_bytes) {
         checks.push(CheckResult {
             id: "policy.structure".into(),
             outcome: CheckOutcome::Pass,
@@ -102,7 +99,31 @@ pub fn verify(
             expected: Some("enclava-trust-policy-v1".into()),
             reason_code: "OK".into(),
         });
-        warnings.push("CRYPTOGRAPHIC_CHECKS_NOT_IMPLEMENTED".into());
+        Some(policy)
+    } else {
+        checks.push(CheckResult {
+            id: "policy.structure".into(),
+            outcome: CheckOutcome::Fail,
+            observed: None,
+            expected: Some("enclava-trust-policy-v1".into()),
+            reason_code: "MALFORMED_POLICY".into(),
+        });
+        None
+    };
+
+    if let (Some(bundle), Some(policy)) = (bundle.as_ref(), policy.as_ref()) {
+        verify_evidence(bundle, policy, &context, &mut checks, &mut warnings);
+        for required in &policy.required_checks {
+            if !checks.iter().any(|check| &check.id == required) {
+                checks.push(CheckResult {
+                    id: required.clone(),
+                    outcome: CheckOutcome::Fail,
+                    observed: None,
+                    expected: Some("supported verifier check".into()),
+                    reason_code: "UNSUPPORTED_REQUIRED_CHECK".into(),
+                });
+            }
+        }
     }
 
     let verdict = if checks
@@ -110,6 +131,18 @@ pub fn verify(
         .any(|check| check.outcome == CheckOutcome::Fail)
     {
         Verdict::Fail
+    } else if let Some(policy) = policy.as_ref()
+        && policy.required_checks.iter().all(|required| {
+            checks
+                .iter()
+                .any(|check| &check.id == required && check.outcome == CheckOutcome::Pass)
+        })
+        && (!policy.transport.require_tls_channel_spki
+            || checks.iter().any(|check| {
+                check.id == "transport.tls_channel_spki" && check.outcome == CheckOutcome::Pass
+            }))
+    {
+        Verdict::Pass
     } else {
         Verdict::Inconclusive
     };
@@ -123,6 +156,218 @@ pub fn verify(
         verifier_version: env!("CARGO_PKG_VERSION").into(),
         checks,
         warnings,
+    }
+}
+
+fn verify_evidence(
+    bundle: &ProofBundle<'_>,
+    policy: &policy::TrustPolicy,
+    context: &VerificationContext,
+    checks: &mut Vec<CheckResult>,
+    warnings: &mut Vec<String>,
+) {
+    let report = parse_snp_report(bundle.snp_report);
+    checks.push(simple_check(
+        "amd.report_structure",
+        report.is_ok(),
+        "INVALID_SNP_REPORT",
+    ));
+    let endorsements = parse_amd_endorsements(bundle.amd_endorsements);
+    checks.push(simple_check(
+        "amd.endorsements_structure",
+        endorsements.is_ok(),
+        "INVALID_AMD_ENDORSEMENTS",
+    ));
+    let leaf_spki = tls_leaf_spki_sha256(bundle.tls_leaf_der);
+    checks.push(simple_check(
+        "binding.tls_leaf_certificate",
+        leaf_spki.is_ok(),
+        "INVALID_TLS_LEAF_CERTIFICATE",
+    ));
+
+    if let (Ok(report), Ok(endorsements)) = (&report, &endorsements) {
+        let chain_valid = policy.amd.trusted_ark_sha256.iter().any(|trusted| {
+            policy::decode_32(trusted).is_some_and(|trusted| {
+                verify_amd_certificate_chain(
+                    endorsements.ark_der,
+                    endorsements.ask_der,
+                    endorsements.vcek_der,
+                    &trusted,
+                )
+                .is_ok()
+            })
+        });
+        checks.push(simple_check(
+            "amd.certificate_chain",
+            chain_valid,
+            "AMD_CHAIN_INVALID_OR_UNTRUSTED",
+        ));
+        checks.push(simple_check(
+            "amd.report_signature",
+            verify_snp_signature(report, endorsements.vcek_der).is_ok(),
+            "SNP_REPORT_SIGNATURE_INVALID",
+        ));
+        let revocation = verify_amd_revocation(
+            endorsements.ark_der,
+            endorsements.ask_der,
+            endorsements.vcek_der,
+            endorsements.crl_der,
+            context.now_unix_seconds,
+            policy.amd.revocation_max_age_seconds,
+        );
+        checks.push(simple_check(
+            "amd.revocation.freshness",
+            revocation.is_ok(),
+            match revocation {
+                Err(AmdVerificationError::RevocationDataExpired) => "REVOCATION_DATA_EXPIRED",
+                Err(AmdVerificationError::RevocationDataStale) => "REVOCATION_DATA_STALE",
+                Err(AmdVerificationError::RevocationTimeMissing) => "REVOCATION_TIME_MISSING",
+                Err(AmdVerificationError::Revoked) => "VCEK_REVOKED",
+                _ => "AMD_REVOCATION_INVALID",
+            },
+        ));
+        checks.push(simple_check(
+            "amd.measurement",
+            policy.amd.allowed_measurements.iter().any(|measurement| {
+                policy::decode_48(measurement).as_ref() == Some(&report.measurement)
+            }),
+            "SNP_MEASUREMENT_REJECTED",
+        ));
+        checks.push(simple_check(
+            "amd.tcb",
+            policy::tcb_meets(report.reported_tcb, &policy.amd.minimum_tcb),
+            "SNP_TCB_BELOW_MINIMUM",
+        ));
+        checks.push(simple_check(
+            "amd.guest_policy",
+            report.guest_policy & policy.amd.guest_policy_mask == policy.amd.guest_policy_value,
+            "SNP_POLICY_REJECTED",
+        ));
+        if let Ok(leaf_spki) = leaf_spki {
+            checks.push(simple_check(
+                "binding.report_data",
+                report_data_matches(
+                    report,
+                    bundle.target_origin,
+                    &bundle.challenge_nonce,
+                    &leaf_spki,
+                    bundle.proxy_receipt_public_key,
+                ),
+                "REPORT_DATA_MISMATCH",
+            ));
+            match context.observed_channel_spki_sha256 {
+                Some(observed) => checks.push(equality_check(
+                    "transport.tls_channel_spki",
+                    observed == leaf_spki,
+                    hex::encode(observed),
+                    hex::encode(leaf_spki),
+                    "CHANNEL_SPKI_MISMATCH",
+                )),
+                None => {
+                    checks.push(CheckResult {
+                        id: "transport.tls_channel_spki".into(),
+                        outcome: CheckOutcome::Skipped,
+                        observed: None,
+                        expected: Some(hex::encode(leaf_spki)),
+                        reason_code: "CHANNEL_SPKI_UNAVAILABLE".into(),
+                    });
+                    warnings.push("LIVE_TLS_CHANNEL_BINDING_NOT_CHECKED".into());
+                }
+            }
+        }
+    }
+
+    checks.push(simple_check(
+        "policy.target_origin",
+        policy
+            .target
+            .origins
+            .iter()
+            .any(|origin| origin == bundle.target_origin),
+        "TARGET_ORIGIN_REJECTED",
+    ));
+    match verify_workload_artifacts(
+        bundle.workload_artifacts_json,
+        bundle.trustee_policy_json,
+        bundle.cc_init_data_toml,
+        &policy.trusted_org_keyring_sha256,
+        &policy.trusted_policy_signing_pubkeys,
+    ) {
+        Ok(artifacts) => {
+            checks.push(simple_check(
+                "artifacts.signatures",
+                true,
+                "ARTIFACT_SIGNATURE_INVALID",
+            ));
+            checks.push(simple_check(
+                "artifacts.relationships",
+                true,
+                "ARTIFACT_RELATIONSHIP_INVALID",
+            ));
+            checks.push(simple_check(
+                "artifacts.descriptor_measurement",
+                report.as_ref().is_ok_and(|report| {
+                    artifacts
+                        .descriptor
+                        .expected_firmware_measurement
+                        .matches_report(&report.measurement)
+                }),
+                "DESCRIPTOR_MEASUREMENT_MISMATCH",
+            ));
+            checks.push(simple_check(
+                "supply_chain.image_policy",
+                policy
+                    .target
+                    .image_digests
+                    .iter()
+                    .any(|digest| digest == &artifacts.descriptor.image_digest),
+                "IMAGE_DIGEST_REJECTED",
+            ));
+            checks.push(simple_check(
+                "supply_chain.portable_integrity",
+                verify_portable_material(
+                    bundle.sigstore_material,
+                    bundle.provenance_oci_material,
+                    &artifacts.descriptor.image_digest,
+                )
+                .is_ok(),
+                "PORTABLE_SUPPLY_CHAIN_MATERIAL_INVALID",
+            ));
+            // Fail closed until Fulcio/Rekor and provenance signature appraisal
+            // is completed by the next verifier gate.
+            checks.push(simple_check(
+                "supply_chain.signatures",
+                false,
+                "SUPPLY_CHAIN_SIGNATURE_VERIFICATION_INCOMPLETE",
+            ));
+        }
+        Err(error) => {
+            warnings.push(error.to_string());
+            checks.push(simple_check(
+                "artifacts.signatures",
+                false,
+                "ARTIFACT_SIGNATURE_INVALID",
+            ));
+            checks.push(simple_check(
+                "artifacts.relationships",
+                false,
+                "ARTIFACT_RELATIONSHIP_INVALID",
+            ));
+        }
+    }
+}
+
+fn simple_check(id: &str, passes: bool, reason: &str) -> CheckResult {
+    CheckResult {
+        id: id.into(),
+        outcome: if passes {
+            CheckOutcome::Pass
+        } else {
+            CheckOutcome::Fail
+        },
+        observed: None,
+        expected: None,
+        reason_code: if passes { "OK" } else { reason }.into(),
     }
 }
 
@@ -180,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn never_passes_without_completed_security_checks() {
+    fn incomplete_policy_fails_closed() {
         assert_eq!(
             verify(
                 &bundle(&[7; 32]),
@@ -188,7 +433,7 @@ mod tests {
                 context([7; 32]),
             )
             .verdict,
-            Verdict::Inconclusive
+            Verdict::Fail
         );
     }
 
