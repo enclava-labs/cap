@@ -15,6 +15,30 @@ pub struct TrustPolicy {
     pub sigstore: SigstorePolicy,
     #[serde(default)]
     pub transport: TransportPolicy,
+    #[serde(default)]
+    pub appraiser: AppraiserPolicy,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppraiserPolicy {
+    #[serde(default)]
+    pub keys: Vec<AppraiserKeyPolicy>,
+    #[serde(default)]
+    pub maximum_receipt_lifetime_seconds: u64,
+    #[serde(default)]
+    pub clock_skew_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppraiserKeyPolicy {
+    pub key_id: String,
+    pub public_key_base64: String,
+    pub not_before_unix_seconds: u64,
+    pub not_after_unix_seconds: u64,
+    #[serde(default)]
+    pub revoked: bool,
 }
 
 #[derive(Debug, Deserialize)]

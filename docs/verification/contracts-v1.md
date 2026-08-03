@@ -47,6 +47,10 @@ origin/deployment identity; image digests; runtime/sidecar/artifact relationship
 clock-skew and signed revocation-freshness requirements; and whether
 `transport.tls_channel_spki` is required. Exact policy bytes are hashed as supplied.
 
+`appraiser.keys` independently pins each accepted Ed25519 key by identifier, public key, validity
+interval, and revocation status. Receipt lifetime and clock-skew bounds are policy inputs. A
+response-carried key is informational and must exactly match an independent pin.
+
 ## Appraisal result
 
 The JSON result fields are `verdict`, `bundle_sha256`, `policy_sha256`, `target_origin`,
@@ -60,3 +64,6 @@ are CE-v1 check records with explicit presence bits for both optional fields), t
 `FAIL`; no policy, insufficient policy, or an unavailable required context fact is `INCONCLUSIVE`.
 `transport.tls_channel_spki` is `SKIPPED` with `CHANNEL_SPKI_UNAVAILABLE` when the verifier did not
 observe the live TLS connection. A policy requiring it cannot pass in that context.
+
+Machine-readable appraiser/result schemas are in `schema/`; stable codes are listed in
+`reason-codes-v1.md`. The canonical Rust receipt verifier is `verify_appraisal_response`.

@@ -34,3 +34,8 @@ publish both keys independently for a bounded overlap; never authorize a replace
 response alone.
 
 Run `cargo test -p enclava-appraiser` as the local conformance check.
+
+Consumers verify responses with `enclava_verifier::verify_appraisal_response` and the independently
+supplied `appraiser` policy section. It enforces the exact result hash, signature, validity windows,
+maximum lifetime, clock skew, revocation, and overlap rotation. Stable failures are documented in
+`reason-codes-v1.md`.

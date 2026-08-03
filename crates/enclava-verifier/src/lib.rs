@@ -5,6 +5,7 @@ mod artifacts;
 mod bundle;
 mod evidence;
 mod policy;
+mod receipt;
 mod result;
 mod sigstore;
 mod snp;
@@ -21,7 +22,11 @@ pub use evidence::{
     AmdEndorsements, EvidenceError, expected_report_data, parse_amd_endorsements,
     report_data_matches, tls_leaf_spki_sha256,
 };
-pub use policy::SigstorePolicy;
+pub use policy::{AppraiserKeyPolicy, AppraiserPolicy, SigstorePolicy, TrustPolicy};
+pub use receipt::{
+    AppraisalResponse, ReceiptError, SignedReceipt, appraisal_receipt_bytes,
+    verify_appraisal_response,
+};
 pub use result::{
     AppraisalResult, CheckOutcome, CheckResult, Verdict, canonical_result_bytes,
     canonical_result_sha256,

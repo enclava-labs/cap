@@ -10,9 +10,11 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::{Signer as _, SigningKey};
-use enclava_common::canonical::ce_v1_bytes;
-use enclava_verifier::{AppraisalResult, VerificationContext, canonical_result_sha256, verify};
-use serde::{Deserialize, Serialize};
+use enclava_verifier::{
+    AppraisalResponse, AppraisalResult, SignedReceipt, VerificationContext,
+    appraisal_receipt_bytes, canonical_result_sha256, verify,
+};
+use serde::Deserialize;
 
 const REQUEST_MEDIA_TYPE: &str = "application/vnd.enclava.appraisal-request.v1+json";
 const RESPONSE_MEDIA_TYPE: &str = "application/vnd.enclava.appraisal-response.v1+json";
@@ -38,22 +40,6 @@ struct AppraisalRequest {
     policy_id: Option<String>,
     challenge_nonce_base64url: String,
     expected_target_origin: String,
-}
-
-#[derive(Serialize)]
-struct AppraisalResponse {
-    result: AppraisalResult,
-    result_sha256: String,
-    receipt: Option<SignedReceipt>,
-}
-
-#[derive(Serialize)]
-struct SignedReceipt {
-    key_id: String,
-    appraised_at: u64,
-    expires_at: u64,
-    public_key_base64: String,
-    signature_base64: String,
 }
 
 #[tokio::main]
@@ -147,7 +133,7 @@ async fn appraise(
 impl ReceiptSigner {
     fn sign(&self, result: &AppraisalResult, result_hash: [u8; 32], now: u64) -> SignedReceipt {
         let expires = now.saturating_add(self.lifetime_seconds);
-        let receipt = receipt_bytes(result, result_hash, now, expires, &self.key_id);
+        let receipt = appraisal_receipt_bytes(result, result_hash, now, expires, &self.key_id);
         SignedReceipt {
             key_id: self.key_id.clone(),
             appraised_at: now,
@@ -157,30 +143,6 @@ impl ReceiptSigner {
             signature_base64: general_purpose::STANDARD.encode(self.key.sign(&receipt).to_bytes()),
         }
     }
-}
-
-fn receipt_bytes(
-    result: &AppraisalResult,
-    result_hash: [u8; 32],
-    appraised_at: u64,
-    expires_at: u64,
-    key_id: &str,
-) -> Vec<u8> {
-    let result_hash = hex::encode(result_hash);
-    let appraised_at = appraised_at.to_string();
-    let expires_at = expires_at.to_string();
-    ce_v1_bytes(&[
-        ("purpose", b"enclava-appraisal-receipt-v1"),
-        ("result_sha256", result_hash.as_bytes()),
-        ("bundle_sha256", result.bundle_sha256.as_bytes()),
-        ("policy_sha256", result.policy_sha256.as_bytes()),
-        ("challenge_nonce", result.challenge_nonce.as_bytes()),
-        ("target_origin", result.target_origin.as_bytes()),
-        ("appraised_at", appraised_at.as_bytes()),
-        ("expires_at", expires_at.as_bytes()),
-        ("verifier_version", result.verifier_version.as_bytes()),
-        ("key_id", key_id.as_bytes()),
-    ])
 }
 
 impl AppState {
@@ -311,7 +273,7 @@ mod tests {
             .key
             .verifying_key()
             .verify(
-                &receipt_bytes(&result, hash, 100, 400, "test-2026"),
+                &appraisal_receipt_bytes(&result, hash, 100, 400, "test-2026"),
                 &signature,
             )
             .unwrap();
