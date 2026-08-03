@@ -6,6 +6,7 @@ members = [
     "crates/enclava-api",
     "crates/enclava-cli",
     "crates/enclava-init",
+    "crates/enclava-verifier",
     "crates/enclava-wait-exec",
 ]
 
@@ -61,7 +62,9 @@ zeroize = { version = "1", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }
 tokio-rustls = "0.26"
 x509-cert = "0.2"
+url = "2"
 
 # Internal
 enclava-common = { path = "crates/enclava-common" }
+enclava-verifier = { path = "crates/enclava-verifier" }
 enclava-engine = { path = "crates/enclava-engine" }

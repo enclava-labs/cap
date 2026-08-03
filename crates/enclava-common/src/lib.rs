@@ -1,9 +1,14 @@
 pub mod canonical;
 pub mod crypto;
+#[cfg(feature = "runtime")]
 pub mod descriptor;
 pub mod hostnames;
+#[cfg(feature = "runtime")]
 pub mod image;
+#[cfg(feature = "runtime")]
 pub mod log_encryption;
+#[cfg(feature = "runtime")]
 pub mod orgs;
+#[cfg(feature = "runtime")]
 pub mod types;
 pub mod validate;
