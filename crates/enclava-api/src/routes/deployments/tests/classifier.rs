@@ -284,7 +284,7 @@ fn deployment_descriptor_for_security_profile_tests()
             caddy_digest: "sha256:2222".to_string(),
         },
         api_signing_pubkey: "api-pubkey".to_string(),
-        expected_firmware_measurement: [3; 32],
+        expected_firmware_measurement: [3; 32].into(),
         expected_runtime_class: "kata-qemu-snp".to_string(),
         kbs_resource_path: "default/cap-org-app-tls-owner".to_string(),
         unlock_mode: "password".to_string(),

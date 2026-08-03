@@ -80,6 +80,40 @@ pub struct Sidecars {
     pub caddy_digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirmwareMeasurement {
+    Legacy([u8; 32]),
+    Full([u8; 48]),
+}
+
+impl FirmwareMeasurement {
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Legacy(bytes) => bytes,
+            Self::Full(bytes) => bytes,
+        }
+    }
+
+    pub fn matches_report(&self, report: &[u8; 48]) -> bool {
+        match self {
+            Self::Legacy(expected) => report[..32] == *expected,
+            Self::Full(expected) => report == expected,
+        }
+    }
+}
+
+impl From<[u8; 32]> for FirmwareMeasurement {
+    fn from(value: [u8; 32]) -> Self {
+        Self::Legacy(value)
+    }
+}
+
+impl From<[u8; 48]> for FirmwareMeasurement {
+    fn from(value: [u8; 48]) -> Self {
+        Self::Full(value)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeploymentDescriptor {
     pub schema_version: String,
@@ -110,8 +144,10 @@ pub struct DeploymentDescriptor {
     #[serde(default)]
     pub api_signing_pubkey: String,
 
-    #[serde(with = "hex_bytes32")]
-    pub expected_firmware_measurement: [u8; 32],
+    /// Legacy descriptors contain a 32-byte prefix; v2 contains the complete
+    /// 48-byte SNP launch measurement.
+    #[serde(with = "hex_measurement")]
+    pub expected_firmware_measurement: FirmwareMeasurement,
     pub expected_runtime_class: String,
     pub kbs_resource_path: String,
     pub unlock_mode: String,
@@ -143,6 +179,25 @@ mod hex_bytes32 {
         let s = String::deserialize(d)?;
         let bytes = hex::decode(&s).map_err(D::Error::custom)?;
         bytes.try_into().map_err(|_| D::Error::custom("len != 32"))
+    }
+}
+
+mod hex_measurement {
+    use super::FirmwareMeasurement;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(b: &FirmwareMeasurement, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(b.as_bytes()))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<FirmwareMeasurement, D::Error> {
+        use serde::de::Error;
+        let bytes = hex::decode(String::deserialize(d)?).map_err(D::Error::custom)?;
+        match bytes.len() {
+            32 => Ok(FirmwareMeasurement::Legacy(bytes.try_into().unwrap())),
+            48 => Ok(FirmwareMeasurement::Full(bytes.try_into().unwrap())),
+            len => Err(D::Error::custom(format!("len {len} != 32 or 48"))),
+        }
     }
 }
 
@@ -303,7 +358,7 @@ fn descriptor_records<'a>(
         ("api_signing_pubkey", d.api_signing_pubkey.as_bytes()),
         (
             "expected_firmware_measurement",
-            &d.expected_firmware_measurement,
+            d.expected_firmware_measurement.as_bytes(),
         ),
         (
             "expected_runtime_class",

@@ -6,8 +6,8 @@
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 pub use enclava_common::descriptor::{
-    Capabilities, DeploymentDescriptor, EnvVar, Mount, OciRuntimeSpec, Port, Resources,
-    SecurityContext, Sidecars, SignerIdentity, canonical_oci_spec_bytes,
+    Capabilities, DeploymentDescriptor, EnvVar, FirmwareMeasurement, Mount, OciRuntimeSpec, Port,
+    Resources, SecurityContext, Sidecars, SignerIdentity, canonical_oci_spec_bytes,
     canonical_sidecar_map_bytes, canonical_signer_bytes, descriptor_canonical_bytes,
     descriptor_core_canonical_bytes, descriptor_core_hash,
 };
@@ -290,7 +290,7 @@ pub fn build_descriptor(input: DeploymentDescriptorBuildInput) -> DeploymentDesc
         oci_runtime_spec: input.oci_runtime_spec,
         sidecars: input.sidecars,
         api_signing_pubkey: input.api_signing_pubkey,
-        expected_firmware_measurement: input.expected_firmware_measurement,
+        expected_firmware_measurement: input.expected_firmware_measurement.into(),
         expected_runtime_class: input.expected_runtime_class,
         kbs_resource_path: input.kbs_resource_path,
         unlock_mode: input.unlock_mode,
@@ -374,7 +374,7 @@ mod tests {
                 caddy_digest: "sha256:2222".to_string(),
             },
             api_signing_pubkey: "test-api-signing-pubkey".to_string(),
-            expected_firmware_measurement: [3; 32],
+            expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-abcd1234-demo-tls-owner".to_string(),
             unlock_mode: "password".to_string(),
@@ -403,6 +403,38 @@ mod tests {
         d.expected_kbs_policy_hash = [0xFE; 32];
         let h2 = descriptor_core_hash(&d);
         assert_eq!(h1, h2, "core hash must NOT include expected_*_hash fields");
+    }
+
+    #[test]
+    fn descriptor_measurement_reader_accepts_legacy_and_full_values() {
+        let descriptor = fixed_descriptor();
+        let mut value = serde_json::to_value(&descriptor).unwrap();
+        value["expected_firmware_measurement"] = serde_json::Value::String("03".repeat(32));
+        let legacy: DeploymentDescriptor = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            legacy.expected_firmware_measurement,
+            FirmwareMeasurement::Legacy([3; 32])
+        );
+
+        value["expected_firmware_measurement"] = serde_json::Value::String("03".repeat(48));
+        let full: DeploymentDescriptor = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            full.expected_firmware_measurement,
+            FirmwareMeasurement::Full([3; 48])
+        );
+    }
+
+    #[test]
+    fn descriptor_v2_canonical_bytes_bind_all_measurement_bytes() {
+        let mut original = fixed_descriptor();
+        original.schema_version = "v2".into();
+        original.expected_firmware_measurement = [3; 48].into();
+        let mut changed = original.clone();
+        changed.expected_firmware_measurement = [4; 48].into();
+        assert_ne!(
+            descriptor_canonical_bytes(&original),
+            descriptor_canonical_bytes(&changed)
+        );
     }
 
     #[test]

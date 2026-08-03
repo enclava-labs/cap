@@ -92,7 +92,7 @@ fn descriptor() -> DeploymentDescriptor {
                         .to_string(),
             },
             api_signing_pubkey: "test-api-signing-pubkey".to_string(),
-            expected_firmware_measurement: [3; 32],
+            expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-abcd1234-demo-owner".to_string(),
             unlock_mode: "password".to_string(),
