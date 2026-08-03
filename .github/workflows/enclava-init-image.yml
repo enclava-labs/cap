@@ -1,6 +1,12 @@
 name: Build enclava-init Image
 
 on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: "Optional manual-* candidate tag"
+        required: false
+        type: string
   push:
     branches: ['main']
     tags: ['v*']
@@ -52,11 +58,22 @@ jobs:
             type=ref,event=branch
             type=ref,event=tag
             type=sha,prefix=
+            type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
+
+      - name: Validate manual image tag
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != ''
+        env:
+          VERSION_TAG: ${{ github.event.inputs.version_tag }}
+        run: |
+          if [[ ! "$VERSION_TAG" =~ ^manual-[a-z0-9][a-z0-9_.-]{0,119}$ ]]; then
+            echo "::error::Manual image tags must match ^manual-[a-z0-9][a-z0-9_.-]{0,119}$."
+            exit 1
+          fi
 
       - name: Select build profile
         id: build_profile
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             echo "profile=release" >> "$GITHUB_OUTPUT"
           else
             echo "profile=debug" >> "$GITHUB_OUTPUT"
@@ -67,7 +84,7 @@ jobs:
         with:
           context: .
           file: ./crates/enclava-init/Dockerfile
-          push: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
+          push: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
