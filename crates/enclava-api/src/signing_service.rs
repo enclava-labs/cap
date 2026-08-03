@@ -1020,7 +1020,12 @@ pub fn workload_artifacts_json(
 pub fn trustee_policy_json(
     signed_policy_artifact: &SignedPolicyArtifact,
 ) -> Result<String, SigningServiceError> {
-    Ok(serde_json::to_string(signed_policy_artifact)?)
+    let mut value = serde_json::to_value(signed_policy_artifact)?;
+    value
+        .as_object_mut()
+        .expect("SignedPolicyArtifact serializes as an object")
+        .remove("agent_policy_text");
+    Ok(serde_json::to_string(&value)?)
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1194,7 +1199,7 @@ fn decode_loaded_workload_artifacts(
             descriptor_signing_pubkey,
             org_keyring_fingerprint,
         },
-        trustee_policy_json: serde_json::to_string(&signed_policy_artifact)?,
+        trustee_policy_json: trustee_policy_json(&signed_policy_artifact)?,
         workload_artifacts_json: serde_json::to_string(&artifacts_json)?,
         signed_policy_artifact,
         signing_artifacts,
@@ -1278,13 +1283,15 @@ pub async fn load_workload_artifacts_json(
         "org_keyring_signature": hex::encode(row.org_keyring_signature),
         "signed_policy_artifact": row.signed_policy_artifact,
     });
-    let policy = artifacts
-        .get("signed_policy_artifact")
-        .cloned()
-        .ok_or_else(|| SigningServiceError::Blob("signed_policy_artifact missing".into()))?;
+    let policy: SignedPolicyArtifact = serde_json::from_value(
+        artifacts
+            .get("signed_policy_artifact")
+            .cloned()
+            .ok_or_else(|| SigningServiceError::Blob("signed_policy_artifact missing".into()))?,
+    )?;
     Ok(Some((
         serde_json::to_string(&artifacts)?,
-        serde_json::to_string(&policy)?,
+        trustee_policy_json(&policy)?,
     )))
 }
 

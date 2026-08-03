@@ -17,8 +17,8 @@ const FIELDS: [(&str, usize); 14] = [
     ("tls_leaf_der", 16_384),
     ("proxy_receipt_public_key", 4_096),
     ("amd_endorsements", 131_072),
-    ("cc_init_data_toml", 49_152),
-    ("workload_artifacts_json", 98_304),
+    ("cc_init_data_toml", 196_608),
+    ("workload_artifacts_json", 196_608),
     ("trustee_policy_json", 49_152),
     ("sigstore_material", 196_608),
     ("provenance_oci_material", 311_296),
@@ -190,5 +190,21 @@ mod tests {
             parse_proof_bundle(&ce_v1_bytes(&records)),
             Err(BundleError::UnexpectedField { index: 0, .. })
         ));
+    }
+
+    #[test]
+    fn accepts_realistic_raw_genpolicy_material_within_static_limit() {
+        let bytes = valid_bundle();
+        let decoded = ce_v1_decode(&bytes).unwrap();
+        let cc_init_data = vec![b'a'; 150_000];
+        let workload_artifacts = vec![b'b'; 150_000];
+        let mut records = decoded
+            .iter()
+            .map(|record| (record.label, record.value))
+            .collect::<Vec<_>>();
+        records[9].1 = &cc_init_data;
+        records[10].1 = &workload_artifacts;
+
+        parse_proof_bundle(&ce_v1_bytes(&records)).unwrap();
     }
 }

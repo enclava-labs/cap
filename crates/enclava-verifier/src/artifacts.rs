@@ -92,11 +92,7 @@ pub fn verify_workload_artifacts(
         serde_json::from_slice(workload_json).map_err(|_| ArtifactError::Malformed)?;
     let trustee_value: serde_json::Value =
         serde_json::from_slice(trustee_policy_json).map_err(|_| ArtifactError::Malformed)?;
-    let embedded_value = serde_json::to_value(&artifacts.signed_policy_artifact)
-        .map_err(|_| ArtifactError::Malformed)?;
-    if trustee_value != embedded_value {
-        return Err(ArtifactError::RelationshipMismatch);
-    }
+    verify_compact_trustee_policy(&trustee_value, &artifacts.signed_policy_artifact)?;
 
     let keyring_bytes = canonical_keyring_bytes(&artifacts.org_keyring_payload)?;
     let keyring_sha256 = hex::encode(Sha256::digest(&keyring_bytes));
@@ -156,6 +152,21 @@ pub fn verify_workload_artifacts(
     Ok(VerifiedArtifacts {
         descriptor: artifacts.descriptor_payload,
     })
+}
+
+fn verify_compact_trustee_policy(
+    trustee_value: &serde_json::Value,
+    artifact: &SignedPolicyArtifact,
+) -> Result<(), ArtifactError> {
+    let mut expected = serde_json::to_value(artifact).map_err(|_| ArtifactError::Malformed)?;
+    expected
+        .as_object_mut()
+        .ok_or(ArtifactError::Malformed)?
+        .remove("agent_policy_text");
+    if trustee_value != &expected {
+        return Err(ArtifactError::RelationshipMismatch);
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -310,4 +321,48 @@ fn decode_64(value: &str) -> Result<[u8; 64], ArtifactError> {
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(ArtifactError::Malformed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn artifact() -> SignedPolicyArtifact {
+        SignedPolicyArtifact {
+            metadata: PolicyMetadata {
+                app_id: "app".into(),
+                deploy_id: "deploy".into(),
+                descriptor_core_hash: "00".repeat(32),
+                descriptor_signing_pubkey: "11".repeat(32),
+                platform_release_version: "release".into(),
+                policy_template_id: "template".into(),
+                policy_template_sha256: "22".repeat(32),
+                agent_policy_sha256: "33".repeat(32),
+                genpolicy_version_pin: "genpolicy@1".into(),
+                signed_at: "2026-08-03T00:00:00Z".into(),
+                key_id: "key".into(),
+            },
+            rego_text: "package policy".into(),
+            rego_sha256: "44".repeat(32),
+            agent_policy_text: "large generated policy".into(),
+            agent_policy_sha256: "33".repeat(32),
+            signature: "55".repeat(64),
+            verify_pubkey_b64: "pubkey".into(),
+            org_keyring: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn compact_trustee_policy_must_match_every_retained_field() {
+        let artifact = artifact();
+        let mut compact = serde_json::to_value(&artifact).unwrap();
+        compact.as_object_mut().unwrap().remove("agent_policy_text");
+        verify_compact_trustee_policy(&compact, &artifact).unwrap();
+
+        compact["agent_policy_sha256"] = serde_json::Value::String("66".repeat(32));
+        assert_eq!(
+            verify_compact_trustee_policy(&compact, &artifact),
+            Err(ArtifactError::RelationshipMismatch)
+        );
+    }
 }

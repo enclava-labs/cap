@@ -535,6 +535,21 @@ fn signed_artifact_agent_policy_drives_cc_init_data_hash() {
 }
 
 #[test]
+fn trustee_policy_copy_omits_only_duplicated_agent_policy_text() {
+    let artifacts = signing_artifacts(descriptor());
+    let artifact = signed_policy_artifact(&artifacts, &SigningKey::from_bytes(&[0x33; 32]));
+    let mut expected = serde_json::to_value(&artifact).unwrap();
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("agent_policy_text");
+
+    let actual: serde_json::Value =
+        serde_json::from_str(&super::trustee_policy_json(&artifact).unwrap()).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
 fn rejects_rendered_cc_init_data_hash_mismatch() {
     let artifacts = signing_artifacts(descriptor());
     let err = artifacts

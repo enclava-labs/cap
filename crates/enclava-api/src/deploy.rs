@@ -1987,11 +1987,11 @@ fn build_verification_material(
 ) -> Result<Vec<u8>, DeployError> {
     let cc_init_data = enclava_engine::manifest::cc_init_data::build_toml(app);
     let fields = [
-        ("cc_init_data_toml", cc_init_data.as_bytes(), 49_152),
+        ("cc_init_data_toml", cc_init_data.as_bytes(), 196_608),
         (
             "workload_artifacts_json",
             workload_artifacts_json.as_bytes(),
-            98_304,
+            196_608,
         ),
         (
             "trustee_policy_json",

@@ -162,8 +162,8 @@ Proof bundle v1 limits are part of the wire contract:
 
 - complete bundle: `1,048,576` bytes;
 - static verification-material blob stored in the pod ConfigMap: `716,800` bytes (700 KiB), including CE framing;
-- `cc-init-data.toml`: `49,152` bytes (48 KiB);
-- `workload-artifacts.json`: `98,304` bytes (96 KiB);
+- `cc-init-data.toml`: `196,608` bytes (192 KiB);
+- `workload-artifacts.json`: `196,608` bytes (192 KiB);
 - `trustee-policy.json`: `49,152` bytes (48 KiB);
 - Sigstore/Cosign material: `196,608` bytes (192 KiB);
 - provenance plus required OCI material: `311,296` bytes (304 KiB);

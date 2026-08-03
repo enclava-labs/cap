@@ -25,8 +25,8 @@ exactly once and in this order:
 | `tls_leaf_der` | 16,384 |
 | `proxy_receipt_public_key` | 4,096 |
 | `amd_endorsements` | 131,072 |
-| `cc_init_data_toml` | 49,152 |
-| `workload_artifacts_json` | 98,304 |
+| `cc_init_data_toml` | 196,608 |
+| `workload_artifacts_json` | 196,608 |
 | `trustee_policy_json` | 49,152 |
 | `sigstore_material` | 196,608 |
 | `provenance_oci_material` | 311,296 |
