@@ -57,6 +57,7 @@ hmac = "0.12"
 subtle = "2"
 tower_governor = "0.8"
 sigstore = { version = "0.14", default-features = false, features = ["cosign", "sigstore-trust-root", "rustls-tls", "verify"] }
+oci-client = { version = "0.17", default-features = false, features = ["rustls-tls"] }
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["tokio", "system-config"] }
 zeroize = { version = "1", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs", "tls12"] }

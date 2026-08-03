@@ -1487,6 +1487,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "nostr",
+ "oci-client",
  "rand 0.8.6",
  "reqwest 0.13.2",
  "rustls",

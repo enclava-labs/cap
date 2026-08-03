@@ -382,6 +382,8 @@ pub struct ApplyDeploymentManifestsRequest {
     pub signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
     pub local_workload_artifacts_json: Option<String>,
     pub local_trustee_policy_json: Option<String>,
+    pub sigstore_material: Vec<u8>,
+    pub provenance_oci_material: Vec<u8>,
     pub log_encryption: Option<LogEncryptionConfig>,
 }
 
@@ -1839,6 +1841,8 @@ pub async fn apply_deployment_manifests(
         signed_policy_artifact,
         local_workload_artifacts_json,
         local_trustee_policy_json,
+        sigstore_material,
+        provenance_oci_material,
         log_encryption,
     } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
@@ -1854,11 +1858,12 @@ pub async fn apply_deployment_manifests(
     )?;
     app_spec.workload_artifact_binding = workload_artifact_binding;
     app_spec.log_encryption = log_encryption;
-    if let (Some(workload_artifacts), Some(trustee_policy)) =
-        (local_workload_artifacts_json, local_trustee_policy_json)
-    {
-        app_spec.attestation.local_workload_artifacts_json = Some(workload_artifacts);
-        app_spec.attestation.local_trustee_policy_json = Some(trustee_policy);
+    if let (Some(workload_artifacts), Some(trustee_policy)) = (
+        local_workload_artifacts_json.as_ref(),
+        local_trustee_policy_json.as_ref(),
+    ) {
+        app_spec.attestation.local_workload_artifacts_json = Some(workload_artifacts.clone());
+        app_spec.attestation.local_trustee_policy_json = Some(trustee_policy.clone());
     }
     if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
         let policy_sha256: [u8; 32] = hex::decode(&signed_policy_artifact.agent_policy_sha256)
@@ -1879,6 +1884,14 @@ pub async fn apply_deployment_manifests(
                 .clone(),
         });
     }
+
+    app_spec.attestation.verification_material = Some(build_verification_material(
+        &app_spec,
+        local_workload_artifacts_json.as_deref().unwrap_or_default(),
+        local_trustee_policy_json.as_deref().unwrap_or_default(),
+        &sigstore_material,
+        &provenance_oci_material,
+    )?);
 
     enclava_engine::validate::validate_app(&app_spec)
         .map_err(|e| DeployError::Validation(e.to_string()))?;
@@ -1963,4 +1976,45 @@ pub async fn apply_deployment_manifests(
         app_spec,
         manifest_hash: hash,
     }))
+}
+
+fn build_verification_material(
+    app: &enclava_engine::types::ConfidentialApp,
+    workload_artifacts_json: &str,
+    trustee_policy_json: &str,
+    sigstore_material: &[u8],
+    provenance_oci_material: &[u8],
+) -> Result<Vec<u8>, DeployError> {
+    let cc_init_data = enclava_engine::manifest::cc_init_data::build_toml(app);
+    let fields = [
+        ("cc_init_data_toml", cc_init_data.as_bytes(), 49_152),
+        (
+            "workload_artifacts_json",
+            workload_artifacts_json.as_bytes(),
+            98_304,
+        ),
+        (
+            "trustee_policy_json",
+            trustee_policy_json.as_bytes(),
+            49_152,
+        ),
+        ("sigstore_material", sigstore_material, 196_608),
+        ("provenance_oci_material", provenance_oci_material, 311_296),
+    ];
+    if fields.iter().any(|(_, value, limit)| value.len() > *limit) {
+        return Err(DeployError::Validation(
+            "verification material field exceeds v1 limit".into(),
+        ));
+    }
+    let records = fields
+        .iter()
+        .map(|(label, value, _)| (*label, *value))
+        .collect::<Vec<_>>();
+    let material = enclava_common::canonical::ce_v1_bytes(&records);
+    if material.len() > enclava_engine::manifest::verification_material::MAX_BYTES {
+        return Err(DeployError::Validation(
+            "verification material exceeds 700 KiB".into(),
+        ));
+    }
+    Ok(material)
 }
