@@ -18,8 +18,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
 RUN if [ "${BUILD_PROFILE}" = "release" ]; then \
-      cargo build --release -p enclava-init --bin enclava-init && \
-      cargo build --release -p enclava-init --bin enclava-log-relay && \
+      cargo build --release -p enclava-init --features prod-strict --bin enclava-init && \
+      cargo build --release -p enclava-init --features prod-strict --bin enclava-log-relay && \
       cargo build --release -p enclava-wait-exec --target x86_64-unknown-linux-musl && \
       mkdir -p /out && \
       cp target/release/enclava-init /out/enclava-init && \
