@@ -12,6 +12,7 @@ pub struct TrustPolicy {
     pub target: TargetPolicy,
     pub trusted_org_keyring_sha256: Vec<String>,
     pub trusted_policy_signing_pubkeys: Vec<String>,
+    pub sigstore: SigstorePolicy,
     #[serde(default)]
     pub transport: TransportPolicy,
 }
@@ -47,6 +48,12 @@ pub struct TcbPolicy {
 pub struct TargetPolicy {
     pub origins: Vec<String>,
     pub image_digests: Vec<String>,
+    pub runtime_classes: Vec<String>,
+    pub attestation_proxy_digests: Vec<String>,
+    pub caddy_digests: Vec<String>,
+    pub platform_release_versions: Vec<String>,
+    pub organization_ids: Vec<String>,
+    pub application_ids: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -54,6 +61,20 @@ pub struct TargetPolicy {
 pub struct TransportPolicy {
     #[serde(default)]
     pub require_tls_channel_spki: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigstorePolicy {
+    pub fulcio_roots_der_base64: Vec<String>,
+    pub fulcio_intermediates_der_base64: Vec<String>,
+    pub trusted_fulcio_root_sha256: Vec<String>,
+    pub rekor_spki_der_base64: Vec<String>,
+    pub certificate_identity: String,
+    pub oidc_issuer: String,
+    pub source_repository: String,
+    pub workflow_ref: String,
+    pub provenance_builder_id: String,
 }
 
 impl TrustPolicy {
@@ -75,6 +96,12 @@ impl TrustPolicy {
                 .all(|measurement| decode_48(measurement).is_some())
             && !policy.target.origins.is_empty()
             && !policy.target.image_digests.is_empty()
+            && !policy.target.runtime_classes.is_empty()
+            && !policy.target.attestation_proxy_digests.is_empty()
+            && !policy.target.caddy_digests.is_empty()
+            && !policy.target.platform_release_versions.is_empty()
+            && !policy.target.organization_ids.is_empty()
+            && !policy.target.application_ids.is_empty()
             && !policy.trusted_org_keyring_sha256.is_empty()
             && policy
                 .trusted_org_keyring_sha256
@@ -84,7 +111,16 @@ impl TrustPolicy {
             && policy
                 .trusted_policy_signing_pubkeys
                 .iter()
-                .all(|key| decode_32(key).is_some()))
+                .all(|key| decode_32(key).is_some())
+            && !policy.sigstore.fulcio_roots_der_base64.is_empty()
+            && !policy.sigstore.fulcio_intermediates_der_base64.is_empty()
+            && !policy.sigstore.trusted_fulcio_root_sha256.is_empty()
+            && !policy.sigstore.rekor_spki_der_base64.is_empty()
+            && !policy.sigstore.certificate_identity.is_empty()
+            && !policy.sigstore.oidc_issuer.is_empty()
+            && !policy.sigstore.source_repository.is_empty()
+            && !policy.sigstore.workflow_ref.is_empty()
+            && !policy.sigstore.provenance_builder_id.is_empty())
         .then_some(policy)
     }
 }

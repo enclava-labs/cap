@@ -6,6 +6,7 @@ mod bundle;
 mod evidence;
 mod policy;
 mod result;
+mod sigstore;
 mod snp;
 mod supply_chain;
 
@@ -20,11 +21,13 @@ pub use evidence::{
     AmdEndorsements, EvidenceError, expected_report_data, parse_amd_endorsements,
     report_data_matches, tls_leaf_spki_sha256,
 };
+pub use policy::SigstorePolicy;
 pub use result::{
     AppraisalResult, CheckOutcome, CheckResult, Verdict, canonical_result_bytes,
     canonical_result_sha256,
 };
 use sha2::{Digest, Sha256};
+pub use sigstore::{SigstoreError, verify_sigstore_and_provenance};
 pub use snp::{SNP_REPORT_BYTES, SnpReport, SnpReportError, parse_snp_report};
 pub use supply_chain::{SupplyChainError, verify_portable_material};
 
@@ -323,6 +326,53 @@ fn verify_evidence(
                     .any(|digest| digest == &artifacts.descriptor.image_digest),
                 "IMAGE_DIGEST_REJECTED",
             ));
+            let descriptor = &artifacts.descriptor;
+            checks.push(simple_check(
+                "platform.runtime_class",
+                policy
+                    .target
+                    .runtime_classes
+                    .iter()
+                    .any(|value| value == &descriptor.expected_runtime_class),
+                "RUNTIME_CLASS_REJECTED",
+            ));
+            checks.push(simple_check(
+                "platform.sidecars",
+                policy
+                    .target
+                    .attestation_proxy_digests
+                    .iter()
+                    .any(|value| value == &descriptor.sidecars.attestation_proxy_digest)
+                    && policy
+                        .target
+                        .caddy_digests
+                        .iter()
+                        .any(|value| value == &descriptor.sidecars.caddy_digest),
+                "SIDECAR_DIGEST_REJECTED",
+            ));
+            checks.push(simple_check(
+                "platform.release",
+                policy
+                    .target
+                    .platform_release_versions
+                    .iter()
+                    .any(|value| value == &descriptor.platform_release_version),
+                "PLATFORM_RELEASE_REJECTED",
+            ));
+            checks.push(simple_check(
+                "deployment.identity",
+                policy
+                    .target
+                    .organization_ids
+                    .iter()
+                    .any(|value| value == &descriptor.org_id.to_string())
+                    && policy
+                        .target
+                        .application_ids
+                        .iter()
+                        .any(|value| value == &descriptor.app_id.to_string()),
+                "DEPLOYMENT_IDENTITY_REJECTED",
+            ));
             checks.push(simple_check(
                 "supply_chain.portable_integrity",
                 verify_portable_material(
@@ -333,12 +383,16 @@ fn verify_evidence(
                 .is_ok(),
                 "PORTABLE_SUPPLY_CHAIN_MATERIAL_INVALID",
             ));
-            // Fail closed until Fulcio/Rekor and provenance signature appraisal
-            // is completed by the next verifier gate.
             checks.push(simple_check(
                 "supply_chain.signatures",
-                false,
-                "SUPPLY_CHAIN_SIGNATURE_VERIFICATION_INCOMPLETE",
+                verify_sigstore_and_provenance(
+                    bundle.sigstore_material,
+                    bundle.provenance_oci_material,
+                    &artifacts.descriptor.image_digest,
+                    &policy.sigstore,
+                )
+                .is_ok(),
+                "SUPPLY_CHAIN_SIGNATURE_INVALID",
             ));
         }
         Err(error) => {

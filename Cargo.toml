@@ -4,9 +4,11 @@ members = [
     "crates/enclava-common",
     "crates/enclava-engine",
     "crates/enclava-api",
+    "crates/enclava-appraiser",
     "crates/enclava-cli",
     "crates/enclava-init",
     "crates/enclava-verifier",
+    "crates/enclava-verifier-wasm",
     "crates/enclava-wait-exec",
 ]
 

@@ -1,0 +1,542 @@
+use base64::Engine as _;
+use enclava_common::canonical::ce_v1_decode;
+use p256::{
+    ecdsa::{Signature as P256Signature, VerifyingKey as P256Key, signature::Verifier},
+    pkcs8::DecodePublicKey as _,
+};
+use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384Key};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use x509_cert::{
+    Certificate,
+    der::{Decode, Encode},
+    ext::pkix::{SubjectAltName, name::GeneralName},
+};
+
+use crate::policy::SigstorePolicy;
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SigstoreError {
+    #[error("Sigstore material is malformed")]
+    Malformed,
+    #[error("Fulcio certificate chain is invalid or untrusted")]
+    InvalidFulcioChain,
+    #[error("Sigstore certificate identity is rejected")]
+    IdentityRejected,
+    #[error("DSSE signature or subject is invalid")]
+    InvalidSignature,
+    #[error("Rekor transparency evidence is invalid")]
+    InvalidTransparency,
+    #[error("Rekor inclusion promise is invalid")]
+    InvalidInclusionPromise,
+    #[error("Rekor inclusion proof is invalid")]
+    InvalidInclusionProof,
+    #[error("Rekor checkpoint is invalid")]
+    InvalidCheckpoint,
+    #[error("build provenance is invalid or rejected")]
+    InvalidProvenance,
+}
+
+pub fn verify_sigstore_and_provenance(
+    sigstore_material: &[u8],
+    provenance_material: &[u8],
+    expected_image_digest: &str,
+    policy: &SigstorePolicy,
+) -> Result<(), SigstoreError> {
+    let signature_blob = portable_blob(sigstore_material, "signature_blob")?;
+    let bundle: Value =
+        serde_json::from_slice(signature_blob).map_err(|_| SigstoreError::Malformed)?;
+    let certificate_der = decode_b64(pointer_str(
+        &bundle,
+        "/verificationMaterial/certificate/rawBytes",
+    )?)?;
+    let dsse = bundle.get("dsseEnvelope").ok_or(SigstoreError::Malformed)?;
+    let payload_b64 = pointer_str(dsse, "/payload")?;
+    let payload_type = pointer_str(dsse, "/payloadType")?;
+    let signature_b64 = pointer_str(dsse, "/signatures/0/sig")?;
+    let payload = decode_b64(payload_b64)?;
+    let signature = decode_b64(signature_b64)?;
+
+    let entries = bundle
+        .pointer("/verificationMaterial/tlogEntries")
+        .and_then(Value::as_array)
+        .filter(|entries| !entries.is_empty())
+        .ok_or(SigstoreError::Malformed)?;
+    let integrated_time = entries
+        .iter()
+        .filter_map(|entry| {
+            pointer_str(entry, "/integratedTime")
+                .ok()?
+                .parse::<u64>()
+                .ok()
+        })
+        .min()
+        .ok_or(SigstoreError::Malformed)?;
+    let certificate = verify_fulcio_chain(&certificate_der, integrated_time, policy)?;
+    verify_identity(&certificate, policy)?;
+    let pae = dsse_pae(payload_type, &payload);
+    verify_p256_spki(
+        &certificate
+            .tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .map_err(|_| SigstoreError::Malformed)?,
+        &pae,
+        &signature,
+    )
+    .map_err(|_| SigstoreError::InvalidSignature)?;
+    let statement: Value =
+        serde_json::from_slice(&payload).map_err(|_| SigstoreError::Malformed)?;
+    if !statement_has_subject(&statement, expected_image_digest) {
+        return Err(SigstoreError::InvalidSignature);
+    }
+    let mut transparency_error = SigstoreError::InvalidTransparency;
+    let mut transparency_valid = false;
+    for entry in entries {
+        match verify_tlog_entry(entry, &payload, signature_b64, &certificate_der, policy) {
+            Ok(()) => {
+                transparency_valid = true;
+                break;
+            }
+            Err(error) => transparency_error = error,
+        }
+    }
+    if !transparency_valid {
+        return Err(transparency_error);
+    }
+    verify_provenance(provenance_material, expected_image_digest, policy)
+}
+
+fn portable_blob<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u8], SigstoreError> {
+    let records = ce_v1_decode(bytes).map_err(|_| SigstoreError::Malformed)?;
+    let mut matches = records.iter().filter(|record| record.label == label);
+    let value = matches.next().ok_or(SigstoreError::Malformed)?.value;
+    matches
+        .next()
+        .is_none()
+        .then_some(value)
+        .ok_or(SigstoreError::Malformed)
+}
+
+fn verify_fulcio_chain(
+    leaf_der: &[u8],
+    at: u64,
+    policy: &SigstorePolicy,
+) -> Result<Certificate, SigstoreError> {
+    let leaf = Certificate::from_der(leaf_der).map_err(|_| SigstoreError::Malformed)?;
+    if !valid_at(&leaf, at) {
+        return Err(SigstoreError::InvalidFulcioChain);
+    }
+    for intermediate_b64 in &policy.fulcio_intermediates_der_base64 {
+        let intermediate_der = decode_b64(intermediate_b64)?;
+        let intermediate =
+            Certificate::from_der(&intermediate_der).map_err(|_| SigstoreError::Malformed)?;
+        if !valid_at(&intermediate, at)
+            || verify_certificate_signature(&leaf, &intermediate).is_err()
+        {
+            continue;
+        }
+        for root_b64 in &policy.fulcio_roots_der_base64 {
+            let root_der = decode_b64(root_b64)?;
+            if !policy.trusted_fulcio_root_sha256.iter().any(|trusted| {
+                hex::decode(trusted).ok().as_deref() == Some(Sha256::digest(&root_der).as_slice())
+            }) {
+                continue;
+            }
+            let root = Certificate::from_der(&root_der).map_err(|_| SigstoreError::Malformed)?;
+            if valid_at(&root, at) && verify_certificate_signature(&intermediate, &root).is_ok() {
+                return Ok(leaf);
+            }
+        }
+    }
+    Err(SigstoreError::InvalidFulcioChain)
+}
+
+fn verify_certificate_signature(certificate: &Certificate, issuer: &Certificate) -> Result<(), ()> {
+    if certificate.signature_algorithm != certificate.tbs_certificate.signature
+        || certificate.tbs_certificate.issuer != issuer.tbs_certificate.subject
+    {
+        return Err(());
+    }
+    let signed = certificate.tbs_certificate.to_der().map_err(|_| ())?;
+    let signature = certificate.signature.as_bytes().ok_or(())?;
+    let spki = issuer
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|_| ())?;
+    match certificate.signature_algorithm.oid.to_string().as_str() {
+        "1.2.840.10045.4.3.2" => verify_p256_spki(&spki, &signed, signature),
+        "1.2.840.10045.4.3.3" => {
+            let key = P384Key::from_public_key_der(&spki).map_err(|_| ())?;
+            let signature = P384Signature::from_der(signature).map_err(|_| ())?;
+            key.verify(&signed, &signature).map_err(|_| ())
+        }
+        _ => Err(()),
+    }
+}
+
+fn verify_p256_spki(spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), ()> {
+    let key = P256Key::from_public_key_der(spki).map_err(|_| ())?;
+    let signature = P256Signature::from_der(signature).map_err(|_| ())?;
+    key.verify(message, &signature).map_err(|_| ())
+}
+
+fn valid_at(certificate: &Certificate, at: u64) -> bool {
+    let validity = &certificate.tbs_certificate.validity;
+    validity.not_before.to_unix_duration().as_secs() <= at
+        && at <= validity.not_after.to_unix_duration().as_secs()
+}
+
+fn verify_identity(
+    certificate: &Certificate,
+    policy: &SigstorePolicy,
+) -> Result<(), SigstoreError> {
+    let extensions = certificate
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .ok_or(SigstoreError::IdentityRejected)?;
+    let san = extensions
+        .iter()
+        .find(|extension| extension.extn_id.to_string() == "2.5.29.17")
+        .and_then(|extension| SubjectAltName::from_der(extension.extn_value.as_bytes()).ok())
+        .ok_or(SigstoreError::IdentityRejected)?;
+    let identity_matches = san.0.iter().any(|name| {
+        matches!(name, GeneralName::UniformResourceIdentifier(uri) if uri.as_str() == policy.certificate_identity)
+    });
+    let issuer_matches = extensions
+        .iter()
+        .find(|extension| extension.extn_id.to_string() == "1.3.6.1.4.1.57264.1.1")
+        .and_then(|extension| der_string(extension.extn_value.as_bytes()))
+        .as_deref()
+        == Some(policy.oidc_issuer.as_str());
+    (identity_matches && issuer_matches)
+        .then_some(())
+        .ok_or(SigstoreError::IdentityRejected)
+}
+
+fn der_string(bytes: &[u8]) -> Option<String> {
+    if bytes.iter().all(|byte| matches!(byte, 0x20..=0x7e)) {
+        return String::from_utf8(bytes.to_vec()).ok();
+    }
+    if !matches!(bytes.first(), Some(0x0c | 0x16)) {
+        return None;
+    }
+    let (length, offset) = match *bytes.get(1)? {
+        length @ 0..=127 => (usize::from(length), 2),
+        0x81 => (usize::from(*bytes.get(2)?), 3),
+        0x82 => (
+            usize::from(u16::from_be_bytes([*bytes.get(2)?, *bytes.get(3)?])),
+            4,
+        ),
+        _ => return None,
+    };
+    let value = bytes.get(offset..offset + length)?;
+    (offset + length == bytes.len())
+        .then(|| String::from_utf8(value.to_vec()).ok())
+        .flatten()
+}
+
+fn verify_tlog_entry(
+    entry: &Value,
+    payload: &[u8],
+    signature_b64: &str,
+    certificate_der: &[u8],
+    policy: &SigstorePolicy,
+) -> Result<(), SigstoreError> {
+    let Ok(body) = pointer_str(entry, "/canonicalizedBody").and_then(decode_b64) else {
+        return Err(SigstoreError::InvalidTransparency);
+    };
+    let Ok(body_json) = serde_json::from_slice::<Value>(&body) else {
+        return Err(SigstoreError::InvalidTransparency);
+    };
+    if pointer_str(&body_json, "/spec/payloadHash/value").ok()
+        != Some(hex::encode(Sha256::digest(payload)).as_str())
+        || pointer_str(&body_json, "/spec/signatures/0/signature").ok() != Some(signature_b64)
+        || !pem_matches(
+            pointer_str(&body_json, "/spec/signatures/0/verifier").unwrap_or_default(),
+            certificate_der,
+        )
+    {
+        return Err(SigstoreError::InvalidTransparency);
+    }
+    let Ok(set) = pointer_str(entry, "/inclusionPromise/signedEntryTimestamp").and_then(decode_b64)
+    else {
+        return Err(SigstoreError::InvalidInclusionPromise);
+    };
+    let rekor_keys = policy
+        .rekor_spki_der_base64
+        .iter()
+        .filter_map(|key| decode_b64(key).ok())
+        .collect::<Vec<_>>();
+    let set_payload = serde_json::json!({
+        "body": base64::engine::general_purpose::STANDARD.encode(&body),
+        "integratedTime": pointer_str(entry, "/integratedTime").ok().and_then(|value| value.parse::<i64>().ok()),
+        "logID": pointer_str(entry, "/logId/keyId").ok().and_then(|value| decode_b64(value).ok()).map(hex::encode),
+        "logIndex": pointer_str(entry, "/logIndex").ok().and_then(|value| value.parse::<i64>().ok()),
+    });
+    if set_payload
+        .as_object()
+        .is_some_and(|payload| payload.values().any(Value::is_null))
+    {
+        return Err(SigstoreError::InvalidInclusionPromise);
+    }
+    let set_payload =
+        serde_json::to_vec(&set_payload).map_err(|_| SigstoreError::InvalidInclusionPromise)?;
+    if !rekor_keys
+        .iter()
+        .any(|key| verify_p256_spki(key, &set_payload, &set).is_ok())
+    {
+        return Err(SigstoreError::InvalidInclusionPromise);
+    }
+    let Some(proof) = entry.pointer("/inclusionProof") else {
+        return Err(SigstoreError::InvalidInclusionProof);
+    };
+    if !verify_inclusion_proof(proof, &body) {
+        return Err(SigstoreError::InvalidInclusionProof);
+    }
+    verify_checkpoint(
+        pointer_str(proof, "/checkpoint/envelope").unwrap_or_default(),
+        proof,
+        &rekor_keys,
+    )
+    .then_some(())
+    .ok_or(SigstoreError::InvalidCheckpoint)
+}
+
+fn verify_inclusion_proof(proof: &Value, body: &[u8]) -> bool {
+    let Ok(index) = pointer_str(proof, "/logIndex")
+        .and_then(|value| value.parse::<u64>().map_err(|_| SigstoreError::Malformed))
+    else {
+        return false;
+    };
+    let Ok(tree_size) = pointer_str(proof, "/treeSize")
+        .and_then(|value| value.parse::<u64>().map_err(|_| SigstoreError::Malformed))
+    else {
+        return false;
+    };
+    if tree_size == 0 || index >= tree_size {
+        return false;
+    }
+    let Ok(expected) = pointer_str(proof, "/rootHash").and_then(decode_b64) else {
+        return false;
+    };
+    let Some(hashes) = proof.get("hashes").and_then(Value::as_array) else {
+        return false;
+    };
+    let mut hash: [u8; 32] = Sha256::new()
+        .chain_update([0])
+        .chain_update(body)
+        .finalize()
+        .into();
+    let inner = u64::BITS as usize - (index ^ (tree_size - 1)).leading_zeros() as usize;
+    let border = (index >> inner).count_ones() as usize;
+    if hashes.len() != inner + border {
+        return false;
+    }
+    for (level, sibling) in hashes.iter().enumerate() {
+        let Some(encoded) = sibling.as_str() else {
+            return false;
+        };
+        let Ok(sibling) = decode_b64(encoded) else {
+            return false;
+        };
+        if sibling.len() != 32 {
+            return false;
+        }
+        hash = if level >= inner || ((index >> level) & 1) == 1 {
+            Sha256::new()
+                .chain_update([1])
+                .chain_update(&sibling)
+                .chain_update(hash)
+                .finalize()
+                .into()
+        } else {
+            Sha256::new()
+                .chain_update([1])
+                .chain_update(hash)
+                .chain_update(&sibling)
+                .finalize()
+                .into()
+        };
+    }
+    expected.as_slice() == hash
+}
+
+fn verify_checkpoint(envelope: &str, proof: &Value, rekor_keys: &[Vec<u8>]) -> bool {
+    let Some((signed, signature_line)) = envelope.rsplit_once("\n— ") else {
+        return false;
+    };
+    let signed = signed.to_owned();
+    let mut parts = signature_line.split_whitespace();
+    let _name = parts.next();
+    let Some(encoded) = parts.next() else {
+        return false;
+    };
+    let Ok(signature) = decode_b64(encoded) else {
+        return false;
+    };
+    if signature.len() <= 4 {
+        return false;
+    }
+    let lines = signed.lines().collect::<Vec<_>>();
+    if lines.len() < 3
+        || lines[1] != pointer_str(proof, "/treeSize").unwrap_or_default()
+        || decode_b64(lines[2]).ok().as_deref()
+            != pointer_str(proof, "/rootHash")
+                .ok()
+                .and_then(|value| decode_b64(value).ok())
+                .as_deref()
+    {
+        return false;
+    }
+    rekor_keys
+        .iter()
+        .any(|key| verify_p256_spki(key, signed.as_bytes(), &signature[4..]).is_ok())
+}
+
+fn pem_matches(pem: &str, certificate_der: &[u8]) -> bool {
+    let decoded;
+    let pem = if pem.contains("-----BEGIN CERTIFICATE-----") {
+        pem
+    } else {
+        decoded = decode_b64(pem)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_default();
+        &decoded
+    };
+    let encoded = pem
+        .split("-----BEGIN CERTIFICATE-----")
+        .nth(1)
+        .and_then(|value| value.split("-----END CERTIFICATE-----").next())
+        .map(|value| value.split_whitespace().collect::<String>());
+    encoded.and_then(|value| decode_b64(&value).ok()).as_deref() == Some(certificate_der)
+}
+
+fn verify_provenance(
+    material: &[u8],
+    expected_image_digest: &str,
+    policy: &SigstorePolicy,
+) -> Result<(), SigstoreError> {
+    let records = ce_v1_decode(material).map_err(|_| SigstoreError::Malformed)?;
+    let source = records
+        .iter()
+        .find(|record| record.label == "image_manifest")
+        .ok_or(SigstoreError::Malformed)?;
+    let source: Value =
+        serde_json::from_slice(source.value).map_err(|_| SigstoreError::Malformed)?;
+    let referenced = source
+        .get("manifests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|descriptor| {
+            descriptor
+                .pointer("/annotations/vnd.docker.reference.type")
+                .and_then(Value::as_str)
+                != Some("attestation-manifest")
+        })
+        .filter_map(|descriptor| descriptor.get("digest").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let blob = portable_blob(material, "provenance_blob")?;
+    let provenance: Value = serde_json::from_slice(blob).map_err(|_| SigstoreError::Malformed)?;
+    let subject_matches = provenance
+        .get("subject")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|subject| {
+            subject
+                .pointer("/digest/sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|digest| {
+                    referenced
+                        .iter()
+                        .any(|reference| reference.strip_prefix("sha256:") == Some(digest))
+                })
+        });
+    let image_bound = source.get("schemaVersion").is_some()
+        && format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(
+                records
+                    .iter()
+                    .find(|record| record.label == "image_manifest")
+                    .unwrap()
+                    .value
+            ))
+        ) == expected_image_digest;
+    let repository = provenance
+        .pointer("/predicate/buildDefinition/internalParameters/github_repository")
+        .and_then(Value::as_str);
+    let workflow = provenance
+        .pointer("/predicate/buildDefinition/internalParameters/github_workflow_ref")
+        .and_then(Value::as_str);
+    let builder = provenance
+        .pointer("/predicate/runDetails/builder/id")
+        .and_then(Value::as_str);
+    if image_bound
+        && subject_matches
+        && repository == Some(policy.source_repository.as_str())
+        && workflow == Some(policy.workflow_ref.as_str())
+        && builder == Some(policy.provenance_builder_id.as_str())
+    {
+        Ok(())
+    } else {
+        Err(SigstoreError::InvalidProvenance)
+    }
+}
+
+fn statement_has_subject(statement: &Value, digest: &str) -> bool {
+    let expected = digest.strip_prefix("sha256:").unwrap_or(digest);
+    statement
+        .get("subject")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|subject| subject.pointer("/digest/sha256").and_then(Value::as_str) == Some(expected))
+}
+
+fn dsse_pae(payload_type: &str, payload: &[u8]) -> Vec<u8> {
+    format!(
+        "DSSEv1 {} {payload_type} {} ",
+        payload_type.len(),
+        payload.len()
+    )
+    .into_bytes()
+    .into_iter()
+    .chain(payload.iter().copied())
+    .collect()
+}
+
+fn pointer_str<'a>(value: &'a Value, pointer: &str) -> Result<&'a str, SigstoreError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .ok_or(SigstoreError::Malformed)
+}
+
+fn decode_b64(value: &str) -> Result<Vec<u8>, SigstoreError> {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| SigstoreError::Malformed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pae_is_unambiguous() {
+        assert_eq!(dsse_pae("x", b"abc"), b"DSSEv1 1 x 3 abc");
+        assert_ne!(dsse_pae("xa", b"bc"), dsse_pae("x", b"abc"));
+    }
+
+    #[test]
+    fn der_string_rejects_trailing_bytes() {
+        assert_eq!(der_string(b"\x0c\x03abc"), Some("abc".into()));
+        assert_eq!(der_string(b"\x0c\x03abc!"), None);
+    }
+}

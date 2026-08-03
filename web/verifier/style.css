@@ -1,0 +1,14 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+body { margin: 0; }
+main { width: min(52rem, calc(100% - 2rem)); margin: 3rem auto; }
+form { display: grid; gap: 1rem; padding: 1.25rem; border: 1px solid currentColor; border-radius: .5rem; }
+label { display: grid; gap: .35rem; }
+input, button { font: inherit; padding: .65rem; }
+button { cursor: pointer; }
+.warning { border-left: .35rem solid #d68b00; padding: .75rem; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: .6rem; border-bottom: 1px solid #8888; text-align: left; }
+[data-verdict="PASS"] { color: #16803a; }
+[data-verdict="FAIL"] { color: #c32b2b; }
+[data-verdict="INCONCLUSIVE"] { color: #a76a00; }

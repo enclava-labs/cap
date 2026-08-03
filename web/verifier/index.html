@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Enclava Independent Verifier</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>Independent confidential-workload verification</h1>
+    <p>This local page fetches evidence from the target and evaluates a policy file you selected. It does not call Enclava or another appraiser.</p>
+    <form id="verify-form">
+      <label>Target HTTPS origin <input id="target" type="url" required placeholder="https://app.example"></label>
+      <label>Independent policy file <input id="policy" type="file" accept="application/json,.json" required></label>
+      <button type="submit">Verify</button>
+    </form>
+    <p id="status" role="status" aria-live="polite"></p>
+    <section id="result" hidden>
+      <h2 id="verdict"></h2>
+      <p id="channel-warning" class="warning" hidden>Evidence valid; live TLS channel binding was not checked. Use the CAP CLI for that stronger check.</p>
+      <button id="download" type="button">Download exact proof bundle</button>
+      <h3>Checks</h3>
+      <div class="table-wrap"><table><thead><tr><th>Check</th><th>Outcome</th><th>Reason</th></tr></thead><tbody id="checks"></tbody></table></div>
+    </section>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

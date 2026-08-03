@@ -1508,6 +1508,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "enclava-appraiser"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "enclava-common",
+ "enclava-verifier",
+ "hex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "enclava-cli"
 version = "0.1.0"
 dependencies = [
@@ -1633,6 +1649,7 @@ dependencies = [
  "enclava-common",
  "hex",
  "num-bigint",
+ "p256",
  "p384",
  "pkcs1",
  "serde",
@@ -1642,6 +1659,17 @@ dependencies = [
  "url",
  "uuid",
  "x509-cert",
+]
+
+[[package]]
+name = "enclava-verifier-wasm"
+version = "0.1.0"
+dependencies = [
+ "enclava-verifier",
+ "hex",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]
