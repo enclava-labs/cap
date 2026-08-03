@@ -1,14 +1,18 @@
 //! Deterministic, I/O-free verification primitives shared by native and WASM adapters.
 
+mod amd;
 mod bundle;
 mod result;
+mod snp;
 
+pub use amd::{AmdVerificationError, verify_amd_certificate_chain, verify_snp_signature};
 pub use bundle::{BundleError, PROOF_BUNDLE_MEDIA_TYPE, ProofBundle, parse_proof_bundle};
 pub use result::{
     AppraisalResult, CheckOutcome, CheckResult, Verdict, canonical_result_bytes,
     canonical_result_sha256,
 };
 use sha2::{Digest, Sha256};
+pub use snp::{SNP_REPORT_BYTES, SnpReport, SnpReportError, parse_snp_report};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerificationContext {

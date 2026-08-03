@@ -1625,13 +1625,18 @@ dependencies = [
 name = "enclava-verifier"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "enclava-common",
  "hex",
+ "num-bigint",
+ "p384",
+ "pkcs1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "url",
+ "x509-cert",
 ]
 
 [[package]]

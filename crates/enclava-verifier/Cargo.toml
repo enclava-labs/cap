@@ -6,8 +6,15 @@ edition.workspace = true
 [dependencies]
 enclava-common = { path = "../enclava-common", default-features = false }
 hex = { workspace = true }
+p384 = { workspace = true }
+num-bigint = { workspace = true }
+pkcs1 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
+x509-cert = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
