@@ -222,6 +222,7 @@ fn attestation_config() -> AttestationConfig {
             local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
+            verification_material: None,
         }
 }
 

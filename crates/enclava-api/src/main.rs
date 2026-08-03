@@ -471,6 +471,7 @@ fn load_attestation_config(
         local_trustee_policy_json: None,
         platform_trustee_policy_pubkey_hex,
         signing_service_pubkey_hex,
+        verification_material: None,
     }
     .into())
 }

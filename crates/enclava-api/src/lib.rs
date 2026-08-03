@@ -755,6 +755,7 @@ pub(crate) mod test_support {
                 local_trustee_policy_json: None,
                 platform_trustee_policy_pubkey_hex: Some("11".repeat(32)),
                 signing_service_pubkey_hex: Some("11".repeat(32)),
+                verification_material: None,
             }),
             platform_release_envelope: None,
             dns: None,

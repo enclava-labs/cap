@@ -247,6 +247,9 @@ pub struct AttestationConfig {
     /// hex encoded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signing_service_pubkey_hex: Option<String>,
+    /// Bounded CE-v1 evidence mounted only into attestation-proxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_material: Option<Vec<u8>>,
 }
 
 pub fn default_acme_ca_url() -> String {

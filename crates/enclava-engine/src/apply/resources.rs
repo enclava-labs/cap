@@ -59,6 +59,9 @@ pub async fn apply_standard_resources(
     apply_namespaced_resource(engine, ns, &manifests.startup_configmap, generation).await?;
     apply_namespaced_resource(engine, ns, &manifests.ingress_configmap, generation).await?;
     apply_namespaced_resource(engine, ns, &manifests.enclava_init_configmap, generation).await?;
+    if let Some(configmap) = &manifests.verification_material_configmap {
+        apply_namespaced_resource(engine, ns, configmap, generation).await?;
+    }
 
     tracing::info!(namespace = %ns, "all standard resources applied");
     Ok(())

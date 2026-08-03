@@ -202,6 +202,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
             local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
+            verification_material: None,
         }),
         platform_release_envelope: None,
         dns: None,

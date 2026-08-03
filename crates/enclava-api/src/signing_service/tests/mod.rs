@@ -625,6 +625,7 @@ fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> Confide
             local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: Some("bb".repeat(32)),
             signing_service_pubkey_hex: Some("bb".repeat(32)),
+            verification_material: None,
         },
         egress_mode: enclava_engine::types::EgressMode::Restricted,
         public_internet_egress_excluded_cidrs: Vec::new(),

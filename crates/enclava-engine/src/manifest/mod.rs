@@ -18,6 +18,7 @@ pub mod service;
 pub mod service_account;
 pub mod startup;
 pub mod statefulset;
+pub mod verification_material;
 pub mod volumes;
 
 use k8s_openapi::api::apps::v1::StatefulSet;
@@ -45,6 +46,7 @@ pub struct GeneratedManifests {
     pub startup_configmap: ConfigMap,
     pub ingress_configmap: ConfigMap,
     pub enclava_init_configmap: ConfigMap,
+    pub verification_material_configmap: Option<ConfigMap>,
     pub statefulset: StatefulSet,
     /// KBS owner_resource_bindings entry: (key, value) for the policy Rego.
     pub kbs_owner_binding: (String, Value),
@@ -70,6 +72,7 @@ pub fn generate_all_manifests(app: &ConfidentialApp) -> GeneratedManifests {
         startup_configmap: startup::generate_startup_configmap(app),
         ingress_configmap: ingress::generate_ingress_configmap(app),
         enclava_init_configmap: enclava_init_config::generate_enclava_init_configmap(app),
+        verification_material_configmap: verification_material::generate(app),
         statefulset: statefulset::generate_statefulset(app),
         kbs_owner_binding: kbs_policy::generate_owner_binding_entry(app),
     }
