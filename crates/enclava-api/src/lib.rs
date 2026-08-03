@@ -184,6 +184,10 @@ fn internal_routes() -> Router<AppState> {
             axum::routing::get(routes::internal::get_paas_app_logs),
         )
         .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/proof-bundle",
+            axum::routing::get(routes::internal::get_paas_proof_bundle),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}/members",
             axum::routing::get(routes::internal::list_paas_members),
         )
