@@ -92,6 +92,7 @@ fn descriptor() -> DeploymentDescriptor {
                         .to_string(),
             },
             api_signing_pubkey: "test-api-signing-pubkey".to_string(),
+            independent_verification: true,
             expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-abcd1234-demo-owner".to_string(),
@@ -284,6 +285,26 @@ fn rejects_descriptor_for_different_api_signing_key() {
         .unwrap_err();
 
     assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "api_signing_pubkey"));
+}
+
+#[test]
+fn rejects_descriptor_without_independent_verification_contract() {
+    let mut descriptor = descriptor();
+    descriptor.independent_verification = false;
+    let artifacts = signing_artifacts(descriptor.clone());
+    let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+    let err = artifacts
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(err, SigningServiceError::Mismatch(field) if field == "independent_verification")
+    );
 }
 
 #[test]

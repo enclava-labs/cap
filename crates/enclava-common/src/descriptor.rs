@@ -143,6 +143,8 @@ pub struct DeploymentDescriptor {
     pub sidecars: Sidecars,
     #[serde(default)]
     pub api_signing_pubkey: String,
+    #[serde(default)]
+    pub independent_verification: bool,
 
     /// Legacy descriptors contain a 32-byte prefix; v2 contains the complete
     /// 48-byte SNP launch measurement.
@@ -373,6 +375,9 @@ fn descriptor_records<'a>(
             d.platform_release_version.as_bytes(),
         ),
     ];
+    if d.independent_verification {
+        r.push(("independent_verification", b"true"));
+    }
     if include_chain_anchors {
         r.push(("expected_agent_policy_hash", &d.expected_agent_policy_hash));
         r.push(("expected_cc_init_data_hash", &d.expected_cc_init_data_hash));

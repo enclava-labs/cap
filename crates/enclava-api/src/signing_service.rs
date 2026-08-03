@@ -356,6 +356,11 @@ impl DeploymentSigningArtifacts {
         if self.descriptor.api_signing_pubkey != api_signing_pubkey {
             return Err(SigningServiceError::Mismatch("api_signing_pubkey".into()));
         }
+        if !self.descriptor.independent_verification {
+            return Err(SigningServiceError::Mismatch(
+                "independent_verification".into(),
+            ));
+        }
         if self.descriptor.unlock_mode != app_unlock_mode(app.unlock_mode) {
             return Err(SigningServiceError::Mismatch("unlock_mode".into()));
         }

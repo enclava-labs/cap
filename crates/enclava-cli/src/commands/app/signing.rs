@@ -643,6 +643,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             caddy_digest: caddy_image.digest().to_string(),
         },
         api_signing_pubkey,
+        independent_verification: true,
         expected_firmware_measurement: release.expected_firmware_measurement_bytes()?,
         expected_runtime_class: release.expected_runtime_class.clone(),
         kbs_resource_path: format!(

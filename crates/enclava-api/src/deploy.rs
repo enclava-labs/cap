@@ -1435,6 +1435,7 @@ mod tests {
                     .to_string(),
             },
             api_signing_pubkey: "test-api-signing-pubkey".to_string(),
+            independent_verification: true,
             expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-demo-org-customer-app-owner".to_string(),

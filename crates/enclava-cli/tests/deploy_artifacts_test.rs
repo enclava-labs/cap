@@ -323,6 +323,7 @@ fn deploy_descriptor_and_keyring_envelopes_serialize_for_deploy_request() {
                 .to_string(),
         },
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
+        independent_verification: true,
         expected_firmware_measurement: [2; 32],
         expected_runtime_class: "kata-qemu-snp".to_string(),
         kbs_resource_path: "default/cap-acme-demo-owner".to_string(),

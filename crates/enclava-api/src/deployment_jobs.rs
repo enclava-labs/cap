@@ -3176,6 +3176,7 @@ mod tests {
                 caddy_digest: format!("sha256:{}", "22".repeat(32)),
             },
             api_signing_pubkey: payload.api_signing_pubkey.clone(),
+            independent_verification: true,
             expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: format!("default/{}-owner", payload.app.namespace),

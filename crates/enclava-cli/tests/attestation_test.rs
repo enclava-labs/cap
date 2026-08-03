@@ -56,6 +56,7 @@ fn fixed_descriptor() -> DeploymentDescriptor {
             caddy_digest: "sha256:2222".to_string(),
         },
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
+        independent_verification: false,
         expected_firmware_measurement: [3; 32].into(),
         expected_runtime_class: "kata-qemu-snp".to_string(),
         kbs_resource_path: "default/cap-abcd1234-demo-tls-owner".to_string(),
