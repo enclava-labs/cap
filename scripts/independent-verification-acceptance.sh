@@ -71,4 +71,45 @@ if ! grep -Eq '<pre id="result">PASS [0-9a-f]{64}</pre>' "$tmp/dom.html"; then
   cat "$tmp/dom.html" >&2
   exit 1
 fi
+
+if [[ "${ADVERSARIAL:-0}" == "1" ]]; then
+  curl -fsS "$origin/" >"$tmp/tenant.html"
+  grep -Fq 'Tenant claim: approved image and measurement. This green page is untrusted.' "$tmp/tenant.html"
+  curl -fsS "$origin/api/fake-appraiser" >"$tmp/fake-appraiser.json"
+  python3 - "$tmp/fake-appraiser.json" <<'PY'
+import base64, json, sys
+response = json.load(open(sys.argv[1], encoding="utf-8"))
+receipt = response.get("receipt", {})
+if response.get("verdict") != "PASS" or not receipt.get("key_id"):
+    raise SystemExit("dishonest appraiser did not return its PASS opinion")
+if len(base64.b64decode(receipt.get("public_key_base64", ""), validate=True)) != 32:
+    raise SystemExit("dishonest appraiser receipt public key is malformed")
+if len(base64.b64decode(receipt.get("signature_base64", ""), validate=True)) != 64:
+    raise SystemExit("dishonest appraiser receipt signature is malformed")
+if not isinstance(receipt.get("appraised_at"), int) or not isinstance(receipt.get("expires_at"), int):
+    raise SystemExit("dishonest appraiser receipt times are malformed")
+PY
+  shadow_status="$(curl -sS -o "$tmp/shadow.json" -w '%{http_code}' "$origin/.well-known/confidential/proof-bundle")"
+  [[ "$shadow_status" == "400" ]] && ! grep -Fq 'untrusted-tenant' "$tmp/shadow.json"
+  if "$enclava_bin" verify "$origin" --policy "$tmp/rejected-policy.json" --json >"$tmp/online-rejected.json" 2>/dev/null; then
+    echo "dishonest tenant and appraiser unexpectedly changed the local CLI verdict" >&2
+    exit 1
+  fi
+  python3 - "$tmp/online-rejected.json" <<'PY'
+import json, sys
+result = json.load(open(sys.argv[1], encoding="utf-8"))
+if result["verdict"] != "FAIL" or not any(
+    check["reason_code"] == "SNP_MEASUREMENT_REJECTED" for check in result["checks"]
+):
+    raise SystemExit("live CLI collusion check did not reject the measurement")
+PY
+  timeout 45 "$chrome" --headless --no-sandbox --disable-gpu --disable-background-networking \
+    --disable-component-update --disable-domain-reliability --no-first-run --disable-sync --virtual-time-budget=30000 \
+    --user-data-dir="$tmp/chrome-rejected" --dump-dom \
+    "$url&reject=measurement&expected=FAIL&reason=SNP_MEASUREMENT_REJECTED" >"$tmp/rejected-dom.html"
+  if ! grep -Eq '<pre id="result">PASS [0-9a-f]{64}</pre>' "$tmp/rejected-dom.html"; then
+    cat "$tmp/rejected-dom.html" >&2
+    exit 1
+  fi
+fi
 echo "independent verification acceptance: PASS"
