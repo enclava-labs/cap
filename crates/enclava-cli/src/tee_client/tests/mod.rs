@@ -1,4 +1,6 @@
-use super::{TeeClient, accepts_invalid_tee_certs, normalize_unlock_mode};
+use super::{
+    TeeClient, TeeError, accepts_invalid_tee_certs, is_tee_tcp_connect_error, normalize_unlock_mode,
+};
 use sev::parser::ByteParser;
 use std::net::IpAddr;
 use std::sync::{Mutex, OnceLock};
@@ -50,6 +52,16 @@ fn paas_provided_edge_resolve_ip_is_preserved() {
 
     assert_eq!(tee.resolve_ip, Some(resolve_ip));
     assert_eq!(ownership.resolve_ip, Some(resolve_ip));
+}
+
+#[test]
+fn private_resolve_ip_fallback_is_limited_to_tcp_connect_errors() {
+    assert!(is_tee_tcp_connect_error(&TeeError::Attestation(
+        "TEE TCP connect timed out".to_string()
+    )));
+    assert!(!is_tee_tcp_connect_error(&TeeError::Attestation(
+        "TEE TLS handshake failed: invalid certificate".to_string()
+    )));
 }
 
 #[test]

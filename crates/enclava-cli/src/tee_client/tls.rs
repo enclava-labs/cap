@@ -147,6 +147,7 @@ pub(super) async fn fetch_tls_leaf_spki_der(
     host: &str,
     port: u16,
     resolve_ip: Option<IpAddr>,
+    timeout: std::time::Duration,
 ) -> Result<Vec<u8>, TeeError> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let algorithms = provider.signature_verification_algorithms;
@@ -157,11 +158,16 @@ pub(super) async fn fetch_tls_leaf_spki_der(
         .with_custom_certificate_verifier(Arc::new(NoVerifier { algorithms }))
         .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(tls));
-    let stream = match resolve_ip {
-        Some(ip) => TcpStream::connect(SocketAddr::new(ip, port)).await,
-        None => TcpStream::connect((host, port)).await,
-    }
-    .map_err(|err| TeeError::Attestation(format!("TEE TCP connect failed: {err}")))?;
+    let connect = async {
+        match resolve_ip {
+            Some(ip) => TcpStream::connect(SocketAddr::new(ip, port)).await,
+            None => TcpStream::connect((host, port)).await,
+        }
+    };
+    let stream = tokio::time::timeout(timeout.min(std::time::Duration::from_secs(10)), connect)
+        .await
+        .map_err(|_| TeeError::Attestation("TEE TCP connect timed out".to_string()))?
+        .map_err(|err| TeeError::Attestation(format!("TEE TCP connect failed: {err}")))?;
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|_| TeeError::Attestation("TEE host is not a valid DNS name".to_string()))?;
     let tls_stream = connector
