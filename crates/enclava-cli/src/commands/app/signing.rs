@@ -164,7 +164,6 @@ pub(crate) async fn ensure_manual_deploy_keyring(
             verify_keyring(&envelope, &owner_key.public)?;
             store_trusted_owner(&org_id, &owner_key.public)?;
             store_keyring_envelope(&org_id, &envelope)?;
-            Ok((org_id, org_name, owner_key))
         }
         Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {
             if !active.is_personal {
@@ -179,23 +178,24 @@ pub(crate) async fn ensure_manual_deploy_keyring(
             store_trusted_owner(&org_id, &owner_key.public)?;
             store_keyring_envelope(&org_id, &envelope)?;
             upload_keyring(api, &org_name, &envelope).await?;
-            match api
-                .bootstrap_signing_service_owner(
-                    &org_name,
-                    &BootstrapSigningServiceRequest {
-                        owner_pubkey_hex: hex::encode(owner_key.public.to_bytes()),
-                    },
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
-                Err(err) => return Err(err.into()),
-            }
-            Ok((org_id, org_name, owner_key))
         }
-        Err(err) => Err(err.into()),
+        Err(err) => return Err(err.into()),
     }
+
+    match api
+        .bootstrap_signing_service_owner(
+            &org_name,
+            &BootstrapSigningServiceRequest {
+                owner_pubkey_hex: hex::encode(owner_key.public.to_bytes()),
+            },
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok((org_id, org_name, owner_key))
 }
 
 fn render_trustee_policy(
