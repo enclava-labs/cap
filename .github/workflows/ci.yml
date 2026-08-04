@@ -187,5 +187,14 @@ jobs:
       - name: Run checked-in browser fixture
         run: |
           python3 -m http.server 8000 >/tmp/enclava-verifier-http.log 2>&1 &
-          google-chrome --headless --no-sandbox --disable-gpu --virtual-time-budget=5000 \
-            --dump-dom http://127.0.0.1:8000/web/verifier/test.html | grep -E '<pre id="result">PASS [0-9a-f]{64}</pre>'
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/web/verifier/test.html >/dev/null && break
+            sleep 1
+          done
+          google-chrome --headless --no-sandbox --disable-gpu --virtual-time-budget=30000 \
+            --dump-dom http://127.0.0.1:8000/web/verifier/test.html > /tmp/enclava-verifier-dom.html
+          if ! grep -E '<pre id="result">PASS [0-9a-f]{64}</pre>' /tmp/enclava-verifier-dom.html; then
+            cat /tmp/enclava-verifier-dom.html
+            cat /tmp/enclava-verifier-http.log
+            exit 1
+          fi
