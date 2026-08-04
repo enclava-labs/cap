@@ -794,7 +794,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env_vars.push(env("ENCLAVA_INIT_UNLOCK_SOCKET", UNLOCK_SOCKET_PATH));
         env_vars.push(env(
             "PROOF_TLS_CERT_PATH",
-            "/run/enclava/public-tls/tenant-ingress/certificates/tls.crt",
+            "/run/enclava/public-tls/certificates/tls.crt",
         ));
     }
     if let Some(cert) = cc_init_data::trustee_kbs_ca_cert_pem() {
