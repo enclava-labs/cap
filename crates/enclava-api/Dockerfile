@@ -13,6 +13,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
+RUN find crates -type f -exec touch {} +
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
@@ -53,6 +55,8 @@ RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+
+RUN find crates -type f -exec touch {} +
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \

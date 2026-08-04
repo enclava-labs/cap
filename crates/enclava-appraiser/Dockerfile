@@ -4,6 +4,7 @@ RUN apk add --no-cache musl-dev
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+RUN find crates -type f -exec touch {} +
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release --bin enclava-appraiser && \
