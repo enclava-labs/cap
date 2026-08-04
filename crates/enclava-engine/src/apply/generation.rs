@@ -12,12 +12,16 @@ use kube::{
     api::{DeleteParams, Patch, PatchParams, PostParams, Preconditions},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 use super::engine::{ApplyEngine, ApplyError};
 
 pub const MUTATION_GENERATION_ANNOTATION: &str = "enclava.dev/cap-provider-mutation-generation";
 const MAX_CONFLICT_RETRIES: usize = 12;
+
+fn conflict_retry_delay(attempt: usize) -> Duration {
+    Duration::from_millis(25 * (1 << attempt.min(3)))
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MutationGeneration(i64);
@@ -174,7 +178,7 @@ where
         field_manager: Some(engine.config().field_manager.clone()),
         ..PostParams::default()
     };
-    for _ in 0..MAX_CONFLICT_RETRIES {
+    for attempt in 0..MAX_CONFLICT_RETRIES {
         let current = match api.get(name).await {
             Ok(current) => Some(current),
             Err(kube::Error::Api(error)) if error.code == 404 => None,
@@ -208,7 +212,10 @@ where
                     verify_applied_generation(&applied, generation)?;
                     return Ok(applied);
                 }
-                Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => continue,
+                Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
+                    tokio::time::sleep(conflict_retry_delay(attempt)).await;
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         } else {
@@ -221,7 +228,10 @@ where
                     verify_applied_generation(&applied, generation)?;
                     return Ok(applied);
                 }
-                Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => continue,
+                Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
+                    tokio::time::sleep(conflict_retry_delay(attempt)).await;
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -375,6 +385,13 @@ mod tests {
     const RESOURCE_PATH: &str = "/api/v1/namespaces/fence-test/configmaps/fenced";
     const COLLECTION_PATH: &str = "/api/v1/namespaces/fence-test/configmaps";
     const STATEFULSET_PATH: &str = "/apis/apps/v1/namespaces/fence-test/statefulsets/fenced";
+
+    #[test]
+    fn conflict_retry_backoff_is_bounded() {
+        assert_eq!(conflict_retry_delay(0), Duration::from_millis(25));
+        assert_eq!(conflict_retry_delay(3), Duration::from_millis(200));
+        assert_eq!(conflict_retry_delay(100), Duration::from_millis(200));
+    }
 
     #[derive(Default)]
     struct Pause {
