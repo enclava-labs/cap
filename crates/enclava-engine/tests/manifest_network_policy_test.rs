@@ -88,6 +88,40 @@ fn cap_api_namespace_requires_an_explicit_internal_service_url() {
 }
 
 #[test]
+fn operator_named_cap_service_gets_relay_and_tee_rules() {
+    let mut app = sample_app();
+    app.attestation.tls_certificate_broker_url = Some(
+        "http://cap-api-standalone-iv.enclava-dev.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
+            .to_string(),
+    );
+
+    let policy = generate_network_policy(&app);
+    assert_eq!(
+        cap_api_namespace_for_attestation(&app.attestation, &app.api_url),
+        Some("enclava-dev")
+    );
+    assert!(
+        policy["spec"]["egress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| {
+                rule["toServices"][0]["k8sService"]["serviceName"].as_str() == Some("amd-kds-relay")
+            })
+    );
+    assert!(
+        policy["spec"]["ingress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| {
+                rule["fromEndpoints"][0]["matchLabels"]["app.kubernetes.io/name"].as_str()
+                    == Some("cap-api-standalone-iv")
+            })
+    );
+}
+
+#[test]
 fn network_policy_ingress_allows_platform_edge_host_path_on_public_ports() {
     let app = sample_app();
     let val = generate_network_policy(&app);

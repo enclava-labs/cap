@@ -262,19 +262,17 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
             ],
             "toPorts": [{ "ports": [{ "port": authority.port.to_string(), "protocol": "TCP" }] }],
         })];
-        if service_name == "cap-api" {
-            rules.push(json!({
-                "toEndpoints": [
-                    {
-                        "matchLabels": {
-                            "io.kubernetes.pod.namespace": namespace,
-                            "app.kubernetes.io/name": service_name
-                        }
+        rules.push(json!({
+            "toEndpoints": [
+                {
+                    "matchLabels": {
+                        "io.kubernetes.pod.namespace": namespace,
+                        "app.kubernetes.io/name": service_name
                     }
-                ],
-                "toPorts": [{ "ports": [{ "port": "3000", "protocol": "TCP" }] }],
-            }));
-        }
+                }
+            ],
+            "toPorts": [{ "ports": [{ "port": "3000", "protocol": "TCP" }] }],
+        }));
         return rules;
     }
 
@@ -285,13 +283,14 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
 }
 
 fn cap_api_tee_ingress_rule(app: &ConfidentialApp) -> Option<Value> {
-    let namespace = cap_api_namespace_for_attestation(&app.attestation, &app.api_url)?;
+    let (service_name, namespace) =
+        cap_api_service_for_attestation(&app.attestation, &app.api_url)?;
     Some(json!({
         "fromEndpoints": [
             {
                 "matchLabels": {
                     "io.kubernetes.pod.namespace": namespace,
-                    "app.kubernetes.io/name": "cap-api"
+                    "app.kubernetes.io/name": service_name
                 }
             }
         ],
@@ -307,25 +306,30 @@ fn cap_api_tee_ingress_rule(app: &ConfidentialApp) -> Option<Value> {
 }
 
 /// Return the CAP namespace only when workload configuration explicitly uses
-/// the internal `cap-api` Service. Tenant policy generation and CAP status
-/// observation share this predicate so the direct TEE path is selected only
-/// when its ingress rule is present.
+/// an internal CAP Service. Tenant policy generation and CAP status observation
+/// share this predicate so the direct TEE path is selected only when its
+/// ingress rule is present.
 pub fn cap_api_namespace_for_attestation<'a>(
     attestation: &'a AttestationConfig,
     api_url: &'a str,
 ) -> Option<&'a str> {
+    cap_api_service_for_attestation(attestation, api_url).map(|(_, namespace)| namespace)
+}
+
+fn cap_api_service_for_attestation<'a>(
+    attestation: &'a AttestationConfig,
+    api_url: &'a str,
+) -> Option<(&'a str, &'a str)> {
     [
         attestation.tls_certificate_broker_url.as_deref(),
         attestation.workload_artifacts_url.as_deref(),
-        attestation.trustee_policy_url.as_deref(),
         Some(api_url),
     ]
     .into_iter()
     .flatten()
     .find_map(|url| {
         let authority = parse_url_authority(url)?;
-        let (service_name, namespace) = kubernetes_service_name(authority.host)?;
-        (service_name == "cap-api").then_some(namespace)
+        kubernetes_service_name(authority.host)
     })
 }
 
