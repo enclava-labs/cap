@@ -6,11 +6,19 @@ local assets and fetches the target's reserved proof endpoint directly. Do not r
 `file://`, whose module and fetch behavior differs between browsers.
 
 Tagged GitHub releases publish the deterministic archive, its hashes, bundled schemas/version, and
-a keyless Sigstore signature bundle. Verify it with:
+an independently signed example policy. Verify either artifact with:
 
 ```sh
 cosign verify-blob --bundle enclava-verifier-web.tar.gz.sigstore.json \
   --certificate-identity-regexp '^https://github.com/enclava-labs/cap/.github/workflows/release.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   enclava-verifier-web.tar.gz
+
+cosign verify-blob --bundle example-policy.json.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/enclava-labs/cap/.github/workflows/release.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  example-policy.json
 ```
+
+The example policy is illustrative and pins one recorded Prove-It fixture. Select and authenticate
+a policy for the deployment you intend to verify; never accept one supplied by the target.

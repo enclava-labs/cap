@@ -105,6 +105,7 @@ jobs:
           path: |
             web/verifier/release/enclava-verifier-web.tar.gz
             web/verifier/release/SHA256SUMS
+            web/verifier/release/example-policy.json
 
   release:
     name: Create GitHub release
@@ -129,15 +130,19 @@ jobs:
       - uses: sigstore/cosign-installer@v3.9.2
 
       - name: Sign independently pinnable web verifier
-        run: >-
-          cosign sign-blob --yes
-          --bundle artifacts/enclava-verifier-web/enclava-verifier-web.tar.gz.sigstore.json
-          artifacts/enclava-verifier-web/enclava-verifier-web.tar.gz
+        run: |
+          cosign sign-blob --yes \
+            --bundle artifacts/enclava-verifier-web/enclava-verifier-web.tar.gz.sigstore.json \
+            artifacts/enclava-verifier-web/enclava-verifier-web.tar.gz
+          cosign sign-blob --yes \
+            --bundle artifacts/enclava-verifier-web/example-policy.json.sigstore.json \
+            artifacts/enclava-verifier-web/example-policy.json
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/*/*.tar.gz
+            artifacts/enclava-verifier-web/example-policy.json
             artifacts/enclava-verifier-web/*.sigstore.json
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
