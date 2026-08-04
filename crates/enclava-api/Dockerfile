@@ -13,11 +13,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-RUN find crates -type f -exec touch {} +
-
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
     cargo build --bin enclava-api --bin cap-migrate && \
     cp /build/target/debug/enclava-api /usr/local/bin/enclava-api && \
     cp /build/target/debug/cap-migrate /usr/local/bin/cap-migrate
@@ -56,11 +53,8 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-RUN find crates -type f -exec touch {} +
-
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
     cargo build --release --bin enclava-api --bin cap-migrate && \
     cp /build/target/release/enclava-api /usr/local/bin/enclava-api && \
     cp /build/target/release/cap-migrate /usr/local/bin/cap-migrate && \
