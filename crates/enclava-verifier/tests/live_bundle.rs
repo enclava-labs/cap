@@ -1,6 +1,8 @@
 use base64::Engine as _;
 use enclava_common::canonical::ce_v1_decode;
-use enclava_verifier::{CheckOutcome, Verdict, VerificationContext, verify};
+use enclava_verifier::{
+    CheckOutcome, Verdict, VerificationContext, canonical_result_sha256, verify,
+};
 
 fn fixture() -> (Vec<u8>, Vec<u8>) {
     let encoded = include_str!("fixtures/prove-it-live.bundle.b64")
@@ -102,14 +104,34 @@ fn rejected_policy(field: &str, value: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&policy).unwrap()
 }
 
+fn rejected_measurement_policy() -> Vec<u8> {
+    let (_, policy) = fixture();
+    let parsed: serde_json::Value = serde_json::from_slice(&policy).unwrap();
+    let measurement = parsed["amd"]["allowed_measurements"][0].as_str().unwrap();
+    String::from_utf8(policy)
+        .unwrap()
+        .replacen(measurement, &"00".repeat(48), 1)
+        .into_bytes()
+}
+
 #[test]
 fn independently_selected_policy_and_channel_context_fail_closed() {
     let (bundle, _) = fixture();
+    let rejected_measurement = rejected_measurement_policy();
+    let rejected = verify(&bundle, &rejected_measurement, context());
+    assert_eq!(rejected.verdict, Verdict::Fail);
+    assert!(
+        rejected
+            .checks
+            .iter()
+            .any(|check| check.reason_code == "SNP_MEASUREMENT_REJECTED")
+    );
+    assert_eq!(
+        hex::encode(canonical_result_sha256(&rejected)),
+        "63f02a375ad811f5c520d294720f49ee14a951ae01b34bd616101db6e5fe331b"
+    );
+
     for policy in [
-        rejected_policy(
-            "/amd/allowed_measurements",
-            serde_json::json!(["00".repeat(48)]),
-        ),
         rejected_policy(
             "/target/image_digests",
             serde_json::json!([format!("sha256:{}", "00".repeat(32))]),
