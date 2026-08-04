@@ -11,6 +11,29 @@ struct ContextInput {
 
 #[wasm_bindgen]
 pub fn verify_bundle(bundle: &[u8], policy: &[u8], context_json: &str) -> Result<String, JsError> {
+    Ok(serde_json::to_string(&verify_input(
+        bundle,
+        policy,
+        context_json,
+    )?)?)
+}
+
+#[wasm_bindgen]
+pub fn verify_bundle_sha256(
+    bundle: &[u8],
+    policy: &[u8],
+    context_json: &str,
+) -> Result<String, JsError> {
+    Ok(hex::encode(enclava_verifier::canonical_result_sha256(
+        &verify_input(bundle, policy, context_json)?,
+    )))
+}
+
+fn verify_input(
+    bundle: &[u8],
+    policy: &[u8],
+    context_json: &str,
+) -> Result<enclava_verifier::AppraisalResult, JsError> {
     let context: ContextInput = serde_json::from_str(context_json)?;
     let challenge_nonce = decode_32(&context.challenge_nonce, "challenge_nonce")
         .map_err(|error| JsError::new(&error))?;
@@ -20,7 +43,7 @@ pub fn verify_bundle(bundle: &[u8], policy: &[u8], context_json: &str) -> Result
         .map(|value| decode_32(value, "observed_channel_spki_sha256"))
         .transpose()
         .map_err(|error| JsError::new(&error))?;
-    let result = enclava_verifier::verify(
+    Ok(enclava_verifier::verify(
         bundle,
         policy,
         enclava_verifier::VerificationContext {
@@ -29,8 +52,7 @@ pub fn verify_bundle(bundle: &[u8], policy: &[u8], context_json: &str) -> Result
             now_unix_seconds: context.now_unix_seconds,
             observed_channel_spki_sha256,
         },
-    );
-    Ok(serde_json::to_string(&result)?)
+    ))
 }
 
 fn decode_32(value: &str, name: &str) -> Result<[u8; 32], String> {

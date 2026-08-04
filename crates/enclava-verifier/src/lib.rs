@@ -12,7 +12,8 @@ mod snp;
 mod supply_chain;
 
 pub use amd::{
-    AmdVerificationError, verify_amd_certificate_chain, verify_amd_revocation, verify_snp_signature,
+    AmdVerificationError, verify_amd_certificate_chain, verify_amd_revocation,
+    verify_snp_signature, verify_vcek_report_binding,
 };
 pub use artifacts::{ArtifactError, VerifiedArtifacts, verify_workload_artifacts};
 pub use bundle::{
@@ -214,6 +215,11 @@ fn verify_evidence(
             "amd.report_signature",
             verify_snp_signature(report, endorsements.vcek_der).is_ok(),
             "SNP_REPORT_SIGNATURE_INVALID",
+        ));
+        checks.push(simple_check(
+            "amd.vcek_binding",
+            verify_vcek_report_binding(report, endorsements.vcek_der).is_ok(),
+            "VCEK_REPORT_BINDING_INVALID",
         ));
         let revocation = verify_amd_revocation(
             endorsements.ark_der,
@@ -503,5 +509,23 @@ mod tests {
         assert!(result.checks.iter().any(|check| {
             check.id == "binding.challenge_nonce" && check.reason_code == "NONCE_MISMATCH"
         }));
+    }
+
+    #[test]
+    fn malformed_fixture_has_stable_cross_runtime_hash() {
+        let result = verify(
+            &[],
+            &[],
+            VerificationContext {
+                challenge_nonce: [0; 32],
+                expected_target_origin: "https://fixture.example".into(),
+                now_unix_seconds: 1_700_000_000,
+                observed_channel_spki_sha256: None,
+            },
+        );
+        assert_eq!(
+            hex::encode(canonical_result_sha256(&result)),
+            "540e8973f6c70712f986c9bba3ece9e05b92f4765551020618ae08584b1d88f3"
+        );
     }
 }

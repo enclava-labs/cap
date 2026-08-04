@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Verifier fixture harness</title>
+<pre id="result">RUNNING</pre>
+<script type="module">
+  import init, { verify_bundle, verify_bundle_sha256 } from './pkg/enclava_verifier_wasm.js';
+  const context = JSON.stringify({
+    challenge_nonce: '01'.repeat(32),
+    expected_target_origin: 'https://prove-it-independent-dev.e72a13df.dev.enclava.work',
+    now_unix_seconds: 1785844800,
+    observed_channel_spki_sha256: null
+  });
+  try {
+    await init();
+    const encoded = (await (await fetch('../../crates/enclava-verifier/tests/fixtures/prove-it-live.bundle.b64')).text())
+      .replaceAll(/\s/g, '');
+    const bundle = Uint8Array.from(atob(encoded), byte => byte.charCodeAt(0));
+    const policy = new Uint8Array(await (await fetch('../../crates/enclava-verifier/tests/fixtures/prove-it-live.policy.json')).arrayBuffer());
+    const result = JSON.parse(verify_bundle(bundle, policy, context));
+    const hash = verify_bundle_sha256(bundle, policy, context);
+    const rejectedPolicy = JSON.parse(new TextDecoder().decode(policy));
+    rejectedPolicy.amd.allowed_measurements = ['00'.repeat(48)];
+    const rejected = JSON.parse(verify_bundle(bundle, new TextEncoder().encode(JSON.stringify(rejectedPolicy)), context));
+    document.querySelector('#result').textContent =
+      result.verdict === 'PASS' && rejected.verdict === 'FAIL' &&
+      rejected.checks.some(check => check.reason_code === 'SNP_MEASUREMENT_REJECTED') &&
+      hash === 'a4cd78a56031360e6a17bd7aa4433f92cca9a5011ab3d7cfc1c09d08aa8a1b18'
+        ? `PASS ${hash}` : `FAIL ${result.verdict} ${hash}`;
+  } catch (error) {
+    document.querySelector('#result').textContent = `ERROR ${error}`;
+  }
+</script>

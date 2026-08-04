@@ -75,6 +75,17 @@ jobs:
       - name: Run doctests
         run: cargo test --doc
 
+      - name: Run appraiser API conformance
+        run: |
+          ENCLAVA_APPRAISER_BIND=127.0.0.1:18080 cargo run -q -p enclava-appraiser >/tmp/enclava-appraiser.log 2>&1 &
+          appraiser_pid=$!
+          trap 'kill "$appraiser_pid"' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break
+            sleep 1
+          done
+          python3 scripts/appraiser-conformance.py http://127.0.0.1:18080
+
   dependency-gates:
     name: Audit Rust dependencies
     runs-on: ubuntu-latest
@@ -155,3 +166,26 @@ jobs:
             echo "enclava-init prod-strict unexpectedly accepted luks-integration"
             exit 1
           fi
+
+  browser-verifier:
+    name: Test verifier in headless browser
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install matching wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.118 --locked
+
+      - name: Build web verifier
+        run: ./web/verifier/build.sh
+
+      - name: Run checked-in browser fixture
+        run: |
+          python3 -m http.server 8000 >/tmp/enclava-verifier-http.log 2>&1 &
+          google-chrome --headless --no-sandbox --disable-gpu --virtual-time-budget=5000 \
+            --dump-dom http://127.0.0.1:8000/web/verifier/test.html | grep -E '<pre id="result">PASS [0-9a-f]{64}</pre>'

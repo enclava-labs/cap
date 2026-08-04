@@ -33,7 +33,13 @@ must independently pin the key ID and key with validity/revocation intervals. Du
 publish both keys independently for a bounded overlap; never authorize a replacement from a
 response alone.
 
-Run `cargo test -p enclava-appraiser` as the local conformance check.
+Run `python3 scripts/appraiser-conformance.py https://appraiser.example` against any deployed
+implementation. The command checks the public media types, no-store behavior, request context,
+fail-closed behavior, stable reason code, and canonical result hash. Repeat it against Enclava's
+deployment and a separately deployed instance. Use `--header 'Authorization:Bearer ...'` only when
+the independently operated endpoint intentionally requires authentication.
+
+Run `cargo test -p enclava-appraiser` for the reference implementation's local unit checks.
 
 Consumers verify responses with `enclava_verifier::verify_appraisal_response` and the independently
 supplied `appraiser` policy section. It enforces the exact result hash, signature, validity windows,

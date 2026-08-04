@@ -28,6 +28,8 @@ pub enum AmdVerificationError {
     UntrustedArk,
     #[error("SNP report signature is invalid")]
     InvalidReportSignature,
+    #[error("AMD VCEK does not match the SNP report chip ID and TCB")]
+    VcekReportMismatch,
     #[error("AMD certificate is outside its validity interval")]
     CertificateTimeInvalid,
     #[error("AMD revocation list is invalid")]
@@ -84,6 +86,27 @@ pub fn verify_amd_revocation(
     {
         return Err(AmdVerificationError::InvalidRevocationList);
     }
+    verify_revocation_times(&crl, now_unix_seconds, maximum_age_seconds)?;
+    if crl
+        .tbs_cert_list
+        .revoked_certificates
+        .as_ref()
+        .is_some_and(|revoked| {
+            revoked
+                .iter()
+                .any(|entry| entry.serial_number == vcek.tbs_certificate.serial_number)
+        })
+    {
+        return Err(AmdVerificationError::Revoked);
+    }
+    Ok(())
+}
+
+fn verify_revocation_times(
+    crl: &CertificateList,
+    now_unix_seconds: u64,
+    maximum_age_seconds: u64,
+) -> Result<(), AmdVerificationError> {
     let this_update = crl.tbs_cert_list.this_update.to_unix_duration().as_secs();
     let next_update = crl
         .tbs_cert_list
@@ -98,18 +121,6 @@ pub fn verify_amd_revocation(
         || now_unix_seconds.saturating_sub(this_update) > maximum_age_seconds
     {
         return Err(AmdVerificationError::RevocationDataStale);
-    }
-    if crl
-        .tbs_cert_list
-        .revoked_certificates
-        .as_ref()
-        .is_some_and(|revoked| {
-            revoked
-                .iter()
-                .any(|entry| entry.serial_number == vcek.tbs_certificate.serial_number)
-        })
-    {
-        return Err(AmdVerificationError::Revoked);
     }
     Ok(())
 }
@@ -169,6 +180,47 @@ pub fn verify_snp_signature(
     verifying_key(&vcek)?
         .verify(report.signed_bytes, &signature)
         .map_err(|_| AmdVerificationError::InvalidReportSignature)
+}
+
+pub fn verify_vcek_report_binding(
+    report: &SnpReport<'_>,
+    vcek_der: &[u8],
+) -> Result<(), AmdVerificationError> {
+    let vcek =
+        Certificate::from_der(vcek_der).map_err(|_| AmdVerificationError::InvalidCertificate)?;
+    let extensions = vcek
+        .tbs_certificate
+        .extensions
+        .as_ref()
+        .ok_or(AmdVerificationError::VcekReportMismatch)?;
+    let extension = |oid: &str| {
+        extensions
+            .iter()
+            .find(|extension| extension.extn_id.to_string() == oid)
+            .map(|extension| extension.extn_value.as_bytes())
+            .ok_or(AmdVerificationError::VcekReportMismatch)
+    };
+    let reported_tcb = report.reported_tcb.to_le_bytes();
+    let matches = der_u8(extension("1.3.6.1.4.1.3704.1.3.1")?) == Some(reported_tcb[0])
+        && der_u8(extension("1.3.6.1.4.1.3704.1.3.2")?) == Some(reported_tcb[1])
+        && der_u8(extension("1.3.6.1.4.1.3704.1.3.3")?) == Some(reported_tcb[6])
+        && der_u8(extension("1.3.6.1.4.1.3704.1.3.8")?) == Some(reported_tcb[7])
+        && bytes_64(extension("1.3.6.1.4.1.3704.1.4")?) == Some(report.chip_id);
+    matches
+        .then_some(())
+        .ok_or(AmdVerificationError::VcekReportMismatch)
+}
+
+fn der_u8(value: &[u8]) -> Option<u8> {
+    match value {
+        [0x02, 0x01, byte] if *byte < 0x80 => Some(*byte),
+        [0x02, 0x02, 0, byte] if *byte >= 0x80 => Some(*byte),
+        _ => None,
+    }
+}
+
+fn bytes_64(value: &[u8]) -> Option<[u8; 64]> {
+    value.try_into().ok()
 }
 
 fn verify_certificate_signature(
@@ -306,6 +358,7 @@ mod tests {
             "ark" => include_str!("../tests/fixtures/genoa-ark.der.b64"),
             "ask" => include_str!("../tests/fixtures/genoa-ask.der.b64"),
             "vcek" => include_str!("../tests/fixtures/genoa-vcek.der.b64"),
+            "crl" => include_str!("../tests/fixtures/genoa-crl.der.b64"),
             _ => unreachable!(),
         };
         base64::engine::general_purpose::STANDARD
@@ -321,7 +374,9 @@ mod tests {
         let vcek = fixture("vcek");
         let ark_sha256: [u8; 32] = Sha256::digest(&ark).into();
         verify_amd_certificate_chain(&ark, &ask, &vcek, &ark_sha256).unwrap();
-        verify_snp_signature(&parse_snp_report(&report_bytes).unwrap(), &vcek).unwrap();
+        let report = parse_snp_report(&report_bytes).unwrap();
+        verify_snp_signature(&report, &vcek).unwrap();
+        verify_vcek_report_binding(&report, &vcek).unwrap();
     }
 
     #[test]
@@ -340,6 +395,71 @@ mod tests {
         assert_eq!(
             verify_snp_signature(&parse_snp_report(&mutated).unwrap(), &vcek),
             Err(AmdVerificationError::InvalidReportSignature)
+        );
+    }
+
+    #[test]
+    fn rejects_vcek_for_a_different_chip_or_tcb() {
+        let mut report_bytes = fixture("report");
+        let vcek = fixture("vcek");
+        report_bytes[0x1a0] ^= 1;
+        assert_eq!(
+            verify_vcek_report_binding(&parse_snp_report(&report_bytes).unwrap(), &vcek),
+            Err(AmdVerificationError::VcekReportMismatch)
+        );
+
+        let mut report_bytes = fixture("report");
+        report_bytes[0x180] ^= 1;
+        assert_eq!(
+            verify_vcek_report_binding(&parse_snp_report(&report_bytes).unwrap(), &vcek),
+            Err(AmdVerificationError::VcekReportMismatch)
+        );
+    }
+
+    #[test]
+    fn enforces_fresh_stale_expired_missing_and_revoked_crl_states() {
+        let ark = fixture("ark");
+        let ask = fixture("ask");
+        let vcek = fixture("vcek");
+        let crl = fixture("crl");
+        assert_eq!(
+            verify_amd_revocation(&ark, &ask, &vcek, &crl, 1_785_844_800, 30 * 86_400),
+            Ok(())
+        );
+        assert_eq!(
+            verify_amd_revocation(&ark, &ask, &vcek, &crl, 1_787_227_200, 7 * 86_400),
+            Err(AmdVerificationError::RevocationDataStale)
+        );
+        assert_eq!(
+            verify_amd_revocation(&ark, &ask, &vcek, &crl, 1_790_812_800, 90 * 86_400),
+            Err(AmdVerificationError::RevocationDataExpired)
+        );
+
+        let mut parsed_crl = CertificateList::from_der(&crl).unwrap();
+        parsed_crl.tbs_cert_list.next_update = None;
+        assert_eq!(
+            verify_revocation_times(&parsed_crl, 1_785_844_800, 30 * 86_400),
+            Err(AmdVerificationError::RevocationTimeMissing)
+        );
+
+        let mut revoked_vcek = Certificate::from_der(&vcek).unwrap();
+        revoked_vcek.tbs_certificate.serial_number = parsed_crl
+            .tbs_cert_list
+            .revoked_certificates
+            .as_ref()
+            .unwrap()[0]
+            .serial_number
+            .clone();
+        assert_eq!(
+            verify_amd_revocation(
+                &ark,
+                &ask,
+                &revoked_vcek.to_der().unwrap(),
+                &crl,
+                1_785_844_800,
+                30 * 86_400,
+            ),
+            Err(AmdVerificationError::Revoked)
         );
     }
 }

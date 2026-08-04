@@ -5,6 +5,12 @@ Build the static release with `./web/verifier/build.sh`, then serve the reposito
 local assets and fetches the target's reserved proof endpoint directly. Do not run it with
 `file://`, whose module and fetch behavior differs between browsers.
 
-Publish the generated archive and `SHA256SUMS` through an independently authenticated release
-channel. A release operator signs both with the platform release key; private signing keys are not
-accepted by this build script.
+Tagged GitHub releases publish the deterministic archive, its hashes, bundled schemas/version, and
+a keyless Sigstore signature bundle. Verify it with:
+
+```sh
+cosign verify-blob --bundle enclava-verifier-web.tar.gz.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/enclava-labs/cap/.github/workflows/release.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  enclava-verifier-web.tar.gz
+```

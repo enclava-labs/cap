@@ -81,12 +81,38 @@ jobs:
           name: enclava-${{ matrix.os }}-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/enclava-*.tar.gz
 
+  build-web-verifier:
+    name: Build local HTML/WASM verifier
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install matching wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.118 --locked
+
+      - name: Build deterministic web release
+        run: ./web/verifier/build.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enclava-verifier-web
+          path: |
+            web/verifier/release/enclava-verifier-web.tar.gz
+            web/verifier/release/SHA256SUMS
+
   release:
     name: Create GitHub release
-    needs: [build-linux, build-macos]
+    needs: [build-linux, build-macos, build-web-verifier]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -100,9 +126,18 @@ jobs:
           cd artifacts
           sha256sum */*.tar.gz > SHA256SUMS.txt
 
+      - uses: sigstore/cosign-installer@v3.9.2
+
+      - name: Sign independently pinnable web verifier
+        run: >-
+          cosign sign-blob --yes
+          --bundle artifacts/enclava-verifier-web/enclava-verifier-web.tar.gz.sigstore.json
+          artifacts/enclava-verifier-web/enclava-verifier-web.tar.gz
+
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             artifacts/*/*.tar.gz
+            artifacts/enclava-verifier-web/*.sigstore.json
             artifacts/SHA256SUMS.txt
           generate_release_notes: true
