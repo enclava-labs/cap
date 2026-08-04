@@ -202,3 +202,14 @@ jobs:
             --dump-dom 'http://127.0.0.1:8000/web/verifier/test.html?reject=measurement&expected=FAIL&reason=SNP_MEASUREMENT_REJECTED' \
             > /tmp/enclava-verifier-rejected-dom.html
           grep -E '<pre id="result">PASS [0-9a-f]{64}</pre>' /tmp/enclava-verifier-rejected-dom.html
+          for vector in \
+            'snp_report:SNP_REPORT_SIGNATURE_INVALID' \
+            'sigstore_material:SUPPLY_CHAIN_SIGNATURE_INVALID' \
+            'provenance_oci_material:SUPPLY_CHAIN_SIGNATURE_INVALID'; do
+            field="${vector%%:*}"
+            reason="${vector#*:}"
+            google-chrome --headless --no-sandbox --disable-gpu --virtual-time-budget=30000 \
+              --dump-dom "http://127.0.0.1:8000/web/verifier/test.html?mutate=${field}&expected=FAIL&reason=${reason}" \
+              > "/tmp/enclava-verifier-${field}-dom.html"
+            grep -E '<pre id="result">PASS [0-9a-f]{64}</pre>' "/tmp/enclava-verifier-${field}-dom.html"
+          done

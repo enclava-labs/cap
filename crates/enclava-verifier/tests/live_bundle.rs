@@ -116,7 +116,7 @@ fn rejected_measurement_policy() -> Vec<u8> {
 
 #[test]
 fn independently_selected_policy_and_channel_context_fail_closed() {
-    let (bundle, _) = fixture();
+    let (bundle, policy) = fixture();
     let rejected_measurement = rejected_measurement_policy();
     let rejected = verify(&bundle, &rejected_measurement, context());
     assert_eq!(rejected.verdict, Verdict::Fail);
@@ -130,6 +130,34 @@ fn independently_selected_policy_and_channel_context_fail_closed() {
         hex::encode(canonical_result_sha256(&rejected)),
         "63f02a375ad811f5c520d294720f49ee14a951ae01b34bd616101db6e5fe331b"
     );
+
+    for (field, reason, hash) in [
+        (
+            "snp_report",
+            "SNP_REPORT_SIGNATURE_INVALID",
+            "5a0027525995ca9741194fc2c3ca439bef21d7838e1176447cd66ccf26c80c2a",
+        ),
+        (
+            "sigstore_material",
+            "SUPPLY_CHAIN_SIGNATURE_INVALID",
+            "ce329c730ed95af1a3bade7239958c0f4ebb790a800e72c7d0afde8dfbfb85d4",
+        ),
+        (
+            "provenance_oci_material",
+            "SUPPLY_CHAIN_SIGNATURE_INVALID",
+            "66b43fa8721a02bfc17481b386d1362da9549a86c3ba1b04ec1b48d28282f9a9",
+        ),
+    ] {
+        let result = verify(&mutate_record(bundle.clone(), field), &policy, context());
+        assert_eq!(result.verdict, Verdict::Fail);
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|check| check.reason_code == reason)
+        );
+        assert_eq!(hex::encode(canonical_result_sha256(&result)), hash);
+    }
 
     for policy in [
         rejected_policy(

@@ -26,6 +26,24 @@
     return new TextEncoder().encode(rejected);
   }
 
+  function mutateRecord(bytes, wanted) {
+    const mutated = bytes.slice();
+    for (let offset = 0; offset < mutated.length;) {
+      const labelLength = (mutated[offset] << 8) | mutated[offset + 1];
+      offset += 2;
+      const label = new TextDecoder().decode(mutated.subarray(offset, offset + labelLength));
+      offset += labelLength;
+      const valueLength = new DataView(mutated.buffer, mutated.byteOffset + offset, 4).getUint32(0);
+      offset += 4;
+      if (label === wanted) {
+        mutated[offset] ^= 1;
+        return mutated;
+      }
+      offset += valueLength;
+    }
+    throw new Error(`bundle has no ${wanted} record`);
+  }
+
   async function loadCase() {
     if (!target) {
       const encoded = (await (await trackedFetch('../../crates/enclava-verifier/tests/fixtures/prove-it-live.bundle.b64')).text())
@@ -73,6 +91,7 @@
     await init();
     const testCase = await loadCase();
     if (params.get('reject') === 'measurement') testCase.policy = rejectMeasurement(testCase.policy);
+    if (params.get('mutate')) testCase.bundle = mutateRecord(testCase.bundle, params.get('mutate'));
     const context = JSON.stringify(testCase.context);
     const result = JSON.parse(verify_bundle(testCase.bundle, testCase.policy, context));
     const hash = verify_bundle_sha256(testCase.bundle, testCase.policy, context);
@@ -83,9 +102,13 @@
       expectedResult = expectedResult && rejected.verdict === 'FAIL' &&
         rejected.checks.some(check => check.reason_code === 'SNP_MEASUREMENT_REJECTED');
     }
-    const fixtureHash = params.get('reject') === 'measurement'
-      ? '63f02a375ad811f5c520d294720f49ee14a951ae01b34bd616101db6e5fe331b'
-      : 'a4cd78a56031360e6a17bd7aa4433f92cca9a5011ab3d7cfc1c09d08aa8a1b18';
+    const fixtureHash = ({
+      measurement: '63f02a375ad811f5c520d294720f49ee14a951ae01b34bd616101db6e5fe331b',
+      snp_report: '5a0027525995ca9741194fc2c3ca439bef21d7838e1176447cd66ccf26c80c2a',
+      sigstore_material: 'ce329c730ed95af1a3bade7239958c0f4ebb790a800e72c7d0afde8dfbfb85d4',
+      provenance_oci_material: '66b43fa8721a02bfc17481b386d1362da9549a86c3ba1b04ec1b48d28282f9a9'
+    })[params.get('mutate') || params.get('reject')] ||
+      'a4cd78a56031360e6a17bd7aa4433f92cca9a5011ab3d7cfc1c09d08aa8a1b18';
     const fixtureHashMatches = target || hash === fixtureHash;
     document.querySelector('#result').textContent =
       expectedResult && fixtureHashMatches
