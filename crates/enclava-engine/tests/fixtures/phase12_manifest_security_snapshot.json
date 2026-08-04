@@ -10,13 +10,10 @@
     "containsWorld": false,
     "fqdnRules": [
       "acme-v02.api.letsencrypt.org",
-      "acme-staging-v02.api.letsencrypt.org",
-      "kdsintf.amd.com"
+      "acme-staging-v02.api.letsencrypt.org"
     ],
-    "ruleCount": 7,
-    "userFqdnRules": [
-      "kdsintf.amd.com"
-    ]
+    "ruleCount": 6,
+    "userFqdnRules": []
   },
   "kbs": {
     "regoContainsDefaultDeny": true,
