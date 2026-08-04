@@ -2,6 +2,21 @@ use super::*;
 use tempfile::tempdir;
 
 #[test]
+fn public_tls_certificate_handoff_is_optional_and_public_only() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("tls-state/certificates/tls.crt");
+    let destination = dir.path().join("runtime/certificates/tls.crt");
+
+    publish_public_tls_certificate(&source, &destination).unwrap();
+    assert!(!destination.exists());
+
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"public certificate").unwrap();
+    publish_public_tls_certificate(&source, &destination).unwrap();
+    assert_eq!(std::fs::read(destination).unwrap(), b"public certificate");
+}
+
+#[test]
 fn ready_probe_reflects_ready_file_state() {
     let dir = tempdir().unwrap();
     let ready = dir.path().join("run/enclava/init-ready");

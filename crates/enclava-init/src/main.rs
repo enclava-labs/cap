@@ -882,11 +882,19 @@ fn provision_static_tls_certificate(cfg: &Config) -> Result<()> {
                 .with_context(|| format!("chown {}", path.display()))?;
         }
     }
-    let certificate = std::fs::read(tls_certificate::cert_path(&persistent))
-        .context("reading public TLS certificate for proxy handoff")?;
-    writes::atomic_write(Path::new(PUBLIC_TLS_CERT_HANDOFF_PATH), &certificate, 0o644)
-        .context("publishing public TLS certificate for proxy handoff")?;
+    let cert_path = tls_certificate::cert_path(&persistent);
+    publish_public_tls_certificate(&cert_path, Path::new(PUBLIC_TLS_CERT_HANDOFF_PATH))?;
     Ok(())
+}
+
+fn publish_public_tls_certificate(source: &Path, destination: &Path) -> Result<()> {
+    if !source.is_file() {
+        return Ok(());
+    }
+    let certificate =
+        std::fs::read(source).context("reading public TLS certificate for proxy handoff")?;
+    writes::atomic_write(destination, &certificate, 0o644)
+        .context("publishing public TLS certificate for proxy handoff")
 }
 
 fn sync_caddy_runtime_back(cfg: &Config) -> Result<()> {
