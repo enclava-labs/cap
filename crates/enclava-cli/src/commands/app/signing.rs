@@ -149,10 +149,7 @@ pub(crate) async fn ensure_manual_deploy_keyring(
     if let (Some(trusted_owner), Ok(local_envelope)) =
         (load_trusted_owner(&org_id)?, load_keyring_envelope(&org_id))
     {
-        let verified = verify_keyring(&local_envelope, &trusted_owner)?;
-        if member_allows_deploy(verified, &owner_key.public) {
-            return Ok((org_id, org_name, owner_key));
-        }
+        verify_keyring(&local_envelope, &trusted_owner)?;
     }
 
     match api.get_org_keyring(&org_name).await {
