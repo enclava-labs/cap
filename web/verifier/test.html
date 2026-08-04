@@ -4,29 +4,77 @@
 <pre id="result">RUNNING</pre>
 <script type="module">
   import init, { verify_bundle, verify_bundle_sha256 } from './pkg/enclava_verifier_wasm.js';
-  const context = JSON.stringify({
-    challenge_nonce: '01'.repeat(32),
-    expected_target_origin: 'https://prove-it-independent-dev.e72a13df.dev.enclava.work',
-    now_unix_seconds: 1785844800,
-    observed_channel_spki_sha256: null
-  });
+
+  const params = new URLSearchParams(location.search);
+  const target = params.get('target');
+  const requests = [];
+  const trackedFetch = (input, options) => {
+    const url = new URL(input, location.href);
+    requests.push(url);
+    return fetch(url, options);
+  };
+
+  async function loadCase() {
+    if (!target) {
+      const encoded = (await (await trackedFetch('../../crates/enclava-verifier/tests/fixtures/prove-it-live.bundle.b64')).text())
+        .replaceAll(/\s/g, '');
+      return {
+        bundle: Uint8Array.from(atob(encoded), byte => byte.charCodeAt(0)),
+        policy: new Uint8Array(await (await trackedFetch('../../crates/enclava-verifier/tests/fixtures/prove-it-live.policy.json')).arrayBuffer()),
+        context: {
+          challenge_nonce: '01'.repeat(32),
+          expected_target_origin: 'https://prove-it-independent-dev.e72a13df.dev.enclava.work',
+          now_unix_seconds: 1785844800,
+          observed_channel_spki_sha256: null
+        }
+      };
+    }
+
+    const origin = new URL(target);
+    if (origin.protocol !== 'https:' || origin.origin + '/' !== origin.href) throw new Error('target must be a bare HTTPS origin');
+    const nonce = crypto.getRandomValues(new Uint8Array(32));
+    const encodedNonce = btoa(String.fromCharCode(...nonce)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+    const proofUrl = `${origin.origin}/.well-known/confidential/proof-bundle?nonce=${encodedNonce}`;
+    const response = await trackedFetch(proofUrl, {
+      headers: { Accept: 'application/vnd.enclava.proof-bundle.v1' },
+      credentials: 'omit', cache: 'no-store', redirect: 'error'
+    });
+    if (!response.ok || response.headers.get('content-type') !== 'application/vnd.enclava.proof-bundle.v1') {
+      throw new Error(`proof endpoint returned ${response.status}`);
+    }
+    const policyUrl = params.get('policy') || '/policy.json';
+    const policy = new Uint8Array(await (await trackedFetch(policyUrl)).arrayBuffer());
+    const external = requests.filter(url => url.origin !== location.origin);
+    if (external.length !== 1 || external[0].href !== proofUrl) throw new Error('unexpected external verifier request');
+    return {
+      bundle: new Uint8Array(await response.arrayBuffer()), policy,
+      context: {
+        challenge_nonce: [...nonce].map(byte => byte.toString(16).padStart(2, '0')).join(''),
+        expected_target_origin: origin.origin,
+        now_unix_seconds: Math.floor(Date.now() / 1000),
+        observed_channel_spki_sha256: null
+      }
+    };
+  }
+
   try {
     await init();
-    const encoded = (await (await fetch('../../crates/enclava-verifier/tests/fixtures/prove-it-live.bundle.b64')).text())
-      .replaceAll(/\s/g, '');
-    const bundle = Uint8Array.from(atob(encoded), byte => byte.charCodeAt(0));
-    const policy = new Uint8Array(await (await fetch('../../crates/enclava-verifier/tests/fixtures/prove-it-live.policy.json')).arrayBuffer());
-    const result = JSON.parse(verify_bundle(bundle, policy, context));
-    const hash = verify_bundle_sha256(bundle, policy, context);
-    const rejectedPolicy = new TextDecoder().decode(policy).replace(
-      'dbf5e0ee559e016dbb7322fbee35c9e84922b055a210317129c4dae3b3ddf51ff28cf1181e65d0d4ade9b1b070462c67',
-      '00'.repeat(48)
+    const testCase = await loadCase();
+    const context = JSON.stringify(testCase.context);
+    const result = JSON.parse(verify_bundle(testCase.bundle, testCase.policy, context));
+    const hash = verify_bundle_sha256(testCase.bundle, testCase.policy, context);
+    const policyText = new TextDecoder().decode(testCase.policy);
+    const rejectedPolicy = policyText.replace(
+      /(\"allowed_measurements\"\s*:\s*\[\s*\")[0-9a-f]{96}(\")/i,
+      `$1${'00'.repeat(48)}$2`
     );
-    const rejected = JSON.parse(verify_bundle(bundle, new TextEncoder().encode(rejectedPolicy), context));
+    if (rejectedPolicy === policyText) throw new Error('policy has no 48-byte allowed measurement');
+    const rejected = JSON.parse(verify_bundle(testCase.bundle, new TextEncoder().encode(rejectedPolicy), context));
+    const fixtureHashMatches = target || hash === 'a4cd78a56031360e6a17bd7aa4433f92cca9a5011ab3d7cfc1c09d08aa8a1b18';
     document.querySelector('#result').textContent =
       result.verdict === 'PASS' && rejected.verdict === 'FAIL' &&
       rejected.checks.some(check => check.reason_code === 'SNP_MEASUREMENT_REJECTED') &&
-      hash === 'a4cd78a56031360e6a17bd7aa4433f92cca9a5011ab3d7cfc1c09d08aa8a1b18'
+      fixtureHashMatches
         ? `PASS ${hash}` : `FAIL ${result.verdict} ${hash}`;
   } catch (error) {
     document.querySelector('#result').textContent = `ERROR ${error}`;
