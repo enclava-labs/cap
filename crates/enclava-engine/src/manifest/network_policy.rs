@@ -5,12 +5,11 @@ use crate::types::{AttestationConfig, ConfidentialApp, EgressMode, EgressRule};
 /// Platform-default FQDN egress allowlist.
 ///
 /// Hardcoded so the operator cannot quietly drop these. Caddy needs ACME
-/// reachability to issue and renew TLS certs, and the proof proxy needs AMD KDS
-/// endorsements for self-contained verification bundles.
+/// reachability to issue and renew TLS certs. AMD KDS traffic uses the internal
+/// relay below because Kata guests cannot use Cilium's DNS proxy.
 const PLATFORM_DEFAULT_FQDNS: &[&str] = &[
     "acme-v02.api.letsencrypt.org",
     "acme-staging-v02.api.letsencrypt.org",
-    "kdsintf.amd.com",
 ];
 
 const PUBLIC_INTERNET_CIDR: &str = "0.0.0.0/0";
@@ -153,6 +152,8 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
         }));
     }
 
+    egress.extend(amd_kds_relay_egress_rules(app));
+
     for rule in tls_certificate_broker_egress_rules(app) {
         egress.push(rule);
     }
@@ -182,6 +183,32 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
             "egress": egress,
         }
     })
+}
+
+fn amd_kds_relay_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
+    let Some(namespace) = cap_api_namespace_for_attestation(&app.attestation, &app.api_url) else {
+        return Vec::new();
+    };
+    vec![
+        json!({
+            "toServices": [{
+                "k8sService": {
+                    "namespace": namespace,
+                    "serviceName": "amd-kds-relay"
+                }
+            }],
+            "toPorts": [{ "ports": [{ "port": "8080", "protocol": "TCP" }] }]
+        }),
+        json!({
+            "toEndpoints": [{
+                "matchLabels": {
+                    "io.kubernetes.pod.namespace": namespace,
+                    "app.kubernetes.io/name": "amd-kds-relay"
+                }
+            }],
+            "toPorts": [{ "ports": [{ "port": "8080", "protocol": "TCP" }] }]
+        }),
+    ]
 }
 
 fn public_internet_egress_rule(app: &ConfidentialApp) -> Value {

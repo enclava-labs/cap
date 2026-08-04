@@ -243,7 +243,11 @@ fn restricted_egress_mode_does_not_emit_public_cidr() {
 
 #[test]
 fn default_egress_includes_platform_endpoints() {
-    let app = sample_app();
+    let mut app = sample_app();
+    app.attestation.tls_certificate_broker_url = Some(
+        "http://cap-api.cap-test01.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
+            .to_string(),
+    );
     let val = generate_network_policy(&app);
     let egress = val["spec"]["egress"].as_array().unwrap();
     let fqdns: Vec<&str> = egress
@@ -258,10 +262,13 @@ fn default_egress_includes_platform_endpoints() {
         fqdns.contains(&"acme-staging-v02.api.letsencrypt.org"),
         "missing ACME staging endpoint in {fqdns:?}"
     );
-    assert!(
-        fqdns.contains(&"kdsintf.amd.com"),
-        "missing AMD KDS endpoint in {fqdns:?}"
-    );
+    let relay = egress
+        .iter()
+        .find(|rule| {
+            rule["toServices"][0]["k8sService"]["serviceName"].as_str() == Some("amd-kds-relay")
+        })
+        .expect("missing AMD KDS relay");
+    assert_eq!(relay["toPorts"][0]["ports"][0]["port"], "8080");
     for rule in egress {
         if rule["toFQDNs"][0]["matchName"]
             .as_str()
@@ -340,11 +347,7 @@ fn empty_egress_allowlist_renders_zero_extra_rules() {
     app.egress_allowlist = Vec::new();
     let val = generate_network_policy(&app);
     let egress = val["spec"]["egress"].as_array().unwrap();
-    assert_eq!(
-        egress.len(),
-        7,
-        "DNS + same-ns + KBS x2 + ACME x2 + AMD KDS"
-    );
+    assert_eq!(egress.len(), 6, "DNS + same-ns + KBS x2 + ACME x2");
 }
 
 #[test]
@@ -363,7 +366,6 @@ fn per_app_egress_extends_platform_default() {
         .collect();
     assert!(fqdns.contains(&"acme-v02.api.letsencrypt.org"));
     assert!(fqdns.contains(&"acme-staging-v02.api.letsencrypt.org"));
-    assert!(fqdns.contains(&"kdsintf.amd.com"));
     assert!(fqdns.contains(&"api.stripe.com"));
 }
 
@@ -383,8 +385,8 @@ fn egress_allowlist_renders_one_rule_per_entry() {
     ];
     let val = generate_network_policy(&app);
     let egress = val["spec"]["egress"].as_array().unwrap();
-    assert_eq!(egress.len(), 9, "4 cluster + 3 platform + 2 user");
-    assert_eq!(egress[7]["toFQDNs"][0]["matchName"], "api.stripe.com");
-    assert_eq!(egress[7]["toPorts"][0]["ports"][0]["port"], "443");
-    assert_eq!(egress[8]["toFQDNs"][0]["matchName"], "hooks.slack.com");
+    assert_eq!(egress.len(), 8, "4 cluster + 2 platform + 2 user");
+    assert_eq!(egress[6]["toFQDNs"][0]["matchName"], "api.stripe.com");
+    assert_eq!(egress[6]["toPorts"][0]["ports"][0]["port"], "443");
+    assert_eq!(egress[7]["toFQDNs"][0]["matchName"], "hooks.slack.com");
 }

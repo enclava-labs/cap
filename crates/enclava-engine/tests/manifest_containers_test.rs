@@ -254,7 +254,12 @@ fn password_app_container_omits_startup_probe_while_waiting_for_unlock() {
 
 #[test]
 fn proxy_container_name_and_port() {
-    let c = build_attestation_proxy_container(&sample_app());
+    let mut app = sample_app();
+    app.attestation.tls_certificate_broker_url = Some(
+        "http://cap-api.cap-test01.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
+            .to_string(),
+    );
+    let c = build_attestation_proxy_container(&app);
     assert_eq!(c.name, "attestation-proxy");
     let ports = c.ports.as_ref().unwrap();
     assert!(ports.iter().any(|p| p.container_port == 8081));
@@ -317,6 +322,14 @@ fn proxy_container_name_and_port() {
             .value
             .as_deref(),
         Some("http://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/resource")
+    );
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == "AMD_KDS_BASE_URL")
+            .unwrap()
+            .value
+            .as_deref(),
+        Some("http://amd-kds-relay.cap-test01.svc.cluster.local:8080/vcek/v1")
     );
     let readiness = c.readiness_probe.as_ref().unwrap();
     let http_get = readiness.http_get.as_ref().unwrap();

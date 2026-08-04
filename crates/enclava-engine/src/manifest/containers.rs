@@ -16,6 +16,7 @@ use k8s_openapi::api::core::v1::{
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 use crate::manifest::cc_init_data;
+use crate::manifest::network_policy::cap_api_namespace_for_attestation;
 use crate::types::{CaddyTlsMode, ConfidentialApp, WorkloadSecurityProfile};
 use enclava_common::types::UnlockMode;
 
@@ -777,6 +778,12 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
     ];
     if !workload_profile_runs_as_root(primary.workload_security_profile) {
         env_vars.push(env("CAP_CONFIG_FILE_GID", CAP_CONFIG_FILE_GID));
+    }
+    if let Some(namespace) = cap_api_namespace_for_attestation(&app.attestation, &app.api_url) {
+        env_vars.push(env(
+            "AMD_KDS_BASE_URL",
+            &format!("http://amd-kds-relay.{namespace}.svc.cluster.local:8080/vcek/v1"),
+        ));
     }
     if let Some(keys) = required_config_keys_from_primary(app) {
         env_vars.push(env("CAP_CONFIG_REQUIRED_KEYS", &keys));
