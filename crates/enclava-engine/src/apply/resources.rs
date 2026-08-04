@@ -25,7 +25,7 @@ where
     let name = resource.meta().name.as_deref().unwrap_or("<unnamed>");
 
     let api: Api<K> = Api::namespaced(engine.client().clone(), namespace);
-    let patched = apply_resource(engine, &api, resource, generation, false).await?;
+    let patched = apply_resource(engine, &api, resource, generation, false, false).await?;
 
     tracing::info!(
         kind = %K::kind(&Default::default()),

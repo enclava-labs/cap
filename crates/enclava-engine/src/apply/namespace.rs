@@ -25,7 +25,7 @@ pub async fn apply_namespace(
         .ok_or_else(|| ApplyError::NamespaceNotReady("namespace has no name".to_string()))?;
 
     let api: Api<Namespace> = Api::all(engine.client().clone());
-    let patched = apply_resource(engine, &api, namespace, generation, true).await?;
+    let patched = apply_resource(engine, &api, namespace, generation, true, false).await?;
 
     tracing::info!(namespace = %name, "namespace applied via SSA");
     Ok(patched)

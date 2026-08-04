@@ -160,6 +160,7 @@ pub async fn apply_resource<K>(
     resource: &K,
     generation: MutationGeneration,
     force: bool,
+    exact_when_trusted: bool,
 ) -> Result<K, ApplyError>
 where
     K: Resource + Clone + Debug + Serialize + DeserializeOwned,
@@ -182,12 +183,12 @@ where
 
         if let Some(current) = current {
             ensure_not_stale(&current, generation)?;
-            let patch_params =
-                if force || only_trusted_field_managers(&current, &engine.config().field_manager) {
-                    PatchParams::apply(&engine.config().field_manager).force()
-                } else {
-                    PatchParams::apply(&engine.config().field_manager)
-                };
+            let trusted = only_trusted_field_managers(&current, &engine.config().field_manager);
+            let patch_params = if force || trusted {
+                PatchParams::apply(&engine.config().field_manager).force()
+            } else {
+                PatchParams::apply(&engine.config().field_manager)
+            };
             let resource_version = current
                 .meta()
                 .resource_version
@@ -196,9 +197,13 @@ where
             let mut desired = resource.clone();
             desired.meta_mut().resource_version = Some(resource_version);
             annotate(&mut desired, generation);
-            match super::bounded_kube_write(api.patch(name, &patch_params, &Patch::Apply(&desired)))
-                .await
-            {
+            let applied = if exact_when_trusted && trusted {
+                super::bounded_kube_write(api.replace(name, &post_params, &desired)).await
+            } else {
+                super::bounded_kube_write(api.patch(name, &patch_params, &Patch::Apply(&desired)))
+                    .await
+            };
+            match applied {
                 Ok(applied) => {
                     verify_applied_generation(&applied, generation)?;
                     return Ok(applied);
@@ -420,6 +425,13 @@ mod tests {
                         "namespace": "fence-test",
                         "uid": "22222222-2222-2222-2222-222222222222",
                         "resourceVersion": "1",
+                        "managedFields": [{
+                            "manager": "enclava-platform",
+                            "operation": "Update",
+                            "apiVersion": "apps/v1",
+                            "fieldsType": "FieldsV1",
+                            "fieldsV1": {},
+                        }],
                         "annotations": {
                             MUTATION_GENERATION_ANNOTATION: "1",
                             "unrelated-metadata": "preserved",
@@ -514,7 +526,8 @@ mod tests {
         let pause = {
             let mut locked = state.lock().expect("fake state poisoned");
             let pause = match (method.clone(), path.as_str()) {
-                (Method::PATCH, RESOURCE_PATH | STATEFULSET_PATH) => &mut locked.pause_patch,
+                (Method::PATCH, RESOURCE_PATH | STATEFULSET_PATH)
+                | (Method::PUT, STATEFULSET_PATH) => &mut locked.pause_patch,
                 (Method::DELETE, RESOURCE_PATH) => &mut locked.pause_delete,
                 (Method::POST, COLLECTION_PATH) => &mut locked.pause_create,
                 _ => {
@@ -555,6 +568,31 @@ mod tests {
         let payload: Value = serde_json::from_slice(body).map_err(io::Error::other)?;
         let mut locked = state.lock().expect("fake state poisoned");
         match method {
+            Method::PUT => {
+                let Some(current) = locked.resource.clone() else {
+                    return Ok(status_response(StatusCode::NOT_FOUND, "NotFound"));
+                };
+                if payload
+                    .pointer("/metadata/resourceVersion")
+                    .and_then(Value::as_str)
+                    != current
+                        .pointer("/metadata/resourceVersion")
+                        .and_then(Value::as_str)
+                {
+                    locked.rejected_preconditions += 1;
+                    return Ok(status_response(StatusCode::CONFLICT, "Conflict"));
+                }
+                let mut updated = payload;
+                updated["metadata"]["uid"] = current["metadata"]["uid"].clone();
+                updated["metadata"]["resourceVersion"] =
+                    json!(locked.next_resource_version.to_string());
+                locked.next_resource_version += 1;
+                locked.resource = Some(updated);
+                Ok(json_response(
+                    StatusCode::OK,
+                    locked.resource.clone().expect("resource was replaced"),
+                ))
+            }
             Method::PATCH => {
                 let Some(current) = locked.resource.clone() else {
                     return Ok(status_response(StatusCode::NOT_FOUND, "NotFound"));
@@ -715,6 +753,7 @@ mod tests {
                 &desired("old"),
                 MutationGeneration::new(1).unwrap(),
                 false,
+                false,
             )
             .await
         });
@@ -727,6 +766,7 @@ mod tests {
             &api,
             &desired("new"),
             MutationGeneration::new(2).unwrap(),
+            false,
             false,
         )
         .await
@@ -787,6 +827,7 @@ mod tests {
             &desired("replacement"),
             MutationGeneration::new(2).unwrap(),
             false,
+            false,
         )
         .await
         .expect("replacement generation applies");
@@ -820,6 +861,7 @@ mod tests {
                 &api,
                 &desired("created-after-cancel"),
                 MutationGeneration::new(1).unwrap(),
+                false,
                 false,
             )
             .await
@@ -879,6 +921,51 @@ mod tests {
             .unwrap(),
         );
         assert!(!only_trusted_field_managers(&external, "enclava-platform"));
+    }
+
+    #[tokio::test]
+    async fn exact_trusted_update_prunes_omitted_statefulset_fields() {
+        let state = Arc::new(Mutex::new(FakeState::with_statefulset()));
+        state.lock().unwrap().resource.as_mut().unwrap()["spec"]["template"]["spec"]["containers"]
+            [0]["volumeMounts"] = json!([{
+            "name": "obsolete",
+            "mountPath": "/obsolete",
+        }]);
+        let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
+        let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), "fence-test");
+        let desired: StatefulSet = serde_json::from_value(json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {"name": "fenced", "namespace": "fence-test"},
+            "spec": {
+                "replicas": 1,
+                "serviceName": "fenced-service",
+                "selector": {"matchLabels": {"app": "fenced"}},
+                "template": {
+                    "metadata": {"labels": {"app": "fenced"}},
+                    "spec": {"containers": [{"name": "workload", "image": "example.test/workload:current"}]},
+                },
+            },
+        }))
+        .unwrap();
+
+        apply_resource(
+            &engine,
+            &api,
+            &desired,
+            MutationGeneration::new(2).unwrap(),
+            false,
+            true,
+        )
+        .await
+        .expect("trusted StatefulSet is replaced exactly");
+
+        let locked = state.lock().unwrap();
+        assert!(
+            locked.resource.as_ref().unwrap()["spec"]["template"]["spec"]["containers"][0]
+                .get("volumeMounts")
+                .is_none()
+        );
     }
 
     #[tokio::test]
