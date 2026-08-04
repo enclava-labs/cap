@@ -18,9 +18,11 @@
     const policy = new Uint8Array(await (await fetch('../../crates/enclava-verifier/tests/fixtures/prove-it-live.policy.json')).arrayBuffer());
     const result = JSON.parse(verify_bundle(bundle, policy, context));
     const hash = verify_bundle_sha256(bundle, policy, context);
-    const rejectedPolicy = JSON.parse(new TextDecoder().decode(policy));
-    rejectedPolicy.amd.allowed_measurements = ['00'.repeat(48)];
-    const rejected = JSON.parse(verify_bundle(bundle, new TextEncoder().encode(JSON.stringify(rejectedPolicy)), context));
+    const rejectedPolicy = new TextDecoder().decode(policy).replace(
+      'dbf5e0ee559e016dbb7322fbee35c9e84922b055a210317129c4dae3b3ddf51ff28cf1181e65d0d4ade9b1b070462c67',
+      '00'.repeat(48)
+    );
+    const rejected = JSON.parse(verify_bundle(bundle, new TextEncoder().encode(rejectedPolicy), context));
     document.querySelector('#result').textContent =
       result.verdict === 'PASS' && rejected.verdict === 'FAIL' &&
       rejected.checks.some(check => check.reason_code === 'SNP_MEASUREMENT_REJECTED') &&
