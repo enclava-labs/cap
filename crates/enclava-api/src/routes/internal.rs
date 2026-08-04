@@ -3494,13 +3494,27 @@ pub async fn get_paas_proof_bundle(
     );
     let origin = validated_proof_origin(&query.origin, &allowed_domains)
         .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "origin_not_allowed"))?;
+    let domain = reqwest::Url::parse(&origin)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "origin_not_allowed"))?;
+    let client = match crate::routes::logs::resolve_internal_tee_socket(
+        &app_name,
+        &artifacts.descriptor.namespace,
+    )
+    .await
+    {
+        Some(socket) => crate::routes::logs::build_resolved_tenant_tee_http_client(&domain, socket)
+            .unwrap_or_else(|_| state.tee_http_client.clone()),
+        None => state.tee_http_client.clone(),
+    };
     let url = format!("{origin}/.well-known/confidential/proof-bundle?nonce={canonical_nonce}");
     let upstream = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        state
-            .tee_http_client
+        client
             .get(url)
             .header(header::ACCEPT, PROOF_BUNDLE_MEDIA_TYPE)
+            .timeout(std::time::Duration::from_secs(20))
             .send(),
     )
     .await
