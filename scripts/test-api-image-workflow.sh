@@ -122,9 +122,9 @@ for required in \
 done
 
 for required in \
-  "cargo build --bin enclava-api --bin cap-migrate" \
+  "cargo build --locked --bin enclava-api --bin cap-migrate" \
   "COPY --from=debug-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate" \
-  "cargo build --release --bin enclava-api --bin cap-migrate" \
+  "cargo build --locked --release --bin enclava-api --bin cap-migrate" \
   "COPY --from=release-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate"; do
   grep -Fq -- "$required" "$DOCKERFILE" \
     || fail "API image Dockerfile is missing: $required"
