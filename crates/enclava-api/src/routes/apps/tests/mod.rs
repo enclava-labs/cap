@@ -1,7 +1,7 @@
 use super::{
     AppDeleteFailure, CreateAppRequest, EgressAllowlistAuditReason, RotateSignerRequest,
     SignerRotationTokenRequest, app_delete_failure, create_app,
-    delete_tenant_namespace_with_timeouts, egress_allowlist_host_audit_reasons,
+    delete_tenant_namespace_with_timeouts, derive_identity, egress_allowlist_host_audit_reasons,
     issue_signer_rotation_token_route, list_apps, request_workload_teardown,
     requires_workload_teardown, validate_egress_allowlist, validate_egress_mode,
     workload_teardown_instance_id,
@@ -431,6 +431,20 @@ async fn create_app_rejects_member_before_database_access() {
     };
 
     assert_eq!(err.0, StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn derive_identity_rejects_oversized_generated_namespace() {
+    let error = derive_identity(
+        &"o".repeat(40),
+        uuid::Uuid::nil(),
+        &"a".repeat(20),
+        "password",
+        Some(&"00".repeat(32)),
+    )
+    .unwrap_err();
+
+    assert!(error.contains("namespace longer than 63 characters"));
 }
 
 #[tokio::test]

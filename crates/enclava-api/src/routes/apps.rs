@@ -581,6 +581,12 @@ pub(crate) fn derive_identity(
     let app_id_short = &app_id.to_string()[..8];
     let instance_id = format!("{tenant_id}-{app_id_short}");
     let namespace = format!("cap-{org_name}-{app_name}");
+    if namespace.len() > 63 {
+        return Err(
+            "organization and app names produce a Kubernetes namespace longer than 63 characters"
+                .to_string(),
+        );
+    }
     let service_account = format!("cap-{app_name}-sa");
 
     let bootstrap_owner_pubkey_hash = match unlock_mode {
