@@ -53,7 +53,6 @@ fn caddyfile_has_attestation_proxy_route() {
     let data = cm.data.as_ref().unwrap();
     let caddyfile = data.get("Caddyfile").unwrap();
     assert!(caddyfile.contains("/v1/attestation"));
-    assert!(caddyfile.contains("/.well-known/enclava/proof"));
     assert!(caddyfile.contains("127.0.0.1:8081"));
 }
 

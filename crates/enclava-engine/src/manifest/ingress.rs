@@ -249,9 +249,7 @@ fn render_caddyfile_from_spec(spec: &CaddyfileSpec) -> String {
             out.push_str("  tls internal\n");
         }
     }
-    out.push_str(
-        "  @attestation-proxy path /v1/attestation /v1/attestation/* /unlock /.well-known/enclava/proof\n",
-    );
+    out.push_str("  @attestation-proxy path /v1/attestation /v1/attestation/* /unlock\n");
     out.push_str("  handle @attestation-proxy {\n");
     out.push_str("    reverse_proxy 127.0.0.1:8081\n");
     out.push_str("  }\n");
