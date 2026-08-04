@@ -5,7 +5,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release --bin enclava-appraiser && \
+    cargo build --locked --release --bin enclava-appraiser && \
     cp target/release/enclava-appraiser /usr/local/bin/enclava-appraiser
 
 FROM alpine:3.20
