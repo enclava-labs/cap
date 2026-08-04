@@ -22,6 +22,7 @@ const DEFAULT_KBS_FETCH_ATTEMPTS: u32 = 30;
 const DEFAULT_KBS_FETCH_RETRY_SLEEP_SECONDS: u64 = 2;
 const DEFAULT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS: u64 = 10;
 const CADDY_RUNTIME_HANDOFF_PATH: &str = "/run/enclava/caddy-runtime";
+const PUBLIC_TLS_CERT_HANDOFF_PATH: &str = "/run/enclava/public-tls/certificates/tls.crt";
 const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
 const MANAGED_CONFIG_ROOT: &str = ".enclava";
@@ -881,6 +882,10 @@ fn provision_static_tls_certificate(cfg: &Config) -> Result<()> {
                 .with_context(|| format!("chown {}", path.display()))?;
         }
     }
+    let certificate = std::fs::read(tls_certificate::cert_path(&persistent))
+        .context("reading public TLS certificate for proxy handoff")?;
+    writes::atomic_write(Path::new(PUBLIC_TLS_CERT_HANDOFF_PATH), &certificate, 0o644)
+        .context("publishing public TLS certificate for proxy handoff")?;
     Ok(())
 }
 

@@ -702,13 +702,6 @@ fn proxy_volume_mounts(app: &ConfidentialApp, legacy: bool) -> Vec<VolumeMount> 
             mount_path: "/run/enclava".to_string(),
             ..Default::default()
         });
-        v.push(VolumeMount {
-            name: "tls-state-mount".to_string(),
-            mount_path: "/run/enclava/public-tls".to_string(),
-            mount_propagation: Some("HostToContainer".to_string()),
-            read_only: Some(true),
-            ..Default::default()
-        });
         if app.attestation.verification_material.is_some() {
             v.push(VolumeMount {
                 name: "verification-material".to_string(),
@@ -794,7 +787,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env_vars.push(env("ENCLAVA_INIT_UNLOCK_SOCKET", UNLOCK_SOCKET_PATH));
         env_vars.push(env(
             "PROOF_TLS_CERT_PATH",
-            "/run/enclava/public-tls/tenant-ingress/certificates/tls.crt",
+            "/run/enclava/public-tls/certificates/tls.crt",
         ));
     }
     if let Some(cert) = cc_init_data::trustee_kbs_ca_cert_pem() {
