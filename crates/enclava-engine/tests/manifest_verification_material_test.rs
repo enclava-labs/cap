@@ -37,7 +37,8 @@ fn verification_material_is_mounted_only_into_proxy() {
     }));
     assert!(proxy.env.as_ref().unwrap().iter().any(|variable| {
         variable.name == "PROOF_TLS_CERT_PATH"
-            && variable.value.as_deref() == Some("/run/enclava/public-tls/certificates/tls.crt")
+            && variable.value.as_deref()
+                == Some("/run/enclava/public-tls/tenant-ingress/certificates/tls.crt")
     }));
     assert!(
         pod.containers
