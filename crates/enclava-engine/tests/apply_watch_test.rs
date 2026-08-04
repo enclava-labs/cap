@@ -1,7 +1,8 @@
 use enclava_engine::apply::types::DeployPhase;
 use enclava_engine::apply::watch::{
-    PodSnapshot, classify_pod_phase, pod_label_selector, pod_runtime_failure_message,
-    pod_terminal_failure_code, stale_terminating_pod_needs_force_delete,
+    PodSnapshot, classify_pod_phase, pod_label_selector, pod_matches_statefulset_update_revision,
+    pod_runtime_failure_message, pod_terminal_failure_code,
+    stale_terminating_pod_needs_force_delete,
 };
 use k8s_openapi::api::core::v1::{
     ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus, Pod,
@@ -258,6 +259,29 @@ fn terminating_pod_does_not_fail_replacement_rollout() {
 #[test]
 fn pod_label_selector_matches_generated_statefulset_labels() {
     assert_eq!(pod_label_selector("my-app"), "app=my-app");
+}
+
+#[test]
+fn stale_statefulset_revision_does_not_fail_replacement_rollout() {
+    let pod = Pod {
+        metadata: ObjectMeta {
+            labels: Some(std::collections::BTreeMap::from([(
+                "controller-revision-hash".to_string(),
+                "app-old".to_string(),
+            )])),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    assert!(!pod_matches_statefulset_update_revision(
+        &pod,
+        Some("app-new")
+    ));
+    assert!(pod_matches_statefulset_update_revision(
+        &pod,
+        Some("app-old")
+    ));
 }
 
 #[test]
