@@ -7,12 +7,24 @@
 
   const params = new URLSearchParams(location.search);
   const target = params.get('target');
+  const expectedVerdict = params.get('expected') || 'PASS';
+  const expectedReason = params.get('reason');
   const requests = [];
   const trackedFetch = (input, options) => {
     const url = new URL(input, location.href);
     requests.push(url);
     return fetch(url, options);
   };
+
+  function rejectMeasurement(policy) {
+    const text = new TextDecoder().decode(policy);
+    const rejected = text.replace(
+      /(\"allowed_measurements\"\s*:\s*\[\s*\")[0-9a-f]{96}(\")/i,
+      `$1${'00'.repeat(48)}$2`
+    );
+    if (rejected === text) throw new Error('policy has no accepted 48-byte measurement');
+    return new TextEncoder().encode(rejected);
+  }
 
   async function loadCase() {
     if (!target) {
@@ -60,21 +72,23 @@
   try {
     await init();
     const testCase = await loadCase();
+    if (params.get('reject') === 'measurement') testCase.policy = rejectMeasurement(testCase.policy);
     const context = JSON.stringify(testCase.context);
     const result = JSON.parse(verify_bundle(testCase.bundle, testCase.policy, context));
     const hash = verify_bundle_sha256(testCase.bundle, testCase.policy, context);
-    const policyText = new TextDecoder().decode(testCase.policy);
-    const rejectedPolicy = policyText.replace(
-      /(\"allowed_measurements\"\s*:\s*\[\s*\")[0-9a-f]{96}(\")/i,
-      `$1${'00'.repeat(48)}$2`
-    );
-    if (rejectedPolicy === policyText) throw new Error('policy has no 48-byte allowed measurement');
-    const rejected = JSON.parse(verify_bundle(testCase.bundle, new TextEncoder().encode(rejectedPolicy), context));
-    const fixtureHashMatches = target || hash === 'a4cd78a56031360e6a17bd7aa4433f92cca9a5011ab3d7cfc1c09d08aa8a1b18';
+    let expectedResult = result.verdict === expectedVerdict &&
+      (!expectedReason || result.checks.some(check => check.reason_code === expectedReason));
+    if (expectedVerdict === 'PASS') {
+      const rejected = JSON.parse(verify_bundle(testCase.bundle, rejectMeasurement(testCase.policy), context));
+      expectedResult = expectedResult && rejected.verdict === 'FAIL' &&
+        rejected.checks.some(check => check.reason_code === 'SNP_MEASUREMENT_REJECTED');
+    }
+    const fixtureHash = params.get('reject') === 'measurement'
+      ? '63f02a375ad811f5c520d294720f49ee14a951ae01b34bd616101db6e5fe331b'
+      : 'a4cd78a56031360e6a17bd7aa4433f92cca9a5011ab3d7cfc1c09d08aa8a1b18';
+    const fixtureHashMatches = target || hash === fixtureHash;
     document.querySelector('#result').textContent =
-      result.verdict === 'PASS' && rejected.verdict === 'FAIL' &&
-      rejected.checks.some(check => check.reason_code === 'SNP_MEASUREMENT_REJECTED') &&
-      fixtureHashMatches
+      expectedResult && fixtureHashMatches
         ? `PASS ${hash}` : `FAIL ${result.verdict} ${hash}`;
   } catch (error) {
     document.querySelector('#result').textContent = `ERROR ${error}`;
