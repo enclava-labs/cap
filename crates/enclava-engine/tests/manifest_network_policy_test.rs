@@ -242,7 +242,7 @@ fn restricted_egress_mode_does_not_emit_public_cidr() {
 }
 
 #[test]
-fn default_egress_includes_acme_endpoints() {
+fn default_egress_includes_platform_endpoints() {
     let app = sample_app();
     let val = generate_network_policy(&app);
     let egress = val["spec"]["egress"].as_array().unwrap();
@@ -257,6 +257,10 @@ fn default_egress_includes_acme_endpoints() {
     assert!(
         fqdns.contains(&"acme-staging-v02.api.letsencrypt.org"),
         "missing ACME staging endpoint in {fqdns:?}"
+    );
+    assert!(
+        fqdns.contains(&"kdsintf.amd.com"),
+        "missing AMD KDS endpoint in {fqdns:?}"
     );
     for rule in egress {
         if rule["toFQDNs"][0]["matchName"]
@@ -336,7 +340,11 @@ fn empty_egress_allowlist_renders_zero_extra_rules() {
     app.egress_allowlist = Vec::new();
     let val = generate_network_policy(&app);
     let egress = val["spec"]["egress"].as_array().unwrap();
-    assert_eq!(egress.len(), 6, "DNS + same-ns + KBS x2 + ACME x2");
+    assert_eq!(
+        egress.len(),
+        7,
+        "DNS + same-ns + KBS x2 + ACME x2 + AMD KDS"
+    );
 }
 
 #[test]
@@ -355,6 +363,7 @@ fn per_app_egress_extends_platform_default() {
         .collect();
     assert!(fqdns.contains(&"acme-v02.api.letsencrypt.org"));
     assert!(fqdns.contains(&"acme-staging-v02.api.letsencrypt.org"));
+    assert!(fqdns.contains(&"kdsintf.amd.com"));
     assert!(fqdns.contains(&"api.stripe.com"));
 }
 
@@ -374,8 +383,8 @@ fn egress_allowlist_renders_one_rule_per_entry() {
     ];
     let val = generate_network_policy(&app);
     let egress = val["spec"]["egress"].as_array().unwrap();
-    assert_eq!(egress.len(), 8, "4 cluster + 2 ACME + 2 user");
-    assert_eq!(egress[6]["toFQDNs"][0]["matchName"], "api.stripe.com");
-    assert_eq!(egress[6]["toPorts"][0]["ports"][0]["port"], "443");
-    assert_eq!(egress[7]["toFQDNs"][0]["matchName"], "hooks.slack.com");
+    assert_eq!(egress.len(), 9, "4 cluster + 3 platform + 2 user");
+    assert_eq!(egress[7]["toFQDNs"][0]["matchName"], "api.stripe.com");
+    assert_eq!(egress[7]["toPorts"][0]["ports"][0]["port"], "443");
+    assert_eq!(egress[8]["toFQDNs"][0]["matchName"], "hooks.slack.com");
 }

@@ -5,10 +5,12 @@ use crate::types::{AttestationConfig, ConfidentialApp, EgressMode, EgressRule};
 /// Platform-default FQDN egress allowlist.
 ///
 /// Hardcoded so the operator cannot quietly drop these. Caddy needs ACME
-/// reachability to issue and renew TLS certs for tenant ingress.
+/// reachability to issue and renew TLS certs, and the proof proxy needs AMD KDS
+/// endorsements for self-contained verification bundles.
 const PLATFORM_DEFAULT_FQDNS: &[&str] = &[
     "acme-v02.api.letsencrypt.org",
     "acme-staging-v02.api.letsencrypt.org",
+    "kdsintf.amd.com",
 ];
 
 const PUBLIC_INTERNET_CIDR: &str = "0.0.0.0/0";
