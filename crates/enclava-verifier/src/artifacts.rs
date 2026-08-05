@@ -90,6 +90,11 @@ pub fn verify_workload_artifacts(
 ) -> Result<VerifiedArtifacts, ArtifactError> {
     let artifacts: WorkloadArtifacts =
         serde_json::from_slice(workload_json).map_err(|_| ArtifactError::Malformed)?;
+    if !artifacts.descriptor_payload.independent_verification
+        || artifacts.org_keyring_payload.org_id != artifacts.descriptor_payload.org_id
+    {
+        return Err(ArtifactError::RelationshipMismatch);
+    }
     let trustee_value: serde_json::Value =
         serde_json::from_slice(trustee_policy_json).map_err(|_| ArtifactError::Malformed)?;
     verify_compact_trustee_policy(&trustee_value, &artifacts.signed_policy_artifact)?;
@@ -364,5 +369,43 @@ mod tests {
             verify_compact_trustee_policy(&compact, &artifact),
             Err(ArtifactError::RelationshipMismatch)
         );
+    }
+
+    #[test]
+    fn descriptor_must_opt_in_and_match_keyring_org() {
+        let encoded = include_str!("../tests/fixtures/prove-it-live.bundle.b64")
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        let bundle = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let proof = crate::parse_proof_bundle(&bundle).unwrap();
+        let mut workload: serde_json::Value =
+            serde_json::from_slice(proof.workload_artifacts_json).unwrap();
+        workload["descriptor_payload"]["independent_verification"] = false.into();
+        assert!(matches!(
+            verify_workload_artifacts(
+                &serde_json::to_vec(&workload).unwrap(),
+                proof.trustee_policy_json,
+                proof.cc_init_data_toml,
+                &[],
+                &[],
+            ),
+            Err(ArtifactError::RelationshipMismatch)
+        ));
+
+        workload["descriptor_payload"]["independent_verification"] = true.into();
+        workload["org_keyring_payload"]["org_id"] = "00000000-0000-0000-0000-000000000001".into();
+        assert!(matches!(
+            verify_workload_artifacts(
+                &serde_json::to_vec(&workload).unwrap(),
+                proof.trustee_policy_json,
+                proof.cc_init_data_toml,
+                &[],
+                &[],
+            ),
+            Err(ArtifactError::RelationshipMismatch)
+        ));
     }
 }

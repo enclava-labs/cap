@@ -81,7 +81,14 @@ pub fn expected_report_data(
     receipt_public_key: &[u8],
 ) -> Result<[u8; 64], EvidenceError> {
     let url = url::Url::parse(target_origin).map_err(|_| EvidenceError::InvalidEncoding)?;
-    let domain = url.host_str().ok_or(EvidenceError::InvalidEncoding)?;
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return Err(EvidenceError::InvalidEncoding);
+    }
+    let host = url.host_str().ok_or(EvidenceError::InvalidEncoding)?;
+    let domain = match url.port() {
+        Some(port) if port != 443 => format!("{host}:{port}"),
+        _ => host.to_owned(),
+    };
     let transcript_hash = ce_v1_hash(&[
         ("purpose", b"enclava-tee-tls-v1"),
         ("domain", domain.as_bytes()),
@@ -152,6 +159,10 @@ mod tests {
         assert_ne!(
             expected,
             expected_report_data("https://other.example", &nonce, &spki, &key).unwrap()
+        );
+        assert_ne!(
+            expected,
+            expected_report_data("https://app.example:8443", &nonce, &spki, &key).unwrap()
         );
         assert_ne!(
             expected,

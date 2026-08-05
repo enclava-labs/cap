@@ -15,9 +15,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/enclava-api/**"
+      - "crates/enclava-appraiser/**"
       - "crates/enclava-cli/platform-release.json"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
+      - "crates/enclava-verifier/**"
   pull_request:
     paths:
       - ".github/workflows/api-image.yml"
@@ -30,9 +32,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/enclava-api/**"
+      - "crates/enclava-appraiser/**"
       - "crates/enclava-cli/platform-release.json"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
+      - "crates/enclava-verifier/**"
   workflow_dispatch:
     inputs:
       version_tag:

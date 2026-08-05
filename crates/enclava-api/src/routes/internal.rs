@@ -3456,7 +3456,7 @@ pub async fn get_paas_proof_bundle(
 
     let (cap_org_id, _, _) = mapped_cap_org(&state, &paas_org_id).await?;
     let row: Option<(Uuid, Uuid)> = sqlx::query_as(
-        "SELECT a.id, d.id
+        "SELECT a.id, COALESCE(job.artifact_deployment_id, d.id)
            FROM apps a
            JOIN LATERAL (
                SELECT id FROM deployments
@@ -3464,6 +3464,13 @@ pub async fn get_paas_proof_bundle(
                 ORDER BY completed_at DESC NULLS LAST, created_at DESC
                 LIMIT 1
            ) d ON true
+           LEFT JOIN LATERAL (
+               SELECT artifact_deployment_id
+                 FROM deployment_apply_jobs
+                WHERE app_id = a.id AND deployment_id = d.id
+                ORDER BY generation DESC
+                LIMIT 1
+           ) job ON true
           WHERE a.org_id = $1 AND a.name = $2",
     )
     .bind(cap_org_id)

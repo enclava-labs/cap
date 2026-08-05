@@ -43,7 +43,27 @@ pub fn verify_sigstore_and_provenance(
     expected_image_digest: &str,
     policy: &SigstorePolicy,
 ) -> Result<(), SigstoreError> {
-    let signature_blob = portable_blob(sigstore_material, "signature_blob")?;
+    let records = ce_v1_decode(sigstore_material).map_err(|_| SigstoreError::Malformed)?;
+    let mut signatures = records
+        .iter()
+        .filter(|record| record.label == "signature_blob")
+        .peekable();
+    if signatures.peek().is_none() {
+        return Err(SigstoreError::Malformed);
+    }
+    if !signatures
+        .any(|record| verify_signature_blob(record.value, expected_image_digest, policy).is_ok())
+    {
+        return Err(SigstoreError::InvalidSignature);
+    }
+    verify_provenance(provenance_material, expected_image_digest, policy)
+}
+
+fn verify_signature_blob(
+    signature_blob: &[u8],
+    expected_image_digest: &str,
+    policy: &SigstorePolicy,
+) -> Result<(), SigstoreError> {
     let bundle: Value =
         serde_json::from_slice(signature_blob).map_err(|_| SigstoreError::Malformed)?;
     let certificate_der = decode_b64(pointer_str(
@@ -77,21 +97,13 @@ pub fn verify_sigstore_and_provenance(
     .map_err(|_| SigstoreError::InvalidSignature)?;
     let statement: Value =
         serde_json::from_slice(&payload).map_err(|_| SigstoreError::Malformed)?;
-    if !statement_has_subject(&statement, expected_image_digest) {
+    if statement.pointer("/predicateType").and_then(Value::as_str)
+        != Some("https://sigstore.dev/cosign/sign/v1")
+        || !statement_has_subject(&statement, expected_image_digest)
+    {
         return Err(SigstoreError::InvalidSignature);
     }
-    verify_provenance(provenance_material, expected_image_digest, policy)
-}
-
-fn portable_blob<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u8], SigstoreError> {
-    let records = ce_v1_decode(bytes).map_err(|_| SigstoreError::Malformed)?;
-    let mut matches = records.iter().filter(|record| record.label == label);
-    let value = matches.next().ok_or(SigstoreError::Malformed)?.value;
-    matches
-        .next()
-        .is_none()
-        .then_some(value)
-        .ok_or(SigstoreError::Malformed)
+    Ok(())
 }
 
 fn verify_fulcio_chain(
@@ -178,8 +190,10 @@ fn verify_identity(
         .find(|extension| extension.extn_id.to_string() == "2.5.29.17")
         .and_then(|extension| SubjectAltName::from_der(extension.extn_value.as_bytes()).ok())
         .ok_or(SigstoreError::IdentityRejected)?;
-    let identity_matches = san.0.iter().any(|name| {
-        matches!(name, GeneralName::UniformResourceIdentifier(uri) if uri.as_str() == policy.certificate_identity)
+    let identity_matches = san.0.iter().any(|name| match name {
+        GeneralName::UniformResourceIdentifier(uri) => uri.as_str() == policy.certificate_identity,
+        GeneralName::Rfc822Name(email) => email.as_str() == policy.certificate_identity,
+        _ => false,
     });
     let issuer_matches = extensions
         .iter()
@@ -428,12 +442,12 @@ fn verify_provenance(
     policy: &SigstorePolicy,
 ) -> Result<(), SigstoreError> {
     let records = ce_v1_decode(material).map_err(|_| SigstoreError::Malformed)?;
-    let source = records
+    let source_record = records
         .iter()
         .find(|record| record.label == "image_manifest")
         .ok_or(SigstoreError::Malformed)?;
     let source: Value =
-        serde_json::from_slice(source.value).map_err(|_| SigstoreError::Malformed)?;
+        serde_json::from_slice(source_record.value).map_err(|_| SigstoreError::Malformed)?;
     let referenced = source
         .get("manifests")
         .and_then(Value::as_array)
@@ -447,53 +461,87 @@ fn verify_provenance(
         })
         .filter_map(|descriptor| descriptor.get("digest").and_then(Value::as_str))
         .collect::<Vec<_>>();
-    let blob = portable_blob(material, "provenance_blob")?;
-    let provenance: Value = serde_json::from_slice(blob).map_err(|_| SigstoreError::Malformed)?;
-    let subject_matches = provenance
-        .get("subject")
+    let attestation_manifests = source
+        .get("manifests")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .any(|subject| {
-            subject
-                .pointer("/digest/sha256")
+        .filter(|descriptor| {
+            descriptor
+                .pointer("/annotations/vnd.docker.reference.type")
                 .and_then(Value::as_str)
-                .is_some_and(|digest| {
-                    referenced
-                        .iter()
-                        .any(|reference| reference.strip_prefix("sha256:") == Some(digest))
-                })
-        });
+                == Some("attestation-manifest")
+        })
+        .filter_map(|descriptor| descriptor.get("digest").and_then(Value::as_str))
+        .collect::<Vec<_>>();
     let image_bound = source.get("schemaVersion").is_some()
         && format!(
             "sha256:{}",
-            hex::encode(Sha256::digest(
-                records
-                    .iter()
-                    .find(|record| record.label == "image_manifest")
-                    .unwrap()
-                    .value
-            ))
+            hex::encode(Sha256::digest(source_record.value))
         ) == expected_image_digest;
-    let repository = provenance
-        .pointer("/predicate/buildDefinition/internalParameters/github_repository")
-        .and_then(Value::as_str);
-    let workflow = provenance
-        .pointer("/predicate/buildDefinition/internalParameters/github_workflow_ref")
-        .and_then(Value::as_str);
-    let builder = provenance
-        .pointer("/predicate/runDetails/builder/id")
-        .and_then(Value::as_str);
-    if image_bound
-        && subject_matches
-        && repository == Some(policy.source_repository.as_str())
-        && workflow == Some(policy.workflow_ref.as_str())
-        && builder == Some(policy.provenance_builder_id.as_str())
-    {
+    if !image_bound {
+        Err(SigstoreError::InvalidProvenance)
+    } else if provenance_candidates(&records, &attestation_manifests).any(|blob| {
+        serde_json::from_slice::<Value>(blob).is_ok_and(|provenance| {
+            let expected_subjects = if referenced.is_empty() {
+                vec![expected_image_digest]
+            } else {
+                referenced.clone()
+            };
+            statement_has_any_subject(&provenance, &expected_subjects)
+                && provenance
+                    .pointer("/predicate/buildDefinition/internalParameters/github_repository")
+                    .and_then(Value::as_str)
+                    == Some(policy.source_repository.as_str())
+                && provenance
+                    .pointer("/predicate/buildDefinition/internalParameters/github_workflow_ref")
+                    .and_then(Value::as_str)
+                    == Some(policy.workflow_ref.as_str())
+                && provenance
+                    .pointer("/predicate/runDetails/builder/id")
+                    .and_then(Value::as_str)
+                    == Some(policy.provenance_builder_id.as_str())
+        })
+    }) {
         Ok(())
     } else {
         Err(SigstoreError::InvalidProvenance)
     }
+}
+
+fn provenance_candidates<'a>(
+    records: &'a [enclava_common::canonical::CeV1Record<'a>],
+    trusted_manifests: &[&str],
+) -> impl Iterator<Item = &'a [u8]> {
+    records
+        .iter()
+        .enumerate()
+        .filter_map(move |(index, record)| {
+            (record.label == "provenance_blob").then_some(())?;
+            let manifest = records[..index]
+                .iter()
+                .rev()
+                .find(|candidate| candidate.label == "provenance_manifest")?;
+            let manifest_trusted = trusted_manifests.is_empty()
+                || trusted_manifests.iter().any(|digest| {
+                    *digest == format!("sha256:{}", hex::encode(Sha256::digest(manifest.value)))
+                });
+            let manifest: Value = serde_json::from_slice(manifest.value).ok()?;
+            let blob_digest = format!("sha256:{}", hex::encode(Sha256::digest(record.value)));
+            let blob_referenced = manifest
+                .get("layers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|layer| layer.get("digest").and_then(Value::as_str) == Some(&blob_digest));
+            (manifest_trusted && blob_referenced).then_some(record.value)
+        })
+}
+
+fn statement_has_any_subject(statement: &Value, digests: &[&str]) -> bool {
+    digests
+        .iter()
+        .any(|digest| statement_has_subject(statement, digest))
 }
 
 fn statement_has_subject(statement: &Value, digest: &str) -> bool {
@@ -534,6 +582,7 @@ fn decode_b64(value: &str) -> Result<Vec<u8>, SigstoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use enclava_common::canonical::ce_v1_bytes;
 
     #[test]
     fn pae_is_unambiguous() {
@@ -561,7 +610,12 @@ mod tests {
             "../tests/fixtures/prove-it-live.policy.json"
         ))
         .unwrap();
-        let signature_blob = portable_blob(proof.sigstore_material, "signature_blob").unwrap();
+        let signature_blob = ce_v1_decode(proof.sigstore_material)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.label == "signature_blob")
+            .unwrap()
+            .value;
         let bundle: Value = serde_json::from_slice(signature_blob).unwrap();
         let certificate_der =
             decode_b64(pointer_str(&bundle, "/verificationMaterial/certificate/rawBytes").unwrap())
@@ -591,5 +645,76 @@ mod tests {
         )
         .unwrap();
         assert_eq!(selected_time, real_time);
+    }
+
+    #[test]
+    fn accepts_one_trusted_signature_among_multiple_blobs() {
+        let encoded = include_str!("../tests/fixtures/prove-it-live.bundle.b64")
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        let bundle_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let proof = crate::parse_proof_bundle(&bundle_bytes).unwrap();
+        let records = ce_v1_decode(proof.sigstore_material).unwrap();
+        let image_digest = std::str::from_utf8(
+            records
+                .iter()
+                .find(|record| record.label == "image_digest")
+                .unwrap()
+                .value,
+        )
+        .unwrap();
+        let mut fields = records
+            .iter()
+            .take(3)
+            .map(|record| (record.label, record.value))
+            .collect::<Vec<_>>();
+        fields.push(("signature_blob", b"not a bundle"));
+        fields.extend(
+            records
+                .iter()
+                .skip(3)
+                .map(|record| (record.label, record.value)),
+        );
+        let material = ce_v1_bytes(&fields);
+        let policy = crate::TrustPolicy::parse(include_bytes!(
+            "../tests/fixtures/prove-it-live.policy.json"
+        ))
+        .unwrap();
+        verify_sigstore_and_provenance(
+            &material,
+            proof.provenance_oci_material,
+            image_digest,
+            &policy.sigstore,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn provenance_blob_must_belong_to_a_trusted_attestation_manifest() {
+        let forged_blob = b"forged";
+        let trusted_blob = b"trusted";
+        let manifest = |blob: &[u8]| {
+            serde_json::to_vec(&serde_json::json!({
+                "layers": [{"digest": format!("sha256:{}", hex::encode(Sha256::digest(blob)))}]
+            }))
+            .unwrap()
+        };
+        let forged_manifest = manifest(forged_blob);
+        let trusted_manifest = manifest(trusted_blob);
+        let trusted_digest = format!("sha256:{}", hex::encode(Sha256::digest(&trusted_manifest)));
+        let material = ce_v1_bytes(&[
+            ("provenance_manifest", &forged_manifest),
+            ("provenance_blob", forged_blob),
+            ("provenance_manifest", &trusted_manifest),
+            ("provenance_blob", trusted_blob),
+        ]);
+        let records = ce_v1_decode(&material).unwrap();
+        assert_eq!(
+            provenance_candidates(&records, &[trusted_digest.as_str()]).collect::<Vec<_>>(),
+            vec![trusted_blob.as_slice()]
+        );
     }
 }
