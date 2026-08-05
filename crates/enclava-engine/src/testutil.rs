@@ -73,6 +73,9 @@ pub fn sample_app() -> ConfidentialApp {
             trustee_policy_read_available: false,
             workload_artifacts_url: None,
             tls_certificate_broker_url: None,
+            amd_kds_base_url: Some(
+                "http://amd-kds-relay.cap-test01.svc.cluster.local:8080/vcek/v1".to_string(),
+            ),
             trustee_policy_url: None,
             local_workload_artifacts_json: None,
             local_trustee_policy_json: None,

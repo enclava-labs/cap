@@ -186,27 +186,45 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
 }
 
 fn amd_kds_relay_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
-    let Some(namespace) = cap_api_namespace_for_attestation(&app.attestation, &app.api_url) else {
+    let Some(url) = app.attestation.amd_kds_base_url.as_deref() else {
         return Vec::new();
+    };
+    let Some(authority) = parse_url_authority(url) else {
+        return Vec::new();
+    };
+    let Some((service_name, namespace)) = kubernetes_service_name(authority.host) else {
+        return vec![json!({
+            "toFQDNs": [{ "matchName": authority.host }],
+            "toPorts": [{ "ports": [{
+                "port": authority.port.to_string(),
+                "protocol": "TCP"
+            }] }],
+        })];
     };
     vec![
         json!({
             "toServices": [{
                 "k8sService": {
                     "namespace": namespace,
-                    "serviceName": "amd-kds-relay"
+                    "serviceName": service_name
                 }
             }],
-            "toPorts": [{ "ports": [{ "port": "8080", "protocol": "TCP" }] }]
+            "toPorts": [{ "ports": [{
+                "port": authority.port.to_string(),
+                "protocol": "TCP"
+            }] }]
         }),
         json!({
             "toEndpoints": [{
                 "matchLabels": {
                     "io.kubernetes.pod.namespace": namespace,
-                    "app.kubernetes.io/name": "amd-kds-relay"
+                    "app.kubernetes.io/name": service_name
                 }
             }],
-            "toPorts": [{ "ports": [{ "port": "8080", "protocol": "TCP" }] }]
+            "toPorts": [{ "ports": [{
+                "port": authority.port.to_string(),
+                "protocol": "TCP"
+            }] }]
         }),
     ]
 }

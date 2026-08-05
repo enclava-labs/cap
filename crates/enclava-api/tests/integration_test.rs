@@ -197,6 +197,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
             trustee_policy_read_available: false,
             workload_artifacts_url: None,
             tls_certificate_broker_url: None,
+            amd_kds_base_url: None,
             trustee_policy_url: None,
             local_workload_artifacts_json: None,
             local_trustee_policy_json: None,

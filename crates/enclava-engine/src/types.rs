@@ -229,6 +229,9 @@ pub struct AttestationConfig {
     /// Caddy's shared runtime directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_certificate_broker_url: Option<String>,
+    /// AMD KDS-compatible endorsement relay used by proof-producing workloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amd_kds_base_url: Option<String>,
     /// Trustee workload-attested active policy body endpoint for this platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trustee_policy_url: Option<String>,

@@ -354,6 +354,7 @@ pub(crate) fn confidential_app_for_cc_hash(
                 release,
                 &deployment_context,
             )?,
+            amd_kds_base_url: None,
             trustee_policy_url: None,
             local_workload_artifacts_json: Some("{}".to_string()),
             local_trustee_policy_json: Some("{}".to_string()),

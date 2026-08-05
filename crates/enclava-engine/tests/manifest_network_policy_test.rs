@@ -381,7 +381,11 @@ fn empty_egress_allowlist_renders_zero_extra_rules() {
     app.egress_allowlist = Vec::new();
     let val = generate_network_policy(&app);
     let egress = val["spec"]["egress"].as_array().unwrap();
-    assert_eq!(egress.len(), 6, "DNS + same-ns + KBS x2 + ACME x2");
+    assert_eq!(
+        egress.len(),
+        8,
+        "DNS + same-ns + KBS x2 + ACME x2 + AMD relay x2"
+    );
 }
 
 #[test]
@@ -419,8 +423,8 @@ fn egress_allowlist_renders_one_rule_per_entry() {
     ];
     let val = generate_network_policy(&app);
     let egress = val["spec"]["egress"].as_array().unwrap();
-    assert_eq!(egress.len(), 8, "4 cluster + 2 platform + 2 user");
-    assert_eq!(egress[6]["toFQDNs"][0]["matchName"], "api.stripe.com");
-    assert_eq!(egress[6]["toPorts"][0]["ports"][0]["port"], "443");
-    assert_eq!(egress[7]["toFQDNs"][0]["matchName"], "hooks.slack.com");
+    assert_eq!(egress.len(), 10, "6 cluster + 2 platform + 2 user");
+    assert_eq!(egress[8]["toFQDNs"][0]["matchName"], "api.stripe.com");
+    assert_eq!(egress[8]["toPorts"][0]["ports"][0]["port"], "443");
+    assert_eq!(egress[9]["toFQDNs"][0]["matchName"], "hooks.slack.com");
 }

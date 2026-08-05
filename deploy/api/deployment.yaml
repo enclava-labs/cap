@@ -57,6 +57,8 @@ spec:
           value: "false"
         - name: API_URL
           value: "https://api.enclava.dev"
+        - name: AMD_KDS_BASE_URL
+          value: "http://amd-kds-relay.enclava-platform.svc.cluster.local:8080/vcek/v1"
         - name: PLATFORM_DOMAIN
           value: "enclava.dev"
         - name: DNS_MANAGEMENT_REQUIRED

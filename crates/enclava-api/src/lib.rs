@@ -754,6 +754,7 @@ pub(crate) mod test_support {
                 trustee_policy_read_available: true,
                 workload_artifacts_url: Some("https://api.example.test/workload/artifacts".into()),
                 tls_certificate_broker_url: None,
+                amd_kds_base_url: None,
                 trustee_policy_url: Some("https://kbs.example.test/policy".into()),
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,
