@@ -92,6 +92,14 @@ jobs:
           push: false
           provenance: false
 
+      - name: Build appraiser image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./crates/enclava-appraiser/Dockerfile
+          push: false
+          provenance: false
+
   publish:
     name: Publish signed API image
     if: github.event_name == 'workflow_dispatch' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag'))

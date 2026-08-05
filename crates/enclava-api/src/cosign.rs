@@ -143,19 +143,17 @@ fn digest_to_cosign_tag(digest: &str, suffix: &str) -> String {
 
 /// Parse an image reference into (registry, repository) components.
 fn parse_image_parts(image_ref: &str) -> Result<(String, String), CosignError> {
-    let base = image_ref
-        .split('@')
-        .next()
-        .unwrap_or(image_ref)
-        .split(':')
-        .next()
-        .unwrap_or(image_ref);
+    let base = image_ref.split('@').next().unwrap_or(image_ref);
+    let base = match (base.rfind('/'), base.rfind(':')) {
+        (slash, Some(colon)) if slash.is_none_or(|slash| colon > slash) => &base[..colon],
+        _ => base,
+    };
 
     let parts: Vec<&str> = base.splitn(3, '/').collect();
     match parts.len() {
         1 => Ok(("docker.io".to_string(), format!("library/{}", parts[0]))),
         2 => {
-            if parts[0].contains('.') || parts[0].contains(':') {
+            if parts[0].contains('.') || parts[0].contains(':') || parts[0] == "localhost" {
                 Ok((parts[0].to_string(), parts[1].to_string()))
             } else {
                 Ok((
@@ -443,7 +441,6 @@ pub async fn fetch_portable_verification_material(
         &source_manifest,
         &registry,
         &repository,
-        image_digest,
         &auth,
         MANIFEST_TYPES,
     )
@@ -532,7 +529,6 @@ async fn pull_provenance_objects(
     source_manifest: &[u8],
     registry: &str,
     repository: &str,
-    image_digest: &str,
     auth: &oci_client::secrets::RegistryAuth,
     accepted_media_types: &[&str],
 ) -> Result<Vec<(Vec<u8>, Vec<Vec<u8>>)>, CosignError> {
@@ -541,7 +537,7 @@ async fn pull_provenance_objects(
     let source: OciManifest = serde_json::from_slice(source_manifest).map_err(|error| {
         CosignError::VerificationFailed(format!("invalid source OCI manifest: {error}"))
     })?;
-    let mut references = match source {
+    let references = match source {
         OciManifest::ImageIndex(index) => index
             .manifests
             .into_iter()
@@ -563,10 +559,8 @@ async fn pull_provenance_objects(
         OciManifest::Image(_) => Vec::new(),
     };
     if references.is_empty() {
-        references.push(oci_client::Reference::with_tag(
-            registry.to_string(),
-            repository.to_string(),
-            digest_to_cosign_tag(image_digest, "att"),
+        return Err(CosignError::VerificationFailed(
+            "source index has no bound provenance manifests".into(),
         ));
     }
     let mut objects = Vec::with_capacity(references.len());
@@ -1030,6 +1024,10 @@ mod tests {
         assert_eq!(
             parse_image_parts("user/repo:tag").unwrap(),
             ("docker.io".to_string(), "user/repo".to_string())
+        );
+        assert_eq!(
+            parse_image_parts("registry.example:5000/org/repo:tag").unwrap(),
+            ("registry.example:5000".to_string(), "org/repo".to_string())
         );
     }
 

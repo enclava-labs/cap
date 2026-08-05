@@ -479,20 +479,16 @@ fn verify_provenance(
             "sha256:{}",
             hex::encode(Sha256::digest(source_record.value))
         ) == expected_image_digest;
-    if !image_bound {
-        Err(SigstoreError::InvalidProvenance)
-    } else if provenance_candidates(&records, &attestation_manifests).any(|blob| {
-        serde_json::from_slice::<Value>(blob).is_ok_and(|provenance| {
-            let expected_subjects = if referenced.is_empty() {
-                vec![expected_image_digest]
-            } else {
-                referenced.clone()
-            };
-            statement_has_any_subject(&provenance, &expected_subjects)
-                && provenance
-                    .pointer("/predicate/buildDefinition/internalParameters/github_repository")
-                    .and_then(Value::as_str)
-                    == Some(policy.source_repository.as_str())
+    if !image_bound || referenced.is_empty() || attestation_manifests.is_empty() {
+        return Err(SigstoreError::InvalidProvenance);
+    }
+    let provenances = provenance_candidates(&records, &attestation_manifests)
+        .filter_map(|blob| serde_json::from_slice::<Value>(blob).ok())
+        .filter(|provenance| {
+            provenance
+                .pointer("/predicate/buildDefinition/internalParameters/github_repository")
+                .and_then(Value::as_str)
+                == Some(policy.source_repository.as_str())
                 && provenance
                     .pointer("/predicate/buildDefinition/internalParameters/github_workflow_ref")
                     .and_then(Value::as_str)
@@ -502,6 +498,11 @@ fn verify_provenance(
                     .and_then(Value::as_str)
                     == Some(policy.provenance_builder_id.as_str())
         })
+        .collect::<Vec<_>>();
+    if referenced.iter().all(|digest| {
+        provenances
+            .iter()
+            .any(|provenance| statement_has_subject(provenance, digest))
     }) {
         Ok(())
     } else {
@@ -522,10 +523,9 @@ fn provenance_candidates<'a>(
                 .iter()
                 .rev()
                 .find(|candidate| candidate.label == "provenance_manifest")?;
-            let manifest_trusted = trusted_manifests.is_empty()
-                || trusted_manifests.iter().any(|digest| {
-                    *digest == format!("sha256:{}", hex::encode(Sha256::digest(manifest.value)))
-                });
+            let manifest_trusted = trusted_manifests.iter().any(|digest| {
+                *digest == format!("sha256:{}", hex::encode(Sha256::digest(manifest.value)))
+            });
             let manifest: Value = serde_json::from_slice(manifest.value).ok()?;
             let blob_digest = format!("sha256:{}", hex::encode(Sha256::digest(record.value)));
             let blob_referenced = manifest
@@ -536,12 +536,6 @@ fn provenance_candidates<'a>(
                 .any(|layer| layer.get("digest").and_then(Value::as_str) == Some(&blob_digest));
             (manifest_trusted && blob_referenced).then_some(record.value)
         })
-}
-
-fn statement_has_any_subject(statement: &Value, digests: &[&str]) -> bool {
-    digests
-        .iter()
-        .any(|digest| statement_has_subject(statement, digest))
 }
 
 fn statement_has_subject(statement: &Value, digest: &str) -> bool {
@@ -716,5 +710,74 @@ mod tests {
             provenance_candidates(&records, &[trusted_digest.as_str()]).collect::<Vec<_>>(),
             vec![trusted_blob.as_slice()]
         );
+        assert!(provenance_candidates(&records, &[]).next().is_none());
+    }
+
+    #[test]
+    fn provenance_must_cover_every_deployable_index_child() {
+        let policy = crate::TrustPolicy::parse(include_bytes!(
+            "../tests/fixtures/prove-it-live.policy.json"
+        ))
+        .unwrap()
+        .sigstore;
+        let children = [
+            format!("sha256:{}", "11".repeat(32)),
+            format!("sha256:{}", "22".repeat(32)),
+        ];
+        let provenance = |digest: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "subject": [{"digest": {"sha256": digest.strip_prefix("sha256:").unwrap()}}],
+                "predicate": {
+                    "buildDefinition": {"internalParameters": {
+                        "github_repository": policy.source_repository.as_str(),
+                        "github_workflow_ref": policy.workflow_ref.as_str(),
+                    }},
+                    "runDetails": {"builder": {"id": policy.provenance_builder_id.as_str()}},
+                },
+            }))
+            .unwrap()
+        };
+        let blobs = [provenance(&children[0]), provenance(&children[1])];
+        let manifests = blobs.each_ref().map(|blob| {
+            serde_json::to_vec(&serde_json::json!({
+                "layers": [{"digest": format!("sha256:{}", hex::encode(Sha256::digest(blob)))}]
+            }))
+            .unwrap()
+        });
+        let source = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [
+                {"digest": children[0]},
+                {"digest": children[1]},
+                {
+                    "digest": format!("sha256:{}", hex::encode(Sha256::digest(&manifests[0]))),
+                    "annotations": {"vnd.docker.reference.type": "attestation-manifest"},
+                },
+                {
+                    "digest": format!("sha256:{}", hex::encode(Sha256::digest(&manifests[1]))),
+                    "annotations": {"vnd.docker.reference.type": "attestation-manifest"},
+                },
+            ],
+        }))
+        .unwrap();
+        let expected = format!("sha256:{}", hex::encode(Sha256::digest(&source)));
+        let incomplete = ce_v1_bytes(&[
+            ("image_manifest", &source),
+            ("provenance_manifest", &manifests[0]),
+            ("provenance_blob", &blobs[0]),
+        ]);
+        assert_eq!(
+            verify_provenance(&incomplete, &expected, &policy),
+            Err(SigstoreError::InvalidProvenance)
+        );
+
+        let complete = ce_v1_bytes(&[
+            ("image_manifest", &source),
+            ("provenance_manifest", &manifests[0]),
+            ("provenance_blob", &blobs[0]),
+            ("provenance_manifest", &manifests[1]),
+            ("provenance_blob", &blobs[1]),
+        ]);
+        verify_provenance(&complete, &expected, &policy).unwrap();
     }
 }
