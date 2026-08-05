@@ -90,6 +90,18 @@ fn test_deployment_context() -> DeploymentContextResponse {
 }
 
 #[test]
+fn create_unlock_mode_validation_rejects_auto_with_workaround() {
+    // auto is a post-claim transition (via `auto-unlock enable`), never a first-deploy
+    // mode — there is no owner seed to seal at create time.
+    let err = validate_create_unlock_mode("auto").unwrap_err();
+    assert!(
+        err.contains("auto-unlock enable"),
+        "error should name the workaround: {err}",
+    );
+    assert!(validate_create_unlock_mode("password").is_ok());
+}
+
+#[test]
 fn optional_app_name_uses_loaded_config() {
     let app_name = optional_app_name_from_config_result(Ok(test_app_config()))
         .expect("valid config")
