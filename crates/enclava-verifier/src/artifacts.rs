@@ -85,6 +85,7 @@ pub fn verify_workload_artifacts(
     workload_json: &[u8],
     trustee_policy_json: &[u8],
     cc_init_data_toml: &[u8],
+    snp_host_data: &[u8; 32],
     trusted_keyring_sha256: &[String],
     trusted_policy_signing_pubkeys: &[String],
 ) -> Result<VerifiedArtifacts, ArtifactError> {
@@ -153,7 +154,7 @@ pub fn verify_workload_artifacts(
         &artifacts.signed_policy_artifact,
         trusted_policy_signing_pubkeys,
     )?;
-    verify_relationships(&artifacts, cc_init_data_toml)?;
+    verify_relationships(&artifacts, cc_init_data_toml, snp_host_data)?;
     Ok(VerifiedArtifacts {
         descriptor: artifacts.descriptor_payload,
     })
@@ -213,6 +214,7 @@ fn verify_policy_artifact(
 fn verify_relationships(
     artifacts: &WorkloadArtifacts,
     cc_init_data_toml: &[u8],
+    snp_host_data: &[u8; 32],
 ) -> Result<(), ArtifactError> {
     let descriptor = &artifacts.descriptor_payload;
     let metadata = &artifacts.signed_policy_artifact.metadata;
@@ -238,6 +240,7 @@ fn verify_relationships(
         || descriptor.expected_agent_policy_hash != agent_hash
         || descriptor.expected_kbs_policy_hash != rego_hash
         || descriptor.expected_cc_init_data_hash != cc_hash
+        || snp_host_data != &cc_hash
     {
         return Err(ArtifactError::RelationshipMismatch);
     }
@@ -389,6 +392,7 @@ mod tests {
                 &serde_json::to_vec(&workload).unwrap(),
                 proof.trustee_policy_json,
                 proof.cc_init_data_toml,
+                &Sha256::digest(proof.cc_init_data_toml).into(),
                 &[],
                 &[],
             ),
@@ -402,10 +406,31 @@ mod tests {
                 &serde_json::to_vec(&workload).unwrap(),
                 proof.trustee_policy_json,
                 proof.cc_init_data_toml,
+                &Sha256::digest(proof.cc_init_data_toml).into(),
                 &[],
                 &[],
             ),
             Err(ArtifactError::RelationshipMismatch)
         ));
+    }
+
+    #[test]
+    fn relationships_bind_cc_init_data_to_snp_host_data() {
+        let encoded = include_str!("../tests/fixtures/prove-it-live.bundle.b64")
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        let bundle = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let proof = crate::parse_proof_bundle(&bundle).unwrap();
+        let artifacts: WorkloadArtifacts =
+            serde_json::from_slice(proof.workload_artifacts_json).unwrap();
+        let cc_hash: [u8; 32] = Sha256::digest(proof.cc_init_data_toml).into();
+        verify_relationships(&artifacts, proof.cc_init_data_toml, &cc_hash).unwrap();
+        assert_eq!(
+            verify_relationships(&artifacts, proof.cc_init_data_toml, &[0; 32]),
+            Err(ArtifactError::RelationshipMismatch)
+        );
     }
 }

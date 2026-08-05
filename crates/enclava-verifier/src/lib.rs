@@ -238,7 +238,8 @@ fn verify_evidence(
                 Err(AmdVerificationError::RevocationDataExpired) => "REVOCATION_DATA_EXPIRED",
                 Err(AmdVerificationError::RevocationDataStale) => "REVOCATION_DATA_STALE",
                 Err(AmdVerificationError::RevocationTimeMissing) => "REVOCATION_TIME_MISSING",
-                Err(AmdVerificationError::Revoked) => "VCEK_REVOKED",
+                Err(AmdVerificationError::AskRevoked) => "ASK_REVOKED",
+                Err(AmdVerificationError::VcekRevoked) => "VCEK_REVOKED",
                 _ => "AMD_REVOCATION_INVALID",
             },
         ));
@@ -302,13 +303,20 @@ fn verify_evidence(
             .any(|origin| origin == bundle.target_origin),
         "TARGET_ORIGIN_REJECTED",
     ));
-    match verify_workload_artifacts(
-        bundle.workload_artifacts_json,
-        bundle.trustee_policy_json,
-        bundle.cc_init_data_toml,
-        &policy.trusted_org_keyring_sha256,
-        &policy.trusted_policy_signing_pubkeys,
-    ) {
+    let artifacts = report
+        .as_ref()
+        .map_err(|_| ArtifactError::RelationshipMismatch)
+        .and_then(|report| {
+            verify_workload_artifacts(
+                bundle.workload_artifacts_json,
+                bundle.trustee_policy_json,
+                bundle.cc_init_data_toml,
+                &report.host_data,
+                &policy.trusted_org_keyring_sha256,
+                &policy.trusted_policy_signing_pubkeys,
+            )
+        });
+    match artifacts {
         Ok(artifacts) => {
             checks.push(simple_check(
                 "artifacts.signatures",

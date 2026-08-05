@@ -34,8 +34,10 @@ pub enum AmdVerificationError {
     CertificateTimeInvalid,
     #[error("AMD revocation list is invalid")]
     InvalidRevocationList,
+    #[error("AMD ASK is revoked")]
+    AskRevoked,
     #[error("AMD VCEK is revoked")]
-    Revoked,
+    VcekRevoked,
     #[error("AMD revocation data has no signed nextUpdate")]
     RevocationTimeMissing,
     #[error("AMD revocation data is stale")]
@@ -81,11 +83,17 @@ pub fn verify_amd_revocation(
         .signature
         .as_bytes()
         .ok_or(AmdVerificationError::InvalidRevocationList)?;
-    if !verify_rsa_certificate_list_signature(&ark, &signed, signature)
-        && !verify_rsa_certificate_list_signature(&ask, &signed, signature)
+    let (revoked_serial, revokes_ask) = if crl.tbs_cert_list.issuer == ark.tbs_certificate.subject
+        && verify_rsa_certificate_list_signature(&ark, &signed, signature)
     {
+        (&ask.tbs_certificate.serial_number, true)
+    } else if crl.tbs_cert_list.issuer == ask.tbs_certificate.subject
+        && verify_rsa_certificate_list_signature(&ask, &signed, signature)
+    {
+        (&vcek.tbs_certificate.serial_number, false)
+    } else {
         return Err(AmdVerificationError::InvalidRevocationList);
-    }
+    };
     verify_revocation_times(&crl, now_unix_seconds, maximum_age_seconds)?;
     if crl
         .tbs_cert_list
@@ -94,10 +102,14 @@ pub fn verify_amd_revocation(
         .is_some_and(|revoked| {
             revoked
                 .iter()
-                .any(|entry| entry.serial_number == vcek.tbs_certificate.serial_number)
+                .any(|entry| entry.serial_number == *revoked_serial)
         })
     {
-        return Err(AmdVerificationError::Revoked);
+        return Err(if revokes_ask {
+            AmdVerificationError::AskRevoked
+        } else {
+            AmdVerificationError::VcekRevoked
+        });
     }
     Ok(())
 }
@@ -467,8 +479,8 @@ mod tests {
             Err(AmdVerificationError::RevocationTimeMissing)
         );
 
-        let mut revoked_vcek = Certificate::from_der(&vcek).unwrap();
-        revoked_vcek.tbs_certificate.serial_number = parsed_crl
+        let mut revoked_ask = Certificate::from_der(&ask).unwrap();
+        revoked_ask.tbs_certificate.serial_number = parsed_crl
             .tbs_cert_list
             .revoked_certificates
             .as_ref()
@@ -478,13 +490,13 @@ mod tests {
         assert_eq!(
             verify_amd_revocation(
                 &ark,
-                &ask,
-                &revoked_vcek.to_der().unwrap(),
+                &revoked_ask.to_der().unwrap(),
+                &vcek,
                 &crl,
                 1_785_844_800,
                 30 * 86_400,
             ),
-            Err(AmdVerificationError::Revoked)
+            Err(AmdVerificationError::AskRevoked)
         );
     }
 }

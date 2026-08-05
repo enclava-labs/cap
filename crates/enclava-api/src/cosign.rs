@@ -490,6 +490,7 @@ async fn pull_signature_objects(
     accepted_media_types: &[&str],
 ) -> Result<Vec<(Vec<u8>, Vec<Vec<u8>>)>, CosignError> {
     if let Ok(object) = pull_oci_object(client, legacy_signature, auth, accepted_media_types).await
+        && object.1.iter().any(|blob| is_portable_signature_blob(blob))
     {
         return Ok(vec![object]);
     }
@@ -504,14 +505,18 @@ async fn pull_signature_objects(
             source.repository().to_string(),
             descriptor.digest,
         );
-        let object = pull_oci_object(client, &reference, auth, accepted_media_types).await?;
-        let manifest: serde_json::Value = serde_json::from_slice(&object.0).map_err(|error| {
-            CosignError::VerificationFailed(format!("invalid signature manifest: {error}"))
-        })?;
+        let Ok(object) = pull_oci_object(client, &reference, auth, accepted_media_types).await
+        else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&object.0) else {
+            continue;
+        };
         if manifest
             .pointer("/annotations/dev.sigstore.bundle.predicateType")
             .and_then(serde_json::Value::as_str)
             == Some("https://sigstore.dev/cosign/sign/v1")
+            && object.1.iter().any(|blob| is_portable_signature_blob(blob))
         {
             objects.push(object);
         }
@@ -522,6 +527,19 @@ async fn pull_signature_objects(
         ));
     }
     Ok(objects)
+}
+
+fn is_portable_signature_blob(blob: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(blob).is_ok_and(|bundle| {
+        bundle.get("dsseEnvelope").is_some()
+            && bundle
+                .pointer("/verificationMaterial/certificate/rawBytes")
+                .is_some()
+            && bundle
+                .pointer("/verificationMaterial/tlogEntries")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|entries| !entries.is_empty())
+    })
 }
 
 async fn pull_provenance_objects(
@@ -1029,6 +1047,16 @@ mod tests {
             parse_image_parts("registry.example:5000/org/repo:tag").unwrap(),
             ("registry.example:5000".to_string(), "org/repo".to_string())
         );
+    }
+
+    #[test]
+    fn portable_signature_blobs_require_bundle_material() {
+        assert!(!is_portable_signature_blob(
+            br#"{"critical":{"image":{"docker-manifest-digest":"sha256:00"}}}"#
+        ));
+        assert!(is_portable_signature_blob(
+            br#"{"dsseEnvelope":{},"verificationMaterial":{"certificate":{"rawBytes":"AA=="},"tlogEntries":[{}]}}"#
+        ));
     }
 
     #[test]
