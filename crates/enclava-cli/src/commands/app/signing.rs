@@ -146,23 +146,37 @@ pub(crate) async fn ensure_manual_deploy_keyring(
     let owner_key = keys::derive_org_owner_key(user_id, org_id, &seed)?;
     register_public_key(api, &owner_key.public).await?;
 
+    let trusted_owner = load_trusted_owner(&org_id)?;
     if let (Some(trusted_owner), Ok(local_envelope)) =
-        (load_trusted_owner(&org_id)?, load_keyring_envelope(&org_id))
+        (trusted_owner.as_ref(), load_keyring_envelope(&org_id))
     {
-        verify_keyring(&local_envelope, &trusted_owner)?;
+        verify_keyring(&local_envelope, trusted_owner)?;
     }
 
     match api.get_org_keyring(&org_name).await {
         Ok(response) => {
             let envelope = keyring_envelope_from_response(response)?;
-            if envelope.signing_pubkey.to_bytes() != owner_key.public.to_bytes() {
+            if trusted_owner.is_none()
+                && envelope.signing_pubkey.to_bytes() != owner_key.public.to_bytes()
+            {
                 return Err(
                     "remote org keyring is owned by a different key; restore the matching recovery seed or use org keyring commands"
                         .into(),
                 );
             }
-            verify_keyring(&envelope, &owner_key.public)?;
-            store_trusted_owner(&org_id, &owner_key.public)?;
+            let keyring = verify_keyring(
+                &envelope,
+                trusted_owner.as_ref().unwrap_or(&owner_key.public),
+            )?;
+            if !member_allows_deploy(keyring, &owner_key.public) {
+                return Err(
+                    "current CLI signing key is not an owner/admin/deployer in the org keyring"
+                        .into(),
+                );
+            }
+            if trusted_owner.is_none() {
+                store_trusted_owner(&org_id, &owner_key.public)?;
+            }
             store_keyring_envelope(&org_id, &envelope)?;
         }
         Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {

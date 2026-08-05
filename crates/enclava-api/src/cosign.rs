@@ -443,6 +443,7 @@ pub async fn fetch_portable_verification_material(
     let provenance_objects = pull_provenance_objects(
         &client,
         &source_manifest,
+        image_digest,
         &registry,
         &repository,
         &auth,
@@ -570,6 +571,7 @@ fn is_portable_signature_blob(blob: &[u8]) -> bool {
 async fn pull_provenance_objects(
     client: &oci_client::client::Client,
     source_manifest: &[u8],
+    image_digest: &str,
     registry: &str,
     repository: &str,
     auth: &oci_client::secrets::RegistryAuth,
@@ -599,7 +601,11 @@ async fn pull_provenance_objects(
                 )
             })
             .collect::<Vec<_>>(),
-        OciManifest::Image(_) => Vec::new(),
+        OciManifest::Image(_) => vec![oci_client::Reference::with_tag(
+            registry.to_string(),
+            repository.to_string(),
+            digest_to_cosign_tag(image_digest, "att"),
+        )],
     };
     if references.is_empty() {
         return Err(CosignError::VerificationFailed(
