@@ -146,8 +146,9 @@ pub struct DeploymentDescriptor {
     #[serde(default)]
     pub independent_verification: bool,
 
-    /// Legacy descriptors contain a 32-byte prefix; v2 contains the complete
-    /// 48-byte SNP launch measurement.
+    /// Legacy descriptors retain their signed 32-byte prefix for migration
+    /// compatibility; v2 descriptors contain all 48 bytes. Independent trust
+    /// policy always evaluates the separate full-width `amd.measurement` check.
     #[serde(with = "hex_measurement")]
     pub expected_firmware_measurement: FirmwareMeasurement,
     pub expected_runtime_class: String,

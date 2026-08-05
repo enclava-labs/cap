@@ -3,6 +3,9 @@ name = "enclava-verifier"
 version = "0.1.0"
 edition.workspace = true
 
+[features]
+fuzzing = []
+
 [dependencies]
 base64 = { workspace = true }
 chrono = { workspace = true }

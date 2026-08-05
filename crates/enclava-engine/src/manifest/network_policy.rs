@@ -251,6 +251,9 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
     };
 
     if let Some((service_name, namespace)) = kubernetes_service_name(authority.host) {
+        // The broker may be any explicitly configured internal Service (for
+        // example a standalone CAP candidate), not only one literally named
+        // `cap-api`. The URL remains platform-supplied, never tenant input.
         let mut rules = vec![json!({
             "toServices": [
                 {
@@ -320,6 +323,9 @@ fn cap_api_service_for_attestation<'a>(
     attestation: &'a AttestationConfig,
     api_url: &'a str,
 ) -> Option<(&'a str, &'a str)> {
+    // `trustee_policy_url` is intentionally absent: independent-verification
+    // deployments hand the policy to init as a local file URI. It is not a
+    // CAP network dependency and must not select CAP ingress policy.
     [
         attestation.tls_certificate_broker_url.as_deref(),
         attestation.workload_artifacts_url.as_deref(),

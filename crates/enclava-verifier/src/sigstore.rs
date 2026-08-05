@@ -62,18 +62,8 @@ pub fn verify_sigstore_and_provenance(
         .and_then(Value::as_array)
         .filter(|entries| !entries.is_empty())
         .ok_or(SigstoreError::Malformed)?;
-    let integrated_time = entries
-        .iter()
-        .filter_map(|entry| {
-            pointer_str(entry, "/integratedTime")
-                .ok()?
-                .parse::<u64>()
-                .ok()
-        })
-        .min()
-        .ok_or(SigstoreError::Malformed)?;
-    let certificate = verify_fulcio_chain(&certificate_der, integrated_time, policy)?;
-    verify_identity(&certificate, policy)?;
+    let (certificate, _) =
+        verify_transparency_and_fulcio(entries, &payload, signature_b64, &certificate_der, policy)?;
     let pae = dsse_pae(payload_type, &payload);
     verify_p256_spki(
         &certificate
@@ -89,20 +79,6 @@ pub fn verify_sigstore_and_provenance(
         serde_json::from_slice(&payload).map_err(|_| SigstoreError::Malformed)?;
     if !statement_has_subject(&statement, expected_image_digest) {
         return Err(SigstoreError::InvalidSignature);
-    }
-    let mut transparency_error = SigstoreError::InvalidTransparency;
-    let mut transparency_valid = false;
-    for entry in entries {
-        match verify_tlog_entry(entry, &payload, signature_b64, &certificate_der, policy) {
-            Ok(()) => {
-                transparency_valid = true;
-                break;
-            }
-            Err(error) => transparency_error = error,
-        }
-    }
-    if !transparency_valid {
-        return Err(transparency_error);
     }
     verify_provenance(provenance_material, expected_image_digest, policy)
 }
@@ -244,7 +220,10 @@ fn verify_tlog_entry(
     signature_b64: &str,
     certificate_der: &[u8],
     policy: &SigstorePolicy,
-) -> Result<(), SigstoreError> {
+) -> Result<u64, SigstoreError> {
+    let integrated_time = pointer_str(entry, "/integratedTime")?
+        .parse::<u64>()
+        .map_err(|_| SigstoreError::Malformed)?;
     let Ok(body) = pointer_str(entry, "/canonicalizedBody").and_then(decode_b64) else {
         return Err(SigstoreError::InvalidTransparency);
     };
@@ -272,7 +251,7 @@ fn verify_tlog_entry(
         .collect::<Vec<_>>();
     let set_payload = serde_json::json!({
         "body": base64::engine::general_purpose::STANDARD.encode(&body),
-        "integratedTime": pointer_str(entry, "/integratedTime").ok().and_then(|value| value.parse::<i64>().ok()),
+        "integratedTime": i64::try_from(integrated_time).ok(),
         "logID": pointer_str(entry, "/logId/keyId").ok().and_then(|value| decode_b64(value).ok()).map(hex::encode),
         "logIndex": pointer_str(entry, "/logIndex").ok().and_then(|value| value.parse::<i64>().ok()),
     });
@@ -301,8 +280,36 @@ fn verify_tlog_entry(
         proof,
         &rekor_keys,
     )
-    .then_some(())
+    .then_some(integrated_time)
     .ok_or(SigstoreError::InvalidCheckpoint)
+}
+
+fn verify_transparency_and_fulcio(
+    entries: &[Value],
+    payload: &[u8],
+    signature_b64: &str,
+    certificate_der: &[u8],
+    policy: &SigstorePolicy,
+) -> Result<(Certificate, u64), SigstoreError> {
+    let mut transparency_error = SigstoreError::InvalidTransparency;
+    let mut certificate_error = None;
+    for entry in entries {
+        match verify_tlog_entry(entry, payload, signature_b64, certificate_der, policy) {
+            Ok(integrated_time) => {
+                match verify_fulcio_chain(certificate_der, integrated_time, policy).and_then(
+                    |certificate| {
+                        verify_identity(&certificate, policy)?;
+                        Ok(certificate)
+                    },
+                ) {
+                    Ok(certificate) => return Ok((certificate, integrated_time)),
+                    Err(error) => certificate_error = Some(error),
+                }
+            }
+            Err(error) => transparency_error = error,
+        }
+    }
+    Err(certificate_error.unwrap_or(transparency_error))
 }
 
 fn verify_inclusion_proof(proof: &Value, body: &[u8]) -> bool {
@@ -538,5 +545,51 @@ mod tests {
     fn der_string_rejects_trailing_bytes() {
         assert_eq!(der_string(b"\x0c\x03abc"), Some("abc".into()));
         assert_eq!(der_string(b"\x0c\x03abc!"), None);
+    }
+
+    #[test]
+    fn certificate_time_comes_from_the_verified_tlog_entry() {
+        let encoded = include_str!("../tests/fixtures/prove-it-live.bundle.b64")
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        let bundle_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let proof = crate::parse_proof_bundle(&bundle_bytes).unwrap();
+        let policy = crate::TrustPolicy::parse(include_bytes!(
+            "../tests/fixtures/prove-it-live.policy.json"
+        ))
+        .unwrap();
+        let signature_blob = portable_blob(proof.sigstore_material, "signature_blob").unwrap();
+        let bundle: Value = serde_json::from_slice(signature_blob).unwrap();
+        let certificate_der =
+            decode_b64(pointer_str(&bundle, "/verificationMaterial/certificate/rawBytes").unwrap())
+                .unwrap();
+        let dsse = bundle.get("dsseEnvelope").unwrap();
+        let payload = decode_b64(pointer_str(dsse, "/payload").unwrap()).unwrap();
+        let signature_b64 = pointer_str(dsse, "/signatures/0/sig").unwrap();
+        let real_entry = bundle
+            .pointer("/verificationMaterial/tlogEntries/0")
+            .unwrap()
+            .clone();
+        let real_time = pointer_str(&real_entry, "/integratedTime")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        let mut fabricated = real_entry.clone();
+        fabricated["integratedTime"] = Value::String("1".into());
+        fabricated["inclusionPromise"]["signedEntryTimestamp"] =
+            Value::String(base64::engine::general_purpose::STANDARD.encode([0; 64]));
+
+        let (_, selected_time) = verify_transparency_and_fulcio(
+            &[fabricated, real_entry],
+            &payload,
+            signature_b64,
+            &certificate_der,
+            &policy.sigstore,
+        )
+        .unwrap();
+        assert_eq!(selected_time, real_time);
     }
 }

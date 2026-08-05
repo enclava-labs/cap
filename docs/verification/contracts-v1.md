@@ -47,6 +47,11 @@ origin/deployment identity; image digests; runtime/sidecar/artifact relationship
 clock-skew and signed revocation-freshness requirements; and whether
 `transport.tls_channel_spki` is required. Exact policy bytes are hashed as supplied.
 
+The policy's `amd.measurement` values are always the complete 48-byte SNP launch measurement. A
+legacy signed deployment descriptor may carry and compare only its historical 32-byte prefix so
+old descriptor signatures remain valid during migration; that compatibility check cannot replace
+the full-width policy check required for an independent `PASS`.
+
 `appraiser.keys` independently pins each accepted Ed25519 key by identifier, public key, validity
 interval, and revocation status. Receipt lifetime and clock-skew bounds are policy inputs. A
 response-carried key is informational and must exactly match an independent pin.

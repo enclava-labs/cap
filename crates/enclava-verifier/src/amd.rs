@@ -304,7 +304,7 @@ fn verify_rsa_pss_sha384(
     let (masked_db, hash_and_trailer) = encoded.split_at(db_len);
     let hash = &hash_and_trailer[..HASH_BYTES];
     let unused_bits = encoded_len * 8 - encoded_bits;
-    if masked_db[0] >> (8 - unused_bits) != 0 {
+    if unused_bits > 0 && masked_db[0] >> (8 - unused_bits) != 0 {
         return false;
     }
     let mask = mgf1_sha384(hash, db_len);
@@ -326,6 +326,17 @@ fn verify_rsa_pss_sha384(
         .chain_update(salt)
         .finalize();
     hash == expected.as_slice()
+}
+
+#[doc(hidden)]
+#[cfg(feature = "fuzzing")]
+pub fn verify_rsa_pss_sha384_for_fuzzing(
+    modulus: &[u8],
+    exponent: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    verify_rsa_pss_sha384(modulus, exponent, message, signature)
 }
 
 fn mgf1_sha384(seed: &[u8], len: usize) -> Vec<u8> {
@@ -414,6 +425,20 @@ mod tests {
             verify_vcek_report_binding(&parse_snp_report(&report_bytes).unwrap(), &vcek),
             Err(AmdVerificationError::VcekReportMismatch)
         );
+    }
+
+    #[test]
+    fn rsa_pss_rejects_zero_unused_bits_without_panicking() {
+        let mut modulus = vec![0; 129];
+        modulus[0] = 1; // 1025 bits, so the encoded message has zero unused bits.
+        let mut signature = vec![0; 129];
+        signature[128] = 0xbc;
+        assert!(!verify_rsa_pss_sha384(
+            &modulus,
+            &[1],
+            b"message",
+            &signature
+        ));
     }
 
     #[test]

@@ -11,6 +11,8 @@ mod sigstore;
 mod snp;
 mod supply_chain;
 
+#[cfg(feature = "fuzzing")]
+pub use amd::verify_rsa_pss_sha384_for_fuzzing;
 pub use amd::{
     AmdVerificationError, verify_amd_certificate_chain, verify_amd_revocation,
     verify_snp_signature, verify_vcek_report_binding,
@@ -408,18 +410,67 @@ fn verify_evidence(
         }
         Err(error) => {
             warnings.push(error.to_string());
-            checks.push(simple_check(
-                "artifacts.signatures",
-                false,
-                "ARTIFACT_SIGNATURE_INVALID",
-            ));
-            checks.push(simple_check(
-                "artifacts.relationships",
-                false,
-                "ARTIFACT_RELATIONSHIP_INVALID",
-            ));
+            checks.extend(artifact_failure_checks(&error));
         }
     }
+}
+
+fn artifact_failure_checks(error: &ArtifactError) -> [CheckResult; 2] {
+    let (signature_outcome, signature_reason, relationship_outcome, relationship_reason) =
+        match error {
+            ArtifactError::RelationshipMismatch => (
+                CheckOutcome::Skipped,
+                "ARTIFACT_SIGNATURE_NOT_CHECKED",
+                CheckOutcome::Fail,
+                "ARTIFACT_RELATIONSHIP_INVALID",
+            ),
+            ArtifactError::Malformed => (
+                CheckOutcome::Fail,
+                "MALFORMED_WORKLOAD_ARTIFACTS",
+                CheckOutcome::Skipped,
+                "ARTIFACT_RELATIONSHIP_NOT_CHECKED",
+            ),
+            ArtifactError::InvalidCustomerSignature => (
+                CheckOutcome::Fail,
+                "CUSTOMER_SIGNATURE_INVALID",
+                CheckOutcome::Skipped,
+                "ARTIFACT_RELATIONSHIP_NOT_CHECKED",
+            ),
+            ArtifactError::UntrustedCustomerAuthority => (
+                CheckOutcome::Fail,
+                "CUSTOMER_AUTHORITY_UNTRUSTED",
+                CheckOutcome::Skipped,
+                "ARTIFACT_RELATIONSHIP_NOT_CHECKED",
+            ),
+            ArtifactError::InvalidPolicySignature => (
+                CheckOutcome::Fail,
+                "POLICY_ARTIFACT_SIGNATURE_INVALID",
+                CheckOutcome::Skipped,
+                "ARTIFACT_RELATIONSHIP_NOT_CHECKED",
+            ),
+            ArtifactError::UntrustedPolicySigner => (
+                CheckOutcome::Fail,
+                "POLICY_SIGNER_UNTRUSTED",
+                CheckOutcome::Skipped,
+                "ARTIFACT_RELATIONSHIP_NOT_CHECKED",
+            ),
+        };
+    [
+        CheckResult {
+            id: "artifacts.signatures".into(),
+            outcome: signature_outcome,
+            observed: None,
+            expected: None,
+            reason_code: signature_reason.into(),
+        },
+        CheckResult {
+            id: "artifacts.relationships".into(),
+            outcome: relationship_outcome,
+            observed: None,
+            expected: None,
+            reason_code: relationship_reason.into(),
+        },
+    ]
 }
 
 fn simple_check(id: &str, passes: bool, reason: &str) -> CheckResult {
@@ -527,5 +578,21 @@ mod tests {
             hex::encode(canonical_result_sha256(&result)),
             "540e8973f6c70712f986c9bba3ece9e05b92f4765551020618ae08584b1d88f3"
         );
+    }
+
+    #[test]
+    fn artifact_failures_identify_the_failed_check() {
+        let relationship = artifact_failure_checks(&ArtifactError::RelationshipMismatch);
+        assert_eq!(relationship[0].outcome, CheckOutcome::Skipped);
+        assert_eq!(relationship[1].outcome, CheckOutcome::Fail);
+        assert_eq!(relationship[1].reason_code, "ARTIFACT_RELATIONSHIP_INVALID");
+
+        let signature = artifact_failure_checks(&ArtifactError::InvalidPolicySignature);
+        assert_eq!(signature[0].outcome, CheckOutcome::Fail);
+        assert_eq!(
+            signature[0].reason_code,
+            "POLICY_ARTIFACT_SIGNATURE_INVALID"
+        );
+        assert_eq!(signature[1].outcome, CheckOutcome::Skipped);
     }
 }
