@@ -901,7 +901,50 @@ fn sync_caddy_runtime_back(cfg: &Config) -> Result<()> {
     let persistent = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
     let runtime = Path::new(CADDY_RUNTIME_HANDOFF_PATH);
     sync_dir_contents(runtime, &persistent)
-        .with_context(|| format!("copying {} to {}", runtime.display(), persistent.display()))
+        .with_context(|| format!("copying {} to {}", runtime.display(), persistent.display()))?;
+    publish_caddy_runtime_certificate(runtime, Path::new(PUBLIC_TLS_CERT_HANDOFF_PATH))
+}
+
+fn publish_caddy_runtime_certificate(runtime: &Path, destination: &Path) -> Result<()> {
+    let certificates = runtime.join("certificates");
+    let Some(source) = newest_certificate(&certificates)? else {
+        return Ok(());
+    };
+    publish_public_tls_certificate(&source, destination)
+}
+
+fn newest_certificate(directory: &Path) -> Result<Option<PathBuf>> {
+    if !directory.is_dir() {
+        return Ok(None);
+    }
+    let mut newest = None;
+    for entry in
+        std::fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading entry in {}", directory.display()))?;
+        let ty = entry
+            .file_type()
+            .with_context(|| format!("reading file type for {}", entry.path().display()))?;
+        let path = entry.path();
+        if ty.is_dir() {
+            if let Some(candidate) = newest_certificate(&path)? {
+                newest = newer_certificate(newest, candidate)?;
+            }
+        } else if ty.is_file() && path.extension().is_some_and(|ext| ext == "crt") {
+            newest = newer_certificate(newest, path)?;
+        }
+    }
+    Ok(newest)
+}
+
+fn newer_certificate(current: Option<PathBuf>, candidate: PathBuf) -> Result<Option<PathBuf>> {
+    let candidate_modified = std::fs::metadata(&candidate)?.modified()?;
+    match current {
+        Some(current) if std::fs::metadata(&current)?.modified()? > candidate_modified => {
+            Ok(Some(current))
+        }
+        _ => Ok(Some(candidate)),
+    }
 }
 
 fn sync_dir_contents(src: &Path, dst: &Path) -> Result<()> {
