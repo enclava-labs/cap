@@ -85,7 +85,7 @@ async fn apply_dynamic_resource(
     let dyn_obj = value_to_dynamic_object(value, ar)?;
     let name = dyn_obj.metadata.name.as_deref().unwrap_or("<unnamed>");
     let api: Api<DynamicObject> = Api::namespaced_with(engine.client().clone(), namespace, ar);
-    let patched = apply_resource(engine, &api, &dyn_obj, generation, false).await?;
+    let patched = apply_resource(engine, &api, &dyn_obj, generation, false, false).await?;
 
     tracing::info!(
         namespace = %namespace,

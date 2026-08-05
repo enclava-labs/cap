@@ -444,6 +444,7 @@ fn load_attestation_config(
         "TLS_CERTIFICATE_BROKER_URL",
         trustee_policy_read_available && caddy_tls_mode == CaddyTlsMode::Dns01Broker,
     )?;
+    let amd_kds_base_url = load_url_env("AMD_KDS_BASE_URL", true)?;
     let trustee_policy_url = load_url_env("TRUSTEE_POLICY_URL", trustee_policy_read_available)?;
     let release_pubkey =
         platform_release.map(|release| release.signing_service_pubkey_hex.as_str());
@@ -466,11 +467,13 @@ fn load_attestation_config(
         trustee_policy_read_available,
         workload_artifacts_url,
         tls_certificate_broker_url,
+        amd_kds_base_url,
         trustee_policy_url,
         local_workload_artifacts_json: None,
         local_trustee_policy_json: None,
         platform_trustee_policy_pubkey_hex,
         signing_service_pubkey_hex,
+        verification_material: None,
     }
     .into())
 }

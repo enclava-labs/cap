@@ -984,6 +984,17 @@ async fn deploy_app_candidate(
                 Json(serde_json::json!({"error": "cosign_verification_failed"})),
             )
         })?;
+    let portable_material =
+        crate::cosign::fetch_portable_verification_material(&body.image, &image_digest)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        serde_json::json!({"error": "portable_verification_material_unavailable"}),
+                    ),
+                )
+            })?;
 
     // Fetch provenance attestation and SBOM if available (non-fatal if missing).
     let (provenance, sbom) =
@@ -1291,8 +1302,8 @@ async fn deploy_app_candidate(
     // verification result, not hardcoded.
     let cosign_verified = true;
     sqlx::query(
-        "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest, cosign_verified, provenance_attestation, sbom, external_id, source_provider, source_repository)
-         VALUES ($1, $2, $3, 'api', $4, $5, $6, $7, $8, $9, $10, $11)",
+        "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest, cosign_verified, provenance_attestation, sbom, external_id, source_provider, source_repository, sigstore_material, provenance_oci_material)
+         VALUES ($1, $2, $3, 'api', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(deploy_id)
     .bind(auth.org_id)
@@ -1305,6 +1316,8 @@ async fn deploy_app_candidate(
     .bind(body.external_id.as_deref())
     .bind(source_provider)
     .bind(body.source_repository.as_deref())
+    .bind(&portable_material.sigstore)
+    .bind(&portable_material.provenance_oci)
     .execute(&mut *tx)
     .await
     .map_err(|e| {

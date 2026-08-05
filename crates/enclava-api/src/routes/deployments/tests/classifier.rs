@@ -217,11 +217,13 @@ fn attestation_config() -> AttestationConfig {
             trustee_policy_read_available: false,
             workload_artifacts_url: None,
             tls_certificate_broker_url: None,
+            amd_kds_base_url: None,
             trustee_policy_url: None,
             local_workload_artifacts_json: None,
             local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
+            verification_material: None,
         }
 }
 
@@ -284,7 +286,8 @@ fn deployment_descriptor_for_security_profile_tests()
             caddy_digest: "sha256:2222".to_string(),
         },
         api_signing_pubkey: "api-pubkey".to_string(),
-        expected_firmware_measurement: [3; 32],
+        independent_verification: true,
+        expected_firmware_measurement: [3; 32].into(),
         expected_runtime_class: "kata-qemu-snp".to_string(),
         kbs_resource_path: "default/cap-org-app-tls-owner".to_string(),
         unlock_mode: "password".to_string(),

@@ -4,6 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
 };
+use base64::{Engine as _, engine::general_purpose};
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -26,6 +27,8 @@ const CONFIG_TOKEN_HARD_ATTEMPT_SECONDS: u64 = 30;
 const CONFIG_TOKEN_CANCELLATION_SECONDS: u64 = 5;
 const CONFIG_TOKEN_RECEIPT_LEASE_SECONDS: i64 = 60;
 const CONFIG_TOKEN_SAFE_RETURN_SECONDS: i64 = CONFIG_TOKEN_HARD_ATTEMPT_SECONDS as i64;
+const PROOF_BUNDLE_MEDIA_TYPE: &str = "application/vnd.enclava.proof-bundle.v1";
+const MAX_PROOF_BUNDLE_BYTES: usize = 1_048_576;
 
 #[derive(Debug, sqlx::FromRow)]
 struct IdempotencyRow {
@@ -3423,6 +3426,170 @@ pub async fn get_paas_app_logs(
         return Err(json_error(StatusCode::FORBIDDEN, "scope_not_allowed"));
     }
     crate::routes::logs::paas_app_logs(auth, state, app_name, query).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InternalProofBundleQuery {
+    nonce: String,
+    origin: String,
+}
+
+pub async fn get_paas_proof_bundle(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Path((paas_org_id, app_name)): Path<(String, String)>,
+    Query(query): Query<InternalProofBundleQuery>,
+) -> Result<Response, InternalRouteError> {
+    validate_external_id(&paas_org_id, "paas_org_id")?;
+    crate::routes::apps::validate_app_name(&app_name)
+        .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
+    let nonce: [u8; 32] = general_purpose::URL_SAFE_NO_PAD
+        .decode(&query.nonce)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "invalid_nonce"))?;
+    let canonical_nonce = general_purpose::URL_SAFE_NO_PAD.encode(nonce);
+    if canonical_nonce != query.nonce {
+        return Err(json_error(StatusCode::BAD_REQUEST, "invalid_nonce"));
+    }
+
+    let (cap_org_id, _, _) = mapped_cap_org(&state, &paas_org_id).await?;
+    let row: Option<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT a.id, COALESCE(job.artifact_deployment_id, d.id)
+           FROM apps a
+           JOIN LATERAL (
+               SELECT id FROM deployments
+                WHERE app_id = a.id AND status = 'healthy'
+                ORDER BY completed_at DESC NULLS LAST, created_at DESC
+                LIMIT 1
+           ) d ON true
+           LEFT JOIN LATERAL (
+               SELECT artifact_deployment_id
+                 FROM deployment_apply_jobs
+                WHERE app_id = a.id AND deployment_id = d.id
+                ORDER BY generation DESC
+                LIMIT 1
+           ) job ON true
+          WHERE a.org_id = $1 AND a.name = $2",
+    )
+    .bind(cap_org_id)
+    .bind(&app_name)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| db_error())?;
+    let (app_id, deployment_id) =
+        row.ok_or_else(|| json_error(StatusCode::NOT_FOUND, "app_or_deployment_not_found"))?;
+    let artifacts = crate::signing_service::load_workload_artifacts_for_deployment(
+        &state.db,
+        app_id,
+        deployment_id,
+    )
+    .await
+    .map_err(|_| db_error())?
+    .ok_or_else(|| json_error(StatusCode::CONFLICT, "workload_artifacts_not_found"))?;
+    let mut allowed_domains = vec![
+        artifacts.descriptor.app_domain.as_str(),
+        artifacts.descriptor.tee_domain.as_str(),
+    ];
+    allowed_domains.extend(
+        artifacts
+            .descriptor
+            .custom_domains
+            .iter()
+            .map(String::as_str),
+    );
+    let origin = validated_proof_origin(&query.origin, &allowed_domains)
+        .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "origin_not_allowed"))?;
+    let domain = reqwest::Url::parse(&origin)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .ok_or_else(|| json_error(StatusCode::BAD_REQUEST, "origin_not_allowed"))?;
+    let client =
+        match crate::edge::resolve_gateway_address(&app_name, &artifacts.descriptor.namespace)
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(ip) => crate::routes::logs::build_resolved_tenant_tee_http_client(
+                &domain,
+                std::net::SocketAddr::new(ip, 443),
+            )
+            .unwrap_or_else(|_| state.tee_http_client.clone()),
+            None => state.tee_http_client.clone(),
+        };
+    let url = format!("{origin}/.well-known/confidential/proof-bundle?nonce={canonical_nonce}");
+    let upstream = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        client
+            .get(url)
+            .header(header::ACCEPT, PROOF_BUNDLE_MEDIA_TYPE)
+            .timeout(std::time::Duration::from_secs(20))
+            .send(),
+    )
+    .await
+    .map_err(|_| json_error(StatusCode::GATEWAY_TIMEOUT, "proof_bundle_timeout"))?
+    .map_err(|_| json_error(StatusCode::BAD_GATEWAY, "proof_bundle_unavailable"))?;
+    if !upstream.status().is_success() {
+        let status = if upstream.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        return Err(json_error(status, "proof_bundle_unavailable"));
+    }
+    if upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some(PROOF_BUNDLE_MEDIA_TYPE)
+        || upstream.content_length().unwrap_or(0) > MAX_PROOF_BUNDLE_BYTES as u64
+    {
+        return Err(json_error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_proof_bundle_response",
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut stream = upstream.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|_| json_error(StatusCode::BAD_GATEWAY, "proof_bundle_unavailable"))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROOF_BUNDLE_BYTES {
+            return Err(json_error(
+                StatusCode::BAD_GATEWAY,
+                "proof_bundle_too_large",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, PROOF_BUNDLE_MEDIA_TYPE),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+fn validated_proof_origin(value: &str, allowed_domains: &[&str]) -> Option<String> {
+    let origin = reqwest::Url::parse(value).ok()?;
+    if origin.scheme() != "https"
+        || origin.username() != ""
+        || origin.password().is_some()
+        || origin.port_or_known_default() != Some(443)
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        return None;
+    }
+    let host = origin.host_str()?;
+    allowed_domains
+        .contains(&host)
+        .then(|| format!("https://{host}"))
 }
 
 pub async fn list_paas_members(
@@ -9394,7 +9561,25 @@ mod tests {
 
 #[cfg(test)]
 mod confidentiality_tests {
-    use super::project_internal_deployment_error;
+    use super::{project_internal_deployment_error, validated_proof_origin};
+
+    #[test]
+    fn proof_origin_accepts_only_bare_signed_https_domains() {
+        let allowed = ["app.example", "custom.example"];
+        assert_eq!(
+            validated_proof_origin("https://custom.example", &allowed).as_deref(),
+            Some("https://custom.example")
+        );
+        for rejected in [
+            "http://app.example",
+            "https://app.example.evil",
+            "https://app.example/path",
+            "https://user@app.example",
+            "https://app.example:8443",
+        ] {
+            assert_eq!(validated_proof_origin(rejected, &allowed), None);
+        }
+    }
 
     #[test]
     fn stored_internal_deployment_errors_are_projected_without_plaintext() {

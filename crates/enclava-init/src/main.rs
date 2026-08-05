@@ -22,6 +22,7 @@ const DEFAULT_KBS_FETCH_ATTEMPTS: u32 = 30;
 const DEFAULT_KBS_FETCH_RETRY_SLEEP_SECONDS: u64 = 2;
 const DEFAULT_KBS_FETCH_REQUEST_TIMEOUT_SECONDS: u64 = 10;
 const CADDY_RUNTIME_HANDOFF_PATH: &str = "/run/enclava/caddy-runtime";
+const PUBLIC_TLS_CERT_HANDOFF_PATH: &str = "/run/enclava/public-tls/certificates/tls.crt";
 const CADDY_RUNTIME_SYNC_INTERVAL_SECONDS: u64 = 5;
 const DEFAULT_STAGE_FILE: &str = "/run/enclava/init-stage";
 const MANAGED_CONFIG_ROOT: &str = ".enclava";
@@ -881,14 +882,69 @@ fn provision_static_tls_certificate(cfg: &Config) -> Result<()> {
                 .with_context(|| format!("chown {}", path.display()))?;
         }
     }
+    let cert_path = tls_certificate::cert_path(&persistent);
+    publish_public_tls_certificate(&cert_path, Path::new(PUBLIC_TLS_CERT_HANDOFF_PATH))?;
     Ok(())
+}
+
+fn publish_public_tls_certificate(source: &Path, destination: &Path) -> Result<()> {
+    if !source.is_file() {
+        return Ok(());
+    }
+    let certificate =
+        std::fs::read(source).context("reading public TLS certificate for proxy handoff")?;
+    writes::atomic_write(destination, &certificate, 0o644)
+        .context("publishing public TLS certificate for proxy handoff")
 }
 
 fn sync_caddy_runtime_back(cfg: &Config) -> Result<()> {
     let persistent = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
     let runtime = Path::new(CADDY_RUNTIME_HANDOFF_PATH);
     sync_dir_contents(runtime, &persistent)
-        .with_context(|| format!("copying {} to {}", runtime.display(), persistent.display()))
+        .with_context(|| format!("copying {} to {}", runtime.display(), persistent.display()))?;
+    publish_caddy_runtime_certificate(runtime, Path::new(PUBLIC_TLS_CERT_HANDOFF_PATH))
+}
+
+fn publish_caddy_runtime_certificate(runtime: &Path, destination: &Path) -> Result<()> {
+    let certificates = runtime.join("certificates");
+    let Some(source) = newest_certificate(&certificates)? else {
+        return Ok(());
+    };
+    publish_public_tls_certificate(&source, destination)
+}
+
+fn newest_certificate(directory: &Path) -> Result<Option<PathBuf>> {
+    if !directory.is_dir() {
+        return Ok(None);
+    }
+    let mut newest = None;
+    for entry in
+        std::fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading entry in {}", directory.display()))?;
+        let ty = entry
+            .file_type()
+            .with_context(|| format!("reading file type for {}", entry.path().display()))?;
+        let path = entry.path();
+        if ty.is_dir() {
+            if let Some(candidate) = newest_certificate(&path)? {
+                newest = newer_certificate(newest, candidate)?;
+            }
+        } else if ty.is_file() && path.extension().is_some_and(|ext| ext == "crt") {
+            newest = newer_certificate(newest, path)?;
+        }
+    }
+    Ok(newest)
+}
+
+fn newer_certificate(current: Option<PathBuf>, candidate: PathBuf) -> Result<Option<PathBuf>> {
+    let candidate_modified = std::fs::metadata(&candidate)?.modified()?;
+    match current {
+        Some(current) if std::fs::metadata(&current)?.modified()? > candidate_modified => {
+            Ok(Some(current))
+        }
+        _ => Ok(Some(candidate)),
+    }
 }
 
 fn sync_dir_contents(src: &Path, dst: &Path) -> Result<()> {

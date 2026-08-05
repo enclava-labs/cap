@@ -15,9 +15,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/enclava-api/**"
+      - "crates/enclava-appraiser/**"
       - "crates/enclava-cli/platform-release.json"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
+      - "crates/enclava-verifier/**"
   pull_request:
     paths:
       - ".github/workflows/api-image.yml"
@@ -30,9 +32,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/enclava-api/**"
+      - "crates/enclava-appraiser/**"
       - "crates/enclava-cli/platform-release.json"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
+      - "crates/enclava-verifier/**"
   workflow_dispatch:
     inputs:
       version_tag:
@@ -88,9 +92,17 @@ jobs:
           push: false
           provenance: false
 
+      - name: Build appraiser image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./crates/enclava-appraiser/Dockerfile
+          push: false
+          provenance: false
+
   publish:
     name: Publish signed API image
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag')
+    if: github.event_name == 'workflow_dispatch' || (github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref_type == 'tag'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -193,7 +205,53 @@ jobs:
         run: cosign sign --yes "$IMAGE@$DIGEST"
 
       - name: Verify signed digest
+        if: github.event_name != 'workflow_dispatch'
         run: scripts/verify-api-image-ref.sh --cosign dist/enclava-api-image.txt
+
+      - name: Verify manually dispatched candidate digest
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          IMAGE: ghcr.io/enclava-labs/enclava-api
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SIGNER_SUBJECT: https://github.com/${{ github.workflow_ref }}
+        run: |
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-identity "${SIGNER_SUBJECT}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+      - name: Extract appraiser metadata
+        id: appraiser-meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ghcr.io/enclava-labs/enclava-appraiser
+          tags: |
+            type=sha,prefix=
+            type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
+
+      - name: Build and push appraiser
+        id: appraiser-build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: crates/enclava-appraiser/Dockerfile
+          push: true
+          tags: ${{ steps.appraiser-meta.outputs.tags }}
+          labels: ${{ steps.appraiser-meta.outputs.labels }}
+          cache-from: type=gha,scope=appraiser
+          cache-to: type=gha,mode=max,scope=appraiser
+          provenance: true
+
+      - name: Sign and verify appraiser digest
+        env:
+          IMAGE: ghcr.io/enclava-labs/enclava-appraiser
+          DIGEST: ${{ steps.appraiser-build.outputs.digest }}
+          SIGNER_SUBJECT: https://github.com/${{ github.workflow_ref }}
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          cosign verify "${IMAGE}@${DIGEST}" \
+            --certificate-identity "${SIGNER_SUBJECT}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          printf '%s@%s\n' "${IMAGE}" "${DIGEST}" > dist/enclava-appraiser-image.txt
 
       - name: Upload release manifest artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -203,3 +261,4 @@ jobs:
             dist/enclava-api-deploy.yaml
             dist/enclava-api-image.txt
             dist/enclava-api-signer-identity.txt
+            dist/enclava-appraiser-image.txt

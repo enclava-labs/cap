@@ -1487,6 +1487,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "nostr",
+ "oci-client",
  "rand 0.8.6",
  "reqwest 0.13.2",
  "rustls",
@@ -1507,6 +1508,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "enclava-appraiser"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "enclava-common",
+ "enclava-verifier",
+ "hex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "enclava-cli"
 version = "0.1.0"
 dependencies = [
@@ -1522,6 +1539,7 @@ dependencies = [
  "ed25519-dalek",
  "enclava-common",
  "enclava-engine",
+ "enclava-verifier",
  "futures",
  "hex",
  "hkdf",
@@ -1619,6 +1637,39 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "enclava-verifier"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "enclava-common",
+ "hex",
+ "num-bigint",
+ "p256",
+ "p384",
+ "pkcs1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+ "x509-cert",
+]
+
+[[package]]
+name = "enclava-verifier-wasm"
+version = "0.1.0"
+dependencies = [
+ "enclava-verifier",
+ "hex",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]

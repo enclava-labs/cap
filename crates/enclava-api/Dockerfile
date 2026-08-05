@@ -15,8 +15,7 @@ COPY crates/ crates/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
-    cargo build --bin enclava-api --bin cap-migrate && \
+    cargo build --locked --bin enclava-api --bin cap-migrate && \
     cp /build/target/debug/enclava-api /usr/local/bin/enclava-api && \
     cp /build/target/debug/cap-migrate /usr/local/bin/cap-migrate
 
@@ -56,8 +55,7 @@ COPY crates/ crates/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
-    cargo build --release --bin enclava-api --bin cap-migrate && \
+    cargo build --locked --release --bin enclava-api --bin cap-migrate && \
     cp /build/target/release/enclava-api /usr/local/bin/enclava-api && \
     cp /build/target/release/cap-migrate /usr/local/bin/cap-migrate && \
     strip /usr/local/bin/enclava-api /usr/local/bin/cap-migrate

@@ -4,18 +4,32 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
-uuid = { workspace = true }
-chrono = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+uuid = { version = "1", default-features = false, features = ["serde"], optional = true }
+chrono = { workspace = true, optional = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
-rand = { workspace = true }
-base64 = { workspace = true }
-chacha20poly1305 = { workspace = true }
-hkdf = { workspace = true }
-x25519-dalek = { workspace = true }
+rand = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+chacha20poly1305 = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
+x25519-dalek = { workspace = true, optional = true }
 
 [features]
+default = ["runtime"]
+descriptor = ["dep:chrono", "dep:serde", "dep:uuid"]
+runtime = [
+    "dep:base64",
+    "dep:chacha20poly1305",
+    "dep:chrono",
+    "dep:hkdf",
+    "dep:rand",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:uuid",
+    "dep:x25519-dalek",
+    "descriptor",
+]
 prod-strict = []

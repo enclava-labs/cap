@@ -78,7 +78,7 @@ pub async fn apply_network_policy(
 
     let ar = cilium_api_resource();
     let api: Api<DynamicObject> = Api::namespaced_with(engine.client().clone(), namespace, &ar);
-    let patched = apply_resource(engine, &api, &dyn_obj, generation, false).await?;
+    let patched = apply_resource(engine, &api, &dyn_obj, generation, false, false).await?;
 
     tracing::info!(
         namespace = %namespace,

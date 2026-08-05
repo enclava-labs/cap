@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://enclava.dev/schemas/appraisal-result-v1.schema.json",
+  "title": "Enclava appraisal result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "bundle_sha256", "policy_sha256", "target_origin", "challenge_nonce", "verified_at", "verifier_version", "checks", "warnings"],
+  "properties": {
+    "verdict": { "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+    "bundle_sha256": { "$ref": "#/$defs/hex32" },
+    "policy_sha256": { "$ref": "#/$defs/hex32" },
+    "target_origin": { "type": "string", "format": "uri", "maxLength": 2048 },
+    "challenge_nonce": { "$ref": "#/$defs/hex32" },
+    "verified_at": { "type": "integer", "minimum": 0 },
+    "verifier_version": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "outcome", "observed", "expected", "reason_code"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9_.-]+$" },
+          "outcome": { "enum": ["PASS", "FAIL", "SKIPPED"] },
+          "observed": { "type": ["string", "null"] },
+          "expected": { "type": ["string", "null"] },
+          "reason_code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" }
+        }
+      }
+    },
+    "warnings": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": { "hex32": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }
+}

@@ -140,6 +140,41 @@ fn optional_app_name_propagates_malformed_and_invalid_config() {
 }
 
 #[test]
+fn manual_deploy_keyring_always_checks_remote_state() {
+    let source = include_str!("../signing.rs");
+    let body = source
+        .split("pub(crate) async fn ensure_manual_deploy_keyring")
+        .nth(1)
+        .unwrap()
+        .split("fn render_trustee_policy")
+        .next()
+        .unwrap();
+    let local_check = body.find("verify_keyring").unwrap();
+    let remote_check = body.find("api.get_org_keyring").unwrap();
+
+    assert!(local_check < remote_check);
+    assert!(!body[local_check..remote_check].contains("return Ok"));
+}
+
+#[test]
+fn manual_deploy_keyring_always_bootstraps_the_signing_service() {
+    let source = include_str!("../signing.rs");
+    let body = source
+        .split("pub(crate) async fn ensure_manual_deploy_keyring")
+        .nth(1)
+        .unwrap()
+        .split("fn render_trustee_policy")
+        .next()
+        .unwrap();
+
+    assert_eq!(body.matches(".bootstrap_signing_service_owner").count(), 1);
+    assert!(
+        body.find(".bootstrap_signing_service_owner").unwrap()
+            > body.find("match api.get_org_keyring").unwrap()
+    );
+}
+
+#[test]
 fn deployment_context_platform_release_is_verified_and_selected() {
     let envelope = PlatformReleaseEnvelope {
         payload: test_release(),

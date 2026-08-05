@@ -3,6 +3,38 @@ use enclava_init::config::AppBindMountConfig;
 use tempfile::tempdir;
 
 #[test]
+fn public_tls_certificate_handoff_is_optional_and_public_only() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("tls-state/certificates/tls.crt");
+    let destination = dir.path().join("runtime/certificates/tls.crt");
+
+    publish_public_tls_certificate(&source, &destination).unwrap();
+    assert!(!destination.exists());
+
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"public certificate").unwrap();
+    publish_public_tls_certificate(&source, &destination).unwrap();
+    assert_eq!(std::fs::read(destination).unwrap(), b"public certificate");
+}
+
+#[test]
+fn caddy_runtime_certificate_is_published_and_refreshed() {
+    let dir = tempdir().unwrap();
+    let runtime = dir.path().join("caddy-runtime");
+    let certificate = runtime.join("certificates/acme/app.example.test/app.example.test.crt");
+    let destination = dir.path().join("public-tls/certificates/tls.crt");
+    std::fs::create_dir_all(certificate.parent().unwrap()).unwrap();
+
+    std::fs::write(&certificate, b"initial certificate").unwrap();
+    publish_caddy_runtime_certificate(&runtime, &destination).unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), b"initial certificate");
+
+    std::fs::write(&certificate, b"renewed certificate").unwrap();
+    publish_caddy_runtime_certificate(&runtime, &destination).unwrap();
+    assert_eq!(std::fs::read(destination).unwrap(), b"renewed certificate");
+}
+
+#[test]
 fn ready_probe_reflects_ready_file_state() {
     let dir = tempdir().unwrap();
     let ready = dir.path().join("run/enclava/init-ready");

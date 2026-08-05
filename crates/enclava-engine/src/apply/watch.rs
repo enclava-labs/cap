@@ -129,6 +129,16 @@ pub fn pod_label_selector(statefulset_name: &str) -> String {
     format!("app={statefulset_name}")
 }
 
+pub fn pod_matches_statefulset_update_revision(pod: &Pod, update_revision: Option<&str>) -> bool {
+    update_revision.is_none_or(|expected| {
+        pod.metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("controller-revision-hash"))
+            .is_none_or(|actual| actual == expected)
+    })
+}
+
 /// Lightweight snapshot of a pod's state for phase classification.
 /// Extracted from a k8s Pod object to keep classification logic pure and testable.
 #[derive(Debug, Clone)]
@@ -373,6 +383,7 @@ pub async fn watch_rollout(
         let ready = sts_status.and_then(|s| s.ready_replicas).unwrap_or(0);
         let current = sts_status.and_then(|s| s.current_replicas).unwrap_or(0);
         let updated = sts_status.and_then(|s| s.updated_replicas).unwrap_or(0);
+        let update_revision = sts_status.and_then(|s| s.update_revision.as_deref());
 
         if observed_generation >= generation
             && ready >= desired
@@ -416,8 +427,13 @@ pub async fn watch_rollout(
         }
 
         let mut worst_phase = DeployPhase::Running;
+        let mut target_pod_observed = false;
 
         for pod in &pods.items {
+            if !pod_matches_statefulset_update_revision(pod, update_revision) {
+                continue;
+            }
+            target_pod_observed = true;
             let snap = PodSnapshot::from_pod(pod);
             let phase = classify_pod_phase(&snap);
 
@@ -439,7 +455,7 @@ pub async fn watch_rollout(
         }
 
         // If no pods exist yet, we're still in Applying
-        if pods.items.is_empty() {
+        if !target_pod_observed {
             worst_phase = DeployPhase::Applying;
         }
 

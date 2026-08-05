@@ -676,7 +676,7 @@ fn enclava_init_ready_probe() -> Probe {
     }
 }
 
-fn proxy_volume_mounts(legacy: bool) -> Vec<VolumeMount> {
+fn proxy_volume_mounts(app: &ConfidentialApp, legacy: bool) -> Vec<VolumeMount> {
     let mut v = vec![
         VolumeMount {
             name: "ownership-signal".to_string(),
@@ -702,6 +702,14 @@ fn proxy_volume_mounts(legacy: bool) -> Vec<VolumeMount> {
             mount_path: "/run/enclava".to_string(),
             ..Default::default()
         });
+        if app.attestation.verification_material.is_some() {
+            v.push(VolumeMount {
+                name: "verification-material".to_string(),
+                mount_path: "/etc/enclava-verification".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            });
+        }
         v.push(VolumeMount {
             name: "unlock-channel".to_string(),
             mount_path: "/run/enclava-unlock".to_string(),
@@ -770,6 +778,9 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
     if !workload_profile_runs_as_root(primary.workload_security_profile) {
         env_vars.push(env("CAP_CONFIG_FILE_GID", CAP_CONFIG_FILE_GID));
     }
+    if let Some(url) = app.attestation.amd_kds_base_url.as_deref() {
+        env_vars.push(env("AMD_KDS_BASE_URL", url));
+    }
     if let Some(keys) = required_config_keys_from_primary(app) {
         env_vars.push(env("CAP_CONFIG_REQUIRED_KEYS", &keys));
     }
@@ -777,6 +788,10 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env_vars.push(env("ENCLAVA_CONTAINER_NAME", "attestation-proxy"));
         env_vars.push(env("ENCLAVA_STARTED_DIR", "/run/enclava/containers"));
         env_vars.push(env("ENCLAVA_INIT_UNLOCK_SOCKET", UNLOCK_SOCKET_PATH));
+        env_vars.push(env(
+            "PROOF_TLS_CERT_PATH",
+            "/run/enclava/public-tls/certificates/tls.crt",
+        ));
     }
     if let Some(cert) = cc_init_data::trustee_kbs_ca_cert_pem() {
         env_vars.push(env("KBS_RESOURCE_CA_CERT_PEM", &cert));
@@ -799,7 +814,7 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
             },
         ]),
         env: Some(env_vars),
-        volume_mounts: Some(proxy_volume_mounts(legacy)),
+        volume_mounts: Some(proxy_volume_mounts(app, legacy)),
         security_context: Some(proxy_security_context(legacy)),
         resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
             requests: Some({

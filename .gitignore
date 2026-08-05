@@ -1,5 +1,7 @@
 # Build
 /target
+/web/verifier/pkg
+/web/verifier/release
 /docs
 /tools
 /runbooks/audits

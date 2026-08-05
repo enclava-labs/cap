@@ -1725,6 +1725,8 @@ async fn apply_claimed_job(
                 signed_policy_artifact: validated.signed_policy_artifact,
                 local_workload_artifacts_json: validated.local_workload_artifacts_json,
                 local_trustee_policy_json: validated.local_trustee_policy_json,
+                sigstore_material: validated.sigstore_material,
+                provenance_oci_material: validated.provenance_oci_material,
                 log_encryption: payload.log_encryption.clone(),
             },
             &mutation,
@@ -1887,6 +1889,8 @@ struct ValidatedApplyArtifacts {
     signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
     local_workload_artifacts_json: Option<String>,
     local_trustee_policy_json: Option<String>,
+    sigstore_material: Vec<u8>,
+    provenance_oci_material: Vec<u8>,
 }
 
 async fn validate_apply_artifacts(
@@ -1895,6 +1899,20 @@ async fn validate_apply_artifacts(
     payload: &DeploymentApplyJobPayload,
     primary_image_digest: &str,
 ) -> Result<ValidatedApplyArtifacts, DeploymentJobError> {
+    let portable = sqlx::query_as::<_, (Option<Vec<u8>>, Option<Vec<u8>>)>(
+        "SELECT sigstore_material, provenance_oci_material
+           FROM deployments WHERE id = $1 AND app_id = $2 AND org_id = $3",
+    )
+    .bind(job.source_deployment_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(DeploymentJobError::Artifact)?;
+    // Historical deployments predate portable proof retention. Keep rollback
+    // compatible; the verifier will explicitly reject the empty proof fields.
+    let sigstore_material = portable.0.unwrap_or_default();
+    let provenance_oci_material = portable.1.unwrap_or_default();
     let currently_signed_required = crate::routes::deployments::customer_signed_deploy_required(
         state.attestation.as_ref(),
         state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
@@ -1912,6 +1930,8 @@ async fn validate_apply_artifacts(
             signed_policy_artifact: None,
             local_workload_artifacts_json: None,
             local_trustee_policy_json: None,
+            sigstore_material,
+            provenance_oci_material,
         });
     };
     let loaded = crate::signing_service::load_workload_artifacts_exact(
@@ -1951,6 +1971,8 @@ async fn validate_apply_artifacts(
         signed_policy_artifact: Some(loaded.signed_policy_artifact),
         local_workload_artifacts_json: Some(loaded.workload_artifacts_json),
         local_trustee_policy_json: Some(loaded.trustee_policy_json),
+        sigstore_material,
+        provenance_oci_material,
     })
 }
 
@@ -3154,7 +3176,8 @@ mod tests {
                 caddy_digest: format!("sha256:{}", "22".repeat(32)),
             },
             api_signing_pubkey: payload.api_signing_pubkey.clone(),
-            expected_firmware_measurement: [3; 32],
+            independent_verification: true,
+            expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: format!("default/{}-owner", payload.app.namespace),
             unlock_mode: "auto".to_string(),

@@ -16,7 +16,7 @@ use crate::descriptor::{DeploymentDescriptor, SignerIdentity};
 pub struct ParsedSnpReport {
     pub report_data: [u8; 64],
     pub host_data: [u8; 32],
-    pub firmware_measurement: [u8; 32],
+    pub firmware_measurement: [u8; 48],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,12 +131,10 @@ pub fn validate_snp_report_with_der_chain(
 }
 
 fn parsed_report_from_sev(report: &sev::firmware::guest::AttestationReport) -> ParsedSnpReport {
-    let mut firmware_measurement = [0u8; 32];
-    firmware_measurement.copy_from_slice(&report.measurement[..32]);
     ParsedSnpReport {
         report_data: report.report_data,
         host_data: report.host_data,
-        firmware_measurement,
+        firmware_measurement: report.measurement,
     }
 }
 
@@ -164,11 +162,12 @@ pub fn verify_attestation_bundle(
     };
     let descriptor = expectations.descriptor;
 
-    require_eq32(
-        report.firmware_measurement,
-        descriptor.expected_firmware_measurement,
-        AttestationError::FirmwareMeasurementMismatch,
-    )?;
+    if !descriptor
+        .expected_firmware_measurement
+        .matches_report(&report.firmware_measurement)
+    {
+        return Err(AttestationError::FirmwareMeasurementMismatch);
+    }
 
     let cc_init_data_hash: [u8; 32] = Sha256::digest(&bundle.cc_init_data_toml).into();
     require_eq32(

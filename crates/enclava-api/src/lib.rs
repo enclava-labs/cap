@@ -184,6 +184,10 @@ fn internal_routes() -> Router<AppState> {
             axum::routing::get(routes::internal::get_paas_app_logs),
         )
         .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/proof-bundle",
+            axum::routing::get(routes::internal::get_paas_proof_bundle),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}/members",
             axum::routing::get(routes::internal::list_paas_members),
         )
@@ -750,11 +754,13 @@ pub(crate) mod test_support {
                 trustee_policy_read_available: true,
                 workload_artifacts_url: Some("https://api.example.test/workload/artifacts".into()),
                 tls_certificate_broker_url: None,
+                amd_kds_base_url: None,
                 trustee_policy_url: Some("https://kbs.example.test/policy".into()),
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,
                 platform_trustee_policy_pubkey_hex: Some("11".repeat(32)),
                 signing_service_pubkey_hex: Some("11".repeat(32)),
+                verification_material: None,
             }),
             platform_release_envelope: None,
             dns: None,

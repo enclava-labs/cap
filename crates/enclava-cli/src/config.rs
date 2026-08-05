@@ -74,6 +74,9 @@ pub struct CliPaths {
 impl CliPaths {
     /// Resolve paths using the user's home directory.
     pub fn resolve() -> Result<Self, ConfigError> {
+        if let Some(root) = std::env::var_os("ENCLAVA_STATE_DIR") {
+            return Self::from_root(root.into());
+        }
         let home = dirs::home_dir().ok_or(ConfigError::NoHomeDir)?;
         Self::from_root(home.join(".enclava"))
     }

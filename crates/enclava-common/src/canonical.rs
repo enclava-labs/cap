@@ -7,6 +7,20 @@
 
 use sha2::{Digest, Sha256};
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CeV1DecodeError {
+    #[error("truncated CE-v1 record at byte {offset}")]
+    Truncated { offset: usize },
+    #[error("CE-v1 label at byte {offset} is not UTF-8")]
+    InvalidLabel { offset: usize },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CeV1Record<'a> {
+    pub label: &'a str,
+    pub value: &'a [u8],
+}
+
 /// Returns the raw CE-v1 TLV-encoded message bytes.
 ///
 /// Each record is encoded as `label_len:u16_be || label_bytes || value_len:u32_be || value_bytes`.
@@ -28,6 +42,44 @@ pub fn ce_v1_bytes(records: &[(&str, &[u8])]) -> Vec<u8> {
         out.extend_from_slice(value);
     }
     out
+}
+
+/// Strictly decodes all CE-v1 records without copying their contents.
+pub fn ce_v1_decode(bytes: &[u8]) -> Result<Vec<CeV1Record<'_>>, CeV1DecodeError> {
+    let mut records = Vec::new();
+    let mut offset = 0;
+
+    while offset < bytes.len() {
+        let label_len = read_len::<2>(bytes, &mut offset)?;
+        let label_offset = offset;
+        let label_bytes = take(bytes, &mut offset, label_len)?;
+        let label =
+            std::str::from_utf8(label_bytes).map_err(|_| CeV1DecodeError::InvalidLabel {
+                offset: label_offset,
+            })?;
+        let value_len = read_len::<4>(bytes, &mut offset)?;
+        let value = take(bytes, &mut offset, value_len)?;
+        records.push(CeV1Record { label, value });
+    }
+
+    Ok(records)
+}
+
+fn read_len<const N: usize>(bytes: &[u8], offset: &mut usize) -> Result<usize, CeV1DecodeError> {
+    let raw: [u8; N] = take(bytes, offset, N)?.try_into().expect("length checked");
+    Ok(raw
+        .into_iter()
+        .fold(0usize, |value, byte| (value << 8) | usize::from(byte)))
+}
+
+fn take<'a>(bytes: &'a [u8], offset: &mut usize, len: usize) -> Result<&'a [u8], CeV1DecodeError> {
+    let end = offset
+        .checked_add(len)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(CeV1DecodeError::Truncated { offset: *offset })?;
+    let value = &bytes[*offset..end];
+    *offset = end;
+    Ok(value)
 }
 
 /// Returns the 32-byte SHA-256 of `ce_v1_bytes(records)`.
@@ -93,5 +145,49 @@ mod tests {
         let bytes = ce_v1_bytes(records);
         let expected: [u8; 32] = Sha256::digest(&bytes).into();
         assert_eq!(ce_v1_hash(records), expected);
+    }
+
+    #[test]
+    fn decode_round_trips_binary_values() {
+        let bytes = ce_v1_bytes(&[("purpose", b"proof-bundle-v1"), ("binary", b"\0\xff")]);
+        assert_eq!(
+            ce_v1_decode(&bytes).unwrap(),
+            vec![
+                CeV1Record {
+                    label: "purpose",
+                    value: b"proof-bundle-v1",
+                },
+                CeV1Record {
+                    label: "binary",
+                    value: b"\0\xff",
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_rejects_every_truncation() {
+        for bytes in [
+            ce_v1_bytes(&[("purpose", b"proof-bundle-v1")]),
+            ce_v1_bytes(&[("nonce", &[7; 32])]),
+        ] {
+            for end in 1..bytes.len() {
+                assert!(
+                    matches!(
+                        ce_v1_decode(&bytes[..end]),
+                        Err(CeV1DecodeError::Truncated { .. })
+                    ),
+                    "accepted truncation at {end}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_rejects_invalid_utf8_labels() {
+        assert_eq!(
+            ce_v1_decode(&[0, 1, 0xff, 0, 0, 0, 0]),
+            Err(CeV1DecodeError::InvalidLabel { offset: 2 })
+        );
     }
 }

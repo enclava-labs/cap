@@ -66,7 +66,8 @@ fn fixed_descriptor() -> DeploymentDescriptor {
             caddy_digest: "sha256:2222".to_string(),
         },
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
-        expected_firmware_measurement: [3; 32],
+        independent_verification: false,
+        expected_firmware_measurement: [3; 32].into(),
         expected_runtime_class: "kata-qemu-snp".to_string(),
         kbs_resource_path: "default/cap-abcd1234-demo-tls-owner".to_string(),
         unlock_mode: "password".to_string(),
@@ -120,4 +121,14 @@ fn descriptor_core_hash_is_stable() {
     }
     let expected = std::fs::read_to_string(&fixture).expect("fixture missing");
     assert_eq!(hex::encode(h), expected.trim());
+}
+
+#[test]
+fn independent_verification_descriptor_core_hash_is_stable() {
+    let mut descriptor = fixed_descriptor();
+    descriptor.independent_verification = true;
+    assert_eq!(
+        hex::encode(descriptor_core_hash(&descriptor)),
+        "01defa6dd84c96010cc0322a903177bda834c50779eb058b1a3ed70f40c0fbd3"
+    );
 }
