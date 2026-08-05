@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{DateTime, Utc};
+use futures::StreamExt as _;
 use serde::Serialize;
 use sigstore::cosign::CosignCapabilities;
 use sigstore::cosign::verification_constraint::{
@@ -38,6 +39,9 @@ use sigstore::registry::{Auth, ClientConfig, ClientProtocol, OciReference};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 
 use crate::registry::registry_base_url;
+
+const MAX_SIGSTORE_MATERIAL_BYTES: usize = 196_608;
+const MAX_PROVENANCE_MATERIAL_BYTES: usize = 311_296;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CosignError {
@@ -471,7 +475,9 @@ pub async fn fetch_portable_verification_material(
     }
     let provenance_oci = enclava_common::canonical::ce_v1_bytes(&provenance_records);
 
-    if sigstore.len() > 196_608 || provenance_oci.len() > 311_296 {
+    if sigstore.len() > MAX_SIGSTORE_MATERIAL_BYTES
+        || provenance_oci.len() > MAX_PROVENANCE_MATERIAL_BYTES
+    {
         return Err(CosignError::VerificationFailed(
             "portable verification material exceeds v1 limits".into(),
         ));
@@ -489,7 +495,14 @@ async fn pull_signature_objects(
     auth: &oci_client::secrets::RegistryAuth,
     accepted_media_types: &[&str],
 ) -> Result<Vec<(Vec<u8>, Vec<Vec<u8>>)>, CosignError> {
-    if let Ok(object) = pull_oci_object(client, legacy_signature, auth, accepted_media_types).await
+    if let Ok(object) = pull_oci_object(
+        client,
+        legacy_signature,
+        auth,
+        accepted_media_types,
+        MAX_SIGSTORE_MATERIAL_BYTES,
+    )
+    .await
         && object.1.iter().any(|blob| is_portable_signature_blob(blob))
     {
         return Ok(vec![object]);
@@ -505,7 +518,14 @@ async fn pull_signature_objects(
             source.repository().to_string(),
             descriptor.digest,
         );
-        let Ok(object) = pull_oci_object(client, &reference, auth, accepted_media_types).await
+        let Ok(object) = pull_oci_object(
+            client,
+            &reference,
+            auth,
+            accepted_media_types,
+            MAX_SIGSTORE_MATERIAL_BYTES,
+        )
+        .await
         else {
             continue;
         };
@@ -518,6 +538,11 @@ async fn pull_signature_objects(
             == Some("https://sigstore.dev/cosign/sign/v1")
             && object.1.iter().any(|blob| is_portable_signature_blob(blob))
         {
+            if objects.iter().map(oci_object_size).sum::<usize>() + oci_object_size(&object)
+                > MAX_SIGSTORE_MATERIAL_BYTES
+            {
+                return Err(portable_material_too_large());
+            }
             objects.push(object);
         }
     }
@@ -583,7 +608,20 @@ async fn pull_provenance_objects(
     }
     let mut objects = Vec::with_capacity(references.len());
     for reference in references {
-        objects.push(pull_oci_object(client, &reference, auth, accepted_media_types).await?);
+        let object = pull_oci_object(
+            client,
+            &reference,
+            auth,
+            accepted_media_types,
+            MAX_PROVENANCE_MATERIAL_BYTES,
+        )
+        .await?;
+        if objects.iter().map(oci_object_size).sum::<usize>() + oci_object_size(&object)
+            > MAX_PROVENANCE_MATERIAL_BYTES
+        {
+            return Err(portable_material_too_large());
+        }
+        objects.push(object);
     }
     Ok(objects)
 }
@@ -593,6 +631,7 @@ async fn pull_oci_object(
     reference: &oci_client::Reference,
     auth: &oci_client::secrets::RegistryAuth,
     accepted_media_types: &[&str],
+    maximum_bytes: usize,
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), CosignError> {
     use oci_client::manifest::OciManifest;
 
@@ -608,16 +647,53 @@ async fn pull_oci_object(
             "verification object is not an OCI image manifest".into(),
         ));
     };
+    let mut total = raw.len();
     let mut blobs = Vec::with_capacity(manifest.layers.len());
     for layer in &manifest.layers {
+        let declared_size =
+            usize::try_from(layer.size).map_err(|_| portable_material_too_large())?;
+        if total.saturating_add(declared_size) > maximum_bytes {
+            return Err(portable_material_too_large());
+        }
         let mut bytes = Vec::new();
-        client
-            .pull_blob(reference, layer, &mut bytes)
+        let mut stream = client
+            .pull_blob_stream(reference, layer)
             .await
             .map_err(|error| CosignError::VerificationFailed(error.to_string()))?;
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|error| CosignError::VerificationFailed(error.to_string()))?;
+            extend_bounded(&mut bytes, &chunk, total, maximum_bytes)?;
+        }
+        total += bytes.len();
         blobs.push(bytes);
     }
     Ok((raw.to_vec(), blobs))
+}
+
+fn oci_object_size((manifest, blobs): &(Vec<u8>, Vec<Vec<u8>>)) -> usize {
+    manifest.len() + blobs.iter().map(Vec::len).sum::<usize>()
+}
+
+fn portable_material_too_large() -> CosignError {
+    CosignError::VerificationFailed("portable verification material exceeds v1 limits".into())
+}
+
+fn extend_bounded(
+    bytes: &mut Vec<u8>,
+    chunk: &[u8],
+    previous_bytes: usize,
+    maximum_bytes: usize,
+) -> Result<(), CosignError> {
+    if previous_bytes
+        .saturating_add(bytes.len())
+        .saturating_add(chunk.len())
+        > maximum_bytes
+    {
+        return Err(portable_material_too_large());
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
 }
 
 async fn fetch_attestation_tag(
@@ -1057,6 +1133,13 @@ mod tests {
         assert!(is_portable_signature_blob(
             br#"{"dsseEnvelope":{},"verificationMaterial":{"certificate":{"rawBytes":"AA=="},"tlogEntries":[{}]}}"#
         ));
+    }
+
+    #[test]
+    fn portable_blob_buffer_stops_at_limit() {
+        let mut bytes = vec![1; 2];
+        extend_bounded(&mut bytes, &[2, 3], 1, 5).unwrap();
+        assert!(extend_bounded(&mut bytes, &[4], 1, 5).is_err());
     }
 
     #[test]

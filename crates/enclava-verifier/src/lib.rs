@@ -239,7 +239,6 @@ fn verify_evidence(
                 Err(AmdVerificationError::RevocationDataStale) => "REVOCATION_DATA_STALE",
                 Err(AmdVerificationError::RevocationTimeMissing) => "REVOCATION_TIME_MISSING",
                 Err(AmdVerificationError::AskRevoked) => "ASK_REVOKED",
-                Err(AmdVerificationError::VcekRevoked) => "VCEK_REVOKED",
                 _ => "AMD_REVOCATION_INVALID",
             },
         ));

@@ -205,8 +205,10 @@ pub fn verify_keyring<'e>(
 }
 
 fn state_dir(org_id: &Uuid) -> Result<PathBuf, KeyringError> {
-    let home = dirs::home_dir().ok_or(KeyringError::NoHome)?;
-    let dir = home.join(".enclava").join("state").join(org_id.to_string());
+    let root = crate::config::CliPaths::resolve()
+        .map_err(|_| KeyringError::NoHome)?
+        .root;
+    let dir = root.join("state").join(org_id.to_string());
     fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {
@@ -384,5 +386,15 @@ mod tests {
         let env = sign_keyring(&owner_a, sample_keyring(&owner_a));
         let err = verify_keyring(&env, &owner_b.public).unwrap_err();
         assert!(matches!(err, KeyringError::TofuMismatch));
+    }
+
+    #[test]
+    fn keyring_state_uses_configured_cli_root() {
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ENCLAVA_STATE_DIR", temp.path()) };
+        let org_id = Uuid::new_v4();
+        let dir = state_dir(&org_id).unwrap();
+        unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") };
+        assert_eq!(dir, temp.path().join("state").join(org_id.to_string()));
     }
 }
