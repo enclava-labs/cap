@@ -48,6 +48,7 @@ fn value_to_dynamic_object_rejects_missing_metadata() {
 #[ignore]
 async fn apply_cilium_network_policy_creates() {
     use enclava_engine::apply::engine::ApplyEngine;
+    use enclava_engine::apply::generation::MutationGeneration;
     use enclava_engine::apply::namespace::apply_namespace;
     use enclava_engine::apply::network_policy::apply_network_policy;
     use enclava_engine::manifest::namespace::generate_namespace;
@@ -58,10 +59,11 @@ async fn apply_cilium_network_policy_creates() {
     let app = sample_app();
 
     let ns = generate_namespace(&app);
-    apply_namespace(&engine, &ns).await.unwrap();
+    let generation = MutationGeneration::new(1).unwrap();
+    apply_namespace(&engine, &ns, generation).await.unwrap();
 
     let np = generate_network_policy(&app);
-    apply_network_policy(&engine, &app.namespace, &np)
+    apply_network_policy(&engine, &app.namespace, &np, generation)
         .await
         .unwrap();
 

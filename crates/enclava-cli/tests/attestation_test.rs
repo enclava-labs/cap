@@ -56,7 +56,8 @@ fn fixed_descriptor() -> DeploymentDescriptor {
             caddy_digest: "sha256:2222".to_string(),
         },
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
-        expected_firmware_measurement: [3; 32],
+        independent_verification: false,
+        expected_firmware_measurement: [3; 32].into(),
         expected_runtime_class: "kata-qemu-snp".to_string(),
         kbs_resource_path: "default/cap-abcd1234-demo-tls-owner".to_string(),
         unlock_mode: "password".to_string(),
@@ -135,7 +136,7 @@ fn valid_case() -> ValidCase {
         parsed_snp_report: ParsedSnpReport {
             report_data,
             host_data: Sha256::digest(&cc_init_data).into(),
-            firmware_measurement: descriptor.expected_firmware_measurement,
+            firmware_measurement: [3; 48],
         },
         cc_init_data_toml: cc_init_data,
         tls_pubkey_spki_der,
@@ -206,5 +207,17 @@ fn rejects_descriptor_claim_mismatch() {
     assert!(matches!(
         verify_attestation_bundle(&case.bundle, &case.expectations()),
         Err(AttestationError::ClaimMismatch { claim: "namespace" })
+    ));
+}
+
+#[test]
+fn v2_rejects_mismatch_in_measurement_tail() {
+    let mut case = valid_case();
+    case.descriptor.schema_version = "v2".into();
+    case.descriptor.expected_firmware_measurement = [3; 48].into();
+    case.bundle.parsed_snp_report.firmware_measurement[47] ^= 1;
+    assert!(matches!(
+        verify_attestation_bundle(&case.bundle, &case.expectations()),
+        Err(AttestationError::FirmwareMeasurementMismatch)
     ));
 }

@@ -20,6 +20,8 @@ pub enum ValidationError {
     InvalidIdentityHashHex,
     #[error("sidecar image '{name}' must be pinned by digest: {detail}")]
     SidecarImageNotPinned { name: String, detail: String },
+    #[error("verification material exceeds 716800 bytes")]
+    VerificationMaterialTooLarge,
 }
 
 /// Validates that a ConfidentialApp spec is well-formed.
@@ -81,6 +83,15 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
             name: "caddy".to_string(),
             detail: e.to_string(),
         });
+    }
+
+    if app
+        .attestation
+        .verification_material
+        .as_ref()
+        .is_some_and(|material| material.len() > crate::manifest::verification_material::MAX_BYTES)
+    {
+        return Err(ValidationError::VerificationMaterialTooLarge);
     }
 
     Ok(())

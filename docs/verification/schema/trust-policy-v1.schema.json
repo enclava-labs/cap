@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://enclava.dev/schemas/trust-policy-v1.schema.json",
+  "title": "Enclava trust policy v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "required_checks", "amd", "target", "trusted_org_keyring_sha256", "trusted_policy_signing_pubkeys", "sigstore"],
+  "properties": {
+    "schema_version": { "const": "enclava-trust-policy-v1" },
+    "label": { "type": "string", "maxLength": 256 },
+    "required_checks": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z0-9_.-]+$" } },
+    "amd": {
+      "type": "object", "additionalProperties": false,
+      "required": ["trusted_ark_sha256", "allowed_measurements", "minimum_tcb", "guest_policy_mask", "guest_policy_value", "revocation_max_age_seconds"],
+      "properties": {
+        "trusted_ark_sha256": { "$ref": "#/$defs/hex32List" },
+        "allowed_measurements": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/hex48" } },
+        "minimum_tcb": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "bootloader": { "$ref": "#/$defs/u8" }, "tee": { "$ref": "#/$defs/u8" },
+            "fmc": { "$ref": "#/$defs/u8" }, "snp": { "$ref": "#/$defs/u8" },
+            "microcode": { "$ref": "#/$defs/u8" }
+          }
+        },
+        "guest_policy_mask": { "type": "integer", "minimum": 0 },
+        "guest_policy_value": { "type": "integer", "minimum": 0 },
+        "revocation_max_age_seconds": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "target": {
+      "type": "object", "additionalProperties": false,
+      "required": ["origins", "image_digests", "runtime_classes", "attestation_proxy_digests", "caddy_digests", "platform_release_versions", "organization_ids", "application_ids"],
+      "properties": {
+        "origins": { "$ref": "#/$defs/nonemptyStrings" },
+        "image_digests": { "$ref": "#/$defs/nonemptyStrings" },
+        "runtime_classes": { "$ref": "#/$defs/nonemptyStrings" },
+        "attestation_proxy_digests": { "$ref": "#/$defs/nonemptyStrings" },
+        "caddy_digests": { "$ref": "#/$defs/nonemptyStrings" },
+        "platform_release_versions": { "$ref": "#/$defs/nonemptyStrings" },
+        "organization_ids": { "$ref": "#/$defs/nonemptyStrings" },
+        "application_ids": { "$ref": "#/$defs/nonemptyStrings" }
+      }
+    },
+    "trusted_org_keyring_sha256": { "$ref": "#/$defs/hex32List" },
+    "trusted_policy_signing_pubkeys": { "$ref": "#/$defs/hex32List" },
+    "sigstore": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fulcio_roots_der_base64", "fulcio_intermediates_der_base64", "trusted_fulcio_root_sha256", "rekor_spki_der_base64", "certificate_identity", "oidc_issuer", "source_repository", "workflow_ref", "provenance_builder_id"],
+      "properties": {
+        "fulcio_roots_der_base64": { "$ref": "#/$defs/nonemptyStrings" },
+        "fulcio_intermediates_der_base64": { "$ref": "#/$defs/nonemptyStrings" },
+        "trusted_fulcio_root_sha256": { "$ref": "#/$defs/hex32List" },
+        "rekor_spki_der_base64": { "$ref": "#/$defs/nonemptyStrings" },
+        "certificate_identity": { "$ref": "#/$defs/nonemptyString" },
+        "oidc_issuer": { "$ref": "#/$defs/nonemptyString" },
+        "source_repository": { "$ref": "#/$defs/nonemptyString" },
+        "workflow_ref": { "$ref": "#/$defs/nonemptyString" },
+        "provenance_builder_id": { "$ref": "#/$defs/nonemptyString" }
+      }
+    },
+    "transport": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "require_tls_channel_spki": { "type": "boolean" } }
+    },
+    "appraiser": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "maximum_receipt_lifetime_seconds": { "type": "integer", "minimum": 0 },
+        "clock_skew_seconds": { "type": "integer", "minimum": 0 },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["key_id", "public_key_base64", "not_before_unix_seconds", "not_after_unix_seconds"],
+            "properties": {
+              "key_id": { "$ref": "#/$defs/nonemptyString" },
+              "public_key_base64": { "type": "string", "contentEncoding": "base64" },
+              "not_before_unix_seconds": { "type": "integer", "minimum": 0 },
+              "not_after_unix_seconds": { "type": "integer", "minimum": 0 },
+              "revoked": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "u8": { "type": "integer", "minimum": 0, "maximum": 255 },
+    "hex32": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "hex48": { "type": "string", "pattern": "^[0-9a-f]{96}$" },
+    "hex32List": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/hex32" } },
+    "nonemptyString": { "type": "string", "minLength": 1 },
+    "nonemptyStrings": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/nonemptyString" } }
+  }
+}

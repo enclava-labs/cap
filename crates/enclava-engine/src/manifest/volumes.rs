@@ -123,6 +123,17 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
             }),
             ..Default::default()
         });
+        if app.attestation.verification_material.is_some() {
+            v.push(Volume {
+                name: "verification-material".to_string(),
+                config_map: Some(ConfigMapVolumeSource {
+                    name: crate::manifest::verification_material::configmap_name(&app.name),
+                    default_mode: Some(0o444),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
     }
     v
 }

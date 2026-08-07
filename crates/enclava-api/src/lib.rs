@@ -4,12 +4,14 @@ pub mod clients;
 pub mod cosign;
 pub mod db;
 pub mod deploy;
+pub mod deployment_jobs;
 pub mod dns;
 pub mod edge;
 pub mod entitlements;
 pub mod env_gates;
 pub mod kbs;
 pub mod models;
+pub mod mutation_leases;
 pub mod platform_release;
 pub mod ratelimit;
 pub mod registry;
@@ -18,8 +20,13 @@ pub mod signing_service;
 pub mod source_provider;
 pub mod state;
 
-use axum::Router;
-use axum::http::{HeaderValue, Method, header};
+use axum::{
+    Json, Router,
+    extract::{Request, State},
+    http::{HeaderValue, Method, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+};
 use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
@@ -54,8 +61,91 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
     router
         .merge(api_routes)
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            freeze_workload_authority_mutations,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_startup_ready,
+        ))
         .layer(build_cors_layer())
         .with_state(state)
+}
+
+async fn require_startup_ready(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path() == "/livez" || state.startup_is_ready() {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CACHE_CONTROL, "no-store")],
+        "startup reconciliation in progress",
+    )
+        .into_response()
+}
+
+async fn freeze_workload_authority_mutations(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.deployment_dispatch_enabled
+        || !is_workload_authority_mutation(request.method(), request.uri().path())
+    {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "error": "deploy_blocked",
+            "reason": "deployment_dispatch_disabled",
+            "message": "tenant workload mutation is disabled by the deployment activation gate",
+        })),
+    )
+        .into_response()
+}
+
+fn is_workload_authority_mutation(method: &Method, path: &str) -> bool {
+    if matches!(method, &Method::GET | &Method::HEAD | &Method::OPTIONS) {
+        return false;
+    }
+
+    let segments = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+
+    if method == Method::DELETE
+        && matches!(
+            segments.as_slice(),
+            ["apps", _] | ["internal", "paas", "orgs", _, "apps", _]
+        )
+    {
+        return false;
+    }
+
+    if matches!(segments.as_slice(), ["internal", "paas", ..]) {
+        return !(method == Method::PUT
+            && matches!(
+                segments.as_slice(),
+                ["internal", "paas", "orgs", _]
+                    | ["internal", "paas", "orgs", _, "entitlements"]
+                    | ["internal", "paas", "orgs", _, "members", _]
+            ));
+    }
+
+    let control_plane_write = matches!(segments.first(), Some(&"auth"))
+        || (method == Method::POST && matches!(segments.as_slice(), ["orgs"]))
+        || (method == Method::POST && matches!(segments.as_slice(), ["orgs", _, "invite"]))
+        || (method == Method::DELETE && matches!(segments.as_slice(), ["orgs", _, "members", _]));
+    !control_plane_write
 }
 
 fn internal_routes() -> Router<AppState> {
@@ -92,6 +182,10 @@ fn internal_routes() -> Router<AppState> {
         .route(
             "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/logs",
             axum::routing::get(routes::internal::get_paas_app_logs),
+        )
+        .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/proof-bundle",
+            axum::routing::get(routes::internal::get_paas_proof_bundle),
         )
         .route(
             "/internal/paas/orgs/{paas_org_id}/members",
@@ -435,7 +529,10 @@ fn workload_routes() -> Router<AppState> {
 }
 
 fn health_routes() -> Router<AppState> {
-    Router::new().route("/health", axum::routing::get(|| async { "ok" }))
+    Router::new()
+        .route("/livez", axum::routing::get(|| async { "ok" }))
+        .route("/readyz", axum::routing::get(|| async { "ok" }))
+        .route("/health", axum::routing::get(|| async { "ok" }))
 }
 
 /// Build the CORS layer from `CORS_ALLOWED_ORIGINS` (comma-separated).
@@ -493,6 +590,98 @@ pub fn test_router(state: AppState) -> Router {
 }
 
 #[cfg(test)]
+mod runtime_gate_tests {
+    use super::{is_workload_authority_mutation, test_router};
+    use axum::{
+        body::Body,
+        http::{Method, Request, StatusCode, header},
+    };
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    #[test]
+    fn workload_gate_is_fail_closed_for_current_and_future_writes() {
+        for (method, path) in [
+            (Method::POST, "/apps"),
+            (Method::DELETE, "/apps/demo/domains/example.test"),
+            (Method::POST, "/internal/paas/orgs/org-1/deployments"),
+            (Method::POST, "/internal/paas/future-workload-authority"),
+            (Method::POST, "/api/v2/workload/future"),
+        ] {
+            assert!(is_workload_authority_mutation(&method, path));
+        }
+
+        for (method, path) in [
+            (Method::GET, "/apps"),
+            (Method::DELETE, "/apps/demo"),
+            (Method::POST, "/auth/login"),
+            (Method::POST, "/orgs"),
+            (Method::DELETE, "/orgs/acme/members/user-1"),
+            (Method::PUT, "/internal/paas/orgs/org-1/entitlements"),
+            (Method::DELETE, "/internal/paas/orgs/org-1/apps/demo"),
+        ] {
+            assert!(!is_workload_authority_mutation(&method, path));
+        }
+    }
+
+    #[tokio::test]
+    async fn router_exposes_only_liveness_until_ready_then_enforces_dispatch_gate() {
+        let mut state = crate::test_support::lazy_state();
+        state.deployment_dispatch_enabled = false;
+        state
+            .startup_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        let app = test_router(state.clone());
+
+        let live = app
+            .clone()
+            .oneshot(Request::get("/livez").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+
+        let not_ready = app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(not_ready.headers()[header::CACHE_CONTROL], "no-store");
+
+        state.mark_startup_ready();
+        let ready = app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        let frozen = app
+            .clone()
+            .oneshot(
+                Request::post("/future-workload-authority")
+                    .header(header::ORIGIN, "http://localhost:5173")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(frozen.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let allow_origin = &frozen.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN];
+        assert_eq!(allow_origin, "http://localhost:5173");
+        let body = frozen.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["reason"], "deployment_dispatch_disabled");
+
+        let cleanup = app
+            .oneshot(Request::delete("/apps/demo").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(cleanup.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod test_support {
     use crate::auth::api_key::ValidatedApiKey;
     use crate::auth::middleware::{AuthContext, ManagementOrigin};
@@ -531,9 +720,12 @@ pub(crate) mod test_support {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgresql://test:test@localhost:5432/test")
             .expect("lazy postgres URL should parse");
+        let side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
         AppState {
             db: pool,
             management_mode: crate::state::CapManagementMode::Standalone,
+            deployment_dispatch_enabled: true,
+            startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             signing_key: Arc::new(SigningKey::generate(&mut OsRng)),
             hmac_key: Arc::new([7u8; 32]),
             api_url: "https://api.example.test".to_string(),
@@ -562,11 +754,13 @@ pub(crate) mod test_support {
                 trustee_policy_read_available: true,
                 workload_artifacts_url: Some("https://api.example.test/workload/artifacts".into()),
                 tls_certificate_broker_url: None,
+                amd_kds_base_url: None,
                 trustee_policy_url: Some("https://kbs.example.test/policy".into()),
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,
                 platform_trustee_policy_pubkey_hex: Some("11".repeat(32)),
                 signing_service_pubkey_hex: Some("11".repeat(32)),
+                verification_material: None,
             }),
             platform_release_envelope: None,
             dns: None,
@@ -577,6 +771,7 @@ pub(crate) mod test_support {
             signing_service: None,
             require_customer_signed_policy_artifact: true,
             deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            side_effect_admission,
             internal_auth: None,
         }
     }

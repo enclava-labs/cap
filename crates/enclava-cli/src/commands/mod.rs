@@ -9,6 +9,7 @@ pub mod org;
 pub mod ownership;
 pub mod prepare;
 pub mod template;
+pub mod verify;
 
 use clap::{Parser, Subcommand};
 
@@ -84,6 +85,8 @@ pub enum Command {
     /// Inspect a deployment descriptor (debug; phase 7 groundwork)
     #[command(subcommand)]
     Descriptor(descriptor::DescriptorCommand),
+    /// Independently verify a live target or saved proof bundle
+    Verify(verify::VerifyArgs),
 }
 
 pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -113,5 +116,6 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Org(cmd) => org::run(cmd).await,
         Command::Key(cmd) => key::run(cmd).await,
         Command::Descriptor(cmd) => descriptor::run(cmd).await,
+        Command::Verify(args) => verify::run(args).await,
     }
 }

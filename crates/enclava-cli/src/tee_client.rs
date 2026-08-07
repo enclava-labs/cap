@@ -455,9 +455,27 @@ impl TeeClient {
     pub async fn attest_receipt_key(
         &self,
     ) -> Result<(TransitionReceiptAttestation, TeeClient), TeeError> {
+        match self.attest_receipt_key_once().await {
+            Err(error) if self.resolve_ip.is_some() && is_tee_tcp_connect_error(&error) => {
+                Self::new_with_timeout_and_resolve_ip(
+                    &self.confidential_base_url,
+                    self.timeout,
+                    None,
+                )
+                .attest_receipt_key_once()
+                .await
+            }
+            result => result,
+        }
+    }
+
+    async fn attest_receipt_key_once(
+        &self,
+    ) -> Result<(TransitionReceiptAttestation, TeeClient), TeeError> {
         let endpoint = EndpointParts::parse(&self.confidential_base_url)?;
         let leaf_spki_der =
-            fetch_tls_leaf_spki_der(&endpoint.host, endpoint.port, self.resolve_ip).await?;
+            fetch_tls_leaf_spki_der(&endpoint.host, endpoint.port, self.resolve_ip, self.timeout)
+                .await?;
         let leaf_spki_sha256: [u8; 32] = Sha256::digest(&leaf_spki_der).into();
         let pinned_http = build_spki_pinned_client(
             leaf_spki_sha256,
@@ -516,6 +534,10 @@ impl TeeClient {
         };
         Ok((transition_attestation, self.with_http(pinned_http)))
     }
+}
+
+fn is_tee_tcp_connect_error(error: &TeeError) -> bool {
+    matches!(error, TeeError::Attestation(message) if message.starts_with("TEE TCP connect "))
 }
 
 fn build_tee_http_client(

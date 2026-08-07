@@ -1,4 +1,6 @@
-use enclava_engine::manifest::network_policy::generate_network_policy;
+use enclava_engine::manifest::network_policy::{
+    cap_api_namespace_for_attestation, generate_network_policy,
+};
 use enclava_engine::testutil::sample_app;
 
 #[test]
@@ -41,7 +43,7 @@ fn network_policy_ingress_allows_envoy_gateway() {
 }
 
 #[test]
-fn network_policy_ingress_allows_cap_api_to_tee_tls_port() {
+fn network_policy_ingress_allows_cap_api_to_confidential_tls_ports() {
     let mut app = sample_app();
     app.attestation.tls_certificate_broker_url = Some(
         "http://cap-api.cap-test01.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
@@ -56,8 +58,67 @@ fn network_policy_ingress_allows_cap_api_to_tee_tls_port() {
         "cap-test01"
     );
     assert_eq!(from[0]["matchLabels"]["app.kubernetes.io/name"], "cap-api");
-    assert_eq!(ingress["toPorts"][0]["ports"][0]["port"], "8443");
-    assert_eq!(ingress["toPorts"][0]["ports"][0]["protocol"], "TCP");
+    let ports = ingress["toPorts"][0]["ports"].as_array().unwrap();
+    let ports = ports
+        .iter()
+        .map(|port| {
+            (
+                port["port"].as_str().unwrap(),
+                port["protocol"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ports, vec![("10443", "TCP"), ("8443", "TCP")]);
+}
+
+#[test]
+fn cap_api_namespace_requires_an_explicit_internal_service_url() {
+    let mut app = sample_app();
+    assert_eq!(
+        cap_api_namespace_for_attestation(&app.attestation, &app.api_url),
+        None
+    );
+
+    app.attestation.workload_artifacts_url =
+        Some("http://cap-api.cap-test01.svc.cluster.local/api/v1/workload/artifacts".to_string());
+    assert_eq!(
+        cap_api_namespace_for_attestation(&app.attestation, &app.api_url),
+        Some("cap-test01")
+    );
+}
+
+#[test]
+fn operator_named_cap_service_gets_relay_and_tee_rules() {
+    let mut app = sample_app();
+    app.attestation.tls_certificate_broker_url = Some(
+        "http://cap-api-standalone-iv.enclava-dev.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
+            .to_string(),
+    );
+
+    let policy = generate_network_policy(&app);
+    assert_eq!(
+        cap_api_namespace_for_attestation(&app.attestation, &app.api_url),
+        Some("enclava-dev")
+    );
+    assert!(
+        policy["spec"]["egress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| {
+                rule["toServices"][0]["k8sService"]["serviceName"].as_str() == Some("amd-kds-relay")
+            })
+    );
+    assert!(
+        policy["spec"]["ingress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| {
+                rule["fromEndpoints"][0]["matchLabels"]["app.kubernetes.io/name"].as_str()
+                    == Some("cap-api-standalone-iv")
+            })
+    );
 }
 
 #[test]
@@ -97,9 +158,9 @@ fn network_policy_egress_has_dns() {
     assert_eq!(dns_ports[0]["protocol"], "UDP");
     assert_eq!(dns_ports[1]["port"], "53");
     assert_eq!(dns_ports[1]["protocol"], "TCP");
-    assert_eq!(
-        egress[0]["toPorts"][0]["rules"]["dns"][0]["matchPattern"],
-        "*"
+    assert!(
+        egress[0]["toPorts"][0].get("rules").is_none(),
+        "Kata guests require direct L4 DNS because Cilium's DNS proxy does not relay responses"
     );
 }
 
@@ -215,8 +276,12 @@ fn restricted_egress_mode_does_not_emit_public_cidr() {
 }
 
 #[test]
-fn default_egress_includes_acme_endpoints() {
-    let app = sample_app();
+fn default_egress_includes_platform_endpoints() {
+    let mut app = sample_app();
+    app.attestation.tls_certificate_broker_url = Some(
+        "http://cap-api.cap-test01.svc.cluster.local/api/v1/workload/tls/dns01-certificate"
+            .to_string(),
+    );
     let val = generate_network_policy(&app);
     let egress = val["spec"]["egress"].as_array().unwrap();
     let fqdns: Vec<&str> = egress
@@ -231,6 +296,13 @@ fn default_egress_includes_acme_endpoints() {
         fqdns.contains(&"acme-staging-v02.api.letsencrypt.org"),
         "missing ACME staging endpoint in {fqdns:?}"
     );
+    let relay = egress
+        .iter()
+        .find(|rule| {
+            rule["toServices"][0]["k8sService"]["serviceName"].as_str() == Some("amd-kds-relay")
+        })
+        .expect("missing AMD KDS relay");
+    assert_eq!(relay["toPorts"][0]["ports"][0]["port"], "8080");
     for rule in egress {
         if rule["toFQDNs"][0]["matchName"]
             .as_str()
@@ -309,7 +381,11 @@ fn empty_egress_allowlist_renders_zero_extra_rules() {
     app.egress_allowlist = Vec::new();
     let val = generate_network_policy(&app);
     let egress = val["spec"]["egress"].as_array().unwrap();
-    assert_eq!(egress.len(), 6, "DNS + same-ns + KBS x2 + ACME x2");
+    assert_eq!(
+        egress.len(),
+        8,
+        "DNS + same-ns + KBS x2 + ACME x2 + AMD relay x2"
+    );
 }
 
 #[test]
@@ -347,8 +423,8 @@ fn egress_allowlist_renders_one_rule_per_entry() {
     ];
     let val = generate_network_policy(&app);
     let egress = val["spec"]["egress"].as_array().unwrap();
-    assert_eq!(egress.len(), 8, "4 cluster + 2 ACME + 2 user");
-    assert_eq!(egress[6]["toFQDNs"][0]["matchName"], "api.stripe.com");
-    assert_eq!(egress[6]["toPorts"][0]["ports"][0]["port"], "443");
-    assert_eq!(egress[7]["toFQDNs"][0]["matchName"], "hooks.slack.com");
+    assert_eq!(egress.len(), 10, "6 cluster + 2 platform + 2 user");
+    assert_eq!(egress[8]["toFQDNs"][0]["matchName"], "api.stripe.com");
+    assert_eq!(egress[8]["toPorts"][0]["ports"][0]["port"], "443");
+    assert_eq!(egress[9]["toFQDNs"][0]["matchName"], "hooks.slack.com");
 }

@@ -5,6 +5,7 @@ use enclava_common::types::{ResourceLimits, UnlockMode as CommonUnlockMode};
 use enclava_engine::apply::{
     engine::ApplyEngine,
     gateway::apply_gateway_resources,
+    generation::MutationGeneration,
     namespace::apply_namespace,
     network_policy::apply_network_policy,
     orchestrator::{MANIFEST_HASH_ANNOTATION, manifest_hash},
@@ -20,7 +21,7 @@ use enclava_engine::types::{
 };
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::net::IpAddr;
 use uuid::Uuid;
 
@@ -30,6 +31,7 @@ const DEFAULT_TENANT_IMAGE_PULL_SECRET_NAME: &str = "enclava-registry-auth";
 const TENANT_IMAGE_PULL_SECRET_NAME_ENV: &str = "TENANT_IMAGE_PULL_SECRET_NAME";
 const TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES_ENV: &str = "TENANT_IMAGE_PULL_ALLOWED_REPOSITORIES";
 const PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS_ENV: &str = "CAP_PUBLIC_INTERNET_EGRESS_EXCLUDED_CIDRS";
+pub(crate) const PERSISTED_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 
 #[derive(Debug, Clone)]
 struct TenantImagePullSecretConfig {
@@ -90,18 +92,16 @@ fn classify_rollout_result(
                 terminal: false,
             }
         }
-        Ok(status) => DeploymentOutcome {
+        Ok(_) => DeploymentOutcome {
             deploy_status: "failed",
             app_status: "failed",
-            error_message: status
-                .message
-                .or_else(|| Some(format!("{:?}", status.phase))),
+            error_message: Some(PERSISTED_DEPLOYMENT_ERROR_MESSAGE.to_string()),
             terminal: true,
         },
-        Err(err) => DeploymentOutcome {
+        Err(_) => DeploymentOutcome {
             deploy_status: "failed",
             app_status: "failed",
-            error_message: Some(err),
+            error_message: Some(PERSISTED_DEPLOYMENT_ERROR_MESSAGE.to_string()),
             terminal: true,
         },
     }
@@ -303,6 +303,7 @@ async fn apply_all_with_tenant_image_pull_secret(
     manifests: &enclava_engine::manifest::GeneratedManifests,
     manifest_hash: &str,
     image_pull_secret_config: Option<&TenantImagePullSecretConfig>,
+    generation: MutationGeneration,
 ) -> Result<(), DeployError> {
     let ns_name = manifests
         .namespace
@@ -315,12 +316,12 @@ async fn apply_all_with_tenant_image_pull_secret(
             )
         })?;
 
-    apply_namespace(engine, &manifests.namespace).await?;
+    apply_namespace(engine, &manifests.namespace, generation).await?;
     tracing::info!(namespace = %ns_name, "step 1/5: namespace ready");
 
     if let Some(config) = image_pull_secret_config {
         let secret = generate_tenant_image_pull_secret(ns_name, config);
-        apply_namespaced_resource(engine, ns_name, &secret).await?;
+        apply_namespaced_resource(engine, ns_name, &secret, generation).await?;
         tracing::info!(
             namespace = %ns_name,
             secret = %config.name,
@@ -328,10 +329,10 @@ async fn apply_all_with_tenant_image_pull_secret(
         );
     }
 
-    apply_standard_resources(engine, manifests).await?;
+    apply_standard_resources(engine, manifests, generation).await?;
     tracing::info!(namespace = %ns_name, "step 2/5: standard resources applied");
 
-    apply_network_policy(engine, ns_name, &manifests.network_policy).await?;
+    apply_network_policy(engine, ns_name, &manifests.network_policy, generation).await?;
     tracing::info!(namespace = %ns_name, "step 3/5: CiliumNetworkPolicy applied");
 
     apply_gateway_resources(
@@ -341,6 +342,7 @@ async fn apply_all_with_tenant_image_pull_secret(
         &manifests.gateway,
         &manifests.tls_route,
         &manifests.tee_tls_route,
+        generation,
     )
     .await?;
     tracing::info!(namespace = %ns_name, "step 4/5: Gateway API resources applied");
@@ -354,7 +356,7 @@ async fn apply_all_with_tenant_image_pull_secret(
             manifest_hash.to_string(),
         );
 
-    apply_statefulset(engine, ns_name, &sts).await?;
+    apply_statefulset(engine, ns_name, &sts, generation).await?;
     tracing::info!(
         namespace = %ns_name,
         manifest_hash = %manifest_hash,
@@ -368,16 +370,136 @@ async fn apply_all_with_tenant_image_pull_secret(
 pub struct ApplyDeploymentManifestsRequest {
     pub pool: PgPool,
     pub app: App,
+    pub snapshot: DeploymentApplySnapshot,
     pub deployment_id: Uuid,
     pub attestation_config: Option<AttestationConfig>,
     pub kbs_policy_config: Option<crate::kbs::KbsPolicyConfig>,
+    pub edge_config_generation: i64,
+    pub kubernetes_mutation_generation: i64,
     pub api_signing_pubkey: String,
     pub api_url: String,
     pub workload_artifact_binding: Option<WorkloadArtifactBinding>,
     pub signed_policy_artifact: Option<crate::signing_service::SignedPolicyArtifact>,
     pub local_workload_artifacts_json: Option<String>,
     pub local_trustee_policy_json: Option<String>,
+    pub sigstore_material: Vec<u8>,
+    pub provenance_oci_material: Vec<u8>,
     pub log_encryption: Option<LogEncryptionConfig>,
+}
+
+/// Immutable database-row inputs captured for one queued deployment apply.
+///
+/// The API can accept another deployment while this one waits for the apply
+/// semaphore. Keeping these rows on the queued request prevents a later
+/// deployment from changing the manifest rendered for this deployment ID.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeploymentApplySnapshot {
+    pub containers: Vec<AppContainer>,
+    pub resources: AppResources,
+}
+
+impl DeploymentApplySnapshot {
+    pub fn new(containers: Vec<AppContainer>, resources: AppResources) -> Self {
+        Self {
+            containers,
+            resources,
+        }
+    }
+}
+
+/// Authoritative database rows used while validating an existing app
+/// deployment. Acceptance locks and compares this snapshot before committing
+/// any candidate changes.
+#[derive(Debug, Clone)]
+pub(crate) struct ExistingAppAuthoritySnapshot {
+    app_updated_at: chrono::DateTime<chrono::Utc>,
+    containers: Vec<AppContainer>,
+    resources: AppResources,
+}
+
+impl ExistingAppAuthoritySnapshot {
+    pub(crate) fn new(
+        app_updated_at: chrono::DateTime<chrono::Utc>,
+        containers: Vec<AppContainer>,
+        resources: AppResources,
+    ) -> Self {
+        Self {
+            app_updated_at,
+            containers,
+            resources,
+        }
+    }
+
+    pub(crate) fn app_id(&self) -> Uuid {
+        self.resources.app_id
+    }
+}
+
+pub(crate) async fn lock_and_verify_existing_app_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    expected: &ExistingAppAuthoritySnapshot,
+) -> Result<bool, sqlx::Error> {
+    verify_existing_app_authority_rows(tx, app_id, expected, true).await
+}
+
+/// Compare the accepted app/runtime rows while the caller holds the app
+/// advisory lane, without taking row locks. Durable workers use this form
+/// because manifest application updates app/deployment status through other
+/// pooled connections while the advisory lane remains held. Taking a row lock
+/// here would make the worker wait on itself.
+pub(crate) async fn verify_existing_app_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    expected: &ExistingAppAuthoritySnapshot,
+) -> Result<bool, sqlx::Error> {
+    verify_existing_app_authority_rows(tx, app_id, expected, false).await
+}
+
+async fn verify_existing_app_authority_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    expected: &ExistingAppAuthoritySnapshot,
+    lock_rows: bool,
+) -> Result<bool, sqlx::Error> {
+    let app_query = if lock_rows {
+        "SELECT updated_at FROM apps WHERE id = $1 FOR UPDATE"
+    } else {
+        "SELECT updated_at FROM apps WHERE id = $1"
+    };
+    let current_updated_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(app_query)
+        .bind(app_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if current_updated_at != Some(expected.app_updated_at) {
+        return Ok(false);
+    }
+
+    let containers_query = if lock_rows {
+        "SELECT * FROM app_containers WHERE app_id = $1 ORDER BY id FOR UPDATE"
+    } else {
+        "SELECT * FROM app_containers WHERE app_id = $1 ORDER BY id"
+    };
+    let current_containers: Vec<AppContainer> = sqlx::query_as(containers_query)
+        .bind(app_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    let mut expected_containers = expected.containers.clone();
+    expected_containers.sort_by_key(|container| container.id);
+    if current_containers != expected_containers {
+        return Ok(false);
+    }
+
+    let resources_query = if lock_rows {
+        "SELECT * FROM app_resources WHERE app_id = $1 FOR UPDATE"
+    } else {
+        "SELECT * FROM app_resources WHERE app_id = $1"
+    };
+    let current_resources: Option<AppResources> = sqlx::query_as(resources_query)
+        .bind(app_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(current_resources.as_ref() == Some(&expected.resources))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -404,6 +526,31 @@ pub enum DeployError {
     KbsPolicy(#[from] crate::kbs::KbsPolicyError),
     #[error("edge route error: {0}")]
     EdgeRoute(#[from] crate::edge::EdgeRouteError),
+    #[error("durable mutation fence error: {0}")]
+    Mutation(#[from] crate::mutation_leases::MutationLeaseError),
+}
+
+impl DeployError {
+    /// Return a bounded code safe for persistence and operator logs.
+    pub(crate) fn public_code(&self) -> &'static str {
+        match self {
+            Self::Db(_) => "database_error",
+            Self::NoContainers => "no_containers",
+            Self::ImageParse(_) => "image_parse_error",
+            Self::NoDigest(_) => "image_digest_required",
+            Self::Validation(_) => "deployment_validation_error",
+            Self::MissingAttestationConfig => "deploy_runtime_not_configured",
+            Self::Apply(error) => error.public_code(),
+            Self::NotDeployed(_) => "app_not_deployed",
+            Self::KbsPolicy(_) => "kbs_policy_error",
+            Self::EdgeRoute(_) => "edge_route_error",
+            Self::Mutation(_) => "mutation_fence_error",
+        }
+    }
+}
+
+fn persisted_deployment_error(error_message: Option<&str>) -> Option<&'static str> {
+    error_message.map(|_| PERSISTED_DEPLOYMENT_ERROR_MESSAGE)
 }
 
 pub(crate) fn serialize_workload_command(
@@ -509,8 +656,36 @@ pub async fn build_confidential_app(
         .fetch_one(pool)
         .await?;
 
+    build_confidential_app_from_rows(
+        app,
+        deployment_id,
+        attestation_config,
+        api_signing_pubkey,
+        api_url,
+        &containers_rows,
+        &resources,
+    )
+}
+
+/// Build a `ConfidentialApp` from an immutable snapshot of database rows.
+///
+/// Deployment request validation uses this helper to render a candidate spec
+/// before any requested app or container changes are persisted.
+pub(crate) fn build_confidential_app_from_rows(
+    app: &App,
+    deployment_id: Uuid,
+    attestation_config: &AttestationConfig,
+    api_signing_pubkey: &str,
+    api_url: &str,
+    containers_rows: &[AppContainer],
+    resources: &AppResources,
+) -> Result<ConfidentialApp, DeployError> {
+    if containers_rows.is_empty() {
+        return Err(DeployError::NoContainers);
+    }
+
     let mut containers = Vec::new();
-    for row in &containers_rows {
+    for row in containers_rows {
         let image_str = row
             .image_digest
             .as_ref()
@@ -596,8 +771,8 @@ pub async fn build_confidential_app(
         api_signing_pubkey: api_signing_pubkey.to_string(),
         api_url: api_url.to_string(),
         resources: ResourceLimits {
-            cpu: resources.cpu_limit,
-            memory: resources.memory_limit,
+            cpu: resources.cpu_limit.clone(),
+            memory: resources.memory_limit.clone(),
         },
         attestation: attestation_config.clone(),
         egress_mode,
@@ -609,9 +784,21 @@ pub async fn build_confidential_app(
     })
 }
 
-async fn latest_deployment_id_for_app(pool: &PgPool, app_id: Uuid) -> Result<Uuid, sqlx::Error> {
+pub(crate) async fn latest_deployment_id_for_app(
+    pool: &PgPool,
+    app_id: Uuid,
+) -> Result<Uuid, sqlx::Error> {
     let deployment_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM deployments WHERE app_id = $1 ORDER BY created_at DESC LIMIT 1",
+        "SELECT deployment.id
+           FROM deployments AS deployment
+           LEFT JOIN deployment_apply_jobs AS apply_job
+             ON apply_job.deployment_id = deployment.id
+          WHERE deployment.app_id = $1
+          ORDER BY (apply_job.generation IS NOT NULL) DESC,
+                   apply_job.generation DESC NULLS LAST,
+                   deployment.created_at DESC,
+                   deployment.id DESC
+          LIMIT 1",
     )
     .bind(app_id)
     .fetch_optional(pool)
@@ -619,32 +806,197 @@ async fn latest_deployment_id_for_app(pool: &PgPool, app_id: Uuid) -> Result<Uui
     Ok(deployment_id.unwrap_or_else(Uuid::nil))
 }
 
-/// Record a deployment result in the database.
-pub async fn record_deployment_result(
-    pool: &PgPool,
-    deployment_id: Uuid,
-    status: &str,
-    manifest_hash: Option<&str>,
-    error_message: Option<&str>,
-    terminal: bool,
+pub(crate) const DEPLOYMENT_SUPERSEDED_ERROR: &str = "deployment_superseded";
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SupersedeDeploymentError {
+    #[error("an unexpired deployment mutation is still in progress")]
+    Busy,
+    #[error("database error")]
+    Database(#[from] sqlx::Error),
+}
+
+fn app_deployment_lane_key(app_id: Uuid) -> i64 {
+    let (high, low) = app_id.as_u64_pair();
+    (high ^ low) as i64
+}
+
+/// Serialize deployment acceptance, manifest application, and terminal result
+/// publication for one app across every API replica.
+///
+/// A 64-bit advisory key collision can only serialize unrelated apps; it
+/// cannot allow two operations for the same app to overlap.
+pub(crate) async fn lock_app_deployment_lane(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE deployments
-         SET status = $1::deploy_status_enum,
-             manifest_hash = $2,
-             error_message = $3,
-             completed_at = CASE WHEN $4 THEN now() ELSE completed_at END
-         WHERE id = $5",
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(app_deployment_lane_key(app_id))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Mark accepted-but-incomplete deployments as superseded before inserting a
+/// newer deployment for the same app. The caller must hold the app deployment
+/// lane for the surrounding transaction.
+pub(crate) async fn supersede_incomplete_deployments(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+) -> Result<u64, SupersedeDeploymentError> {
+    // Never revoke the relational owner of an external mutation while its DB
+    // lease is live. Queued work and expired owners are safe to terminalize;
+    // an active watcher is observation-only and publication remains fenced by
+    // its generation/token after supersession.
+    let active_mutation: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployment_apply_jobs AS job
+               JOIN deployments AS deployment ON deployment.id = job.deployment_id
+              WHERE job.app_id = $1
+                AND job.locked_until >= clock_timestamp()
+                AND (
+                    job.state IN ('setting_up', 'cleaning_up')
+                    OR (
+                        job.state = 'running'
+                        AND deployment.status IN (
+                            'pending'::deploy_status_enum,
+                            'applying'::deploy_status_enum
+                        )
+                    )
+                )
+         )",
     )
-    .bind(status)
-    .bind(manifest_hash)
-    .bind(error_message)
-    .bind(terminal)
-    .bind(deployment_id)
-    .execute(pool)
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if active_mutation {
+        return Err(SupersedeDeploymentError::Busy);
+    }
+    // Stop every queued or leased operation before terminalizing its
+    // deployment. A worker that already holds a lease must acquire the same
+    // app lane before any setup/apply/cleanup side effect, so once this update
+    // commits it can only observe a lost lease / terminal generation.
+    sqlx::query(
+        "UPDATE deployment_apply_jobs
+         SET state = 'failed',
+             lock_token = NULL,
+             locked_until = NULL,
+             next_attempt_at = clock_timestamp(),
+             last_error_code = $1,
+             updated_at = clock_timestamp()
+         WHERE app_id = $2
+           AND state IN (
+               'setup_pending', 'setting_up',
+               'cleanup_pending', 'cleaning_up',
+               'pending', 'running'
+           )",
+    )
+    .bind(DEPLOYMENT_SUPERSEDED_ERROR)
+    .bind(app_id)
+    .execute(&mut **tx)
     .await?;
 
-    Ok(())
+    let result = sqlx::query(
+        "UPDATE deployments
+         SET status = 'failed'::deploy_status_enum,
+             error_message = $1,
+             completed_at = clock_timestamp()
+         WHERE app_id = $2
+           AND status::text IN ('pending', 'applying', 'watching')",
+    )
+    .bind(DEPLOYMENT_SUPERSEDED_ERROR)
+    .bind(app_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub(crate) async fn deployment_is_active_for_apply(
+    tx: &mut Transaction<'_, Postgres>,
+    app_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM deployments AS deployment
+             JOIN apps AS app ON app.id = deployment.app_id
+             WHERE deployment.id = $1
+               AND deployment.app_id = $2
+               -- A worker can die after idempotent SSA apply and before its
+               -- rollout watcher publishes a terminal result. Reclaiming a
+               -- watching generation must re-apply and re-watch it; treating
+               -- it as inactive would complete the job while stranding the
+               -- deployment forever in watching.
+               AND deployment.status::text IN ('pending', 'applying', 'watching')
+               AND app.status <> 'deleting'::app_status_enum
+         )",
+    )
+    .bind(deployment_id)
+    .bind(app_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// Publish a rollout observation only while it still belongs to the active
+/// watching deployment and exact manifest hash. A newer acceptance first
+/// supersedes the old row under the same app deployment lane, so a late old
+/// watcher becomes a no-op for both deployment and app status.
+#[cfg(test)]
+pub(crate) struct DeploymentResultUpdate<'a> {
+    pub app_id: Uuid,
+    pub deployment_id: Uuid,
+    pub deploy_status: &'a str,
+    pub expected_manifest_hash: &'a str,
+    pub app_status: &'a str,
+    pub error_code: Option<&'a str>,
+    pub terminal: bool,
+}
+
+#[cfg(test)]
+pub(crate) async fn record_deployment_result_if_current(
+    pool: &PgPool,
+    update: DeploymentResultUpdate<'_>,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_app_deployment_lane(&mut tx, update.app_id).await?;
+
+    let result = sqlx::query(
+        "UPDATE deployments
+         SET status = $1::deploy_status_enum,
+             error_message = $2,
+             completed_at = CASE WHEN $3 THEN clock_timestamp() ELSE completed_at END
+         WHERE id = $4
+           AND app_id = $5
+           AND status = 'watching'::deploy_status_enum
+           AND manifest_hash = $6",
+    )
+    .bind(update.deploy_status)
+    .bind(update.error_code)
+    .bind(update.terminal)
+    .bind(update.deployment_id)
+    .bind(update.app_id)
+    .bind(update.expected_manifest_hash)
+    .execute(&mut *tx)
+    .await?;
+
+    let recorded = result.rows_affected() == 1;
+    if recorded {
+        sqlx::query(
+            "UPDATE apps
+             SET status = $1::app_status_enum,
+                 updated_at = clock_timestamp()
+             WHERE id = $2",
+        )
+        .bind(update.app_status)
+        .bind(update.app_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(recorded)
 }
 
 #[cfg(test)]
@@ -672,12 +1024,115 @@ mod tests {
             trustee_policy_read_available: true,
             workload_artifacts_url: None,
             tls_certificate_broker_url: None,
+            amd_kds_base_url: None,
             trustee_policy_url: None,
             local_workload_artifacts_json: None,
             local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
+            verification_material: None,
         }
+    }
+
+    fn queued_apply_app() -> App {
+        let now = chrono::Utc::now();
+        App {
+            id: uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            org_id: uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+            name: "queued-app".to_string(),
+            namespace: "cap-queued-app".to_string(),
+            instance_id: "queued-app-instance".to_string(),
+            tenant_id: "8f346820".to_string(),
+            service_account: "cap-queued-app-sa".to_string(),
+            bootstrap_owner_pubkey_hash: "11".repeat(32),
+            tenant_instance_identity_hash: "22".repeat(32),
+            unlock_mode: crate::models::UnlockMode::Password,
+            domain: "queued-app.8f346820.enclava.dev".to_string(),
+            tee_domain: Some("queued-app.8f346820.tee.enclava.dev".to_string()),
+            custom_domain: None,
+            status: AppStatus::Creating,
+            signer_identity_subject: Some("https://github.com/acme/app".to_string()),
+            signer_identity_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
+            signer_identity_set_at: Some(now),
+            source_provider: Some("github".to_string()),
+            source_repository: Some("acme/app".to_string()),
+            egress_allowlist: sqlx::types::Json(Vec::new()),
+            egress_mode: "restricted".to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn queued_apply_snapshot(digest_byte: char) -> DeploymentApplySnapshot {
+        let app = queued_apply_app();
+        let digest = format!("sha256:{}", digest_byte.to_string().repeat(64));
+        DeploymentApplySnapshot::new(
+            vec![AppContainer {
+                id: uuid::Uuid::new_v4(),
+                app_id: app.id,
+                name: "web".to_string(),
+                image_ref: "ghcr.io/acme/app:latest".to_string(),
+                image_digest: Some(digest),
+                port: Some(8080),
+                command: None,
+                storage_paths: Some(vec!["/data".to_string()]),
+                workload_security_profile: Some("restricted".to_string()),
+                is_primary: true,
+            }],
+            AppResources {
+                app_id: app.id,
+                cpu_limit: "1".to_string(),
+                memory_limit: "1Gi".to_string(),
+                app_data_size: "5Gi".to_string(),
+                tls_data_size: "2Gi".to_string(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn queued_apply_renders_its_captured_rows_after_later_state_changes() {
+        let app = queued_apply_app();
+        let first_snapshot = queued_apply_snapshot('a');
+        let later_snapshot = queued_apply_snapshot('b');
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let queued_gate = gate.clone();
+        let queued_app = app.clone();
+        let queued = tokio::spawn(async move {
+            let _permit = queued_gate.acquire().await.expect("queue remains open");
+            build_confidential_app_from_rows(
+                &queued_app,
+                uuid::Uuid::new_v4(),
+                &test_attestation_config(),
+                "api-signing-key",
+                "https://api.enclava.dev",
+                &first_snapshot.containers,
+                &first_snapshot.resources,
+            )
+            .expect("captured apply snapshot")
+        });
+
+        tokio::task::yield_now().await;
+        let later = build_confidential_app_from_rows(
+            &app,
+            uuid::Uuid::new_v4(),
+            &test_attestation_config(),
+            "api-signing-key",
+            "https://api.enclava.dev",
+            &later_snapshot.containers,
+            &later_snapshot.resources,
+        )
+        .expect("later apply snapshot");
+        gate.add_permits(1);
+        let first = queued.await.expect("queued renderer");
+
+        assert_eq!(
+            first.containers[0].image.digest(),
+            format!("sha256:{}", "a".repeat(64))
+        );
+        assert_eq!(
+            later.containers[0].image.digest(),
+            format!("sha256:{}", "b".repeat(64))
+        );
     }
 
     #[test]
@@ -716,7 +1171,32 @@ mod tests {
         assert!(outcome.terminal);
         assert_eq!(
             outcome.error_message.as_deref(),
-            Some("rollout did not complete within 600s")
+            Some(PERSISTED_DEPLOYMENT_ERROR_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn deployment_error_persistence_discards_plaintext() {
+        const SENSITIVE_ERROR: &str =
+            "kubernetes response included customer-secret-name and private-config";
+
+        let persisted = persisted_deployment_error(Some(SENSITIVE_ERROR));
+        assert_eq!(persisted, Some(PERSISTED_DEPLOYMENT_ERROR_MESSAGE));
+        assert!(!persisted.unwrap().contains("customer-secret-name"));
+        assert_eq!(persisted_deployment_error(None), None);
+
+        let error = DeployError::Apply(enclava_engine::apply::engine::ApplyError::RolloutFailed(
+            SENSITIVE_ERROR.to_string(),
+        ));
+        assert_eq!(error.public_code(), "rollout_failed");
+        assert!(!error.public_code().contains("customer-secret-name"));
+
+        let mutation_error =
+            DeployError::Mutation(crate::mutation_leases::MutationLeaseError::Busy);
+        assert_eq!(mutation_error.public_code(), "mutation_fence_error");
+        assert_eq!(
+            crate::deployment_jobs::DeploymentJobError::from(mutation_error).code(),
+            "mutation_fence_error"
         );
     }
 
@@ -956,7 +1436,8 @@ mod tests {
                     .to_string(),
             },
             api_signing_pubkey: "test-api-signing-pubkey".to_string(),
-            expected_firmware_measurement: [3; 32],
+            independent_verification: true,
+            expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-demo-org-customer-app-owner".to_string(),
             unlock_mode: "password".to_string(),
@@ -1036,12 +1517,14 @@ mod tests {
                 caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
                 trustee_policy_read_available: true,
                 workload_artifacts_url: None,
-            tls_certificate_broker_url: None,
+                tls_certificate_broker_url: None,
+                amd_kds_base_url: None,
                 trustee_policy_url: None,
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,
                 platform_trustee_policy_pubkey_hex: None,
                 signing_service_pubkey_hex: None,
+                verification_material: None,
             },
             egress_mode: EgressMode::Restricted,
             public_internet_egress_excluded_cidrs: Vec::new(),
@@ -1118,12 +1601,14 @@ mod tests {
                 caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
                 trustee_policy_read_available: true,
                 workload_artifacts_url: None,
-            tls_certificate_broker_url: None,
+                tls_certificate_broker_url: None,
+                amd_kds_base_url: None,
                 trustee_policy_url: None,
                 local_workload_artifacts_json: None,
                 local_trustee_policy_json: None,
                 platform_trustee_policy_pubkey_hex: None,
                 signing_service_pubkey_hex: None,
+                verification_material: None,
             },
             egress_mode: EgressMode::Restricted,
             public_internet_egress_excluded_cidrs: Vec::new(),
@@ -1158,7 +1643,7 @@ pub async fn set_deployment_status(
     )
     .bind(status)
     .bind(manifest_hash)
-    .bind(error_message)
+    .bind(persisted_deployment_error(error_message))
     .bind(terminal)
     .bind(deployment_id)
     .execute(pool)
@@ -1168,7 +1653,10 @@ pub async fn set_deployment_status(
 }
 
 pub async fn set_app_status(pool: &PgPool, app_id: Uuid, status: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE apps SET status = $1::app_status_enum, updated_at = now() WHERE id = $2")
+    // This is a nonterminal worker projection, not a change to accepted app
+    // authority. Advancing updated_at here would make a reclaimed durable job
+    // reject its own immutable payload after a crash between apply phases.
+    sqlx::query("UPDATE apps SET status = $1::app_status_enum WHERE id = $2")
         .bind(status)
         .bind(app_id)
         .execute(pool)
@@ -1192,6 +1680,8 @@ pub async fn reapply_tenant_ingress(
     attestation_config: Option<&AttestationConfig>,
     api_signing_pubkey: &str,
     api_url: &str,
+    mutation: &crate::mutation_leases::AppMutationLease,
+    kubernetes_mutation_generation: i64,
 ) -> Result<(), DeployError> {
     let Some(attestation_config) = attestation_config else {
         return Err(DeployError::MissingAttestationConfig);
@@ -1214,9 +1704,19 @@ pub async fn reapply_tenant_ingress(
 
     let engine = ApplyEngine::try_default().await?;
     ensure_statefulset_exists(&engine, &app_spec.namespace, &app_spec.name).await?;
-    enclava_engine::apply::resources::apply_namespaced_resource(&engine, &app_spec.namespace, &cm)
+    let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
+    mutation
+        .arm_resource_scope_until_reconciled("kubernetes_namespace")
         .await?;
-    restart_statefulset_for_ingress(&engine, &app_spec.namespace, &app_spec.name).await?;
+    enclava_engine::apply::resources::apply_namespaced_resource(
+        &engine,
+        &app_spec.namespace,
+        &cm,
+        generation,
+    )
+    .await?;
+    restart_statefulset_for_ingress(&engine, &app_spec.namespace, &app_spec.name, generation)
+        .await?;
 
     let status = watch_rollout(&engine, &app_spec.namespace, &app_spec.name).await?;
     if status.phase != DeployPhase::Running {
@@ -1253,13 +1753,15 @@ async fn restart_statefulset_for_ingress(
     engine: &ApplyEngine,
     namespace: &str,
     name: &str,
+    generation: MutationGeneration,
 ) -> Result<(), DeployError> {
     use k8s_openapi::api::apps::v1::StatefulSet;
     use kube::Api;
-    use kube::api::{Patch, PatchParams};
 
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
     let patch = serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
         "spec": {
             "template": {
                 "metadata": {
@@ -1270,9 +1772,8 @@ async fn restart_statefulset_for_ingress(
             }
         }
     });
-    api.patch(name, &PatchParams::default(), &Patch::Merge(&patch))
-        .await
-        .map_err(enclava_engine::apply::engine::ApplyError::Kube)?;
+    enclava_engine::apply::generation::apply_existing_partial(&api, name, &patch, generation)
+        .await?;
 
     tracing::info!(
         namespace = %namespace,
@@ -1283,42 +1784,90 @@ async fn restart_statefulset_for_ingress(
     Ok(())
 }
 
-/// Apply manifests before returning the deploy response, then continue rollout
-/// monitoring in the background so CLI/API calls are not held for TEE boot.
+/// A rollout handle returned after Kubernetes accepted the rendered manifests.
+///
+/// Callers must await [`DeploymentRollout::watch`]. Durable deployment workers
+/// keep their database lease alive while doing so, allowing a replacement API
+/// process to re-apply and resume observation after a crash.
+pub struct DeploymentRollout {
+    app: App,
+    engine: ApplyEngine,
+    app_spec: ConfidentialApp,
+    manifest_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeploymentRolloutOutcome {
+    pub deploy_status: &'static str,
+    pub app_status: &'static str,
+    pub error_code: Option<&'static str>,
+    pub terminal: bool,
+    pub manifest_hash: String,
+}
+
+impl DeploymentRollout {
+    /// Observe Kubernetes only. The durable job owner publishes this bounded
+    /// outcome after atomically revalidating its database lease.
+    pub async fn watch(self) -> DeploymentRolloutOutcome {
+        let previous_app_status = self.app.status;
+        let unlock_mode = self.app.unlock_mode;
+        let result = watch_rollout(&self.engine, &self.app_spec.namespace, &self.app_spec.name)
+            .await
+            .map_err(|error| error.public_code().to_string());
+        let outcome = classify_rollout_result(result, previous_app_status, unlock_mode);
+        DeploymentRolloutOutcome {
+            deploy_status: outcome.deploy_status,
+            app_status: outcome.app_status,
+            error_code: (outcome.deploy_status == "failed").then_some("deployment_rollout_failed"),
+            terminal: outcome.terminal,
+            manifest_hash: self.manifest_hash,
+        }
+    }
+}
+
+/// Apply manifests and return durable rollout-observation context.
 pub async fn apply_deployment_manifests(
     request: ApplyDeploymentManifestsRequest,
-) -> Result<(), DeployError> {
+    mutation: &crate::mutation_leases::AppMutationLease,
+) -> Result<Option<DeploymentRollout>, DeployError> {
     let ApplyDeploymentManifestsRequest {
         pool,
         app,
+        snapshot,
         deployment_id,
         attestation_config,
         kbs_policy_config,
+        edge_config_generation,
+        kubernetes_mutation_generation,
         api_signing_pubkey,
         api_url,
         workload_artifact_binding,
         signed_policy_artifact,
         local_workload_artifacts_json,
         local_trustee_policy_json,
+        sigstore_material,
+        provenance_oci_material,
         log_encryption,
     } = request;
     let attestation_config = attestation_config.ok_or(DeployError::MissingAttestationConfig)?;
-    let mut app_spec = build_confidential_app(
-        &pool,
+
+    let mut app_spec = build_confidential_app_from_rows(
         &app,
         deployment_id,
         &attestation_config,
         &api_signing_pubkey,
         &api_url,
-    )
-    .await?;
+        &snapshot.containers,
+        &snapshot.resources,
+    )?;
     app_spec.workload_artifact_binding = workload_artifact_binding;
     app_spec.log_encryption = log_encryption;
-    if let (Some(workload_artifacts), Some(trustee_policy)) =
-        (local_workload_artifacts_json, local_trustee_policy_json)
-    {
-        app_spec.attestation.local_workload_artifacts_json = Some(workload_artifacts);
-        app_spec.attestation.local_trustee_policy_json = Some(trustee_policy);
+    if let (Some(workload_artifacts), Some(trustee_policy)) = (
+        local_workload_artifacts_json.as_ref(),
+        local_trustee_policy_json.as_ref(),
+    ) {
+        app_spec.attestation.local_workload_artifacts_json = Some(workload_artifacts.clone());
+        app_spec.attestation.local_trustee_policy_json = Some(trustee_policy.clone());
     }
     if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
         let policy_sha256: [u8; 32] = hex::decode(&signed_policy_artifact.agent_policy_sha256)
@@ -1340,6 +1889,14 @@ pub async fn apply_deployment_manifests(
         });
     }
 
+    app_spec.attestation.verification_material = Some(build_verification_material(
+        &app_spec,
+        local_workload_artifacts_json.as_deref().unwrap_or_default(),
+        local_trustee_policy_json.as_deref().unwrap_or_default(),
+        &sigstore_material,
+        &provenance_oci_material,
+    )?);
+
     enclava_engine::validate::validate_app(&app_spec)
         .map_err(|e| DeployError::Validation(e.to_string()))?;
 
@@ -1350,12 +1907,15 @@ pub async fn apply_deployment_manifests(
     set_deployment_status(&pool, deployment_id, "applying", Some(&hash), None, false).await?;
     set_app_status(&pool, app.id, "creating").await?;
 
-    if let Some(signed_policy_artifact) = signed_policy_artifact.as_ref() {
+    if signed_policy_artifact.is_some() {
         if should_reconcile_global_signed_policy_artifacts(true, &app_spec.attestation) {
-            crate::kbs::reconcile_signed_policy_artifacts(
+            // Acceptance already advanced the durable desired generation in
+            // the same transaction that persisted this artifact.  Converge
+            // that generation here while the caller holds the global KBS
+            // mutation fence; do not enqueue a second generation.
+            crate::kbs::reconcile_pending_signed_policy_artifacts(
                 &pool,
                 kbs_policy_config.as_ref(),
-                Some(signed_policy_artifact),
             )
             .await?;
         } else {
@@ -1371,12 +1931,17 @@ pub async fn apply_deployment_manifests(
         crate::kbs::reconcile_policy(&pool, kbs_policy_config.as_ref()).await?;
     }
 
+    let generation = MutationGeneration::new(kubernetes_mutation_generation)?;
     let engine = ApplyEngine::try_default().await?;
+    mutation
+        .arm_resource_scope_until_reconciled("kubernetes_namespace")
+        .await?;
     apply_all_with_tenant_image_pull_secret(
         &engine,
         &manifests,
         &hash,
         tenant_image_pull_secret_config.as_ref(),
+        generation,
     )
     .await?;
     let edge_config = crate::edge::EdgeRouteConfig::from_env();
@@ -1405,34 +1970,55 @@ pub async fn apply_deployment_manifests(
             &app_target,
         )?);
     }
-    crate::edge::ensure_haproxy_routes(&pool, &edge_config, &routes).await?;
+    crate::edge::ensure_haproxy_routes(&pool, &edge_config, Some(edge_config_generation), &routes)
+        .await?;
     set_deployment_status(&pool, deployment_id, "watching", Some(&hash), None, false).await?;
 
-    tokio::spawn(async move {
-        let previous_app_status = app.status;
-        let unlock_mode = app.unlock_mode;
-        let result = watch_rollout(&engine, &app_spec.namespace, &app_spec.name)
-            .await
-            .map_err(|e| e.to_string());
-        let outcome = classify_rollout_result(result, previous_app_status, unlock_mode);
+    Ok(Some(DeploymentRollout {
+        app,
+        engine,
+        app_spec,
+        manifest_hash: hash,
+    }))
+}
 
-        if let Err(e) = record_deployment_result(
-            &pool,
-            deployment_id,
-            outcome.deploy_status,
-            Some(&hash),
-            outcome.error_message.as_deref(),
-            outcome.terminal,
-        )
-        .await
-        {
-            tracing::error!(deployment_id = %deployment_id, error = %e, "failed to record deployment result");
-        }
-
-        if let Err(e) = set_app_status(&pool, app.id, outcome.app_status).await {
-            tracing::error!(app_id = %app.id, error = %e, "failed to update app status");
-        }
-    });
-
-    Ok(())
+fn build_verification_material(
+    app: &enclava_engine::types::ConfidentialApp,
+    workload_artifacts_json: &str,
+    trustee_policy_json: &str,
+    sigstore_material: &[u8],
+    provenance_oci_material: &[u8],
+) -> Result<Vec<u8>, DeployError> {
+    let cc_init_data = enclava_engine::manifest::cc_init_data::build_toml(app);
+    let fields = [
+        ("cc_init_data_toml", cc_init_data.as_bytes(), 196_608),
+        (
+            "workload_artifacts_json",
+            workload_artifacts_json.as_bytes(),
+            196_608,
+        ),
+        (
+            "trustee_policy_json",
+            trustee_policy_json.as_bytes(),
+            49_152,
+        ),
+        ("sigstore_material", sigstore_material, 196_608),
+        ("provenance_oci_material", provenance_oci_material, 311_296),
+    ];
+    if fields.iter().any(|(_, value, limit)| value.len() > *limit) {
+        return Err(DeployError::Validation(
+            "verification material field exceeds v1 limit".into(),
+        ));
+    }
+    let records = fields
+        .iter()
+        .map(|(label, value, _)| (*label, *value))
+        .collect::<Vec<_>>();
+    let material = enclava_common::canonical::ce_v1_bytes(&records);
+    if material.len() > enclava_engine::manifest::verification_material::MAX_BYTES {
+        return Err(DeployError::Validation(
+            "verification material exceeds 700 KiB".into(),
+        ));
+    }
+    Ok(material)
 }

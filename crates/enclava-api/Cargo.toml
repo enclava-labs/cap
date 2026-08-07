@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "migrate-two-hostnames"
 path = "src/bin/migrate_two_hostnames.rs"
 
+[[bin]]
+name = "cap-migrate"
+path = "src/bin/cap_migrate.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 enclava-engine = { workspace = true }
@@ -46,6 +50,7 @@ hmac = { workspace = true }
 subtle = { workspace = true }
 tower_governor = { workspace = true }
 sigstore = { workspace = true }
+oci-client = { workspace = true }
 hickory-resolver = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }

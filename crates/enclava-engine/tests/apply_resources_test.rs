@@ -4,6 +4,7 @@
 #[ignore]
 async fn apply_service_account_creates() {
     use enclava_engine::apply::engine::ApplyEngine;
+    use enclava_engine::apply::generation::MutationGeneration;
     use enclava_engine::apply::namespace::apply_namespace;
     use enclava_engine::apply::resources::apply_namespaced_resource;
     use enclava_engine::manifest::namespace::generate_namespace;
@@ -16,13 +17,15 @@ async fn apply_service_account_creates() {
 
     // Create namespace first
     let ns = generate_namespace(&app);
-    apply_namespace(&engine, &ns).await.unwrap();
+    let generation = MutationGeneration::new(1).unwrap();
+    apply_namespace(&engine, &ns, generation).await.unwrap();
 
     // Apply ServiceAccount
     let sa = generate_service_account(&app);
-    let result: ServiceAccount = apply_namespaced_resource(&engine, &app.namespace, &sa)
-        .await
-        .unwrap();
+    let result: ServiceAccount =
+        apply_namespaced_resource(&engine, &app.namespace, &sa, generation)
+            .await
+            .unwrap();
     assert_eq!(result.metadata.name.as_deref(), Some("cap-test-app-sa"));
 
     // Cleanup
@@ -39,6 +42,7 @@ async fn apply_service_account_creates() {
 #[ignore]
 async fn apply_configmap_creates() {
     use enclava_engine::apply::engine::ApplyEngine;
+    use enclava_engine::apply::generation::MutationGeneration;
     use enclava_engine::apply::namespace::apply_namespace;
     use enclava_engine::apply::resources::apply_namespaced_resource;
     use enclava_engine::manifest::bootstrap::generate_bootstrap_configmap;
@@ -50,10 +54,11 @@ async fn apply_configmap_creates() {
     let app = sample_app();
 
     let ns = generate_namespace(&app);
-    apply_namespace(&engine, &ns).await.unwrap();
+    let generation = MutationGeneration::new(1).unwrap();
+    apply_namespace(&engine, &ns, generation).await.unwrap();
 
     let cm = generate_bootstrap_configmap(&app);
-    let result: ConfigMap = apply_namespaced_resource(&engine, &app.namespace, &cm)
+    let result: ConfigMap = apply_namespaced_resource(&engine, &app.namespace, &cm, generation)
         .await
         .unwrap();
     assert!(result.metadata.name.is_some());

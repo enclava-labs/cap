@@ -104,7 +104,7 @@ pub struct Membership {
     pub removed_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct App {
     pub id: Uuid,
     pub org_id: Uuid,
@@ -131,7 +131,7 @@ pub struct App {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AppContainer {
     pub id: Uuid,
     pub app_id: Uuid,
@@ -145,7 +145,7 @@ pub struct AppContainer {
     pub is_primary: bool,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AppResources {
     pub app_id: Uuid,
     pub cpu_limit: String,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::routes::status::{LiveObservation, observe_app_status_for_deployment};
 
 #[derive(Debug, Deserialize)]
 pub struct GenericDeploymentRequest {
@@ -86,6 +87,10 @@ pub struct GenericDeploymentResponse {
     pub error_message: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Explicit live evidence. The lifecycle fields above remain database
+    /// projections; consumers must use this observation to decide whether a
+    /// healthy/running projection is current.
+    pub observation: LiveObservation,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,6 +101,7 @@ pub struct GenericConfigTokenResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tee_resolve_ip: Option<std::net::IpAddr>,
     pub expires_in_seconds: u64,
+    pub issued_at: chrono::DateTime<chrono::Utc>,
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -114,6 +120,7 @@ impl GenericDeploymentResponse {
             .get("image")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        let error_message = public_deployment_error_message(deployment.error_message.as_deref());
         Self {
             deployment_id: deployment.id,
             app_id: app.id,
@@ -130,10 +137,16 @@ impl GenericDeploymentResponse {
                 .or_else(|| app.source_repository.clone()),
             status: format!("{:?}", deployment.status).to_lowercase(),
             app_status: format!("{:?}", app.status).to_lowercase(),
-            error_message: deployment.error_message,
+            error_message,
             created_at: deployment.created_at,
             completed_at: deployment.completed_at,
+            observation: LiveObservation::not_observed(),
         }
+    }
+
+    fn with_observation(mut self, observation: LiveObservation) -> Self {
+        self.observation = observation;
+        self
     }
 }
 
@@ -219,6 +232,7 @@ pub async fn create_generic_deployment(
     Json(body): Json<GenericDeploymentRequest>,
 ) -> Result<(StatusCode, Json<GenericDeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     scopes::require_app_write(&auth)?;
+    crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
     validate_external_id(body.external_id.as_deref())?;
 
     validate_source_context(
@@ -234,6 +248,12 @@ pub async fn create_generic_deployment(
         && let Some((deployment, app)) =
             fetch_deployment_by_external_id(&state, auth.org_id, external_id).await?
     {
+        if super::deployment_setup_incomplete(&deployment) {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "external_id belongs to a deployment whose setup did not complete",
+            ));
+        }
         ensure_idempotent_retry_matches(&deployment, &app, &body)?;
         return Ok((
             StatusCode::OK,
@@ -247,10 +267,9 @@ pub async fn create_generic_deployment(
     let normalized_egress_mode = crate::routes::apps::validate_egress_mode(&body.app.egress_mode)
         .map_err(|e| json_error(StatusCode::BAD_REQUEST, e))?;
 
-    let app = match fetch_app_by_name(&state, auth.org_id, &body.app.name).await? {
-        Some(app) => {
+    let (app, app_mutation) = match fetch_app_by_name(&state, auth.org_id, &body.app.name).await? {
+        Some(app) => (
             ensure_generic_app_metadata(
-                &state,
                 app,
                 GenericAppMetadata {
                     provider: body.source.provider,
@@ -260,9 +279,9 @@ pub async fn create_generic_deployment(
                     egress_allowlist: &normalized_egress_allowlist,
                     egress_mode: normalized_egress_mode,
                 },
-            )
-            .await?
-        }
+            )?,
+            super::AppMutation::UpdateGenericMetadata,
+        ),
         None if body.app.create_if_missing => {
             let create = crate::routes::apps::CreateAppRequest {
                 name: body.app.name.clone(),
@@ -275,12 +294,10 @@ pub async fn create_generic_deployment(
                 egress_allowlist: body.app.egress_allowlist.clone(),
                 egress_mode: normalized_egress_mode.as_str().to_string(),
             };
-            let (_, Json(created)) =
-                crate::routes::apps::create_app(auth.clone(), State(state.clone()), Json(create))
-                    .await?;
-            fetch_app_by_name(&state, auth.org_id, &created.name)
-                .await?
-                .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+            (
+                crate::routes::apps::prepare_app_candidate(&state, &auth, &create).await?,
+                super::AppMutation::Insert,
+            )
         }
         None => {
             return Err(json_error(
@@ -304,13 +321,8 @@ pub async fn create_generic_deployment(
         log_encryption: body.security.log_encryption.clone(),
     };
     let org_id = auth.org_id;
-    let (status, Json(deployed)) = deploy(
-        auth,
-        State(state.clone()),
-        Path(app.name.clone()),
-        Json(deploy_request),
-    )
-    .await?;
+    let (status, Json(deployed)) =
+        super::deploy_app_candidate(auth, state.clone(), app, deploy_request, app_mutation).await?;
     let (deployment, app) = fetch_deployment_with_app(&state, org_id, deployed.deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
@@ -332,9 +344,20 @@ pub async fn get_generic_deployment(
         .await?
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "deployment not found"))?;
 
-    Ok(Json(GenericDeploymentResponse::from_deployment(
-        deployment, &app,
-    )))
+    let observed = observe_app_status_for_deployment(&state, &app, Some(deployment.id)).await;
+    let runtime_failure = observed
+        .runtime_failure_matches_deployment(deployment.id)
+        .then(|| observed.runtime_failure_public_message())
+        .flatten();
+    let observation = observed.observation;
+    let mut response =
+        GenericDeploymentResponse::from_deployment(deployment, &app).with_observation(observation);
+    if let Some(runtime_failure) = runtime_failure {
+        response.status = "failed".to_string();
+        response.app_status = "failed".to_string();
+        response.error_message = Some(runtime_failure);
+    }
+    Ok(Json(response))
 }
 
 /// POST /deployments/{deployment_id}/config-token -- generic config-token bridge.
@@ -343,15 +366,49 @@ pub async fn generic_config_token(
     State(state): State<AppState>,
     Path(deployment_id): Path<Uuid>,
 ) -> Result<Json<GenericConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+    generic_config_token_inner(auth, state, deployment_id, None).await
+}
+
+pub(crate) async fn generic_config_token_for_issuance(
+    auth: AuthContext,
+    state: AppState,
+    deployment_id: Uuid,
+    issuance: crate::auth::jwt::ConfigTokenIssuance,
+) -> Result<Json<GenericConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
+    generic_config_token_inner(auth, state, deployment_id, Some(issuance)).await
+}
+
+async fn generic_config_token_inner(
+    auth: AuthContext,
+    state: AppState,
+    deployment_id: Uuid,
+    issuance: Option<crate::auth::jwt::ConfigTokenIssuance>,
+) -> Result<Json<GenericConfigTokenResponse>, (StatusCode, Json<serde_json::Value>)> {
     scopes::require_admin(&auth)?;
     scopes::require_scope(&auth, "config:write")?;
 
     let (_deployment, app) = fetch_deployment_with_app(&state, auth.org_id, deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "deployment not found"))?;
-    let Json(token) =
-        crate::routes::config::issue_config_token_route(auth, State(state), Path(app.name.clone()))
-            .await?;
+    let Json(token) = match issuance {
+        Some(issuance) => {
+            crate::routes::config::issue_config_token_route_for_issuance(
+                auth,
+                state,
+                app.name.clone(),
+                issuance,
+            )
+            .await?
+        }
+        None => {
+            crate::routes::config::issue_config_token_route(
+                auth,
+                State(state),
+                Path(app.name.clone()),
+            )
+            .await?
+        }
+    };
 
     Ok(Json(GenericConfigTokenResponse {
         deployment_id,
@@ -359,7 +416,8 @@ pub async fn generic_config_token(
         tee_url: token.tee_url,
         tee_resolve_ip: token.tee_resolve_ip,
         expires_in_seconds: token.expires_in_seconds,
-        expires_at: chrono::Utc::now() + chrono::Duration::seconds(token.expires_in_seconds as i64),
+        issued_at: token.issued_at,
+        expires_at: token.expires_at,
     }))
 }
 
@@ -564,9 +622,8 @@ struct GenericAppMetadata<'a> {
     egress_mode: enclava_engine::types::EgressMode,
 }
 
-async fn ensure_generic_app_metadata(
-    state: &AppState,
-    app: App,
+fn ensure_generic_app_metadata(
+    mut app: App,
     metadata: GenericAppMetadata<'_>,
 ) -> Result<App, (StatusCode, Json<serde_json::Value>)> {
     let provider_str = metadata.provider.as_str();
@@ -601,27 +658,11 @@ async fn ensure_generic_app_metadata(
         }
     }
 
-    sqlx::query_as(
-        "UPDATE apps
-            SET source_provider = $1,
-                source_repository = $2,
-                signer_identity_subject = $3,
-                signer_identity_issuer = $4,
-                signer_identity_set_at = COALESCE(signer_identity_set_at, now()),
-                egress_allowlist = $5,
-                egress_mode = $6,
-                updated_at = now()
-          WHERE id = $7
-          RETURNING *",
-    )
-    .bind(provider_str)
-    .bind(metadata.repository)
-    .bind(metadata.subject)
-    .bind(metadata.issuer)
-    .bind(sqlx::types::Json(metadata.egress_allowlist.to_vec()))
-    .bind(metadata.egress_mode.as_str())
-    .bind(app.id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))
+    app.source_provider = Some(provider_str.to_string());
+    app.source_repository = Some(metadata.repository.to_string());
+    app.signer_identity_subject = Some(metadata.subject.to_string());
+    app.signer_identity_issuer = Some(metadata.issuer.to_string());
+    app.egress_allowlist = sqlx::types::Json(metadata.egress_allowlist.to_vec());
+    app.egress_mode = metadata.egress_mode.as_str().to_string();
+    Ok(app)
 }

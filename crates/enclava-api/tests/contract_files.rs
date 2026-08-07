@@ -37,6 +37,17 @@ fn paas_internal_logs_contract() {
     }
 }
 
+#[test]
+fn ci_serializes_tests_that_share_postgres_authority() {
+    let workflow = fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
+        .expect("read CI workflow");
+
+    assert!(
+        workflow.contains("cargo test --workspace -- --test-threads=1"),
+        "CI must serialize tests that share global PostgreSQL-backed provider fences"
+    );
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

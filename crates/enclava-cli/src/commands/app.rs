@@ -17,7 +17,7 @@ use chrono::Utc;
 use clap::Subcommand;
 use enclava_cli::api_client::{ApiClient, ApiError};
 use enclava_cli::api_types::*;
-use enclava_cli::app_config::AppConfig;
+use enclava_cli::app_config::{AppConfig, AppConfigError};
 use enclava_cli::config::{self, CliPaths};
 use enclava_cli::descriptor::{
     CapAppOciRuntimeSpecInput, DeploymentDescriptorBuildInput, Sidecars, SignerIdentity,
@@ -30,7 +30,7 @@ use enclava_cli::keyring::{
 };
 use enclava_cli::keys;
 use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, verify_envelope};
-use enclava_cli::tee_client::TeeClient;
+use enclava_cli::tee_client::{TeeClient, TeeError};
 use enclava_common::log_encryption::{
     EncryptedLogFrame, LOG_ENCRYPTION_ALGORITHM, decrypt_log_frame, generate_log_keypair,
     log_keypair_from_private_key,
@@ -55,6 +55,36 @@ fn resolve_app_name(explicit: &Option<String>) -> Result<String, Box<dyn std::er
     }
     let config = AppConfig::find_and_load()?;
     Ok(config.app.name)
+}
+
+/// Like `resolve_app_name`, but returns `Ok(None)` when neither `--app` nor an
+/// `enclava.toml` is present, so org-level `list`/`revoke` can fall back to the
+/// org-scoped endpoints. `select`/`generate` keep using `resolve_app_name`.
+fn resolve_optional_app_name(
+    explicit: &Option<String>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if let Some(name) = explicit {
+        return Ok(Some(name.clone()));
+    }
+    Ok(optional_app_name_from_config_result(
+        AppConfig::find_and_load(),
+    )?)
+}
+
+fn optional_app_name_from_config_result(
+    result: Result<AppConfig, AppConfigError>,
+) -> Result<Option<String>, AppConfigError> {
+    match result {
+        Ok(config) => Ok(Some(config.app.name)),
+        Err(AppConfigError::ReadFile { path, source })
+            if source.kind() == std::io::ErrorKind::NotFound
+                && Path::new(&path).file_name().and_then(|name| name.to_str())
+                    == Some("enclava.toml") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Build an authenticated API client from stored config/credentials.
@@ -220,7 +250,8 @@ mod signing;
 pub(crate) use signing::{ConfidentialAppForCcHash, confidential_app_for_cc_hash};
 pub(crate) use signing::{
     SignedDeployBlobParams, build_signed_deploy_blobs, ensure_manual_deploy_keyring,
-    load_or_derive_bootstrap_private_key, resolve_current_user_org,
+    fetch_verified_platform_release, load_or_derive_bootstrap_private_key,
+    resolve_current_user_org,
 };
 
 #[derive(Args)]
@@ -243,8 +274,27 @@ pub struct CreateArgs {
     pub signer_issuer: String,
 }
 
+/// Auto-unlock is only reachable via `enclava auto-unlock enable` after a password-mode
+/// claim has established the owner seed inside the TEE (the CLI then seals that seed
+/// to an attestation-gated KBS resource). At `create` time no claim has happened, so
+/// there is no seed to seal — `unlock.mode = "auto"` is always a category error. Fail
+/// fast with the workaround rather than letting enclava-init time out (~60s) fetching
+/// a KBS wrap-key that nothing provisions.
+fn validate_create_unlock_mode(mode: &str) -> Result<(), &'static str> {
+    match mode {
+        "auto" => Err(
+            "auto-unlock cannot be set at first deploy: the owner seed is \
+             established by a password-mode claim. Set `unlock.mode = \"password\"` for \
+             the first deploy, then run `enclava auto-unlock enable` to seal the seed \
+             for restarts.",
+        ),
+        _ => Ok(()),
+    }
+}
+
 pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let app_config = AppConfig::find_and_load()?;
+    validate_create_unlock_mode(&app_config.unlock.mode)?;
     let (api, paths, _cli_config) = build_api_client()?;
 
     let bootstrap_key = if app_config.unlock.mode == "password" {
@@ -463,6 +513,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             wait_for_deploy_runtime(
                 &api,
                 &app_name,
+                &resp.deployment_id,
                 max_wait,
                 poll_interval,
                 &pb,
@@ -493,6 +544,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         wait_for_deploy_runtime(
             &api,
             &app_name,
+            &resp.deployment_id,
             max_wait,
             poll_interval,
             &pb,
@@ -524,7 +576,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         let (_attestation, tee) = tee.attest_receipt_key().await?;
 
         for (key, value) in &config_pairs {
-            tee.config_set(key, value, &token_resp.token).await?;
+            set_deploy_config(&tee, key, value, &token_resp.token).await?;
             api.sync_config_key(&app_name, key, false).await?;
         }
     }
@@ -554,6 +606,27 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     Ok(())
+}
+
+async fn set_deploy_config(
+    tee: &TeeClient,
+    key: &str,
+    value: &str,
+    token: &str,
+) -> Result<(), TeeError> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match tee.config_set(key, value, token).await {
+            Err(error) if should_retry_deploy_config(&error) && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+fn should_retry_deploy_config(error: &TeeError) -> bool {
+    matches!(error, TeeError::Tee { status: 423, .. })
 }
 
 pub(crate) async fn wait_for_bootstrap_endpoint(
@@ -608,19 +681,13 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
 async fn wait_for_deploy_runtime(
     api: &ApiClient,
     app_name: &str,
+    expected_deployment_id: &str,
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
     target: DeployRuntimeTarget,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
-    let direct_tee = api
-        .get_unlock_endpoint(app_name)
-        .await
-        .ok()
-        .map(|endpoint| {
-            TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip)
-        });
 
     loop {
         if start.elapsed() > max_wait {
@@ -628,9 +695,18 @@ async fn wait_for_deploy_runtime(
             return Err("deploy timed out waiting for TEE to boot".into());
         }
 
-        match api.get_status(app_name).await {
+        let direct_tee_allowed = match api.get_status(app_name).await {
             Ok(status) => {
-                if target.accepts_api_status(status.status.as_str()) {
+                let observation_is_fresh = observation_is_fresh_for_deployment(
+                    status.observation.as_ref(),
+                    expected_deployment_id,
+                );
+                let direct_tee_allowed = status.status != "failed"
+                    && observation_allows_direct_tee_fallback(
+                        status.observation.as_ref(),
+                        expected_deployment_id,
+                    );
+                if observation_is_fresh && target.accepts_api_status(status.status.as_str()) {
                     pb.set_position(3);
                     pb.set_message(match status.status.as_str() {
                         "locked" => "TEE running, storage locked",
@@ -639,8 +715,11 @@ async fn wait_for_deploy_runtime(
                     return Ok(());
                 }
 
+                let pod_phase_is_verified = observation_is_fresh && status.status != "failed";
                 match status.pod_phase.as_deref() {
-                    Some("Running") if target.accepts_running_pod_phase() => {
+                    Some("Running")
+                        if pod_phase_is_verified && target.accepts_running_pod_phase() =>
+                    {
                         pb.set_position(3);
                         pb.set_message("TEE running, attestation complete");
                         return Ok(());
@@ -650,36 +729,81 @@ async fn wait_for_deploy_runtime(
                     }
                     None => {}
                 }
+                direct_tee_allowed
             }
             Err(_) => {
-                // Status endpoint may not be ready yet.
+                // The direct endpoint is app-bound rather than deployment-bound.
+                // Without a current CAP observation there is no pod/deployment
+                // evidence proving it belongs to this deploy, so retry CAP and
+                // do not let an old TEE satisfy a replacement rollout.
+                false
             }
-        }
+        };
 
-        if let Some(tee) = direct_tee.as_ref()
+        if direct_tee_allowed
+            && let Ok(endpoint) = api.get_unlock_endpoint(app_name).await
+            && let tee = TeeClient::new_for_ownership_with_resolve_ip(
+                &endpoint.tee_url,
+                endpoint.tee_resolve_ip,
+            )
             && let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
             && let Ok(status) = attested_tee.status_json().await
         {
-            match tee_unlock_state(&status) {
-                "locked" => {
-                    pb.set_position(3);
-                    pb.set_message("TEE running, storage locked");
-                    return Ok(());
+            if tee_supplemental_fields_are_consistent(&status) {
+                match tee_unlock_state(&status) {
+                    "locked" => {
+                        pb.set_position(3);
+                        pb.set_message("TEE running, storage locked");
+                        return Ok(());
+                    }
+                    "unlocked" if target.accepts_direct_unlocked() => {
+                        pb.set_position(3);
+                        pb.set_message("TEE running, attestation complete");
+                        return Ok(());
+                    }
+                    "unlocked" => {
+                        pb.set_message("Waiting for replacement TEE lock...");
+                    }
+                    _ => {}
                 }
-                "unlocked" if target.accepts_direct_unlocked() => {
-                    pb.set_position(3);
-                    pb.set_message("TEE running, attestation complete");
-                    return Ok(());
-                }
-                "unlocked" => {
-                    pb.set_message("Waiting for replacement TEE lock...");
-                }
-                _ => {}
+            } else {
+                pb.set_message("Waiting for healthy TEE status...");
             }
         }
 
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+fn observation_is_fresh_for_deployment(
+    observation: Option<&AppStatusObservation>,
+    expected_deployment_id: &str,
+) -> bool {
+    observation.is_none_or(|observation| {
+        observation.state == "fresh"
+            && !observation.drifted
+            && observation.deployment_id.as_deref() == Some(expected_deployment_id)
+    })
+}
+
+fn observation_allows_direct_tee_fallback(
+    observation: Option<&AppStatusObservation>,
+    expected_deployment_id: &str,
+) -> bool {
+    observation.is_none_or(|observation| {
+        let pod_evidence_allows_fallback = match observation.state.as_str() {
+            "fresh" => observation.reason.is_none(),
+            "partial" => matches!(
+                observation.reason.as_deref(),
+                Some("tee_unavailable" | "tee_malformed" | "tee_evidence_incomplete")
+            ),
+            _ => false,
+        };
+
+        pod_evidence_allows_fallback
+            && !observation.drifted
+            && observation.deployment_id.as_deref() == Some(expected_deployment_id)
+    })
 }
 
 async fn find_deployment_entry(
@@ -807,11 +931,25 @@ async fn ensure_password_storage_unlocked_for_config(
 
 fn tee_unlock_state(status: &serde_json::Value) -> &str {
     status
-        .get("state")
-        .or_else(|| status.get("unlock_state"))
+        .get("unlock_state")
+        .or_else(|| status.get("state"))
         .or_else(|| status.get("ownership_state"))
         .and_then(|value| value.as_str())
         .unwrap_or("unknown")
+}
+
+fn tee_supplemental_fields_are_consistent(status: &serde_json::Value) -> bool {
+    let live_state = tee_unlock_state(status);
+    let optional_field_matches = |name: &str, expected: &str| match status.get(name) {
+        None | Some(serde_json::Value::Null) => true,
+        Some(value) => value
+            .as_str()
+            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected)),
+    };
+
+    optional_field_matches("pod_status", "running")
+        && optional_field_matches("tee_status", "ready")
+        && optional_field_matches("storage_status", live_state)
 }
 
 async fn wait_for_deploy_unlock_completion(
@@ -953,6 +1091,12 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
                     .and_then(|value| value.as_str())
                     .map(str::to_string);
             }
+            if status.tee_error.is_none() {
+                status.tee_error = tee_status_json
+                    .get("error")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+            }
         }
     }
 
@@ -992,8 +1136,23 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     if let Some(unlock) = &status.unlock_status {
         println!("Unlock:   {unlock}");
     }
+    if let Some(tee_error) = &status.tee_error {
+        println!("TEE error: {}", tee_error.red());
+    }
     if let Some(deployed) = &status.last_deployed {
         println!("Deployed: {deployed}");
+    }
+    if let Some(observation) = &status.observation {
+        println!("Freshness: {}", observation.state);
+        if observation.drifted {
+            println!("Drift:    deployment identity mismatch");
+        }
+        if let Some(observed_at) = &observation.observed_at {
+            println!("Observed: {observed_at}");
+        }
+        if let Some(reason) = &observation.reason {
+            println!("Evidence: {reason}");
+        }
     }
 
     Ok(())
@@ -1406,20 +1565,32 @@ fn verify_private_log_key_permissions(path: &Path) -> Result<(), Box<dyn std::er
 }
 
 async fn list_log_keys(args: LogKeyAppArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let app_name = resolve_app_name(&args.app)?;
     let (api, _paths, _cli_config) = build_api_client()?;
-    let list = api.list_log_keys(&app_name).await?;
-    println!("App: {}", list.app_name);
-    println!(
-        "Active key: {}",
-        list.active_key_id.as_deref().unwrap_or("-")
-    );
-    for key in list.keys {
-        let active = if key.active_for_app { "active" } else { "-" };
-        println!(
-            "{} {} {} {}",
-            key.key_id, key.status, active, key.public_key_sha256
-        );
+    match resolve_optional_app_name(&args.app)? {
+        Some(app_name) => {
+            let list = api.list_log_keys(&app_name).await?;
+            println!("App: {}", list.app_name);
+            println!(
+                "Active key: {}",
+                list.active_key_id.as_deref().unwrap_or("-")
+            );
+            for key in list.keys {
+                let active = if key.active_for_app { "active" } else { "-" };
+                println!(
+                    "{} {} {} {}",
+                    key.key_id, key.status, active, key.public_key_sha256
+                );
+            }
+        }
+        None => {
+            let list = api.list_org_log_keys().await?;
+            for key in list.keys {
+                println!(
+                    "{} {} selected-by={} {}",
+                    key.key_id, key.status, key.selected_by_count, key.public_key_sha256
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1433,10 +1604,14 @@ async fn select_log_key(args: LogKeySelectArgs) -> Result<(), Box<dyn std::error
 }
 
 async fn revoke_log_key(args: LogKeySelectArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let app_name = resolve_app_name(&args.app)?;
     let (api, _paths, _cli_config) = build_api_client()?;
-    let key = api.revoke_log_key(&app_name, &args.key_id).await?;
-    println!("Revoked log key: {}", key.key_id);
+    if let Some(app_name) = resolve_optional_app_name(&args.app)? {
+        let key = api.revoke_log_key(&app_name, &args.key_id).await?;
+        println!("Revoked log key: {}", key.key_id);
+    } else {
+        let key = api.revoke_org_log_key(&args.key_id).await?;
+        println!("Revoked log key (org): {}", key.key_id);
+    }
     Ok(())
 }
 

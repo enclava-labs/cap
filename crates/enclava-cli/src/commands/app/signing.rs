@@ -20,6 +20,17 @@ pub(crate) fn platform_release_from_deployment_context(
     platform_release_from_deployment_context_with_verifier(deployment_context, verify_envelope)
 }
 
+pub(crate) async fn fetch_verified_platform_release(
+    api: &ApiClient,
+) -> Result<(DeploymentContextResponse, PlatformRelease), Box<dyn std::error::Error>> {
+    let deployment_context = api.deployment_context().await?;
+    let release = match platform_release_from_deployment_context(&deployment_context)? {
+        Some(release) => release,
+        None => PlatformRelease::load_verified()?,
+    };
+    Ok((deployment_context, release))
+}
+
 pub(crate) fn platform_release_from_deployment_context_with_verifier<Verify, Err>(
     deployment_context: &DeploymentContextResponse,
     verify: Verify,
@@ -135,28 +146,38 @@ pub(crate) async fn ensure_manual_deploy_keyring(
     let owner_key = keys::derive_org_owner_key(user_id, org_id, &seed)?;
     register_public_key(api, &owner_key.public).await?;
 
+    let trusted_owner = load_trusted_owner(&org_id)?;
     if let (Some(trusted_owner), Ok(local_envelope)) =
-        (load_trusted_owner(&org_id)?, load_keyring_envelope(&org_id))
+        (trusted_owner.as_ref(), load_keyring_envelope(&org_id))
     {
-        let verified = verify_keyring(&local_envelope, &trusted_owner)?;
-        if member_allows_deploy(verified, &owner_key.public) {
-            return Ok((org_id, org_name, owner_key));
-        }
+        verify_keyring(&local_envelope, trusted_owner)?;
     }
 
     match api.get_org_keyring(&org_name).await {
         Ok(response) => {
             let envelope = keyring_envelope_from_response(response)?;
-            if envelope.signing_pubkey.to_bytes() != owner_key.public.to_bytes() {
+            if trusted_owner.is_none()
+                && envelope.signing_pubkey.to_bytes() != owner_key.public.to_bytes()
+            {
                 return Err(
                     "remote org keyring is owned by a different key; restore the matching recovery seed or use org keyring commands"
                         .into(),
                 );
             }
-            verify_keyring(&envelope, &owner_key.public)?;
-            store_trusted_owner(&org_id, &owner_key.public)?;
+            let keyring = verify_keyring(
+                &envelope,
+                trusted_owner.as_ref().unwrap_or(&owner_key.public),
+            )?;
+            if !member_allows_deploy(keyring, &owner_key.public) {
+                return Err(
+                    "current CLI signing key is not an owner/admin/deployer in the org keyring"
+                        .into(),
+                );
+            }
+            if trusted_owner.is_none() {
+                store_trusted_owner(&org_id, &owner_key.public)?;
+            }
             store_keyring_envelope(&org_id, &envelope)?;
-            Ok((org_id, org_name, owner_key))
         }
         Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {
             if !active.is_personal {
@@ -171,23 +192,24 @@ pub(crate) async fn ensure_manual_deploy_keyring(
             store_trusted_owner(&org_id, &owner_key.public)?;
             store_keyring_envelope(&org_id, &envelope)?;
             upload_keyring(api, &org_name, &envelope).await?;
-            match api
-                .bootstrap_signing_service_owner(
-                    &org_name,
-                    &BootstrapSigningServiceRequest {
-                        owner_pubkey_hex: hex::encode(owner_key.public.to_bytes()),
-                    },
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
-                Err(err) => return Err(err.into()),
-            }
-            Ok((org_id, org_name, owner_key))
         }
-        Err(err) => Err(err.into()),
+        Err(err) => return Err(err.into()),
     }
+
+    match api
+        .bootstrap_signing_service_owner(
+            &org_name,
+            &BootstrapSigningServiceRequest {
+                owner_pubkey_hex: hex::encode(owner_key.public.to_bytes()),
+            },
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
+        Err(err) => return Err(err.into()),
+    }
+    Ok((org_id, org_name, owner_key))
 }
 
 fn render_trustee_policy(
@@ -332,11 +354,13 @@ pub(crate) fn confidential_app_for_cc_hash(
                 release,
                 &deployment_context,
             )?,
+            amd_kds_base_url: None,
             trustee_policy_url: None,
             local_workload_artifacts_json: Some("{}".to_string()),
             local_trustee_policy_json: Some("{}".to_string()),
             platform_trustee_policy_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
             signing_service_pubkey_hex: Some(release.signing_service_pubkey_hex.clone()),
+            verification_material: None,
         },
         egress_mode: enclava_engine::types::EgressMode::Restricted,
         public_internet_egress_excluded_cidrs: Vec::new(),
@@ -518,11 +542,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         );
     }
 
-    let deployment_context = api.deployment_context().await?;
-    let release = match platform_release_from_deployment_context(&deployment_context)? {
-        Some(release) => release,
-        None => PlatformRelease::load_verified()?,
-    };
+    let (deployment_context, release) = fetch_verified_platform_release(api).await?;
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
     let _signing_service_pubkey = release.signing_service_pubkey_bytes()?;
     let proxy_image = enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?;
@@ -635,6 +655,7 @@ pub(crate) async fn build_signed_deploy_blobs(
             caddy_digest: caddy_image.digest().to_string(),
         },
         api_signing_pubkey,
+        independent_verification: true,
         expected_firmware_measurement: release.expected_firmware_measurement_bytes()?,
         expected_runtime_class: release.expected_runtime_class.clone(),
         kbs_resource_path: format!(

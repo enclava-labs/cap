@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://enclava.dev/schemas/appraiser-api-v1.schema.json",
+  "title": "Enclava appraiser API v1",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bundle_base64", "challenge_nonce_base64url", "expected_target_origin"],
+      "properties": {
+        "bundle_base64": { "type": "string", "contentEncoding": "base64" },
+        "policy_base64": { "type": "string", "contentEncoding": "base64" },
+        "policy_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "challenge_nonce_base64url": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+        "expected_target_origin": { "type": "string", "format": "uri", "maxLength": 2048 }
+      },
+      "oneOf": [
+        { "required": ["policy_base64"], "not": { "required": ["policy_id"] } },
+        { "required": ["policy_id"], "not": { "required": ["policy_base64"] } }
+      ]
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key_id", "appraised_at", "expires_at", "public_key_base64", "signature_base64"],
+      "properties": {
+        "key_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "appraised_at": { "type": "integer", "minimum": 0 },
+        "expires_at": { "type": "integer", "minimum": 0 },
+        "public_key_base64": { "type": "string", "contentEncoding": "base64" },
+        "signature_base64": { "type": "string", "contentEncoding": "base64" }
+      }
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "result_sha256", "receipt"],
+      "properties": {
+        "result": { "$ref": "appraisal-result-v1.schema.json" },
+        "result_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "receipt": { "oneOf": [{ "$ref": "#/$defs/receipt" }, { "type": "null" }] }
+      }
+    }
+  }
+}

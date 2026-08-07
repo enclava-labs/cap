@@ -5,6 +5,7 @@ use crate::types::ConfidentialApp;
 
 use super::engine::{ApplyEngine, ApplyError};
 use super::gateway::apply_gateway_resources;
+use super::generation::MutationGeneration;
 use super::namespace::apply_namespace;
 use super::network_policy::apply_network_policy;
 use super::resources::apply_standard_resources;
@@ -41,6 +42,7 @@ pub fn manifest_hash(manifests: &GeneratedManifests) -> String {
         serde_json::to_value(&manifests.startup_configmap).unwrap_or_default(),
         serde_json::to_value(&manifests.ingress_configmap).unwrap_or_default(),
         serde_json::to_value(&manifests.enclava_init_configmap).unwrap_or_default(),
+        serde_json::to_value(&manifests.verification_material_configmap).unwrap_or_default(),
         serde_json::to_value(&manifests.statefulset).unwrap_or_default(),
         manifests.kbs_owner_binding.1.clone(),
     ];
@@ -67,6 +69,7 @@ pub fn manifest_hash(manifests: &GeneratedManifests) -> String {
 pub async fn apply_all(
     engine: &ApplyEngine,
     manifests: &GeneratedManifests,
+    generation: MutationGeneration,
 ) -> Result<(), ApplyError> {
     let ns_name = manifests
         .namespace
@@ -75,13 +78,13 @@ pub async fn apply_all(
         .as_deref()
         .ok_or_else(|| ApplyError::NamespaceNotReady("namespace has no name".to_string()))?;
 
-    apply_namespace(engine, &manifests.namespace).await?;
+    apply_namespace(engine, &manifests.namespace, generation).await?;
     tracing::info!(namespace = %ns_name, "step 1/5: namespace ready");
 
-    apply_standard_resources(engine, manifests).await?;
+    apply_standard_resources(engine, manifests, generation).await?;
     tracing::info!(namespace = %ns_name, "step 2/5: standard resources applied");
 
-    apply_network_policy(engine, ns_name, &manifests.network_policy).await?;
+    apply_network_policy(engine, ns_name, &manifests.network_policy, generation).await?;
     tracing::info!(namespace = %ns_name, "step 3/5: CiliumNetworkPolicy applied");
 
     apply_gateway_resources(
@@ -91,6 +94,7 @@ pub async fn apply_all(
         &manifests.gateway,
         &manifests.tls_route,
         &manifests.tee_tls_route,
+        generation,
     )
     .await?;
     tracing::info!(namespace = %ns_name, "step 4/5: Gateway API resources applied");
@@ -105,7 +109,7 @@ pub async fn apply_all(
         .get_or_insert_with(Default::default);
     annotations.insert(MANIFEST_HASH_ANNOTATION.to_string(), hash.clone());
 
-    apply_statefulset(engine, ns_name, &sts).await?;
+    apply_statefulset(engine, ns_name, &sts, generation).await?;
     tracing::info!(
         namespace = %ns_name,
         manifest_hash = %hash,
@@ -127,6 +131,7 @@ pub async fn apply_all(
 pub async fn apply_and_watch(
     engine: &ApplyEngine,
     app: &ConfidentialApp,
+    generation: MutationGeneration,
 ) -> Result<DeployStatus, ApplyError> {
     // Generate manifests
     let manifests = generate_all_manifests(app);
@@ -135,7 +140,7 @@ pub async fn apply_and_watch(
         .map_err(ApplyError::ManifestGeneration)?;
 
     // Apply all
-    apply_all(engine, &manifests).await?;
+    apply_all(engine, &manifests, generation).await?;
 
     // Watch rollout
     let status = watch_rollout(engine, &app.namespace, &app.name).await?;

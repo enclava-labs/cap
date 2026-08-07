@@ -17,7 +17,6 @@ use enclava_common::canonical::ce_v1_bytes;
 use enclava_engine::types::LogEncryptionConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::middleware::AuthContext;
@@ -100,9 +99,7 @@ impl RequestedUnlockMode {
         match mode {
             "auto" | "auto-unlock" => Ok(Self::Auto),
             "password" => Ok(Self::Password),
-            _ => Err(format!(
-                "invalid unlock mode '{mode}': expected 'password' or 'auto-unlock'"
-            )),
+            _ => Err("invalid unlock mode: expected 'password' or 'auto-unlock'".to_string()),
         }
     }
 
@@ -290,31 +287,529 @@ fn verify_transition_attestation(
     Ok(())
 }
 
+type UnlockModeError = (StatusCode, Json<serde_json::Value>);
+
+fn unlock_database_error() -> UnlockModeError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({"error": "database error"})),
+    )
+}
+
+fn unlock_transition_conflict(message: &'static str) -> UnlockModeError {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({"error": message})),
+    )
+}
+
 async fn reject_replayed_transition_receipt(
-    pool: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     app_id: Uuid,
     receipt_timestamp: DateTime<Utc>,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(), UnlockModeError> {
     let latest: Option<DateTime<Utc>> = sqlx::query_scalar(
         "SELECT max(receipt_timestamp) FROM unlock_transition_receipts WHERE app_id = $1",
     )
     .bind(app_id)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?;
+    .map_err(|_| unlock_database_error())?;
 
     if latest.is_some_and(|latest| receipt_timestamp <= latest) {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "replayed transition_receipt"})),
-        ));
+        return Err(unlock_transition_conflict("replayed transition_receipt"));
     }
     Ok(())
+}
+
+struct UnlockModeCommitRequest<'a> {
+    org_id: Uuid,
+    user_id: Uuid,
+    app_name: &'a str,
+    observed_authority: &'a crate::deploy::ExistingAppAuthoritySnapshot,
+    source_deployment_id: Uuid,
+    requested: RequestedUnlockMode,
+    receipt: &'a SignedReceiptResponse,
+    transition_attestation: &'a TransitionReceiptAttestation,
+    verified_receipt: &'a VerifiedTransitionReceipt,
+    receipt_json: &'a serde_json::Value,
+    deploy_id: Uuid,
+    image_digest: Option<&'a str>,
+    signed_workload_command: Option<&'a str>,
+    signed_container_port: Option<i32>,
+    signed_storage_paths: Option<&'a Vec<String>>,
+    signing_artifacts: Option<&'a crate::signing_service::DeploymentSigningArtifacts>,
+    signed_policy_artifact: Option<&'a crate::signing_service::SignedPolicyArtifact>,
+    log_encryption: Option<&'a LogEncryptionConfig>,
+    api_signing_pubkey: &'a str,
+    api_url: &'a str,
+    attestation_config: Option<&'a enclava_engine::types::AttestationConfig>,
+    signing_service_pubkey_hex: Option<&'a str>,
+    signed_required: bool,
+}
+
+#[derive(Debug)]
+struct CommittedUnlockModeTransition {
+    app: App,
+}
+
+/// Lock and revalidate the accepted transition, then persist every
+/// authoritative row as one unit.  The external signing work deliberately
+/// happens before this helper so no network request holds the application row
+/// lock; everything that can make the transition visible happens here.
+async fn commit_unlock_mode_transition(
+    pool: &sqlx::PgPool,
+    request: UnlockModeCommitRequest<'_>,
+) -> Result<CommittedUnlockModeTransition, UnlockModeError> {
+    let mut tx = pool.begin().await.map_err(|_| unlock_database_error())?;
+
+    // Match every hosted authority writer's global lock order. The caller's
+    // owner role, customer signing authority and app/runtime generation are
+    // all re-read only after their respective lanes are held.
+    crate::entitlements::lock_org_entitlement_lane(&mut tx, request.org_id)
+        .await
+        .map_err(|_| unlock_database_error())?;
+    crate::signing_service::lock_org_signing_authority_lane(&mut tx, request.org_id)
+        .await
+        .map_err(|_| unlock_database_error())?;
+    let current_role =
+        crate::auth::scopes::active_membership_role_in_tx(&mut tx, request.org_id, request.user_id)
+            .await?;
+    crate::auth::scopes::require_owner_role(current_role)?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, request.observed_authority.app_id())
+        .await
+        .map_err(|_| unlock_database_error())?;
+
+    // Check replay while holding the app lane but before comparing the
+    // observed runtime snapshot. A concurrent successful transition changes
+    // that snapshot, but a duplicate receipt should still have one stable,
+    // bounded outcome: replay conflict.
+    reject_replayed_transition_receipt(
+        &mut tx,
+        request.observed_authority.app_id(),
+        request.verified_receipt.receipt_timestamp,
+    )
+    .await?;
+    if !crate::deploy::lock_and_verify_existing_app_authority(
+        &mut tx,
+        request.observed_authority.app_id(),
+        request.observed_authority,
+    )
+    .await
+    .map_err(|_| unlock_database_error())?
+    {
+        return Err(unlock_transition_conflict(
+            "app changed while unlock mode transition was validating; retry",
+        ));
+    }
+
+    let locked_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+        .bind(request.observed_authority.app_id())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| unlock_database_error())?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "app not found"})),
+        ))?;
+    if locked_app.org_id != request.org_id || locked_app.name != request.app_name {
+        return Err(unlock_transition_conflict(
+            "app changed while unlock mode transition was validating; retry",
+        ));
+    }
+    if locked_app.status == crate::models::AppStatus::Deleting {
+        return Err(unlock_transition_conflict("app deletion is in progress"));
+    }
+
+    let locked_current = current_mode(&locked_app);
+    if !validate_transition(locked_current, request.requested) {
+        return Err(unlock_transition_conflict("invalid unlock mode transition"));
+    }
+    let reverified = verify_transition_receipt(
+        request.receipt,
+        &locked_app,
+        locked_current,
+        request.requested,
+    )
+    .map_err(|_| {
+        unlock_transition_conflict("app changed while unlock mode transition was validating; retry")
+    })?;
+    verify_transition_attestation(request.transition_attestation, &locked_app, &reverified)
+        .map_err(|_| {
+            unlock_transition_conflict(
+                "app changed while unlock mode transition was validating; retry",
+            )
+        })?;
+
+    let locked_containers: Vec<crate::models::AppContainer> = sqlx::query_as(
+        "SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC, id",
+    )
+    .bind(locked_app.id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|_| unlock_database_error())?;
+    let locked_primary = locked_containers
+        .iter()
+        .find(|container| container.is_primary)
+        .ok_or_else(|| unlock_transition_conflict("app has no primary container"))?;
+    if locked_primary.image_digest.as_deref() != request.image_digest {
+        return Err(unlock_transition_conflict(
+            "app runtime changed while unlock mode transition was validating; retry",
+        ));
+    }
+
+    // Lock resources too so the apply snapshot is exactly the state accepted
+    // by this transaction rather than a later concurrent edit.
+    let resources: crate::models::AppResources =
+        sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+            .bind(locked_app.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| unlock_database_error())?;
+    crate::routes::deployments::enforce_authoritative_entitlement(
+        &mut tx,
+        request.org_id,
+        &resources,
+        false,
+    )
+    .await?;
+
+    let source: (Uuid, String, Option<String>, serde_json::Value) = sqlx::query_as(
+        "SELECT deployment.id, deployment.status::text,
+                deployment.image_digest, deployment.spec_snapshot
+           FROM deployments AS deployment
+           JOIN deployment_apply_jobs AS apply_job
+             ON apply_job.deployment_id = deployment.id
+          WHERE deployment.app_id = $1
+          ORDER BY apply_job.generation DESC
+          LIMIT 1",
+    )
+    .bind(locked_app.id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| unlock_database_error())?
+    .ok_or_else(|| unlock_transition_conflict("app has no deployment generation"))?;
+    if source.0 != request.source_deployment_id
+        || matches!(source.1.as_str(), "pending" | "applying" | "watching")
+        || source.2.as_deref() != request.image_digest
+        || source
+            .3
+            .get("log_encryption")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+            != serde_json::to_value(request.log_encryption).map_err(|_| unlock_database_error())?
+    {
+        return Err(unlock_transition_conflict(
+            "deployment generation changed while unlock mode transition was validating; retry",
+        ));
+    }
+
+    if request.signed_required && request.signing_artifacts.is_none() {
+        return Err(unlock_transition_conflict(
+            "current deployment authority requires signed artifacts",
+        ));
+    }
+    if request.signing_artifacts.is_some() != request.signed_policy_artifact.is_some() {
+        return Err(unlock_transition_conflict(
+            "signed deployment authority is incomplete",
+        ));
+    }
+
+    if let (Some(artifacts), Some(signed_policy_artifact)) =
+        (request.signing_artifacts, request.signed_policy_artifact)
+    {
+        let image_digest = request.image_digest.ok_or((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "signed unlock-mode redeployment requires an existing digest-pinned primary image"
+            })),
+        ))?;
+        let mut signed_locked_app = locked_app.clone();
+        signed_locked_app.unlock_mode = request.requested.model_value();
+        artifacts
+            .validate_deployment_inputs(
+                &signed_locked_app,
+                image_digest,
+                request.api_signing_pubkey,
+            )
+            .map_err(crate::routes::deployments::signing_error_response)?;
+        artifacts
+            .validate_customer_authority_in_tx(&mut tx)
+            .await
+            .map_err(crate::routes::deployments::signing_error_response)?;
+        let signing_service_pubkey_hex = request.signing_service_pubkey_hex.ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "platform signing-service pubkey required for signed deployment verification"
+            })),
+        ))?;
+        artifacts
+            .validate_signed_artifact(signed_policy_artifact, signing_service_pubkey_hex)
+            .map_err(crate::routes::deployments::signing_error_response)?;
+
+        let locked_profile = locked_primary
+            .workload_security_profile
+            .as_deref()
+            .unwrap_or("restricted")
+            .parse::<enclava_engine::types::WorkloadSecurityProfile>()
+            .map_err(|_| {
+                unlock_transition_conflict("stored workload security profile is invalid")
+            })?;
+        let signed_profile =
+            crate::routes::deployments::signed_descriptor_profile(&artifacts.descriptor)
+                .ok_or_else(|| {
+                    crate::routes::deployments::signing_error_response(
+                        crate::signing_service::SigningServiceError::Mismatch(
+                            "workload_security_profile".to_string(),
+                        ),
+                    )
+                })?;
+        if signed_profile != locked_profile {
+            return Err(crate::routes::deployments::signing_error_response(
+                crate::signing_service::SigningServiceError::Mismatch(
+                    "workload_security_profile".to_string(),
+                ),
+            ));
+        }
+    }
+
+    let result = sqlx::query(
+        "UPDATE apps SET unlock_mode = $1::unlock_enum, updated_at = now() WHERE id = $2",
+    )
+    .bind(request.requested.db_value())
+    .bind(locked_app.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| unlock_database_error())?;
+    if result.rows_affected() != 1 {
+        return Err(unlock_database_error());
+    }
+
+    if request.signed_workload_command.is_some()
+        || request.signed_container_port.is_some()
+        || request.signed_storage_paths.is_some()
+    {
+        let result = sqlx::query(
+            "UPDATE app_containers
+             SET command = COALESCE($1, command),
+                 port = COALESCE($2, port),
+                 storage_paths = COALESCE($3, storage_paths)
+             WHERE app_id = $4 AND is_primary = true",
+        )
+        .bind(request.signed_workload_command)
+        .bind(request.signed_container_port)
+        .bind(request.signed_storage_paths)
+        .bind(locked_app.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| unlock_database_error())?;
+        if result.rows_affected() != 1 {
+            return Err(unlock_database_error());
+        }
+    }
+
+    let updated_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+        .bind(locked_app.id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| unlock_database_error())?;
+    let containers: Vec<crate::models::AppContainer> = sqlx::query_as(
+        "SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC, id",
+    )
+    .bind(locked_app.id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|_| unlock_database_error())?;
+
+    // Repeat the signed cc-init render from the exact locked rows that will be
+    // stored in the durable job. This is the final validation before any
+    // unlock transition row becomes commit-visible.
+    if let (Some(artifacts), Some(signed_policy_artifact)) =
+        (request.signing_artifacts, request.signed_policy_artifact)
+    {
+        let attestation = request.attestation_config.ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "attestation runtime configuration required for signed deployment"
+            })),
+        ))?;
+        let mut app_spec = crate::deploy::build_confidential_app_from_rows(
+            &updated_app,
+            request.deploy_id,
+            attestation,
+            request.api_signing_pubkey,
+            request.api_url,
+            &containers,
+            &resources,
+        )
+        .map_err(|_| unlock_transition_conflict("stored workload runtime is invalid"))?;
+        crate::deploy::set_primary_descriptor_runtime(&mut app_spec, &artifacts.descriptor);
+        app_spec.workload_artifact_binding = Some(artifacts.binding());
+        app_spec.log_encryption = request.log_encryption.cloned();
+        crate::routes::deployments::select_local_signed_artifact_delivery(
+            &mut app_spec.attestation,
+        );
+        app_spec.generated_agent_policy = Some(
+            artifacts
+                .generated_agent_policy(signed_policy_artifact)
+                .map_err(crate::routes::deployments::signing_error_response)?,
+        );
+        let (_encoded, cc_init_data_hash) =
+            enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+        artifacts
+            .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
+            .map_err(crate::routes::deployments::signing_error_response)?;
+    }
+
+    let primary = containers
+        .iter()
+        .find(|container| container.is_primary)
+        .ok_or_else(|| unlock_transition_conflict("app has no primary container"))?;
+    let workload_security_profile = primary
+        .workload_security_profile
+        .as_deref()
+        .unwrap_or("restricted");
+
+    let spec_snapshot = serde_json::json!({
+        "app_name": &updated_app.name,
+        "namespace": &updated_app.namespace,
+        "instance_id": &updated_app.instance_id,
+        "unlock_mode": request.requested.api_value(),
+        "source_generation": request.source_deployment_id,
+        "image": &primary.image_ref,
+        "image_digest": request.image_digest,
+        "resolved_resources": {
+            "cpu": &resources.cpu_limit,
+            "memory": &resources.memory_limit,
+            "storage": &resources.app_data_size,
+            "tls_storage": &resources.tls_data_size,
+        },
+        "workload_security_profile": workload_security_profile,
+        "transition": {
+            "from": locked_current.api_value(),
+            "to": request.requested.api_value(),
+        },
+        "signed_descriptor_core_hash": request
+            .signing_artifacts
+            .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
+        "log_encryption": request.log_encryption,
+        "setup_state": crate::deployment_jobs::DEPLOYMENT_SETUP_ACCEPTED,
+    });
+
+    crate::deploy::supersede_incomplete_deployments(&mut tx, locked_app.id)
+        .await
+        .map_err(|error| match error {
+            crate::deploy::SupersedeDeploymentError::Busy => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "deployment mutation is still in progress"})),
+            ),
+            crate::deploy::SupersedeDeploymentError::Database(_) => unlock_database_error(),
+        })?;
+    sqlx::query(
+        "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest)
+         VALUES ($1, $2, $3, 'api', $4, $5)",
+    )
+    .bind(request.deploy_id)
+    .bind(request.org_id)
+    .bind(locked_app.id)
+    .bind(&spec_snapshot)
+    .bind(request.image_digest)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| unlock_database_error())?;
+
+    let insert_receipt = sqlx::query(
+        "INSERT INTO unlock_transition_receipts
+            (app_id, deployment_id, from_mode, to_mode, receipt,
+             receipt_pubkey_sha256, receipt_timestamp)
+         VALUES ($1, $2, $3::unlock_enum, $4::unlock_enum, $5, $6, $7)",
+    )
+    .bind(locked_app.id)
+    .bind(request.deploy_id)
+    .bind(locked_current.db_value())
+    .bind(request.requested.db_value())
+    .bind(request.receipt_json)
+    .bind(&reverified.pubkey_sha256_bytes)
+    .bind(reverified.receipt_timestamp)
+    .execute(&mut *tx)
+    .await;
+    if let Err(error) = insert_receipt {
+        if error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref()
+            == Some("23505")
+        {
+            return Err(unlock_transition_conflict("replayed transition_receipt"));
+        }
+        return Err(unlock_database_error());
+    }
+
+    if let (Some(artifacts), Some(signed)) =
+        (request.signing_artifacts, request.signed_policy_artifact)
+    {
+        crate::signing_service::persist_workload_artifacts(
+            &mut *tx,
+            locked_app.id,
+            request.deploy_id,
+            artifacts,
+            signed,
+        )
+        .await
+        .map_err(|_| unlock_database_error())?;
+        crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
+            .await
+            .map_err(|_| unlock_database_error())?;
+    } else {
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
+            .await
+            .map_err(|_| unlock_database_error())?;
+    }
+
+    let apply_payload = crate::deployment_jobs::DeploymentApplyJobPayload::new(
+        updated_app.clone(),
+        crate::deploy::DeploymentApplySnapshot::new(containers.clone(), resources.clone()),
+        request.attestation_config.cloned(),
+        request.api_signing_pubkey.to_string(),
+        request.api_url.to_string(),
+        request.signing_artifacts.map(|_| request.deploy_id),
+        request
+            .signing_artifacts
+            .map(|artifacts| artifacts.descriptor_core_hash),
+        request.log_encryption.cloned(),
+        false,
+    );
+    crate::deployment_jobs::insert_ready_job(
+        &mut tx,
+        request.deploy_id,
+        request.deploy_id,
+        &apply_payload,
+        request.signed_required,
+    )
+    .await
+    .map_err(|_| unlock_database_error())?;
+
+    // Audit is part of acceptance, not best effort. Any audit failure aborts
+    // the mode, receipt, runtime, deployment and artifact writes above.
+    sqlx::query(
+        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail)
+         VALUES ($1, $2, $3, 'app.unlock_mode.update', $4)",
+    )
+    .bind(request.org_id)
+    .bind(locked_app.id)
+    .bind(request.user_id)
+    .bind(serde_json::json!({
+        "from": locked_current.api_value(),
+        "to": request.requested.api_value(),
+        "deployment_id": request.deploy_id,
+    }))
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| unlock_database_error())?;
+
+    tx.commit().await.map_err(|_| unlock_database_error())?;
+
+    Ok(CommittedUnlockModeTransition { app: updated_app })
 }
 
 /// GET /apps/{name}/unlock/status -- ownership state (queried from TEE).
@@ -493,8 +988,6 @@ pub async fn update_unlock_mode(
             )
         },
     )?;
-    reject_replayed_transition_receipt(&state.db, app.id, verified_receipt.receipt_timestamp)
-        .await?;
 
     let signing_artifacts = crate::signing_service::decode_optional_blobs(
         body.customer_descriptor_blob.clone(),
@@ -506,11 +999,11 @@ pub async fn update_unlock_mode(
             crate::signing_service::SigningServiceError::ArtifactWithoutBlobs,
         ));
     }
-    if crate::routes::deployments::customer_signed_deploy_required(
+    let signed_required = crate::routes::deployments::customer_signed_deploy_required(
         state.attestation.as_ref(),
         state.signing_service.is_some() || state.require_customer_signed_policy_artifact,
-    ) && signing_artifacts.is_none()
-    {
+    );
+    if signed_required && signing_artifacts.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -519,45 +1012,94 @@ pub async fn update_unlock_mode(
         ));
     }
 
-    let image_digest: Option<String> = sqlx::query_scalar(
-        "SELECT image_digest FROM app_containers WHERE app_id = $1 AND is_primary = true LIMIT 1",
+    let observed_containers: Vec<crate::models::AppContainer> = sqlx::query_as(
+        "SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC, id",
     )
     .bind(app.id)
-    .fetch_optional(&state.db)
+    .fetch_all(&state.db)
     .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?
-    .flatten();
-    let log_encryption: Option<LogEncryptionConfig> = sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT spec_snapshot->'log_encryption'
-           FROM deployments
-          WHERE app_id = $1
-            AND spec_snapshot ? 'log_encryption'
-            AND spec_snapshot->'log_encryption' <> 'null'::jsonb
-          ORDER BY created_at DESC
+    .map_err(|_| unlock_database_error())?;
+    let primary = observed_containers
+        .iter()
+        .find(|container| container.is_primary)
+        .ok_or_else(|| unlock_transition_conflict("app has no primary container"))?;
+    let image_digest = primary.image_digest.clone();
+    let current_profile = primary
+        .workload_security_profile
+        .clone()
+        .unwrap_or_else(|| "restricted".to_string());
+    let observed_resources: crate::models::AppResources =
+        sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+            .bind(app.id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| unlock_database_error())?;
+    let observed_authority = crate::deploy::ExistingAppAuthoritySnapshot::new(
+        app.updated_at,
+        observed_containers,
+        observed_resources.clone(),
+    );
+    let source: (Uuid, String, Option<String>, serde_json::Value) = sqlx::query_as(
+        "SELECT deployment.id, deployment.status::text,
+                deployment.image_digest, deployment.spec_snapshot
+           FROM deployments AS deployment
+           JOIN deployment_apply_jobs AS apply_job
+             ON apply_job.deployment_id = deployment.id
+          WHERE deployment.app_id = $1
+          ORDER BY apply_job.generation DESC
           LIMIT 1",
     )
     .bind(app.id)
     .fetch_optional(&state.db)
     .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?
-    .map(serde_json::from_value)
-    .transpose()
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "stored log encryption metadata is invalid"})),
+    .map_err(|_| unlock_database_error())?
+    .ok_or_else(|| unlock_transition_conflict("app has no deployment generation"))?;
+    if matches!(source.1.as_str(), "pending" | "applying" | "watching") {
+        return Err(unlock_transition_conflict(
+            "current deployment generation is still in progress",
+        ));
+    }
+    if source.2.as_deref() != image_digest.as_deref() {
+        return Err(unlock_transition_conflict(
+            "current runtime does not match its deployment generation",
+        ));
+    }
+    let resolved = source.3.get("resolved_resources").ok_or_else(|| {
+        unlock_transition_conflict(
+            "current deployment predates exact resource snapshots; deploy a current generation first",
         )
     })?;
+    let exact_resource = |field: &str, expected: &str| {
+        resolved.get(field).and_then(serde_json::Value::as_str) == Some(expected)
+    };
+    if !exact_resource("cpu", &observed_resources.cpu_limit)
+        || !exact_resource("memory", &observed_resources.memory_limit)
+        || !exact_resource("storage", &observed_resources.app_data_size)
+        || !exact_resource("tls_storage", &observed_resources.tls_data_size)
+    {
+        return Err(unlock_transition_conflict(
+            "current resource authority does not match its deployment generation",
+        ));
+    }
+    if source
+        .3
+        .get("workload_security_profile")
+        .and_then(serde_json::Value::as_str)
+        != Some(current_profile.as_str())
+    {
+        return Err(unlock_transition_conflict(
+            "current workload security profile does not match its deployment generation",
+        ));
+    }
+    let log_encryption: Option<LogEncryptionConfig> = serde_json::from_value(
+        source
+            .3
+            .get("log_encryption")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|_| unlock_transition_conflict("stored log encryption metadata is invalid"))?;
+    let source_deployment_id = source.0;
 
     let mut signed_app = app.clone();
     signed_app.unlock_mode = requested.model_value();
@@ -565,13 +1107,12 @@ pub async fn update_unlock_mode(
         .as_ref()
         .map(|artifacts| artifacts.descriptor.deploy_id)
         .unwrap_or_else(Uuid::new_v4);
-    let mut workload_artifact_binding = None;
     let mut signed_policy_artifact = None;
     let mut signed_workload_command = None;
     let mut signed_container_port = None;
     let mut signed_storage_paths = None;
+    let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
     if let Some(artifacts) = signing_artifacts.as_ref() {
-        let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
         let image_digest_ref = image_digest.as_deref().ok_or((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -609,10 +1150,10 @@ pub async fn update_unlock_mode(
             &state.api_url,
         )
         .await
-        .map_err(|e| {
+        .map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
+                Json(serde_json::json!({"error": "stored workload runtime is invalid"})),
             )
         })?;
         crate::deploy::set_primary_descriptor_runtime(&mut app_spec, &artifacts.descriptor);
@@ -641,7 +1182,6 @@ pub async fn update_unlock_mode(
         artifacts
             .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
             .map_err(crate::routes::deployments::signing_error_response)?;
-        workload_artifact_binding = Some(binding);
         signed_policy_artifact = Some(signed);
     }
 
@@ -651,231 +1191,41 @@ pub async fn update_unlock_mode(
             Json(serde_json::json!({"error": "receipt serialization error"})),
         )
     })?;
-
-    let mut tx = state.db.begin().await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?;
-
-    sqlx::query("UPDATE apps SET unlock_mode = $1::unlock_enum, updated_at = now() WHERE id = $2")
-        .bind(requested.db_value())
-        .bind(app.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-        })?;
-
-    if signed_workload_command.is_some()
-        || signed_container_port.is_some()
-        || signed_storage_paths.is_some()
-    {
-        sqlx::query(
-            "UPDATE app_containers
-             SET command = COALESCE($1, command),
-                 port = COALESCE($2, port),
-                 storage_paths = COALESCE($3, storage_paths)
-             WHERE app_id = $4 AND is_primary = true",
-        )
-        .bind(signed_workload_command.as_ref())
-        .bind(signed_container_port)
-        .bind(signed_storage_paths.as_ref())
-        .bind(app.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-        })?;
-    }
-
-    sqlx::query(
-        "INSERT INTO unlock_transition_receipts
-            (app_id, from_mode, to_mode, receipt, receipt_pubkey_sha256, receipt_timestamp)
-         VALUES ($1, $2::unlock_enum, $3::unlock_enum, $4, $5, $6)",
-    )
-    .bind(app.id)
-    .bind(current.db_value())
-    .bind(requested.db_value())
-    .bind(receipt_json)
-    .bind(verified_receipt.pubkey_sha256_bytes)
-    .bind(verified_receipt.receipt_timestamp)
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?;
-
-    tx.commit().await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?;
-
-    let updated_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
-        .bind(app.id)
-        .fetch_one(&state.db)
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-        })?;
-
-    let spec_snapshot = serde_json::json!({
-        "app_name": updated_app.name,
-        "namespace": updated_app.namespace,
-        "instance_id": updated_app.instance_id,
-        "unlock_mode": requested.api_value(),
-        "transition": {
-            "from": current.api_value(),
-            "to": requested.api_value(),
+    let committed = commit_unlock_mode_transition(
+        &state.db,
+        UnlockModeCommitRequest {
+            org_id: auth.org_id,
+            user_id: auth.user_id,
+            app_name: &app_name,
+            observed_authority: &observed_authority,
+            source_deployment_id,
+            requested,
+            receipt,
+            transition_attestation,
+            verified_receipt: &verified_receipt,
+            receipt_json: &receipt_json,
+            deploy_id,
+            image_digest: image_digest.as_deref(),
+            signed_workload_command: signed_workload_command.as_deref(),
+            signed_container_port,
+            signed_storage_paths: signed_storage_paths.as_ref(),
+            signing_artifacts: signing_artifacts.as_ref(),
+            signed_policy_artifact: signed_policy_artifact.as_ref(),
+            log_encryption: log_encryption.as_ref(),
+            api_signing_pubkey: &api_signing_pubkey,
+            api_url: &state.api_url,
+            attestation_config: state.attestation.as_ref(),
+            signing_service_pubkey_hex: state
+                .attestation
+                .as_ref()
+                .and_then(|config| config.signing_service_pubkey_hex.as_deref()),
+            signed_required,
         },
-        "signed_descriptor_core_hash": signing_artifacts
-            .as_ref()
-            .map(|artifacts| hex::encode(artifacts.descriptor_core_hash)),
-        "log_encryption": &log_encryption,
-    });
-
-    sqlx::query(
-        "INSERT INTO deployments (id, org_id, app_id, trigger, spec_snapshot, image_digest)
-         VALUES ($1, $2, $3, 'api', $4, $5)",
     )
-    .bind(deploy_id)
-    .bind(auth.org_id)
-    .bind(app.id)
-    .bind(&spec_snapshot)
-    .bind(&image_digest)
-    .execute(&state.db)
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "database error"})),
-        )
-    })?;
-
-    if let (Some(artifacts), Some(signed)) =
-        (signing_artifacts.as_ref(), signed_policy_artifact.as_ref())
-    {
-        crate::signing_service::persist_workload_artifacts(
-            &state.db, app.id, deploy_id, artifacts, signed,
-        )
-        .await
-        .map_err(crate::routes::deployments::signing_error_response)?;
-    }
-
-    let _ = sqlx::query(
-        "INSERT INTO audit_log (org_id, app_id, user_id, action, detail)
-         VALUES ($1, $2, $3, 'app.unlock_mode.update', $4)",
-    )
-    .bind(auth.org_id)
-    .bind(app.id)
-    .bind(auth.user_id)
-    .bind(serde_json::json!({
-        "from": current.api_value(),
-        "to": requested.api_value(),
-        "deployment_id": deploy_id,
-    }))
-    .execute(&state.db)
-    .await;
-
-    let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
-    let local_verification_artifacts =
-        match (signing_artifacts.as_ref(), signed_policy_artifact.as_ref()) {
-            (Some(artifacts), Some(signed)) => Some((
-                crate::signing_service::workload_artifacts_json(artifacts, signed)
-                    .map_err(crate::routes::deployments::signing_error_response)?,
-                crate::signing_service::trustee_policy_json(signed)
-                    .map_err(crate::routes::deployments::signing_error_response)?,
-            )),
-            _ => None,
-        };
-    let db = state.db.clone();
-    let attestation = state.attestation.clone();
-    let kbs_policy = state.kbs_policy.clone();
-    let api_url = state.api_url.clone();
-    let apply_app = updated_app.clone();
-    let apply_permits = state.deployment_apply_permits.clone();
-    let (local_workload_artifacts_json, local_trustee_policy_json) =
-        local_verification_artifacts.unzip();
-    tokio::spawn(async move {
-        let _apply_permit = match apply_permits.acquire_owned().await {
-            Ok(permit) => permit,
-            Err(e) => {
-                let error_message = format!("deployment apply limiter closed: {e}");
-                let _ = crate::deploy::set_deployment_status(
-                    &db,
-                    deploy_id,
-                    "failed",
-                    None,
-                    Some(&error_message),
-                    true,
-                )
-                .await;
-                let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
-                tracing::error!(
-                    app_id = %apply_app.id,
-                    deployment_id = %deploy_id,
-                    error = %error_message,
-                    "failed to acquire unlock-mode apply permit"
-                );
-                return;
-            }
-        };
-
-        if let Err(e) = crate::deploy::apply_deployment_manifests(
-            crate::deploy::ApplyDeploymentManifestsRequest {
-                pool: db.clone(),
-                app: apply_app.clone(),
-                deployment_id: deploy_id,
-                attestation_config: attestation,
-                kbs_policy_config: kbs_policy,
-                api_signing_pubkey,
-                api_url,
-                workload_artifact_binding,
-                signed_policy_artifact,
-                local_workload_artifacts_json,
-                local_trustee_policy_json,
-                log_encryption,
-            },
-        )
-        .await
-        {
-            let error_message = e.to_string();
-            let _ = crate::deploy::set_deployment_status(
-                &db,
-                deploy_id,
-                "failed",
-                None,
-                Some(&error_message),
-                true,
-            )
-            .await;
-            let _ = crate::deploy::set_app_status(&db, apply_app.id, "failed").await;
-            tracing::error!(
-                app_id = %apply_app.id,
-                deployment_id = %deploy_id,
-                error = %error_message,
-                "failed to apply unlock-mode manifests"
-            );
-        }
-    });
+    .await?;
 
     Ok(Json(UpdateUnlockModeResponse {
-        app_name: updated_app.name,
+        app_name: committed.app.name,
         unlock_mode: requested.api_value().to_string(),
         deployment_id: Some(deploy_id),
         status: "deploying".to_string(),
@@ -884,6 +1234,7 @@ pub async fn update_unlock_mode(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
     use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
     use chrono::Utc;
     use ed25519_dalek::{Signer, SigningKey};
@@ -892,10 +1243,10 @@ mod tests {
 
     use super::{
         ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode, SignedReceiptResponse,
-        TransitionReceiptAttestation, validate_transition, verify_transition_attestation,
-        verify_transition_receipt,
+        TransitionReceiptAttestation, UnlockModeCommitRequest, commit_unlock_mode_transition,
+        validate_transition, verify_transition_attestation, verify_transition_receipt,
     };
-    use crate::models::{App, AppStatus, UnlockMode};
+    use crate::models::{App, AppContainer, AppStatus, UnlockMode};
 
     fn test_app() -> App {
         App {
@@ -931,10 +1282,27 @@ mod tests {
         attestation_quote_sha256: &str,
         signing_key: &SigningKey,
     ) -> SignedReceiptResponse {
-        let timestamp = "2026-04-28T12:00:00Z";
+        signed_transition_receipt_for_app(
+            test_app().id,
+            "2026-04-28T12:00:00Z",
+            from_mode,
+            to_mode,
+            attestation_quote_sha256,
+            signing_key,
+        )
+    }
+
+    fn signed_transition_receipt_for_app(
+        app_id: Uuid,
+        timestamp: &str,
+        from_mode: &str,
+        to_mode: &str,
+        attestation_quote_sha256: &str,
+        signing_key: &SigningKey,
+    ) -> SignedReceiptResponse {
         let payload = ReceiptPayloadView {
             purpose: "enclava-unlock-receipt-v1".to_string(),
-            app_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            app_id: app_id.to_string(),
             resource_path: None,
             from_mode: Some(from_mode.to_string()),
             to_mode: Some(to_mode.to_string()),
@@ -972,8 +1340,16 @@ mod tests {
         signing_key: &SigningKey,
         quote_hash: &str,
     ) -> TransitionReceiptAttestation {
+        transition_attestation_for_domain("demo.tee.enclava.dev", signing_key, quote_hash)
+    }
+
+    fn transition_attestation_for_domain(
+        tee_domain: &str,
+        signing_key: &SigningKey,
+        quote_hash: &str,
+    ) -> TransitionReceiptAttestation {
         TransitionReceiptAttestation {
-            tee_domain: "demo.tee.enclava.dev".to_string(),
+            tee_domain: tee_domain.to_string(),
             nonce: B64.encode([0x99; 32]),
             leaf_spki_sha256: "aa".repeat(32),
             receipt_pubkey_sha256: hex::encode(Sha256::digest(
@@ -981,6 +1357,326 @@ mod tests {
             )),
             attestation_evidence_sha256: quote_hash.to_string(),
         }
+    }
+
+    async fn database_test_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect unlock regression database");
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate unlock regression database");
+        pool
+    }
+
+    struct UnlockTestFixture {
+        app: App,
+        user_id: Uuid,
+        source_deployment_id: Uuid,
+        authority: crate::deploy::ExistingAppAuthoritySnapshot,
+    }
+
+    async fn insert_unlock_test_app(pool: &sqlx::PgPool) -> UnlockTestFixture {
+        let org_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let app_name = format!("unlock-{}", &suffix[..12]);
+        sqlx::query(
+            "INSERT INTO organizations (id, name, cust_slug)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(org_id)
+        .bind(format!("unlock-test-{suffix}"))
+        .bind(&suffix[..8])
+        .execute(pool)
+        .await
+        .expect("insert unlock test organization");
+        sqlx::query(
+            "INSERT INTO apps (
+                id, org_id, name, namespace, instance_id, tenant_id,
+                service_account, bootstrap_owner_pubkey_hash,
+                tenant_instance_identity_hash, unlock_mode, domain, tee_domain,
+                status
+             )
+             VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                'password'::unlock_enum, $10, $11, 'running'::app_status_enum
+             )",
+        )
+        .bind(app_id)
+        .bind(org_id)
+        .bind(&app_name)
+        .bind(format!("cap-{app_name}"))
+        .bind(format!("instance-{suffix}"))
+        .bind(&suffix[..8])
+        .bind(format!("cap-{app_name}-sa"))
+        .bind("11".repeat(32))
+        .bind("22".repeat(32))
+        .bind(format!("{app_name}.{}.enclava.dev", &suffix[..8]))
+        .bind(format!("{app_name}.{}.tee.enclava.dev", &suffix[..8]))
+        .execute(pool)
+        .await
+        .expect("insert unlock test app");
+        sqlx::query(
+            "INSERT INTO app_containers (
+                id, app_id, name, image_ref, image_digest, command, port,
+                storage_paths, is_primary
+             )
+             VALUES ($1, $2, 'web', $3, $4, $5, 8080, $6, true)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(app_id)
+        .bind("ghcr.io/enclava-labs/test@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .bind("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .bind("[\"/bin/old\"]")
+        .bind(vec!["/data".to_string()])
+        .execute(pool)
+        .await
+        .expect("insert unlock test container");
+        sqlx::query("INSERT INTO app_resources (app_id) VALUES ($1)")
+            .bind(app_id)
+            .execute(pool)
+            .await
+            .expect("insert unlock test resources");
+        let app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(pool)
+            .await
+            .expect("load unlock test app");
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'unlock actor')")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("insert unlock test actor");
+        sqlx::query(
+            "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $2, 'owner'::role_enum)",
+        )
+        .bind(user_id)
+        .bind(org_id)
+        .execute(pool)
+        .await
+        .expect("insert unlock test owner membership");
+        let containers: Vec<crate::models::AppContainer> = sqlx::query_as(
+            "SELECT * FROM app_containers WHERE app_id = $1 ORDER BY is_primary DESC, id",
+        )
+        .bind(app_id)
+        .fetch_all(pool)
+        .await
+        .expect("load unlock test containers");
+        let resources: crate::models::AppResources =
+            sqlx::query_as("SELECT * FROM app_resources WHERE app_id = $1")
+                .bind(app_id)
+                .fetch_one(pool)
+                .await
+                .expect("load unlock test resources");
+        let source_deployment_id = Uuid::new_v4();
+        let image_digest = containers[0]
+            .image_digest
+            .clone()
+            .expect("unlock test digest");
+        let mut tx = pool.begin().await.expect("begin unlock source generation");
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, spec_snapshot, image_digest
+             ) VALUES ($1, $2, $3, 'api', $4, $5)",
+        )
+        .bind(source_deployment_id)
+        .bind(org_id)
+        .bind(app_id)
+        .bind(serde_json::json!({
+            "image": &containers[0].image_ref,
+            "image_digest": &image_digest,
+            "resolved_resources": {
+                "cpu": &resources.cpu_limit,
+                "memory": &resources.memory_limit,
+                "storage": &resources.app_data_size,
+                "tls_storage": &resources.tls_data_size,
+            },
+            "workload_security_profile": "restricted",
+            "signed_descriptor_core_hash": null,
+            "log_encryption": null,
+            "setup_state": crate::deployment_jobs::DEPLOYMENT_SETUP_ACCEPTED,
+        }))
+        .bind(&image_digest)
+        .execute(&mut *tx)
+        .await
+        .expect("insert unlock source deployment");
+        let payload = crate::deployment_jobs::DeploymentApplyJobPayload::new(
+            app.clone(),
+            crate::deploy::DeploymentApplySnapshot::new(containers.clone(), resources.clone()),
+            None,
+            "test-api-key".to_string(),
+            "https://api.example.test".to_string(),
+            None,
+            None,
+            None,
+            false,
+        );
+        crate::deployment_jobs::insert_ready_job(
+            &mut tx,
+            source_deployment_id,
+            source_deployment_id,
+            &payload,
+            false,
+        )
+        .await
+        .expect("insert unlock source job");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'healthy'::deploy_status_enum,
+                    completed_at = clock_timestamp()
+              WHERE id = $1",
+        )
+        .bind(source_deployment_id)
+        .execute(&mut *tx)
+        .await
+        .expect("complete unlock source deployment");
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET state = 'completed', updated_at = clock_timestamp()
+              WHERE deployment_id = $1",
+        )
+        .bind(source_deployment_id)
+        .execute(&mut *tx)
+        .await
+        .expect("complete unlock source job");
+        tx.commit().await.expect("commit unlock source generation");
+        let authority =
+            crate::deploy::ExistingAppAuthoritySnapshot::new(app.updated_at, containers, resources);
+        UnlockTestFixture {
+            app,
+            user_id,
+            source_deployment_id,
+            authority,
+        }
+    }
+
+    async fn delete_unlock_test_org(pool: &sqlx::PgPool, org_id: Uuid) {
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(pool)
+            .await
+            .expect("delete unlock test audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(pool)
+            .await
+            .expect("delete unlock test organization");
+    }
+
+    fn test_signing_artifacts(
+        app: &App,
+        deploy_id: Uuid,
+        image_digest: &str,
+        api_signing_pubkey: &str,
+    ) -> (
+        crate::signing_service::DeploymentSigningArtifacts,
+        crate::signing_service::SignedPolicyArtifact,
+    ) {
+        let descriptor = serde_json::json!({
+            "schema_version": "v1",
+            "org_id": app.org_id,
+            "org_slug": app.tenant_id,
+            "app_id": app.id,
+            "app_name": app.name,
+            "deploy_id": deploy_id,
+            "created_at": Utc::now(),
+            "nonce": "01".repeat(32),
+            "app_domain": app.domain,
+            "tee_domain": app.tee_domain.as_deref().unwrap_or(&app.domain),
+            "custom_domains": [],
+            "namespace": app.namespace,
+            "service_account": app.service_account,
+            "identity_hash": app.tenant_instance_identity_hash,
+            "image_ref": format!("ghcr.io/enclava-labs/test@{image_digest}"),
+            "image_digest": image_digest,
+            "signer_identity": {
+                "subject": app.signer_identity_subject.as_deref().unwrap_or_default(),
+                "issuer": app.signer_identity_issuer.as_deref().unwrap_or_default(),
+            },
+            "oci_runtime_spec": {
+                "command": [enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH],
+                "args": ["/usr/local/bin/test"],
+                "env": [],
+                "ports": [{"container_port": 8080, "protocol": "TCP"}],
+                "mounts": [],
+                "capabilities": {"add": [], "drop": []},
+                "security_context": {
+                    "run_as_user": 1000,
+                    "run_as_group": 1000,
+                    "read_only_root_fs": true,
+                    "allow_privilege_escalation": false,
+                    "privileged": false,
+                },
+                "resources": {"requests": [], "limits": []},
+            },
+            "sidecars": {
+                "attestation_proxy_digest": format!("sha256:{}", "11".repeat(32)),
+                "caddy_digest": format!("sha256:{}", "22".repeat(32)),
+            },
+            "api_signing_pubkey": api_signing_pubkey,
+            "expected_firmware_measurement": "03".repeat(32),
+            "expected_runtime_class": "kata-qemu-snp",
+            "kbs_resource_path": format!("default/{}-owner", app.name),
+            "unlock_mode": "auto",
+            "policy_template_id": "enclava-kbs-policy-v1",
+            "policy_template_sha256": "04".repeat(32),
+            "platform_release_version": "cap-test",
+            "expected_agent_policy_hash": "05".repeat(32),
+            "expected_cc_init_data_hash": "06".repeat(32),
+            "expected_kbs_policy_hash": "07".repeat(32),
+        });
+        let descriptor_blob = serde_json::json!({
+            "descriptor": descriptor,
+            "signature": "08".repeat(64),
+            "signing_key_id": "test-deployer-key",
+            "signing_pubkey": "09".repeat(32),
+        })
+        .to_string();
+        let keyring_blob = serde_json::json!({
+            "keyring": {
+                "org_id": app.org_id,
+                "version": 1,
+                "members": [],
+                "updated_at": Utc::now(),
+            },
+            "signature": "0a".repeat(64),
+            "signing_pubkey": "0b".repeat(32),
+        })
+        .to_string();
+        let artifacts = crate::signing_service::decode_optional_blobs(
+            Some(descriptor_blob),
+            Some(keyring_blob),
+        )
+        .expect("decode test signing artifacts")
+        .expect("test signing artifacts present");
+        let signed = serde_json::from_value(serde_json::json!({
+            "metadata": {
+                "app_id": app.id.to_string(),
+                "deploy_id": deploy_id.to_string(),
+                "descriptor_core_hash": hex::encode(artifacts.descriptor_core_hash),
+                "descriptor_signing_pubkey": hex::encode(artifacts.descriptor_signing_pubkey),
+                "platform_release_version": "cap-test",
+                "policy_template_id": "enclava-kbs-policy-v1",
+                "policy_template_sha256": "04".repeat(32),
+                "agent_policy_sha256": "05".repeat(32),
+                "genpolicy_version_pin": "test",
+                "signed_at": Utc::now().to_rfc3339(),
+                "key_id": "test",
+            },
+            "rego_text": "package test",
+            "rego_sha256": "0c".repeat(32),
+            "agent_policy_text": "{}",
+            "agent_policy_sha256": "05".repeat(32),
+            "signature": B64.encode([0x0d; 64]),
+            "verify_pubkey_b64": B64.encode([0x0e; 32]),
+        }))
+        .expect("decode test signed policy artifact");
+        (artifacts, signed)
     }
 
     #[test]
@@ -1116,5 +1812,675 @@ mod tests {
             verify_transition_attestation(&attestation, &test_app(), &verified).unwrap_err(),
             "transition_attestation.receipt_pubkey_sha256"
         );
+    }
+
+    #[tokio::test]
+    async fn audit_failure_rolls_back_unlock_mode_runtime_receipt_and_deployment() {
+        let pool = database_test_pool().await;
+        let UnlockTestFixture {
+            app,
+            user_id,
+            source_deployment_id,
+            authority,
+        } = insert_unlock_test_app(&pool).await;
+        let signing_key = SigningKey::from_bytes(&[17; 32]);
+        let quote_hash = "ab".repeat(32);
+        let receipt = signed_transition_receipt_for_app(
+            app.id,
+            "2026-07-17T10:00:00Z",
+            "password",
+            "auto",
+            &quote_hash,
+            &signing_key,
+        );
+        let verified_receipt = verify_transition_receipt(
+            &receipt,
+            &app,
+            RequestedUnlockMode::Password,
+            RequestedUnlockMode::Auto,
+        )
+        .expect("verify test transition receipt");
+        let attestation = transition_attestation_for_domain(
+            app.tee_domain.as_deref().expect("test TEE domain"),
+            &signing_key,
+            &quote_hash,
+        );
+        let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+        let deploy_id = Uuid::new_v4();
+        let image_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let new_command = "[\"/bin/new\"]";
+        let new_storage_paths = vec!["/new-data".to_string()];
+
+        let suffix = app.id.simple().to_string();
+        let function_name = format!("cap_test_block_unlock_audit_{suffix}");
+        let trigger_name = format!("cap_test_block_unlock_audit_trigger_{suffix}");
+        sqlx::query(&format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF NEW.app_id = '{}'::uuid THEN
+                 RAISE EXCEPTION 'forced unlock audit failure';
+               END IF;
+               RETURN NEW;
+             END
+             $$",
+            app.id
+        ))
+        .execute(&pool)
+        .await
+        .expect("create unlock audit failure function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger_name}
+             BEFORE INSERT ON audit_log
+             FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create unlock audit failure trigger");
+
+        let result = commit_unlock_mode_transition(
+            &pool,
+            UnlockModeCommitRequest {
+                org_id: app.org_id,
+                user_id,
+                app_name: &app.name,
+                observed_authority: &authority,
+                source_deployment_id,
+                requested: RequestedUnlockMode::Auto,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id,
+                image_digest: Some(image_digest),
+                signed_workload_command: Some(new_command),
+                signed_container_port: Some(9090),
+                signed_storage_paths: Some(&new_storage_paths),
+                signing_artifacts: None,
+                signed_policy_artifact: None,
+                log_encryption: None,
+                api_signing_pubkey: "unused-without-signing-artifacts",
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+            },
+        )
+        .await;
+        let (status, _) = result.expect_err("mandatory audit failure rejects transition");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let persisted_mode: String =
+            sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load rolled-back unlock mode");
+        assert_eq!(persisted_mode, "password");
+        let persisted_container: AppContainer =
+            sqlx::query_as("SELECT * FROM app_containers WHERE app_id = $1 AND is_primary = true")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load rolled-back primary container");
+        assert_eq!(
+            persisted_container.command.as_deref(),
+            Some("[\"/bin/old\"]")
+        );
+        assert_eq!(persisted_container.port, Some(8080));
+        assert_eq!(
+            persisted_container.storage_paths,
+            Some(vec!["/data".to_string()])
+        );
+        let receipt_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM unlock_transition_receipts WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count rolled-back receipts");
+        assert_eq!(receipt_count, 0);
+        let deployment_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deployments WHERE id = $1")
+                .bind(deploy_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count rolled-back deployment");
+        assert_eq!(deployment_count, 0);
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE app_id = $1 AND action = 'app.unlock_mode.update'",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rolled-back audit rows");
+        assert_eq!(audit_count, 0);
+
+        sqlx::query(&format!("DROP TRIGGER {trigger_name} ON audit_log"))
+            .execute(&pool)
+            .await
+            .expect("drop unlock audit failure trigger");
+        sqlx::query(&format!("DROP FUNCTION {function_name}()"))
+            .execute(&pool)
+            .await
+            .expect("drop unlock audit failure function");
+        delete_unlock_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn deployment_insert_failure_rolls_back_unlock_mode_and_receipt() {
+        let pool = database_test_pool().await;
+        let UnlockTestFixture {
+            app,
+            user_id,
+            source_deployment_id,
+            authority,
+        } = insert_unlock_test_app(&pool).await;
+        let signing_key = SigningKey::from_bytes(&[19; 32]);
+        let quote_hash = "bc".repeat(32);
+        let receipt = signed_transition_receipt_for_app(
+            app.id,
+            "2026-07-17T10:30:00Z",
+            "password",
+            "auto",
+            &quote_hash,
+            &signing_key,
+        );
+        let verified_receipt = verify_transition_receipt(
+            &receipt,
+            &app,
+            RequestedUnlockMode::Password,
+            RequestedUnlockMode::Auto,
+        )
+        .expect("verify deployment failure receipt");
+        let attestation = transition_attestation_for_domain(
+            app.tee_domain.as_deref().expect("test TEE domain"),
+            &signing_key,
+            &quote_hash,
+        );
+        let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+        let deploy_id = Uuid::new_v4();
+        let image_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        sqlx::query(
+            "INSERT INTO deployments (
+                 id, org_id, app_id, trigger, status, spec_snapshot, image_digest
+             ) VALUES ($1, $2, $3, 'api', 'failed'::deploy_status_enum, '{}'::jsonb, $4)",
+        )
+        .bind(deploy_id)
+        .bind(app.org_id)
+        .bind(app.id)
+        .bind(image_digest)
+        .execute(&pool)
+        .await
+        .expect("reserve duplicate deployment id");
+
+        let result = commit_unlock_mode_transition(
+            &pool,
+            UnlockModeCommitRequest {
+                org_id: app.org_id,
+                user_id,
+                app_name: &app.name,
+                observed_authority: &authority,
+                source_deployment_id,
+                requested: RequestedUnlockMode::Auto,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id,
+                image_digest: Some(image_digest),
+                signed_workload_command: None,
+                signed_container_port: None,
+                signed_storage_paths: None,
+                signing_artifacts: None,
+                signed_policy_artifact: None,
+                log_encryption: None,
+                api_signing_pubkey: "unused-without-signing-artifacts",
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+            },
+        )
+        .await;
+        let (status, _) = result.expect_err("deployment insert failure rejects transition");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let persisted_mode: String =
+            sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load mode after deployment failure");
+        assert_eq!(persisted_mode, "password");
+        let receipt_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM unlock_transition_receipts WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count receipts after deployment failure");
+        assert_eq!(receipt_count, 0);
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE app_id = $1 AND action = 'app.unlock_mode.update'",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count audits after deployment failure");
+        assert_eq!(audit_count, 0);
+
+        delete_unlock_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn durable_job_insert_failure_rolls_back_entire_unlock_transition() {
+        let pool = database_test_pool().await;
+        let UnlockTestFixture {
+            app,
+            user_id,
+            source_deployment_id,
+            authority,
+        } = insert_unlock_test_app(&pool).await;
+        let signing_key = SigningKey::from_bytes(&[20; 32]);
+        let quote_hash = "be".repeat(32);
+        let receipt = signed_transition_receipt_for_app(
+            app.id,
+            "2026-07-17T10:40:00Z",
+            "password",
+            "auto",
+            &quote_hash,
+            &signing_key,
+        );
+        let verified_receipt = verify_transition_receipt(
+            &receipt,
+            &app,
+            RequestedUnlockMode::Password,
+            RequestedUnlockMode::Auto,
+        )
+        .expect("verify durable-job failure receipt");
+        let attestation = transition_attestation_for_domain(
+            app.tee_domain.as_deref().expect("test TEE domain"),
+            &signing_key,
+            &quote_hash,
+        );
+        let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+        let deploy_id = Uuid::new_v4();
+        let image_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let suffix = app.id.simple().to_string();
+        let function_name = format!("cap_test_block_unlock_job_{suffix}");
+        let trigger_name = format!("cap_test_block_unlock_job_trigger_{suffix}");
+        sqlx::query(&format!(
+            "CREATE FUNCTION {function_name}() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF NEW.deployment_id = '{deploy_id}'::uuid THEN
+                 RAISE EXCEPTION 'forced unlock durable job failure';
+               END IF;
+               RETURN NEW;
+             END
+             $$"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create durable-job failure function");
+        sqlx::query(&format!(
+            "CREATE TRIGGER {trigger_name}
+             BEFORE INSERT ON deployment_apply_jobs
+             FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create durable-job failure trigger");
+
+        let result = commit_unlock_mode_transition(
+            &pool,
+            UnlockModeCommitRequest {
+                org_id: app.org_id,
+                user_id,
+                app_name: &app.name,
+                observed_authority: &authority,
+                source_deployment_id,
+                requested: RequestedUnlockMode::Auto,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id,
+                image_digest: Some(image_digest),
+                signed_workload_command: None,
+                signed_container_port: None,
+                signed_storage_paths: None,
+                signing_artifacts: None,
+                signed_policy_artifact: None,
+                log_encryption: None,
+                api_signing_pubkey: "unused-without-signing-artifacts",
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+            },
+        )
+        .await;
+        let (status, _) = result.expect_err("durable job failure rejects transition");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        let persisted_mode: String =
+            sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load mode after durable-job failure");
+        assert_eq!(persisted_mode, "password");
+        let receipt_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM unlock_transition_receipts WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count receipts after durable-job failure");
+        assert_eq!(receipt_count, 0);
+        let deployment_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deployments WHERE id = $1")
+                .bind(deploy_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count deployment after durable-job failure");
+        assert_eq!(deployment_count, 0);
+        let job_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM deployment_apply_jobs WHERE deployment_id = $1",
+        )
+        .bind(deploy_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count job after durable-job failure");
+        assert_eq!(job_count, 0);
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE app_id = $1 AND action = 'app.unlock_mode.update'",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count audit after durable-job failure");
+        assert_eq!(audit_count, 0);
+
+        sqlx::query(&format!(
+            "DROP TRIGGER {trigger_name} ON deployment_apply_jobs"
+        ))
+        .execute(&pool)
+        .await
+        .expect("drop durable-job failure trigger");
+        sqlx::query(&format!("DROP FUNCTION {function_name}()"))
+            .execute(&pool)
+            .await
+            .expect("drop durable-job failure function");
+        delete_unlock_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_artifact_authority_rejects_unlock_atomically() {
+        let pool = database_test_pool().await;
+        let UnlockTestFixture {
+            app,
+            user_id,
+            source_deployment_id,
+            authority,
+        } = insert_unlock_test_app(&pool).await;
+        let signing_key = SigningKey::from_bytes(&[21; 32]);
+        let quote_hash = "bd".repeat(32);
+        let receipt = signed_transition_receipt_for_app(
+            app.id,
+            "2026-07-17T10:45:00Z",
+            "password",
+            "auto",
+            &quote_hash,
+            &signing_key,
+        );
+        let verified_receipt = verify_transition_receipt(
+            &receipt,
+            &app,
+            RequestedUnlockMode::Password,
+            RequestedUnlockMode::Auto,
+        )
+        .expect("verify artifact failure receipt");
+        let attestation = transition_attestation_for_domain(
+            app.tee_domain.as_deref().expect("test TEE domain"),
+            &signing_key,
+            &quote_hash,
+        );
+        let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+        let deploy_id = Uuid::new_v4();
+        let image_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let api_signing_pubkey = "test-api-signing-key";
+        let (artifacts, signed) =
+            test_signing_artifacts(&app, deploy_id, image_digest, api_signing_pubkey);
+
+        let result = commit_unlock_mode_transition(
+            &pool,
+            UnlockModeCommitRequest {
+                org_id: app.org_id,
+                user_id,
+                app_name: &app.name,
+                observed_authority: &authority,
+                source_deployment_id,
+                requested: RequestedUnlockMode::Auto,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id,
+                image_digest: Some(image_digest),
+                signed_workload_command: None,
+                signed_container_port: None,
+                signed_storage_paths: None,
+                signing_artifacts: Some(&artifacts),
+                signed_policy_artifact: Some(&signed),
+                log_encryption: None,
+                api_signing_pubkey,
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+            },
+        )
+        .await;
+        let (status, _) = result.expect_err("invalid artifact authority rejects transition");
+        assert!(
+            matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "invalid signed authority must fail before persistence, got {status}"
+        );
+
+        let persisted_mode: String =
+            sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load mode after artifact failure");
+        assert_eq!(persisted_mode, "password");
+        let receipt_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM unlock_transition_receipts WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count receipts after artifact failure");
+        assert_eq!(receipt_count, 0);
+        let deployment_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deployments WHERE id = $1")
+                .bind(deploy_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count deployment after artifact failure");
+        assert_eq!(deployment_count, 0);
+        let artifact_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM workload_artifacts WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count artifacts after artifact failure");
+        assert_eq!(artifact_count, 0);
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE app_id = $1 AND action = 'app.unlock_mode.update'",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count audits after artifact failure");
+        assert_eq!(audit_count, 0);
+
+        delete_unlock_test_org(&pool, app.org_id).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_transition_receipt_commits_exactly_once() {
+        let pool = database_test_pool().await;
+        let UnlockTestFixture {
+            app,
+            user_id,
+            source_deployment_id,
+            authority,
+        } = insert_unlock_test_app(&pool).await;
+        let signing_key = SigningKey::from_bytes(&[23; 32]);
+        let quote_hash = "cd".repeat(32);
+        let receipt = signed_transition_receipt_for_app(
+            app.id,
+            "2026-07-17T11:00:00Z",
+            "password",
+            "auto",
+            &quote_hash,
+            &signing_key,
+        );
+        let verified_receipt = verify_transition_receipt(
+            &receipt,
+            &app,
+            RequestedUnlockMode::Password,
+            RequestedUnlockMode::Auto,
+        )
+        .expect("verify duplicate test receipt");
+        let attestation = transition_attestation_for_domain(
+            app.tee_domain.as_deref().expect("test TEE domain"),
+            &signing_key,
+            &quote_hash,
+        );
+        let receipt_json = serde_json::to_value(&receipt).expect("serialize receipt");
+        let image_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let first_deploy_id = Uuid::new_v4();
+        let second_deploy_id = Uuid::new_v4();
+        let first = commit_unlock_mode_transition(
+            &pool,
+            UnlockModeCommitRequest {
+                org_id: app.org_id,
+                user_id,
+                app_name: &app.name,
+                observed_authority: &authority,
+                source_deployment_id,
+                requested: RequestedUnlockMode::Auto,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id: first_deploy_id,
+                image_digest: Some(image_digest),
+                signed_workload_command: None,
+                signed_container_port: None,
+                signed_storage_paths: None,
+                signing_artifacts: None,
+                signed_policy_artifact: None,
+                log_encryption: None,
+                api_signing_pubkey: "unused-without-signing-artifacts",
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+            },
+        );
+        let second = commit_unlock_mode_transition(
+            &pool,
+            UnlockModeCommitRequest {
+                org_id: app.org_id,
+                user_id,
+                app_name: &app.name,
+                observed_authority: &authority,
+                source_deployment_id,
+                requested: RequestedUnlockMode::Auto,
+                receipt: &receipt,
+                transition_attestation: &attestation,
+                verified_receipt: &verified_receipt,
+                receipt_json: &receipt_json,
+                deploy_id: second_deploy_id,
+                image_digest: Some(image_digest),
+                signed_workload_command: None,
+                signed_container_port: None,
+                signed_storage_paths: None,
+                signing_artifacts: None,
+                signed_policy_artifact: None,
+                log_encryption: None,
+                api_signing_pubkey: "unused-without-signing-artifacts",
+                api_url: "https://api.example.test",
+                attestation_config: None,
+                signing_service_pubkey_hex: None,
+                signed_required: false,
+            },
+        );
+
+        let (first, second) = tokio::join!(first, second);
+        let mut success_count = 0;
+        let mut replay_conflict_count = 0;
+        for result in [first, second] {
+            match result {
+                Ok(_) => success_count += 1,
+                Err((status, body)) => {
+                    assert_eq!(status, StatusCode::CONFLICT);
+                    assert_eq!(body.0["error"], "replayed transition_receipt");
+                    replay_conflict_count += 1;
+                }
+            }
+        }
+        assert_eq!(success_count, 1);
+        assert_eq!(replay_conflict_count, 1);
+
+        let persisted_mode: String =
+            sqlx::query_scalar("SELECT unlock_mode::text FROM apps WHERE id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("load committed unlock mode");
+        assert_eq!(persisted_mode, "auto");
+        let receipt_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM unlock_transition_receipts WHERE app_id = $1")
+                .bind(app.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count committed transition receipts");
+        assert_eq!(receipt_count, 1);
+        let deployment_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deployments WHERE id IN ($1, $2)")
+                .bind(first_deploy_id)
+                .bind(second_deploy_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count committed unlock deployments");
+        assert_eq!(deployment_count, 1);
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log WHERE app_id = $1 AND action = 'app.unlock_mode.update'",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count committed unlock audits");
+        assert_eq!(audit_count, 1);
+        let receipt_index_is_unique: bool = sqlx::query_scalar(
+            "SELECT indisunique
+               FROM pg_index
+              WHERE indexrelid = 'idx_unlock_transition_receipts_app_timestamp'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("load receipt replay index metadata");
+        assert!(receipt_index_is_unique);
+
+        delete_unlock_test_org(&pool, app.org_id).await;
     }
 }

@@ -1,7 +1,8 @@
-use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
+use kube::api::{Api, ApiResource, DynamicObject};
 use serde_json::Value;
 
 use super::engine::{ApplyEngine, ApplyError};
+use super::generation::{MutationGeneration, apply_resource};
 
 fn api_resource(group: &str, version: &str, kind: &str, plural: &str) -> ApiResource {
     ApiResource {
@@ -79,12 +80,12 @@ async fn apply_dynamic_resource(
     namespace: &str,
     value: &Value,
     ar: &ApiResource,
+    generation: MutationGeneration,
 ) -> Result<DynamicObject, ApplyError> {
     let dyn_obj = value_to_dynamic_object(value, ar)?;
     let name = dyn_obj.metadata.name.as_deref().unwrap_or("<unnamed>");
     let api: Api<DynamicObject> = Api::namespaced_with(engine.client().clone(), namespace, ar);
-    let pp = PatchParams::apply(&engine.config().field_manager);
-    let patched = api.patch(name, &pp, &Patch::Apply(&dyn_obj)).await?;
+    let patched = apply_resource(engine, &api, &dyn_obj, generation, false, false).await?;
 
     tracing::info!(
         namespace = %namespace,
@@ -103,10 +104,39 @@ pub async fn apply_gateway_resources(
     gateway: &Value,
     tls_route: &Value,
     tee_tls_route: &Value,
+    generation: MutationGeneration,
 ) -> Result<(), ApplyError> {
-    apply_dynamic_resource(engine, namespace, envoy_proxy, &envoy_proxy_api_resource()).await?;
-    apply_dynamic_resource(engine, namespace, gateway, &gateway_api_resource()).await?;
-    apply_dynamic_resource(engine, namespace, tls_route, &tls_route_api_resource()).await?;
-    apply_dynamic_resource(engine, namespace, tee_tls_route, &tls_route_api_resource()).await?;
+    apply_dynamic_resource(
+        engine,
+        namespace,
+        envoy_proxy,
+        &envoy_proxy_api_resource(),
+        generation,
+    )
+    .await?;
+    apply_dynamic_resource(
+        engine,
+        namespace,
+        gateway,
+        &gateway_api_resource(),
+        generation,
+    )
+    .await?;
+    apply_dynamic_resource(
+        engine,
+        namespace,
+        tls_route,
+        &tls_route_api_resource(),
+        generation,
+    )
+    .await?;
+    apply_dynamic_resource(
+        engine,
+        namespace,
+        tee_tls_route,
+        &tls_route_api_resource(),
+        generation,
+    )
+    .await?;
     Ok(())
 }

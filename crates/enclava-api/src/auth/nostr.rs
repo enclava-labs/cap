@@ -103,9 +103,9 @@ pub fn verify_nip98_event(
     let now = Timestamp::now();
     let created = event.created_at;
     let diff = if now > created {
-        now.as_u64() - created.as_u64()
+        now.as_secs() - created.as_secs()
     } else {
-        created.as_u64() - now.as_u64()
+        created.as_secs() - now.as_secs()
     };
     if diff > 60 {
         return Err(NostrAuthError::Expired);

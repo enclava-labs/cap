@@ -1,6 +1,7 @@
 use enclava_engine::apply::types::DeployPhase;
 use enclava_engine::apply::watch::{
-    PodSnapshot, classify_pod_phase, pod_label_selector, pod_runtime_failure_message,
+    PodSnapshot, classify_pod_phase, pod_label_selector, pod_matches_statefulset_update_revision,
+    pod_runtime_failure_message, pod_terminal_failure_code,
     stale_terminating_pod_needs_force_delete,
 };
 use k8s_openapi::api::core::v1::{
@@ -72,6 +73,26 @@ fn failed_pod_maps_to_failed() {
 }
 
 #[test]
+fn terminal_pod_failure_does_not_retain_workload_controlled_name() {
+    const SENSITIVE_POD_NAME: &str = "customer-secret-project-pod";
+    let pod = Pod {
+        metadata: ObjectMeta {
+            name: Some(SENSITIVE_POD_NAME.to_string()),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Failed".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let code = pod_terminal_failure_code(&pod).expect("terminal failure code");
+    assert_eq!(code, "pod_failed");
+    assert!(!code.contains(SENSITIVE_POD_NAME));
+}
+
+#[test]
 fn unknown_phase_maps_to_tee_booting() {
     let snap = PodSnapshot {
         phase: Some("Unknown".to_string()),
@@ -86,9 +107,11 @@ fn unknown_phase_maps_to_tee_booting() {
 
 #[test]
 fn running_pod_with_crashloop_after_start_error_reports_runtime_failure() {
+    const WAITING_SECRET: &str = "waiting-message-secret=tenant-api-key";
+    const TERMINATED_SECRET: &str = "terminated-message-secret=tenant-private-key";
     let pod = Pod {
         metadata: ObjectMeta {
-            name: Some("shell-0".to_string()),
+            name: Some("tenant-secret-pod-name".to_string()),
             ..Default::default()
         },
         status: Some(PodStatus {
@@ -102,7 +125,7 @@ fn running_pod_with_crashloop_after_start_error_reports_runtime_failure() {
                 state: Some(ContainerState {
                     waiting: Some(ContainerStateWaiting {
                         reason: Some("CrashLoopBackOff".to_string()),
-                        message: Some("back-off restarting failed container=web".to_string()),
+                        message: Some(WAITING_SECRET.to_string()),
                     }),
                     ..Default::default()
                 }),
@@ -110,10 +133,7 @@ fn running_pod_with_crashloop_after_start_error_reports_runtime_failure() {
                     terminated: Some(ContainerStateTerminated {
                         reason: Some("StartError".to_string()),
                         exit_code: 128,
-                        message: Some(
-                            "failed to create containerd task: EINVAL: Invalid argument"
-                                .to_string(),
-                        ),
+                        message: Some(TERMINATED_SECRET.to_string()),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -126,10 +146,16 @@ fn running_pod_with_crashloop_after_start_error_reports_runtime_failure() {
     };
 
     let message = pod_runtime_failure_message(&pod).unwrap();
-    assert!(message.contains("pod 'shell-0'"));
-    assert!(message.contains("CrashLoopBackOff"));
-    assert!(message.contains("StartError"));
-    assert!(message.contains("EINVAL"));
+    assert_eq!(
+        message,
+        "container_runtime_failure status=waiting code=crash_loop_back_off; \
+         previous_container_runtime_failure status=terminated code=start_error exit_code=128"
+    );
+    assert!(!message.contains(WAITING_SECRET));
+    assert!(!message.contains(TERMINATED_SECRET));
+    assert!(!message.contains("tenant-secret-pod-name"));
+    assert!(!message.contains("web"));
+    assert!(message.len() < 192);
 }
 
 #[test]
@@ -193,8 +219,69 @@ fn running_container_ignores_recovered_last_start_error() {
 }
 
 #[test]
+fn terminating_pod_does_not_fail_replacement_rollout() {
+    let pod = Pod {
+        metadata: ObjectMeta {
+            deletion_timestamp: Some(Time(
+                "2026-07-31T10:31:09Z"
+                    .parse::<Timestamp>()
+                    .expect("timestamp parses"),
+            )),
+            ..Default::default()
+        },
+        status: Some(PodStatus {
+            phase: Some("Failed".to_string()),
+            container_statuses: Some(vec![ContainerStatus {
+                name: "web".to_string(),
+                image: "example.test/web@sha256:abc".to_string(),
+                image_id: "example.test/web@sha256:abc".to_string(),
+                ready: false,
+                restart_count: 0,
+                state: Some(ContainerState {
+                    terminated: Some(ContainerStateTerminated {
+                        reason: Some("Error".to_string()),
+                        exit_code: 137,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    assert!(pod_runtime_failure_message(&pod).is_none());
+    assert!(pod_terminal_failure_code(&pod).is_none());
+}
+
+#[test]
 fn pod_label_selector_matches_generated_statefulset_labels() {
     assert_eq!(pod_label_selector("my-app"), "app=my-app");
+}
+
+#[test]
+fn stale_statefulset_revision_does_not_fail_replacement_rollout() {
+    let pod = Pod {
+        metadata: ObjectMeta {
+            labels: Some(std::collections::BTreeMap::from([(
+                "controller-revision-hash".to_string(),
+                "app-old".to_string(),
+            )])),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    assert!(!pod_matches_statefulset_update_revision(
+        &pod,
+        Some("app-new")
+    ));
+    assert!(pod_matches_statefulset_update_revision(
+        &pod,
+        Some("app-old")
+    ));
 }
 
 #[test]

@@ -1,0 +1,103 @@
+{
+  "schema_version": "enclava-trust-policy-v1",
+  "label": "Independent Prove-It dev acceptance",
+  "required_checks": [
+    "binding.challenge_nonce",
+    "binding.target_origin",
+    "policy.structure",
+    "amd.report_structure",
+    "amd.endorsements_structure",
+    "binding.tls_leaf_certificate",
+    "amd.certificate_chain",
+    "amd.report_signature",
+    "amd.vcek_binding",
+    "amd.revocation.freshness",
+    "amd.measurement",
+    "amd.tcb",
+    "amd.guest_policy",
+    "binding.report_data",
+    "policy.target_origin",
+    "artifacts.signatures",
+    "artifacts.relationships",
+    "artifacts.descriptor_measurement",
+    "supply_chain.image_policy",
+    "platform.runtime_class",
+    "platform.sidecars",
+    "platform.release",
+    "deployment.identity",
+    "supply_chain.portable_integrity",
+    "supply_chain.signatures"
+  ],
+  "amd": {
+    "trusted_ark_sha256": [
+      "4c6598d19c18719c5dfd4a7d335f674e5bfe1d8f800cea2cf270c10d103db2f1"
+    ],
+    "allowed_measurements": [
+      "dbf5e0ee559e016dbb7322fbee35c9e84922b055a210317129c4dae3b3ddf51ff28cf1181e65d0d4ade9b1b070462c67"
+    ],
+    "minimum_tcb": {
+      "bootloader": 12,
+      "tee": 0,
+      "fmc": 0,
+      "snp": 28,
+      "microcode": 88
+    },
+    "guest_policy_mask": 18446744073709551615,
+    "guest_policy_value": 196608,
+    "revocation_max_age_seconds": 3888000
+  },
+  "target": {
+    "origins": [
+      "https://prove-it-independent-dev.e72a13df.dev.enclava.work"
+    ],
+    "image_digests": [
+      "sha256:073939e48252e9248c4a16cb356e7c68d9128c57d6369b4b83fe5c3a35c092f4"
+    ],
+    "runtime_classes": [
+      "kata-qemu-snp"
+    ],
+    "attestation_proxy_digests": [
+      "sha256:1bfe0018f37709743b1a82071f89fa402e322ed1c01ce55220fae4e7e89f25f7"
+    ],
+    "caddy_digests": [
+      "sha256:ba4182b5a9196649f1a43e38a434238f8826540bf0289b61e517e0143f16071e"
+    ],
+    "platform_release_versions": [
+      "dev-independent-verification-2026-08-04.2"
+    ],
+    "organization_ids": [
+      "c91aaecb-faba-48df-a90f-7ad395847f48"
+    ],
+    "application_ids": [
+      "50af9122-38ef-8cbd-a99a-5aca62da69ec"
+    ]
+  },
+  "trusted_org_keyring_sha256": [
+    "adf58780ac8d40c49155bbc165a7d6dc27e30530051971ce98d26778e29b3f8e"
+  ],
+  "trusted_policy_signing_pubkeys": [
+    "8e8c2d06c66cd21be5069fad1978800b8202ad846877ec3ff023c8cb803448b2"
+  ],
+  "sigstore": {
+    "fulcio_roots_der_base64": [
+      "MIIB9zCCAXygAwIBAgIUALZNAPFdxHPwjeDloDwyYChAO/4wCgYIKoZIzj0EAwMwKjEVMBMGA1UEChMMc2lnc3RvcmUuZGV2MREwDwYDVQQDEwhzaWdzdG9yZTAeFw0yMTEwMDcxMzU2NTlaFw0zMTEwMDUxMzU2NThaMCoxFTATBgNVBAoTDHNpZ3N0b3JlLmRldjERMA8GA1UEAxMIc2lnc3RvcmUwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAT7XeFT4rb3PQGwS4IajtLk3/OlnpgangaBclYpsYBr5i+4ynB07ceb3LP0OIOZdxexX69c5iVuyJRQ+Hz05yi+UF3uBWAlHpiS5sh0+H2GHE7SXrk1EC5m1Tr19L9gg92jYzBhMA4GA1UdDwEB/wQEAwIBBjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQWBBRYwB5fkUWlZql6zJChkyLQKsXF+jAfBgNVHSMEGDAWgBRYwB5fkUWlZql6zJChkyLQKsXF+jAKBggqhkjOPQQDAwNpADBmAjEAj1nHeXZp+13NWBNa+EDsDP8G1WWg1tCMWP/WHPqpaVo0jhsweNFZgSs0eE7wYI4qAjEA2WB9ot98sIkoF3vZYdd3/VtWB5b9TNMea7Ix/stJ5TfcLLeABLE4BNJOsQ4vnBHJ"
+    ],
+    "fulcio_intermediates_der_base64": [
+      "MIICGjCCAaGgAwIBAgIUALnViVfnU0brJasmRkHrn/UnfaQwCgYIKoZIzj0EAwMwKjEVMBMGA1UEChMMc2lnc3RvcmUuZGV2MREwDwYDVQQDEwhzaWdzdG9yZTAeFw0yMjA0MTMyMDA2MTVaFw0zMTEwMDUxMzU2NThaMDcxFTATBgNVBAoTDHNpZ3N0b3JlLmRldjEeMBwGA1UEAxMVc2lnc3RvcmUtaW50ZXJtZWRpYXRlMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE8RVS/ysH+NOvuDZyPIZtilgUF9NlarYpAd9HP1vBBH1U5CV77LSS7s0ZiH4nE7Hv7ptS6LvvR/STk798LVgMzLlJ4HeIfF3tHSaexLcYpSASr1kS0N/RgBJz/9jWCiXno3sweTAOBgNVHQ8BAf8EBAMCAQYwEwYDVR0lBAwwCgYIKwYBBQUHAwMwEgYDVR0TAQH/BAgwBgEB/wIBADAdBgNVHQ4EFgQU39Ppz1YkEZb5qNjpKFWixi4YZD8wHwYDVR0jBBgwFoAUWMAeX5FFpWapesyQoZMi0CrFxfowCgYIKoZIzj0EAwMDZwAwZAIwPCsQK4DYiZYDPIaDi5HFKnfxXx6ASSVmERfsynYBiX2X6SJRnZU84/9DZdnFvvxmAjBOt6QpBlc4J/0DxvkTCqpclvziL6BCCPnjdlIB3Pu3BxsPmygUY7Ii2zbdCdliiow="
+    ],
+    "trusted_fulcio_root_sha256": [
+      "3ba7b6cc4e95469d4d334b49cb257ad8537076fa84b0ca87ff4ecfe6a54680c1"
+    ],
+    "rekor_spki_der_base64": [
+      "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2G2Y+2tabdTV5BcGiBIx0a9fAFwrkBbmLSGtks4L3qX6yYY0zufBnhC8Ur/iy55GhWP/9A/bY2LhC30M9+RYtw=="
+    ],
+    "certificate_identity": "https://github.com/aljazceru/prove-it/.github/workflows/image.yml@refs/heads/feat/independent-verification",
+    "oidc_issuer": "https://token.actions.githubusercontent.com",
+    "source_repository": "aljazceru/prove-it",
+    "workflow_ref": "aljazceru/prove-it/.github/workflows/image.yml@refs/heads/feat/independent-verification",
+    "provenance_builder_id": "https://github.com/aljazceru/prove-it/actions/runs/30857701854/attempts/1"
+  },
+  "transport": {
+    "require_tls_channel_spki": false
+  }
+}

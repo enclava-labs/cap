@@ -3,8 +3,15 @@ kind: Deployment
 metadata:
   name: enclava-api
   namespace: enclava-platform
+  labels:
+    app.kubernetes.io/name: cap-api
 spec:
   replicas: 2
+  # Deterministic config-token receipts can be replayed for five minutes.
+  # Never mix binaries with different receipt/signing contracts in that live
+  # window; see runbooks/paas-config-token-idempotency.md.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: enclava-api
@@ -12,8 +19,10 @@ spec:
     metadata:
       labels:
         app: enclava-api
+        app.kubernetes.io/name: cap-api
     spec:
-      automountServiceAccountToken: false
+      serviceAccountName: enclava-api
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -42,8 +51,14 @@ spec:
             secretKeyRef:
               name: api-secrets
               key: database-url
+        # Keep false through migration, clean-cut proof, provider convergence,
+        # and smoke tests. Enable only in a later activation rollout.
+        - name: CAP_DEPLOYMENT_DISPATCH_ENABLED
+          value: "false"
         - name: API_URL
           value: "https://api.enclava.dev"
+        - name: AMD_KDS_BASE_URL
+          value: "http://amd-kds-relay.enclava-platform.svc.cluster.local:8080/vcek/v1"
         - name: PLATFORM_DOMAIN
           value: "enclava.dev"
         - name: DNS_MANAGEMENT_REQUIRED
@@ -67,15 +82,22 @@ spec:
           limits:
             cpu: 1000m
             memory: 1Gi
+        startupProbe:
+          httpGet:
+            path: /livez
+            port: 3000
+          periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 180
         livenessProbe:
           httpGet:
-            path: /health
+            path: /livez
             port: 3000
           initialDelaySeconds: 5
           periodSeconds: 30
         readinessProbe:
           httpGet:
-            path: /health
+            path: /readyz
             port: 3000
           initialDelaySeconds: 5
           periodSeconds: 10

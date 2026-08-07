@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{DateTime, Utc};
+use futures::StreamExt as _;
 use serde::Serialize;
 use sigstore::cosign::CosignCapabilities;
 use sigstore::cosign::verification_constraint::{
@@ -38,6 +39,9 @@ use sigstore::registry::{Auth, ClientConfig, ClientProtocol, OciReference};
 use sigstore::trust::sigstore::SigstoreTrustRoot;
 
 use crate::registry::registry_base_url;
+
+const MAX_SIGSTORE_MATERIAL_BYTES: usize = 196_608;
+const MAX_PROVENANCE_MATERIAL_BYTES: usize = 311_296;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CosignError {
@@ -84,6 +88,12 @@ pub struct VerifiedSignature {
     pub signer_issuer: Option<String>,
     pub verified_at: DateTime<Utc>,
     pub rekor_log_index: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PortableVerificationMaterial {
+    pub sigstore: Vec<u8>,
+    pub provenance_oci: Vec<u8>,
 }
 
 fn env_flag(name: &str) -> bool {
@@ -137,19 +147,17 @@ fn digest_to_cosign_tag(digest: &str, suffix: &str) -> String {
 
 /// Parse an image reference into (registry, repository) components.
 fn parse_image_parts(image_ref: &str) -> Result<(String, String), CosignError> {
-    let base = image_ref
-        .split('@')
-        .next()
-        .unwrap_or(image_ref)
-        .split(':')
-        .next()
-        .unwrap_or(image_ref);
+    let base = image_ref.split('@').next().unwrap_or(image_ref);
+    let base = match (base.rfind('/'), base.rfind(':')) {
+        (slash, Some(colon)) if slash.is_none_or(|slash| colon > slash) => &base[..colon],
+        _ => base,
+    };
 
     let parts: Vec<&str> = base.splitn(3, '/').collect();
     match parts.len() {
         1 => Ok(("docker.io".to_string(), format!("library/{}", parts[0]))),
         2 => {
-            if parts[0].contains('.') || parts[0].contains(':') {
+            if parts[0].contains('.') || parts[0].contains(':') || parts[0] == "localhost" {
                 Ok((parts[0].to_string(), parts[1].to_string()))
             } else {
                 Ok((
@@ -386,6 +394,312 @@ pub async fn fetch_attestations(
     let sbom = fetch_attestation_tag(client, &base_url, &repository, digest, "sbom").await?;
 
     Ok((provenance, sbom))
+}
+
+/// Preserve the exact OCI manifests and signed layers needed for offline replay.
+pub async fn fetch_portable_verification_material(
+    image_ref: &str,
+    image_digest: &str,
+) -> Result<PortableVerificationMaterial, CosignError> {
+    use oci_client::client::{Client, ClientConfig};
+    use oci_client::secrets::RegistryAuth;
+
+    const MANIFEST_TYPES: &[&str] = &[
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+    ];
+
+    let (registry, repository) = parse_image_parts(image_ref)?;
+    let auth: RegistryAuth = (&registry_auth_from_env(&registry)).into();
+    let mut config = ClientConfig::default();
+    if env_flag("COSIGN_ALLOW_HTTP_REGISTRY") {
+        config.protocol = oci_client::client::ClientProtocol::Http;
+    }
+    let client = Client::new(config);
+    let source = oci_client::Reference::with_digest(
+        registry.clone(),
+        repository.clone(),
+        image_digest.to_string(),
+    );
+    let signature = oci_client::Reference::with_tag(
+        registry.clone(),
+        repository.clone(),
+        digest_to_cosign_tag(image_digest, "sig"),
+    );
+
+    let (source_manifest, source_resolved) = client
+        .pull_manifest_raw(&source, &auth, MANIFEST_TYPES)
+        .await
+        .map_err(|error| CosignError::VerificationFailed(error.to_string()))?;
+    if source_resolved != image_digest {
+        return Err(CosignError::VerificationFailed(
+            "source manifest digest mismatch".into(),
+        ));
+    }
+    let signature_objects =
+        pull_signature_objects(&client, &source, &signature, &auth, MANIFEST_TYPES).await?;
+    let provenance_objects = pull_provenance_objects(
+        &client,
+        &source_manifest,
+        image_digest,
+        &registry,
+        &repository,
+        &auth,
+        MANIFEST_TYPES,
+    )
+    .await?;
+
+    let mut sigstore_records = vec![
+        ("purpose", b"enclava-sigstore-material-v1".as_slice()),
+        ("image_digest", image_digest.as_bytes()),
+    ];
+    for (manifest, blobs) in &signature_objects {
+        sigstore_records.push(("signature_manifest", manifest.as_slice()));
+        sigstore_records.extend(blobs.iter().map(|blob| ("signature_blob", blob.as_slice())));
+    }
+    let sigstore = enclava_common::canonical::ce_v1_bytes(&sigstore_records);
+
+    let mut provenance_records = vec![
+        ("purpose", b"enclava-provenance-oci-material-v1".as_slice()),
+        ("image_digest", image_digest.as_bytes()),
+        ("image_manifest", source_manifest.as_ref()),
+    ];
+    for (manifest, blobs) in &provenance_objects {
+        provenance_records.push(("provenance_manifest", manifest.as_slice()));
+        provenance_records.extend(
+            blobs
+                .iter()
+                .map(|blob| ("provenance_blob", blob.as_slice())),
+        );
+    }
+    let provenance_oci = enclava_common::canonical::ce_v1_bytes(&provenance_records);
+
+    if sigstore.len() > MAX_SIGSTORE_MATERIAL_BYTES
+        || provenance_oci.len() > MAX_PROVENANCE_MATERIAL_BYTES
+    {
+        return Err(CosignError::VerificationFailed(
+            "portable verification material exceeds v1 limits".into(),
+        ));
+    }
+    Ok(PortableVerificationMaterial {
+        sigstore,
+        provenance_oci,
+    })
+}
+
+async fn pull_signature_objects(
+    client: &oci_client::client::Client,
+    source: &oci_client::Reference,
+    legacy_signature: &oci_client::Reference,
+    auth: &oci_client::secrets::RegistryAuth,
+    accepted_media_types: &[&str],
+) -> Result<Vec<(Vec<u8>, Vec<Vec<u8>>)>, CosignError> {
+    if let Ok(object) = pull_oci_object(
+        client,
+        legacy_signature,
+        auth,
+        accepted_media_types,
+        MAX_SIGSTORE_MATERIAL_BYTES,
+    )
+    .await
+        && object.1.iter().any(|blob| is_portable_signature_blob(blob))
+    {
+        return Ok(vec![object]);
+    }
+    let referrers = client
+        .pull_referrers(source, None)
+        .await
+        .map_err(|error| CosignError::VerificationFailed(error.to_string()))?;
+    let mut objects = Vec::new();
+    for descriptor in referrers.manifests {
+        let reference = oci_client::Reference::with_digest(
+            source.resolve_registry().to_string(),
+            source.repository().to_string(),
+            descriptor.digest,
+        );
+        let Ok(object) = pull_oci_object(
+            client,
+            &reference,
+            auth,
+            accepted_media_types,
+            MAX_SIGSTORE_MATERIAL_BYTES,
+        )
+        .await
+        else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&object.0) else {
+            continue;
+        };
+        if manifest
+            .pointer("/annotations/dev.sigstore.bundle.predicateType")
+            .and_then(serde_json::Value::as_str)
+            == Some("https://sigstore.dev/cosign/sign/v1")
+            && object.1.iter().any(|blob| is_portable_signature_blob(blob))
+        {
+            if objects.iter().map(oci_object_size).sum::<usize>() + oci_object_size(&object)
+                > MAX_SIGSTORE_MATERIAL_BYTES
+            {
+                return Err(portable_material_too_large());
+            }
+            objects.push(object);
+        }
+    }
+    if objects.is_empty() {
+        return Err(CosignError::NotSigned(
+            "no portable Sigstore signature object found".into(),
+        ));
+    }
+    Ok(objects)
+}
+
+fn is_portable_signature_blob(blob: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(blob).is_ok_and(|bundle| {
+        bundle.get("dsseEnvelope").is_some()
+            && bundle
+                .pointer("/verificationMaterial/certificate/rawBytes")
+                .is_some()
+            && bundle
+                .pointer("/verificationMaterial/tlogEntries")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|entries| !entries.is_empty())
+    })
+}
+
+async fn pull_provenance_objects(
+    client: &oci_client::client::Client,
+    source_manifest: &[u8],
+    image_digest: &str,
+    registry: &str,
+    repository: &str,
+    auth: &oci_client::secrets::RegistryAuth,
+    accepted_media_types: &[&str],
+) -> Result<Vec<(Vec<u8>, Vec<Vec<u8>>)>, CosignError> {
+    use oci_client::manifest::OciManifest;
+
+    let source: OciManifest = serde_json::from_slice(source_manifest).map_err(|error| {
+        CosignError::VerificationFailed(format!("invalid source OCI manifest: {error}"))
+    })?;
+    let references = match source {
+        OciManifest::ImageIndex(index) => index
+            .manifests
+            .into_iter()
+            .filter(|descriptor| {
+                descriptor
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.get("vnd.docker.reference.type"))
+                    .is_some_and(|kind| kind == "attestation-manifest")
+            })
+            .map(|descriptor| {
+                oci_client::Reference::with_digest(
+                    registry.to_string(),
+                    repository.to_string(),
+                    descriptor.digest,
+                )
+            })
+            .collect::<Vec<_>>(),
+        OciManifest::Image(_) => vec![oci_client::Reference::with_tag(
+            registry.to_string(),
+            repository.to_string(),
+            digest_to_cosign_tag(image_digest, "att"),
+        )],
+    };
+    if references.is_empty() {
+        return Err(CosignError::VerificationFailed(
+            "source index has no bound provenance manifests".into(),
+        ));
+    }
+    let mut objects = Vec::with_capacity(references.len());
+    for reference in references {
+        let object = pull_oci_object(
+            client,
+            &reference,
+            auth,
+            accepted_media_types,
+            MAX_PROVENANCE_MATERIAL_BYTES,
+        )
+        .await?;
+        if objects.iter().map(oci_object_size).sum::<usize>() + oci_object_size(&object)
+            > MAX_PROVENANCE_MATERIAL_BYTES
+        {
+            return Err(portable_material_too_large());
+        }
+        objects.push(object);
+    }
+    Ok(objects)
+}
+
+async fn pull_oci_object(
+    client: &oci_client::client::Client,
+    reference: &oci_client::Reference,
+    auth: &oci_client::secrets::RegistryAuth,
+    accepted_media_types: &[&str],
+    maximum_bytes: usize,
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), CosignError> {
+    use oci_client::manifest::OciManifest;
+
+    let (raw, _) = client
+        .pull_manifest_raw(reference, auth, accepted_media_types)
+        .await
+        .map_err(|error| CosignError::VerificationFailed(error.to_string()))?;
+    let manifest: OciManifest = serde_json::from_slice(&raw).map_err(|error| {
+        CosignError::VerificationFailed(format!("invalid OCI manifest: {error}"))
+    })?;
+    let OciManifest::Image(manifest) = manifest else {
+        return Err(CosignError::VerificationFailed(
+            "verification object is not an OCI image manifest".into(),
+        ));
+    };
+    let mut total = raw.len();
+    let mut blobs = Vec::with_capacity(manifest.layers.len());
+    for layer in &manifest.layers {
+        let declared_size =
+            usize::try_from(layer.size).map_err(|_| portable_material_too_large())?;
+        if total.saturating_add(declared_size) > maximum_bytes {
+            return Err(portable_material_too_large());
+        }
+        let mut bytes = Vec::new();
+        let mut stream = client
+            .pull_blob_stream(reference, layer)
+            .await
+            .map_err(|error| CosignError::VerificationFailed(error.to_string()))?;
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|error| CosignError::VerificationFailed(error.to_string()))?;
+            extend_bounded(&mut bytes, &chunk, total, maximum_bytes)?;
+        }
+        total += bytes.len();
+        blobs.push(bytes);
+    }
+    Ok((raw.to_vec(), blobs))
+}
+
+fn oci_object_size((manifest, blobs): &(Vec<u8>, Vec<Vec<u8>>)) -> usize {
+    manifest.len() + blobs.iter().map(Vec::len).sum::<usize>()
+}
+
+fn portable_material_too_large() -> CosignError {
+    CosignError::VerificationFailed("portable verification material exceeds v1 limits".into())
+}
+
+fn extend_bounded(
+    bytes: &mut Vec<u8>,
+    chunk: &[u8],
+    previous_bytes: usize,
+    maximum_bytes: usize,
+) -> Result<(), CosignError> {
+    if previous_bytes
+        .saturating_add(bytes.len())
+        .saturating_add(chunk.len())
+        > maximum_bytes
+    {
+        return Err(portable_material_too_large());
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
 }
 
 async fn fetch_attestation_tag(
@@ -811,6 +1125,27 @@ mod tests {
             parse_image_parts("user/repo:tag").unwrap(),
             ("docker.io".to_string(), "user/repo".to_string())
         );
+        assert_eq!(
+            parse_image_parts("registry.example:5000/org/repo:tag").unwrap(),
+            ("registry.example:5000".to_string(), "org/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn portable_signature_blobs_require_bundle_material() {
+        assert!(!is_portable_signature_blob(
+            br#"{"critical":{"image":{"docker-manifest-digest":"sha256:00"}}}"#
+        ));
+        assert!(is_portable_signature_blob(
+            br#"{"dsseEnvelope":{},"verificationMaterial":{"certificate":{"rawBytes":"AA=="},"tlogEntries":[{}]}}"#
+        ));
+    }
+
+    #[test]
+    fn portable_blob_buffer_stops_at_limit() {
+        let mut bytes = vec![1; 2];
+        extend_bounded(&mut bytes, &[2, 3], 1, 5).unwrap();
+        assert!(extend_bounded(&mut bytes, &[4], 1, 5).is_err());
     }
 
     #[test]

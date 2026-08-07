@@ -21,6 +21,37 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn parse_fail_closed_switch(name: &str, value: Option<&str>) -> anyhow::Result<bool> {
+    match value {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => anyhow::bail!("{name} must be exactly `true` or `false`"),
+    }
+}
+
+fn load_deployment_dispatch_enabled() -> anyhow::Result<bool> {
+    let value = match std::env::var("CAP_DEPLOYMENT_DISPATCH_ENABLED") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("CAP_DEPLOYMENT_DISPATCH_ENABLED must be valid UTF-8")
+        }
+    };
+    parse_fail_closed_switch("CAP_DEPLOYMENT_DISPATCH_ENABLED", value.as_deref())
+}
+
+fn validate_edge_reconciliation_mode(
+    deployment_dispatch_enabled: bool,
+    edge_reconciliation_disabled: bool,
+) -> anyhow::Result<()> {
+    if deployment_dispatch_enabled && edge_reconciliation_disabled {
+        anyhow::bail!(
+            "CAP_DISABLE_EDGE_RECONCILIATION cannot be enabled while deployment dispatch is enabled"
+        );
+    }
+    Ok(())
+}
+
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -128,6 +159,9 @@ fn build_tenant_tee_http_client_with_env(
                     matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES")
                 }),
         )
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
         .https_only(true);
 
     if let Some(cert_pem) = lookup("TENANT_TEE_CA_CERT_PEM") {
@@ -410,6 +444,7 @@ fn load_attestation_config(
         "TLS_CERTIFICATE_BROKER_URL",
         trustee_policy_read_available && caddy_tls_mode == CaddyTlsMode::Dns01Broker,
     )?;
+    let amd_kds_base_url = load_url_env("AMD_KDS_BASE_URL", true)?;
     let trustee_policy_url = load_url_env("TRUSTEE_POLICY_URL", trustee_policy_read_available)?;
     let release_pubkey =
         platform_release.map(|release| release.signing_service_pubkey_hex.as_str());
@@ -432,11 +467,13 @@ fn load_attestation_config(
         trustee_policy_read_available,
         workload_artifacts_url,
         tls_certificate_broker_url,
+        amd_kds_base_url,
         trustee_policy_url,
         local_workload_artifacts_json: None,
         local_trustee_policy_json: None,
         platform_trustee_policy_pubkey_hex,
         signing_service_pubkey_hex,
+        verification_material: None,
     }
     .into())
 }
@@ -469,6 +506,8 @@ fn load_dns_config() -> anyhow::Result<Option<DnsConfig>> {
 
     Ok(Some(DnsConfig {
         cloudflare_api_token,
+        cloudflare_api_base_url: std::env::var("CLOUDFLARE_API_BASE_URL")
+            .unwrap_or_else(|_| "https://api.cloudflare.com/client/v4".to_string()),
         cloudflare_zone_id: std::env::var("CLOUDFLARE_ZONE_ID")
             .ok()
             .filter(|v| !v.trim().is_empty()),
@@ -547,6 +586,20 @@ async fn main() {
 
     if let Err(e) = enclava_api::env_gates::enforce_production_env_gates() {
         eprintln!("startup refused: {e}");
+        std::process::exit(1);
+    }
+    let deployment_dispatch_enabled = match load_deployment_dispatch_enabled() {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            eprintln!("startup refused: invalid deployment dispatch configuration: {error}");
+            std::process::exit(1);
+        }
+    };
+    let edge_reconciliation_disabled = env_flag("CAP_DISABLE_EDGE_RECONCILIATION");
+    if let Err(error) =
+        validate_edge_reconciliation_mode(deployment_dispatch_enabled, edge_reconciliation_disabled)
+    {
+        eprintln!("startup refused: invalid edge reconciliation configuration: {error}");
         std::process::exit(1);
     }
 
@@ -749,9 +802,12 @@ async fn main() {
     let trustee_http_client =
         build_trustee_http_client().expect("failed to build Trustee HTTP client");
 
+    let side_effect_admission = enclava_api::state::side_effect_admission_for_pool(&pool);
     let state = AppState {
         db: pool,
         management_mode,
+        deployment_dispatch_enabled,
+        startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         signing_key: Arc::new(signing_key),
         hmac_key: Arc::new(hmac_key),
         api_url,
@@ -772,23 +828,53 @@ async fn main() {
         signing_service,
         require_customer_signed_policy_artifact,
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_applies)),
+        side_effect_admission,
         internal_auth,
     };
 
-    let app = build_router(state);
-
+    let app = build_router(state.clone());
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .expect("failed to bind");
-    tracing::info!("listening on {}", bind_addr);
+    tracing::info!("startup liveness listening on {}", bind_addr);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .expect("server error");
+    if let Err(error) = enclava_api::kbs::reconcile_signed_policy_at_startup(&state).await {
+        eprintln!("startup refused: KBS policy reconciliation failed: {error}");
+        std::process::exit(1);
+    }
+    if edge_reconciliation_disabled {
+        tracing::warn!("tenant HAProxy reconciliation disabled for local development");
+    } else {
+        if let Err(error) = enclava_api::edge::reconcile_all_haproxy_routes_at_startup(&state).await
+        {
+            eprintln!("startup refused: HAProxy route reconciliation failed: {error}");
+            std::process::exit(1);
+        }
+        enclava_api::edge::spawn_haproxy_reconciler(state.clone());
+    }
+    enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
+    if deployment_dispatch_enabled {
+        enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
+    } else {
+        tracing::info!(
+            "workload mutation and durable deployment dispatch are disabled by CAP_DEPLOYMENT_DISPATCH_ENABLED"
+        );
+    }
+    state.mark_startup_ready();
+    tracing::info!("startup reconciliation complete; API is ready");
+
+    server
+        .await
+        .expect("server task panicked")
+        .expect("server error");
 }
 
 #[cfg(test)]
@@ -808,6 +894,57 @@ mod tests {
             main_body.contains(expected),
             "API startup must install a rustls CryptoProvider before building ACME/HTTP clients"
         );
+    }
+
+    #[test]
+    fn deployment_dispatch_switch_is_strict_and_fail_closed() {
+        assert!(!parse_fail_closed_switch("SWITCH", None).unwrap());
+        assert!(!parse_fail_closed_switch("SWITCH", Some("false")).unwrap());
+        assert!(parse_fail_closed_switch("SWITCH", Some("true")).unwrap());
+        for invalid in ["", "1", "TRUE", "yes", " true", "false "] {
+            assert!(
+                parse_fail_closed_switch("SWITCH", Some(invalid)).is_err(),
+                "{invalid:?} must not activate dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_reconciliation_can_only_be_disabled_without_dispatch() {
+        validate_edge_reconciliation_mode(false, false).unwrap();
+        validate_edge_reconciliation_mode(true, false).unwrap();
+        validate_edge_reconciliation_mode(false, true).unwrap();
+        assert!(validate_edge_reconciliation_mode(true, true).is_err());
+    }
+
+    #[test]
+    fn kbs_and_edge_authority_converge_before_dispatch_and_readiness() {
+        let source = include_str!("main.rs");
+        let main_body = source
+            .split("#[tokio::main]")
+            .nth(1)
+            .and_then(|body| body.split("#[cfg(test)]").next())
+            .expect("main body");
+        let kbs = main_body
+            .find("reconcile_signed_policy_at_startup")
+            .expect("startup KBS reconciliation");
+        let edge = main_body
+            .find("reconcile_all_haproxy_routes_at_startup")
+            .expect("startup edge reconciliation");
+        let local_disable = main_body
+            .find("CAP_DISABLE_EDGE_RECONCILIATION")
+            .expect("explicit local-only edge disable");
+        let dispatch = main_body
+            .find("spawn_deployment_dispatcher")
+            .expect("deployment dispatcher");
+        let ready = main_body
+            .find("mark_startup_ready")
+            .expect("readiness gate");
+        assert!(
+            !main_body[..edge].contains("config.required"),
+            "configured KBS management must never bypass the startup barrier"
+        );
+        assert!(kbs < edge && local_disable < edge && edge < dispatch && dispatch < ready);
     }
 
     #[test]

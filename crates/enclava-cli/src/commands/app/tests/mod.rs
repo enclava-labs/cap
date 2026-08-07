@@ -90,6 +90,91 @@ fn test_deployment_context() -> DeploymentContextResponse {
 }
 
 #[test]
+fn create_unlock_mode_validation_rejects_auto_with_workaround() {
+    // auto is a post-claim transition (via `auto-unlock enable`), never a first-deploy
+    // mode — there is no owner seed to seal at create time.
+    let err = validate_create_unlock_mode("auto").unwrap_err();
+    assert!(
+        err.contains("auto-unlock enable"),
+        "error should name the workaround: {err}",
+    );
+    assert!(validate_create_unlock_mode("password").is_ok());
+}
+
+#[test]
+fn optional_app_name_uses_loaded_config() {
+    let app_name = optional_app_name_from_config_result(Ok(test_app_config()))
+        .expect("valid config")
+        .expect("app name");
+    assert_eq!(app_name, "demo");
+}
+
+#[test]
+fn optional_app_name_suppresses_only_missing_enclava_toml() {
+    let app_name = optional_app_name_from_config_result(Err(AppConfigError::ReadFile {
+        path: "/tmp/project/enclava.toml".to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+    }))
+    .expect("a genuinely missing enclava.toml enables org scope");
+    assert_eq!(app_name, None);
+
+    let current_dir_error = optional_app_name_from_config_result(Err(AppConfigError::ReadFile {
+        path: ".".to_string(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "cwd unavailable"),
+    }))
+    .expect_err("current-directory errors must not be hidden");
+    assert!(matches!(current_dir_error, AppConfigError::ReadFile { .. }));
+}
+
+#[test]
+fn optional_app_name_propagates_malformed_and_invalid_config() {
+    let parse_error = optional_app_name_from_config_result(AppConfig::parse("["))
+        .expect_err("malformed enclava.toml must fail closed");
+    assert!(matches!(parse_error, AppConfigError::Parse(_)));
+
+    let validation_error = optional_app_name_from_config_result(Err(AppConfigError::Validation(
+        "invalid app config".to_string(),
+    )))
+    .expect_err("invalid enclava.toml must fail closed");
+    assert!(matches!(validation_error, AppConfigError::Validation(_)));
+}
+
+#[test]
+fn manual_deploy_keyring_always_checks_remote_state() {
+    let source = include_str!("../signing.rs");
+    let body = source
+        .split("pub(crate) async fn ensure_manual_deploy_keyring")
+        .nth(1)
+        .unwrap()
+        .split("fn render_trustee_policy")
+        .next()
+        .unwrap();
+    let local_check = body.find("verify_keyring").unwrap();
+    let remote_check = body.find("api.get_org_keyring").unwrap();
+
+    assert!(local_check < remote_check);
+    assert!(!body[local_check..remote_check].contains("return Ok"));
+}
+
+#[test]
+fn manual_deploy_keyring_always_bootstraps_the_signing_service() {
+    let source = include_str!("../signing.rs");
+    let body = source
+        .split("pub(crate) async fn ensure_manual_deploy_keyring")
+        .nth(1)
+        .unwrap()
+        .split("fn render_trustee_policy")
+        .next()
+        .unwrap();
+
+    assert_eq!(body.matches(".bootstrap_signing_service_owner").count(), 1);
+    assert!(
+        body.find(".bootstrap_signing_service_owner").unwrap()
+            > body.find("match api.get_org_keyring").unwrap()
+    );
+}
+
+#[test]
 fn deployment_context_platform_release_is_verified_and_selected() {
     let envelope = PlatformReleaseEnvelope {
         payload: test_release(),
@@ -441,10 +526,169 @@ fn deploy_runtime_wait_falls_back_to_attested_tee_status() {
     let status = body
         .find("status_json")
         .expect("runtime wait must read direct TEE status");
+    let poll_loop = body.find("loop {").expect("runtime wait must poll");
     assert!(
-        endpoint < tee && tee < attest && attest < status && body.contains("tee_unlock_state"),
-        "deploy runtime wait must not depend only on API status when the direct TEE status is available"
+        poll_loop < endpoint
+            && endpoint < tee
+            && tee < attest
+            && attest < status
+            && body.contains("tee_unlock_state"),
+        "deploy runtime wait must refresh and attest the direct TEE endpoint while polling"
     );
+    assert!(
+        body.contains("observation_is_fresh")
+            && body.contains("if observation_is_fresh && target.accepts_api_status")
+            && body.contains("pod_phase_is_verified")
+            && body
+                .contains("observation.deployment_id.as_deref() == Some(expected_deployment_id)")
+            && body.contains("observation.state == \"fresh\"")
+            && body.contains("direct_tee_allowed")
+            && body.contains("status.status != \"failed\""),
+        "new observations must be fresh and deployment-bound while legacy responses without observation remain compatible"
+    );
+}
+
+fn deploy_observation(
+    state: &str,
+    reason: Option<&str>,
+    deployment_id: Option<&str>,
+    drifted: bool,
+) -> AppStatusObservation {
+    AppStatusObservation {
+        state: state.to_string(),
+        reason: reason.map(str::to_string),
+        observed_at: None,
+        last_reconciliation_attempted_at: None,
+        last_successful_reconciled_at: None,
+        deployment_id: deployment_id.map(str::to_string),
+        status: None,
+        drifted,
+    }
+}
+
+#[test]
+fn deploy_runtime_direct_tee_fallback_accepts_matching_partial_observation() {
+    let expected_deployment_id = "22222222-2222-2222-2222-222222222222";
+    for reason in [
+        "tee_unavailable",
+        "tee_malformed",
+        "tee_evidence_incomplete",
+    ] {
+        let observation =
+            deploy_observation("partial", Some(reason), Some(expected_deployment_id), false);
+
+        assert!(observation_allows_direct_tee_fallback(
+            Some(&observation),
+            expected_deployment_id
+        ));
+        assert!(!observation_is_fresh_for_deployment(
+            Some(&observation),
+            expected_deployment_id
+        ));
+    }
+}
+
+#[test]
+fn deploy_runtime_direct_tee_fallback_rejects_pod_gaps_wrong_or_drifted_deployment() {
+    let expected_deployment_id = "22222222-2222-2222-2222-222222222222";
+    let wrong = deploy_observation(
+        "partial",
+        Some("tee_unavailable"),
+        Some("33333333-3333-3333-3333-333333333333"),
+        false,
+    );
+    let drifted = deploy_observation(
+        "partial",
+        Some("tee_unavailable"),
+        Some(expected_deployment_id),
+        true,
+    );
+
+    assert!(!observation_allows_direct_tee_fallback(
+        Some(&wrong),
+        expected_deployment_id
+    ));
+    assert!(!observation_allows_direct_tee_fallback(
+        Some(&drifted),
+        expected_deployment_id
+    ));
+
+    for reason in [
+        None,
+        Some("pod_evidence_incomplete"),
+        Some("evidence_mismatch"),
+        Some("not_observed"),
+    ] {
+        let observation =
+            deploy_observation("partial", reason, Some(expected_deployment_id), false);
+        assert!(
+            !observation_allows_direct_tee_fallback(Some(&observation), expected_deployment_id),
+            "partial observation reason {reason:?} must retain the pod-evidence fence"
+        );
+    }
+}
+
+#[test]
+fn deploy_config_retries_only_locked_tee_responses() {
+    assert!(should_retry_deploy_config(&TeeError::Tee {
+        status: 423,
+        message: "init_not_ready".to_string()
+    }));
+    assert!(!should_retry_deploy_config(&TeeError::Tee {
+        status: 401,
+        message: "unauthorized".to_string()
+    }));
+}
+
+#[test]
+fn direct_tee_status_prefers_current_unlock_state() {
+    let status = serde_json::json!({
+        "state": "unlocked",
+        "unlock_state": "error",
+        "ownership_state": "locked"
+    });
+
+    assert_eq!(tee_unlock_state(&status), "error");
+}
+
+#[test]
+fn direct_tee_status_accepts_matching_or_omitted_supplemental_fields() {
+    for status in [
+        serde_json::json!({
+            "unlock_state": "unlocked",
+            "pod_status": "Running",
+            "tee_status": "READY",
+            "storage_status": "Unlocked"
+        }),
+        serde_json::json!({
+            "state": "locked",
+            "tee_status": "ready",
+            "storage_status": "locked"
+        }),
+        serde_json::json!({"state": "unlocked"}),
+        serde_json::json!({
+            "state": "unlocked",
+            "tee_status": null,
+            "storage_status": null
+        }),
+    ] {
+        assert!(tee_supplemental_fields_are_consistent(&status), "{status}");
+    }
+}
+
+#[test]
+fn direct_tee_status_rejects_errors_mismatches_and_malformed_fields() {
+    for status in [
+        serde_json::json!({"state": "unlocked", "tee_status": "error"}),
+        serde_json::json!({"state": "unlocked", "storage_status": "error"}),
+        serde_json::json!({"state": "locked", "storage_status": "unlocked"}),
+        serde_json::json!({"state": "unlocked", "pod_status": "Pending"}),
+        serde_json::json!({"state": "unlocked", "pod_status": 1}),
+        serde_json::json!({"state": "unlocked", "tee_status": 1}),
+        serde_json::json!({"state": "unlocked", "storage_status": ["unlocked"]}),
+    ] {
+        assert!(!tee_supplemental_fields_are_consistent(&status), "{status}");
+    }
 }
 
 #[test]
@@ -955,7 +1199,7 @@ fn deploy_config_push_attests_before_setting_values() {
         .find("attest_receipt_key")
         .expect("deploy config push must attest the TEE TLS leaf");
     let set = body
-        .find("config_set")
+        .find("set_deploy_config")
         .expect("deploy config push must set config values");
     assert!(
         attest < set,
@@ -1034,4 +1278,80 @@ fn storage_password_file_trims_newlines_and_rejects_empty() {
             .to_string()
             .contains("is empty")
     );
+}
+
+#[tokio::test]
+async fn list_org_log_keys_hits_org_endpoint() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = serde_json::json!({ "keys": [] }).to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let list = api.list_org_log_keys().await.unwrap();
+    let request = handle.join().unwrap();
+
+    assert!(request.starts_with("GET /log-keys "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert!(list.keys.is_empty());
+}
+
+#[tokio::test]
+async fn revoke_org_log_key_hits_org_endpoint() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = serde_json::json!({
+            "key_id": "team-logs",
+            "status": "revoked",
+            "revoked_at": "2026-07-15T00:00:00Z",
+            "cleared_app_selections": 2
+        })
+        .to_string();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let resp = api.revoke_org_log_key("team-logs").await.unwrap();
+    let request = handle.join().unwrap();
+
+    assert!(request.starts_with("DELETE /log-keys/team-logs "));
+    assert!(request.contains("authorization: Bearer test-token"));
+    assert_eq!(resp.key_id, "team-logs");
+    assert_eq!(resp.status, "revoked");
+    assert_eq!(resp.cleared_app_selections, Some(2));
 }

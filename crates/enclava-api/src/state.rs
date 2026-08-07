@@ -9,7 +9,10 @@ use enclava_engine::types::AttestationConfig;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
@@ -144,12 +147,34 @@ fn hash_token(token: &[u8]) -> [u8; 32] {
     out
 }
 
+const RESERVED_POOL_CONNECTIONS: usize = 2;
+const MAX_CONCURRENT_SIDE_EFFECTS: usize = 8;
+
+/// Bound all transactions that enter an advisory authority lane before they
+/// acquire a database connection. Reserving pool headroom lets lease
+/// heartbeats, ownership checks, and ordinary reads make progress even when
+/// every admitted mutation is stalled on an external provider.
+pub fn side_effect_admission_limit(pool: &PgPool) -> usize {
+    let max_connections = pool.options().get_max_connections() as usize;
+    max_connections
+        .saturating_sub(RESERVED_POOL_CONNECTIONS)
+        .clamp(1, MAX_CONCURRENT_SIDE_EFFECTS)
+}
+
+pub fn side_effect_admission_for_pool(pool: &PgPool) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(side_effect_admission_limit(pool)))
+}
+
 /// Shared application state accessible from all axum handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
     /// Instance-level management ownership mode.
     pub management_mode: CapManagementMode,
+    /// Immutable process-lifetime workload admission decision.
+    pub deployment_dispatch_enabled: bool,
+    /// False until startup provider reconciliation has completed.
+    pub startup_ready: Arc<AtomicBool>,
     /// Ed25519 signing key for config JWTs.
     pub signing_key: Arc<SigningKey>,
     /// HMAC key for session JWT signing.
@@ -202,12 +227,31 @@ pub struct AppState {
     /// deployment starts a Kata VM and attaches Longhorn volumes; bursts can
     /// overwhelm a single worker node before Kubernetes has useful feedback.
     pub deployment_apply_permits: Arc<Semaphore>,
+    /// Admission is acquired before opening any transaction that will enter
+    /// an entitlement/signing/app advisory lane. Waiters therefore consume no
+    /// PostgreSQL connection, preserving reserved headroom for heartbeats and
+    /// ownership fencing.
+    pub side_effect_admission: Arc<Semaphore>,
     /// PaaS-only internal route authentication configuration. When unset or
     /// incomplete, `/internal/*` routes fail closed.
     pub internal_auth: Option<InternalAuthConfig>,
 }
 
 impl AppState {
+    pub fn startup_is_ready(&self) -> bool {
+        self.startup_ready.load(Ordering::Acquire)
+    }
+
+    pub fn mark_startup_ready(&self) {
+        self.startup_ready.store(true, Ordering::Release);
+    }
+
+    pub async fn admit_side_effect(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.side_effect_admission.clone().acquire_owned().await
+    }
+
     pub fn dashboard_url(&self) -> Option<&str> {
         self.dashboard_url.as_deref()
     }
@@ -220,6 +264,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
 
     #[test]
     fn internal_auth_can_require_trusted_proxy_secret() {
@@ -233,5 +278,19 @@ mod tests {
         assert!(config.accepts_trusted_proxy_secret("proxy-secret"));
         assert!(!config.accepts_trusted_proxy_secret("wrong-secret"));
         assert!(config.is_usable());
+    }
+
+    #[tokio::test]
+    async fn side_effect_admission_reserves_pool_headroom_before_lane_entry() {
+        let pool = |max_connections| {
+            PgPoolOptions::new()
+                .max_connections(max_connections)
+                .connect_lazy("postgresql://test:test@localhost:5432/test")
+                .expect("lazy test pool")
+        };
+        assert_eq!(side_effect_admission_limit(&pool(2)), 1);
+        assert_eq!(side_effect_admission_limit(&pool(3)), 1);
+        assert_eq!(side_effect_admission_limit(&pool(4)), 2);
+        assert_eq!(side_effect_admission_limit(&pool(20)), 8);
     }
 }

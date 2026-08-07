@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicI32, AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -17,6 +17,7 @@ use chrono::{SecondsFormat, Utc};
 use enclava_common::log_encryption::{
     LogEncryptionPublicKey, LogFrameContext, encrypt_log_frame, validate_public_key,
 };
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 
 const DEFAULT_STARTED_DIR: &str = "/run/enclava/containers";
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
@@ -24,6 +25,14 @@ const DEFAULT_STARTUP: &str = "/startup/startup.sh";
 const DEFAULT_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
 const STARTED_DIR_MODE: u32 = 0o2770;
 const O_NOFOLLOW: i32 = 0o400000;
+const TERMINATION_SIGNALS: [Signal; 4] = [
+    Signal::SIGHUP,
+    Signal::SIGINT,
+    Signal::SIGQUIT,
+    Signal::SIGTERM,
+];
+static CHILD_PID: AtomicI32 = AtomicI32::new(0);
+static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 fn main() {
     if let Err(err) = run(env::args_os().skip(1).collect()) {
@@ -132,6 +141,7 @@ fn run_with_encrypted_logs(
     args: Vec<OsString>,
     logs: EncryptedLogConfig,
 ) -> Result<i32, String> {
+    install_signal_forwarding()?;
     let spool = open_log_spool(&logs.spool_path)?;
     let spool = Arc::new(Mutex::new(spool));
     let sequence = Arc::new(AtomicU64::new(1));
@@ -147,6 +157,12 @@ fn run_with_encrypted_logs(
                 PathBuf::from(&program).display()
             )
         })?;
+    let child_pid = i32::try_from(child.id()).map_err(|_| "child PID exceeds i32".to_string())?;
+    CHILD_PID.store(child_pid, Ordering::Release);
+    let pending = PENDING_SIGNAL.swap(0, Ordering::AcqRel);
+    if pending != 0 {
+        forward_signal_to_child(child_pid, pending);
+    }
 
     let stdout = child
         .stdout
@@ -174,6 +190,7 @@ fn run_with_encrypted_logs(
     let status = child
         .wait()
         .map_err(|err| format!("failed to wait for encrypted log child: {err}"))?;
+    CHILD_PID.store(0, Ordering::Release);
     for result in [stdout_thread.join(), stderr_thread.join()] {
         match result {
             Ok(Ok(())) => {}
@@ -182,6 +199,36 @@ fn run_with_encrypted_logs(
         }
     }
     Ok(status.code().unwrap_or(1))
+}
+
+fn install_signal_forwarding() -> Result<(), String> {
+    let action = SigAction::new(
+        SigHandler::Handler(handle_termination_signal),
+        SaFlags::SA_RESTART,
+        SigSet::empty(),
+    );
+    for signal in TERMINATION_SIGNALS {
+        // SAFETY: the handler only performs lock-free atomic operations and kill(2).
+        unsafe { sigaction(signal, &action) }
+            .map_err(|err| format!("failed to register {signal:?} handler: {err}"))?;
+    }
+    Ok(())
+}
+
+extern "C" fn handle_termination_signal(signal: i32) {
+    let child_pid = CHILD_PID.load(Ordering::Acquire);
+    if child_pid == 0 {
+        PENDING_SIGNAL.store(signal, Ordering::Release);
+    } else {
+        forward_signal_to_child(child_pid, signal);
+    }
+}
+
+fn forward_signal_to_child(child_pid: i32, signal: i32) {
+    // SAFETY: kill(2) is async-signal-safe and child_pid is a spawned child process.
+    unsafe {
+        nix::libc::kill(child_pid, signal);
+    }
 }
 
 fn open_log_spool(path: &Path) -> Result<File, String> {

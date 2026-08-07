@@ -414,7 +414,7 @@ pub(super) fn bind_mount_plan_for_workload(
     workload: &WorkloadNamespace,
 ) -> Result<Vec<NamespaceBindMount>> {
     let mut mounts = Vec::new();
-    if workload.name != "tenant-ingress" {
+    if workload.name != "tenant-ingress" && workload.name != "attestation-proxy" {
         for bind in &cfg.app_bind_mounts {
             mounts.push(NamespaceBindMount {
                 source: namespace_source(

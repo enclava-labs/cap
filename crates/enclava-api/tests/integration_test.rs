@@ -1,17 +1,26 @@
 //! Integration tests for API routes using testcontainers.
 
-use axum::http::StatusCode;
+use axum::{
+    Json as AxumJson, Router, extract::State as AxumState, http::StatusCode, routing::post,
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{Duration, Utc};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use enclava_api::{
     auth::jwt::issue_session_token,
+    deploy::DeploymentApplySnapshot,
+    deployment_jobs::{DeploymentApplyJobPayload, insert_setup_job},
+    models::{App, AppContainer, AppResources},
+    signing_service::{AgentPolicyResponse, PolicyMetadata, SignedPolicyArtifact},
     state::{AppState, CapManagementMode, InternalAuthConfig},
     test_router,
 };
 use enclava_common::{
+    canonical::{ce_v1_bytes, ce_v1_hash},
     descriptor::{
         Capabilities, DeploymentDescriptor, EnvVar, OciRuntimeSpec, Port, Resources,
-        SecurityContext, Sidecars, SignerIdentity,
+        SecurityContext, Sidecars, SignerIdentity, descriptor_canonical_bytes,
+        descriptor_core_hash,
     },
     image::ImageRef,
 };
@@ -22,6 +31,110 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::sync::Arc;
 use uuid::Uuid;
+
+const TEST_KBS_POLICY: &str = "package policy\n\ndefault allow := false\n";
+const TEST_AGENT_POLICY: &str = "package agent_policy\n\ndefault CreateContainerRequest := true\n";
+const TEST_GENPOLICY_PIN: &str = "kata-containers/genpolicy@3.28.0+test";
+
+#[derive(Clone)]
+struct TestPolicyService {
+    signing_key: Arc<SigningKey>,
+}
+
+async fn test_agent_policy() -> AxumJson<AgentPolicyResponse> {
+    AxumJson(AgentPolicyResponse {
+        agent_policy_text: TEST_AGENT_POLICY.to_string(),
+        agent_policy_sha256: hex::encode(Sha256::digest(TEST_AGENT_POLICY.as_bytes())),
+        genpolicy_version_pin: TEST_GENPOLICY_PIN.to_string(),
+        log_encryption: None,
+    })
+}
+
+async fn test_sign_policy(
+    AxumState(service): AxumState<TestPolicyService>,
+    AxumJson(request): AxumJson<Value>,
+) -> AxumJson<SignedPolicyArtifact> {
+    let descriptor_envelope: Value = serde_json::from_str(
+        request["customer_descriptor_blob"]
+            .as_str()
+            .expect("customer descriptor blob"),
+    )
+    .expect("descriptor envelope JSON");
+    let descriptor: DeploymentDescriptor =
+        serde_json::from_value(descriptor_envelope["descriptor"].clone())
+            .expect("deployment descriptor");
+    let descriptor_signing_pubkey = descriptor_envelope["signing_pubkey"]
+        .as_str()
+        .expect("descriptor signing pubkey");
+    let rego_hash: [u8; 32] = Sha256::digest(TEST_KBS_POLICY.as_bytes()).into();
+    let agent_policy_hash: [u8; 32] = Sha256::digest(TEST_AGENT_POLICY.as_bytes()).into();
+    let metadata = PolicyMetadata {
+        app_id: descriptor.app_id.to_string(),
+        deploy_id: descriptor.deploy_id.to_string(),
+        descriptor_core_hash: hex::encode(descriptor_core_hash(&descriptor)),
+        descriptor_signing_pubkey: descriptor_signing_pubkey.to_string(),
+        platform_release_version: descriptor.platform_release_version.clone(),
+        policy_template_id: descriptor.policy_template_id.clone(),
+        policy_template_sha256: hex::encode(descriptor.policy_template_sha256),
+        agent_policy_sha256: hex::encode(agent_policy_hash),
+        genpolicy_version_pin: TEST_GENPOLICY_PIN.to_string(),
+        signed_at: "2026-07-15T00:00:00+00:00".to_string(),
+        key_id: "test-policy-key-v1".to_string(),
+    };
+    let metadata_hash = test_policy_metadata_hash(&metadata);
+    let signing_input = ce_v1_bytes(&[
+        ("purpose", b"enclava-policy-artifact-v1"),
+        ("metadata", &metadata_hash),
+        ("rego_sha256", &rego_hash),
+    ]);
+
+    AxumJson(SignedPolicyArtifact {
+        metadata,
+        rego_text: TEST_KBS_POLICY.to_string(),
+        rego_sha256: hex::encode(rego_hash),
+        agent_policy_text: TEST_AGENT_POLICY.to_string(),
+        agent_policy_sha256: hex::encode(agent_policy_hash),
+        signature: hex::encode(service.signing_key.sign(&signing_input).to_bytes()),
+        verify_pubkey_b64: B64.encode(service.signing_key.verifying_key().to_bytes()),
+        org_keyring: None,
+    })
+}
+
+fn test_policy_metadata_hash(metadata: &PolicyMetadata) -> [u8; 32] {
+    let app_id = Uuid::parse_str(&metadata.app_id).expect("metadata app id");
+    let deploy_id = Uuid::parse_str(&metadata.deploy_id).expect("metadata deploy id");
+    let descriptor_core_hash =
+        hex::decode(&metadata.descriptor_core_hash).expect("descriptor core hash");
+    let descriptor_signing_pubkey =
+        hex::decode(&metadata.descriptor_signing_pubkey).expect("descriptor signing pubkey");
+    let policy_template_sha256 =
+        hex::decode(&metadata.policy_template_sha256).expect("policy template hash");
+    let agent_policy_sha256 =
+        hex::decode(&metadata.agent_policy_sha256).expect("agent policy hash");
+
+    ce_v1_hash(&[
+        ("app_id", app_id.as_bytes().as_slice()),
+        ("deploy_id", deploy_id.as_bytes().as_slice()),
+        ("descriptor_core_hash", descriptor_core_hash.as_slice()),
+        (
+            "descriptor_signing_pubkey",
+            descriptor_signing_pubkey.as_slice(),
+        ),
+        (
+            "platform_release_version",
+            metadata.platform_release_version.as_bytes(),
+        ),
+        ("policy_template_id", metadata.policy_template_id.as_bytes()),
+        ("policy_template_sha256", policy_template_sha256.as_slice()),
+        ("agent_policy_sha256", agent_policy_sha256.as_slice()),
+        (
+            "genpolicy_version_pin",
+            metadata.genpolicy_version_pin.as_bytes(),
+        ),
+        ("signed_at", metadata.signed_at.as_bytes()),
+        ("key_id", metadata.key_id.as_bytes()),
+    ])
+}
 
 async fn setup_test_db() -> PgPool {
     let database_url = std::env::var("DATABASE_URL")
@@ -50,9 +163,12 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
         );
     }
 
+    let side_effect_admission = enclava_api::state::side_effect_admission_for_pool(&pool);
     let state = AppState {
         db: pool.clone(),
         management_mode,
+        deployment_dispatch_enabled: true,
+        startup_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         signing_key,
         hmac_key,
         api_url: "http://localhost:3000".to_string(),
@@ -81,11 +197,13 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
             trustee_policy_read_available: false,
             workload_artifacts_url: None,
             tls_certificate_broker_url: None,
+            amd_kds_base_url: None,
             trustee_policy_url: None,
             local_workload_artifacts_json: None,
             local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
+            verification_material: None,
         }),
         platform_release_envelope: None,
         dns: None,
@@ -96,6 +214,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
         signing_service: None,
         require_customer_signed_policy_artifact: false,
         deployment_apply_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        side_effect_admission,
         internal_auth: Some(InternalAuthConfig::from_plaintext_tokens(
             &["cap-internal-current", "cap-internal-next"],
             &["spiffe://paas.example.test/enclava-paas"],
@@ -185,30 +304,52 @@ fn generic_deployment_body(
     })
 }
 
-async fn persisted_app_source(pool: &PgPool, org_id: Uuid, app_name: &str) -> (String, String) {
-    sqlx::query_as::<_, (String, String)>(
-        "SELECT source_provider, source_repository
-           FROM apps
+async fn persisted_app_snapshot(pool: &PgPool, org_id: Uuid, app_name: &str) -> Option<Value> {
+    sqlx::query_scalar::<_, Value>(
+        "SELECT to_jsonb(a)
+           FROM apps a
           WHERE org_id = $1 AND name = $2",
     )
     .bind(org_id)
     .bind(app_name)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
-    .expect("persisted app source")
+    .expect("persisted app snapshot")
 }
 
-async fn persisted_app_egress(pool: &PgPool, org_id: Uuid, app_name: &str) -> Value {
-    sqlx::query_scalar::<_, Value>(
-        "SELECT egress_allowlist
+async fn app_deployment_rows_snapshot(pool: &PgPool, app_id: Uuid) -> (Value, Value) {
+    let containers = sqlx::query_scalar::<_, Value>(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY c.id), '[]'::jsonb)
+           FROM app_containers c
+          WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(pool)
+    .await
+    .expect("app container snapshot");
+    let deployments = sqlx::query_scalar::<_, Value>(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(d) ORDER BY d.id), '[]'::jsonb)
+           FROM deployments d
+          WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(pool)
+    .await
+    .expect("deployment snapshot");
+    (containers, deployments)
+}
+
+async fn persisted_app_id(pool: &PgPool, org_id: Uuid, app_name: &str) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id
            FROM apps
           WHERE org_id = $1 AND name = $2",
     )
     .bind(org_id)
     .bind(app_name)
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
-    .expect("persisted app egress allowlist")
+    .expect("persisted app id")
 }
 
 async fn bootstrap_paas_internal_org(
@@ -271,6 +412,175 @@ fn github_signer_subject() -> &'static str {
 
 fn github_signer_issuer() -> &'static str {
     "https://token.actions.githubusercontent.com"
+}
+
+fn signed_deployment_descriptor(
+    app: &enclava_api::models::App,
+    image: &str,
+    api_signing_pubkey: &str,
+) -> DeploymentDescriptor {
+    DeploymentDescriptor {
+        schema_version: "v1".to_string(),
+        org_id: app.org_id,
+        org_slug: app.tenant_id.clone(),
+        app_id: app.id,
+        app_name: app.name.clone(),
+        deploy_id: Uuid::new_v4(),
+        created_at: Utc::now(),
+        nonce: [7; 32],
+        app_domain: app.domain.clone(),
+        tee_domain: app.tee_domain.clone().unwrap_or_else(|| app.domain.clone()),
+        custom_domains: vec![],
+        namespace: app.namespace.clone(),
+        service_account: app.service_account.clone(),
+        identity_hash: hex::decode(&app.tenant_instance_identity_hash)
+            .expect("identity hash hex")
+            .try_into()
+            .expect("identity hash length"),
+        image_ref: image.to_string(),
+        image_digest: image
+            .split_once('@')
+            .expect("digest-pinned test image")
+            .1
+            .to_string(),
+        signer_identity: SignerIdentity {
+            subject: app
+                .signer_identity_subject
+                .clone()
+                .expect("test app signer subject"),
+            issuer: app
+                .signer_identity_issuer
+                .clone()
+                .expect("test app signer issuer"),
+        },
+        oci_runtime_spec: OciRuntimeSpec {
+            command: vec![enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH.to_string()],
+            args: vec!["/usr/local/bin/app".to_string()],
+            env: vec![],
+            ports: vec![Port {
+                container_port: 8080,
+                protocol: "TCP".to_string(),
+            }],
+            mounts: vec![],
+            capabilities: Capabilities::default(),
+            security_context: SecurityContext::default(),
+            resources: Resources::default(),
+        },
+        sidecars: Sidecars {
+            attestation_proxy_digest:
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            caddy_digest: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                .to_string(),
+        },
+        api_signing_pubkey: api_signing_pubkey.to_string(),
+        independent_verification: true,
+        expected_firmware_measurement: [3; 32].into(),
+        expected_runtime_class: "kata-qemu-snp".to_string(),
+        kbs_resource_path: format!("default/{}-owner", app.name),
+        unlock_mode: format!("{:?}", app.unlock_mode).to_lowercase(),
+        policy_template_id: "enclava-kbs-policy-v1".to_string(),
+        policy_template_sha256: [4; 32],
+        platform_release_version: "cap-test".to_string(),
+        expected_agent_policy_hash: [5; 32],
+        expected_cc_init_data_hash: [6; 32],
+        expected_kbs_policy_hash: [7; 32],
+    }
+}
+
+async fn register_test_customer_authority(
+    pool: &PgPool,
+    org_id: Uuid,
+    customer_key: &SigningKey,
+) -> Value {
+    let user_id: Uuid =
+        sqlx::query_scalar("SELECT user_id FROM memberships WHERE org_id = $1 AND role = 'owner'")
+            .bind(org_id)
+            .fetch_one(pool)
+            .await
+            .expect("organization owner");
+    let signing_key_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO user_signing_keys (id, user_id, pubkey)
+         VALUES ($1, $2, $3)
+         RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user_id)
+    .bind(customer_key.verifying_key().to_bytes().to_vec())
+    .fetch_one(pool)
+    .await
+    .expect("customer signing key");
+
+    let added_at = Utc::now();
+    let updated_at = added_at;
+    let pubkey = customer_key.verifying_key().to_bytes();
+    let added_at_text = added_at.to_rfc3339();
+    let member_hash = ce_v1_hash(&[
+        ("user_id", user_id.as_bytes().as_slice()),
+        ("pubkey", pubkey.as_slice()),
+        ("role", b"owner"),
+        ("added_at", added_at_text.as_bytes()),
+    ]);
+    let user_id_label = user_id.to_string();
+    let members_hash = ce_v1_hash(&[(user_id_label.as_str(), member_hash.as_slice())]);
+    let version = 1_u64.to_be_bytes();
+    let updated_at_text = updated_at.to_rfc3339();
+    let keyring_canonical = ce_v1_bytes(&[
+        ("purpose", b"enclava-org-keyring-v1"),
+        ("org_id", org_id.as_bytes().as_slice()),
+        ("version", &version),
+        ("members", &members_hash),
+        ("updated_at", updated_at_text.as_bytes()),
+    ]);
+    let signature = customer_key.sign(&keyring_canonical).to_bytes();
+    let keyring = serde_json::json!({
+        "org_id": org_id,
+        "version": 1,
+        "members": [{
+            "user_id": user_id,
+            "pubkey": hex::encode(pubkey),
+            "role": "owner",
+            "added_at": added_at,
+        }],
+        "updated_at": updated_at,
+    });
+
+    sqlx::query(
+        "INSERT INTO org_keyrings (
+            org_id, version, keyring_payload, signature, signing_key_id
+         )
+         VALUES ($1, 1, $2, $3, $4)",
+    )
+    .bind(org_id)
+    .bind(serde_json::to_vec(&keyring).expect("keyring payload"))
+    .bind(signature.to_vec())
+    .bind(signing_key_id)
+    .execute(pool)
+    .await
+    .expect("registered org keyring");
+
+    serde_json::json!({
+        "keyring": keyring,
+        "signature": hex::encode(signature),
+        "signing_pubkey": hex::encode(pubkey),
+    })
+}
+
+fn signed_test_artifact_blobs(
+    descriptor: DeploymentDescriptor,
+    customer_key: &SigningKey,
+    org_keyring_envelope: &Value,
+) -> (String, String) {
+    let descriptor_signature = customer_key.sign(&descriptor_canonical_bytes(&descriptor));
+    let customer_descriptor_blob = serde_json::json!({
+        "descriptor": descriptor,
+        "signature": hex::encode(descriptor_signature.to_bytes()),
+        "signing_key_id": "test-deployer-key",
+        "signing_pubkey": hex::encode(customer_key.verifying_key().to_bytes()),
+    })
+    .to_string();
+    let org_keyring_blob = org_keyring_envelope.to_string();
+    (customer_descriptor_blob, org_keyring_blob)
 }
 
 fn device_code_hash(code: &str) -> Vec<u8> {
@@ -1112,6 +1422,153 @@ async fn paas_internal_deploy_reuses_signed_deploy_gate() {
 }
 
 #[tokio::test]
+async fn rejected_signed_deployments_leave_existing_and_candidate_container_rows_unchanged() {
+    let (mut state, pool) = setup_test_state().await;
+    let policy_signing_key = Arc::new(SigningKey::from_bytes(&[0x33; 32]));
+    let policy_service = Router::new()
+        .route("/agent-policy", post(test_agent_policy))
+        .route("/sign", post(test_sign_policy))
+        .with_state(TestPolicyService {
+            signing_key: policy_signing_key.clone(),
+        });
+    let policy_server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(policy_service);
+    state.signing_service = Some(
+        enclava_api::signing_service::SigningServiceClient::new(
+            policy_server
+                .server_url("/")
+                .expect("policy service URL")
+                .to_string(),
+            None,
+        )
+        .expect("policy signing service client"),
+    );
+    state
+        .attestation
+        .as_mut()
+        .expect("test attestation config")
+        .signing_service_pubkey_hex =
+        Some(hex::encode(policy_signing_key.verifying_key().to_bytes()));
+    let api_signing_pubkey = enclava_api::auth::jwt::public_key_base64(&state.signing_key);
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("signed-{}", &suffix[..12]);
+    let (session_token, org_id) = signup_owner(&server, "signed-rollback").await;
+    let image = "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+            "signer_identity_subject": github_signer_subject(),
+            "signer_identity_issuer": github_signer_issuer(),
+        }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let persisted_app: enclava_api::models::App =
+        sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+            .bind(org_id)
+            .bind(&app_name)
+            .fetch_one(&pool)
+            .await
+            .expect("created signed deployment app");
+    sqlx::query(
+        "INSERT INTO app_containers (
+            id, app_id, name, image_ref, image_digest, command, port,
+            storage_paths, workload_security_profile, is_primary
+         )
+         VALUES ($1, $2, 'web', $3, $4, $5, 8080, $6, 'restricted', true)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(persisted_app.id)
+    .bind("ghcr.io/acme/confidential-app:previous")
+    .bind("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    .bind("[\"/usr/local/bin/previous\"]")
+    .bind(vec!["/previous-state"])
+    .execute(&pool)
+    .await
+    .expect("insert existing app container");
+
+    let app_before = persisted_app_snapshot(&pool, org_id, &app_name)
+        .await
+        .expect("app before invalid deploys");
+    let rows_before = app_deployment_rows_snapshot(&pool, persisted_app.id).await;
+    let customer_key = SigningKey::from_bytes(&[0x44; 32]);
+    let org_keyring_envelope = register_test_customer_authority(&pool, org_id, &customer_key).await;
+    let mut base_descriptor =
+        signed_deployment_descriptor(&persisted_app, image, &api_signing_pubkey);
+    base_descriptor.expected_agent_policy_hash =
+        Sha256::digest(TEST_AGENT_POLICY.as_bytes()).into();
+    base_descriptor.expected_kbs_policy_hash = Sha256::digest(TEST_KBS_POLICY.as_bytes()).into();
+
+    let mut invalid_signer = base_descriptor.clone();
+    invalid_signer.signer_identity.subject =
+        "https://github.com/attacker/repo/.github/workflows/build.yml@refs/heads/main".to_string();
+    let mut invalid_app = base_descriptor.clone();
+    invalid_app.app_id = Uuid::new_v4();
+    let mut invalid_digest = base_descriptor;
+    invalid_digest.image_digest =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
+
+    let mut invalid_policy = invalid_digest.clone();
+    invalid_policy.image_digest = image
+        .split_once('@')
+        .expect("digest-pinned test image")
+        .1
+        .to_string();
+    invalid_policy.expected_kbs_policy_hash = [0xee; 32];
+
+    let mut invalid_cc_init = invalid_policy.clone();
+    invalid_cc_init.expected_kbs_policy_hash = Sha256::digest(TEST_KBS_POLICY.as_bytes()).into();
+    invalid_cc_init.expected_cc_init_data_hash = [0xdd; 32];
+
+    for (expected_field, container_name, descriptor) in [
+        ("signer_identity.subject", "web", invalid_signer),
+        ("app_id", "worker", invalid_app),
+        ("image_digest", "web", invalid_digest),
+        ("expected_kbs_policy_hash", "web", invalid_policy),
+        ("expected_cc_init_data_hash", "worker", invalid_cc_init),
+    ] {
+        let (customer_descriptor_blob, org_keyring_blob) =
+            signed_test_artifact_blobs(descriptor, &customer_key, &org_keyring_envelope);
+        let response = server
+            .post(&format!("/apps/{app_name}/deploy"))
+            .add_header("x-forwarded-for", "127.0.0.1")
+            .authorization_bearer(&session_token)
+            .json(&serde_json::json!({
+                "image": image,
+                "container_name": container_name,
+                "customer_descriptor_blob": customer_descriptor_blob,
+                "org_keyring_blob": org_keyring_blob,
+            }))
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body: Value = response.json();
+        assert_eq!(
+            body["error"], "signed_artifact_mismatch",
+            "unexpected rejection for {expected_field}: {body}"
+        );
+        assert_eq!(
+            persisted_app_snapshot(&pool, org_id, &app_name).await,
+            Some(app_before.clone()),
+            "invalid {expected_field} changed the app row"
+        );
+        assert_eq!(
+            app_deployment_rows_snapshot(&pool, persisted_app.id).await,
+            rows_before,
+            "invalid {expected_field} changed container or deployment rows"
+        );
+    }
+}
+
+#[tokio::test]
 async fn paas_internal_agent_policy_route_reaches_cap_policy_broker() {
     let (state, pool) = setup_paas_managed_test_state().await;
     let app = test_router(state);
@@ -1223,7 +1680,8 @@ async fn paas_internal_agent_policy_route_reaches_cap_policy_broker() {
                     .to_string(),
         },
         api_signing_pubkey: "test-api-signing-pubkey".to_string(),
-        expected_firmware_measurement: [3; 32],
+        independent_verification: true,
+        expected_firmware_measurement: [3; 32].into(),
         expected_runtime_class: "kata-qemu-snp".to_string(),
         kbs_resource_path: format!("default/{app_name}-owner"),
         unlock_mode: "password".to_string(),
@@ -1309,6 +1767,32 @@ async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_pre
     .await
     .assert_status_ok();
 
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("generic-app-create-{suffix}"),
+    )
+    .json(&serde_json::json!({
+        "name": app_name,
+        "unlock_mode": "auto",
+    }))
+    .await
+    .assert_status(StatusCode::CREATED);
+
+    let cap_org_id: Uuid = sqlx::query_scalar(
+        "SELECT cap_id FROM paas_external_mappings WHERE resource_type = 'organization' AND paas_external_id = $1",
+    )
+    .bind(&paas_org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("cap org mapping");
+    let app_before = persisted_app_snapshot(&pool, cap_org_id, &app_name)
+        .await
+        .expect("created app snapshot");
+    let app_id = persisted_app_id(&pool, cap_org_id, &app_name)
+        .await
+        .expect("created app id");
+    let rows_before = app_deployment_rows_snapshot(&pool, app_id).await;
+
     let mut deploy_body = generic_deployment_body(
         &external_id,
         &app_name,
@@ -1340,20 +1824,15 @@ async fn paas_internal_generic_deployment_uses_synced_entitlement_and_signer_pre
         "unexpected response body: {body}"
     );
 
-    let cap_org_id: Uuid = sqlx::query_scalar(
-        "SELECT cap_id FROM paas_external_mappings WHERE resource_type = 'organization' AND paas_external_id = $1",
-    )
-    .bind(&paas_org_id)
-    .fetch_one(&pool)
-    .await
-    .expect("cap org mapping");
     assert_eq!(
-        persisted_app_source(&pool, cap_org_id, &app_name).await,
-        ("github".to_string(), "acme/confidential-app".to_string())
+        persisted_app_snapshot(&pool, cap_org_id, &app_name).await,
+        Some(app_before),
+        "rejected first generic deployment must not pin app metadata"
     );
     assert_eq!(
-        persisted_app_egress(&pool, cap_org_id, &app_name).await,
-        serde_json::json!([{ "host": "relay.enclava.me", "ports": [20000] }])
+        app_deployment_rows_snapshot(&pool, app_id).await,
+        rows_before,
+        "rejected first generic deployment must not add containers or deployments"
     );
 }
 
@@ -1484,6 +1963,10 @@ async fn paas_internal_app_logs_fail_closed_after_actor_validation() {
 
 #[tokio::test]
 async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
+    // Expiry is absolute: a challenge past `expires_at` is refused even when
+    // `verified_at` was already captured, and the live TXT lookup never runs
+    // (this env has no DNS, so a 409 -- not a 502 -- proves the lookup was
+    // skipped). No domain is attached and no DNS record is tracked.
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);
@@ -1549,6 +2032,86 @@ async fn custom_domain_verified_challenge_cannot_replay_after_expiry() {
 }
 
 #[tokio::test]
+async fn custom_domain_verified_challenge_rechecks_txt_within_window() {
+    // Regression guard against re-introducing a verified-skip: a challenge that
+    // already holds `verified_at` but is still within its window MUST re-run the
+    // live TXT lookup -- it may not skip straight to applying the domain. This
+    // env has no DNS, so the lookup surfaces as a 502 lookup error (not a 200
+    // skip-to-apply), and no domain is attached.
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("recheck-{}", &suffix[..12]);
+    let domain = format!("recheck-{}.example.com", &suffix[..12]);
+    let (session_token, _org_id) = signup_owner(&server, "domain-recheck").await;
+
+    let create = server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await;
+    create.assert_status(StatusCode::CREATED);
+    let create_body: Value = create.json();
+    let app_id = Uuid::parse_str(create_body["id"].as_str().expect("app id")).unwrap();
+
+    // Postgres `timestamptz` stores microsecond precision; truncate the planted
+    // value so the round-trip through the DB compares exactly.
+    let planted_verified_at = chrono::DateTime::from_timestamp_micros(
+        (Utc::now() - Duration::hours(1)).timestamp_micros(),
+    )
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO custom_domain_challenges (
+             id, app_id, domain, challenge_token, expires_at, verified_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(app_id)
+    .bind(&domain)
+    .bind("historically-valid-token")
+    .bind(Utc::now() + Duration::hours(1))
+    .bind(planted_verified_at)
+    .execute(&pool)
+    .await
+    .expect("insert verified in-window domain challenge");
+
+    let verify = server
+        .post(&format!("/apps/{app_name}/domains/{domain}/verify"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .await;
+    // The live TXT lookup ran and failed (no DNS in this env) -- proof that a
+    // captured `verified_at` did not bypass it.
+    verify.assert_status(StatusCode::BAD_GATEWAY);
+
+    // No apply, no re-persist: the domain is not attached and the proof stands
+    // unchanged.
+    let custom_domain: Option<String> =
+        sqlx::query_scalar("SELECT custom_domain FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app custom domain");
+    assert_eq!(custom_domain, None);
+
+    let verified_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT verified_at FROM custom_domain_challenges WHERE app_id = $1 AND domain = $2",
+    )
+    .bind(app_id)
+    .bind(&domain)
+    .fetch_one(&pool)
+    .await
+    .expect("load verified_at");
+    assert_eq!(verified_at, Some(planted_verified_at));
+}
+
+#[tokio::test]
 async fn generic_github_deployment_validates_and_reaches_strict_deploy_gate() {
     let (mut state, pool) = setup_test_state().await;
     state.require_customer_signed_policy_artifact = true;
@@ -1583,10 +2146,7 @@ async fn generic_github_deployment_validates_and_reaches_strict_deploy_gate() {
             .contains("signed policy deployments require"),
         "unexpected response body: {body}"
     );
-    assert_eq!(
-        persisted_app_source(&pool, org_id, &app_name).await,
-        ("github".to_string(), "acme/confidential-app".to_string())
-    );
+    assert_eq!(persisted_app_snapshot(&pool, org_id, &app_name).await, None);
 }
 
 #[tokio::test]
@@ -1624,13 +2184,7 @@ async fn generic_gitlab_deployment_validates_and_reaches_strict_deploy_gate() {
             .contains("signed policy deployments require"),
         "unexpected response body: {body}"
     );
-    assert_eq!(
-        persisted_app_source(&pool, org_id, &app_name).await,
-        (
-            "gitlab".to_string(),
-            "acme/platform/confidential-app".to_string()
-        )
-    );
+    assert_eq!(persisted_app_snapshot(&pool, org_id, &app_name).await, None);
 }
 
 #[tokio::test]
@@ -1677,6 +2231,46 @@ async fn generic_deployment_external_id_is_idempotent_and_conflict_checked() {
     .await
     .expect("insert idempotency app");
 
+    let accepted_app: App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load idempotency app snapshot");
+    let payload = DeploymentApplyJobPayload::new(
+        accepted_app,
+        DeploymentApplySnapshot::new(
+            vec![AppContainer {
+                id: Uuid::new_v4(),
+                app_id,
+                name: "app".to_string(),
+                image_ref: image.to_string(),
+                image_digest: Some(
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                ),
+                port: None,
+                command: None,
+                storage_paths: None,
+                workload_security_profile: Some("restricted".to_string()),
+                is_primary: true,
+            }],
+            AppResources {
+                app_id,
+                cpu_limit: "1".to_string(),
+                memory_limit: "1Gi".to_string(),
+                app_data_size: "5Gi".to_string(),
+                tls_data_size: "2Gi".to_string(),
+            },
+        ),
+        None,
+        "integration-test-api-pubkey".to_string(),
+        "https://api.example.test".to_string(),
+        None,
+        None,
+        None,
+        false,
+    );
+    let mut deployment_tx = pool.begin().await.expect("begin idempotency deployment");
     sqlx::query(
         "INSERT INTO deployments (
             id, org_id, app_id, trigger, status, spec_snapshot, image_digest,
@@ -1703,9 +2297,22 @@ async fn generic_deployment_external_id_is_idempotent_and_conflict_checked() {
     .bind(&external_id)
     .bind("github")
     .bind("acme/confidential-app")
-    .execute(&pool)
+    .execute(&mut *deployment_tx)
     .await
     .expect("insert idempotency deployment");
+    insert_setup_job(
+        &mut deployment_tx,
+        deployment_id,
+        deployment_id,
+        &payload,
+        false,
+    )
+    .await
+    .expect("insert idempotency deployment durable job");
+    deployment_tx
+        .commit()
+        .await
+        .expect("commit idempotency deployment and durable job");
 
     let retry = server
         .post("/deployments")
@@ -1750,6 +2357,56 @@ async fn generic_deployment_external_id_is_idempotent_and_conflict_checked() {
     assert_eq!(
         conflict_body["error"].as_str(),
         Some("external_id already exists with different app.name")
+    );
+
+    let mut incomplete_tx = pool
+        .begin()
+        .await
+        .expect("begin incomplete setup transition");
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'failed'::deploy_status_enum,
+                spec_snapshot = jsonb_set(spec_snapshot, '{setup_state}', '\"cleanup_pending\"'::jsonb, true),
+                error_message = 'deployment DNS setup failed'
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&mut *incomplete_tx)
+    .await
+    .expect("mark deployment setup incomplete");
+    sqlx::query(
+        "UPDATE deployment_apply_jobs
+            SET state = 'failed', next_attempt_at = clock_timestamp()
+          WHERE deployment_id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&mut *incomplete_tx)
+    .await
+    .expect("terminalize incomplete setup job");
+    incomplete_tx
+        .commit()
+        .await
+        .expect("commit incomplete setup transition");
+
+    let incomplete_retry = server
+        .post("/deployments")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&generic_deployment_body(
+            &external_id,
+            &app_name,
+            "github",
+            "acme/confidential-app",
+            image,
+            subject,
+            issuer,
+        ))
+        .await;
+    incomplete_retry.assert_status(StatusCode::CONFLICT);
+    let incomplete_body: Value = incomplete_retry.json();
+    assert_eq!(
+        incomplete_body["error"].as_str(),
+        Some("external_id belongs to a deployment whose setup did not complete")
     );
 }
 

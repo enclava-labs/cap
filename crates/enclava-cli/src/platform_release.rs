@@ -294,6 +294,25 @@ mod tests {
     }
 
     #[test]
+    fn tagged_cli_release_build_pins_bundled_release_root() {
+        let envelope: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let workflow = include_str!("../../../.github/workflows/release.yml");
+        let expected = format!(
+            "\nenv:\n  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: {}\n",
+            envelope.signing_pubkey
+        );
+
+        assert!(workflow.contains(&expected));
+        assert_eq!(
+            workflow
+                .matches("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX:")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn tampering_breaks_signature() {
         let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
         let mut tampered = raw.clone();

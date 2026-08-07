@@ -1,7 +1,8 @@
-use kube::api::{Api, ApiResource, DynamicObject, Patch, PatchParams};
+use kube::api::{Api, ApiResource, DynamicObject};
 use serde_json::Value;
 
 use super::engine::{ApplyEngine, ApplyError};
+use super::generation::{MutationGeneration, apply_resource};
 
 /// Returns the ApiResource descriptor for CiliumNetworkPolicy.
 /// This avoids a runtime discovery call -- we know the CRD schema.
@@ -69,6 +70,7 @@ pub async fn apply_network_policy(
     engine: &ApplyEngine,
     namespace: &str,
     policy_value: &Value,
+    generation: MutationGeneration,
 ) -> Result<DynamicObject, ApplyError> {
     let dyn_obj = value_to_dynamic_object(policy_value)?;
 
@@ -76,9 +78,7 @@ pub async fn apply_network_policy(
 
     let ar = cilium_api_resource();
     let api: Api<DynamicObject> = Api::namespaced_with(engine.client().clone(), namespace, &ar);
-    let pp = PatchParams::apply(&engine.config().field_manager);
-
-    let patched = api.patch(name, &pp, &Patch::Apply(&dyn_obj)).await?;
+    let patched = apply_resource(engine, &api, &dyn_obj, generation, false, false).await?;
 
     tracing::info!(
         namespace = %namespace,

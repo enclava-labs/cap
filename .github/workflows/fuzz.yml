@@ -1,0 +1,22 @@
+name: Fuzz smoke tests
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - run: cargo fuzz run parse_proof_bundle -- -max_total_time=20
+      - run: cargo fuzz run ce_v1_decode -- -max_total_time=20
+      - run: cargo fuzz run verify_rsa_pss_sha384 -- -max_total_time=20

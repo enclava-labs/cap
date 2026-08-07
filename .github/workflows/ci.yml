@@ -65,12 +65,26 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        # Database-backed tests share one PostgreSQL service and exercise
+        # intentionally global provider fences. Serialize them so independent
+        # fixtures cannot contend through that shared authority.
+        run: cargo test --workspace -- --test-threads=1
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test
 
       - name: Run doctests
         run: cargo test --doc
+
+      - name: Run appraiser API conformance
+        run: |
+          ENCLAVA_APPRAISER_BIND=127.0.0.1:18080 cargo run -q -p enclava-appraiser >/tmp/enclava-appraiser.log 2>&1 &
+          appraiser_pid=$!
+          trap 'kill "$appraiser_pid"' EXIT
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18080/healthz >/dev/null && break
+            sleep 1
+          done
+          python3 scripts/appraiser-conformance.py http://127.0.0.1:18080
 
   dependency-gates:
     name: Audit Rust dependencies
@@ -152,3 +166,50 @@ jobs:
             echo "enclava-init prod-strict unexpectedly accepted luks-integration"
             exit 1
           fi
+
+  browser-verifier:
+    name: Test verifier in headless browser
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install matching wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --version 0.2.118 --locked
+
+      - name: Build web verifier
+        run: ./web/verifier/build.sh
+
+      - name: Run checked-in browser fixture
+        run: |
+          python3 -m http.server 8000 >/tmp/enclava-verifier-http.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:8000/web/verifier/test.html >/dev/null && break
+            sleep 1
+          done
+          google-chrome --headless --no-sandbox --disable-gpu --virtual-time-budget=30000 \
+            --dump-dom http://127.0.0.1:8000/web/verifier/test.html > /tmp/enclava-verifier-dom.html
+          if ! grep -E '<pre id="result">PASS [0-9a-f]{64}</pre>' /tmp/enclava-verifier-dom.html; then
+            cat /tmp/enclava-verifier-dom.html
+            cat /tmp/enclava-verifier-http.log
+            exit 1
+          fi
+          google-chrome --headless --no-sandbox --disable-gpu --virtual-time-budget=30000 \
+            --dump-dom 'http://127.0.0.1:8000/web/verifier/test.html?reject=measurement&expected=FAIL&reason=SNP_MEASUREMENT_REJECTED' \
+            > /tmp/enclava-verifier-rejected-dom.html
+          grep -E '<pre id="result">PASS [0-9a-f]{64}</pre>' /tmp/enclava-verifier-rejected-dom.html
+          for vector in \
+            'snp_report:SNP_REPORT_SIGNATURE_INVALID' \
+            'sigstore_material:SUPPLY_CHAIN_SIGNATURE_INVALID' \
+            'provenance_oci_material:SUPPLY_CHAIN_SIGNATURE_INVALID'; do
+            field="${vector%%:*}"
+            reason="${vector#*:}"
+            google-chrome --headless --no-sandbox --disable-gpu --virtual-time-budget=30000 \
+              --dump-dom "http://127.0.0.1:8000/web/verifier/test.html?mutate=${field}&expected=FAIL&reason=${reason}" \
+              > "/tmp/enclava-verifier-${field}-dom.html"
+            grep -E '<pre id="result">PASS [0-9a-f]{64}</pre>' "/tmp/enclava-verifier-${field}-dom.html"
+          done

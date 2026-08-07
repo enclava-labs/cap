@@ -51,6 +51,25 @@ pub struct ConfigTokenClaims {
     pub jti: String,
 }
 
+#[derive(Debug)]
+pub struct IssuedConfigToken {
+    pub token: String,
+    pub issued_at: chrono::DateTime<Utc>,
+    pub expires_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigTokenIssuance {
+    pub receipt_version: i16,
+    pub issued_at: chrono::DateTime<Utc>,
+    pub jti: String,
+    pub resource_id: Uuid,
+    pub instance_id: String,
+}
+
+pub const CONFIG_TOKEN_TTL_SECONDS: i64 = 5 * 60;
+pub const CONFIG_TOKEN_RECEIPT_VERSION: i16 = 1;
+
 #[derive(Debug, Clone)]
 pub struct SignerRotationTokenInput {
     pub user_id: Uuid,
@@ -112,6 +131,7 @@ fn session_validator() -> Validation {
 
 fn config_validator() -> Validation {
     let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.leeway = 0;
     validation.set_required_spec_claims(&["sub", "exp", "iat", "iss", "aud"]);
     validation.set_issuer(&[TOKEN_ISSUER]);
     validation.set_audience(&[CONFIG_AUDIENCE]);
@@ -175,19 +195,72 @@ pub fn issue_config_token(
     instance_id: &str,
     scopes: Vec<String>,
 ) -> Result<String, JwtError> {
-    let now = Utc::now();
+    issue_config_token_with_expiry(signing_key, user_id, org_id, app_id, instance_id, scopes)
+        .map(|issued| issued.token)
+}
+
+/// Issue a config token together with the exact whole-second expiry encoded
+/// in its signed `exp` claim.
+pub fn issue_config_token_with_expiry(
+    signing_key: &SigningKey,
+    user_id: Uuid,
+    org_id: Uuid,
+    app_id: Uuid,
+    instance_id: &str,
+    scopes: Vec<String>,
+) -> Result<IssuedConfigToken, JwtError> {
+    let issued_at =
+        chrono::DateTime::from_timestamp(Utc::now().timestamp(), 0).ok_or(JwtError::Invalid)?;
+    issue_config_token_for_issuance(
+        signing_key,
+        user_id,
+        org_id,
+        app_id,
+        instance_id,
+        scopes,
+        &ConfigTokenIssuance {
+            receipt_version: CONFIG_TOKEN_RECEIPT_VERSION,
+            issued_at,
+            jti: new_jti(),
+            resource_id: app_id,
+            instance_id: instance_id.to_string(),
+        },
+    )
+}
+
+/// Issue the exact config JWT described by a durable, non-secret issuance
+/// receipt. Ed25519 signing is deterministic, so the same claims regenerate
+/// the same compact bearer without storing it.
+pub fn issue_config_token_for_issuance(
+    signing_key: &SigningKey,
+    user_id: Uuid,
+    org_id: Uuid,
+    app_id: Uuid,
+    instance_id: &str,
+    scopes: Vec<String>,
+    issuance: &ConfigTokenIssuance,
+) -> Result<IssuedConfigToken, JwtError> {
+    if issuance.receipt_version != CONFIG_TOKEN_RECEIPT_VERSION
+        || issuance.resource_id != app_id
+        || issuance.instance_id != instance_id
+    {
+        return Err(JwtError::Invalid);
+    }
+    let issued_at = chrono::DateTime::from_timestamp(issuance.issued_at.timestamp(), 0)
+        .ok_or(JwtError::Invalid)?;
+    let expires_at = issued_at + Duration::seconds(CONFIG_TOKEN_TTL_SECONDS);
     let claims = ConfigTokenClaims {
         sub: user_id.to_string(),
         org_id: org_id.to_string(),
         app_id: app_id.to_string(),
         instance_id: instance_id.to_string(),
         scopes,
-        exp: (now + Duration::minutes(5)).timestamp(),
-        iat: now.timestamp(),
+        exp: expires_at.timestamp(),
+        iat: issued_at.timestamp(),
         iss: TOKEN_ISSUER.to_string(),
         aud: CONFIG_AUDIENCE.to_string(),
         typ: CONFIG_TYP.to_string(),
-        jti: new_jti(),
+        jti: issuance.jti.clone(),
     };
 
     let secret = signing_key
@@ -198,7 +271,11 @@ pub fn issue_config_token(
         &claims,
         &EncodingKey::from_ed_der(secret.as_bytes()),
     )?;
-    Ok(token)
+    Ok(IssuedConfigToken {
+        token,
+        issued_at,
+        expires_at,
+    })
 }
 
 /// Verify a config token using an Ed25519 verifying key. Used in tests and
@@ -338,6 +415,100 @@ mod tests {
         assert_eq!(claims.typ, CONFIG_TYP);
         assert_eq!(claims.instance_id, "test-instance");
         assert!(!claims.jti.is_empty());
+    }
+
+    #[test]
+    fn deterministic_config_token_matches_receipt_and_signed_expiry_exactly() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let issued_at = chrono::DateTime::parse_from_rfc3339("2026-07-18T12:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let user_id = Uuid::new_v4();
+        let org_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let issuance = ConfigTokenIssuance {
+            receipt_version: CONFIG_TOKEN_RECEIPT_VERSION,
+            issued_at,
+            jti: "11111111-2222-8333-8444-555555555555".to_string(),
+            resource_id: app_id,
+            instance_id: "test-instance".to_string(),
+        };
+        let first = issue_config_token_for_issuance(
+            &signing,
+            user_id,
+            org_id,
+            app_id,
+            "test-instance",
+            vec!["config:write".to_string()],
+            &issuance,
+        )
+        .unwrap();
+        let duplicate = issue_config_token_for_issuance(
+            &signing,
+            user_id,
+            org_id,
+            app_id,
+            "test-instance",
+            vec!["config:write".to_string()],
+            &issuance,
+        )
+        .unwrap();
+
+        assert_eq!(duplicate.token, first.token);
+        assert_eq!(first.issued_at, issued_at);
+        assert_eq!(first.expires_at - first.issued_at, Duration::minutes(5));
+        let claims = verify_config_token(&signing.verifying_key(), &first.token)
+            .expect_err("the fixed historical token is expired at verification time");
+        assert!(matches!(claims, JwtError::Expired));
+
+        let validation = config_validator();
+        assert_eq!(validation.leeway, 0);
+        let decoding_key = {
+            use base64::Engine;
+            let x = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(signing.verifying_key().to_bytes());
+            DecodingKey::from_ed_components(&x).unwrap()
+        };
+        let mut claim_validation = config_validator();
+        claim_validation.validate_exp = false;
+        let decoded = decode::<ConfigTokenClaims>(&first.token, &decoding_key, &claim_validation)
+            .unwrap()
+            .claims;
+        assert_eq!(decoded.iat, first.issued_at.timestamp());
+        assert_eq!(decoded.exp, first.expires_at.timestamp());
+        assert_eq!(decoded.exp - decoded.iat, CONFIG_TOKEN_TTL_SECONDS);
+        assert_eq!(decoded.jti, issuance.jti);
+    }
+
+    #[test]
+    fn config_token_validator_rejects_immediately_after_signed_expiry() {
+        let signing = SigningKey::generate(&mut OsRng);
+        let issued_at = chrono::DateTime::from_timestamp(
+            Utc::now().timestamp() - CONFIG_TOKEN_TTL_SECONDS - 1,
+            0,
+        )
+        .unwrap();
+        let app_id = Uuid::new_v4();
+        let token = issue_config_token_for_issuance(
+            &signing,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            app_id,
+            "expired-instance",
+            vec!["config:write".to_string()],
+            &ConfigTokenIssuance {
+                receipt_version: CONFIG_TOKEN_RECEIPT_VERSION,
+                issued_at,
+                jti: Uuid::new_v4().to_string(),
+                resource_id: app_id,
+                instance_id: "expired-instance".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_config_token(&signing.verifying_key(), &token.token),
+            Err(JwtError::Expired)
+        ));
     }
 
     #[test]

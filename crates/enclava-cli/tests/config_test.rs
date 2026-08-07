@@ -1,6 +1,35 @@
 use std::fs;
 
 #[test]
+fn cli_state_directory_can_be_isolated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("isolated");
+    let paths = enclava_cli::config::CliPaths::from_root(state.clone()).unwrap();
+    enclava_cli::config::save_credentials(
+        &paths,
+        &enclava_cli::config::Credentials {
+            session_token: Some("test-session".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_enclava"))
+        .arg("logout")
+        .env("ENCLAVA_STATE_DIR", &state)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert!(
+        enclava_cli::config::load_credentials(&paths)
+            .unwrap()
+            .session_token
+            .is_none()
+    );
+}
+
+#[test]
 fn cli_paths_from_explicit_root() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join(".enclava");

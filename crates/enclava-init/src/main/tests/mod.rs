@@ -1,5 +1,38 @@
 use super::*;
+use enclava_init::config::AppBindMountConfig;
 use tempfile::tempdir;
+
+#[test]
+fn public_tls_certificate_handoff_is_optional_and_public_only() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("tls-state/certificates/tls.crt");
+    let destination = dir.path().join("runtime/certificates/tls.crt");
+
+    publish_public_tls_certificate(&source, &destination).unwrap();
+    assert!(!destination.exists());
+
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::write(&source, b"public certificate").unwrap();
+    publish_public_tls_certificate(&source, &destination).unwrap();
+    assert_eq!(std::fs::read(destination).unwrap(), b"public certificate");
+}
+
+#[test]
+fn caddy_runtime_certificate_is_published_and_refreshed() {
+    let dir = tempdir().unwrap();
+    let runtime = dir.path().join("caddy-runtime");
+    let certificate = runtime.join("certificates/acme/app.example.test/app.example.test.crt");
+    let destination = dir.path().join("public-tls/certificates/tls.crt");
+    std::fs::create_dir_all(certificate.parent().unwrap()).unwrap();
+
+    std::fs::write(&certificate, b"initial certificate").unwrap();
+    publish_caddy_runtime_certificate(&runtime, &destination).unwrap();
+    assert_eq!(std::fs::read(&destination).unwrap(), b"initial certificate");
+
+    std::fs::write(&certificate, b"renewed certificate").unwrap();
+    publish_caddy_runtime_certificate(&runtime, &destination).unwrap();
+    assert_eq!(std::fs::read(destination).unwrap(), b"renewed certificate");
+}
 
 #[test]
 fn ready_probe_reflects_ready_file_state() {
@@ -98,6 +131,16 @@ fn caddy_tls_bind_source_is_below_tls_state_root() {
         caddy_tls_bind_dir(Path::new("/state/tls-state")),
         PathBuf::from("/state/tls-state/tenant-ingress")
     );
+}
+
+#[test]
+fn static_broker_tls_does_not_back_sync_ephemeral_caddy_runtime() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config_with_signed_cc(dir.path(), "");
+
+    assert!(caddy_runtime_back_sync_required(&cfg));
+    cfg.tls_certificate_broker_url = Some("https://broker.example.test".to_string());
+    assert!(!caddy_runtime_back_sync_required(&cfg));
 }
 
 #[test]
@@ -250,6 +293,37 @@ fn tenant_ingress_bind_plan_uses_shared_tls_mount_not_namespace_bind() {
     let mounts = bind_mount_plan_for_workload(&cfg, 42, &workload).unwrap();
 
     assert!(mounts.is_empty());
+}
+
+#[test]
+fn attestation_proxy_bind_plan_is_empty_even_with_app_data_binds() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config_with_signed_cc(dir.path(), "");
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: "app-data".to_string(),
+        mount_path: "/app/data".to_string(),
+    });
+
+    let proxy = WorkloadNamespace {
+        name: "attestation-proxy".to_string(),
+        pid: 1234,
+    };
+    assert!(
+        bind_mount_plan_for_workload(&cfg, 42, &proxy)
+            .unwrap()
+            .is_empty()
+    );
+
+    let primary = WorkloadNamespace {
+        name: "web".to_string(),
+        pid: 1234,
+    };
+    assert_eq!(
+        bind_mount_plan_for_workload(&cfg, 42, &primary)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

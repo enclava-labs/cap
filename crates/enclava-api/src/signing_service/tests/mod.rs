@@ -92,7 +92,8 @@ fn descriptor() -> DeploymentDescriptor {
                         .to_string(),
             },
             api_signing_pubkey: "test-api-signing-pubkey".to_string(),
-            expected_firmware_measurement: [3; 32],
+            independent_verification: true,
+            expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
             kbs_resource_path: "default/cap-abcd1234-demo-owner".to_string(),
             unlock_mode: "password".to_string(),
@@ -284,6 +285,65 @@ fn rejects_descriptor_for_different_api_signing_key() {
         .unwrap_err();
 
     assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "api_signing_pubkey"));
+}
+
+#[test]
+fn rejects_descriptor_without_independent_verification_contract() {
+    let mut descriptor = descriptor();
+    descriptor.independent_verification = false;
+    let artifacts = signing_artifacts(descriptor.clone());
+    let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+    let err = artifacts
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(err, SigningServiceError::Mismatch(field) if field == "independent_verification")
+    );
+}
+
+#[test]
+fn rejects_descriptor_for_different_app_signer_and_image() {
+    let descriptor = descriptor();
+    let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+    let mut different_app = descriptor.clone();
+    different_app.app_id = Uuid::new_v4();
+    let err = signing_artifacts(different_app)
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+        )
+        .unwrap_err();
+    assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "app_id"));
+
+    let mut different_signer = descriptor.clone();
+    different_signer.signer_identity.subject = "https://example.test/attacker".to_string();
+    let err = signing_artifacts(different_signer)
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Mismatch(field) if field == "signer_identity.subject")
+    );
+
+    let err = signing_artifacts(descriptor.clone())
+        .validate_deployment_inputs(
+            &app,
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            &descriptor.api_signing_pubkey,
+        )
+        .unwrap_err();
+    assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "image_digest"));
 }
 
 #[test]
@@ -495,6 +555,33 @@ fn signed_artifact_agent_policy_drives_cc_init_data_hash() {
         .unwrap();
 }
 
+#[test]
+fn trustee_policy_copy_omits_only_duplicated_agent_policy_text() {
+    let artifacts = signing_artifacts(descriptor());
+    let artifact = signed_policy_artifact(&artifacts, &SigningKey::from_bytes(&[0x33; 32]));
+    let mut expected = serde_json::to_value(&artifact).unwrap();
+    expected
+        .as_object_mut()
+        .unwrap()
+        .remove("agent_policy_text");
+
+    let actual: serde_json::Value =
+        serde_json::from_str(&super::trustee_policy_json(&artifact).unwrap()).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn rejects_rendered_cc_init_data_hash_mismatch() {
+    let artifacts = signing_artifacts(descriptor());
+    let err = artifacts
+        .validate_rendered_cc_init_data_hash(&"00".repeat(32))
+        .unwrap_err();
+
+    assert!(
+        matches!(err, SigningServiceError::Mismatch(field) if field == "expected_cc_init_data_hash")
+    );
+}
+
 fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> ConfidentialApp {
     let image = format!("ghcr.io/enclava-labs/demo@{}", descriptor.image_digest);
     ConfidentialApp {
@@ -569,11 +656,13 @@ fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> Confide
             trustee_policy_read_available: true,
             workload_artifacts_url: Some("https://api.example.test/artifacts".to_string()),
             tls_certificate_broker_url: None,
+            amd_kds_base_url: None,
             trustee_policy_url: Some("https://kbs.example.test/policy".to_string()),
             local_workload_artifacts_json: None,
             local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: Some("bb".repeat(32)),
             signing_service_pubkey_hex: Some("bb".repeat(32)),
+            verification_material: None,
         },
         egress_mode: enclava_engine::types::EgressMode::Restricted,
         public_internet_egress_excluded_cidrs: Vec::new(),

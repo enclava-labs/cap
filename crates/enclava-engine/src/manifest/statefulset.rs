@@ -3,7 +3,9 @@
 use k8s_openapi::api::apps::v1::{
     StatefulSet, StatefulSetPersistentVolumeClaimRetentionPolicy, StatefulSetSpec,
 };
-use k8s_openapi::api::core::v1::{PodSecurityContext, PodSpec, PodTemplateSpec};
+use k8s_openapi::api::core::v1::{
+    PodDNSConfig, PodDNSConfigOption, PodSecurityContext, PodSpec, PodTemplateSpec,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use std::collections::BTreeMap;
 
@@ -24,6 +26,10 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
 
     let mut pod_labels = BTreeMap::new();
     pod_labels.insert("app".to_string(), app.name.clone());
+    pod_labels.insert(
+        "enclava.dev/deployment-id".to_string(),
+        app.deployment_id.to_string(),
+    );
 
     let mut annotations = BTreeMap::new();
     annotations.insert(
@@ -129,6 +135,13 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
                     service_account_name: Some(app.service_account.clone()),
                     automount_service_account_token: Some(false),
                     enable_service_links: Some(false),
+                    dns_config: Some(PodDNSConfig {
+                        options: Some(vec![PodDNSConfigOption {
+                            name: Some("ndots".to_string()),
+                            value: Some("2".to_string()),
+                        }]),
+                        ..Default::default()
+                    }),
                     share_process_namespace: Some(true),
                     node_selector: Some(node_selector),
                     security_context: Some(PodSecurityContext {

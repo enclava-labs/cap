@@ -1,11 +1,12 @@
 use serde_json::{Value, json};
 
-use crate::types::{ConfidentialApp, EgressMode, EgressRule};
+use crate::types::{AttestationConfig, ConfidentialApp, EgressMode, EgressRule};
 
 /// Platform-default FQDN egress allowlist.
 ///
 /// Hardcoded so the operator cannot quietly drop these. Caddy needs ACME
-/// reachability to issue and renew TLS certs for tenant ingress.
+/// reachability to issue and renew TLS certs. AMD KDS traffic uses the internal
+/// relay below because Kata guests cannot use Cilium's DNS proxy.
 const PLATFORM_DEFAULT_FQDNS: &[&str] = &[
     "acme-v02.api.letsencrypt.org",
     "acme-staging-v02.api.letsencrypt.org",
@@ -93,12 +94,7 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
                     "ports": [
                         { "port": "53", "protocol": "UDP" },
                         { "port": "53", "protocol": "TCP" }
-                    ],
-                    "rules": {
-                        "dns": [
-                            { "matchPattern": "*" }
-                        ]
-                    }
+                    ]
                 }
             ]
         }),
@@ -156,6 +152,8 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
         }));
     }
 
+    egress.extend(amd_kds_relay_egress_rules(app));
+
     for rule in tls_certificate_broker_egress_rules(app) {
         egress.push(rule);
     }
@@ -185,6 +183,50 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
             "egress": egress,
         }
     })
+}
+
+fn amd_kds_relay_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
+    let Some(url) = app.attestation.amd_kds_base_url.as_deref() else {
+        return Vec::new();
+    };
+    let Some(authority) = parse_url_authority(url) else {
+        return Vec::new();
+    };
+    let Some((service_name, namespace)) = kubernetes_service_name(authority.host) else {
+        return vec![json!({
+            "toFQDNs": [{ "matchName": authority.host }],
+            "toPorts": [{ "ports": [{
+                "port": authority.port.to_string(),
+                "protocol": "TCP"
+            }] }],
+        })];
+    };
+    vec![
+        json!({
+            "toServices": [{
+                "k8sService": {
+                    "namespace": namespace,
+                    "serviceName": service_name
+                }
+            }],
+            "toPorts": [{ "ports": [{
+                "port": authority.port.to_string(),
+                "protocol": "TCP"
+            }] }]
+        }),
+        json!({
+            "toEndpoints": [{
+                "matchLabels": {
+                    "io.kubernetes.pod.namespace": namespace,
+                    "app.kubernetes.io/name": service_name
+                }
+            }],
+            "toPorts": [{ "ports": [{
+                "port": authority.port.to_string(),
+                "protocol": "TCP"
+            }] }]
+        }),
+    ]
 }
 
 fn public_internet_egress_rule(app: &ConfidentialApp) -> Value {
@@ -227,6 +269,9 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
     };
 
     if let Some((service_name, namespace)) = kubernetes_service_name(authority.host) {
+        // The broker may be any explicitly configured internal Service (for
+        // example a standalone CAP candidate), not only one literally named
+        // `cap-api`. The URL remains platform-supplied, never tenant input.
         let mut rules = vec![json!({
             "toServices": [
                 {
@@ -238,19 +283,17 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
             ],
             "toPorts": [{ "ports": [{ "port": authority.port.to_string(), "protocol": "TCP" }] }],
         })];
-        if service_name == "cap-api" {
-            rules.push(json!({
-                "toEndpoints": [
-                    {
-                        "matchLabels": {
-                            "io.kubernetes.pod.namespace": namespace,
-                            "app.kubernetes.io/name": service_name
-                        }
+        rules.push(json!({
+            "toEndpoints": [
+                {
+                    "matchLabels": {
+                        "io.kubernetes.pod.namespace": namespace,
+                        "app.kubernetes.io/name": service_name
                     }
-                ],
-                "toPorts": [{ "ports": [{ "port": "3000", "protocol": "TCP" }] }],
-            }));
-        }
+                }
+            ],
+            "toPorts": [{ "ports": [{ "port": "3000", "protocol": "TCP" }] }],
+        }));
         return rules;
     }
 
@@ -261,19 +304,21 @@ fn tls_certificate_broker_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
 }
 
 fn cap_api_tee_ingress_rule(app: &ConfidentialApp) -> Option<Value> {
-    let namespace = cap_api_namespace_for_app(app)?;
+    let (service_name, namespace) =
+        cap_api_service_for_attestation(&app.attestation, &app.api_url)?;
     Some(json!({
         "fromEndpoints": [
             {
                 "matchLabels": {
                     "io.kubernetes.pod.namespace": namespace,
-                    "app.kubernetes.io/name": "cap-api"
+                    "app.kubernetes.io/name": service_name
                 }
             }
         ],
         "toPorts": [
             {
                 "ports": [
+                    { "port": "10443", "protocol": "TCP" },
                     { "port": "8443", "protocol": "TCP" }
                 ]
             }
@@ -281,19 +326,34 @@ fn cap_api_tee_ingress_rule(app: &ConfidentialApp) -> Option<Value> {
     }))
 }
 
-fn cap_api_namespace_for_app(app: &ConfidentialApp) -> Option<&str> {
+/// Return the CAP namespace only when workload configuration explicitly uses
+/// an internal CAP Service. Tenant policy generation and CAP status observation
+/// share this predicate so the direct TEE path is selected only when its
+/// ingress rule is present.
+pub fn cap_api_namespace_for_attestation<'a>(
+    attestation: &'a AttestationConfig,
+    api_url: &'a str,
+) -> Option<&'a str> {
+    cap_api_service_for_attestation(attestation, api_url).map(|(_, namespace)| namespace)
+}
+
+fn cap_api_service_for_attestation<'a>(
+    attestation: &'a AttestationConfig,
+    api_url: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    // `trustee_policy_url` is intentionally absent: independent-verification
+    // deployments hand the policy to init as a local file URI. It is not a
+    // CAP network dependency and must not select CAP ingress policy.
     [
-        app.attestation.tls_certificate_broker_url.as_deref(),
-        app.attestation.workload_artifacts_url.as_deref(),
-        app.attestation.trustee_policy_url.as_deref(),
-        Some(app.api_url.as_str()),
+        attestation.tls_certificate_broker_url.as_deref(),
+        attestation.workload_artifacts_url.as_deref(),
+        Some(api_url),
     ]
     .into_iter()
     .flatten()
     .find_map(|url| {
         let authority = parse_url_authority(url)?;
-        let (service_name, namespace) = kubernetes_service_name(authority.host)?;
-        (service_name == "cap-api").then_some(namespace)
+        kubernetes_service_name(authority.host)
     })
 }
 

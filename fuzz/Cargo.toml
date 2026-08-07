@@ -1,0 +1,34 @@
+[package]
+name = "enclava-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+enclava-common = { path = "../crates/enclava-common", features = ["descriptor"] }
+enclava-verifier = { path = "../crates/enclava-verifier", features = ["fuzzing"] }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "parse_proof_bundle"
+path = "fuzz_targets/parse_proof_bundle.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ce_v1_decode"
+path = "fuzz_targets/ce_v1_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "verify_rsa_pss_sha384"
+path = "fuzz_targets/verify_rsa_pss_sha384.rs"
+test = false
+doc = false
+
+[workspace]
+members = ["."]

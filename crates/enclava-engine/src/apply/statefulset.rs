@@ -1,15 +1,19 @@
 use k8s_openapi::api::apps::v1::StatefulSet;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::Api;
 
 use super::engine::{ApplyEngine, ApplyError};
+use super::generation::{MutationGeneration, apply_resource};
 
-/// Apply the StatefulSet via SSA WITHOUT `force` (Phase 11).
+/// Replace the StatefulSet exactly when CAP is its only non-status manager.
 ///
 /// The StatefulSet carries attestation-critical fields: `image`, `runtimeClassName`,
 /// `cc_init_data` annotations, and the signer-identity annotation. If a manager
-/// outside the control plane has set any of these, force-applying would silently
+/// outside the control plane has set any of these, replacing would silently
 /// overwrite their value and a follower-attacker could mask their tampering by
-/// re-claiming ownership on the next reconcile. We surface the conflict instead.
+/// re-claiming ownership on the next reconcile. We use no-force SSA in that case
+/// so the API server surfaces the conflict instead. Exact replacement is needed
+/// for CAP-created objects because their initial `Update` ownership otherwise
+/// retains fields later omitted from the desired manifest.
 ///
 /// On 409 Conflict: the API server returns a status object listing the conflicting
 /// fields and managers. We log a structured warning and return the kube error so
@@ -19,21 +23,20 @@ pub async fn apply_statefulset(
     engine: &ApplyEngine,
     namespace: &str,
     statefulset: &StatefulSet,
+    generation: MutationGeneration,
 ) -> Result<StatefulSet, ApplyError> {
     let name = statefulset.metadata.name.as_deref().unwrap_or("<unnamed>");
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
-    let pp = PatchParams::apply(&engine.config().field_manager);
-
-    match api.patch(name, &pp, &Patch::Apply(statefulset)).await {
+    match apply_resource(engine, &api, statefulset, generation, false, true).await {
         Ok(patched) => {
             tracing::info!(
                 namespace = %namespace,
                 statefulset = %name,
-                "StatefulSet applied via SSA (no-force)"
+                "StatefulSet converged"
             );
             Ok(patched)
         }
-        Err(kube::Error::Api(ae)) if ae.code == 409 => {
+        Err(ApplyError::Kube(kube::Error::Api(ae))) if ae.code == 409 => {
             tracing::warn!(
                 namespace = %namespace,
                 statefulset = %name,
@@ -43,6 +46,6 @@ pub async fn apply_statefulset(
             );
             Err(ApplyError::Kube(kube::Error::Api(ae)))
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e),
     }
 }

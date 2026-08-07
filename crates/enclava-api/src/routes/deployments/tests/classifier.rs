@@ -78,6 +78,102 @@ fn generic_deployment_response_reports_current_app_status_separately() {
 
     assert_eq!(response.status, "pending");
     assert_eq!(response.app_status, "running");
+    let observation = serde_json::to_value(&response.observation).expect("serialize observation");
+    assert_eq!(observation["state"], "partial");
+    assert_eq!(observation["reason"], "not_observed");
+    assert!(observation["deployment_id"].is_null());
+}
+
+#[test]
+fn generic_config_token_response_exposes_whole_second_signed_lifetime_contract() {
+    let issued_at = chrono::DateTime::parse_from_rfc3339("2026-07-18T12:30:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let response = GenericConfigTokenResponse {
+        deployment_id: Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap(),
+        token: "compact.jwt.signature".to_string(),
+        tee_url: "https://customer-app.test.tee.enclava.dev/.well-known/confidential/config"
+            .to_string(),
+        tee_resolve_ip: Some("192.0.2.77".parse().unwrap()),
+        expires_in_seconds: 299,
+        issued_at,
+        expires_at: issued_at + chrono::Duration::seconds(300),
+    };
+    let json = serde_json::to_value(response).unwrap();
+
+    assert_eq!(json["issued_at"], "2026-07-18T12:30:00Z");
+    assert_eq!(json["expires_at"], "2026-07-18T12:35:00Z");
+    assert_eq!(json["expires_in_seconds"], 299);
+    assert_eq!(json["tee_resolve_ip"], "192.0.2.77");
+}
+
+#[test]
+fn incomplete_setup_marker_blocks_idempotent_success() {
+    let app = idempotency_app();
+    let mut deployment = idempotency_deployment(&app);
+
+    assert!(
+        !deployment_setup_incomplete(&deployment),
+        "legacy accepted deployments without a setup marker remain retryable"
+    );
+    deployment.spec_snapshot["setup_state"] = serde_json::json!("dns_pending");
+    assert!(deployment_setup_incomplete(&deployment));
+    deployment.spec_snapshot["setup_state"] = serde_json::json!("cleanup_pending");
+    assert!(deployment_setup_incomplete(&deployment));
+    deployment.spec_snapshot["setup_state"] = serde_json::json!("accepted");
+    assert!(!deployment_setup_incomplete(&deployment));
+    deployment.spec_snapshot["setup_state"] = serde_json::json!("failed");
+    assert!(
+        !deployment_setup_incomplete(&deployment),
+        "a terminal setup failure on an existing app must not block future deploys"
+    );
+}
+
+#[test]
+fn stored_error_plaintext_is_redacted_from_public_and_generic_responses() {
+    const STORED_SECRET: &str = "pod 'tenant-pod' container 'tenant-app' last terminated with StartError exit 128: secret=private-key";
+    let app = idempotency_app();
+
+    let mut generic_deployment = idempotency_deployment(&app);
+    generic_deployment.error_message = Some(STORED_SECRET.to_string());
+    let generic = GenericDeploymentResponse::from_deployment(generic_deployment, &app);
+
+    let mut public_deployment = idempotency_deployment(&app);
+    public_deployment.error_message = Some(STORED_SECRET.to_string());
+    let public = DeploymentResponse::from_deployment(public_deployment, &app);
+
+    for response in [
+        serde_json::to_value(generic).expect("serialize generic response"),
+        serde_json::to_value(public).expect("serialize public response"),
+    ] {
+        let serialized = serde_json::to_string(&response).expect("serialize response value");
+        assert_eq!(response["error_message"], "deployment_error");
+        assert!(!serialized.contains(STORED_SECRET));
+        assert!(!serialized.contains("private-key"));
+    }
+}
+
+#[test]
+fn control_plane_supersession_code_is_preserved_across_deployment_responses() {
+    let app = idempotency_app();
+
+    let mut generic_deployment = idempotency_deployment(&app);
+    generic_deployment.error_message = Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR.to_string());
+    let generic = GenericDeploymentResponse::from_deployment(generic_deployment, &app);
+
+    let mut public_deployment = idempotency_deployment(&app);
+    public_deployment.error_message = Some(crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR.to_string());
+    let public = DeploymentResponse::from_deployment(public_deployment, &app);
+
+    for response in [
+        serde_json::to_value(generic).expect("serialize generic response"),
+        serde_json::to_value(public).expect("serialize public response"),
+    ] {
+        assert_eq!(
+            response["error_message"],
+            crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR
+        );
+    }
 }
 
 fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
@@ -121,11 +217,13 @@ fn attestation_config() -> AttestationConfig {
             trustee_policy_read_available: false,
             workload_artifacts_url: None,
             tls_certificate_broker_url: None,
+            amd_kds_base_url: None,
             trustee_policy_url: None,
             local_workload_artifacts_json: None,
             local_trustee_policy_json: None,
             platform_trustee_policy_pubkey_hex: None,
             signing_service_pubkey_hex: None,
+            verification_material: None,
         }
 }
 
@@ -188,7 +286,8 @@ fn deployment_descriptor_for_security_profile_tests()
             caddy_digest: "sha256:2222".to_string(),
         },
         api_signing_pubkey: "api-pubkey".to_string(),
-        expected_firmware_measurement: [3; 32],
+        independent_verification: true,
+        expected_firmware_measurement: [3; 32].into(),
         expected_runtime_class: "kata-qemu-snp".to_string(),
         kbs_resource_path: "default/cap-org-app-tls-owner".to_string(),
         unlock_mode: "password".to_string(),
@@ -336,16 +435,115 @@ fn signed_deploy_hash_validation_uses_local_artifact_delivery_mode() {
 
 #[test]
 fn signed_deploy_path_ensures_app_and_tee_dns_pair() {
-    let source = include_str!("../../deployments.rs");
-    let deploy_body = source
+    let route_source = include_str!("../../deployments.rs");
+    let deploy_body = route_source
         .split("pub async fn deploy")
         .nth(1)
         .expect("deploy route exists");
+    let job_source = include_str!("../../../deployment_jobs.rs");
 
     assert!(
-        deploy_body.contains("crate::dns::ensure_dns_pair"),
-        "signed deploy must ensure both app and TEE DNS hostnames"
+        deploy_body.contains("insert_setup_job") && deploy_body.contains("process_setup_job"),
+        "signed deploy must durably hand off DNS setup"
     );
+    assert!(
+        job_source.contains("crate::dns::ensure_dns_pair"),
+        "durable setup worker must ensure both app and TEE DNS hostnames"
+    );
+}
+
+#[test]
+fn signed_deploy_validation_precedes_atomic_candidate_commit() {
+    let source = include_str!("../../deployments.rs");
+    let deploy_body = source
+        .split("async fn deploy_app_candidate")
+        .nth(1)
+        .expect("deployment candidate function exists")
+        .split("/// GET /apps/{name}/deployments")
+        .next()
+        .expect("deployment candidate function body");
+
+    let transaction = deploy_body
+        .find("let mut tx = state.db.begin()")
+        .expect("accepted deployment transaction");
+    for validation in [
+        "validate_deployment_inputs",
+        "resolve_signed_policy_artifact",
+        "validate_rendered_cc_init_data_hash",
+    ] {
+        assert!(
+            deploy_body
+                .find(validation)
+                .expect("signed validation exists")
+                < transaction,
+            "{validation} must run before the accepted deployment transaction"
+        );
+    }
+    assert!(
+        transaction
+            < deploy_body
+                .find("INSERT INTO app_containers")
+                .expect("container candidate commit"),
+        "container rows must only change inside the accepted deployment transaction"
+    );
+    assert!(
+        deploy_body.contains("persist_workload_artifacts(\n            &mut *tx"),
+        "signed artifacts must commit in the same transaction"
+    );
+}
+
+#[test]
+fn first_generic_deployment_setup_is_durable_and_compensated_before_error_returns() {
+    let route_source = include_str!("../../deployments.rs");
+    let deploy_body = route_source
+        .split("async fn deploy_app_candidate")
+        .nth(1)
+        .expect("deployment candidate function exists")
+        .split("/// GET /apps/{name}/deployments")
+        .next()
+        .expect("deployment candidate function body");
+    let job_insert = deploy_body
+        .find("insert_setup_job")
+        .expect("durable deployment setup job");
+    let commit = deploy_body.find("tx.commit()").expect("candidate commit");
+    let setup = deploy_body
+        .find("process_setup_job")
+        .expect("recoverable DNS setup");
+    assert!(
+        job_insert < commit && commit < setup,
+        "setup job must commit with the candidate before external DNS work"
+    );
+
+    let job_source = include_str!("../../../deployment_jobs.rs");
+    let setup_body = job_source
+        .split("pub async fn process_setup_job")
+        .nth(1)
+        .expect("durable setup worker exists")
+        .split("async fn load_leased_payload")
+        .next()
+        .expect("durable setup worker body");
+    let durable_failure = setup_body
+        .find("mark_setup_failed")
+        .expect("durable failure marker");
+    let compensation = setup_body
+        .find("process_cleanup_job")
+        .expect("setup compensation");
+    assert!(durable_failure < compensation);
+
+    let compensation_body = job_source
+        .split("async fn attempt_setup_cleanup")
+        .nth(1)
+        .expect("setup compensation helper exists")
+        .split("/// Start the durable dispatcher")
+        .next()
+        .expect("setup compensation helper body");
+    let dns_cleanup = compensation_body
+        .find("delete_all_dns_records_for_app")
+        .expect("DNS cleanup");
+    let app_cleanup = compensation_body
+        .find("DELETE FROM apps WHERE id = $1")
+        .expect("new generic app cleanup");
+    assert!(dns_cleanup < app_cleanup);
 }
 
 #[test]
@@ -364,6 +562,51 @@ fn idempotent_retry_requires_same_deployment_payload() {
         err.1.0["error"].as_str(),
         Some("external_id already exists with different app.name")
     );
+}
+
+#[test]
+fn idempotent_retry_preserves_none_partial_and_full_resource_requests() {
+    let app = idempotency_app();
+
+    let cases = [
+        None,
+        Some(DeployResources {
+            cpu: Some("750m".to_string()),
+            memory: None,
+            storage: None,
+        }),
+        Some(DeployResources {
+            cpu: Some("2".to_string()),
+            memory: Some("3Gi".to_string()),
+            storage: Some("7Gi".to_string()),
+        }),
+    ];
+
+    for requested in cases {
+        let mut deployment = idempotency_deployment(&app);
+        deployment.spec_snapshot["resources"] =
+            serde_json::to_value(&requested).expect("serialize requested resources");
+        deployment.spec_snapshot["resolved_resources"] = serde_json::json!({
+            "cpu": requested
+                .as_ref()
+                .and_then(|resources| resources.cpu.as_deref())
+                .unwrap_or("1"),
+            "memory": requested
+                .as_ref()
+                .and_then(|resources| resources.memory.as_deref())
+                .unwrap_or("1Gi"),
+            "storage": requested
+                .as_ref()
+                .and_then(|resources| resources.storage.as_deref())
+                .unwrap_or("5Gi"),
+            "tls_storage": "2Gi",
+        });
+        let mut request = idempotency_request(&app.name);
+        request.workload.resources = requested;
+
+        ensure_idempotent_retry_matches(&deployment, &app, &request)
+            .expect("response-loss retry matches the original resource request");
+    }
 }
 
 #[test]
