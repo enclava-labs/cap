@@ -1,6 +1,6 @@
 # Enclava CAP
 
-### This is still in heavy development and not advisable to run in production 
+### This is still under heavy development and not advisable to run in production 
 
 Enclava CAP is the open-source control plane core for running OCI images as
 confidential workloads on Kubernetes. It targets Kata confidential containers
