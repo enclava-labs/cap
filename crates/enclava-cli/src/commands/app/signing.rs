@@ -196,18 +196,22 @@ pub(crate) async fn ensure_manual_deploy_keyring(
         Err(err) => return Err(err.into()),
     }
 
-    match api
+    let signing_owner = api
         .bootstrap_signing_service_owner(
             &org_name,
             &BootstrapSigningServiceRequest {
                 owner_pubkey_hex: hex::encode(owner_key.public.to_bytes()),
             },
         )
-        .await
+        .await?;
+    if signing_owner.org_id != org_id.to_string()
+        || signing_owner.state != "ready"
+        || signing_owner.owner_pubkey_fingerprint != hex::encode(owner_key.public.to_bytes())
     {
-        Ok(_) => {}
-        Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
-        Err(err) => return Err(err.into()),
+        return Err(
+            "policy signing service did not confirm the expected organization owner authority"
+                .into(),
+        );
     }
     Ok((org_id, org_name, owner_key))
 }
