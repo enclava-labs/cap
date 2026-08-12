@@ -4335,6 +4335,23 @@ pub async fn bootstrap_paas_keyring_signing_service(
     Ok((status, Json(response)))
 }
 
+pub async fn rotate_paas_keyring_owner(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Path(paas_org_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    validate_external_id(&paas_org_id, "paas_org_id")?;
+    let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
+    let org_name = auth.org_name.clone();
+    let parsed = parse_internal_body(body)?;
+    let Json(response) =
+        crate::routes::orgs::rotate_org_owner(auth, State(state), Path(org_name), Json(parsed))
+            .await?;
+    Ok((StatusCode::OK, Json(to_value(response)?)))
+}
+
 pub async fn issue_paas_signer_rotation_token(
     _auth: InternalAuth,
     State(state): State<AppState>,

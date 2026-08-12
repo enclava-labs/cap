@@ -3,9 +3,11 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::{ce_v1_bytes, ce_v1_hash};
+use enclava_common::crypto::owner_rotation_directive_bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -180,6 +182,26 @@ pub struct BootstrapSigningServiceResponse {
     pub org_id: Uuid,
     pub state: String,
     pub owner_pubkey_fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RotateOrgOwnerRequest {
+    pub version: i64,
+    pub keyring_payload: serde_json::Value,
+    pub signature: String,
+    pub replacement_signing_pubkey: String,
+    pub current_signing_pubkey: String,
+    pub signed_at: DateTime<Utc>,
+    pub reason: String,
+    pub rotation_signature: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RotateOrgOwnerResponse {
+    pub org_id: Uuid,
+    pub state: &'static str,
+    pub keyring_version: i64,
+    pub owner_fingerprint: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -720,6 +742,47 @@ fn signing_readiness_state(
     }
 }
 
+fn validate_rotated_members(
+    current: &SignedOrgKeyring,
+    replacement: &SignedOrgKeyring,
+    current_owner: &[u8; 32],
+    replacement_owner: &[u8; 32],
+) -> Result<(), &'static str> {
+    if current.members.len() != replacement.members.len() {
+        return Err("owner rotation must preserve every keyring member");
+    }
+    let mut replaced = 0;
+    for member in &current.members {
+        let next = replacement
+            .members
+            .iter()
+            .filter(|candidate| candidate.user_id == member.user_id)
+            .collect::<Vec<_>>();
+        if next.len() != 1 {
+            return Err("owner rotation requires one member entry per user");
+        }
+        let next = next[0];
+        if member.pubkey == *current_owner && member.role == SignedOrgKeyringRole::Owner {
+            replaced += 1;
+            if next.pubkey != *replacement_owner
+                || next.role != SignedOrgKeyringRole::Owner
+                || next.added_at != member.added_at
+            {
+                return Err("owner rotation may only replace the current owner public key");
+            }
+        } else if next.pubkey != member.pubkey
+            || next.role != member.role
+            || next.added_at != member.added_at
+        {
+            return Err("owner rotation must preserve non-owner keyring members");
+        }
+    }
+    if replaced != 1 {
+        return Err("current keyring must contain exactly one matching owner entry");
+    }
+    Ok(())
+}
+
 pub async fn bootstrap_signing_service_owner(
     auth: AuthContext,
     State(state): State<AppState>,
@@ -768,6 +831,234 @@ pub async fn bootstrap_signing_service_owner(
         org_id: response.org_id,
         state: response.state,
         owner_pubkey_fingerprint: response.owner_pubkey_fingerprint,
+    }))
+}
+
+pub async fn rotate_org_owner(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(org_name): Path<String>,
+    Json(body): Json<RotateOrgOwnerRequest>,
+) -> Result<Json<RotateOrgOwnerResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_scope(&auth, "org:admin")?;
+    let (org_id, caller_role) = active_membership(&state, &auth, &org_name).await?;
+    scopes::require_owner_role(caller_role)?;
+    crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    if body.reason.trim().is_empty() {
+        return Err(bad_request("rotation reason is required"));
+    }
+    if body.version < 2 {
+        return Err(bad_request("rotated keyring version must be at least two"));
+    }
+
+    let current_owner: [u8; 32] =
+        decode_hex_len("current_signing_pubkey", &body.current_signing_pubkey, 32)?
+            .try_into()
+            .map_err(|_| bad_request("current_signing_pubkey must decode to 32 bytes"))?;
+    let replacement_owner: [u8; 32] = decode_hex_len(
+        "replacement_signing_pubkey",
+        &body.replacement_signing_pubkey,
+        32,
+    )?
+    .try_into()
+    .map_err(|_| bad_request("replacement_signing_pubkey must decode to 32 bytes"))?;
+    if current_owner == replacement_owner {
+        return Err(bad_request(
+            "replacement owner public key must differ from current owner",
+        ));
+    }
+    let keyring_signature: [u8; 64] = decode_hex_len("signature", &body.signature, 64)?
+        .try_into()
+        .map_err(|_| bad_request("signature must decode to 64 bytes"))?;
+    let rotation_signature: [u8; 64] =
+        decode_hex_len("rotation_signature", &body.rotation_signature, 64)?
+            .try_into()
+            .map_err(|_| bad_request("rotation_signature must decode to 64 bytes"))?;
+    let replacement_key = VerifyingKey::from_bytes(&replacement_owner)
+        .map_err(|_| bad_request("replacement owner is not a valid Ed25519 key"))?;
+    let current_key = VerifyingKey::from_bytes(&current_owner)
+        .map_err(|_| bad_request("current owner is not a valid Ed25519 key"))?;
+    let replacement_keyring: SignedOrgKeyring =
+        serde_json::from_value(body.keyring_payload.clone()).map_err(|err| {
+            bad_request(&format!(
+                "keyring_payload is not a valid signed org keyring: {err}"
+            ))
+        })?;
+    if replacement_keyring.org_id != org_id || replacement_keyring.version != body.version as u64 {
+        return Err(bad_request("keyring payload does not match org/version"));
+    }
+    if !replacement_keyring.members.iter().any(|member| {
+        member.pubkey == replacement_owner && member.role == SignedOrgKeyringRole::Owner
+    }) {
+        return Err(bad_request(
+            "replacement owner must be present in the keyring with owner role",
+        ));
+    }
+    let canonical_bytes = canonical_keyring_bytes(&replacement_keyring);
+    replacement_key
+        .verify(&canonical_bytes, &Signature::from_bytes(&keyring_signature))
+        .map_err(|_| bad_request("replacement keyring signature verification failed"))?;
+    let directive = owner_rotation_directive_bytes(
+        org_id,
+        &current_owner,
+        &replacement_owner,
+        body.signed_at,
+        body.reason.trim(),
+    );
+    current_key
+        .verify(&directive, &Signature::from_bytes(&rotation_signature))
+        .map_err(|_| bad_request("owner rotation signature verification failed"))?;
+
+    let payload_bytes = serde_json::to_vec(&body.keyring_payload).map_err(|_| db_error())?;
+    let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+    crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
+        .await
+        .map_err(|_| db_error())?;
+    let current_role = scopes::active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
+    scopes::require_owner_role(current_role)?;
+
+    type AuthorityRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
+    let latest: AuthorityRow = sqlx::query_as(
+        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey
+           FROM org_keyrings ok
+           JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
+          WHERE ok.org_id = $1
+          ORDER BY ok.version DESC
+          LIMIT 1",
+    )
+    .bind(org_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| db_error())?
+    .ok_or_else(|| bad_request("org keyring must be uploaded before owner rotation"))?;
+
+    let (base_payload, expected_current_owner, insert_new_version) = if body.version == latest.0 {
+        if latest.1 != payload_bytes
+            || latest.2 != keyring_signature
+            || latest.3 != replacement_owner
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "keyring version already exists with different content"
+                })),
+            ));
+        }
+        let previous: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT ok.keyring_payload, usk.pubkey
+                   FROM org_keyrings ok
+                   JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
+                  WHERE ok.org_id = $1 AND ok.version = $2",
+        )
+        .bind(org_id)
+        .bind(body.version - 1)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| bad_request("previous keyring authority is unavailable"))?;
+        (previous.0, previous.1, false)
+    } else if body.version == latest.0 + 1 {
+        (latest.1, latest.3, true)
+    } else if body.version < latest.0 {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "keyring version is stale"})),
+        ));
+    } else {
+        return Err(bad_request("keyring version must increment by one"));
+    };
+    if expected_current_owner != current_owner {
+        return Err(bad_request(
+            "rotation signer does not match the current pinned owner",
+        ));
+    }
+    let current_keyring: SignedOrgKeyring =
+        serde_json::from_slice(&base_payload).map_err(|_| db_error())?;
+    if !current_keyring.members.iter().any(|member| {
+        member.user_id == auth.user_id
+            && member.pubkey == current_owner
+            && member.role == SignedOrgKeyringRole::Owner
+    }) {
+        return Err(bad_request(
+            "current pinned owner key does not belong to the authenticated owner",
+        ));
+    }
+    validate_rotated_members(
+        &current_keyring,
+        &replacement_keyring,
+        &current_owner,
+        &replacement_owner,
+    )
+    .map_err(bad_request)?;
+
+    let replacement_signing_key_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM user_signing_keys
+          WHERE user_id = $1 AND pubkey = $2 AND revoked_at IS NULL",
+    )
+    .bind(auth.user_id)
+    .bind(replacement_owner.as_slice())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| db_error())?
+    .ok_or_else(|| bad_request("replacement owner key is not registered for this user"))?;
+
+    let signing_service = state.signing_service.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "platform signing service is not configured"})),
+    ))?;
+    let rotated = signing_service
+        .rotate_owner(&crate::signing_service::RotateOwnerRequest {
+            org_id,
+            replacement_owner_pubkey_b64: B64.encode(replacement_owner),
+            signed_at: body.signed_at,
+            reason: body.reason.trim().to_string(),
+            signing_pubkey_b64: B64.encode(current_owner),
+            signature_b64: B64.encode(rotation_signature),
+        })
+        .await
+        .map_err(crate::routes::deployments::signing_error_response)?;
+    if rotated.org_id != org_id
+        || rotated.owner_pubkey_fingerprint != hex::encode(replacement_owner)
+    {
+        return Err(crate::routes::deployments::signing_error_response(
+            crate::signing_service::SigningServiceError::AuthorityStatus(
+                "owner rotation response does not match requested authority".to_string(),
+            ),
+        ));
+    }
+
+    if insert_new_version {
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(body.version)
+        .bind(&payload_bytes)
+        .bind(keyring_signature.as_slice())
+        .bind(replacement_signing_key_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+        sqlx::query(
+            "INSERT INTO audit_log (org_id, user_id, action, detail)
+             VALUES ($1, $2, 'org.keyring.owner.rotate', $3)",
+        )
+        .bind(org_id)
+        .bind(auth.user_id)
+        .bind(serde_json::json!({"version": body.version, "reason": body.reason.trim()}))
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+    }
+    tx.commit().await.map_err(|_| db_error())?;
+
+    Ok(Json(RotateOrgOwnerResponse {
+        org_id,
+        state: "ready",
+        keyring_version: body.version,
+        owner_fingerprint: hex::encode(Sha256::digest(replacement_owner)),
     }))
 }
 
@@ -1047,6 +1338,66 @@ mod tests {
         assert_ne!(fingerprint, public_key);
         assert_eq!(fingerprint, hex::encode(Sha256::digest(owner)));
         assert_eq!(owner_key_fingerprint("not-hex"), None);
+    }
+
+    #[test]
+    fn owner_rotation_preserves_every_member_except_owner_public_key() {
+        let org_id = Uuid::new_v4();
+        let owner_id = Uuid::new_v4();
+        let deployer_id = Uuid::new_v4();
+        let added_at = Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 0).unwrap();
+        let current_owner = [0x11; 32];
+        let replacement_owner = [0x22; 32];
+        let current = SignedOrgKeyring {
+            org_id,
+            version: 1,
+            members: vec![
+                SignedOrgKeyringMember {
+                    user_id: owner_id,
+                    pubkey: current_owner,
+                    role: SignedOrgKeyringRole::Owner,
+                    added_at,
+                },
+                SignedOrgKeyringMember {
+                    user_id: deployer_id,
+                    pubkey: [0x33; 32],
+                    role: SignedOrgKeyringRole::Deployer,
+                    added_at,
+                },
+            ],
+            updated_at: added_at,
+        };
+        let replacement = SignedOrgKeyring {
+            org_id,
+            version: 2,
+            members: vec![
+                SignedOrgKeyringMember {
+                    user_id: owner_id,
+                    pubkey: replacement_owner,
+                    role: SignedOrgKeyringRole::Owner,
+                    added_at,
+                },
+                SignedOrgKeyringMember {
+                    user_id: deployer_id,
+                    pubkey: [0x33; 32],
+                    role: SignedOrgKeyringRole::Deployer,
+                    added_at,
+                },
+            ],
+            updated_at: added_at,
+        };
+
+        assert!(
+            validate_rotated_members(&current, &replacement, &current_owner, &replacement_owner)
+                .is_ok()
+        );
+
+        let mut tampered = replacement;
+        tampered.members[1].role = SignedOrgKeyringRole::Admin;
+        assert_eq!(
+            validate_rotated_members(&current, &tampered, &current_owner, &replacement_owner),
+            Err("owner rotation must preserve non-owner keyring members")
+        );
     }
 
     async fn database_test_pool() -> sqlx::PgPool {

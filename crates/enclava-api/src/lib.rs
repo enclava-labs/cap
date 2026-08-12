@@ -226,6 +226,10 @@ fn internal_routes() -> Router<AppState> {
             axum::routing::post(routes::internal::bootstrap_paas_keyring_signing_service),
         )
         .route(
+            "/internal/paas/orgs/{paas_org_id}/keyring/rotate-owner",
+            axum::routing::post(routes::internal::rotate_paas_keyring_owner),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/signer/rotation-token",
             axum::routing::post(routes::internal::issue_paas_signer_rotation_token),
         )
@@ -374,6 +378,10 @@ fn org_routes() -> Router<AppState> {
         .route(
             "/orgs/{name}/keyring/bootstrap-signing-service",
             axum::routing::post(routes::orgs::bootstrap_signing_service_owner),
+        )
+        .route(
+            "/orgs/{name}/keyring/rotate-owner",
+            axum::routing::post(routes::orgs::rotate_org_owner),
         )
 }
 

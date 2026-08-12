@@ -776,6 +776,22 @@ impl ApiClient {
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
     }
+
+    pub async fn rotate_org_owner(
+        &self,
+        org_name: &str,
+        req: &RotateOrgOwnerRequest,
+    ) -> Result<RotateOrgOwnerResponse, ApiError> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/orgs/{org_name}/keyring/rotate-owner")))
+            .headers(self.auth_headers()?)
+            .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
 }
 
 fn path_segment(value: &str) -> String {

@@ -206,6 +206,27 @@ impl SigningServiceClient {
         }
         Ok(response.json().await?)
     }
+
+    pub async fn rotate_owner(
+        &self,
+        request: &RotateOwnerRequest,
+    ) -> Result<RotateOwnerResponse, SigningServiceError> {
+        let url = self
+            .base_url
+            .join("rotate-owner")
+            .map_err(|err| SigningServiceError::InvalidUrl(err.to_string()))?;
+        let mut builder = self.http.post(url).json(request);
+        if let Some(token) = self.bearer_token.as_deref() {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(SigningServiceError::Upstream { status, body });
+        }
+        Ok(response.json().await?)
+    }
 }
 
 fn signing_service_timeout_from_env() -> Result<Duration, SigningServiceError> {
@@ -265,6 +286,24 @@ pub struct OwnerStatusResponse {
     pub version: Option<i64>,
     pub owner_pubkey_hex: Option<String>,
     pub last_changed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RotateOwnerRequest {
+    pub org_id: Uuid,
+    pub replacement_owner_pubkey_b64: String,
+    pub signed_at: DateTime<Utc>,
+    pub reason: String,
+    pub signing_pubkey_b64: String,
+    pub signature_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RotateOwnerResponse {
+    pub org_id: Uuid,
+    pub version: u64,
+    pub owner_pubkey_fingerprint: String,
+    pub rotated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]

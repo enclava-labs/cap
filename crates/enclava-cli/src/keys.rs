@@ -294,6 +294,12 @@ pub fn load_or_create_recovery_seed(paths: &CliPaths) -> Result<[u8; 32], KeysEr
     Ok(seed)
 }
 
+pub fn generate_recovery_seed() -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    seed
+}
+
 pub fn seed_fingerprint(seed: &[u8; 32]) -> String {
     hex::encode(Sha256::digest(seed))
 }
