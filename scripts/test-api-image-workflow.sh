@@ -70,6 +70,7 @@ for required in \
   "target=runtime-debug" \
   "ghcr.io/enclava-labs/enclava-api" \
   "dist/enclava-api-image.txt" \
+  "dist/enclava-api-migration.txt" \
   "dist/enclava-api-signer-identity.txt" \
   'signer_subject="https://github.com/${{ github.workflow_ref }}"' \
   "cosign sign --yes" \
@@ -89,6 +90,9 @@ grep -Fq -- "serviceAccountName: enclava-api" "$DEPLOYMENT" \
   || fail "API Deployment must use its Kubernetes reconciliation identity"
 grep -Fq -- "automountServiceAccountToken: true" "$DEPLOYMENT" \
   || fail "API Deployment must mount Kubernetes credentials"
+grep -A1 -F -- "name: DATABASE_MIGRATION_MODE" "$DEPLOYMENT" \
+  | grep -Fq -- "value: verify" \
+  || fail "API Deployment must leave migrations to the release Job"
 [[ "$(grep -Fc -- "app.kubernetes.io/name: cap-api" "$DEPLOYMENT")" -ge 2 ]] \
   || fail "API Deployment and pod template must carry the tenant-policy CAP identity"
 grep -Fq -- 'CAP_DISABLE_EDGE_RECONCILIATION: "true"' "$COMPOSE" \

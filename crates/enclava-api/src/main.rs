@@ -710,9 +710,11 @@ async fn main() {
         .await
         .expect("failed to connect to database");
 
-    enclava_api::db::pool::run_migrations(&pool)
+    let migration_mode =
+        enclava_api::db::pool::MigrationMode::from_env().expect("invalid database migration mode");
+    enclava_api::db::pool::prepare_schema(&pool, migration_mode)
         .await
-        .expect("failed to run migrations");
+        .expect("database schema is not ready for this binary");
 
     let signing_key = load_signing_key().expect("failed to load API signing key");
     tracing::info!(
