@@ -4237,6 +4237,20 @@ pub async fn get_paas_keyring(
     Ok(Json(to_value(response)?))
 }
 
+pub async fn get_paas_signing_readiness(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Path(paas_org_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_external_id(&paas_org_id, "paas_org_id")?;
+    let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
+    let org_name = auth.org_name.clone();
+    let Json(response) =
+        crate::routes::orgs::get_signing_readiness(auth, State(state), Path(org_name)).await?;
+    Ok(Json(to_value(response)?))
+}
+
 pub async fn put_paas_keyring(
     _auth: InternalAuth,
     State(state): State<AppState>,

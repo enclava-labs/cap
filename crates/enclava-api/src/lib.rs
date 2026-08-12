@@ -218,6 +218,10 @@ fn internal_routes() -> Router<AppState> {
                 .put(routes::internal::put_paas_keyring),
         )
         .route(
+            "/internal/paas/orgs/{paas_org_id}/signing-readiness",
+            axum::routing::get(routes::internal::get_paas_signing_readiness),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}/keyring/bootstrap-signing-service",
             axum::routing::post(routes::internal::bootstrap_paas_keyring_signing_service),
         )

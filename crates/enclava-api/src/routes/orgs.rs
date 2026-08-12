@@ -182,6 +182,24 @@ pub struct BootstrapSigningServiceResponse {
     pub owner_pubkey_fingerprint: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct SigningReadinessResponse {
+    pub org_id: Uuid,
+    pub state: &'static str,
+    pub keyring_version: Option<i64>,
+    pub keyring_fingerprint: Option<String>,
+    pub owner_fingerprint: Option<String>,
+    pub last_changed_at: Option<DateTime<Utc>>,
+    pub authorized_signers: Vec<AuthorizedSignerResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AuthorizedSignerResponse {
+    pub user_id: Uuid,
+    pub role: &'static str,
+    pub fingerprint: String,
+}
+
 type KeyringRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
 
 #[derive(Debug, Deserialize)]
@@ -587,6 +605,116 @@ pub async fn get_keyring(
     }))
 }
 
+pub async fn get_signing_readiness(
+    auth: AuthContext,
+    State(state): State<AppState>,
+    Path(org_name): Path<String>,
+) -> Result<Json<SigningReadinessResponse>, (StatusCode, Json<serde_json::Value>)> {
+    scopes::require_member(&auth)?;
+    let (org_id, _) = active_membership(&state, &auth, &org_name).await?;
+    let signing_service = state.signing_service.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "platform signing service is not configured"})),
+    ))?;
+
+    let row: Option<KeyringRow> = sqlx::query_as(
+        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey
+         FROM org_keyrings ok
+         JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
+         WHERE ok.org_id = $1
+         ORDER BY ok.version DESC
+         LIMIT 1",
+    )
+    .bind(org_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| db_error())?;
+    let owner_status = signing_service
+        .owner_status(org_id)
+        .await
+        .map_err(crate::routes::deployments::signing_error_response)?;
+    if owner_status.org_id != org_id
+        || !matches!(owner_status.state.as_str(), "not_configured" | "ready")
+    {
+        return Err(crate::routes::deployments::signing_error_response(
+            crate::signing_service::SigningServiceError::Mismatch(
+                "owner status does not match the requested organization".to_string(),
+            ),
+        ));
+    }
+    let service_owner = owner_status
+        .owner_pubkey_hex
+        .as_deref()
+        .map(|raw| decode_hex_len("owner_pubkey_hex", raw, 32))
+        .transpose()
+        .map_err(|_| {
+            crate::routes::deployments::signing_error_response(
+                crate::signing_service::SigningServiceError::Mismatch(
+                    "owner status contains an invalid public key".to_string(),
+                ),
+            )
+        })?;
+
+    let Some((version, payload_bytes, _signature, signing_pubkey)) = row else {
+        return Ok(Json(SigningReadinessResponse {
+            org_id,
+            state: signing_readiness_state(None, service_owner.as_deref()),
+            keyring_version: None,
+            keyring_fingerprint: None,
+            owner_fingerprint: owner_status
+                .owner_pubkey_hex
+                .as_deref()
+                .and_then(owner_key_fingerprint),
+            last_changed_at: owner_status.last_changed_at,
+            authorized_signers: Vec::new(),
+        }));
+    };
+
+    let keyring: SignedOrgKeyring =
+        serde_json::from_slice(&payload_bytes).map_err(|_| db_error())?;
+    let keyring_fingerprint = hex::encode(Sha256::digest(canonical_keyring_bytes(&keyring)));
+    let authorized_signers = keyring
+        .members
+        .iter()
+        .map(|member| AuthorizedSignerResponse {
+            user_id: member.user_id,
+            role: member.role.as_str(),
+            fingerprint: hex::encode(Sha256::digest(member.pubkey)),
+        })
+        .collect();
+    let state_name = signing_readiness_state(Some(&signing_pubkey), service_owner.as_deref());
+
+    Ok(Json(SigningReadinessResponse {
+        org_id,
+        state: state_name,
+        keyring_version: Some(version),
+        keyring_fingerprint: Some(keyring_fingerprint),
+        owner_fingerprint: owner_status
+            .owner_pubkey_hex
+            .as_deref()
+            .and_then(owner_key_fingerprint),
+        last_changed_at: owner_status.last_changed_at,
+        authorized_signers,
+    }))
+}
+
+fn owner_key_fingerprint(owner_pubkey_hex: &str) -> Option<String> {
+    let bytes = hex::decode(owner_pubkey_hex).ok()?;
+    (bytes.len() == 32).then(|| hex::encode(Sha256::digest(bytes)))
+}
+
+fn signing_readiness_state(
+    keyring_owner: Option<&[u8]>,
+    service_owner: Option<&[u8]>,
+) -> &'static str {
+    match (keyring_owner, service_owner) {
+        (None, None) => "not_configured",
+        (Some(keyring), Some(service)) if keyring == service => "ready",
+        (Some(_), Some(_)) => "drifted",
+        _ => "recovery_required",
+    }
+}
+
 pub async fn bootstrap_signing_service_owner(
     auth: AuthContext,
     State(state): State<AppState>,
@@ -885,6 +1013,36 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
+
+    #[test]
+    fn signing_readiness_requires_both_authorities_to_agree() {
+        let owner = [0x11; 32];
+        let other = [0x22; 32];
+        assert_eq!(signing_readiness_state(None, None), "not_configured");
+        assert_eq!(signing_readiness_state(Some(&owner), Some(&owner)), "ready");
+        assert_eq!(
+            signing_readiness_state(Some(&owner), Some(&other)),
+            "drifted"
+        );
+        assert_eq!(
+            signing_readiness_state(Some(&owner), None),
+            "recovery_required"
+        );
+        assert_eq!(
+            signing_readiness_state(None, Some(&owner)),
+            "recovery_required"
+        );
+    }
+
+    #[test]
+    fn owner_fingerprint_is_a_digest_not_the_public_key() {
+        let owner = [0x11; 32];
+        let public_key = hex::encode(owner);
+        let fingerprint = owner_key_fingerprint(&public_key).expect("valid owner key");
+        assert_ne!(fingerprint, public_key);
+        assert_eq!(fingerprint, hex::encode(Sha256::digest(owner)));
+        assert_eq!(owner_key_fingerprint("not-hex"), None);
+    }
 
     async fn database_test_pool() -> sqlx::PgPool {
         let database_url = std::env::var("DATABASE_URL")

@@ -183,6 +183,27 @@ impl SigningServiceClient {
         }
         Ok(response.json().await?)
     }
+
+    pub async fn owner_status(
+        &self,
+        org_id: Uuid,
+    ) -> Result<OwnerStatusResponse, SigningServiceError> {
+        let url = self
+            .base_url
+            .join(&format!("orgs/{org_id}/owner"))
+            .map_err(|err| SigningServiceError::InvalidUrl(err.to_string()))?;
+        let mut builder = self.http.get(url);
+        if let Some(token) = self.bearer_token.as_deref() {
+            builder = builder.bearer_auth(token);
+        }
+        let response = builder.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(SigningServiceError::Upstream { status, body });
+        }
+        Ok(response.json().await?)
+    }
 }
 
 fn signing_service_timeout_from_env() -> Result<Duration, SigningServiceError> {
@@ -233,6 +254,15 @@ pub struct BootstrapOrgResponse {
     pub org_id: Uuid,
     pub state: String,
     pub owner_pubkey_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerStatusResponse {
+    pub org_id: Uuid,
+    pub state: String,
+    pub version: Option<i64>,
+    pub owner_pubkey_hex: Option<String>,
+    pub last_changed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
