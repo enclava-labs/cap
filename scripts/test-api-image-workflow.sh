@@ -70,6 +70,7 @@ for required in \
   "target=runtime-debug" \
   "ghcr.io/enclava-labs/enclava-api" \
   "dist/enclava-api-image.txt" \
+  "dist/enclava-api-migration.txt" \
   "dist/enclava-api-signer-identity.txt" \
   'signer_subject="https://github.com/${{ github.workflow_ref }}"' \
   "cosign sign --yes" \
