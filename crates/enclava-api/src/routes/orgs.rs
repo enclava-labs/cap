@@ -633,11 +633,16 @@ pub async fn get_signing_readiness(
         .owner_status(org_id)
         .await
         .map_err(crate::routes::deployments::signing_error_response)?;
-    if owner_status.org_id != org_id
-        || !matches!(owner_status.state.as_str(), "not_configured" | "ready")
-    {
+    let owner_state_consistent = matches!(
+        (
+            owner_status.state.as_str(),
+            owner_status.owner_pubkey_hex.as_ref()
+        ),
+        ("not_configured", None) | ("ready", Some(_))
+    );
+    if owner_status.org_id != org_id || !owner_state_consistent {
         return Err(crate::routes::deployments::signing_error_response(
-            crate::signing_service::SigningServiceError::Mismatch(
+            crate::signing_service::SigningServiceError::AuthorityStatus(
                 "owner status does not match the requested organization".to_string(),
             ),
         ));
@@ -649,7 +654,7 @@ pub async fn get_signing_readiness(
         .transpose()
         .map_err(|_| {
             crate::routes::deployments::signing_error_response(
-                crate::signing_service::SigningServiceError::Mismatch(
+                crate::signing_service::SigningServiceError::AuthorityStatus(
                     "owner status contains an invalid public key".to_string(),
                 ),
             )

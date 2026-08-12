@@ -63,6 +63,8 @@ pub enum SigningServiceError {
     Blob(String),
     #[error("signing artifact does not match deployment: {0}")]
     Mismatch(String),
+    #[error("signing authority status is invalid: {0}")]
+    AuthorityStatus(String),
     #[error("signed policy artifact signature verification failed")]
     InvalidSignature,
     #[error("signing service HTTP error: {0}")]
