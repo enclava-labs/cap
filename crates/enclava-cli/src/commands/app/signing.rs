@@ -91,7 +91,6 @@ pub(crate) struct ActiveUserOrg {
     pub(crate) user_id: Uuid,
     pub(crate) org_id: Uuid,
     pub(crate) org_name: String,
-    pub(crate) is_personal: bool,
 }
 
 pub(crate) async fn resolve_current_user_org(
@@ -102,7 +101,6 @@ pub(crate) async fn resolve_current_user_org(
         user_id: Uuid::parse_str(&me.user_id)?,
         org_id: Uuid::parse_str(&me.active_org.id)?,
         org_name: me.active_org.name,
-        is_personal: me.active_org.is_personal,
     })
 }
 
@@ -119,25 +117,6 @@ async fn register_public_key(
     Ok(())
 }
 
-async fn upload_keyring(
-    api: &ApiClient,
-    org_name: &str,
-    envelope: &OrgKeyringEnvelope,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = api
-        .put_org_keyring(
-            org_name,
-            &PutOrgKeyringRequest {
-                version: envelope.keyring.version,
-                keyring_payload: serde_json::to_value(&envelope.keyring)?,
-                signature: hex::encode(envelope.signature.to_bytes()),
-                signing_pubkey: hex::encode(envelope.signing_pubkey.to_bytes()),
-            },
-        )
-        .await?;
-    Ok(())
-}
-
 pub(crate) async fn ensure_manual_deploy_keyring(
     api: &ApiClient,
     paths: &CliPaths,
@@ -147,7 +126,9 @@ pub(crate) async fn ensure_manual_deploy_keyring(
     let user_id = active.user_id;
     let org_id = active.org_id;
     let org_name = active.org_name.clone();
-    let seed = keys::load_or_create_recovery_seed(paths)?;
+    let seed = keys::load_recovery_seed(paths)?.ok_or(
+        "signing authority is not set up; run `enclava key setup --backup-out <offline-backup.json>` first",
+    )?;
     let owner_key = keys::derive_org_owner_key(user_id, org_id, &seed)?;
     register_public_key(api, &owner_key.public).await?;
 
@@ -185,18 +166,10 @@ pub(crate) async fn ensure_manual_deploy_keyring(
             store_keyring_envelope(&org_id, &envelope)?;
         }
         Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {
-            if !active.is_personal {
-                return Err(
-                    "org keyring is missing for a non-personal org; team keyring onboarding is not part of the manual MVP"
-                        .into(),
-                );
-            }
-            let now = Utc::now();
-            let keyring = single_member_keyring(org_id, 1, &owner_key, Role::Owner, now);
-            let envelope = sign_keyring(&owner_key, keyring);
-            store_trusted_owner(&org_id, &owner_key.public)?;
-            store_keyring_envelope(&org_id, &envelope)?;
-            upload_keyring(api, &org_name, &envelope).await?;
+            return Err(
+                "organization signing authority is missing; run `enclava key setup --backup-out <offline-backup.json>` first"
+                    .into(),
+            );
         }
         Err(err) => return Err(err.into()),
     }

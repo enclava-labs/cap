@@ -24,9 +24,8 @@ use enclava_cli::descriptor::{
     build_descriptor, cap_app_oci_runtime_spec,
 };
 use enclava_cli::keyring::{
-    OrgKeyringEnvelope, Role, keyring_fingerprint, load_keyring_envelope, load_trusted_owner,
-    member_allows_deploy, sign_keyring, single_member_keyring, store_keyring_envelope,
-    store_trusted_owner, verify_keyring,
+    OrgKeyringEnvelope, keyring_fingerprint, load_keyring_envelope, load_trusted_owner,
+    member_allows_deploy, store_keyring_envelope, store_trusted_owner, verify_keyring,
 };
 use enclava_cli::keys;
 use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, verify_envelope};
