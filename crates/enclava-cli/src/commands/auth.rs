@@ -104,7 +104,7 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
     config::save_config(&paths, &updated_config)?;
 
     let api = ApiClient::from_config(&updated_config, &creds);
-    ensure_manual_deploy_keyring(&api, &paths).await?;
+    ensure_manual_deploy_keyring(&api, &paths, false).await?;
 
     println!("Account created. Logged in as {}.", resp.org_name);
     Ok(())
@@ -226,7 +226,7 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
     config::save_config(&paths, &updated_config)?;
 
     let api = ApiClient::from_config(&updated_config, &creds);
-    ensure_manual_deploy_keyring(&api, &paths).await?;
+    ensure_manual_deploy_keyring(&api, &paths, false).await?;
 
     println!("Logged in. Active org: {}", resp.org_name);
     Ok(())
@@ -289,7 +289,7 @@ async fn device_login(
 
                 let api = ApiClient::from_config(&updated_config, &creds);
                 let me = api.get_current_user().await?;
-                ensure_manual_deploy_keyring(&api, &paths).await?;
+                ensure_manual_deploy_keyring(&api, &paths, false).await?;
                 println!("Logged in as {}", me.display_name);
                 println!("Active org: {}", me.active_org.name);
                 return Ok(());

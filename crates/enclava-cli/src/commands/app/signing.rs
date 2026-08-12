@@ -141,6 +141,7 @@ async fn upload_keyring(
 pub(crate) async fn ensure_manual_deploy_keyring(
     api: &ApiClient,
     paths: &CliPaths,
+    require_signing_service: bool,
 ) -> Result<(Uuid, String, keys::UserSigningKey), Box<dyn std::error::Error>> {
     let active = resolve_current_user_org(api).await?;
     let user_id = active.user_id;
@@ -200,14 +201,26 @@ pub(crate) async fn ensure_manual_deploy_keyring(
         Err(err) => return Err(err.into()),
     }
 
-    let signing_owner = api
+    let signing_owner = match api
         .bootstrap_signing_service_owner(
             &org_name,
             &BootstrapSigningServiceRequest {
                 owner_pubkey_hex: hex::encode(owner_key.public.to_bytes()),
             },
         )
-        .await?;
+        .await
+    {
+        Ok(response) => Some(response),
+        Err(enclava_cli::api_client::ApiError::Api { status: 503, .. })
+            if !require_signing_service =>
+        {
+            None
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let Some(signing_owner) = signing_owner else {
+        return Ok((org_id, org_name, owner_key));
+    };
     if signing_owner.org_id != org_id.to_string()
         || !confirmed_bootstrap_state(&signing_owner.state)
         || signing_owner.owner_pubkey_fingerprint != hex::encode(owner_key.public.to_bytes())
@@ -563,7 +576,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         return Err("platform deployment context did not include api_signing_pubkey".into());
     }
 
-    let (org_id, org_name, deployer_key) = ensure_manual_deploy_keyring(api, paths).await?;
+    let (org_id, org_name, deployer_key) = ensure_manual_deploy_keyring(api, paths, true).await?;
 
     let app_id = Uuid::parse_str(&app.id)?;
     let trusted_owner = load_trusted_owner(&org_id)?

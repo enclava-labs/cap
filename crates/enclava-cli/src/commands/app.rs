@@ -298,7 +298,7 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
     let (api, paths, _cli_config) = build_api_client()?;
 
     let bootstrap_key = if app_config.unlock.mode == "password" {
-        let (org_id, org, _) = ensure_manual_deploy_keyring(&api, &paths).await?;
+        let (org_id, org, _) = ensure_manual_deploy_keyring(&api, &paths, false).await?;
         let seed = keys::load_or_create_recovery_seed(&paths)?;
         let app_seed = keys::derive_app_bootstrap_seed(org_id, &app_config.app.name, &seed)?;
         let signing_key = SigningKey::from_bytes(&app_seed);

@@ -175,6 +175,15 @@ fn manual_deploy_keyring_always_bootstraps_the_signing_service() {
 }
 
 #[test]
+fn deployment_requires_signing_service_while_account_setup_allows_generic_cap() {
+    let signing = include_str!("../signing.rs");
+    let auth = include_str!("../../auth.rs");
+
+    assert!(signing.contains("ensure_manual_deploy_keyring(api, paths, true).await?"));
+    assert!(auth.contains("ensure_manual_deploy_keyring(&api, &paths, false).await?"));
+}
+
+#[test]
 fn deployment_context_platform_release_is_verified_and_selected() {
     let envelope = PlatformReleaseEnvelope {
         payload: test_release(),

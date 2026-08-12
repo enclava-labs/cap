@@ -690,7 +690,7 @@ async fn template_bootstrap_pubkey_hash(
     if template.unlock_mode != "password" {
         return Ok(None);
     }
-    let (org_id, org_name, _) = ensure_manual_deploy_keyring(api, paths).await?;
+    let (org_id, org_name, _) = ensure_manual_deploy_keyring(api, paths, false).await?;
     let seed = keys::load_or_create_recovery_seed(paths)?;
     let app_seed = keys::derive_app_bootstrap_seed(org_id, instance_name, &seed)?;
     let signing_key = SigningKey::from_bytes(&app_seed);
