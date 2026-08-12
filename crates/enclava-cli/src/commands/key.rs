@@ -201,8 +201,6 @@ async fn verify_or_initialize_remote_keyring(
             }
             let keyring = single_member_keyring(org_id, 1, &owner, Role::Owner, chrono::Utc::now());
             let envelope = sign_keyring(&owner, keyring);
-            store_trusted_owner(&org_id, &owner.public)?;
-            store_keyring_envelope(&org_id, &envelope)?;
             upload_keyring(api, &org_name, &envelope).await?;
             match api
                 .bootstrap_signing_service_owner(
@@ -217,6 +215,11 @@ async fn verify_or_initialize_remote_keyring(
                 Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
                 Err(err) => return Err(err.into()),
             }
+            // Pin only authority CAP accepted. A concurrent team owner may win
+            // the first upload, in which case this setup must leave no losing
+            // local trust state behind.
+            store_trusted_owner(&org_id, &owner.public)?;
+            store_keyring_envelope(&org_id, &envelope)?;
             Ok((org_id, org_name, fingerprint(&owner.public)))
         }
         Err(err) => Err(err.into()),
@@ -848,6 +851,20 @@ mod tests {
         assert!(
             body.find("verify_or_initialize_remote_keyring").unwrap()
                 < body.find("store_seed_at").unwrap()
+        );
+        let initialize_missing = source
+            .split("async fn verify_or_initialize_remote_keyring(")
+            .nth(1)
+            .unwrap()
+            .split("Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {")
+            .nth(1)
+            .unwrap()
+            .split("Err(err) => Err(err.into())")
+            .next()
+            .unwrap();
+        assert!(
+            initialize_missing.find("upload_keyring").unwrap()
+                < initialize_missing.find("store_trusted_owner").unwrap()
         );
         assert!(body.contains("only an organization owner can create signing authority"));
     }
