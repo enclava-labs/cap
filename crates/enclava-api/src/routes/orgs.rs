@@ -974,13 +974,13 @@ pub async fn rotate_org_owner(
     }
     let current_keyring: SignedOrgKeyring =
         serde_json::from_slice(&base_payload).map_err(|_| db_error())?;
-    if !current_keyring.members.iter().any(|member| {
-        member.user_id == auth.user_id
-            && member.pubkey == current_owner
-            && member.role == SignedOrgKeyringRole::Owner
-    }) {
+    if !current_keyring
+        .members
+        .iter()
+        .any(|member| member.pubkey == current_owner && member.role == SignedOrgKeyringRole::Owner)
+    {
         return Err(bad_request(
-            "current pinned owner key does not belong to the authenticated owner",
+            "current pinned owner key is not an owner in the keyring",
         ));
     }
     validate_rotated_members(

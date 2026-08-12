@@ -747,15 +747,11 @@ async fn rotate_owner(
         .members
         .iter()
         .filter(|member| {
-            member.user_id == user_id
-                && member.pubkey == current_owner.public
-                && matches!(member.role, Role::Owner)
+            member.pubkey == current_owner.public && matches!(member.role, Role::Owner)
         })
         .collect();
     if owner_members.len() != 1 {
-        return Err(
-            "current keyring does not contain exactly one owner entry for this user".into(),
-        );
+        return Err("current keyring does not contain exactly one pinned owner entry".into());
     }
     if !yes
         && !dialoguer::Confirm::new()
@@ -774,10 +770,7 @@ async fn rotate_owner(
     next.version += 1;
     next.updated_at = chrono::Utc::now();
     for member in &mut next.members {
-        if member.user_id == user_id
-            && member.pubkey == current_owner.public
-            && matches!(member.role, Role::Owner)
-        {
+        if member.pubkey == current_owner.public && matches!(member.role, Role::Owner) {
             member.pubkey = replacement_owner.public;
         }
     }
