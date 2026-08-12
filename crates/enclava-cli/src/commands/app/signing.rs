@@ -14,6 +14,10 @@ fn env_hex32(name: &str) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>>
         .transpose()
 }
 
+fn confirmed_bootstrap_state(state: &str) -> bool {
+    matches!(state, "bootstrapped" | "already-bootstrapped")
+}
+
 pub(crate) fn platform_release_from_deployment_context(
     deployment_context: &DeploymentContextResponse,
 ) -> Result<Option<PlatformRelease>, Box<dyn std::error::Error>> {
@@ -205,7 +209,7 @@ pub(crate) async fn ensure_manual_deploy_keyring(
         )
         .await?;
     if signing_owner.org_id != org_id.to_string()
-        || signing_owner.state != "ready"
+        || !confirmed_bootstrap_state(&signing_owner.state)
         || signing_owner.owner_pubkey_fingerprint != hex::encode(owner_key.public.to_bytes())
     {
         return Err(
@@ -734,4 +738,17 @@ pub(crate) async fn build_signed_deploy_blobs(
         signed_policy_artifact: serde_json::to_string(&signed_policy_artifact)?,
         log_encryption,
     })
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::confirmed_bootstrap_state;
+
+    #[test]
+    fn accepts_only_policy_service_bootstrap_success_states() {
+        assert!(confirmed_bootstrap_state("bootstrapped"));
+        assert!(confirmed_bootstrap_state("already-bootstrapped"));
+        assert!(!confirmed_bootstrap_state("ready"));
+        assert!(!confirmed_bootstrap_state("failed"));
+    }
 }
