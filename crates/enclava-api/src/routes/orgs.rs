@@ -1006,23 +1006,46 @@ pub async fn rotate_org_owner(
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({"error": "platform signing service is not configured"})),
     ))?;
-    let rotated = signing_service
-        .rotate_owner(&crate::signing_service::RotateOwnerRequest {
-            org_id,
-            replacement_owner_pubkey_b64: B64.encode(replacement_owner),
-            signed_at: body.signed_at,
-            reason: body.reason.trim().to_string(),
-            signing_pubkey_b64: B64.encode(current_owner),
-            signature_b64: B64.encode(rotation_signature),
-        })
+    let owner_status = signing_service
+        .owner_status(org_id)
         .await
         .map_err(crate::routes::deployments::signing_error_response)?;
-    if rotated.org_id != org_id
-        || rotated.owner_pubkey_fingerprint != hex::encode(replacement_owner)
-    {
+    let service_owner = owner_status
+        .owner_pubkey_hex
+        .as_deref()
+        .and_then(|raw| hex::decode(raw).ok());
+    if owner_status.org_id != org_id || owner_status.state != "ready" {
         return Err(crate::routes::deployments::signing_error_response(
             crate::signing_service::SigningServiceError::AuthorityStatus(
-                "owner rotation response does not match requested authority".to_string(),
+                "owner status does not match requested authority".to_string(),
+            ),
+        ));
+    }
+    if service_owner.as_deref() == Some(current_owner.as_slice()) {
+        let rotated = signing_service
+            .rotate_owner(&crate::signing_service::RotateOwnerRequest {
+                org_id,
+                replacement_owner_pubkey_b64: B64.encode(replacement_owner),
+                signed_at: body.signed_at,
+                reason: body.reason.trim().to_string(),
+                signing_pubkey_b64: B64.encode(current_owner),
+                signature_b64: B64.encode(rotation_signature),
+            })
+            .await
+            .map_err(crate::routes::deployments::signing_error_response)?;
+        if rotated.org_id != org_id
+            || rotated.owner_pubkey_fingerprint != hex::encode(replacement_owner)
+        {
+            return Err(crate::routes::deployments::signing_error_response(
+                crate::signing_service::SigningServiceError::AuthorityStatus(
+                    "owner rotation response does not match requested authority".to_string(),
+                ),
+            ));
+        }
+    } else if service_owner.as_deref() != Some(replacement_owner.as_slice()) {
+        return Err(crate::routes::deployments::signing_error_response(
+            crate::signing_service::SigningServiceError::AuthorityStatus(
+                "signing service owner matches neither rotation key".to_string(),
             ),
         ));
     }

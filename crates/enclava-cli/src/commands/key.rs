@@ -615,11 +615,13 @@ async fn setup(backup_out: PathBuf, org: Option<String>) -> Result<(), Box<dyn s
         )
         .into());
     }
-    if existing_seed.is_none() {
-        keys::store_seed_at(&paths.recovery_seed, &seed, false)?;
-    }
     let (_, org_name, owner_fingerprint) =
         verify_or_initialize_remote_keyring(&api, &me, &seed).await?;
+    if existing_seed.is_none() {
+        // Install restored/new authority only after the remote keyring accepts it.
+        // A stale backup must not poison local state and block a corrected retry.
+        keys::store_seed_at(&paths.recovery_seed, &seed, false)?;
+    }
     println!("Signing authority is ready for {org_name}.");
     println!("Owner fingerprint: {owner_fingerprint}");
     println!(
@@ -842,6 +844,10 @@ mod tests {
         assert!(
             body.find("write_encrypted_backup").unwrap()
                 < body.find("verify_or_initialize_remote_keyring").unwrap()
+        );
+        assert!(
+            body.find("verify_or_initialize_remote_keyring").unwrap()
+                < body.find("store_seed_at").unwrap()
         );
         assert!(body.contains("only an organization owner can create signing authority"));
     }

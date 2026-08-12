@@ -4344,12 +4344,36 @@ pub async fn rotate_paas_keyring_owner(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
-    let org_name = auth.org_name.clone();
-    let parsed = parse_internal_body(body)?;
-    let Json(response) =
-        crate::routes::orgs::rotate_org_owner(auth, State(state), Path(org_name), Json(parsed))
-            .await?;
-    Ok((StatusCode::OK, Json(to_value(response)?)))
+    let path = format!("/internal/paas/orgs/{paas_org_id}/keyring/rotate-owner");
+    let idempotency = match begin_actor_idempotent_request(
+        &state,
+        &headers,
+        "POST",
+        &path,
+        &auth,
+        &body,
+        IdempotencyRecovery::FailClosed,
+    )
+    .await?
+    {
+        IdempotencyBegin::Execute(lease) => lease,
+        IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
+    };
+    let result: Result<IdempotencyResponse, InternalRouteError> = async {
+        let org_name = auth.org_name.clone();
+        let parsed = parse_internal_body(body)?;
+        let Json(response) = crate::routes::orgs::rotate_org_owner(
+            auth,
+            State(state.clone()),
+            Path(org_name),
+            Json(parsed),
+        )
+        .await?;
+        Ok((StatusCode::OK, to_value(response)?))
+    }
+    .await;
+    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    Ok((status, Json(response)))
 }
 
 pub async fn issue_paas_signer_rotation_token(
