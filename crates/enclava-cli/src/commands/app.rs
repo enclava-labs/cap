@@ -24,9 +24,8 @@ use enclava_cli::descriptor::{
     build_descriptor, cap_app_oci_runtime_spec,
 };
 use enclava_cli::keyring::{
-    OrgKeyringEnvelope, Role, keyring_fingerprint, load_keyring_envelope, load_trusted_owner,
-    member_allows_deploy, sign_keyring, single_member_keyring, store_keyring_envelope,
-    store_trusted_owner, verify_keyring,
+    OrgKeyringEnvelope, keyring_fingerprint, load_keyring_envelope, load_trusted_owner,
+    member_allows_deploy, store_keyring_envelope, store_trusted_owner, verify_keyring,
 };
 use enclava_cli::keys;
 use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, verify_envelope};
@@ -298,7 +297,7 @@ pub async fn create(args: CreateArgs) -> Result<(), Box<dyn std::error::Error>> 
     let (api, paths, _cli_config) = build_api_client()?;
 
     let bootstrap_key = if app_config.unlock.mode == "password" {
-        let (org_id, org, _) = ensure_manual_deploy_keyring(&api, &paths).await?;
+        let (org_id, org, _) = ensure_manual_deploy_keyring(&api, &paths, false).await?;
         let seed = keys::load_or_create_recovery_seed(&paths)?;
         let app_seed = keys::derive_app_bootstrap_seed(org_id, &app_config.app.name, &seed)?;
         let signing_key = SigningKey::from_bytes(&app_seed);

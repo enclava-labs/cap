@@ -14,6 +14,10 @@ fn env_hex32(name: &str) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>>
         .transpose()
 }
 
+fn confirmed_bootstrap_state(state: &str) -> bool {
+    matches!(state, "bootstrapped" | "already-bootstrapped")
+}
+
 pub(crate) fn platform_release_from_deployment_context(
     deployment_context: &DeploymentContextResponse,
 ) -> Result<Option<PlatformRelease>, Box<dyn std::error::Error>> {
@@ -87,7 +91,6 @@ pub(crate) struct ActiveUserOrg {
     pub(crate) user_id: Uuid,
     pub(crate) org_id: Uuid,
     pub(crate) org_name: String,
-    pub(crate) is_personal: bool,
 }
 
 pub(crate) async fn resolve_current_user_org(
@@ -98,7 +101,6 @@ pub(crate) async fn resolve_current_user_org(
         user_id: Uuid::parse_str(&me.user_id)?,
         org_id: Uuid::parse_str(&me.active_org.id)?,
         org_name: me.active_org.name,
-        is_personal: me.active_org.is_personal,
     })
 }
 
@@ -115,34 +117,18 @@ async fn register_public_key(
     Ok(())
 }
 
-async fn upload_keyring(
-    api: &ApiClient,
-    org_name: &str,
-    envelope: &OrgKeyringEnvelope,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = api
-        .put_org_keyring(
-            org_name,
-            &PutOrgKeyringRequest {
-                version: envelope.keyring.version,
-                keyring_payload: serde_json::to_value(&envelope.keyring)?,
-                signature: hex::encode(envelope.signature.to_bytes()),
-                signing_pubkey: hex::encode(envelope.signing_pubkey.to_bytes()),
-            },
-        )
-        .await?;
-    Ok(())
-}
-
 pub(crate) async fn ensure_manual_deploy_keyring(
     api: &ApiClient,
     paths: &CliPaths,
+    require_signing_service: bool,
 ) -> Result<(Uuid, String, keys::UserSigningKey), Box<dyn std::error::Error>> {
     let active = resolve_current_user_org(api).await?;
     let user_id = active.user_id;
     let org_id = active.org_id;
     let org_name = active.org_name.clone();
-    let seed = keys::load_or_create_recovery_seed(paths)?;
+    let seed = keys::load_recovery_seed(paths)?.ok_or(
+        "signing authority is not set up; run `enclava key setup --backup-out <offline-backup.json>` first",
+    )?;
     let owner_key = keys::derive_org_owner_key(user_id, org_id, &seed)?;
     register_public_key(api, &owner_key.public).await?;
 
@@ -180,23 +166,15 @@ pub(crate) async fn ensure_manual_deploy_keyring(
             store_keyring_envelope(&org_id, &envelope)?;
         }
         Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {
-            if !active.is_personal {
-                return Err(
-                    "org keyring is missing for a non-personal org; team keyring onboarding is not part of the manual MVP"
-                        .into(),
-                );
-            }
-            let now = Utc::now();
-            let keyring = single_member_keyring(org_id, 1, &owner_key, Role::Owner, now);
-            let envelope = sign_keyring(&owner_key, keyring);
-            store_trusted_owner(&org_id, &owner_key.public)?;
-            store_keyring_envelope(&org_id, &envelope)?;
-            upload_keyring(api, &org_name, &envelope).await?;
+            return Err(
+                "organization signing authority is missing; run `enclava key setup --backup-out <offline-backup.json>` first"
+                    .into(),
+            );
         }
         Err(err) => return Err(err.into()),
     }
 
-    match api
+    let signing_owner = match api
         .bootstrap_signing_service_owner(
             &org_name,
             &BootstrapSigningServiceRequest {
@@ -205,9 +183,25 @@ pub(crate) async fn ensure_manual_deploy_keyring(
         )
         .await
     {
-        Ok(_) => {}
-        Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
+        Ok(response) => Some(response),
+        Err(enclava_cli::api_client::ApiError::Api { status: 503, .. })
+            if !require_signing_service =>
+        {
+            None
+        }
         Err(err) => return Err(err.into()),
+    };
+    let Some(signing_owner) = signing_owner else {
+        return Ok((org_id, org_name, owner_key));
+    };
+    if signing_owner.org_id != org_id.to_string()
+        || !confirmed_bootstrap_state(&signing_owner.state)
+        || signing_owner.owner_pubkey_fingerprint != hex::encode(owner_key.public.to_bytes())
+    {
+        return Err(
+            "policy signing service did not confirm the expected organization owner authority"
+                .into(),
+        );
     }
     Ok((org_id, org_name, owner_key))
 }
@@ -555,7 +549,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         return Err("platform deployment context did not include api_signing_pubkey".into());
     }
 
-    let (org_id, org_name, deployer_key) = ensure_manual_deploy_keyring(api, paths).await?;
+    let (org_id, org_name, deployer_key) = ensure_manual_deploy_keyring(api, paths, true).await?;
 
     let app_id = Uuid::parse_str(&app.id)?;
     let trusted_owner = load_trusted_owner(&org_id)?
@@ -730,4 +724,17 @@ pub(crate) async fn build_signed_deploy_blobs(
         signed_policy_artifact: serde_json::to_string(&signed_policy_artifact)?,
         log_encryption,
     })
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::confirmed_bootstrap_state;
+
+    #[test]
+    fn accepts_only_policy_service_bootstrap_success_states() {
+        assert!(confirmed_bootstrap_state("bootstrapped"));
+        assert!(confirmed_bootstrap_state("already-bootstrapped"));
+        assert!(!confirmed_bootstrap_state("ready"));
+        assert!(!confirmed_bootstrap_state("failed"));
+    }
 }
