@@ -27,8 +27,8 @@ pub use evidence::{
 };
 pub use policy::{AppraiserKeyPolicy, AppraiserPolicy, SigstorePolicy, TrustPolicy};
 pub use receipt::{
-    AppraisalResponse, ReceiptError, SignedReceipt, appraisal_receipt_bytes,
-    verify_appraisal_response,
+    AppraisalResponse, ExpectedReceipt, ReceiptError, SignedReceipt, appraisal_receipt_bytes,
+    verify_appraisal_response, verify_appraisal_response_pinned,
 };
 pub use result::{
     AppraisalResult, CheckOutcome, CheckResult, Verdict, canonical_result_bytes,
@@ -223,6 +223,15 @@ fn verify_evidence(
             verify_vcek_report_binding(report, endorsements.vcek_der).is_ok(),
             "VCEK_REPORT_BINDING_INVALID",
         ));
+        // Only policy-pinned ARKs may perform revocation math: decode the
+        // trusted hashes once and hand them to the CRL verification so an
+        // unpinned (attacker-supplied) ARK is rejected before any `modpow`.
+        let trusted_ark_hashes: Vec<[u8; 32]> = policy
+            .amd
+            .trusted_ark_sha256
+            .iter()
+            .filter_map(|trusted| policy::decode_32(trusted))
+            .collect();
         let revocation = verify_amd_revocation(
             endorsements.ark_der,
             endorsements.ask_der,
@@ -230,6 +239,7 @@ fn verify_evidence(
             endorsements.crl_der,
             context.now_unix_seconds,
             policy.amd.revocation_max_age_seconds,
+            &trusted_ark_hashes,
         );
         checks.push(simple_check(
             "amd.revocation.freshness",

@@ -323,11 +323,35 @@ fn device_login_scopes(approve_logs: bool) -> Vec<String> {
     scopes
 }
 
+/// Device-login URLs must be https and free of characters that any platform
+/// shell (notably `cmd.exe` for the Windows `start` builtin) would interpret
+/// as metacharacters. The URL arrives from the API server; a hostile or
+/// compromised API must not gain command execution through the CLI.
+fn browser_safe_device_url(url: &str) -> bool {
+    if !(url.starts_with("https://")
+        || url.starts_with("http://127.0.0.1")
+        || url.starts_with("http://localhost"))
+    {
+        return false;
+    }
+    !url.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(c, '&' | '^' | '|' | '%' | '"' | '<' | '>' | '!' | '(' | ')')
+    })
+}
+
 fn try_open_browser(url: &str) -> bool {
+    if !browser_safe_device_url(url) {
+        return false;
+    }
+    let quoted = format!("\"{url}\"");
     let commands: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("open", &[url])]
     } else if cfg!(target_os = "windows") {
-        &[("cmd", &["/C", "start", "", url])]
+        // Quoted so cmd.exe treats the URL as a single literal token; the
+        // charset check above removes the remaining cmd metacharacters.
+        &[("cmd", &["/C", "start", "", quoted.as_str()])]
     } else {
         &[("xdg-open", &[url])]
     };
@@ -368,4 +392,31 @@ pub async fn logout() -> Result<(), Box<dyn std::error::Error>> {
     config::save_credentials(&paths, &creds)?;
     println!("Logged out. Local recovery keys were left in place.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::browser_safe_device_url;
+
+    #[test]
+    fn accepts_https_device_urls() {
+        assert!(browser_safe_device_url(
+            "https://api.enclava.dev/device/approve?user_code=ABCD-EFGH"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_http_schemes() {
+        assert!(!browser_safe_device_url("file:///etc/passwd"));
+        assert!(!browser_safe_device_url("javascript:alert(1)"));
+    }
+
+    #[test]
+    fn rejects_cmd_metacharacters() {
+        assert!(!browser_safe_device_url("https://evil.example/a&calc.exe"));
+        assert!(!browser_safe_device_url("https://evil.example/a%PATH%b"));
+        assert!(!browser_safe_device_url("https://evil.example/a|b"));
+        assert!(!browser_safe_device_url("https://evil.example/a^b"));
+        assert!(!browser_safe_device_url("https://evil.example/a b"));
+    }
 }

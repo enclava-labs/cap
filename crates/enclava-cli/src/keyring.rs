@@ -33,6 +33,10 @@ pub enum KeyringError {
     Verify(String),
     #[error("owner pubkey mismatch: cached fingerprint differs from candidate; refusing to update")]
     TofuMismatch,
+    #[error(
+        "keyring rollback refused: cached keyring is v{cached} but fetched keyring is v{incoming}; a compromised API can replay old signed keyrings. Clear ~/.enclava/state/<org_id>/ if this is an intentional reset."
+    )]
+    Rollback { cached: u64, incoming: u64 },
     #[error("keyring not yet trusted; run `enclava org keyring trust` to confirm owner pubkey")]
     Untrusted,
     #[error("hex: {0}")]
@@ -263,7 +267,29 @@ pub fn load_keyring_envelope(org_id: &Uuid) -> Result<OrgKeyringEnvelope, Keyrin
     Ok(serde_json::from_str(&raw)?)
 }
 
+/// Cache a keyring envelope, refusing rollbacks: a fetched envelope whose
+/// version is older than the cached one is a replay (a validly-signed but
+/// stale keyring, e.g. re-adding a removed deployer) and is rejected.
+/// Equal versions are accepted (idempotent refetch).
 pub fn store_keyring_envelope(
+    org_id: &Uuid,
+    envelope: &OrgKeyringEnvelope,
+) -> Result<PathBuf, KeyringError> {
+    if let Ok(cached) = load_keyring_envelope(org_id)
+        && cached.keyring.version > envelope.keyring.version
+    {
+        return Err(KeyringError::Rollback {
+            cached: cached.keyring.version,
+            incoming: envelope.keyring.version,
+        });
+    }
+    store_keyring_envelope_force(org_id, envelope)
+}
+
+/// Cache a keyring envelope without rollback protection. Only for explicit
+/// recovery/bootstrap flows where the local cache is being deliberately
+/// re-established.
+pub fn store_keyring_envelope_force(
     org_id: &Uuid,
     envelope: &OrgKeyringEnvelope,
 ) -> Result<PathBuf, KeyringError> {
@@ -390,11 +416,59 @@ mod tests {
 
     #[test]
     fn keyring_state_uses_configured_cli_root() {
+        let _guard = env_state_lock();
         let temp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("ENCLAVA_STATE_DIR", temp.path()) };
         let org_id = Uuid::new_v4();
         let dir = state_dir(&org_id).unwrap();
         unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") };
         assert_eq!(dir, temp.path().join("state").join(org_id.to_string()));
+    }
+
+    fn env_state_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
+    #[test]
+    fn keyring_store_refuses_version_rollback() {
+        let _guard = env_state_lock();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ENCLAVA_STATE_DIR", temp.path()) };
+        let org_id = Uuid::new_v4();
+
+        let owner = UserSigningKey::from_seed(Uuid::new_v4(), [0x11; 32]);
+        let mut v3 = sample_keyring(&owner);
+        v3.version = 3;
+        let envelope_v3 = sign_keyring(&owner, v3);
+        store_keyring_envelope(&org_id, &envelope_v3).unwrap();
+
+        // Same version (idempotent refetch) is accepted.
+        store_keyring_envelope(&org_id, &envelope_v3).unwrap();
+
+        // An older, still-validly-signed keyring replayed by a compromised
+        // API must be refused.
+        let mut v2 = sample_keyring(&owner);
+        v2.version = 2;
+        let envelope_v2 = sign_keyring(&owner, v2);
+        let err = store_keyring_envelope(&org_id, &envelope_v2).unwrap_err();
+        assert!(matches!(
+            err,
+            KeyringError::Rollback {
+                cached: 3,
+                incoming: 2
+            }
+        ));
+
+        // Newer versions are accepted; the explicit force path bypasses the
+        // check for documented recovery flows.
+        let mut v4 = sample_keyring(&owner);
+        v4.version = 4;
+        store_keyring_envelope(&org_id, &sign_keyring(&owner, v4)).unwrap();
+        store_keyring_envelope_force(&org_id, &envelope_v2).unwrap();
+
+        unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") };
     }
 }

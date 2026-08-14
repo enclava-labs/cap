@@ -190,7 +190,7 @@ pub(crate) async fn ensure_manual_deploy_keyring(
             let keyring = single_member_keyring(org_id, 1, &owner_key, Role::Owner, now);
             let envelope = sign_keyring(&owner_key, keyring);
             store_trusted_owner(&org_id, &owner_key.public)?;
-            store_keyring_envelope(&org_id, &envelope)?;
+            store_keyring_envelope_force(&org_id, &envelope)?;
             upload_keyring(api, &org_name, &envelope).await?;
         }
         Err(err) => return Err(err.into()),

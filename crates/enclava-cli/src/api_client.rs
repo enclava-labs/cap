@@ -27,8 +27,17 @@ pub enum ApiError {
 impl ApiClient {
     /// Create a new API client.
     pub fn new(base_url: &str, auth_token: Option<String>) -> Self {
+        // The bearer token must only transit TLS. Plain http remains possible
+        // only for loopback development endpoints (a local API server).
+        let https_only = !base_url
+            .trim_start_matches("http://")
+            .starts_with("127.0.0.1")
+            && !base_url
+                .trim_start_matches("http://")
+                .starts_with("localhost");
         let http = reqwest::Client::builder()
             .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
+            .https_only(https_only)
             .build()
             .expect("failed to build HTTP client");
 

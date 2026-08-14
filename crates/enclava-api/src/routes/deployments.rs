@@ -738,6 +738,15 @@ async fn deploy_app_candidate(
     };
 
     let container_name = body.container_name.as_deref().unwrap_or("web");
+    if enclava_common::validate::validate_dns_label(container_name).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_container_name",
+                "message": "container_name must be a DNS-safe label ([a-z0-9-], max 63 chars)"
+            })),
+        ));
+    }
     let signed_workload_command = match signing_artifacts.as_ref() {
         Some(artifacts) => {
             crate::deploy::serialize_workload_command(&artifacts.descriptor.oci_runtime_spec.args)

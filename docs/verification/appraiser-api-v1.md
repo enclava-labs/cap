@@ -45,3 +45,11 @@ Consumers verify responses with `enclava_verifier::verify_appraisal_response` an
 supplied `appraiser` policy section. It enforces the exact result hash, signature, validity windows,
 maximum lifetime, clock skew, revocation, and overlap rotation. Stable failures are documented in
 `reason-codes-v1.md`.
+
+**Pinning (required):** the appraiser signs results for whatever policy, evidence, nonce, and origin
+a requester supplies — it is a public signing oracle by design. A receipt only proves something
+when the relying party pinned its own choices. Always verify with
+`enclava_verifier::verify_appraisal_response_pinned` and an `ExpectedReceipt` that carries the
+sha256 of YOUR policy document, YOUR challenge nonce, and YOUR expected target origin. A
+validly-signed `PASS` receipt under an attacker-chosen policy is otherwise indistinguishable from a
+genuine one.

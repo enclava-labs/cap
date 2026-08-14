@@ -40,13 +40,25 @@ pub struct TeeClient {
     resolve_ip: Option<IpAddr>,
 }
 
-fn accepts_invalid_tee_certs() -> bool {
-    std::env::var("ENCLAVA_TEE_TLS_MODE")
-        .map(|mode| matches!(mode.as_str(), "staging" | "insecure"))
-        .unwrap_or(false)
-        || std::env::var("ENCLAVA_TEE_ACCEPT_INVALID_CERTS")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+/// Whether TEE TLS verification is relaxed for staging-type environments.
+/// Only honored in debug builds; release builds always verify TLS.
+pub fn accepts_invalid_tee_certs() -> bool {
+    // Release builds never honor TLS-bypass env vars: the gate must hold for
+    // library consumers too, not only for the `enclava` binary's startup
+    // checks in main.rs.
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("ENCLAVA_TEE_TLS_MODE")
+            .map(|mode| matches!(mode.as_str(), "staging" | "insecure"))
             .unwrap_or(false)
+            || std::env::var("ENCLAVA_TEE_ACCEPT_INVALID_CERTS")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(false)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -670,7 +682,18 @@ async fn verify_evidence_report_data_with_json_fallback(
 
     if let Some(snp_report_bytes) = extract_snp_report_bytes(&evidence_json) {
         let chain = match extract_snp_der_chain(&evidence_json) {
-            Some(chain) => chain,
+            Some(chain) if ark_is_pinned_to_builtin_root(&chain.ark_der) => chain,
+            Some(_) => {
+                // An evidence-embedded chain whose ARK does not byte-match a
+                // builtin AMD root is attacker-controlled input: `Chain`'s
+                // verify() only proves internal consistency (ARK self-signed,
+                // ARK->ASK->VCEK->report), never anchoring to AMD. Fall back
+                // to the anchored KDS fetch; if that fails, fail closed.
+                tracing::warn!(
+                    "attestation evidence carried an AMD chain not anchored to a builtin AMD root; falling back to AMD KDS"
+                );
+                fetch_snp_der_chain_from_kds(&snp_report_bytes).await?
+            }
             None => fetch_snp_der_chain_from_kds(&snp_report_bytes).await?,
         };
         let report = validate_snp_report_with_der_chain(
@@ -881,6 +904,29 @@ fn builtin_snp_ca_der_chain(
         .to_der()
         .map_err(|err| TeeError::Attestation(format!("AMD ASK DER encode failed: {err}")))?;
     Ok((ark_der, ask_der))
+}
+
+/// True only when `ark_der` byte-matches one of the built-in AMD ARK roots
+/// compiled into the `sev` crate (Milan, Genoa, Turin). Evidence-embedded
+/// chains are trusted exclusively through this anchor.
+fn ark_is_pinned_to_builtin_root(ark_der: &[u8]) -> bool {
+    static PINNED_ARKS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    let pinned = PINNED_ARKS.get_or_init(|| {
+        let mut roots = Vec::new();
+        for ark in [
+            sev::certs::snp::builtin::milan::ark(),
+            sev::certs::snp::builtin::genoa::ark(),
+            sev::certs::snp::builtin::turin::ark(),
+        ] {
+            if let Ok(cert) = ark
+                && let Ok(der) = cert.to_der()
+            {
+                roots.push(der);
+            }
+        }
+        roots
+    });
+    pinned.iter().any(|root| root == ark_der)
 }
 
 fn amd_kds_vcek_url(

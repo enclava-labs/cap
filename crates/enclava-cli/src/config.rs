@@ -94,12 +94,33 @@ impl CliPaths {
     }
 
     /// Ensure the state directory and subdirectories exist.
+    /// Directories holding credentials and key material are forced to
+    /// owner-only (0700) so secrets are never reachable through a
+    /// world-readable parent.
     pub fn ensure_dirs(&self) -> Result<(), ConfigError> {
         for dir in [&self.root, &self.keys_dir, &self.sessions_dir] {
             std::fs::create_dir_all(dir).map_err(|e| ConfigError::Io {
                 path: dir.clone(),
                 source: e,
             })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::metadata(dir)
+                    .map_err(|e| ConfigError::Io {
+                        path: dir.clone(),
+                        source: e,
+                    })?
+                    .permissions();
+                if perms.mode() & 0o077 != 0 {
+                    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(
+                        |e| ConfigError::Io {
+                            path: dir.clone(),
+                            source: e,
+                        },
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -133,35 +154,7 @@ pub fn save_config(paths: &CliPaths, config: &CliConfig) -> Result<(), ConfigErr
 pub fn save_credentials(paths: &CliPaths, creds: &Credentials) -> Result<(), ConfigError> {
     paths.ensure_dirs()?;
     let content = toml::to_string_pretty(creds).map_err(ConfigError::SerializeToml)?;
-    let path = &paths.credentials;
-
-    // Use atomic write to prevent race conditions
-    let temp_path = path.with_extension("tmp");
-
-    // Write to temporary file first
-    std::fs::write(&temp_path, &content).map_err(|e| ConfigError::Io {
-        path: temp_path.clone(),
-        source: e,
-    })?;
-
-    // Set permissions before moving to final location
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&temp_path, perms).map_err(|e| ConfigError::Io {
-            path: temp_path.clone(),
-            source: e,
-        })?;
-    }
-
-    // Atomic rename to final location
-    std::fs::rename(&temp_path, path).map_err(|e| ConfigError::Io {
-        path: path.clone(),
-        source: e,
-    })?;
-
-    Ok(())
+    write_secret_atomic(&paths.credentials, content.as_bytes())
 }
 
 /// Save a password-mode bootstrap private key with owner-only permissions.
@@ -178,30 +171,58 @@ pub fn save_bootstrap_key(
             path: parent.to_path_buf(),
             source: e,
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |e| ConfigError::Io {
+                    path: parent.to_path_buf(),
+                    source: e,
+                },
+            )?;
+        }
     }
 
-    let temp_path = path.with_extension("tmp");
-    std::fs::write(&temp_path, private_key_hex).map_err(|e| ConfigError::Io {
-        path: temp_path.clone(),
-        source: e,
-    })?;
+    write_secret_atomic(&path, private_key_hex.as_bytes())?;
+    Ok(path)
+}
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&temp_path, perms).map_err(|e| ConfigError::Io {
+/// Atomic secret write: the temp file is created owner-only from birth
+/// (`create_new` + mode 0600), so the plaintext JWT/API key/key hex is never
+/// observable by other local users at any instant, then atomically renamed.
+fn write_secret_atomic(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
+    let temp_path = path.with_extension("tmp");
+    if temp_path.exists() {
+        // Never follow a pre-planted file: remove and recreate below.
+        std::fs::remove_file(&temp_path).map_err(|e| ConfigError::Io {
             path: temp_path.clone(),
             source: e,
         })?;
     }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp_path).map_err(|e| ConfigError::Io {
+        path: temp_path.clone(),
+        source: e,
+    })?;
+    std::io::Write::write_all(&mut file, contents).map_err(|e| ConfigError::Io {
+        path: temp_path.clone(),
+        source: e,
+    })?;
+    drop(file);
 
-    std::fs::rename(&temp_path, &path).map_err(|e| ConfigError::Io {
-        path: path.clone(),
+    // Atomic rename to final location
+    std::fs::rename(&temp_path, path).map_err(|e| ConfigError::Io {
+        path: path.to_path_buf(),
         source: e,
     })?;
 
-    Ok(path)
+    Ok(())
 }
 
 fn load_toml_or_default<T: Default + serde::de::DeserializeOwned>(

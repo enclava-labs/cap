@@ -176,3 +176,67 @@ fn multiple_apps_produce_multiple_bindings() {
     assert!(rego.contains("cap-test-org-test-app-test-app-owner"));
     assert!(rego.contains("cap-test-org-test-app-2-test-app-2-owner"));
 }
+
+#[test]
+fn hostile_namespace_cannot_inject_rego_source() {
+    let mut app = sample_app();
+    // Even though API-side validation should never let these through, the
+    // renderer must not become an injection primitive if a caller skips it:
+    // quotes, backslashes, and braces must be escaped, never interpreted.
+    app.namespace = "cap-x\"-app\"} := true #".to_string();
+    app.service_account = "sa\"-x".to_string();
+    app.tenant_instance_identity_hash = "aa\"bb".to_string();
+    app.name = "n\"-x".to_string();
+
+    let apps = vec![&app];
+    let rego = generate_kbs_policy_rego(&apps, "");
+
+    // The rendered policy must still treat each hostile value as a single
+    // string literal: JSON-escape check on the exact serialized forms.
+    assert!(rego.contains(&format!(
+        "\"allowed_namespaces\": [{}]",
+        serde_json::to_string(&app.namespace).unwrap()
+    )));
+    assert!(rego.contains(&format!(
+        "\"allowed_service_accounts\": [{}]",
+        serde_json::to_string(&app.service_account).unwrap()
+    )));
+    // A raw unescaped occurrence of the hostile namespace must not appear.
+    let raw_ns = app.namespace.clone();
+    assert!(
+        !rego.contains(&format!("\"{raw_ns}\"")),
+        "namespace must never be interpolated unescaped"
+    );
+    // The injection payload must not terminate the string literal early.
+    assert!(!rego.contains("app\"} := true #\": {"));
+}
+
+#[test]
+fn validate_app_rejects_non_dns_namespace_and_service_account() {
+    let mut app = sample_app();
+    app.namespace = "cap-Bad NS".to_string();
+    assert!(matches!(
+        enclava_engine::validate::validate_app(&app),
+        Err(enclava_engine::validate::ValidationError::InvalidNamespace(
+            _
+        ))
+    ));
+
+    let mut app = sample_app();
+    app.service_account = "-bad-sa-".to_string();
+    assert!(matches!(
+        enclava_engine::validate::validate_app(&app),
+        Err(enclava_engine::validate::ValidationError::InvalidServiceAccount(_))
+    ));
+
+    let mut app = sample_app();
+    app.tenant_id = "org/evil".to_string();
+    assert!(matches!(
+        enclava_engine::validate::validate_app(&app),
+        Err(enclava_engine::validate::ValidationError::InvalidTenantId(
+            _
+        ))
+    ));
+
+    assert!(enclava_engine::validate::validate_app(&sample_app()).is_ok());
+}

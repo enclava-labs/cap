@@ -39,6 +39,15 @@ pub enum PlatformReleaseError {
     BadSignature(String),
     #[error("policy_template_sha256 does not match policy_template_text")]
     TemplateHashMismatch,
+    #[error(
+        "platform release downgrade refused: override is {override_version} ({override_created}) but the CLI bundles {bundled_version} ({bundled_created}); refusing a validly-signed stale release"
+    )]
+    DowngradeRefused {
+        override_version: String,
+        override_created: String,
+        bundled_version: String,
+        bundled_created: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,13 +104,48 @@ impl PlatformRelease {
 
 impl PlatformReleaseEnvelope {
     pub fn load_verified() -> Result<Self, PlatformReleaseError> {
+        let override_active = matches!(std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH"), Ok(path) if !path.trim().is_empty());
         let raw = match std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH") {
             Ok(path) if !path.trim().is_empty() => std::fs::read_to_string(Path::new(&path))?,
             _ => BUNDLED_PLATFORM_RELEASE.to_string(),
         };
         let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
         verify_envelope(envelope.clone())?;
+        // Downgrade protection: an env-path override may never be older than
+        // the release compiled into this binary. A validly-signed stale
+        // release (pinned to old measurements/sidecar digests) is exactly
+        // what a file-swap or env-var attack serves.
+        if override_active
+            && let Ok(bundled) =
+                serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+            && release_is_older(&envelope.payload, &bundled.payload)
+        {
+            return Err(PlatformReleaseError::DowngradeRefused {
+                override_version: envelope.payload.platform_release_version.clone(),
+                override_created: envelope.payload.created_at.clone(),
+                bundled_version: bundled.payload.platform_release_version.clone(),
+                bundled_created: bundled.payload.created_at.clone(),
+            });
+        }
         Ok(envelope)
+    }
+}
+
+/// Ordering by version string first, then creation timestamp. Both fields are
+/// part of the signed payload. A strictly-older override loses on either
+/// axis; anything newer-or-equal on version and not-older on created_at
+/// passes.
+fn release_is_older(candidate: &PlatformRelease, bundled: &PlatformRelease) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(&candidate.created_at),
+        chrono::DateTime::parse_from_rfc3339(&bundled.created_at),
+    ) {
+        (Ok(candidate_ts), Ok(bundled_ts)) => {
+            candidate.platform_release_version < bundled.platform_release_version
+                || (candidate.platform_release_version == bundled.platform_release_version
+                    && candidate_ts < bundled_ts)
+        }
+        _ => candidate.platform_release_version < bundled.platform_release_version,
     }
 }
 
@@ -322,6 +366,28 @@ mod tests {
             .push_str("-tampered");
         let err = verify_envelope(tampered).unwrap_err();
         assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
+    }
+
+    #[test]
+    fn older_override_release_is_detected() {
+        let bundled: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+
+        let mut older_version = bundled.payload.clone();
+        older_version.platform_release_version =
+            format!("dev-2000.01.01-{}", older_version.platform_release_version);
+        assert!(release_is_older(&older_version, &bundled.payload));
+
+        let mut older_created = bundled.payload.clone();
+        older_created.created_at = "2000-01-01T00:00:00Z".to_string();
+        assert!(release_is_older(&older_created, &bundled.payload));
+
+        let mut newer_version = bundled.payload.clone();
+        newer_version.platform_release_version =
+            format!("z-{}", newer_version.platform_release_version);
+        assert!(!release_is_older(&newer_version, &bundled.payload));
+
+        assert!(!release_is_older(&bundled.payload, &bundled.payload));
     }
 
     #[test]

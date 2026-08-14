@@ -129,6 +129,15 @@ fn enforce_with(
         {
             return Err(EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_KBS_URL"));
         }
+
+        // The signing-service bearer token must never transit cleartext.
+        if let Some(value) = lookup("PLATFORM_SIGNING_SERVICE_URL")
+            && value.trim().starts_with("http://")
+        {
+            return Err(EnvGateError::DebugOnlyFlagInRelease(
+                "PLATFORM_SIGNING_SERVICE_URL",
+            ));
+        }
     }
 
     Ok(())
@@ -278,6 +287,29 @@ mod tests {
             err,
             EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_KBS_URL")
         ));
+    }
+
+    #[test]
+    fn release_rejects_http_signing_service_url() {
+        let mut env = ok_required();
+        env.insert("TRUSTEE_POLICY_READ_AVAILABLE", "true");
+        env.insert(
+            "PLATFORM_SIGNING_SERVICE_URL",
+            "http://signing.example.test",
+        );
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::DebugOnlyFlagInRelease("PLATFORM_SIGNING_SERVICE_URL")
+        ));
+
+        let mut env = ok_required();
+        env.insert("TRUSTEE_POLICY_READ_AVAILABLE", "true");
+        env.insert(
+            "PLATFORM_SIGNING_SERVICE_URL",
+            "https://signing.example.test",
+        );
+        assert!(run(env, false).is_ok());
     }
 
     #[test]

@@ -344,3 +344,77 @@ fn loads_builtin_amd_snp_ca_chain_for_report_generation() {
     assert!(ark_der.starts_with(&[0x30]));
     assert!(ask_der.starts_with(&[0x30]));
 }
+
+#[test]
+fn builtin_amd_ark_roots_are_pinned() {
+    // Every generation the CLI can resolve must anchor evidence chains.
+    let report = sev::firmware::guest::AttestationReport {
+        version: 3,
+        cpuid_fam_id: Some(25),
+        cpuid_mod_id: Some(160),
+        cpuid_step: Some(2),
+        ..Default::default()
+    };
+
+    let (ark_der, _) = super::builtin_snp_ca_der_chain(&report).unwrap();
+    assert!(super::ark_is_pinned_to_builtin_root(&ark_der));
+}
+
+#[test]
+fn unanchored_ark_bytes_are_not_pinned() {
+    assert!(!super::ark_is_pinned_to_builtin_root(&[0x30, 0x00, 0x01]));
+    assert!(!super::ark_is_pinned_to_builtin_root(&[]));
+}
+
+#[tokio::test]
+async fn evidence_chain_with_unpinned_ark_falls_back_to_kds_and_fails_closed() {
+    // An attacker-controlled chain (ARK not matching a builtin AMD root) must
+    // never be used for verification: the fallback path attempts an anchored
+    // KDS fetch, which is unavailable here, so verification must fail rather
+    // than silently trusting the embedded chain.
+    let mut report = sev::firmware::guest::AttestationReport {
+        version: 3,
+        cpuid_fam_id: Some(25),
+        cpuid_mod_id: Some(160),
+        cpuid_step: Some(2),
+        ..Default::default()
+    };
+    report.report_data = [0x42; 64];
+    let report_bytes = report.to_bytes().unwrap().as_ref().to_vec();
+
+    let evidence = super::AttestationEvidence {
+        payload_b64: String::new(),
+        json: Some(serde_json::json!({
+            "attestation_report": {
+                "report_data": hex::encode([0x42; 64]),
+            },
+            "cert_chain": [
+                {"cert_type": "ARK", "data": [1, 2, 3]},
+                {"cert_type": "ASK", "data": [4, 5, 6]},
+                {"cert_type": "VCEK", "data": [7, 8, 9]}
+            ],
+            "raw_report": report_bytes,
+        })),
+    };
+
+    let err =
+        super::verify_evidence_report_data_with_json_fallback(&evidence, b"", &[0x42; 64], false)
+            .await
+            .unwrap_err();
+    // Fail-closed: either the KDS fetch failed (offline test env) or chain
+    // validation rejected the fabricated chain. Both are acceptable; silently
+    // trusting the embedded chain is not.
+    assert!(err.to_string().contains("KDS") || err.to_string().contains("DER"));
+}
+
+#[test]
+fn snp_report_with_debug_policy_is_rejected() {
+    let mut report = sev::firmware::guest::AttestationReport::default();
+    assert!(crate::attestation::ensure_snp_report_production_policy(&report).is_ok());
+
+    let mut policy = sev::firmware::guest::GuestPolicy::default();
+    policy.set_debug_allowed(true);
+    report.policy = policy;
+    let err = crate::attestation::ensure_snp_report_production_policy(&report).unwrap_err();
+    assert!(err.to_string().contains("DEBUG"));
+}

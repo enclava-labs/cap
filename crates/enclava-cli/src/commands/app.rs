@@ -26,7 +26,7 @@ use enclava_cli::descriptor::{
 use enclava_cli::keyring::{
     OrgKeyringEnvelope, Role, keyring_fingerprint, load_keyring_envelope, load_trusted_owner,
     member_allows_deploy, sign_keyring, single_member_keyring, store_keyring_envelope,
-    store_trusted_owner, verify_keyring,
+    store_keyring_envelope_force, store_trusted_owner, verify_keyring,
 };
 use enclava_cli::keys;
 use enclava_cli::platform_release::{PlatformRelease, PlatformReleaseEnvelope, verify_envelope};

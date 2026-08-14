@@ -4,6 +4,12 @@ use crate::types::ConfidentialApp;
 pub enum ValidationError {
     #[error("app name is invalid: {0}")]
     InvalidName(String),
+    #[error("namespace is invalid: {0}")]
+    InvalidNamespace(String),
+    #[error("service account is invalid: {0}")]
+    InvalidServiceAccount(String),
+    #[error("tenant id is invalid: {0}")]
+    InvalidTenantId(String),
     #[error("at least one container is required")]
     NoContainers,
     #[error("exactly one primary container is required")]
@@ -28,6 +34,18 @@ pub enum ValidationError {
 /// Does NOT check cluster state or tier limits -- those are API-level concerns.
 pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
     validate_name(&app.name)?;
+
+    // Namespace, service account, and tenant id are interpolated into
+    // Kubernetes object names, labels, Rego policy, and TOML config; they must
+    // be DNS-label safe (defense in depth on top of API-side validation).
+    validate_dns_label_field(&app.namespace, ValidationError::InvalidNamespace)?;
+    validate_dns_label_field(&app.service_account, ValidationError::InvalidServiceAccount)?;
+    validate_dns_label_field(&app.tenant_id, ValidationError::InvalidTenantId)?;
+    if app.namespace.len() > 63 {
+        return Err(ValidationError::InvalidNamespace(
+            "namespace exceeds 63 characters".to_string(),
+        ));
+    }
 
     if app.containers.is_empty() {
         return Err(ValidationError::NoContainers);
@@ -116,5 +134,26 @@ fn validate_name(name: &str) -> Result<(), ValidationError> {
         )));
     }
 
+    Ok(())
+}
+
+/// DNS-label check shared by namespace / service-account / tenant-id fields.
+fn validate_dns_label_field(
+    value: &str,
+    error: fn(String) -> ValidationError,
+) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Err(error("cannot be empty".to_string()));
+    }
+    let valid = value
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !value.starts_with('-')
+        && !value.ends_with('-');
+    if !valid {
+        return Err(error(format!(
+            "'{value}' must be lowercase alphanumeric with hyphens, not starting or ending with '-'"
+        )));
+    }
     Ok(())
 }
