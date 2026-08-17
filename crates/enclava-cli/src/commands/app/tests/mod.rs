@@ -175,6 +175,16 @@ fn manual_deploy_keyring_always_bootstraps_the_signing_service() {
 }
 
 #[test]
+fn deployment_requires_explicit_recoverable_setup_and_login_has_no_keyring_side_effect() {
+    let signing = include_str!("../signing.rs");
+    let auth = include_str!("../../auth.rs");
+
+    assert!(signing.contains("ensure_manual_deploy_keyring(api, paths, true).await?"));
+    assert!(signing.contains("enclava key setup --backup-out <offline-backup.json>"));
+    assert!(!auth.contains("ensure_manual_deploy_keyring"));
+}
+
+#[test]
 fn deployment_context_platform_release_is_verified_and_selected() {
     let envelope = PlatformReleaseEnvelope {
         payload: test_release(),

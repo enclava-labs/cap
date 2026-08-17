@@ -9,8 +9,6 @@ use enclava_cli::api_types::{
 };
 use enclava_cli::config::{self, CliPaths, Credentials};
 
-use super::app::ensure_manual_deploy_keyring;
-
 #[derive(Args)]
 pub struct LoginArgs {
     /// Do not try to open a browser; print the URL and code only
@@ -102,9 +100,6 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
     updated_config.org = Some(resp.org_name.clone());
     updated_config.org_id = Some(resp.org_id.to_string());
     config::save_config(&paths, &updated_config)?;
-
-    let api = ApiClient::from_config(&updated_config, &creds);
-    ensure_manual_deploy_keyring(&api, &paths).await?;
 
     println!("Account created. Logged in as {}.", resp.org_name);
     Ok(())
@@ -225,9 +220,6 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
     updated_config.org_id = Some(resp.org_id.to_string());
     config::save_config(&paths, &updated_config)?;
 
-    let api = ApiClient::from_config(&updated_config, &creds);
-    ensure_manual_deploy_keyring(&api, &paths).await?;
-
     println!("Logged in. Active org: {}", resp.org_name);
     Ok(())
 }
@@ -289,7 +281,6 @@ async fn device_login(
 
                 let api = ApiClient::from_config(&updated_config, &creds);
                 let me = api.get_current_user().await?;
-                ensure_manual_deploy_keyring(&api, &paths).await?;
                 println!("Logged in as {}", me.display_name);
                 println!("Active org: {}", me.active_org.name);
                 return Ok(());

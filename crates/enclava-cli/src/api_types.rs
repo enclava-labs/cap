@@ -900,6 +900,26 @@ pub struct BootstrapSigningServiceResponse {
     pub owner_pubkey_fingerprint: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RotateOrgOwnerRequest {
+    pub version: u64,
+    pub keyring_payload: serde_json::Value,
+    pub signature: String,
+    pub replacement_signing_pubkey: String,
+    pub current_signing_pubkey: String,
+    pub signed_at: String,
+    pub reason: String,
+    pub rotation_signature: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RotateOrgOwnerResponse {
+    pub org_id: String,
+    pub state: String,
+    pub keyring_version: u64,
+    pub owner_fingerprint: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct MemberResponse {
     pub user_id: String,
