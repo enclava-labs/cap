@@ -196,6 +196,8 @@ pub(crate) async fn ensure_manual_deploy_keyring(
     };
     if signing_owner.org_id != org_id.to_string()
         || !confirmed_bootstrap_state(&signing_owner.state)
+        // `owner_pubkey_fingerprint` is hex(raw pubkey) by cross-repo contract
+        // (see enclava-api signing_service.rs docs) — not a digest.
         || signing_owner.owner_pubkey_fingerprint != hex::encode(owner_key.public.to_bytes())
     {
         return Err(

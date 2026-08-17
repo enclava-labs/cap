@@ -12,6 +12,7 @@ finding below was verified against source in the main worktree.
 |-----|------|-------|-------|
 | 1 | 2026-08-14 | Initial deep-dive; fixes implemented on `security/deep-dive-fixes` (commit `07d6189`) | merge-base `a5e5fab2` |
 | 2 | 2026-08-17 | Re-ran all v1 findings against merged main (`origin/main` `c7691b7`, incl. PR #86/#87 signing-authority rotation + GitOps migrations); audited all new code; recorded new findings | merge commit `a2f6309` + restore commit `197a045` |
+| 3 | 2026-08-17 | Addressed N-1 (audited hatch + restored release↔runtime-class binding), N-2 (contract pinned at all touch points), N-3 (local `main` repaired) | `security/deep-dive-fixes` |
 
 **Finding ID scheme:** v1 IDs keep their meaning forever. `H-1`, `M-n`, `L-n`
 are v1 findings; each now carries a **Status (rev 2)** line. New rev-2
@@ -251,9 +252,19 @@ ledger verification).
 - Recommendation: log loudly at resolution time, register in the audited-env
   set, and restore `release.expected_runtime_class == try_runtime_class()`
   when a platform release is enabled.
+- **Status (rev 3): Fixed — verified.** (a) `resolve_runtime_class_with_env`
+  emits a `tracing::warn!` every time the hatch resolves the simulated CoCo
+  class; (b) `load_platform_release` binds the signed release to the
+  **resolved** runtime class via `check_release_runtime_class` — hatch +
+  enabled release now fails startup (behavior change: the hatch is only
+  usable when no platform release is loaded, i.e. dev/preprod clusters
+  without release metadata); (c) a source-assert regression test guards the
+  call site against the dropped-hunk failure mode. The hatch stays
+  release-legal by design (unlike `DEBUG_ONLY_FLAGS`) — observability plus
+  the release binding are the compensating controls.
 - Note: local `main` (merge `90ad634`) had silently dropped this whole change
   set (all three files reverted to pre-`origin/main` state); restored on this
-  branch in `197a045`. Whoever maintains local `main` should fix that merge.
+  branch in `197a045`, and local `main` itself repaired in `49d8f48` (N-3).
 
 ### N-2 (Low) — `owner_pubkey_fingerprint` cross-repo contract is actually raw key hex
 
@@ -266,6 +277,14 @@ ledger verification).
   real digest, bootstrap/rotation consistency checks fail closed (DoS/confusion,
   not a bypass). Cross-repo contract should be documented and pinned
   (AGENTS.md blocking rules apply — policy-signing-service is a consumer).
+- **Status (rev 3): Documented (fixed in-repo).** Contract pinned at every
+  touch point: doc comments on `BootstrapOrgResponse::owner_pubkey_fingerprint`
+  and `RotateOrgResponse::owner_pubkey_fingerprint` (`signing_service.rs`),
+  comments at both comparison sites (API `orgs.rs` rotate handler, CLI
+  `app/signing.rs`), and a "Policy-signing-service authority fields" section
+  in `docs/verification/contracts-v1.md`. Cross-repo rename to
+  `owner_pubkey_hex` stays recommended at the service's next contract revision
+  (follow-up 10).
 
 ### N-3 (Low, process) — Merge on local `main` silently reverted origin/main hunks
 
@@ -273,8 +292,15 @@ ledger verification).
   `cc_init_data.rs`, its test, and `main.rs`'s `load_platform_release`
   (discovered because the runtime-class release binding failed to appear after
   the pull). Any branch merging local `main` instead of `origin/main` inherits
-  the loss. Fixed on this branch (`197a045`); recommend auditing local `main`
-  for other dropped hunks (`git diff main origin/main` should be empty).
+  the loss.
+- **Status (rev 3): Fixed — verified.** Commit `49d8f48` on local `main`
+  restores the three dropped files; `git diff origin/main main` is now empty
+  (the worktree's unrelated dirty files were left untouched). Root cause:
+  local `main`'s only unique commit (`d3c3ad2`) was fully superseded by
+  origin/main's later evolution of the same hunks and the merge resolution
+  silently favored the stale side. Guard: the new
+  `release_runtime_class_binding_uses_the_resolved_class` source-assert test
+  fails if this hunk is dropped again.
 
 ### Verified-solid: main's new signing-authority rotation (coverage summary)
 
@@ -332,9 +358,9 @@ Principles:
 | M-9 | Keyring rollback refusal + platform-release monotonicity | Implemented; bootstrap paths superseded by main's upload-then-pin ordering (equivalent or stronger) |
 | M-10 | 0600-from-birth file creation; 0700 dirs | Implemented, verified |
 | L-1, L-3, L-5, L-7, L-9, L-10, L-11, L-12 | See Low table | Implemented, verified |
-| N-1 | Audit-log + env-gate the dev-runtime hatch; restore release↔runtime-class binding when a release is loaded | **Open** |
-| N-2 | Document/pin the signing-service fingerprint field contract | **Open** |
-| N-3 | Fix local `main`; restored on this branch in `197a045` | Branch fixed; local `main` still stale |
+| N-1 | Audit-log + env-gate the dev-runtime hatch; restore release↔runtime-class binding when a release is loaded | Implemented (rev 3): warn at resolution + `check_release_runtime_class` binding + regression test |
+| N-2 | Document/pin the signing-service fingerprint field contract | Implemented (rev 3): docs at all touch points + contracts-v1.md; cross-repo rename pending (follow-up 10) |
+| N-3 | Fix local `main`; restored on this branch in `197a045` | Implemented (rev 3): local `main` repaired in `49d8f48`; `git diff origin/main main` empty |
 
 ### Deferred work (follow-ups, in priority order)
 
@@ -349,8 +375,12 @@ Principles:
 7. Appraiser authentication/rate limiting at the deployment tier (residual
    M-1/M-5 exposure).
 8. Engine teardown helper hardening before first use.
-9. N-1: audited env-gate + release binding for `CAP_ALLOW_DEV_RUNTIME_CLASS`.
-10. N-2: signing-service fingerprint contract documentation.
+9. ~~N-1: audited env-gate + release binding for `CAP_ALLOW_DEV_RUNTIME_CLASS`.~~
+    Done (rev 3); residual: none in-repo.
+10. N-2 cross-repo rename: rename the signing-service's
+    `owner_pubkey_fingerprint` to `owner_pubkey_hex` at the service's next
+    contract revision (coordinated change per AGENTS.md; contract now
+    documented in-repo).
 
 ### Verification
 

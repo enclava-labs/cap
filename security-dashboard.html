@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAP Security Review Dashboard — rev 2 (2026-08-17)</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --text: #e6edf3;
+    --muted: #8b949e; --red: #f85149; --orange: #d29922; --yellow: #e3b341;
+    --blue: #58a6ff; --green: #3fb950; --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 15px/1.55 ui-sans-serif, system-ui, "Segoe UI", sans-serif; padding: 32px 20px 80px; }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  h1 { font-size: 22px; letter-spacing: .3px; }
+  .sub { color: var(--muted); margin: 6px 0 28px; font-size: 13.5px; }
+  .sub code { color: var(--blue); background: none; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; margin-bottom: 24px; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .stat b { font-size: 26px; display: block; }
+  .stat span { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .8px; }
+  .stat.open b { color: var(--orange); } .stat.fixed b { color: var(--green); }
+  .stat.partial b { color: var(--yellow); } .stat.total b { color: var(--blue); }
+
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
+  button.f { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 20px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+  button.f.on { border-color: var(--blue); color: var(--blue); }
+  button.f small { color: var(--muted); margin-left: 4px; }
+
+  .card { background: var(--panel); border: 1px solid var(--border); border-left-width: 4px; border-radius: 10px; padding: 16px 18px; margin-bottom: 12px; }
+  .card.critical { border-left-color: var(--red); } .card.high { border-left-color: var(--orange); }
+  .card.medium { border-left-color: var(--yellow); } .card.low { border-left-color: var(--blue); }
+  .card.hidden { display: none; }
+  .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+  .id { font-weight: 700; font-family: ui-monospace, monospace; }
+  .title { font-weight: 600; flex: 1; min-width: 200px; }
+  .badge { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .7px; padding: 2px 9px; border-radius: 10px; border: 1px solid; }
+  .b-critical { color: var(--red); border-color: var(--red); } .b-high { color: var(--orange); border-color: var(--orange); }
+  .b-medium { color: var(--yellow); border-color: var(--yellow); } .b-low { color: var(--blue); border-color: var(--blue); }
+  .b-fixed { color: var(--green); border-color: var(--green); } .b-open { color: var(--red); border-color: var(--red); }
+  .b-partial { color: var(--yellow); border-color: var(--yellow); } .b-deferred { color: var(--purple); border-color: var(--purple); }
+  .card p { color: var(--muted); font-size: 13.5px; margin-bottom: 6px; }
+  .card p strong { color: var(--text); }
+  .loc { font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); word-break: break-all; }
+  .plan { background: rgba(88,166,255,.07); border: 1px solid rgba(88,166,255,.25); border-radius: 8px; padding: 10px 12px; margin-top: 8px; font-size: 13.5px; }
+  .plan::before { content: "▸ Plan of action"; display: block; color: var(--blue); font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: .8px; margin-bottom: 4px; }
+  .foot { color: var(--muted); font-size: 12px; margin-top: 28px; border-top: 1px solid var(--border); padding-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>CAP Security Review — Dashboard</h1>
+  <p class="sub">Rev 3 · 2026-08-17 · source: <code>SECURITY_REVIEW_DEEP_DIVE.md</code> · branch <code>security/deep-dive-fixes</code> · review basis: merge of <code>origin/main</code> <code>c7691b7</code> + fixes <code>07d6189</code>; rev 3 addressed N-1, N-2, N-3. No open High or Critical findings.</p>
+
+  <div class="stats" id="stats"></div>
+  <div class="controls" id="filters"></div>
+  <div id="cards"></div>
+
+  <p class="foot">Severity scale: Critical &gt; High &gt; Medium &gt; Low. A finding is marked <b>Fixed</b> only when the fix is present and verified in the current worktree. Deferred items are open follow-ups tracked in the review document. Verification on this branch: fmt / clippy / tests / doc-tests green; release builds with <code>ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX</code> still required before merge.</p>
+</div>
+
+<script>
+const FINDINGS = [
+ {id:"H-1", sev:"high", status:"fixed", title:"CLI attestation accepts attacker-supplied AMD cert chain",
+  impact:"On-path attacker at attest_receipt_key time serves their own TLS leaf and a self-generated ARK/ASK/VCEK chain whose report binds the attacker's leaf, nonce and receipt key — CLI trusts a non-TEE as attested. Gates password-mode claim/unlock/recover and config delivery: storage passwords and config secrets could be delivered to a MITM.",
+  fix:"Evidence-embedded chains accepted only when the ARK byte-matches a builtin AMD root (Milan/Genoa/Turin); otherwise anchored KDS fetch; otherwise fail closed (tee_client.rs:684-698, 912-930).",
+  loc:"crates/enclava-cli/src/tee_client.rs, attestation.rs, tee_client/tls.rs"},
+
+ {id:"M-1", sev:"medium", status:"fixed", title:"Unbounded RSA modpow on unpinned ARK (verifier CRL path, DoS)",
+  impact:"~130 KB request to unauthenticated POST /v1/appraise burns minutes-to-hours of CPU (~1000× amplification at 8 KB keys). Availability only; verdict stays Fail.",
+  fix:"CRL path requires the policy-pinned ARK before any RSA math; modulus capped at 8192 bits, exponent capped (amd.rs:48-52). Deployment-tier appraiser auth remains a separate open item.",
+  loc:"crates/enclava-verifier/src/amd.rs, lib.rs · appraiser main.rs"},
+
+ {id:"M-2", sev:"medium", status:"fixed", title:"POST /orgs missing PaaS write gate and org-name validation",
+  impact:"On paas_managed instances public signups could create unlimited orgs and squat names, permanently DoS-ing PaaS provisioning (409 with no takeover). Malformed names flowed into derived K8s namespaces.",
+  fix:"create_org enforces ensure_management_write_allowed + DNS-safe validate_org_name (orgs.rs:56); regression tests kept beside main's tests.",
+  loc:"crates/enclava-api/src/routes/orgs.rs"},
+
+ {id:"M-3", sev:"medium", status:"fixed", title:"Rego injection primitive in engine + unvalidated namespace",
+  impact:"Latent: generate_kbs_policy_rego interpolated namespace/sa/hash into Rego via raw format!(). Production writer escaped separately and K8s rejects bad names, but the engine's public API was an injection path waiting for a future wiring.",
+  fix:"All Rego string interpolation goes through rego_quoted_string (serde_json::to_string); namespace/service-account/tenant-id validated as DNS labels in engine::validate (validate.rs:41-43).",
+  loc:"crates/enclava-engine/src/manifest/kbs_policy.rs, validate.rs"},
+
+ {id:"M-4", sev:"medium", status:"fixed", title:"Tenant egress to internal endpoints was warn-only",
+  impact:"A tenant could open TEE egress to the K8s API server or cloud metadata (all ports) — the audit reasons existed precisely to block this. Mitigated by automountServiceAccountToken:false and Kata isolation.",
+  fix:"Internal/metadata/.svc/rebinding hosts rejected with 400; operator opt-out via audited CAP_EGRESS_ALLOW_INTERNAL_HOSTS (logged per host).",
+  loc:"crates/enclava-api/src/routes/apps.rs · engine network_policy.rs"},
+
+ {id:"M-5", sev:"medium", status:"fixed", title:"Appraiser signs PASS receipts over caller-chosen policies",
+  impact:"Anyone could POST a trivially-satisfiable inline policy + matching evidence and receive a validly-signed PASS receipt. Latent foot-gun for external consumers treating 'valid receipt + PASS' as sufficient.",
+  fix:"verify_appraisal_response_pinned + ExpectedReceipt (policy hash / nonce / origin binding) added to receipt.rs; appraiser docs require consumer-side pinning.",
+  loc:"crates/enclava-appraiser/src/main.rs · verifier receipt.rs"},
+
+ {id:"M-6", sev:"medium", status:"partial", title:"No SNP TCB/policy appraisal in CLI (DEBUG bit unchecked)",
+  impact:"A genuine but debug-enabled or stale-TCB guest passed CLI appraisal after chain verification — only report_data was compared.",
+  fix:"DEBUG-bit guests now rejected fail-closed (attestation.rs:142).",
+  plan:"TCB floors still missing: collect per-platform floor data and add floor checks (the independent verifier already supports floors via policy). Deferred follow-up #1.",
+  loc:"crates/enclava-cli/src/tee_client.rs, attestation.rs"},
+
+ {id:"M-7", sev:"medium", status:"fixed", title:"TLS-verification bypass envs gated only in main(); unconditional in ssh.txt path",
+  impact:"Library consumers and misled users could disable WebPKI via ENCLAVA_TEE_TLS_MODE=staging|insecure in release builds; ssh.txt fetch hard-coded danger_accept_invalid_certs.",
+  fix:"accepts_invalid_tee_certs() honors bypass envs only under cfg!(debug_assertions); ssh.txt uses the same gate. Preprod staging relays need trusted certs or a debug CLI.",
+  loc:"crates/enclava-cli/src/tee_client.rs · commands/template.rs"},
+
+ {id:"M-8", sev:"medium", status:"fixed", title:"Windows command injection via API-supplied URL",
+  impact:"cmd /C start with verification_uri_complete from a malicious --api-url or compromised API → arbitrary command execution on Windows clients (cmd.exe interprets &, ^, |, %VAR%).",
+  fix:"try_open_browser validates scheme + charset (browser_safe_device_url) and quotes the URL; webbrowser bumped to 1.2.2.",
+  loc:"crates/enclava-cli/src/commands/auth.rs:335-353"},
+
+ {id:"M-9", sev:"medium", status:"fixed", title:"No rollback/downgrade protection on keyring fetch and platform release",
+  impact:"A compromised API could replay an older, still-validly-signed keyring (re-adding a removed deployer, dropping new members); any validly-signed old platform release was accepted.",
+  fix:"store_keyring_envelope refuses version rollbacks (equal = idempotent); force variant only for explicit restore/bootstrap; platform-release version monotonicity enforced. Superseded/strengthened by main's upload-then-pin bootstrap ordering.",
+  loc:"crates/enclava-cli/src/keyring.rs · platform_release.rs · commands/org.rs"},
+
+ {id:"M-10", sev:"medium", status:"fixed", title:"CLI secret files briefly world-readable",
+  impact:"credentials.tmp containing plaintext session JWT / API key / Ed25519 bootstrap key hex was created 0644 (umask-dependent) then chmod 0600 then renamed.",
+  fix:"create_new(true).mode(0o600) + rename; state dirs forced 0700. Main's new backup path also writes ciphertext-only tmp files 0600-before-rename.",
+  loc:"crates/enclava-cli/src/config.rs:203-207"},
+
+ {id:"L-1", sev:"low", status:"fixed", title:"60 s JWT exp leeway on session and signer-rotation validators",
+  impact:"Clock-skew leeway widened token validity windows.",
+  fix:"leeway = 0 (jwt.rs:126-136).", loc:"crates/enclava-api/src/auth/jwt.rs"},
+ {id:"L-3", sev:"low", status:"fixed", title:"Signing-service URL may be http:// (bearer token in cleartext)",
+  impact:"Startup gate enforced HTTPS only for TRUSTEE_KBS_URL.",
+  fix:"Release gate requires https for PLATFORM_SIGNING_SERVICE_URL (main.rs:747-749).", loc:"crates/enclava-api/src/main.rs"},
+ {id:"L-5", sev:"low", status:"fixed", title:"verify_chain_or_skip dead branch inviting regression",
+  impact:"API shape + stale doc described a skip path that was (correctly) unreachable.",
+  fix:"Renamed verify_chain_required, returns Result<()>, dead branch + stale docs deleted.", loc:"crates/enclava-init/src/trustee_verify.rs"},
+ {id:"L-7", sev:"low", status:"fixed", title:"Unlock socket: unbounded read_line",
+  impact:"Length limit enforced after unbounded read.",
+  fix:"take(MAX+1) before read_line (socket.rs:62-67).", loc:"crates/enclava-init/src/socket.rs"},
+ {id:"L-9", sev:"low", status:"fixed", title:"container_name unvalidated at deploy acceptance",
+  impact:"Validated only on the logs route.",
+  fix:"DNS-label validated at acceptance (deployments.rs:743-748).", loc:"crates/enclava-api/src/routes/deployments.rs"},
+ {id:"L-10", sev:"low", status:"fixed", title:"Dev postgres published on all interfaces with static creds",
+  impact:"docker-compose exposed postgres 5432 on 0.0.0.0.",
+  fix:"Bound to 127.0.0.1.", loc:"docker-compose.yml"},
+ {id:"L-11", sev:"low", status:"fixed", title:"No CSP meta tag on web verifier pages",
+  impact:"DOM is textContent-only today; hardening against regressions.",
+  fix:"CSP meta tags added to index.html and test.html.", loc:"web/verifier/"},
+ {id:"L-12", sev:"low", status:"fixed", title:"ApiClient does not enforce https",
+  impact:"Plain-http API endpoints accepted (TEE client did enforce).",
+  fix:"https enforced except loopback hosts (api_client.rs:31-40).", loc:"crates/enclava-cli/src/api_client.rs"},
+
+ {id:"N-1", sev:"medium", status:"fixed", title:"Release-build escape hatch for simulated CoCo runtime is unaudited",
+  impact:"Main reintroduced CAP_ALLOW_DEV_RUNTIME_CLASS=true permitting kata-qemu-coco-dev (no real TEE) in release builds, reversing the 'release builds reject all debug bypass envs' invariant. An operator misconfiguration or compromised GitOps repo can schedule all tenant workloads without real TEEs. Verification still fails closed (availability/confidence loss, not a confidentiality bypass), but the startup gate that used to catch this is gone, and unlike the egress opt-out this env is not registered in any env gate and never audit-logged.",
+  plan:"1) Log loudly when the hatch resolves. 2) Register in the audited-env set. 3) Restore release.expected_runtime_class == try_runtime_class() when a platform release is enabled. ~20 lines + test.",
+  fix:"(rev 3) tracing::warn fires every time the hatch resolves the simulated CoCo class; load_platform_release binds the signed release to the resolved runtime class via check_release_runtime_class — hatch + enabled release now fails startup (hatch usable only without release metadata); source-assert regression test guards the call site against the dropped-hunk failure mode.",
+  loc:"crates/enclava-engine/src/manifest/cc_init_data.rs:260,291-296 · api main.rs:356-368"},
+
+ {id:"N-3", sev:"low", status:"fixed", title:"Local main merge silently reverted origin/main hunks",
+  impact:"Local main merge 90ad634 dropped origin/main changes to three files (runtime-class hatch, its test, release binding). Any branch merging local main instead of origin/main inherits the loss — this is how security fixes vanish silently. Fixed on this branch (197a045); local main is still stale.",
+  plan:"Audit local main: git diff main origin/main must be empty; redo the bad merge (90ad634). Two commands.",
+  fix:"(rev 3) Commit 49d8f48 on local main restores the three dropped files; git diff origin/main main is empty, unrelated dirty worktree files untouched. The new source-assert test fails if the hunk is dropped again.",
+  loc:"local main merge commit 90ad634"},
+
+ {id:"N-2", sev:"low", status:"fixed", title:"owner_pubkey_fingerprint contract is actually raw key hex",
+  impact:"The signing service's owner_pubkey_fingerprint is compared against hex(raw pubkey) while every in-repo 'fingerprint' is a SHA-256 digest. If the service ever returns a real digest, bootstrap/rotation consistency checks fail closed (DoS/confusion, not a bypass). Cross-repo contract trap (AGENTS.md blocking rules: policy-signing-service is a consumer).",
+  plan:"Document and pin the field's semantics with the signing-service team; ideally rename to owner_pubkey_hex at the next contract revision.",
+  fix:"(rev 3) Contract pinned at every touch point: doc comments on both signing-service response structs, comments at both comparison sites (API orgs.rs, CLI signing.rs), and a 'Policy-signing-service authority fields' section in docs/verification/contracts-v1.md. Cross-repo rename to owner_pubkey_hex stays recommended at the service's next contract revision (follow-up 10).",
+  loc:"crates/enclava-api/src/routes/orgs.rs · cli commands/app/signing.rs:199"},
+
+ {id:"APPRAISER", sev:"medium", status:"open", title:"Appraiser unauthenticated + unthrottled (residual M-1/M-5)",
+  impact:"POST /v1/appraise is a free oracle: unauthenticated, no rate limit. Per-request CPU is now capped, so no unbounded DoS, but anyone can obtain signed receipts over self-chosen policies indefinitely.",
+  plan:"Add deployment-tier auth/rate limiting (network policy or token in front of the service). Deferred follow-up #7.",
+  loc:"crates/enclava-appraiser/src/main.rs:57-63 · deploy/"},
+
+ {id:"L-2", sev:"low", status:"deferred", title:"Custom-domain challenge token stored plaintext",
+  impact:"DB read = domain takeover ability for pending challenges (all other verifier secrets are hashed).",
+  plan:"Hash challenge tokens at rest via DB migration 00XX. Deferred follow-up #2.",
+  loc:"crates/enclava-api/src/routes/domains.rs:222-233 + migration 0014"},
+ {id:"L-4", sev:"low", status:"deferred", title:"Internal error strings echoed to attestation-authenticated callers",
+  impact:"Info disclosure from workload routes.",
+  plan:"Error-allowlisting refactor for workload routes. Deferred follow-up #3.",
+  loc:"crates/enclava-api/src/routes/workload.rs:66-133"},
+ {id:"L-6", sev:"low", status:"deferred", title:"org_keyring_signature fetched, typed, never verified",
+  impact:"Fingerprint anchoring only — maintenance trap toward future enforcement.",
+  plan:"Enforce signature verification; schema-adjacent (KBS artifact format), needs cross-project coordination per AGENTS.md blocking rules. Deferred follow-up #4.",
+  loc:"crates/enclava-init/src/trustee_verify.rs:100-102"},
+ {id:"L-8", sev:"low", status:"deferred", title:"Legacy 32-of-48-byte measurement prefix compare",
+  impact:"Mitigated by independent full-width check in verifier policies.",
+  plan:"Migrate descriptors off legacy measurements. Deferred follow-up #5.",
+  loc:"crates/enclava-common/src/descriptor.rs:97-103"},
+ {id:"L-13", sev:"low", status:"deferred", title:"Login/signup user enumeration, no per-account throttle",
+  impact:"Timing + response differences reveal account existence; argon2 + global rate limit mitigate.",
+  plan:"Per-account throttle + uniform login timing; needs storage design. Deferred follow-up #6.",
+  loc:"crates/enclava-api/src/auth/email.rs:59-144"},
+ {id:"L-14", sev:"low", status:"deferred", title:":latest / zero-digest image defaults in deploy manifests",
+  impact:"Only the render script enforces digest pinning.",
+  plan:"Operator docs updated; enforcement stays with the render workflow.",
+  loc:"deploy/api/deployment.yaml:35 · kustomization.yaml"},
+ {id:"L-15", sev:"low", status:"deferred", title:"Dead teardown helper follows redirects with bearer token",
+  impact:"Live path hardened; must fix before any wiring.",
+  plan:"redirect-none + tee_domain hardening before first use. Deferred follow-up #8.",
+  loc:"crates/enclava-engine/src/apply/teardown.rs:29-37"},
+ {id:"L-16", sev:"low", status:"partial", title:"Debug derives on secret-bearing structs; --set KEY=VALUE in argv",
+  impact:"Secrets can leak into logs/argv; safe --set-file exists.",
+  fix:"Credentials/bootstrap types no longer derive Debug where avoidable.",
+  plan:"Redact remaining Debug impls on secret structs.",
+  loc:"crates/enclava-cli various"},
+];
+
+const sevLabel = {critical:"Critical", high:"High", medium:"Medium", low:"Low"};
+const stLabel  = {fixed:"Fixed & verified", open:"Open", partial:"Partial", deferred:"Open (deferred)"};
+const stBadge  = {fixed:"b-fixed", open:"b-open", partial:"b-partial", deferred:"b-deferred"};
+const OPENISH  = s => s === "open" || s === "deferred" || s === "partial";
+
+function render() {
+  const fixed = FINDINGS.filter(f => f.status === "fixed").length;
+  const open  = FINDINGS.filter(f => OPENISH(f.status)).length;
+  const partial = FINDINGS.filter(f => f.status === "partial").length;
+  document.getElementById("stats").innerHTML = `
+    <div class="stat total"><b>${FINDINGS.length}</b><span>Findings total</span></div>
+    <div class="stat fixed"><b>${fixed}</b><span>Fixed &amp; verified</span></div>
+    <div class="stat open"><b>${open - partial}</b><span>Open</span></div>
+    <div class="stat partial"><b>${partial}</b><span>Partially fixed</span></div>
+    <div class="stat open"><b>0</b><span>Open High / Critical</span></div>`;
+
+  const filters = [
+    ["all", "All", FINDINGS.length],
+    ["open", "Still open", FINDINGS.filter(f => OPENISH(f.status)).length],
+    ["fixed", "Closed", FINDINGS.filter(f => !OPENISH(f.status)).length],
+    ["medium", "Medium", FINDINGS.filter(f => f.sev === "medium").length],
+    ["low", "Low", FINDINGS.filter(f => f.sev === "low").length],
+  ];
+  document.getElementById("filters").innerHTML = filters
+    .map(([k, l, n], i) => `<button class="f${i === 0 ? " on" : ""}" data-f="${k}">${l}<small>${n}</small></button>`).join("");
+
+  document.getElementById("cards").innerHTML = FINDINGS.map(f => `
+    <div class="card ${f.sev} ${f.status}" data-sev="${f.sev}" data-open="${OPENISH(f.status)}">
+      <div class="head">
+        <span class="id">${f.id}</span>
+        <span class="title">${f.title}</span>
+        <span class="badge b-${f.sev}">${sevLabel[f.sev]}</span>
+        <span class="badge ${stBadge[f.status]}">${stLabel[f.status]}</span>
+      </div>
+      <p><strong>Impact:</strong> ${f.impact}</p>
+      ${f.fix ? `<p><strong>Fix:</strong> ${f.fix}</p>` : ""}
+      ${f.plan ? `<div class="plan">${f.plan}</div>` : ""}
+      <p class="loc">${f.loc}</p>
+    </div>`).join("");
+
+  document.querySelectorAll("button.f").forEach(btn => btn.onclick = () => {
+    document.querySelectorAll("button.f").forEach(b => b.classList.remove("on"));
+    btn.classList.add("on");
+    const f = btn.dataset.f;
+    document.querySelectorAll(".card").forEach(c => {
+      const show = f === "all" || c.dataset.open === "true" && f === "open" ||
+                   c.dataset.open === "false" && f === "fixed" || c.dataset.sev === f;
+      c.classList.toggle("hidden", !show);
+    });
+  });
+}
+render();
+</script>
+</body>
+</html>

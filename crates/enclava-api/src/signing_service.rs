@@ -276,6 +276,13 @@ pub struct BootstrapOrgRequest {
 pub struct BootstrapOrgResponse {
     pub org_id: Uuid,
     pub state: String,
+    /// CROSS-REPO CONTRACT (policy-signing-service): despite the name, this is
+    /// hex(raw 32-byte owner Ed25519 public key) — NOT a SHA-256 digest. Every
+    /// in-repo "fingerprint" IS a digest (see `owner_key_fingerprint` in
+    /// routes/orgs.rs). Consumers byte-compare it against hex::encode(pubkey);
+    /// if the service ever emits a real digest those checks fail closed.
+    /// Renaming or changing the encoding is a coordinated contract change per
+    /// the AGENTS.md blocking rules.
     pub owner_pubkey_fingerprint: String,
 }
 
@@ -302,6 +309,8 @@ pub struct RotateOwnerRequest {
 pub struct RotateOwnerResponse {
     pub org_id: Uuid,
     pub version: u64,
+    /// Same cross-repo contract as `BootstrapOrgResponse::owner_pubkey_fingerprint`:
+    /// hex(raw pubkey), not a digest.
     pub owner_pubkey_fingerprint: String,
     pub rotated_at: DateTime<Utc>,
 }

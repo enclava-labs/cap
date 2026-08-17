@@ -356,16 +356,24 @@ fn load_platform_release(enabled: bool) -> anyhow::Result<Option<PlatformRelease
     let envelope = PlatformReleaseEnvelope::load_verified()
         .map_err(|e| anyhow::anyhow!("failed to load signed platform release: {e}"))?;
     let release = &envelope.payload;
-    if release.expected_runtime_class
-        != enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
-    {
+    // Compare against the *resolved* class, not the default: a signed release
+    // pins the runtime class its measurements describe, so the dev-runtime
+    // escape hatch (CAP_ALLOW_DEV_RUNTIME_CLASS) must not coexist with an
+    // enabled release. Workloads scheduled under the simulated CoCo class
+    // have no real TEE.
+    let runtime_class = enclava_engine::manifest::cc_init_data::try_runtime_class()
+        .map_err(|err| anyhow::anyhow!("invalid CAP runtime class configuration: {err}"))?;
+    check_release_runtime_class(&release.expected_runtime_class, &runtime_class)?;
+    Ok(Some(envelope))
+}
+
+fn check_release_runtime_class(expected: &str, resolved: &str) -> anyhow::Result<()> {
+    if expected != resolved {
         anyhow::bail!(
-            "signed platform release runtime class `{}` does not match API runtime class `{}`",
-            release.expected_runtime_class,
-            enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
+            "signed platform release runtime class `{expected}` does not match API runtime class `{resolved}`"
         );
     }
-    Ok(Some(envelope))
+    Ok(())
 }
 
 fn release_env_value(
@@ -882,6 +890,28 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_runtime_class_binding_uses_the_resolved_class() {
+        // The exact failure mode of the dropped-hunk merge: the call site must
+        // pass the env-resolved class, never the DEFAULT constant, so the
+        // CAP_ALLOW_DEV_RUNTIME_CLASS hatch cannot coexist with a signed
+        // release.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn load_platform_release")
+            .nth(1)
+            .and_then(|s| s.split("fn release_env_value").next())
+            .expect("load_platform_release body");
+        assert!(
+            body.contains("try_runtime_class()"),
+            "load_platform_release must bind the signed release to the resolved runtime class"
+        );
+        assert!(!body.contains("DEFAULT_RUNTIME_CLASS"));
+
+        check_release_runtime_class("kata-qemu-snp", "kata-qemu-snp").unwrap();
+        assert!(check_release_runtime_class("kata-qemu-snp", "kata-qemu-coco-dev").is_err());
+    }
 
     #[test]
     fn api_startup_installs_rustls_crypto_provider() {

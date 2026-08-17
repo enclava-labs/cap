@@ -1046,6 +1046,8 @@ pub async fn rotate_org_owner(
             })
             .await
             .map_err(crate::routes::deployments::signing_error_response)?;
+        // `owner_pubkey_fingerprint` is hex(raw pubkey) by cross-repo contract
+        // (see SigningServiceClient response docs) — not a digest.
         if rotated.org_id != org_id
             || rotated.owner_pubkey_fingerprint != hex::encode(replacement_owner)
         {
