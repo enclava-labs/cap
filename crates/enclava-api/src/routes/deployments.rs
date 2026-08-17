@@ -149,6 +149,9 @@ pub(crate) fn signing_error_response(
         }
         SigningServiceError::Blob(_) => (StatusCode::BAD_REQUEST, "signed_artifact_invalid"),
         SigningServiceError::Mismatch(_) => (StatusCode::BAD_REQUEST, "signed_artifact_mismatch"),
+        SigningServiceError::AuthorityStatus(_) => {
+            (StatusCode::BAD_GATEWAY, "signing_authority_status_invalid")
+        }
         SigningServiceError::InvalidSignature => {
             (StatusCode::BAD_REQUEST, "signed_artifact_signature_invalid")
         }

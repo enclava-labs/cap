@@ -1,17 +1,20 @@
 use clap::Subcommand;
 use ed25519_dalek::{Signature, VerifyingKey};
+use enclava_common::crypto::owner_rotation_directive_bytes;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use uuid::Uuid;
 
 use enclava_cli::api_client::ApiClient;
 use enclava_cli::api_types::{
     BootstrapSigningServiceRequest, CurrentUserResponse, OrgKeyringResponse, PutOrgKeyringRequest,
-    RegisterPublicKeyRequest,
+    RegisterPublicKeyRequest, RotateOrgOwnerRequest,
 };
 use enclava_cli::config::{self, CliPaths};
 use enclava_cli::keyring::{
-    OrgKeyringEnvelope, Role, fingerprint, load_trusted_owner, sign_keyring, single_member_keyring,
-    store_keyring_envelope_force, store_trusted_owner, verify_keyring,
+    OrgKeyringEnvelope, Role, fingerprint, load_trusted_owner, rotate_trusted_owner, sign_keyring,
+    single_member_keyring, store_keyring_envelope, store_keyring_envelope_force,
+    store_trusted_owner, verify_keyring,
 };
 use enclava_cli::keys;
 
@@ -42,6 +45,30 @@ pub enum KeyCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Create recoverable organization signing authority
+    Setup {
+        /// Encrypted recovery backup written before any remote authority change
+        #[arg(long)]
+        backup_out: PathBuf,
+        /// Organization name or ID; defaults to the active organization
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Rotate the organization owner key with an encrypted replacement backup
+    RotateOwner {
+        /// Encrypted replacement recovery backup (reused to retry an interrupted rotation)
+        #[arg(long)]
+        backup_out: PathBuf,
+        /// Organization name or ID; defaults to the active organization
+        #[arg(long)]
+        org: Option<String>,
+        /// Audit reason recorded with the rotation
+        #[arg(long, default_value = "routine owner rotation")]
+        reason: String,
+        /// Skip the final interactive confirmation
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 pub async fn run(cmd: KeyCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -58,6 +85,13 @@ pub async fn run(cmd: KeyCommand) -> Result<(), Box<dyn std::error::Error>> {
             )?;
             restore(input, force).await
         }
+        KeyCommand::Setup { backup_out, org } => setup(backup_out, org).await,
+        KeyCommand::RotateOwner {
+            backup_out,
+            org,
+            reason,
+            yes,
+        } => rotate_owner(backup_out, org, reason, yes).await,
     }
 }
 
@@ -163,16 +197,11 @@ async fn verify_or_initialize_remote_keyring(
             Ok((org_id, org_name, fingerprint(&owner.public)))
         }
         Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {
-            if !me.active_org.is_personal {
-                return Err(
-                    "org keyring is missing for a non-personal org; team keyring onboarding is not part of the manual MVP"
-                        .into(),
-                );
+            if me.active_org.role != "owner" {
+                return Err("only an organization owner can create a missing org keyring".into());
             }
             let keyring = single_member_keyring(org_id, 1, &owner, Role::Owner, chrono::Utc::now());
             let envelope = sign_keyring(&owner, keyring);
-            store_trusted_owner(&org_id, &owner.public)?;
-            store_keyring_envelope_force(&org_id, &envelope)?;
             upload_keyring(api, &org_name, &envelope).await?;
             match api
                 .bootstrap_signing_service_owner(
@@ -187,6 +216,11 @@ async fn verify_or_initialize_remote_keyring(
                 Err(enclava_cli::api_client::ApiError::Api { status: 503, .. }) => {}
                 Err(err) => return Err(err.into()),
             }
+            // Pin only authority CAP accepted. A concurrent team owner may win
+            // the first upload, in which case this setup must leave no losing
+            // local trust state behind.
+            store_trusted_owner(&org_id, &owner.public)?;
+            store_keyring_envelope(&org_id, &envelope)?;
             Ok((org_id, org_name, fingerprint(&owner.public)))
         }
         Err(err) => Err(err.into()),
@@ -478,9 +512,356 @@ async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+fn active_org_matches(
+    requested: Option<&str>,
+    me: &CurrentUserResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(requested) = requested
+        && requested != me.active_org.name
+        && requested != me.active_org.id
+    {
+        return Err(format!(
+            "requested org {requested} does not match active org {} ({})",
+            me.active_org.name, me.active_org.id
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn stored_mnemonics(
+    paths: &CliPaths,
+    org_name: &str,
+) -> Result<Vec<keys::RecoveryBackupMnemonic>, Box<dyn std::error::Error>> {
+    Ok(keys::list_app_mnemonics(paths, org_name)?
+        .into_iter()
+        .map(|(app, mnemonic)| keys::RecoveryBackupMnemonic { app, mnemonic })
+        .collect())
+}
+
+fn write_encrypted_backup(
+    output: &PathBuf,
+    seed: &[u8; 32],
+    passphrase: &str,
+    me: &CurrentUserResponse,
+    owner: &VerifyingKey,
+    mnemonics: &[keys::RecoveryBackupMnemonic],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backup = keys::encrypt_recovery_backup_with_metadata(
+        seed,
+        passphrase,
+        keys::RecoveryBackupMetadata {
+            org_id: Some(me.active_org.id.clone()),
+            org_name: Some(me.active_org.name.clone()),
+            owner_fingerprint: Some(fingerprint(owner)),
+        },
+        mnemonics,
+    )?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = output.with_extension("tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&backup)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(tmp, output)?;
+    Ok(())
+}
+
+async fn setup(backup_out: PathBuf, org: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let paths = CliPaths::resolve()?;
+    let (api, me) = current_user(&paths)
+        .await?
+        .ok_or("signing setup requires an active platform session; run `enclava login` first")?;
+    active_org_matches(org.as_deref(), &me)?;
+    if me.active_org.role != "owner" {
+        return Err("only an organization owner can create signing authority".into());
+    }
+    let user_id = Uuid::parse_str(&me.user_id)?;
+    let org_id = Uuid::parse_str(&me.active_org.id)?;
+    let existing_seed = keys::load_recovery_seed(&paths)?;
+    let seed = if backup_out.exists() {
+        let backup: keys::RecoveryBackup =
+            serde_json::from_str(&std::fs::read_to_string(&backup_out)?)?;
+        ensure_backup_org_matches_active_org(
+            backup.org_id.as_deref(),
+            backup.org_name.as_deref(),
+            &me.active_org.id,
+            &me.active_org.name,
+        )?;
+        let passphrase = prompt_restore_passphrase()?;
+        keys::decrypt_recovery_backup(&backup, &passphrase)?.seed
+    } else {
+        let seed = existing_seed.unwrap_or_else(keys::generate_recovery_seed);
+        let owner = keys::derive_org_owner_key(user_id, org_id, &seed)?;
+        let passphrase = prompt_backup_passphrase()?;
+        write_encrypted_backup(
+            &backup_out,
+            &seed,
+            &passphrase,
+            &me,
+            &owner.public,
+            &stored_mnemonics(&paths, &me.active_org.name)?,
+        )?;
+        println!(
+            "Encrypted recovery backup written to {}",
+            backup_out.display()
+        );
+        seed
+    };
+    if existing_seed.is_some_and(|existing| existing != seed) {
+        return Err(format!(
+            "{} contains a different recovery seed; use a backup of the current seed or move the local state aside after verifying it",
+            paths.recovery_seed.display()
+        )
+        .into());
+    }
+    let (_, org_name, owner_fingerprint) =
+        verify_or_initialize_remote_keyring(&api, &me, &seed).await?;
+    if existing_seed.is_none() {
+        // Install restored/new authority only after the remote keyring accepts it.
+        // A stale backup must not poison local state and block a corrected retry.
+        keys::store_seed_at(&paths.recovery_seed, &seed, false)?;
+    }
+    println!("Signing authority is ready for {org_name}.");
+    println!("Owner fingerprint: {owner_fingerprint}");
+    println!(
+        "Keep {} offline; Enclava cannot reconstruct this authority.",
+        backup_out.display()
+    );
+    Ok(())
+}
+
+fn finalize_local_owner_rotation(
+    paths: &CliPaths,
+    org_id: Uuid,
+    current: &VerifyingKey,
+    replacement: &VerifyingKey,
+    replacement_seed: &[u8; 32],
+    envelope: &OrgKeyringEnvelope,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match load_trusted_owner(&org_id)? {
+        Some(trusted) if trusted.to_bytes() == current.to_bytes() => {
+            rotate_trusted_owner(&org_id, current, replacement)?;
+        }
+        Some(trusted) if trusted.to_bytes() == replacement.to_bytes() => {}
+        _ => return Err("local trusted owner does not match current or replacement key".into()),
+    }
+    store_keyring_envelope(&org_id, envelope)?;
+    // Persist the seed last. An interrupted command can retry with the replacement backup.
+    keys::store_seed_at(&paths.recovery_seed, replacement_seed, true)?;
+    Ok(())
+}
+
+async fn rotate_owner(
+    backup_out: PathBuf,
+    org: Option<String>,
+    reason: String,
+    yes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if reason.trim().is_empty() {
+        return Err("rotation reason cannot be empty".into());
+    }
+    let paths = CliPaths::resolve()?;
+    let current_seed = keys::load_recovery_seed(&paths)?.ok_or(
+        "owner rotation requires a local recovery seed; restore your current backup first",
+    )?;
+    let (api, me) = current_user(&paths)
+        .await?
+        .ok_or("owner rotation requires an active platform session; run `enclava login` first")?;
+    active_org_matches(org.as_deref(), &me)?;
+    let user_id = Uuid::parse_str(&me.user_id)?;
+    let org_id = Uuid::parse_str(&me.active_org.id)?;
+    let current_owner = keys::derive_org_owner_key(user_id, org_id, &current_seed)?;
+
+    let replacement_seed = if backup_out.exists() {
+        let backup: keys::RecoveryBackup =
+            serde_json::from_str(&std::fs::read_to_string(&backup_out)?)?;
+        ensure_backup_org_matches_active_org(
+            backup.org_id.as_deref(),
+            backup.org_name.as_deref(),
+            &me.active_org.id,
+            &me.active_org.name,
+        )?;
+        let passphrase = prompt_restore_passphrase()?;
+        keys::decrypt_recovery_backup(&backup, &passphrase)?.seed
+    } else {
+        let seed = keys::generate_recovery_seed();
+        let replacement = keys::derive_org_owner_key(user_id, org_id, &seed)?;
+        let passphrase = prompt_backup_passphrase()?;
+        write_encrypted_backup(
+            &backup_out,
+            &seed,
+            &passphrase,
+            &me,
+            &replacement.public,
+            &stored_mnemonics(&paths, &me.active_org.name)?,
+        )?;
+        println!(
+            "Encrypted replacement recovery backup written to {}",
+            backup_out.display()
+        );
+        seed
+    };
+    let replacement_owner = keys::derive_org_owner_key(user_id, org_id, &replacement_seed)?;
+    let remote = keyring_envelope_from_response(api.get_org_keyring(&me.active_org.name).await?)?;
+    if current_owner.public == replacement_owner.public {
+        verify_keyring(&remote, &current_owner.public)?;
+        if !keyring_has_owner(&remote, &current_owner.public) {
+            return Err(
+                "remote keyring does not contain the owner derived from this backup".into(),
+            );
+        }
+        println!(
+            "The backup and active owner already match; no rotation was needed. Use a new backup path to start another rotation."
+        );
+        return Ok(());
+    }
+    if remote.signing_pubkey == replacement_owner.public {
+        verify_keyring(&remote, &replacement_owner.public)?;
+        if !keyring_has_owner(&remote, &replacement_owner.public) {
+            return Err("remote keyring does not contain the replacement owner".into());
+        }
+        finalize_local_owner_rotation(
+            &paths,
+            org_id,
+            &current_owner.public,
+            &replacement_owner.public,
+            &replacement_seed,
+            &remote,
+        )?;
+        println!("Owner rotation was already accepted; local recovery state is now current.");
+        return Ok(());
+    }
+    verify_keyring(&remote, &current_owner.public)?;
+    if load_trusted_owner(&org_id)?.map(|key| key.to_bytes())
+        != Some(current_owner.public.to_bytes())
+    {
+        return Err("current owner does not match the locally pinned owner".into());
+    }
+
+    let owner_members: Vec<_> = remote
+        .keyring
+        .members
+        .iter()
+        .filter(|member| {
+            member.pubkey == current_owner.public && matches!(member.role, Role::Owner)
+        })
+        .collect();
+    if owner_members.len() != 1 {
+        return Err("current keyring does not contain exactly one pinned owner entry".into());
+    }
+    if !yes
+        && !dialoguer::Confirm::new()
+            .with_prompt(format!(
+                "Rotate owner key for {}? The encrypted replacement backup must remain available",
+                me.active_org.name
+            ))
+            .default(false)
+            .interact()?
+    {
+        return Err("owner rotation cancelled; no remote authority was changed".into());
+    }
+
+    register_public_key(&api, &replacement_owner.public).await?;
+    let mut next = remote.keyring.clone();
+    next.version += 1;
+    next.updated_at = chrono::Utc::now();
+    for member in &mut next.members {
+        if member.pubkey == current_owner.public && matches!(member.role, Role::Owner) {
+            member.pubkey = replacement_owner.public;
+        }
+    }
+    let next = sign_keyring(&replacement_owner, next);
+    let signed_at = chrono::Utc::now();
+    let directive = owner_rotation_directive_bytes(
+        org_id,
+        &current_owner.public.to_bytes(),
+        &replacement_owner.public.to_bytes(),
+        signed_at,
+        reason.trim(),
+    );
+    let response = api
+        .rotate_org_owner(
+            &me.active_org.name,
+            &RotateOrgOwnerRequest {
+                version: next.keyring.version,
+                keyring_payload: serde_json::to_value(&next.keyring)?,
+                signature: hex::encode(next.signature.to_bytes()),
+                replacement_signing_pubkey: hex::encode(replacement_owner.public.to_bytes()),
+                current_signing_pubkey: hex::encode(current_owner.public.to_bytes()),
+                signed_at: signed_at.to_rfc3339(),
+                reason: reason.trim().to_string(),
+                rotation_signature: hex::encode(current_owner.sign(&directive).to_bytes()),
+            },
+        )
+        .await?;
+    let expected_fingerprint = hex::encode(Sha256::digest(replacement_owner.public.to_bytes()));
+    if response.org_id != me.active_org.id
+        || response.state != "ready"
+        || response.keyring_version != next.keyring.version
+        || response.owner_fingerprint != expected_fingerprint
+    {
+        return Err("rotation response did not confirm the requested replacement owner".into());
+    }
+    finalize_local_owner_rotation(
+        &paths,
+        org_id,
+        &current_owner.public,
+        &replacement_owner.public,
+        &replacement_seed,
+        &next,
+    )?;
+    println!("Owner key rotated for {}.", me.active_org.name);
+    println!("Replacement owner fingerprint: {expected_fingerprint}");
+    println!(
+        "Keep {} and your previous backup offline until a fresh login and deploy both succeed.",
+        backup_out.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_writes_encrypted_backup_before_remote_authority() {
+        let source = include_str!("key.rs");
+        let body = source
+            .split("async fn setup(")
+            .nth(1)
+            .unwrap()
+            .split("fn finalize_local_owner_rotation")
+            .next()
+            .unwrap();
+        assert!(
+            body.find("write_encrypted_backup").unwrap()
+                < body.find("verify_or_initialize_remote_keyring").unwrap()
+        );
+        assert!(
+            body.find("verify_or_initialize_remote_keyring").unwrap()
+                < body.find("store_seed_at").unwrap()
+        );
+        let initialize_missing = source
+            .split("async fn verify_or_initialize_remote_keyring(")
+            .nth(1)
+            .unwrap()
+            .split("Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {")
+            .nth(1)
+            .unwrap()
+            .split("Err(err) => Err(err.into())")
+            .next()
+            .unwrap();
+        assert!(
+            initialize_missing.find("upload_keyring").unwrap()
+                < initialize_missing.find("store_trusted_owner").unwrap()
+        );
+        assert!(body.contains("only an organization owner can create signing authority"));
+    }
 
     #[cfg(unix)]
     #[test]

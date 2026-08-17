@@ -262,6 +262,23 @@ pub fn store_trusted_owner(org_id: &Uuid, pubkey: &VerifyingKey) -> Result<(), K
     Ok(())
 }
 
+/// Atomically replace a pinned owner after the remote owner-signed rotation succeeds.
+pub fn rotate_trusted_owner(
+    org_id: &Uuid,
+    expected: &VerifyingKey,
+    replacement: &VerifyingKey,
+) -> Result<(), KeyringError> {
+    if load_trusted_owner(org_id)?.map(|key| key.to_bytes()) != Some(expected.to_bytes()) {
+        return Err(KeyringError::TofuMismatch);
+    }
+    let path = owner_pubkey_path(org_id)?;
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, replacement.to_bytes())?;
+    set_file_0600(&tmp);
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 pub fn load_keyring_envelope(org_id: &Uuid) -> Result<OrgKeyringEnvelope, KeyringError> {
     let raw = fs::read_to_string(keyring_envelope_path(org_id)?)?;
     Ok(serde_json::from_str(&raw)?)

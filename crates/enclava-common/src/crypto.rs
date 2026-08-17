@@ -1,4 +1,25 @@
-use crate::canonical::ce_v1_hash;
+use chrono::{DateTime, Utc};
+use uuid::Uuid;
+
+use crate::canonical::{ce_v1_bytes, ce_v1_hash};
+
+pub fn owner_rotation_directive_bytes(
+    org_id: Uuid,
+    revoked_pubkey: &[u8; 32],
+    replacement_pubkey: &[u8; 32],
+    signed_at: DateTime<Utc>,
+    reason: &str,
+) -> Vec<u8> {
+    let signed_at = signed_at.to_rfc3339();
+    ce_v1_bytes(&[
+        ("purpose", b"enclava-recovery-v1"),
+        ("org_id", org_id.as_bytes().as_slice()),
+        ("revoked_pubkey", revoked_pubkey),
+        ("replacement_pubkey", replacement_pubkey),
+        ("signed_at", signed_at.as_bytes()),
+        ("reason", reason.as_bytes()),
+    ])
+}
 
 /// Compute stable tenant instance identity hash using CE-v1 (D11 / Phase 1).
 ///
@@ -30,6 +51,7 @@ pub fn compute_identity_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn identity_hash_is_lowercase_hex_64_chars() {
@@ -64,5 +86,20 @@ mod tests {
         let a = compute_identity_hash("a", "bc", "x");
         let b = compute_identity_hash("ab", "c", "x");
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn owner_rotation_directive_is_deterministic_and_domain_separated() {
+        let org_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let at = Utc.with_ymd_and_hms(2026, 8, 12, 12, 0, 0).unwrap();
+        let bytes = owner_rotation_directive_bytes(org_id, &[0x11; 32], &[0x22; 32], at, "routine");
+        assert_eq!(
+            bytes,
+            owner_rotation_directive_bytes(org_id, &[0x11; 32], &[0x22; 32], at, "routine")
+        );
+        assert_ne!(
+            bytes,
+            owner_rotation_directive_bytes(org_id, &[0x11; 32], &[0x22; 32], at, "incident")
+        );
     }
 }
