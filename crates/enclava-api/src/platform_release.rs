@@ -227,6 +227,17 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: "scheme must be http or https".to_string(),
         });
     }
+    // The signing-service bearer token must not transit cleartext
+    // off-cluster; reject at release-validation time so the failure names the
+    // signed field (SigningServiceClient re-checks as a backstop).
+    if signing_url.scheme() == "http"
+        && !crate::signing_service::plain_http_host_allowed(signing_url.host_str())
+    {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "signing_service_url",
+            message: "http scheme is only allowed for loopback/cluster-internal hosts".to_string(),
+        });
+    }
     hex32(
         "signing_service_pubkey_hex",
         &release.signing_service_pubkey_hex,

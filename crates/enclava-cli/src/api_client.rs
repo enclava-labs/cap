@@ -28,13 +28,12 @@ impl ApiClient {
     /// Create a new API client.
     pub fn new(base_url: &str, auth_token: Option<String>) -> Self {
         // The bearer token must only transit TLS. Plain http remains possible
-        // only for loopback development endpoints (a local API server).
-        let https_only = !base_url
-            .trim_start_matches("http://")
-            .starts_with("127.0.0.1")
-            && !base_url
-                .trim_start_matches("http://")
-                .starts_with("localhost");
+        // only for loopback development endpoints (a local API server),
+        // decided on the *parsed* host: a string-prefix test would let
+        // `http://localhost@evil.example` (userinfo) or
+        // `http://localhost.evil.example` (subdomain) send credentials to a
+        // remote host over cleartext.
+        let https_only = !loopback_http_url(base_url);
         let http = reqwest::Client::builder()
             .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
             .https_only(https_only)
@@ -924,5 +923,57 @@ mod tests {
             template_instance_idempotency_key(&changed_descriptor),
             "new signed descriptors for a destroyed/recreated app name must use a new idempotency key"
         );
+    }
+}
+
+/// True only for http URLs whose parsed host is exactly `localhost` or a
+/// loopback IP. Anything else — including https URLs and unparseable input —
+/// forces TLS.
+pub fn loopback_http_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+    match url.host_str() {
+        Some(host) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::loopback_http_url;
+
+    #[test]
+    fn only_exact_loopback_hosts_are_plain_http() {
+        for ok in [
+            "http://127.0.0.1:8080",
+            "http://localhost",
+            "http://LOCALHOST:3000",
+            "http://[::1]:9090",
+            "http://127.8.9.10",
+        ] {
+            assert!(loopback_http_url(ok), "{ok}");
+        }
+        for evil in [
+            "http://localhost.evil.example",
+            "http://localhost@evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://evil.example",
+            "https://evil.example",
+            "not a url",
+            "",
+        ] {
+            assert!(!loopback_http_url(evil), "{evil}");
+        }
     }
 }

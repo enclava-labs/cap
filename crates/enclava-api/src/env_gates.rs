@@ -125,14 +125,16 @@ fn enforce_with(
         }
 
         if let Some(value) = lookup("TRUSTEE_KBS_URL")
-            && value.trim().starts_with("http://")
+            && http_scheme(&value)
         {
             return Err(EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_KBS_URL"));
         }
 
         // The signing-service bearer token must never transit cleartext.
+        // Scheme comes from the parsed URL: `HTTP://host` must not slip a
+        // case-sensitive `starts_with("http://")` check.
         if let Some(value) = lookup("PLATFORM_SIGNING_SERVICE_URL")
-            && value.trim().starts_with("http://")
+            && http_scheme(&value)
         {
             return Err(EnvGateError::DebugOnlyFlagInRelease(
                 "PLATFORM_SIGNING_SERVICE_URL",
@@ -141,6 +143,12 @@ fn enforce_with(
     }
 
     Ok(())
+}
+
+/// True when `value` parses as an http:// URL (any host). Parsing makes the
+/// scheme check case-insensitive (`HTTP://` normalizes to `http`).
+fn http_scheme(value: &str) -> bool {
+    reqwest::Url::parse(value.trim()).is_ok_and(|url| url.scheme() == "http")
 }
 
 #[cfg(test)]
@@ -296,6 +304,19 @@ mod tests {
         env.insert(
             "PLATFORM_SIGNING_SERVICE_URL",
             "http://signing.example.test",
+        );
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::DebugOnlyFlagInRelease("PLATFORM_SIGNING_SERVICE_URL")
+        ));
+
+        // Case-insensitive scheme: `HTTP://` must not slip a prefix check.
+        let mut env = ok_required();
+        env.insert("TRUSTEE_POLICY_READ_AVAILABLE", "true");
+        env.insert(
+            "PLATFORM_SIGNING_SERVICE_URL",
+            "HTTP://signing.example.test",
         );
         let err = run(env, false).unwrap_err();
         assert!(matches!(

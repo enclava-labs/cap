@@ -115,36 +115,56 @@ impl PlatformReleaseEnvelope {
         // the release compiled into this binary. A validly-signed stale
         // release (pinned to old measurements/sidecar digests) is exactly
         // what a file-swap or env-var attack serves.
-        if override_active
-            && let Ok(bundled) =
-                serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
-            && release_is_older(&envelope.payload, &bundled.payload)
-        {
-            return Err(PlatformReleaseError::DowngradeRefused {
-                override_version: envelope.payload.platform_release_version.clone(),
-                override_created: envelope.payload.created_at.clone(),
-                bundled_version: bundled.payload.platform_release_version.clone(),
-                bundled_created: bundled.payload.created_at.clone(),
-            });
+        if override_active {
+            enforce_release_not_older_than_bundled(&envelope.payload)?;
         }
         Ok(envelope)
     }
 }
 
-/// Ordering by version string first, then creation timestamp. Both fields are
-/// part of the signed payload. A strictly-older override loses on either
-/// axis; anything newer-or-equal on version and not-older on created_at
-/// passes.
+/// Reject `release` when it is older than the release compiled into this
+/// binary. Applied to every release source that did not itself come from the
+/// bundle: env-path overrides AND API-provided envelopes (a compromised API
+/// can serve an old, still-validly-signed envelope with a matching
+/// `current_platform_release_id`, otherwise the CLI would sign against
+/// stale measurements, policy, and sidecar digests).
+pub fn enforce_release_not_older_than_bundled(
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    let Ok(bundled) = serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+    else {
+        return Ok(());
+    };
+    if release_is_older(release, &bundled.payload) {
+        return Err(PlatformReleaseError::DowngradeRefused {
+            override_version: release.platform_release_version.clone(),
+            override_created: release.created_at.clone(),
+            bundled_version: bundled.payload.platform_release_version.clone(),
+            bundled_created: bundled.payload.created_at.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Ordering by the signed creation timestamp first, version identifier as a
+/// tiebreak only. `platform_release_version` is an opaque identifier with a
+/// non-monotonic hash suffix (`dev-2026.07.28-proxy-a8303c36`), so it must
+/// never be the primary ordering axis; `created_at` is signed and monotonic
+/// by construction.
 fn release_is_older(candidate: &PlatformRelease, bundled: &PlatformRelease) -> bool {
     match (
         chrono::DateTime::parse_from_rfc3339(&candidate.created_at),
         chrono::DateTime::parse_from_rfc3339(&bundled.created_at),
     ) {
         (Ok(candidate_ts), Ok(bundled_ts)) => {
-            candidate.platform_release_version < bundled.platform_release_version
-                || (candidate.platform_release_version == bundled.platform_release_version
-                    && candidate_ts < bundled_ts)
+            candidate_ts < bundled_ts
+                || (candidate_ts == bundled_ts
+                    && candidate.platform_release_version < bundled.platform_release_version)
         }
+        // A candidate whose signed timestamp does not parse cannot be shown
+        // to be current; fail closed and treat it as older.
+        (Err(_), Ok(_)) => true,
+        // Unorderable baseline (broken bundle): fall back to the identifier.
         _ => candidate.platform_release_version < bundled.platform_release_version,
     }
 }
@@ -315,6 +335,60 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn release(version: &str, created_at: &str) -> PlatformRelease {
+        PlatformRelease {
+            schema_version: "v1".into(),
+            platform_release_version: version.into(),
+            signing_service_url: "https://signing.example".into(),
+            signing_service_pubkey_hex: "00".repeat(32),
+            policy_template_id: "t".into(),
+            policy_template_sha256: "00".repeat(32),
+            policy_template_text: "".into(),
+            attestation_proxy_image: "img".into(),
+            caddy_ingress_image: "img".into(),
+            trustee_kbs_url: "https://kbs.example".into(),
+            trustee_kbs_ca_cert_pem: "".into(),
+            tenant_caddy_tls_mode: "letsencrypt".into(),
+            tenant_caddy_acme_ca: "https://acme-staging.example".into(),
+            expected_firmware_measurement: "00".repeat(48),
+            expected_runtime_class: "kata-qemu-snp".into(),
+            genpolicy_version: "0".into(),
+            created_at: created_at.into(),
+        }
+    }
+
+    #[test]
+    fn release_ordering_uses_the_signed_timestamp_not_the_version_suffix() {
+        // Identifiers carry a non-monotonic hash suffix: lexicographic
+        // comparison would call the NEWER release (newer timestamp, suffix
+        // sorting lower) older, and vice versa.
+        let older = release("dev-2026.07.28-proxy-ffffffff", "2026-07-28T00:00:00Z");
+        let newer = release("dev-2026.08.15-proxy-00000000", "2026-08-15T00:00:00Z");
+        assert!(release_is_older(&older, &newer));
+        assert!(!release_is_older(&newer, &older));
+        assert!(!release_is_older(&newer, &newer));
+    }
+
+    #[test]
+    fn unparseable_candidate_timestamp_fails_closed_as_older() {
+        let bundled = release("r1", "2026-08-15T00:00:00Z");
+        let broken = release("r2", "not-a-timestamp");
+        assert!(release_is_older(&broken, &bundled));
+    }
+
+    #[test]
+    fn api_release_older_than_bundle_is_refused() {
+        // The bundled release is current by definition; anything with an
+        // older signed timestamp loses regardless of identifier.
+        let bundled = PlatformReleaseEnvelope::load_verified().unwrap();
+        let stale = release("zzz-newer-suffix", "2020-01-01T00:00:00Z");
+        assert!(matches!(
+            enforce_release_not_older_than_bundled(&stale),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
+        ));
+        drop(bundled);
+    }
 
     #[test]
     fn bundled_release_verifies_and_hashes_template() {

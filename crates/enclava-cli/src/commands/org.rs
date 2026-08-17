@@ -341,9 +341,12 @@ async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Erro
                 updated_at: Utc::now(),
             };
             let env = sign_keyring(&key, keyring);
+            upload_keyring(&api, &org_name, &env).await?;
+            // Pin only what the server accepted (mirrors `key setup`): a
+            // losing concurrent upload or a failed request must not leave
+            // local trust state ahead of the remote keyring.
             store_trusted_owner(&org, &key.public)?;
             store_keyring_envelope(&org, &env)?;
-            upload_keyring(&api, &org_name, &env).await?;
             if !skip_signing_service_bootstrap {
                 bootstrap_signing_service_owner(&api, &org_name, org, &key.public).await?;
             }
@@ -396,8 +399,12 @@ async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Erro
                 updated_at: Utc::now(),
             };
             let env = sign_keyring(&owner_key, next);
-            store_keyring_envelope(&org, &env)?;
             upload_keyring(&api, &org_name, &env).await?;
+            // Cache only after the server accepted vN+1: caching first would
+            // make a failed/rejected upload leave the local high-water mark
+            // ahead of the remote, so every later fetch of the still-current
+            // vN would be refused as a rollback.
+            store_keyring_envelope(&org, &env)?;
             println!("Added/updated member {user} ({})", fingerprint(&pk));
         }
         KeyringCommand::Trust {

@@ -319,10 +319,10 @@ fn device_login_scopes(approve_logs: bool) -> Vec<String> {
 /// as metacharacters. The URL arrives from the API server; a hostile or
 /// compromised API must not gain command execution through the CLI.
 fn browser_safe_device_url(url: &str) -> bool {
-    if !(url.starts_with("https://")
-        || url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://localhost"))
-    {
+    // Scheme decided on the parsed host (an exact-loopback http URL is the
+    // only non-https exception): a string-prefix test would accept
+    // `http://localhost.evil.example` / `http://localhost@evil.example`.
+    if !(url.starts_with("https://") || enclava_cli::api_client::loopback_http_url(url)) {
         return false;
     }
     !url.chars().any(|c| {

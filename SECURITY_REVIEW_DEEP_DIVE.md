@@ -13,6 +13,7 @@ finding below was verified against source in the main worktree.
 | 1 | 2026-08-14 | Initial deep-dive; fixes implemented on `security/deep-dive-fixes` (commit `07d6189`) | merge-base `a5e5fab2` |
 | 2 | 2026-08-17 | Re-ran all v1 findings against merged main (`origin/main` `c7691b7`, incl. PR #86/#87 signing-authority rotation + GitOps migrations); audited all new code; recorded new findings | merge commit `a2f6309` + restore commit `197a045` |
 | 3 | 2026-08-17 | Addressed N-1 (audited hatch + restored release↔runtime-class binding), N-2 (contract pinned at all touch points), N-3 (local `main` repaired) | `security/deep-dive-fixes` |
+| 4 | 2026-08-17 | External review feedback on the rev-2/3 fixes: loopback HTTP check now host-parsed (no `localhost@evil` / subdomain bypass, CLI + browser URL); env-gate URL scheme checks case-insensitive and enforced on the resolved signing-service URL (loopback/`.svc` carve-out for shipped in-cluster releases); downgrade check applied to API-provided releases and ordered by signed `created_at` (not the opaque version suffix); `ExpectedReceipt` bindings mandatory; keyring cache written only after successful upload | `security/deep-dive-fixes` |
 
 **Finding ID scheme:** v1 IDs keep their meaning forever. `H-1`, `M-n`, `L-n`
 are v1 findings; each now carries a **Status (rev 2)** line. New rev-2
@@ -304,6 +305,8 @@ ledger verification).
 
 ### Verified-solid: main's new signing-authority rotation (coverage summary)
 
+- (rev 4 additions from external review, all verified with tests: see the
+  revision-history row for scope.)
 - `rotate_org_owner` (API): owner scope + in-tx role re-check under the
   signing-authority lane lock; both signatures verified (replacement signs the
   new keyring, current owner signs the CE-v1 domain-separated rotation

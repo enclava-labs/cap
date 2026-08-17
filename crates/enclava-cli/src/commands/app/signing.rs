@@ -21,7 +21,18 @@ fn confirmed_bootstrap_state(state: &str) -> bool {
 pub(crate) fn platform_release_from_deployment_context(
     deployment_context: &DeploymentContextResponse,
 ) -> Result<Option<PlatformRelease>, Box<dyn std::error::Error>> {
-    platform_release_from_deployment_context_with_verifier(deployment_context, verify_envelope)
+    platform_release_from_deployment_context_with_verifier(
+        deployment_context,
+        // Same baseline as env-path overrides: an API-provided envelope that
+        // is older than the release compiled into this binary is a downgrade
+        // (stale measurements/policy/sidecar digests) even when it is
+        // validly signed and its id matches current_platform_release_id.
+        |envelope| {
+            let release = verify_envelope(envelope)?;
+            enclava_cli::platform_release::enforce_release_not_older_than_bundled(&release)?;
+            Ok::<_, enclava_cli::platform_release::PlatformReleaseError>(release)
+        },
+    )
 }
 
 pub(crate) async fn fetch_verified_platform_release(
