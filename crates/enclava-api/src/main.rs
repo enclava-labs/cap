@@ -356,13 +356,13 @@ fn load_platform_release(enabled: bool) -> anyhow::Result<Option<PlatformRelease
     let envelope = PlatformReleaseEnvelope::load_verified()
         .map_err(|e| anyhow::anyhow!("failed to load signed platform release: {e}"))?;
     let release = &envelope.payload;
-    let runtime_class = enclava_engine::manifest::cc_init_data::try_runtime_class()
-        .map_err(|err| anyhow::anyhow!("invalid CAP runtime class configuration: {err}"))?;
-    if release.expected_runtime_class != runtime_class {
+    if release.expected_runtime_class
+        != enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
+    {
         anyhow::bail!(
             "signed platform release runtime class `{}` does not match API runtime class `{}`",
             release.expected_runtime_class,
-            runtime_class
+            enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
         );
     }
     Ok(Some(envelope))
