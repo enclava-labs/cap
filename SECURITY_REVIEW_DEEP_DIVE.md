@@ -14,6 +14,7 @@ finding below was verified against source in the main worktree.
 | 2 | 2026-08-17 | Re-ran all v1 findings against merged main (`origin/main` `c7691b7`, incl. PR #86/#87 signing-authority rotation + GitOps migrations); audited all new code; recorded new findings | merge commit `a2f6309` + restore commit `197a045` |
 | 3 | 2026-08-17 | Addressed N-1 (audited hatch + restored release↔runtime-class binding), N-2 (contract pinned at all touch points), N-3 (local `main` repaired) | `security/deep-dive-fixes` |
 | 4 | 2026-08-17 | External review feedback on the rev-2/3 fixes: loopback HTTP check now host-parsed (no `localhost@evil` / subdomain bypass, CLI + browser URL); env-gate URL scheme checks case-insensitive and enforced on the resolved signing-service URL (loopback/`.svc` carve-out for shipped in-cluster releases); downgrade check applied to API-provided releases and ordered by signed `created_at` (not the opaque version suffix); `ExpectedReceipt` bindings mandatory; keyring cache written only after successful upload | `security/deep-dive-fixes` |
+| 5 | 2026-08-17 | Second review round: env gate allows the preprod in-cluster `http://*.svc` signing URL (manifest is an API consumer per AGENTS.md); downgrade baseline for API-provided releases is now a persisted per-API high-water mark (`~/.enclava/api-release-baselines.json`) instead of the CLI bundle — an environment may legitimately serve an older active release; Cilium policy gains `egressDeny` for metadata/link-local/ULA space (169.254.0.0/16, fc00::/7) closing the DNS-rebind-to-metadata bypass of the hostname denylist (Cilium 1.19 confirmed on-cluster); web verifier CSP fixed (`connect-src 'self'` for the same-origin .wasm fetch on http://localhost, `wasm-unsafe-eval` for WebAssembly.instantiate) and the fixture harness moved out of the inline script to `test-harness.js` so `script-src 'self'` permits it | `security/deep-dive-fixes` |
 
 **Finding ID scheme:** v1 IDs keep their meaning forever. `H-1`, `M-n`, `L-n`
 are v1 findings; each now carries a **Status (rev 2)** line. New rev-2
@@ -120,8 +121,16 @@ Severity scale: Critical > High > Medium > Low.
   isolation, but the audit reasons exist precisely to block this.
 - **Status (rev 2): Fixed — verified.** Internal/metadata/`.svc`/rebinding
   hosts are rejected with 400 (`apps.rs:456+`); operator opt-out via
-  `CAP_EGRESS_ALLOW_INTERNAL_HOSTS=true` is logged per host. Note the asymmetry
-  with rev-2 finding N-1: this opt-out is audited, the runtime-class one is not.
+  `CAP_EGRESS_ALLOW_INTERNAL_HOSTS=true` is logged per host.
+- **Status (rev 5): residual closed.** The hostname denylist was still
+  DNS-rebindable: a tenant-controlled FQDN resolving into metadata/link-local
+  space rode its `toFQDNs` allow rule straight to the metadata endpoint. The
+  generated Cilium policy now carries `egressDeny: toCIDRs [169.254.0.0/16,
+  fc00::/7]` — deny outranks every allow rule, so no allowlisted name can
+  ever reach 169.254.169.254 / AWS IMDS IPv6 (Cilium `egressDeny` support
+  confirmed against the live cluster CRD, v1.19.2). Broader RFC1918 deny
+  remains name-layer only: cluster/service CIDRs are environment-specific and
+  a blanket deny would break legitimate platform FQDN paths.
 
 ### M-5 (Medium) — Appraiser signs PASS receipts over caller-chosen policies
 

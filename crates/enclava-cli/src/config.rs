@@ -69,6 +69,8 @@ pub struct CliPaths {
     pub sessions_dir: PathBuf,
     /// ~/.enclava/recovery.seed (random local seed for deterministic deploy keys)
     pub recovery_seed: PathBuf,
+    /// ~/.enclava/api-release-baselines.json (per-API anti-downgrade marks)
+    pub api_release_baseline: PathBuf,
 }
 
 impl CliPaths {
@@ -89,6 +91,7 @@ impl CliPaths {
             keys_dir: root.join("keys"),
             sessions_dir: root.join("sessions"),
             recovery_seed: root.join("recovery.seed"),
+            api_release_baseline: root.join("api-release-baselines.json"),
             root,
         })
     }

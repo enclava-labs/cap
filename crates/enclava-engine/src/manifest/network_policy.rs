@@ -181,6 +181,17 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
             "endpointSelector": {},
             "ingress": ingress,
             "egress": egress,
+            // Name-layer denylists (internal/metadata hostnames) are
+            // bypassable by a tenant-controlled domain whose A/AAAA record
+            // points at internal space: `toFQDNs` authorizes whatever the
+            // DNS layer resolves. Deny rules outrank allow rules in Cilium,
+            // so metadata and link-local space is unreachable through ANY
+            // allow rule — no legitimate tenant egress ever touches it.
+            // (169.254.0.0/16 covers 169.254.169.254 metadata endpoints;
+            // fc00::/7 covers AWS IMDS IPv6 fd00:ec2::254.)
+            "egressDeny": [
+                { "toCIDRs": ["169.254.0.0/16", "fc00::/7"] }
+            ],
         }
     })
 }

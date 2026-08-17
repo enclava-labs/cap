@@ -428,3 +428,33 @@ fn egress_allowlist_renders_one_rule_per_entry() {
     assert_eq!(egress[8]["toPorts"][0]["ports"][0]["port"], "443");
     assert_eq!(egress[9]["toFQDNs"][0]["matchName"], "hooks.slack.com");
 }
+
+#[test]
+fn generated_policy_denies_metadata_and_link_local_space_regardless_of_allow_rules() {
+    // The hostname denylist is DNS-rebindable (a tenant-controlled FQDN can
+    // resolve into metadata/link-local space and ride a toFQDNs allow rule).
+    // A Cilium egressDeny outranks every allow rule; it must always be
+    // present and must not depend on the egress allowlist contents.
+    let app = sample_app();
+    let policy = enclava_engine::manifest::network_policy::generate_network_policy(&app);
+    let deny = &policy["spec"]["egressDeny"]
+        .as_array()
+        .expect("egressDeny must be an array");
+    assert!(
+        deny.iter().any(|rule| {
+            rule["toCIDRs"]
+                .as_array()
+                .is_some_and(|cidrs| cidrs.iter().any(|c| c == "169.254.0.0/16"))
+                && cidrs_contain(deny, "fc00::/7")
+        }),
+        "metadata (169.254.0.0/16) and AWS IMDS IPv6 (fc00::/7) must be denied"
+    );
+}
+
+fn cidrs_contain(deny: &[serde_json::Value], needle: &str) -> bool {
+    deny.iter().any(|rule| {
+        rule["toCIDRs"]
+            .as_array()
+            .is_some_and(|cidrs| cidrs.iter().any(|c| c == needle))
+    })
+}

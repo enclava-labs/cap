@@ -240,7 +240,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
     }
     // Authenticate platform authority before keyring registration or app creation.
-    fetch_verified_platform_release(api).await?;
+    fetch_verified_platform_release(api, &ctx.paths).await?;
     let capture = if args.no_store_mnemonic {
         MnemonicCapture::Skip
     } else {
@@ -3246,7 +3246,7 @@ mod tests {
         let body = &source[deploy_start..deploy_end];
 
         let verify_platform = body
-            .find("fetch_verified_platform_release(api).await?")
+            .find("fetch_verified_platform_release(api, &ctx.paths)")
             .expect("template deploy verifies the signed platform release");
         let bootstrap = body
             .find("template_bootstrap_pubkey_hash")

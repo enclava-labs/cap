@@ -48,6 +48,12 @@ impl ApiClient {
         }
     }
 
+    /// The API origin (scheme://host[:port]) used as the key for per-API
+    /// state such as the platform-release baseline.
+    pub fn origin(&self) -> &str {
+        &self.base_url
+    }
+
     /// Create a client from CLI config and credentials.
     pub fn from_config(
         config: &crate::config::CliConfig,

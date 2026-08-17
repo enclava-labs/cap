@@ -130,11 +130,15 @@ fn enforce_with(
             return Err(EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_KBS_URL"));
         }
 
-        // The signing-service bearer token must never transit cleartext.
-        // Scheme comes from the parsed URL: `HTTP://host` must not slip a
-        // case-sensitive `starts_with("http://")` check.
+        // The signing-service bearer token must never transit cleartext
+        // off-cluster. Scheme comes from the parsed URL (case-insensitive:
+        // `HTTP://` must not slip a prefix check). The same loopback /
+        // cluster-internal `.svc` carve-out as SigningServiceClient applies:
+        // preprod legitimately fronts the service with an in-cluster
+        // http://*.svc.cluster.local URL (enclava-ops-manifests cap-api).
         if let Some(value) = lookup("PLATFORM_SIGNING_SERVICE_URL")
             && http_scheme(&value)
+            && !signing_url_http_host_allowed(&value)
         {
             return Err(EnvGateError::DebugOnlyFlagInRelease(
                 "PLATFORM_SIGNING_SERVICE_URL",
@@ -149,6 +153,19 @@ fn enforce_with(
 /// scheme check case-insensitive (`HTTP://` normalizes to `http`).
 fn http_scheme(value: &str) -> bool {
     reqwest::Url::parse(value.trim()).is_ok_and(|url| url.scheme() == "http")
+}
+
+/// True when an http:// signing-service URL targets a loopback or
+/// cluster-internal `.svc` host (same carve-out as SigningServiceClient);
+/// non-http URLs are `true` here — the `http_scheme()` check rejects the
+/// cleartext cases that matter.
+fn signing_url_http_host_allowed(value: &str) -> bool {
+    match reqwest::Url::parse(value.trim()) {
+        Ok(url) if url.scheme() == "http" => {
+            crate::signing_service::plain_http_host_allowed(url.host_str())
+        }
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +312,31 @@ mod tests {
             err,
             EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_KBS_URL")
         ));
+    }
+
+    #[test]
+    fn release_allows_cluster_internal_http_signing_service_url() {
+        // Preprod manifests front the signing service with an in-cluster
+        // http://*.svc.cluster.local URL; it must pass the gate (the bearer
+        // token never leaves the cluster network).
+        for ok in [
+            "http://signing-service.enclava-policy.svc.cluster.local:8080",
+            "http://signing-service.enclava-policy.svc",
+            "http://localhost:8080",
+        ] {
+            let mut env = ok_required();
+            env.insert("TRUSTEE_POLICY_READ_AVAILABLE", "true");
+            env.insert("PLATFORM_SIGNING_SERVICE_URL", ok);
+            run(env, false).unwrap_or_else(|e| panic!("{ok} must be allowed: {e:?}"));
+        }
+        // A plain public http host still fails.
+        let mut env = ok_required();
+        env.insert("TRUSTEE_POLICY_READ_AVAILABLE", "true");
+        env.insert(
+            "PLATFORM_SIGNING_SERVICE_URL",
+            "http://signing.example.test",
+        );
+        assert!(run(env, false).is_err());
     }
 
     #[test]
