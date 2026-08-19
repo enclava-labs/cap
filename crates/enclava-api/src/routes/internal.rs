@@ -3463,8 +3463,8 @@ pub async fn put_paas_app_desired_state(
 
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
         let (cap_org_id, _, _) = mapped_cap_org(&state, &paas_org_id).await?;
-        let (app_id, namespace, recorded_state): (Uuid, String, String) = sqlx::query_as(
-            "SELECT id, namespace, status::text
+        let (app_id, namespace): (Uuid, String) = sqlx::query_as(
+            "SELECT id, namespace
                FROM apps
               WHERE org_id = $1
                 AND name = $2
@@ -3537,29 +3537,27 @@ pub async fn put_paas_app_desired_state(
         crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
             .await
             .map_err(|_| db_error())?;
-        if recorded_state != desired_state {
-            let updated = sqlx::query(
-                "UPDATE apps
-                    SET status = $2::app_status_enum,
-                        updated_at = now()
-                  WHERE id = $1
-                    AND org_id = $3
-                    AND namespace = $4
-                    AND status <> 'deleting'::app_status_enum",
-            )
-            .bind(app_id)
-            .bind(desired_state)
-            .bind(cap_org_id)
-            .bind(&namespace)
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| db_error())?;
-            if updated.rows_affected() != 1 {
-                return Err(json_error(
-                    StatusCode::CONFLICT,
-                    "application authority changed",
-                ));
-            }
+        let updated = sqlx::query(
+            "UPDATE apps
+                SET status = $2::app_status_enum,
+                    updated_at = now()
+              WHERE id = $1
+                AND org_id = $3
+                AND namespace = $4
+                AND status <> 'deleting'::app_status_enum",
+        )
+        .bind(app_id)
+        .bind(desired_state)
+        .bind(cap_org_id)
+        .bind(&namespace)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+        if updated.rows_affected() != 1 {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "application authority changed",
+            ));
         }
         mutation
             .finish_in_tx(&mut tx)
