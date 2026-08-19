@@ -1,7 +1,10 @@
 //! Integration tests for API routes using testcontainers.
 
 use axum::{
-    Json as AxumJson, Router, extract::State as AxumState, http::StatusCode, routing::post,
+    Json as AxumJson, Router,
+    extract::State as AxumState,
+    http::{Method, Request, Response, StatusCode, header},
+    routing::post,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{Duration, Utc};
@@ -25,11 +28,17 @@ use enclava_common::{
     image::ImageRef,
 };
 use enclava_engine::{manifest::network_policy::generate_network_policy, types::AttestationConfig};
+use http_body_util::BodyExt;
+use kube::client::Body;
 use rand::rngs::OsRng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::{
+    io,
+    sync::{Arc, Mutex},
+};
+use tower::service_fn;
 use uuid::Uuid;
 
 const TEST_KBS_POLICY: &str = "package policy\n\ndefault allow := false\n";
@@ -1464,6 +1473,156 @@ async fn paas_internal_desired_state_contract_is_authenticated_mapped_and_idempo
         .await;
     running.assert_status_ok();
     assert_eq!(running.json::<Value>()["runtime_state"], "running");
+}
+
+fn desired_statefulset(replicas: i32) -> Value {
+    serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": {
+            "name": "desired-state",
+            "namespace": "desired-state-test",
+            "uid": "22222222-2222-2222-2222-222222222222",
+            "resourceVersion": "1",
+            "annotations": {
+                "enclava.dev/cap-provider-mutation-generation": "1",
+                "retained": "true",
+            },
+        },
+        "spec": {
+            "replicas": replicas,
+            "serviceName": "desired-state",
+            "selector": {"matchLabels": {"app": "desired-state"}},
+            "template": {
+                "metadata": {"labels": {"app": "desired-state"}},
+                "spec": {"containers": [{"name": "app", "image": "example.test/app:current"}]},
+            },
+            "volumeClaimTemplates": [{
+                "metadata": {"name": "retained-data"},
+                "spec": {"accessModes": ["ReadWriteOnce"]},
+            }],
+        },
+        "status": {
+            "currentReplicas": replicas,
+            "readyReplicas": replicas,
+            "updatedReplicas": replicas,
+        },
+    })
+}
+
+fn merge_json(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(target), Value::Object(patch)) => {
+            for (key, value) in patch {
+                merge_json(target.entry(key).or_insert(Value::Null), value);
+            }
+        }
+        (target, patch) => *target = patch.clone(),
+    }
+}
+
+fn desired_state_kube_response(status: StatusCode, body: Value) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string().into_bytes()))
+        .expect("fake Kubernetes response")
+}
+
+fn desired_state_kube_client(state: Arc<Mutex<Value>>) -> kube::Client {
+    kube::Client::new(
+        service_fn(move |request: Request<Body>| {
+            let state = Arc::clone(&state);
+            async move {
+                let method = request.method().clone();
+                if method == Method::GET {
+                    return Ok::<_, io::Error>(desired_state_kube_response(
+                        StatusCode::OK,
+                        state.lock().expect("fake state poisoned").clone(),
+                    ));
+                }
+                if method != Method::PATCH {
+                    return Err(io::Error::other("unexpected fake Kubernetes request"));
+                }
+                let patch: Value = serde_json::from_slice(
+                    &request
+                        .into_body()
+                        .collect()
+                        .await
+                        .map_err(io::Error::other)?
+                        .to_bytes(),
+                )
+                .map_err(io::Error::other)?;
+                let mut resource = state.lock().expect("fake state poisoned");
+                merge_json(&mut resource, &patch);
+                let replicas = resource["spec"]["replicas"].as_i64().unwrap_or_default();
+                resource["metadata"]["resourceVersion"] = serde_json::json!(
+                    resource["metadata"]["resourceVersion"]
+                        .as_str()
+                        .unwrap_or("1")
+                        .parse::<u64>()
+                        .unwrap_or(1)
+                        + 1
+                );
+                resource["status"] = serde_json::json!({
+                    "currentReplicas": replicas,
+                    "readyReplicas": replicas,
+                    "updatedReplicas": replicas,
+                });
+                Ok(desired_state_kube_response(
+                    StatusCode::OK,
+                    resource.clone(),
+                ))
+            }
+        }),
+        "default",
+    )
+}
+
+#[tokio::test]
+async fn desired_state_replica_convergence_stops_resumes_and_retains_configuration() {
+    use enclava_engine::apply::{
+        cleanup::set_statefulset_desired_replicas, engine::ApplyEngine,
+        generation::MutationGeneration,
+    };
+
+    let state = Arc::new(Mutex::new(desired_statefulset(1)));
+    let engine = ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&state)),
+        Default::default(),
+    );
+
+    set_statefulset_desired_replicas(
+        &engine,
+        "desired-state-test",
+        "desired-state",
+        0,
+        std::time::Duration::from_secs(1),
+        MutationGeneration::new(2).unwrap(),
+    )
+    .await
+    .expect("stop converges");
+    {
+        let stopped = state.lock().unwrap();
+        assert_eq!(stopped["spec"]["replicas"], 0);
+        assert_eq!(stopped["metadata"]["annotations"]["retained"], "true");
+        assert_eq!(
+            stopped["spec"]["volumeClaimTemplates"][0]["metadata"]["name"],
+            "retained-data"
+        );
+    }
+
+    set_statefulset_desired_replicas(
+        &engine,
+        "desired-state-test",
+        "desired-state",
+        1,
+        std::time::Duration::from_secs(1),
+        MutationGeneration::new(3).unwrap(),
+    )
+    .await
+    .expect("resume converges");
+    assert_eq!(state.lock().unwrap()["status"]["readyReplicas"], 1);
 }
 
 #[tokio::test]
