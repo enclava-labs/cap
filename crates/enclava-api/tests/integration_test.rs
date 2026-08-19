@@ -1556,13 +1556,14 @@ fn desired_state_kube_client(state: Arc<Mutex<Value>>) -> kube::Client {
                 let mut resource = state.lock().expect("fake state poisoned");
                 merge_json(&mut resource, &patch);
                 let replicas = resource["spec"]["replicas"].as_i64().unwrap_or_default();
-                resource["metadata"]["resourceVersion"] = serde_json::json!(
-                    resource["metadata"]["resourceVersion"]
+                resource["metadata"]["resourceVersion"] = Value::String(
+                    (resource["metadata"]["resourceVersion"]
                         .as_str()
                         .unwrap_or("1")
                         .parse::<u64>()
                         .unwrap_or(1)
-                        + 1
+                        + 1)
+                    .to_string(),
                 );
                 resource["status"] = serde_json::json!({
                     "currentReplicas": replicas,
