@@ -1747,6 +1747,129 @@ async fn paas_internal_desired_state_replay_reconverges_runtime_drift() {
 }
 
 #[tokio::test]
+async fn paas_internal_desired_state_replay_publishes_state_after_concurrent_mutation() {
+    let (mut state, pool) = setup_paas_managed_test_state().await;
+    let application_name = format!("desired-state-replay-{}", Uuid::new_v4());
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let options = database_url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .expect("parse regression database URL")
+        .application_name(&application_name);
+    state.db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .expect("connect named desired-state pool");
+
+    let runtime = Arc::new(Mutex::new(desired_statefulset(0)));
+    let engine = Arc::new(enclava_engine::apply::engine::ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let server = Arc::new(
+        axum_test::TestServer::builder()
+            .http_transport()
+            .build(test_router(state).layer(Extension(engine))),
+    );
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("replay-race-{}", &suffix[..12]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-race-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app stopped");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let operation_id = format!("stop-race-{suffix}");
+    add_internal_headers(server.put(&path), "ignored-initial-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await
+        .assert_status_ok();
+
+    let app_id: Uuid = sqlx::query_scalar("SELECT id FROM apps WHERE name = $1")
+        .bind(&app_name)
+        .fetch_one(&pool)
+        .await
+        .expect("load app id");
+    let (high, low) = app_id.as_u64_pair();
+    let mut opposite = pool.begin().await.expect("begin opposite mutation");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind((high ^ low) as i64)
+        .execute(&mut *opposite)
+        .await
+        .expect("hold app mutation lane");
+    *runtime.lock().unwrap() = desired_statefulset(1);
+
+    let replay_server = Arc::clone(&server);
+    let replay_path = path.clone();
+    let replay_operation_id = operation_id.clone();
+    let replay = tokio::spawn(async move {
+        add_internal_headers(replay_server.put(&replay_path), "ignored-replay-key")
+            .json(&serde_json::json!({
+                "desired_state": "stopped",
+                "operation_id": replay_operation_id,
+            }))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                      WHERE datname = current_database()
+                        AND application_name = $1
+                        AND wait_event_type = 'Lock'
+                 )",
+            )
+            .bind(&application_name)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect replay lock state");
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replay did not pause between lookup and mutation claim");
+
+    sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE id = $1")
+        .bind(app_id)
+        .execute(&mut *opposite)
+        .await
+        .expect("commit opposite desired-state mutation");
+    opposite.commit().await.expect("publish opposite mutation");
+
+    let response = replay.await.expect("join replay");
+    response.assert_status_ok();
+    assert_eq!(response.json::<Value>()["runtime_state"], "stopped");
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
+    let recorded_state: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load converged recorded state");
+    assert_eq!(recorded_state, "stopped");
+}
+
+#[tokio::test]
 async fn desired_state_replica_convergence_stops_resumes_and_retains_configuration() {
     use enclava_engine::apply::{
         cleanup::set_statefulset_desired_replicas, engine::ApplyEngine,
