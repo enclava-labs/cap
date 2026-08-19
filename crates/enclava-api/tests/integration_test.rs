@@ -1359,6 +1359,114 @@ async fn paas_internal_create_app_persists_cli_signer_identity() {
 }
 
 #[tokio::test]
+async fn paas_internal_desired_state_contract_is_authenticated_mapped_and_idempotent() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("state-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app stopped");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    server
+        .put(&path)
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": format!("missing-auth-{suffix}"),
+        }))
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+
+    let operation_id = format!("stop-{suffix}");
+    let stopped = add_internal_headers(server.put(&path), "ignored-header-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    stopped.assert_status_ok();
+    let stopped_body: Value = stopped.json();
+    assert_eq!(
+        stopped_body,
+        serde_json::json!({
+            "operation_id": operation_id,
+            "desired_state": "stopped",
+            "runtime_state": "stopped",
+        })
+    );
+
+    let replay = add_internal_headers(server.put(&path), "another-ignored-header-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    replay.assert_status_ok();
+    assert_eq!(replay.json::<Value>(), stopped_body);
+
+    let conflict = add_internal_headers(server.put(&path), "ignored-conflict-header")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": operation_id,
+        }))
+        .await;
+    conflict.assert_status(StatusCode::CONFLICT);
+    assert_eq!(conflict.json::<Value>()["error"], "idempotency_key_reused");
+
+    let leaked_field = add_internal_headers(server.put(&path), "ignored-leak-header")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": format!("leak-{suffix}"),
+            "plan": "pro",
+        }))
+        .await;
+    leaked_field.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+
+    let unmapped = add_internal_headers(
+        server.put(&format!(
+            "/internal/paas/orgs/unmapped-{suffix}/apps/{app_name}/desired-state"
+        )),
+        "ignored-unmapped-header",
+    )
+    .json(&serde_json::json!({
+        "desired_state": "stopped",
+        "operation_id": format!("unmapped-{suffix}"),
+    }))
+    .await;
+    unmapped.assert_status(StatusCode::NOT_FOUND);
+
+    sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app running");
+    let running = add_internal_headers(server.put(&path), "ignored-running-header")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": format!("running-{suffix}"),
+        }))
+        .await;
+    running.assert_status_ok();
+    assert_eq!(running.json::<Value>()["runtime_state"], "running");
+}
+
+#[tokio::test]
 async fn paas_internal_deploy_reuses_signed_deploy_gate() {
     let (mut state, pool) = setup_paas_managed_test_state().await;
     state.require_customer_signed_policy_artifact = true;
