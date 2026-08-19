@@ -5,7 +5,7 @@ use enclava_common::descriptor::DeploymentDescriptor;
 use enclava_verifier::{
     observed_artifact_anchors, parse_amd_endorsements, parse_proof_bundle, parse_snp_report,
     report_data_matches, tls_leaf_spki_sha256, verify_amd_certificate_chain, verify_snp_signature,
-    verify_vcek_report_binding,
+    verify_vcek_report_binding, verify_workload_artifacts,
 };
 use rand::{RngCore, rngs::OsRng};
 use serde::Deserialize;
@@ -62,10 +62,13 @@ pub struct DescribeArgs {
 }
 
 pub async fn run(args: DescribeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let historical = !args.target.starts_with("https://");
-    let (bytes, live) = if historical {
-        (tokio::fs::read(&args.target).await?, None)
-    } else {
+    // URI schemes are case-insensitive; a valid origin like `HTTPS://…` must
+    // reach the live path (normalize_origin then validates it fully).
+    let live = args
+        .target
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"));
+    let (bytes, live_ctx) = if live {
         let origin = normalize_origin(&args.target)?;
         let mut nonce = [0u8; 32];
         OsRng.fill_bytes(&mut nonce);
@@ -74,14 +77,22 @@ pub async fn run(args: DescribeArgs) -> Result<(), Box<dyn std::error::Error>> {
             tokio::fs::write(path, &bytes).await?;
         }
         (bytes, Some((origin, nonce, channel_spki)))
+    } else {
+        if args.save_bundle.is_some() {
+            return Err(
+                "--save-bundle requires a live HTTPS origin; the historical input is already on disk"
+                    .into(),
+            );
+        }
+        (tokio::fs::read(&args.target).await?, None)
     };
 
-    let observation = observe(&bytes, live.as_ref())?;
+    let observation = observe(&bytes, live_ctx.as_ref())?;
     if args.json {
         println!("{}", serde_json::to_string(&observation)?);
     } else {
         print_human(&observation);
-        if historical {
+        if live_ctx.is_none() {
             eprintln!("Historical evidence: this saved bundle does not prove current liveness.");
         }
     }
@@ -117,8 +128,11 @@ struct Observation {
 #[derive(serde::Serialize)]
 struct WorkloadView {
     image_digest: String,
-    signer_subject: String,
-    signer_issuer: String,
+    /// Signer as *declared by the deployment descriptor* — not the identity
+    /// presented in the sigstore material. On signer drift these two differ;
+    /// `enclava verify` compares the presented certificate against the policy.
+    declared_signer_subject: String,
+    declared_signer_issuer: String,
 }
 
 #[derive(serde::Serialize)]
@@ -155,7 +169,17 @@ struct AuthenticityView {
     report_signature_verifies: bool,
     vcek_report_binding_verifies: bool,
     report_data_self_consistent: bool,
-    live_channel_matches_bundle_leaf: Option<bool>,
+    workload_artifacts_internally_consistent: bool,
+    /// Live fetch context vs the bundle's outer fields — absent for a saved
+    /// bundle (no channel, no sent nonce, no requested origin to compare).
+    live_context_matches_bundle: Option<LiveContextView>,
+}
+
+#[derive(serde::Serialize)]
+struct LiveContextView {
+    target_origin: bool,
+    challenge_nonce: bool,
+    tls_channel_leaf: bool,
 }
 
 /// Trust anchors the target presented about itself. Observable facts, not
@@ -212,18 +236,34 @@ fn observe(
     .is_ok();
     let signature_ok = verify_snp_signature(&report, endorsements.vcek_der).is_ok();
     let vcek_binding_ok = verify_vcek_report_binding(&report, endorsements.vcek_der).is_ok();
-    let (report_origin, report_nonce) = match live {
-        Some((origin, nonce, _)) => (origin.as_str(), *nonce),
-        None => (bundle.target_origin, bundle.challenge_nonce),
-    };
+    // report_data consistency is judged against the bundle's OWN outer
+    // fields, so a tampered origin/nonce cannot be masked by the live
+    // context; the live-context comparison is reported separately below.
     let report_data_ok = report_data_matches(
         &report,
-        report_origin,
-        &report_nonce,
+        bundle.target_origin,
+        &bundle.challenge_nonce,
         &leaf_spki,
         &receipt_key,
     );
-    let live_channel = live.map(|(_, _, channel_spki)| channel_spki == &leaf_spki);
+    // Artifact half of the same idea: signatures and relationships must hold
+    // under the anchors the bundle itself presents (keyring ↔ descriptor ↔
+    // policy ↔ cc_init_data ↔ SNP host_data) before the workload facts are
+    // worth reading as observations.
+    let artifacts_ok = verify_workload_artifacts(
+        bundle.workload_artifacts_json,
+        bundle.trustee_policy_json,
+        bundle.cc_init_data_toml,
+        &report.host_data,
+        std::slice::from_ref(&keyring_sha256),
+        std::slice::from_ref(&policy_signing_pubkey),
+    )
+    .is_ok();
+    let live_context = live.map(|(origin, nonce, channel_spki)| LiveContextView {
+        target_origin: origin == bundle.target_origin,
+        challenge_nonce: *nonce == bundle.challenge_nonce,
+        tls_channel_leaf: *channel_spki == leaf_spki,
+    });
 
     Ok(Observation {
         schema_version: "enclava-proof-bundle-v1",
@@ -234,8 +274,8 @@ fn observe(
         created_at_unix_seconds: bundle.created_at_unix_seconds,
         workload: WorkloadView {
             image_digest: descriptor.image_digest.clone(),
-            signer_subject: descriptor.signer_identity.subject.clone(),
-            signer_issuer: descriptor.signer_identity.issuer.clone(),
+            declared_signer_subject: descriptor.signer_identity.subject.clone(),
+            declared_signer_issuer: descriptor.signer_identity.issuer.clone(),
         },
         platform: PlatformView {
             runtime_class: descriptor.expected_runtime_class.clone(),
@@ -257,7 +297,8 @@ fn observe(
             report_signature_verifies: signature_ok,
             vcek_report_binding_verifies: vcek_binding_ok,
             report_data_self_consistent: report_data_ok,
-            live_channel_matches_bundle_leaf: live_channel,
+            workload_artifacts_internally_consistent: artifacts_ok,
+            live_context_matches_bundle: live_context,
         },
         observed_anchors: AnchorsView {
             org_keyring_sha256: keyring_sha256,
@@ -286,8 +327,14 @@ fn print_human(observation: &Observation) {
     println!();
     println!("Workload");
     println!("  image   {}", observation.workload.image_digest);
-    println!("  signer  {}", observation.workload.signer_subject);
-    println!("  issuer  {}", observation.workload.signer_issuer);
+    println!(
+        "  signer  {} (declared by the descriptor)",
+        observation.workload.declared_signer_subject
+    );
+    println!(
+        "  issuer  {} (declared by the descriptor)",
+        observation.workload.declared_signer_issuer
+    );
     println!();
     println!("Platform");
     println!("  runtime {}", observation.platform.runtime_class);
@@ -329,22 +376,26 @@ fn print_human(observation: &Observation) {
         "  VCEK↔report binding {}",
         fact(auth.vcek_report_binding_verifies)
     );
-    if observation.historical {
+    println!(
+        "  report_data {} with the bundle's own nonce/origin/leaf",
+        fact(auth.report_data_self_consistent)
+    );
+    println!(
+        "  workload artifacts {} (keyring↔descriptor↔policy↔cc_init_data↔host_data under presented anchors)",
+        fact(auth.workload_artifacts_internally_consistent)
+    );
+    if let Some(context) = &auth.live_context_matches_bundle {
+        println!("  live fetch context vs bundle fields:");
+        println!("    origin      {}", fact(context.target_origin));
+        println!("    nonce       {}", fact(context.challenge_nonce));
         println!(
-            "  report_data {} with the bundle's own nonce/origin/leaf",
-            fact(auth.report_data_self_consistent)
+            "    TLS channel {} the leaf in the bundle",
+            if context.tls_channel_leaf {
+                "matches"
+            } else {
+                "DOES NOT match"
+            }
         );
-    } else {
-        println!(
-            "  report_data {} with the challenge nonce sent",
-            fact(auth.report_data_self_consistent)
-        );
-        if let Some(matches) = auth.live_channel_matches_bundle_leaf {
-            println!(
-                "  TLS channel {} the leaf in the bundle",
-                if matches { "matches" } else { "DOES NOT match" }
-            );
-        }
     }
     println!();
     println!("Observed anchors (recorded, not endorsed)");
@@ -446,7 +497,62 @@ mod tests {
                 .evidence_authenticity
                 .report_data_self_consistent
         );
+        assert!(
+            observation
+                .evidence_authenticity
+                .workload_artifacts_internally_consistent
+        );
         assert!(observation.observed_anchors.org_keyring_sha256.len() == 64);
+    }
+
+    #[test]
+    fn tampered_outer_nonce_breaks_report_data_consistency() {
+        // A bundle whose outer challenge_nonce is altered in transit must not
+        // pass report_data self-consistency merely because the SNP report
+        // still matches the originally-sent nonce (the live-masking trap).
+        use enclava_common::canonical::{ce_v1_bytes, ce_v1_decode};
+        let original = fixture_bytes();
+        let decoded = ce_v1_decode(&original).unwrap();
+        let tampered = [9u8; 32];
+        let mut records: Vec<(&str, &[u8])> = decoded
+            .iter()
+            .map(|record| (record.label, record.value))
+            .collect();
+        records[3] = ("challenge_nonce", &tampered);
+        let observation = observe(&ce_v1_bytes(&records), None).unwrap();
+        assert!(
+            !observation
+                .evidence_authenticity
+                .report_data_self_consistent
+        );
+    }
+
+    #[test]
+    fn tampered_descriptor_breaks_artifact_consistency() {
+        // A parseable but tampered descriptor must not present its workload
+        // facts as consistent: the artifact signature/binding chain fails
+        // under the anchors the bundle itself presents.
+        use enclava_common::canonical::{ce_v1_bytes, ce_v1_decode};
+        let original = fixture_bytes();
+        let decoded = ce_v1_decode(&original).unwrap();
+        let mut workload: serde_json::Value = serde_json::from_slice(decoded[10].value).unwrap();
+        workload["descriptor_payload"]["image_digest"] = "sha256:deadbeef".into();
+        let mutated = serde_json::to_vec(&workload).unwrap();
+        let mut records: Vec<(&str, &[u8])> = decoded
+            .iter()
+            .map(|record| (record.label, record.value))
+            .collect();
+        records[10] = ("workload_artifacts_json", &mutated);
+        let observation = observe(&ce_v1_bytes(&records), None).unwrap();
+        assert_eq!(
+            observation.workload.image_digest, "sha256:deadbeef",
+            "the tampered value is still displayed (it is an observation), but flagged"
+        );
+        assert!(
+            !observation
+                .evidence_authenticity
+                .workload_artifacts_internally_consistent
+        );
     }
 
     #[test]
