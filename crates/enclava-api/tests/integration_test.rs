@@ -1613,7 +1613,7 @@ fn desired_state_kube_client(state: Arc<Mutex<Value>>) -> kube::Client {
 }
 
 #[tokio::test]
-async fn paas_internal_desired_state_observes_runtime_drift_and_missing_workload() {
+async fn paas_internal_desired_state_replay_reconverges_runtime_drift() {
     use enclava_engine::apply::engine::ApplyEngine;
 
     let (state, pool) = setup_paas_managed_test_state().await;
@@ -1666,38 +1666,83 @@ async fn paas_internal_desired_state_observes_runtime_drift_and_missing_workload
         .await;
     replay.assert_status_ok();
     assert_eq!(replay.json::<Value>(), stopped_body);
-    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
-
-    let reconverged = add_internal_headers(server.put(&path), "ignored-fresh-key")
-        .json(&serde_json::json!({
-            "desired_state": "stopped",
-            "operation_id": format!("reconverge-drift-{suffix}"),
-        }))
-        .await;
-    reconverged.assert_status_ok();
-    assert_eq!(reconverged.json::<Value>()["runtime_state"], "stopped");
     assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
 
-    *runtime.lock().unwrap() = Value::Null;
-    let missing_operation_id = format!("missing-workload-{suffix}");
-    let missing = add_internal_headers(server.put(&path), "ignored-missing-key")
+    let running_operation_id = format!("resume-drift-{suffix}");
+    let running = add_internal_headers(server.put(&path), "ignored-running-key")
         .json(&serde_json::json!({
-            "desired_state": "stopped",
-            "operation_id": missing_operation_id,
+            "desired_state": "running",
+            "operation_id": running_operation_id,
         }))
         .await;
-    missing.assert_status(StatusCode::CONFLICT);
-    let missing_body: Value = missing.json();
-    assert_eq!(missing_body["error"], "idempotency_recovery_required");
+    running.assert_status_ok();
+    let running_body: Value = running.json();
+    assert_eq!(
+        running_body,
+        serde_json::json!({
+            "operation_id": running_operation_id,
+            "desired_state": "running",
+            "runtime_state": "running",
+        })
+    );
 
-    let missing_replay = add_internal_headers(server.put(&path), "ignored-missing-replay-key")
+    *runtime.lock().unwrap() = desired_statefulset(0);
+    let running_replay = add_internal_headers(server.put(&path), "ignored-running-replay-key")
         .json(&serde_json::json!({
-            "desired_state": "stopped",
-            "operation_id": missing_operation_id,
+            "desired_state": "running",
+            "operation_id": running_operation_id,
         }))
         .await;
-    missing_replay.assert_status(StatusCode::CONFLICT);
-    assert_eq!(missing_replay.json::<Value>(), missing_body);
+    running_replay.assert_status_ok();
+    assert_eq!(running_replay.json::<Value>(), running_body);
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
+
+    *runtime.lock().unwrap() = desired_statefulset(0);
+    let (first, second) = tokio::join!(
+        async {
+            add_internal_headers(server.put(&path), "ignored-concurrent-replay-one")
+                .json(&serde_json::json!({
+                    "desired_state": "running",
+                    "operation_id": running_operation_id,
+                }))
+                .await
+        },
+        async {
+            add_internal_headers(server.put(&path), "ignored-concurrent-replay-two")
+                .json(&serde_json::json!({
+                    "desired_state": "running",
+                    "operation_id": running_operation_id,
+                }))
+                .await
+        },
+    );
+    for response in [first, second] {
+        match response.status_code() {
+            StatusCode::OK => assert_eq!(response.json::<Value>(), running_body),
+            StatusCode::SERVICE_UNAVAILABLE => {
+                assert_eq!(response.json::<Value>()["error"], "desired_state_retryable")
+            }
+            status => panic!("unexpected concurrent replay status {status}"),
+        }
+    }
+    let concurrent_runtime = runtime.lock().unwrap();
+    assert_eq!(concurrent_runtime["spec"]["replicas"], 1);
+    assert_eq!(concurrent_runtime["metadata"]["resourceVersion"], "2");
+    drop(concurrent_runtime);
+
+    *runtime.lock().unwrap() = Value::Null;
+    let missing = add_internal_headers(server.put(&path), "ignored-missing-replay-key")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": running_operation_id,
+        }))
+        .await;
+    missing.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let missing_body: Value = missing.json();
+    assert_eq!(
+        missing_body,
+        serde_json::json!({"error": "desired_state_retryable"})
+    );
 }
 
 #[tokio::test]
