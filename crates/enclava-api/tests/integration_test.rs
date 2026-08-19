@@ -1725,10 +1725,11 @@ async fn paas_internal_desired_state_replay_reconverges_runtime_drift() {
             status => panic!("unexpected concurrent replay status {status}"),
         }
     }
-    let concurrent_runtime = runtime.lock().unwrap();
-    assert_eq!(concurrent_runtime["spec"]["replicas"], 1);
-    assert_eq!(concurrent_runtime["metadata"]["resourceVersion"], "2");
-    drop(concurrent_runtime);
+    {
+        let concurrent_runtime = runtime.lock().unwrap();
+        assert_eq!(concurrent_runtime["spec"]["replicas"], 1);
+        assert_eq!(concurrent_runtime["metadata"]["resourceVersion"], "2");
+    }
 
     *runtime.lock().unwrap() = Value::Null;
     let missing = add_internal_headers(server.put(&path), "ignored-missing-replay-key")

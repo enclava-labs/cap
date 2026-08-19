@@ -3450,10 +3450,16 @@ pub async fn put_paas_app_desired_state(
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
     let hash = request_hash(&body)?;
     let idempotency =
-        match begin_idempotent_request(&state, &body.operation_id, "PUT", &path, &hash).await? {
-            IdempotencyBegin::Execute(lease) => lease,
-            IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
-        };
+        begin_idempotent_request(&state, &body.operation_id, "PUT", &path, &hash).await?;
+    let operation_id = match &idempotency {
+        IdempotencyBegin::Execute(lease) => lease.operation_id(),
+        IdempotencyBegin::Replay((status, response)) if !status.is_success() => {
+            return Ok((*status, Json(response.clone())));
+        }
+        IdempotencyBegin::Replay(_) => {
+            idempotency_operation_id(&body.operation_id, "PUT", &path, &hash)
+        }
+    };
 
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
         let (cap_org_id, _, _) = mapped_cap_org(&state, &paas_org_id).await?;
@@ -3487,7 +3493,7 @@ pub async fn put_paas_app_desired_state(
             &state,
             app_id,
             "app_desired_state",
-            idempotency.operation_id(),
+            operation_id,
             false,
             vec![resource.clone()],
         )
@@ -3570,8 +3576,16 @@ pub async fn put_paas_app_desired_state(
         ))
     }
     .await;
-    let (status, response) = complete_idempotent_result(idempotency, result).await?;
-    Ok((status, Json(response)))
+    match idempotency {
+        IdempotencyBegin::Execute(lease) => {
+            let (status, response) = complete_idempotent_result(lease, result).await?;
+            Ok((status, Json(response)))
+        }
+        IdempotencyBegin::Replay((status, _)) => {
+            let (_, response) = result?;
+            Ok((status, Json(response)))
+        }
+    }
 }
 
 pub async fn get_paas_app_logs(
