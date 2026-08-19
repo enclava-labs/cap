@@ -1,5 +1,5 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{FromRequestParts, Path, Query, State},
     http::{HeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
@@ -8,6 +8,7 @@ use base64::{Engine as _, engine::general_purpose};
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::auth::middleware::{AuthContext, ManagementOrigin};
@@ -3439,6 +3440,7 @@ pub async fn put_paas_app_desired_state(
     _auth: InternalAuth,
     State(state): State<AppState>,
     Path((paas_org_id, app_name)): Path<(String, String)>,
+    engine: Option<Extension<Arc<enclava_engine::apply::engine::ApplyEngine>>>,
     Json(body): Json<InternalAppDesiredStateRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
@@ -3469,66 +3471,67 @@ pub async fn put_paas_app_desired_state(
         .map_err(|_| db_error())?
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "application not found"))?;
         let desired_state = body.desired_state.as_str();
-        if recorded_state != desired_state {
-            let engine = enclava_engine::apply::engine::ApplyEngine::try_default()
-                .await
-                .map_err(|_| {
-                    json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
-                })?;
-            let resource =
-                crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &namespace);
-            let mut mutation = crate::mutation_leases::claim(
-                &state,
-                app_id,
-                "app_desired_state",
-                idempotency.operation_id(),
-                false,
-                vec![resource.clone()],
+        let engine = match engine {
+            Some(Extension(engine)) => engine,
+            None => Arc::new(
+                enclava_engine::apply::engine::ApplyEngine::try_default()
+                    .await
+                    .map_err(|_| {
+                        json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
+                    })?,
+            ),
+        };
+        let resource =
+            crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &namespace);
+        let mut mutation = crate::mutation_leases::claim(
+            &state,
+            app_id,
+            "app_desired_state",
+            idempotency.operation_id(),
+            false,
+            vec![resource.clone()],
+        )
+        .await
+        .map_err(|_| json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"))?;
+        let generation = mutation.resource_generation(&resource).ok_or_else(|| {
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
+        })?;
+        let generation = enclava_engine::apply::generation::MutationGeneration::new(generation)
+            .map_err(|_| json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"))?;
+        let replicas = match body.desired_state {
+            InternalAppDesiredState::Running => 1,
+            InternalAppDesiredState::Stopped => 0,
+        };
+        let convergence = mutation
+            .guard_provider(
+                enclava_engine::apply::cleanup::set_statefulset_desired_replicas(
+                    &engine,
+                    &namespace,
+                    &app_name,
+                    replicas,
+                    std::time::Duration::from_secs(300),
+                    generation,
+                ),
             )
             .await
             .map_err(|_| json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"))?;
-            let generation = mutation.resource_generation(&resource).ok_or_else(|| {
-                json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
-            })?;
-            let generation = enclava_engine::apply::generation::MutationGeneration::new(generation)
-                .map_err(|_| {
-                    json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
-                })?;
-            let replicas = match body.desired_state {
-                InternalAppDesiredState::Running => 1,
-                InternalAppDesiredState::Stopped => 0,
-            };
-            let convergence = mutation
-                .guard_provider(
-                    enclava_engine::apply::cleanup::set_statefulset_desired_replicas(
-                        &engine,
-                        &namespace,
-                        &app_name,
-                        replicas,
-                        std::time::Duration::from_secs(300),
-                        generation,
-                    ),
-                )
-                .await
-                .map_err(|_| {
-                    json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
-                })?;
-            if let Err(error) = convergence {
-                tracing::warn!(
-                    cap_app_id = %app_id,
-                    outcome = error.public_code(),
-                    "application desired-state convergence failed"
-                );
-                return Err(json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "desired_state_retryable",
-                ));
-            }
+        if let Err(error) = convergence {
+            tracing::warn!(
+                cap_app_id = %app_id,
+                outcome = error.public_code(),
+                "application desired-state convergence failed"
+            );
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "desired_state_retryable",
+            ));
+        }
 
-            let mut tx = state.db.begin().await.map_err(|_| db_error())?;
-            crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
-                .await
-                .map_err(|_| db_error())?;
+        let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+        crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+            .await
+            .map_err(|_| db_error())?;
+        if recorded_state != desired_state {
             let updated = sqlx::query(
                 "UPDATE apps
                     SET status = $2::app_status_enum,
@@ -3551,12 +3554,12 @@ pub async fn put_paas_app_desired_state(
                     "application authority changed",
                 ));
             }
-            mutation
-                .finish_in_tx(&mut tx)
-                .await
-                .map_err(|_| db_error())?;
-            tx.commit().await.map_err(|_| db_error())?;
         }
+        mutation
+            .finish_in_tx(&mut tx)
+            .await
+            .map_err(|_| db_error())?;
+        tx.commit().await.map_err(|_| db_error())?;
         Ok((
             StatusCode::OK,
             serde_json::json!({

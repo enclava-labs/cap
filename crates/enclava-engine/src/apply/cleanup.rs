@@ -85,6 +85,38 @@ pub async fn set_statefulset_desired_replicas(
     }
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
 
+    let current = api.get(name).await?;
+    let live_generation = current
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(super::generation::MUTATION_GENERATION_ANNOTATION))
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0);
+    let observed = current.status.as_ref();
+    if live_generation.is_some_and(|value| value <= generation.get())
+        && current
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.replicas)
+            .unwrap_or(1)
+            == desired_replicas
+        && observed
+            .and_then(|status| status.current_replicas)
+            .unwrap_or(0)
+            == desired_replicas
+        && observed
+            .and_then(|status| status.ready_replicas)
+            .unwrap_or(0)
+            == desired_replicas
+        && observed
+            .and_then(|status| status.updated_replicas)
+            .unwrap_or(0)
+            == desired_replicas
+    {
+        return Ok(());
+    }
+
     let patch = json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",

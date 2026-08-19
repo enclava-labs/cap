@@ -1370,7 +1370,12 @@ async fn paas_internal_create_app_persists_cli_signer_identity() {
 #[tokio::test]
 async fn paas_internal_desired_state_contract_is_authenticated_mapped_and_idempotent() {
     let (state, pool) = setup_paas_managed_test_state().await;
-    let app = test_router(state);
+    let runtime = Arc::new(Mutex::new(desired_statefulset(0)));
+    let engine = Arc::new(enclava_engine::apply::engine::ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let app = test_router(state).layer(Extension(engine));
     let server = axum_test::TestServer::builder().http_transport().build(app);
     let suffix = Uuid::new_v4().simple().to_string();
     let paas_org_id = format!("paas-org-{suffix}");
@@ -1419,6 +1424,7 @@ async fn paas_internal_desired_state_contract_is_authenticated_mapped_and_idempo
             "runtime_state": "stopped",
         })
     );
+    assert_eq!(runtime.lock().unwrap()["metadata"]["resourceVersion"], "1");
 
     let replay = add_internal_headers(server.put(&path), "another-ignored-header-key")
         .json(&serde_json::json!({
@@ -1465,6 +1471,7 @@ async fn paas_internal_desired_state_contract_is_authenticated_mapped_and_idempo
         .execute(&pool)
         .await
         .expect("mark app running");
+    *runtime.lock().unwrap() = desired_statefulset(1);
     let running = add_internal_headers(server.put(&path), "ignored-running-header")
         .json(&serde_json::json!({
             "desired_state": "running",
