@@ -393,6 +393,29 @@ pub struct InternalCreateAppRequest {
     pub egress_mode: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalAppDesiredState {
+    Running,
+    Stopped,
+}
+
+impl InternalAppDesiredState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InternalAppDesiredStateRequest {
+    pub desired_state: InternalAppDesiredState,
+    pub operation_id: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InternalDeployRequest {
     pub image: String,
@@ -3406,6 +3429,60 @@ pub async fn delete_paas_app(
             };
         let response = serde_json::json!({"status": "deleted"});
         Ok((status, response))
+    }
+    .await;
+    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    Ok((status, Json(response)))
+}
+
+pub async fn put_paas_app_desired_state(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Path((paas_org_id, app_name)): Path<(String, String)>,
+    Json(body): Json<InternalAppDesiredStateRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    validate_external_id(&paas_org_id, "paas_org_id")?;
+    validate_external_id(&body.operation_id, "operation_id")?;
+    crate::routes::apps::validate_app_name(&app_name)
+        .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let hash = request_hash(&body)?;
+    let idempotency =
+        match begin_idempotent_request(&state, &body.operation_id, "PUT", &path, &hash).await? {
+            IdempotencyBegin::Execute(lease) => lease,
+            IdempotencyBegin::Replay((status, body)) => return Ok((status, Json(body))),
+        };
+
+    let result: Result<IdempotencyResponse, InternalRouteError> = async {
+        let (cap_org_id, _, _) = mapped_cap_org(&state, &paas_org_id).await?;
+        let recorded_state: String = sqlx::query_scalar(
+            "SELECT status::text
+               FROM apps
+              WHERE org_id = $1
+                AND name = $2
+                AND status <> 'deleting'::app_status_enum",
+        )
+        .bind(cap_org_id)
+        .bind(&app_name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "application not found"))?;
+        let desired_state = body.desired_state.as_str();
+        if recorded_state != desired_state {
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "desired_state_retryable",
+            ));
+        }
+        Ok((
+            StatusCode::OK,
+            serde_json::json!({
+                "operation_id": body.operation_id,
+                "desired_state": desired_state,
+                "runtime_state": desired_state,
+            }),
+        ))
     }
     .await;
     let (status, response) = complete_idempotent_result(idempotency, result).await?;
