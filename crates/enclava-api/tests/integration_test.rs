@@ -1,7 +1,7 @@
 //! Integration tests for API routes using testcontainers.
 
 use axum::{
-    Json as AxumJson, Router,
+    Extension, Json as AxumJson, Router,
     extract::State as AxumState,
     http::{Method, Request, Response, StatusCode, header},
     routing::post,
@@ -1536,9 +1536,22 @@ fn desired_state_kube_client(state: Arc<Mutex<Value>>) -> kube::Client {
             async move {
                 let method = request.method().clone();
                 if method == Method::GET {
+                    let resource = state.lock().expect("fake state poisoned").clone();
+                    if resource.is_null() {
+                        return Ok::<_, io::Error>(desired_state_kube_response(
+                            StatusCode::NOT_FOUND,
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "reason": "NotFound",
+                                "code": 404,
+                            }),
+                        ));
+                    }
                     return Ok::<_, io::Error>(desired_state_kube_response(
                         StatusCode::OK,
-                        state.lock().expect("fake state poisoned").clone(),
+                        resource,
                     ));
                 }
                 if method != Method::PATCH {
@@ -1554,6 +1567,18 @@ fn desired_state_kube_client(state: Arc<Mutex<Value>>) -> kube::Client {
                 )
                 .map_err(io::Error::other)?;
                 let mut resource = state.lock().expect("fake state poisoned");
+                if resource.is_null() {
+                    return Ok(desired_state_kube_response(
+                        StatusCode::NOT_FOUND,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Failure",
+                            "reason": "NotFound",
+                            "code": 404,
+                        }),
+                    ));
+                }
                 merge_json(&mut resource, &patch);
                 let replicas = resource["spec"]["replicas"].as_i64().unwrap_or_default();
                 resource["metadata"]["resourceVersion"] = Value::String(
@@ -1578,6 +1603,94 @@ fn desired_state_kube_client(state: Arc<Mutex<Value>>) -> kube::Client {
         }),
         "default",
     )
+}
+
+#[tokio::test]
+async fn paas_internal_desired_state_observes_runtime_drift_and_missing_workload() {
+    use enclava_engine::apply::engine::ApplyEngine;
+
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let runtime = Arc::new(Mutex::new(desired_statefulset(1)));
+    let engine = Arc::new(ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let app = test_router(state).layer(Extension(engine));
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("drift-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-drift-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app stopped while runtime remains running");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let operation_id = format!("repair-drift-{suffix}");
+    let stopped = add_internal_headers(server.put(&path), "ignored-header-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    stopped.assert_status_ok();
+    let stopped_body: Value = stopped.json();
+    assert_eq!(stopped_body["runtime_state"], "stopped");
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
+
+    *runtime.lock().unwrap() = desired_statefulset(1);
+    let replay = add_internal_headers(server.put(&path), "ignored-replay-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    replay.assert_status_ok();
+    assert_eq!(replay.json::<Value>(), stopped_body);
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
+
+    let reconverged = add_internal_headers(server.put(&path), "ignored-fresh-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": format!("reconverge-drift-{suffix}"),
+        }))
+        .await;
+    reconverged.assert_status_ok();
+    assert_eq!(reconverged.json::<Value>()["runtime_state"], "stopped");
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
+
+    *runtime.lock().unwrap() = Value::Null;
+    let missing_operation_id = format!("missing-workload-{suffix}");
+    let missing = add_internal_headers(server.put(&path), "ignored-missing-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": missing_operation_id,
+        }))
+        .await;
+    missing.assert_status(StatusCode::CONFLICT);
+    let missing_body: Value = missing.json();
+    assert_eq!(missing_body["error"], "idempotency_recovery_required");
+
+    let missing_replay = add_internal_headers(server.put(&path), "ignored-missing-replay-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": missing_operation_id,
+        }))
+        .await;
+    missing_replay.assert_status(StatusCode::CONFLICT);
+    assert_eq!(missing_replay.json::<Value>(), missing_body);
 }
 
 #[tokio::test]
