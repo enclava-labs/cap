@@ -17,7 +17,9 @@ pub use amd::{
     AmdVerificationError, verify_amd_certificate_chain, verify_amd_revocation,
     verify_snp_signature, verify_vcek_report_binding,
 };
-pub use artifacts::{ArtifactError, VerifiedArtifacts, verify_workload_artifacts};
+pub use artifacts::{
+    ArtifactError, VerifiedArtifacts, observed_artifact_anchors, verify_workload_artifacts,
+};
 pub use bundle::{
     BundleError, MAX_PROOF_BUNDLE_BYTES, PROOF_BUNDLE_MEDIA_TYPE, ProofBundle, parse_proof_bundle,
 };

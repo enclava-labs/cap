@@ -310,6 +310,22 @@ fn canonical_keyring_bytes(keyring: &OrgKeyring) -> Result<Vec<u8>, ArtifactErro
     ]))
 }
 
+/// Observed trust anchors carried inside a bundle's workload artifacts:
+/// the canonical org-keyring SHA-256 and the policy-signing public key.
+/// Used by `enclava describe` to record what a target presented; these are
+/// observations, not endorsements.
+pub fn observed_artifact_anchors(workload_json: &[u8]) -> Result<(String, String), ArtifactError> {
+    let artifacts: WorkloadArtifacts =
+        serde_json::from_slice(workload_json).map_err(|_| ArtifactError::Malformed)?;
+    let keyring = canonical_keyring_bytes(&artifacts.org_keyring_payload)?;
+    let pubkey = base64::engine::general_purpose::STANDARD
+        .decode(&artifacts.signed_policy_artifact.verify_pubkey_b64)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or(ArtifactError::Malformed)?;
+    Ok((hex::encode(Sha256::digest(keyring)), hex::encode(pubkey)))
+}
+
 fn verify_ed25519(key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> Result<(), ()> {
     VerifyingKey::from_bytes(key)
         .map_err(|_| ())?
