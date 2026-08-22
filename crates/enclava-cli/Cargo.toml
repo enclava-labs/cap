@@ -46,6 +46,7 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 x509-cert = { workspace = true }
 sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl", "serde"] }
+fd-lock = "4.0.4"
 
 [features]
 prod-strict = []

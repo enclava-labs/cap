@@ -435,6 +435,8 @@ fn generated_policy_denies_metadata_and_link_local_space_regardless_of_allow_rul
     // resolve into metadata/link-local space and ride a toFQDNs allow rule).
     // A Cilium egressDeny outranks every allow rule; it must always be
     // present and must not depend on the egress allowlist contents.
+    // NOTE: the field is `toCIDR` (singular) — CiliumNetworkPolicy declares
+    // no `toCIDRs`; the wrong name is rejected by SSA against the CRD.
     let app = sample_app();
     let policy = enclava_engine::manifest::network_policy::generate_network_policy(&app);
     let deny = &policy["spec"]["egressDeny"]
@@ -442,19 +444,10 @@ fn generated_policy_denies_metadata_and_link_local_space_regardless_of_allow_rul
         .expect("egressDeny must be an array");
     assert!(
         deny.iter().any(|rule| {
-            rule["toCIDRs"]
-                .as_array()
-                .is_some_and(|cidrs| cidrs.iter().any(|c| c == "169.254.0.0/16"))
-                && cidrs_contain(deny, "fc00::/7")
+            let cidrs = rule["toCIDR"].as_array();
+            cidrs.is_some_and(|c| c.iter().any(|x| x == "169.254.0.0/16"))
+                && cidrs.is_some_and(|c| c.iter().any(|x| x == "fc00::/7"))
         }),
         "metadata (169.254.0.0/16) and AWS IMDS IPv6 (fc00::/7) must be denied"
     );
-}
-
-fn cidrs_contain(deny: &[serde_json::Value], needle: &str) -> bool {
-    deny.iter().any(|rule| {
-        rule["toCIDRs"]
-            .as_array()
-            .is_some_and(|cidrs| cidrs.iter().any(|c| c == needle))
-    })
 }

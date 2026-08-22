@@ -37,6 +37,10 @@ pub enum KeyringError {
         "keyring rollback refused: cached keyring is v{cached} but fetched keyring is v{incoming}; a compromised API can replay old signed keyrings. Clear ~/.enclava/state/<org_id>/ if this is an intentional reset."
     )]
     Rollback { cached: u64, incoming: u64 },
+    #[error(
+        "keyring divergence refused: version {version} is already cached with different content; a compromised API can hold a valid signature on a rejected concurrent update. Clear ~/.enclava/state/<org_id>/ only after verifying the accepted keyring out-of-band."
+    )]
+    Divergent { version: u64 },
     #[error("keyring not yet trusted; run `enclava org keyring trust` to confirm owner pubkey")]
     Untrusted,
     #[error("hex: {0}")]
@@ -287,20 +291,35 @@ pub fn load_keyring_envelope(org_id: &Uuid) -> Result<OrgKeyringEnvelope, Keyrin
 /// Cache a keyring envelope, refusing rollbacks: a fetched envelope whose
 /// version is older than the cached one is a replay (a validly-signed but
 /// stale keyring, e.g. re-adding a removed deployer) and is rejected.
-/// Equal versions are accepted (idempotent refetch).
+/// Equal versions are accepted only when the canonical keyring bytes match
+/// exactly — a divergent body at the same version is a second, rejected
+/// concurrent update the API still holds a signature for, not an idempotent
+/// refetch. The read/compare/write runs under a per-org file lock so two CLI
+/// processes cannot interleave and regress the high-water mark.
 pub fn store_keyring_envelope(
     org_id: &Uuid,
     envelope: &OrgKeyringEnvelope,
 ) -> Result<PathBuf, KeyringError> {
-    if let Ok(cached) = load_keyring_envelope(org_id)
-        && cached.keyring.version > envelope.keyring.version
-    {
-        return Err(KeyringError::Rollback {
-            cached: cached.keyring.version,
-            incoming: envelope.keyring.version,
-        });
-    }
-    store_keyring_envelope_force(org_id, envelope)
+    let lock_path = keyring_envelope_path(org_id)?.with_extension("lock");
+    crate::fslock::with_file_lock(&lock_path, || {
+        if let Ok(cached) = load_keyring_envelope(org_id) {
+            if cached.keyring.version > envelope.keyring.version {
+                return Err(KeyringError::Rollback {
+                    cached: cached.keyring.version,
+                    incoming: envelope.keyring.version,
+                });
+            }
+            if cached.keyring.version == envelope.keyring.version
+                && canonical_keyring_bytes(&cached.keyring)
+                    != canonical_keyring_bytes(&envelope.keyring)
+            {
+                return Err(KeyringError::Divergent {
+                    version: envelope.keyring.version,
+                });
+            }
+        }
+        store_keyring_envelope_force(org_id, envelope)
+    })
 }
 
 /// Cache a keyring envelope without rollback protection. Only for explicit
@@ -464,6 +483,21 @@ mod tests {
 
         // Same version (idempotent refetch) is accepted.
         store_keyring_envelope(&org_id, &envelope_v3).unwrap();
+
+        // Same version with DIFFERENT content is refused: that is the
+        // second of two concurrent v3 updates, rejected by the API but still
+        // signed — accepting it would overwrite the accepted v3 (e.g.
+        // re-adding a removed deployer).
+        let mut divergent_v3 = sample_keyring(&owner);
+        divergent_v3.version = 3;
+        divergent_v3.members.push(Member {
+            user_id: Uuid::new_v4(),
+            pubkey: UserSigningKey::from_seed(Uuid::new_v4(), [0x44; 32]).public,
+            role: Role::Deployer,
+            added_at: chrono::Utc::now(),
+        });
+        let err = store_keyring_envelope(&org_id, &sign_keyring(&owner, divergent_v3)).unwrap_err();
+        assert!(matches!(err, KeyringError::Divergent { version: 3 }));
 
         // An older, still-validly-signed keyring replayed by a compromised
         // API must be refused.

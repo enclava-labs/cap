@@ -190,7 +190,7 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
             // (169.254.0.0/16 covers 169.254.169.254 metadata endpoints;
             // fc00::/7 covers AWS IMDS IPv6 fd00:ec2::254.)
             "egressDeny": [
-                { "toCIDRs": ["169.254.0.0/16", "fc00::/7"] }
+                { "toCIDR": ["169.254.0.0/16", "fc00::/7"] }
             ],
         }
     })

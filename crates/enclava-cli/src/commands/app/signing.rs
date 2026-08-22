@@ -41,7 +41,24 @@ pub(crate) async fn fetch_verified_platform_release(
             )?;
             release
         }
-        None => PlatformRelease::load_verified()?,
+        None => {
+            // Once this API has served a signed release, omitting the
+            // envelope is a compromise signal, not a normal fallback: fail
+            // closed instead of signing against the bundled release (whose
+            // measurements may not match what the cluster runs).
+            if enclava_cli::platform_release::api_served_release_before(
+                &paths.api_release_baseline,
+                api.origin(),
+            )? {
+                return Err(format!(
+                    "platform API previously served a signed release but now omits it; refusing to fall back. \
+                     If the API intentionally stopped serving releases, remove {} after verifying with the operator.",
+                    paths.api_release_baseline.display()
+                )
+                .into());
+            }
+            PlatformRelease::load_verified()?
+        }
     };
     Ok((deployment_context, release))
 }

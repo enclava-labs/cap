@@ -395,6 +395,22 @@ mod tests {
     }
 
     #[test]
+    fn malformed_baseline_fails_closed_instead_of_resetting_the_high_water_mark() {
+        let dir = std::env::temp_dir().join(format!("pr-baseline-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("baselines.json");
+        std::fs::write(&store, "{ not json").unwrap();
+
+        let ok_release = release("r9", "2026-09-01T00:00:00Z");
+        assert!(
+            enforce_release_not_older_than_last_accepted(&store, "https://api", &ok_release)
+                .is_err()
+        );
+        assert!(api_served_release_before(&store, "https://api").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn per_api_baseline_allows_older_than_bundle_but_refuses_api_downgrades() {
         let dir = std::env::temp_dir().join(format!("pr-baseline-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -559,15 +575,49 @@ pub struct BaselineEntry {
     pub created_at: String,
 }
 
+/// Read the baseline store. Only a missing file means "first run": a
+/// baseline that exists but cannot be read or parsed fails closed —
+/// treating corruption as empty would accept a stale envelope and overwrite
+/// the high-water mark.
+fn read_baseline(store_path: &std::path::Path) -> Result<ApiReleaseBaseline, PlatformReleaseError> {
+    match std::fs::read_to_string(store_path) {
+        Ok(raw) => Ok(serde_json::from_str(&raw)?),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ApiReleaseBaseline::default()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// True once this API origin has served a signed release. Used to fail
+/// closed when an API that previously supplied an envelope stops supplying
+/// one (a compromised API must not be able to drop the envelope and push
+/// signing back onto the local fallback).
+pub fn api_served_release_before(
+    store_path: &std::path::Path,
+    api_origin: &str,
+) -> Result<bool, PlatformReleaseError> {
+    Ok(read_baseline(store_path)?.entries.contains_key(api_origin))
+}
+
 pub fn enforce_release_not_older_than_last_accepted(
     store_path: &std::path::Path,
     api_origin: &str,
     release: &PlatformRelease,
 ) -> Result<(), PlatformReleaseError> {
-    let mut baseline: ApiReleaseBaseline = std::fs::read_to_string(store_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default();
+    // The whole read/compare/write is serialized across processes: two
+    // concurrent deploys could otherwise both read the same state and one
+    // write a stale mark (or drop the other API's entry entirely).
+    let lock_path = store_path.with_extension("lock");
+    crate::fslock::with_file_lock(&lock_path, || {
+        enforce_release_not_older_than_last_accepted_locked(store_path, api_origin, release)
+    })
+}
+
+fn enforce_release_not_older_than_last_accepted_locked(
+    store_path: &std::path::Path,
+    api_origin: &str,
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    let mut baseline = read_baseline(store_path)?;
     if let Some(last) = baseline.entries.get(api_origin)
         && release_pair_is_older(
             (&release.platform_release_version, &release.created_at),
