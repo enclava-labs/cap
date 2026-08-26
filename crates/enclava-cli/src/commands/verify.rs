@@ -87,7 +87,7 @@ pub async fn run(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn normalize_origin(input: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub(crate) fn normalize_origin(input: &str) -> Result<String, Box<dyn std::error::Error>> {
     let url = reqwest::Url::parse(input)?;
     if url.scheme() != "https"
         || url.host().is_none()
@@ -104,7 +104,7 @@ fn normalize_origin(input: &str) -> Result<String, Box<dyn std::error::Error>> {
     Ok(url.origin().ascii_serialization())
 }
 
-async fn fetch_bundle(
+pub(crate) async fn fetch_bundle(
     origin: &str,
     nonce: &[u8; 32],
 ) -> Result<(Vec<u8>, [u8; 32]), Box<dyn std::error::Error>> {

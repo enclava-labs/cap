@@ -1,6 +1,7 @@
 pub mod app;
 pub mod auth;
 pub mod config;
+pub mod describe;
 pub mod descriptor;
 pub mod domains;
 pub mod init;
@@ -87,6 +88,8 @@ pub enum Command {
     Descriptor(descriptor::DescriptorCommand),
     /// Independently verify a live target or saved proof bundle
     Verify(verify::VerifyArgs),
+    /// Observe what a live target or saved proof bundle contains (no appraisal)
+    Describe(describe::DescribeArgs),
 }
 
 pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -117,5 +120,6 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Key(cmd) => key::run(cmd).await,
         Command::Descriptor(cmd) => descriptor::run(cmd).await,
         Command::Verify(args) => verify::run(args).await,
+        Command::Describe(args) => describe::run(args).await,
     }
 }
