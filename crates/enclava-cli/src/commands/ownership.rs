@@ -57,7 +57,7 @@ pub struct ChangePasswordArgs {
 
 #[derive(Subcommand)]
 pub enum AutoUnlockCommand {
-    /// Seal owner seed with VMPCK for automatic restart
+    /// Enable automatic unlock (owner seed wrapped for KBS-attestation-gated release)
     Enable {
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
