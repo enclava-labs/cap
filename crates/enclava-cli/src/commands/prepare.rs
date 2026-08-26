@@ -204,7 +204,7 @@ mod tests {
         assert!(workflow.contains("id-token: write"));
         assert!(workflow.contains("cosign sign --yes"));
         // Pinned installer (cosign 3.x → portable DSSE); a floating tag here
-        // regresses deploys to legacy .sig objects CAP rejects.
+        // can regress deploys to legacy .sig objects that lack portable material.
         assert!(
             workflow.contains("sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6")
         );

@@ -122,8 +122,8 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Install cosign
-        # v4.1.2 — installs cosign 3.x, which signs with portable DSSE
-        # material; CAP rejects legacy 2.x `.sig` objects
+        # v4.1.2 — installs cosign 3.x, which emits portable DSSE
+        # material; legacy 2.x `.sig` objects may lack it
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign image with cosign (keyless)

@@ -66,7 +66,7 @@ pub enum AutoUnlockCommand {
         #[arg(long)]
         image: String,
     },
-    /// Remove sealed seed, require password on restart
+    /// Remove the KBS-gated seed wrap, require password on restart
     Disable {
         /// App name (defaults to enclava.toml app.name)
         #[arg(long)]
@@ -665,12 +665,12 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             let (transition_attestation, tee) = tee.attest_receipt_key().await?;
 
             let password = Password::new()
-                .with_prompt("Unlock password (to authorize sealing)")
+                .with_prompt("Unlock password (to authorize auto-unlock wrapping)")
                 .interact()?;
 
             println!("Enabling auto-unlock for {app_name}...");
             tee.enable_auto_unlock(&password).await?;
-            println!("Sealed seed written inside the TEE.");
+            println!("KBS-gated seed wrap created inside the TEE.");
 
             let transition_receipt = tee
                 .sign_unlock_mode_transition(
@@ -729,12 +729,12 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             let (transition_attestation, tee) = tee.attest_receipt_key().await?;
 
             let password = Password::new()
-                .with_prompt("Unlock password (to authorize unsealing)")
+                .with_prompt("Unlock password (to remove auto-unlock wrapping)")
                 .interact()?;
 
             println!("Disabling auto-unlock for {app_name}...");
             tee.disable_auto_unlock(&password).await?;
-            println!("Sealed seed removed inside the TEE.");
+            println!("KBS-gated seed wrap removed inside the TEE.");
 
             let transition_receipt = tee
                 .sign_unlock_mode_transition(
