@@ -203,6 +203,11 @@ mod tests {
                 .unwrap();
         assert!(workflow.contains("id-token: write"));
         assert!(workflow.contains("cosign sign --yes"));
+        // Pinned installer (cosign 3.x → portable DSSE); a floating tag here
+        // regresses deploys to legacy .sig objects CAP rejects.
+        assert!(
+            workflow.contains("sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6")
+        );
         assert!(!workflow.contains("https://github.com/${{ github.workflow_ref }}"));
         assert!(workflow.contains("enclava deploy --image"));
         assert!(!workflow.contains("ENCLAVA_API_KEY"));
