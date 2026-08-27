@@ -12,6 +12,7 @@ use std::{
 };
 
 use crate::commands::ownership::MnemonicCapture;
+use crate::commands::{counted_progress, format_duration, timed_progress};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use clap::Subcommand;
@@ -400,6 +401,7 @@ pub struct DeployArgs {
 }
 
 pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let deploy_started = Instant::now();
     let app_config = match AppConfig::find_and_load() {
         Ok(config) => config,
         Err(_) => {
@@ -423,6 +425,15 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     } else {
         MnemonicCapture::Store
     };
+    let pb = ProgressBar::new(5);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:30.cyan/blue}] {msg}")?
+            .progress_chars("=> "),
+    );
+    // Polls redraw this bar with real state. A steady ticker would race the
+    // password, unlock, and one-time recovery-mnemonic terminal prompts.
+    pb.set_message("Preparing signed deployment...");
     let signed_blobs = build_signed_deploy_blobs(SignedDeployBlobParams {
         api: &api,
         paths: &paths,
@@ -444,14 +455,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     // Phase 1: Deploy
-    let pb = ProgressBar::new(5);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:30.cyan/blue}] {msg}")?
-            .progress_chars("=> "),
-    );
-    pb.set_message("Deploying...");
-
+    pb.set_message("Submitting deployment...");
     let resp = api.deploy(&app_name, &req).await?;
     pb.set_position(1);
     pb.set_message("Manifests applied");
@@ -460,7 +464,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     pb.set_position(2);
     pb.set_message("Waiting for TEE boot...");
 
-    let max_wait = Duration::from_secs(900);
+    let max_wait = Duration::from_secs(DEPLOY_HEALTH_TIMEOUT_SECONDS);
     let poll_interval = Duration::from_secs(3);
     wait_for_deployment_apply_start(
         &api,
@@ -559,7 +563,7 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
     // Phase 4: Push config if --set was used
     if !config_pairs.is_empty() {
         pb.set_position(4);
-        pb.set_message(format!("Setting {} config values...", config_pairs.len()));
+        pb.set_message(counted_progress("Customer config", 0, config_pairs.len()));
 
         // Get config token from API
         let token_resp = api.get_config_token(&app_name).await?;
@@ -574,9 +578,14 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
             });
         let (_attestation, tee) = tee.attest_receipt_key().await?;
 
-        for (key, value) in &config_pairs {
+        for (index, (key, value)) in config_pairs.iter().enumerate() {
             set_deploy_config(&tee, key, value, &token_resp.token).await?;
             api.sync_config_key(&app_name, key, false).await?;
+            pb.set_message(counted_progress(
+                "Customer config",
+                index + 1,
+                config_pairs.len(),
+            ));
         }
     }
 
@@ -594,12 +603,16 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
         &pb,
     )
     .await?;
-    pb.finish_with_message("Deployed and healthy");
+    pb.finish_with_message(format!(
+        "Deployed and healthy in {}",
+        format_duration(deploy_started.elapsed())
+    ));
 
     println!();
     println!("  App:    {app_name}");
     println!("  URL:    https://{}", resp.app_domain);
     println!("  Deploy: {}", resp.deployment_id);
+    println!("  Duration: {}", format_duration(deploy_started.elapsed()));
     if !config_pairs.is_empty() {
         println!("  Config: {} key(s) set", config_pairs.len());
     }
@@ -644,10 +657,19 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
 
     loop {
         if start.elapsed() > max_wait {
-            pb.abandon_with_message("Timeout waiting for ownership claim endpoint");
-            return Err("deploy timed out waiting for TEE ownership claim endpoint".into());
+            pb.abandon_with_message("TEE ownership timed out");
+            return Err(format!(
+                "TEE ownership for app {app_name} did not become ready within {}; run `enclava status --app {app_name}` for the latest state",
+                format_duration(max_wait)
+            )
+            .into());
         }
 
+        pb.set_message(timed_progress(
+            "TEE ownership: waiting for attested endpoint",
+            start.elapsed(),
+            max_wait,
+        ));
         match tee.attest_receipt_key().await {
             Ok((_attestation, attested_tee)) => match attested_tee.bootstrap_challenge().await {
                 Ok(_) => {
@@ -665,11 +687,19 @@ pub(crate) async fn wait_for_bootstrap_endpoint(
                     return Ok(false);
                 }
                 Err(_) => {
-                    pb.set_message("Waiting for ownership claim endpoint...");
+                    pb.set_message(timed_progress(
+                        "TEE ownership: waiting for claim endpoint",
+                        start.elapsed(),
+                        max_wait,
+                    ));
                 }
             },
             Err(_) => {
-                pb.set_message("Waiting for attested ownership claim endpoint...");
+                pb.set_message(timed_progress(
+                    "TEE ownership: waiting for attested endpoint",
+                    start.elapsed(),
+                    max_wait,
+                ));
             }
         }
 
@@ -690,10 +720,19 @@ async fn wait_for_deploy_runtime(
 
     loop {
         if start.elapsed() > max_wait {
-            pb.abandon_with_message("Timeout waiting for TEE boot");
-            return Err("deploy timed out waiting for TEE to boot".into());
+            pb.abandon_with_message("TEE boot timed out");
+            return Err(format!(
+                "deployment {expected_deployment_id} for app {app_name} did not reach a ready TEE within {}; run `enclava status --app {app_name}` for the latest state",
+                format_duration(max_wait)
+            )
+            .into());
         }
 
+        pb.set_message(timed_progress(
+            "TEE boot: waiting for runtime",
+            start.elapsed(),
+            max_wait,
+        ));
         let direct_tee_allowed = match api.get_status(app_name).await {
             Ok(status) => {
                 let observation_is_fresh = observation_is_fresh_for_deployment(
@@ -724,7 +763,11 @@ async fn wait_for_deploy_runtime(
                         return Ok(());
                     }
                     Some(phase) => {
-                        pb.set_message(format!("Pod: {phase}"));
+                        pb.set_message(timed_progress(
+                            &format!("TEE boot: Pod {phase}"),
+                            start.elapsed(),
+                            max_wait,
+                        ));
                     }
                     None => {}
                 }
@@ -761,12 +804,20 @@ async fn wait_for_deploy_runtime(
                         return Ok(());
                     }
                     "unlocked" => {
-                        pb.set_message("Waiting for replacement TEE lock...");
+                        pb.set_message(timed_progress(
+                            "TEE boot: waiting for replacement storage lock",
+                            start.elapsed(),
+                            max_wait,
+                        ));
                     }
                     _ => {}
                 }
             } else {
-                pb.set_message("Waiting for healthy TEE status...");
+                pb.set_message(timed_progress(
+                    "TEE boot: waiting for consistent status",
+                    start.elapsed(),
+                    max_wait,
+                ));
             }
         }
 
@@ -828,13 +879,21 @@ async fn wait_for_deployment_apply_start(
     let start = Instant::now();
     loop {
         if start.elapsed() > max_wait {
-            pb.abandon_with_message("Timeout waiting for deployment apply");
-            return Err(format!("deployment {deployment_id} did not start applying").into());
+            pb.abandon_with_message("Deployment apply timed out");
+            return Err(format!(
+                "deployment {deployment_id} for app {app_name} did not start applying within {}; run `enclava status --app {app_name}` for the latest state",
+                format_duration(max_wait)
+            )
+            .into());
         }
 
         match find_deployment_entry(api, app_name, deployment_id).await {
             Ok(Some(deployment)) => match deployment.status.as_str() {
-                "pending" => pb.set_message("Waiting for deployment apply..."),
+                "pending" => pb.set_message(timed_progress(
+                    "Applying deployment: pending",
+                    start.elapsed(),
+                    max_wait,
+                )),
                 "failed" => {
                     let detail = deployment
                         .error_message
@@ -844,8 +903,16 @@ async fn wait_for_deployment_apply_start(
                 }
                 _ => return Ok(()),
             },
-            Ok(None) => pb.set_message("Waiting for deployment record..."),
-            Err(_) => pb.set_message("Waiting for deployment status..."),
+            Ok(None) => pb.set_message(timed_progress(
+                "Applying deployment: waiting for record",
+                start.elapsed(),
+                max_wait,
+            )),
+            Err(_) => pb.set_message(timed_progress(
+                "Applying deployment: status check retrying",
+                start.elapsed(),
+                max_wait,
+            )),
         }
 
         tokio::time::sleep(poll_interval).await;
@@ -863,8 +930,12 @@ async fn wait_for_deployment_completion(
     let start = Instant::now();
     loop {
         if start.elapsed() > max_wait {
-            pb.abandon_with_message("Timeout waiting for deployment health");
-            return Err(format!("deployment {deployment_id} timed out waiting for health").into());
+            pb.abandon_with_message("Workload health timed out");
+            return Err(format!(
+                "deployment {deployment_id} for app {app_name} did not become healthy within {}; run `enclava status --app {app_name}` for the latest state",
+                format_duration(max_wait)
+            )
+            .into());
         }
 
         match find_deployment_entry(api, app_name, deployment_id).await {
@@ -878,14 +949,30 @@ async fn wait_for_deployment_completion(
                     return Err(format!("deployment {deployment_id} failed: {detail}").into());
                 }
                 "pending" | "applying" | "watching" => {
-                    pb.set_message(format!("Deployment: {}", deployment.status));
+                    pb.set_message(timed_progress(
+                        &format!("Workload health: {}", deployment.status),
+                        start.elapsed(),
+                        max_wait,
+                    ));
                 }
                 other => {
-                    pb.set_message(format!("Deployment: {other}"));
+                    pb.set_message(timed_progress(
+                        &format!("Workload health: {other}"),
+                        start.elapsed(),
+                        max_wait,
+                    ));
                 }
             },
-            Ok(None) => pb.set_message("Waiting for deployment record..."),
-            Err(_) => pb.set_message("Waiting for deployment status..."),
+            Ok(None) => pb.set_message(timed_progress(
+                "Workload health: waiting for deployment record",
+                start.elapsed(),
+                max_wait,
+            )),
+            Err(_) => pb.set_message(timed_progress(
+                "Workload health: status check retrying",
+                start.elapsed(),
+                max_wait,
+            )),
         }
 
         tokio::time::sleep(poll_interval).await;

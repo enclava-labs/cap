@@ -471,6 +471,24 @@ fn deploy_accepts_storage_password_file_flag() {
 }
 
 #[test]
+fn deploy_progress_does_not_redraw_during_interactive_secret_prompts() {
+    let source = include_str!("../../app.rs");
+    let deploy_start = source
+        .find("pub async fn deploy")
+        .expect("deploy function exists");
+    let deploy_end = source[deploy_start..]
+        .find("async fn wait_for_bootstrap_endpoint")
+        .expect("bootstrap helper follows deploy")
+        + deploy_start;
+    let body = &source[deploy_start..deploy_end];
+
+    assert!(
+        !body.contains("enable_steady_tick"),
+        "deploy progress must not redraw during password, unlock, or recovery-mnemonic prompts"
+    );
+}
+
+#[test]
 fn deploy_bootstrap_probe_attests_before_calling_claim_endpoint() {
     let source = include_str!("../../app.rs");
     let fn_start = source
