@@ -12,7 +12,26 @@ pub mod prepare;
 pub mod template;
 pub mod verify;
 
+use std::time::Duration;
+
 use clap::{Parser, Subcommand};
+
+pub(crate) fn counted_progress(label: &str, completed: usize, total: usize) -> String {
+    format!("{label}: {completed}/{total}")
+}
+
+pub(crate) fn timed_progress(label: &str, elapsed: Duration, timeout: Duration) -> String {
+    format!(
+        "[{} / {}] {label}",
+        format_duration(elapsed),
+        format_duration(timeout)
+    )
+}
+
+pub(crate) fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+}
 
 #[derive(Parser)]
 #[command(
@@ -121,5 +140,26 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Descriptor(cmd) => descriptor::run(cmd).await,
         Command::Verify(args) => verify::run(args).await,
         Command::Describe(args) => describe::run(args).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_progress_formats_counts_and_deadlines() {
+        assert_eq!(
+            counted_progress("Platform config", 7, 13),
+            "Platform config: 7/13"
+        );
+        assert_eq!(
+            timed_progress(
+                "TEE boot: Pod Running",
+                Duration::from_secs(134),
+                Duration::from_secs(900),
+            ),
+            "[02:14 / 15:00] TEE boot: Pod Running"
+        );
     }
 }
