@@ -92,7 +92,7 @@ fn test_deployment_context() -> DeploymentContextResponse {
 #[test]
 fn create_unlock_mode_validation_rejects_auto_with_workaround() {
     // auto is a post-claim transition (via `auto-unlock enable`), never a first-deploy
-    // mode — there is no owner seed to seal at create time.
+    // mode — there is no owner seed to wrap at create time.
     let err = validate_create_unlock_mode("auto").unwrap_err();
     assert!(
         err.contains("auto-unlock enable"),
