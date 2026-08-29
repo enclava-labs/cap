@@ -12,6 +12,9 @@ pub enum ConfigCommand {
         /// KEY=VALUE pairs
         #[arg(required = true)]
         vars: Vec<String>,
+        /// App name (defaults to enclava.toml app.name)
+        #[arg(long)]
+        app: Option<String>,
     },
     /// List config key names (values never leave the TEE)
     Get {
@@ -58,16 +61,13 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
 
 pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        ConfigCommand::Set { vars } => {
+        ConfigCommand::Set { vars, app } => {
             let pairs: Vec<(String, String)> = vars
                 .iter()
                 .map(|v| parse_key_value(v))
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let app_name = {
-                let config = AppConfig::find_and_load()?;
-                config.app.name
-            };
+            let app_name = resolve_app_name(&app)?;
 
             let (api, _paths, _cli_config) = build_api_client()?;
             let app = api.get_app(&app_name).await?;
@@ -156,10 +156,32 @@ mod tests {
     }
 
     #[test]
+    fn config_set_accepts_explicit_app_without_local_config() {
+        use clap::Parser as _;
+
+        let cli = crate::commands::Cli::try_parse_from([
+            "enclava",
+            "config",
+            "set",
+            "DEBIAN_SSH_AUTHORIZED_KEYS=ssh-ed25519 test",
+            "--app",
+            "shell",
+        ])
+        .expect("config set should accept an explicit hosted app");
+        let crate::commands::Command::Config(super::ConfigCommand::Set { vars, app }) = cli.command
+        else {
+            panic!("expected config set command");
+        };
+        assert_eq!(vars.len(), 1);
+        assert_eq!(app.as_deref(), Some("shell"));
+        assert_eq!(super::resolve_app_name(&app).unwrap(), "shell");
+    }
+
+    #[test]
     fn config_set_attests_before_writing_values() {
         let source = include_str!("config.rs");
         let set_start = source
-            .find("ConfigCommand::Set { vars } =>")
+            .find("ConfigCommand::Set { vars, app } =>")
             .expect("set command branch exists");
         let get_start = source[set_start..]
             .find("ConfigCommand::Get")
