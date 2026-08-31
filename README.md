@@ -71,13 +71,15 @@ Requirements:
 
 - Rust 1.85 or newer;
 - Docker Compose for the local API/PostgreSQL stack;
-- `pkg-config`, `libcryptsetup` development headers, `clang`, and `libclang`
-  for the full workspace, including `enclava-init`.
+- `pkg-config` and OpenSSL development headers (`libssl-dev`), required even
+  for a standalone `cargo install enclava-cli`;
+- `libcryptsetup` development headers, `clang`, and `libclang` for the full
+  workspace, including `enclava-init`.
 
 On Debian or Ubuntu:
 
 ```bash
-sudo apt-get install -y pkg-config libcryptsetup-dev clang libclang-dev
+sudo apt-get install -y pkg-config libssl-dev libcryptsetup-dev clang libclang-dev
 ```
 
 Start the development API:
