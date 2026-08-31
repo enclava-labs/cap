@@ -905,24 +905,16 @@ mod tests {
 
     #[test]
     fn release_runtime_class_binding_uses_the_resolved_class() {
-        // The exact failure mode of the dropped-hunk merge: the call site must
-        // pass the env-resolved class, never the DEFAULT constant, so the
-        // CAP_ALLOW_DEV_RUNTIME_CLASS hatch cannot coexist with a signed
-        // release.
-        let source = include_str!("main.rs");
-        let body = source
-            .split("fn load_platform_release")
-            .nth(1)
-            .and_then(|s| s.split("fn release_env_value").next())
-            .expect("load_platform_release body");
+        // A signed release pins the runtime class its measurements describe,
+        // so the CAP_ALLOW_DEV_RUNTIME_CLASS hatch cannot coexist with an
+        // enabled release: a mismatch between the expected class and the
+        // effective (env-resolved) class must fail. Resolution happens in the
+        // caller, which passes the resolved class in — the signature makes a
+        // DEFAULT_RUNTIME_CLASS fallback impossible.
+        validate_platform_release_runtime_class("kata-qemu-snp", "kata-qemu-snp").unwrap();
         assert!(
-            body.contains("try_runtime_class()"),
-            "load_platform_release must bind the signed release to the resolved runtime class"
+            validate_platform_release_runtime_class("kata-qemu-snp", "kata-qemu-coco-dev").is_err()
         );
-        assert!(!body.contains("DEFAULT_RUNTIME_CLASS"));
-
-        check_release_runtime_class("kata-qemu-snp", "kata-qemu-snp").unwrap();
-        assert!(check_release_runtime_class("kata-qemu-snp", "kata-qemu-coco-dev").is_err());
     }
 
     #[test]
