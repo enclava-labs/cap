@@ -47,10 +47,10 @@ tokio-rustls = { workspace = true }
 x509-cert = { workspace = true }
 sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl", "serde"] }
 fd-lock = "4.0.4"
+tempfile = "3"
 
 [features]
 prod-strict = []
 
 [dev-dependencies]
 enclava-engine = { path = "../enclava-engine", features = ["testutil"] }
-tempfile = "3"

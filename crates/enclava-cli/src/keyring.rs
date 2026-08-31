@@ -302,21 +302,25 @@ pub fn store_keyring_envelope(
 ) -> Result<PathBuf, KeyringError> {
     let lock_path = keyring_envelope_path(org_id)?.with_extension("lock");
     crate::fslock::with_file_lock(&lock_path, || {
-        if let Ok(cached) = load_keyring_envelope(org_id) {
-            if cached.keyring.version > envelope.keyring.version {
-                return Err(KeyringError::Rollback {
-                    cached: cached.keyring.version,
-                    incoming: envelope.keyring.version,
-                });
+        match load_keyring_envelope(org_id) {
+            Ok(cached) => {
+                if cached.keyring.version > envelope.keyring.version {
+                    return Err(KeyringError::Rollback {
+                        cached: cached.keyring.version,
+                        incoming: envelope.keyring.version,
+                    });
+                }
+                if cached.keyring.version == envelope.keyring.version
+                    && canonical_keyring_bytes(&cached.keyring)
+                        != canonical_keyring_bytes(&envelope.keyring)
+                {
+                    return Err(KeyringError::Divergent {
+                        version: envelope.keyring.version,
+                    });
+                }
             }
-            if cached.keyring.version == envelope.keyring.version
-                && canonical_keyring_bytes(&cached.keyring)
-                    != canonical_keyring_bytes(&envelope.keyring)
-            {
-                return Err(KeyringError::Divergent {
-                    version: envelope.keyring.version,
-                });
-            }
+            Err(KeyringError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         store_keyring_envelope_force(org_id, envelope)
     })
@@ -519,6 +523,28 @@ mod tests {
         v4.version = 4;
         store_keyring_envelope(&org_id, &sign_keyring(&owner, v4)).unwrap();
         store_keyring_envelope_force(&org_id, &envelope_v2).unwrap();
+
+        unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") };
+    }
+
+    #[test]
+    fn keyring_store_refuses_to_replace_a_corrupt_cache() {
+        let _guard = env_state_lock();
+        let temp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ENCLAVA_STATE_DIR", temp.path()) };
+        let org_id = Uuid::new_v4();
+        fs::write(keyring_envelope_path(&org_id).unwrap(), "{not-json").unwrap();
+
+        let owner = UserSigningKey::from_seed(Uuid::new_v4(), [0x55; 32]);
+        let envelope = sign_keyring(&owner, sample_keyring(&owner));
+        assert!(matches!(
+            store_keyring_envelope(&org_id, &envelope),
+            Err(KeyringError::Json(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(keyring_envelope_path(&org_id).unwrap()).unwrap(),
+            "{not-json"
+        );
 
         unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") };
     }

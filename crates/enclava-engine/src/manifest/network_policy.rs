@@ -187,10 +187,10 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
             // DNS layer resolves. Deny rules outrank allow rules in Cilium,
             // so metadata and link-local space is unreachable through ANY
             // allow rule — no legitimate tenant egress ever touches it.
-            // (169.254.0.0/16 covers 169.254.169.254 metadata endpoints;
-            // fc00::/7 covers AWS IMDS IPv6 fd00:ec2::254.)
+            // (169.254.0.0/16 covers IPv4 link-local metadata endpoints;
+            // fd00:ec2::254/128 is AWS IMDS IPv6; fe80::/10 is IPv6 link-local.)
             "egressDeny": [
-                { "toCIDR": ["169.254.0.0/16", "fc00::/7"] }
+                { "toCIDR": ["169.254.0.0/16", "fd00:ec2::254/128", "fe80::/10"] }
             ],
         }
     })

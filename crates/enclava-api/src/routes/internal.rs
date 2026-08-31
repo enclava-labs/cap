@@ -3440,7 +3440,7 @@ pub async fn put_paas_app_desired_state(
     _auth: InternalAuth,
     State(state): State<AppState>,
     Path((paas_org_id, app_name)): Path<(String, String)>,
-    engine: Option<Extension<Arc<enclava_engine::apply::engine::ApplyEngine>>>,
+    Extension(engine): Extension<Arc<enclava_engine::apply::engine::ApplyEngine>>,
     Json(body): Json<InternalAppDesiredStateRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
@@ -3463,8 +3463,9 @@ pub async fn put_paas_app_desired_state(
 
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
         let (cap_org_id, _, _) = mapped_cap_org(&state, &paas_org_id).await?;
-        let (app_id, namespace): (Uuid, String) = sqlx::query_as(
-            "SELECT id, namespace
+        let (app_id, namespace, current_status): (Uuid, String, crate::models::AppStatus) =
+            sqlx::query_as(
+            "SELECT id, namespace, status
                FROM apps
               WHERE org_id = $1
                 AND name = $2
@@ -3476,17 +3477,13 @@ pub async fn put_paas_app_desired_state(
         .await
         .map_err(|_| db_error())?
         .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "application not found"))?;
+        if current_status == crate::models::AppStatus::Failed {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "failed applications require a successful redeployment before changing desired state",
+            ));
+        }
         let desired_state = body.desired_state.as_str();
-        let engine = match engine {
-            Some(Extension(engine)) => engine,
-            None => Arc::new(
-                enclava_engine::apply::engine::ApplyEngine::try_default()
-                    .await
-                    .map_err(|_| {
-                        json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
-                    })?,
-            ),
-        };
         let resource =
             crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &namespace);
         let mut mutation = crate::mutation_leases::claim(

@@ -41,10 +41,11 @@ the independently operated endpoint intentionally requires authentication.
 
 Run `cargo test -p enclava-appraiser` for the reference implementation's local unit checks.
 
-Consumers verify responses with `enclava_verifier::verify_appraisal_response` and the independently
-supplied `appraiser` policy section. It enforces the exact result hash, signature, validity windows,
-maximum lifetime, clock skew, revocation, and overlap rotation. Stable failures are documented in
-`reason-codes-v1.md`.
+Consumers verify responses with `enclava_verifier::verify_appraisal_response_pinned` and the
+independently supplied `appraiser` policy section. The WASM adapter exports the same pinned-only
+path. It enforces the exact result hash, signature, validity windows, maximum lifetime, clock skew,
+revocation, overlap rotation, and the relying party's policy, nonce, and origin. Stable failures are
+documented in `reason-codes-v1.md`.
 
 **Pinning (required):** the appraiser signs results for whatever policy, evidence, nonce, and origin
 a requester supplies — it is a public signing oracle by design. A receipt only proves something

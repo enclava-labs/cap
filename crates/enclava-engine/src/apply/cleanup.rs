@@ -94,7 +94,7 @@ pub async fn set_statefulset_desired_replicas(
         .and_then(|value| value.parse::<i64>().ok())
         .filter(|value| *value > 0);
     let observed = current.status.as_ref();
-    if live_generation.is_some_and(|value| value <= generation.get())
+    if live_generation.is_some_and(|value| value == generation.get())
         && current
             .spec
             .as_ref()

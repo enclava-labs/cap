@@ -446,8 +446,10 @@ fn generated_policy_denies_metadata_and_link_local_space_regardless_of_allow_rul
         deny.iter().any(|rule| {
             let cidrs = rule["toCIDR"].as_array();
             cidrs.is_some_and(|c| c.iter().any(|x| x == "169.254.0.0/16"))
-                && cidrs.is_some_and(|c| c.iter().any(|x| x == "fc00::/7"))
+                && cidrs.is_some_and(|c| c.iter().any(|x| x == "fd00:ec2::254/128"))
+                && cidrs.is_some_and(|c| c.iter().any(|x| x == "fe80::/10"))
+                && cidrs.is_some_and(|c| c.iter().all(|x| x != "fc00::/7"))
         }),
-        "metadata (169.254.0.0/16) and AWS IMDS IPv6 (fc00::/7) must be denied"
+        "metadata and link-local addresses must be denied without blocking all IPv6 ULA space"
     );
 }

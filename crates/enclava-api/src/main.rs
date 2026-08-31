@@ -1,3 +1,4 @@
+use axum::Extension;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use enclava_common::image::ImageRef;
@@ -854,7 +855,20 @@ async fn main() {
         internal_auth,
     };
 
+    let desired_state_engine = if management_mode == CapManagementMode::PaasManaged {
+        Some(Arc::new(
+            enclava_engine::apply::engine::ApplyEngine::try_default()
+                .await
+                .expect("failed to configure Kubernetes client for PaaS desired-state routes"),
+        ))
+    } else {
+        None
+    };
     let app = build_router(state.clone());
+    let app = match desired_state_engine {
+        Some(engine) => app.layer(Extension(engine)),
+        None => app,
+    };
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await

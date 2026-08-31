@@ -638,14 +638,13 @@ fn enforce_release_not_older_than_last_accepted_locked(
     };
     if baseline.entries.get(api_origin) != Some(&entry) {
         baseline.entries.insert(api_origin.to_string(), entry);
-        let tmp = store_path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&baseline)?)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp, store_path)?;
+        let parent = store_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer_pretty(tmp.as_file_mut(), &baseline)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(store_path).map_err(|error| error.error)?;
     }
     Ok(())
 }

@@ -1391,11 +1391,37 @@ async fn paas_internal_desired_state_contract_is_authenticated_mapped_and_idempo
     .json(&serde_json::json!({"name": app_name}))
     .await
     .assert_status(StatusCode::CREATED);
-    sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE name = $1")
-        .bind(&app_name)
-        .execute(&pool)
-        .await
-        .expect("mark app stopped");
+    sqlx::query(
+        "UPDATE apps
+            SET status = 'stopped'::app_status_enum,
+                signer_identity_subject = $2,
+                signer_identity_issuer = $3,
+                signer_identity_set_at = now()
+          WHERE name = $1",
+    )
+    .bind(&app_name)
+    .bind(github_signer_subject())
+    .bind(github_signer_issuer())
+    .execute(&pool)
+    .await
+    .expect("mark app stopped");
+
+    let deploy_while_stopped = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/deploy"
+        )),
+        &format!("deploy-stopped-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&serde_json::json!({
+        "image": "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }))
+    .await;
+    deploy_while_stopped.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        deploy_while_stopped.json::<Value>()["error"],
+        "start the stopped app before deploying"
+    );
 
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
     server
@@ -1480,6 +1506,23 @@ async fn paas_internal_desired_state_contract_is_authenticated_mapped_and_idempo
         .await;
     running.assert_status_ok();
     assert_eq!(running.json::<Value>()["runtime_state"], "running");
+
+    sqlx::query("UPDATE apps SET status = 'failed'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app failed");
+    let failed_start = add_internal_headers(server.put(&path), "ignored-failed-header")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": format!("failed-{suffix}"),
+        }))
+        .await;
+    failed_start.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        failed_start.json::<Value>()["error"],
+        "failed applications require a successful redeployment before changing desired state"
+    );
 }
 
 fn desired_statefulset(replicas: i32) -> Value {
@@ -1728,7 +1771,23 @@ async fn paas_internal_desired_state_replay_reconverges_runtime_drift() {
     {
         let concurrent_runtime = runtime.lock().unwrap();
         assert_eq!(concurrent_runtime["spec"]["replicas"], 1);
-        assert_eq!(concurrent_runtime["metadata"]["resourceVersion"], "2");
+        assert!(
+            concurrent_runtime["metadata"]["resourceVersion"]
+                .as_str()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                > 1
+        );
+        assert!(
+            concurrent_runtime["metadata"]["annotations"]
+                ["enclava.dev/cap-provider-mutation-generation"]
+                .as_str()
+                .unwrap()
+                .parse::<i64>()
+                .unwrap()
+                > 1
+        );
     }
 
     *runtime.lock().unwrap() = Value::Null;
@@ -1895,6 +1954,10 @@ async fn desired_state_replica_convergence_stops_resumes_and_retains_configurati
     {
         let stopped = state.lock().unwrap();
         assert_eq!(stopped["spec"]["replicas"], 0);
+        assert_eq!(
+            stopped["metadata"]["annotations"]["enclava.dev/cap-provider-mutation-generation"],
+            "2"
+        );
         assert_eq!(stopped["metadata"]["annotations"]["retained"], "true");
         assert_eq!(
             stopped["spec"]["volumeClaimTemplates"][0]["metadata"]["name"],
@@ -1906,9 +1969,24 @@ async fn desired_state_replica_convergence_stops_resumes_and_retains_configurati
         &engine,
         "desired-state-test",
         "desired-state",
-        1,
+        0,
         std::time::Duration::from_secs(1),
         MutationGeneration::new(3).unwrap(),
+    )
+    .await
+    .expect("no-op stop advances generation fence");
+    assert_eq!(
+        state.lock().unwrap()["metadata"]["annotations"]["enclava.dev/cap-provider-mutation-generation"],
+        "3"
+    );
+
+    set_statefulset_desired_replicas(
+        &engine,
+        "desired-state-test",
+        "desired-state",
+        1,
+        std::time::Duration::from_secs(1),
+        MutationGeneration::new(4).unwrap(),
     )
     .await
     .expect("resume converges");
