@@ -1,7 +1,10 @@
 //! Integration tests for API routes using testcontainers.
 
 use axum::{
-    Json as AxumJson, Router, extract::State as AxumState, http::StatusCode, routing::post,
+    Extension, Json as AxumJson, Router,
+    extract::State as AxumState,
+    http::{Method, Request, Response, StatusCode, header},
+    routing::post,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{Duration, Utc};
@@ -25,11 +28,17 @@ use enclava_common::{
     image::ImageRef,
 };
 use enclava_engine::{manifest::network_policy::generate_network_policy, types::AttestationConfig};
+use http_body_util::BodyExt;
+use kube::client::Body;
 use rand::rngs::OsRng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::{
+    io,
+    sync::{Arc, Mutex},
+};
+use tower::service_fn;
 use uuid::Uuid;
 
 const TEST_KBS_POLICY: &str = "package policy\n\ndefault allow := false\n";
@@ -1356,6 +1365,554 @@ async fn paas_internal_create_app_persists_cli_signer_identity() {
         .find(|rule| rule["toFQDNs"][0]["matchName"].as_str() == Some("relay.enclava.me"))
         .expect("relay egress rule");
     assert_eq!(relay_rule["toPorts"][0]["ports"][0]["port"], "20000");
+}
+
+#[tokio::test]
+async fn paas_internal_desired_state_contract_is_authenticated_mapped_and_idempotent() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let runtime = Arc::new(Mutex::new(desired_statefulset(0)));
+    let engine = Arc::new(enclava_engine::apply::engine::ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let app = test_router(state).layer(Extension(engine));
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("state-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app stopped");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    server
+        .put(&path)
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": format!("missing-auth-{suffix}"),
+        }))
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+
+    let operation_id = format!("stop-{suffix}");
+    let stopped = add_internal_headers(server.put(&path), "ignored-header-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    stopped.assert_status_ok();
+    let stopped_body: Value = stopped.json();
+    assert_eq!(
+        stopped_body,
+        serde_json::json!({
+            "operation_id": operation_id,
+            "desired_state": "stopped",
+            "runtime_state": "stopped",
+        })
+    );
+    assert_eq!(runtime.lock().unwrap()["metadata"]["resourceVersion"], "1");
+
+    let replay = add_internal_headers(server.put(&path), "another-ignored-header-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    replay.assert_status_ok();
+    assert_eq!(replay.json::<Value>(), stopped_body);
+
+    let conflict = add_internal_headers(server.put(&path), "ignored-conflict-header")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": operation_id,
+        }))
+        .await;
+    conflict.assert_status(StatusCode::CONFLICT);
+    assert_eq!(conflict.json::<Value>()["error"], "idempotency_key_reused");
+
+    let leaked_field = add_internal_headers(server.put(&path), "ignored-leak-header")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": format!("leak-{suffix}"),
+            "plan": "pro",
+        }))
+        .await;
+    leaked_field.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+
+    let unmapped = add_internal_headers(
+        server.put(&format!(
+            "/internal/paas/orgs/unmapped-{suffix}/apps/{app_name}/desired-state"
+        )),
+        "ignored-unmapped-header",
+    )
+    .json(&serde_json::json!({
+        "desired_state": "stopped",
+        "operation_id": format!("unmapped-{suffix}"),
+    }))
+    .await;
+    unmapped.assert_status(StatusCode::NOT_FOUND);
+
+    sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app running");
+    *runtime.lock().unwrap() = desired_statefulset(1);
+    let running = add_internal_headers(server.put(&path), "ignored-running-header")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": format!("running-{suffix}"),
+        }))
+        .await;
+    running.assert_status_ok();
+    assert_eq!(running.json::<Value>()["runtime_state"], "running");
+}
+
+fn desired_statefulset(replicas: i32) -> Value {
+    serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": {
+            "name": "desired-state",
+            "namespace": "desired-state-test",
+            "uid": "22222222-2222-2222-2222-222222222222",
+            "resourceVersion": "1",
+            "annotations": {
+                "enclava.dev/cap-provider-mutation-generation": "1",
+                "retained": "true",
+            },
+        },
+        "spec": {
+            "replicas": replicas,
+            "serviceName": "desired-state",
+            "selector": {"matchLabels": {"app": "desired-state"}},
+            "template": {
+                "metadata": {"labels": {"app": "desired-state"}},
+                "spec": {"containers": [{"name": "app", "image": "example.test/app:current"}]},
+            },
+            "volumeClaimTemplates": [{
+                "metadata": {"name": "retained-data"},
+                "spec": {"accessModes": ["ReadWriteOnce"]},
+            }],
+        },
+        "status": {
+            "currentReplicas": replicas,
+            "readyReplicas": replicas,
+            "updatedReplicas": replicas,
+        },
+    })
+}
+
+fn merge_json(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(target), Value::Object(patch)) => {
+            for (key, value) in patch {
+                merge_json(target.entry(key).or_insert(Value::Null), value);
+            }
+        }
+        (target, patch) => *target = patch.clone(),
+    }
+}
+
+fn desired_state_kube_response(status: StatusCode, body: Value) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string().into_bytes()))
+        .expect("fake Kubernetes response")
+}
+
+fn desired_state_kube_client(state: Arc<Mutex<Value>>) -> kube::Client {
+    kube::Client::new(
+        service_fn(move |request: Request<Body>| {
+            let state = Arc::clone(&state);
+            async move {
+                let method = request.method().clone();
+                if method == Method::GET {
+                    let resource = state.lock().expect("fake state poisoned").clone();
+                    if resource.is_null() {
+                        return Ok::<_, io::Error>(desired_state_kube_response(
+                            StatusCode::NOT_FOUND,
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "reason": "NotFound",
+                                "code": 404,
+                            }),
+                        ));
+                    }
+                    return Ok::<_, io::Error>(desired_state_kube_response(
+                        StatusCode::OK,
+                        resource,
+                    ));
+                }
+                if method != Method::PATCH {
+                    return Err(io::Error::other("unexpected fake Kubernetes request"));
+                }
+                let patch: Value = serde_json::from_slice(
+                    &request
+                        .into_body()
+                        .collect()
+                        .await
+                        .map_err(io::Error::other)?
+                        .to_bytes(),
+                )
+                .map_err(io::Error::other)?;
+                let mut resource = state.lock().expect("fake state poisoned");
+                if resource.is_null() {
+                    return Ok(desired_state_kube_response(
+                        StatusCode::NOT_FOUND,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Failure",
+                            "reason": "NotFound",
+                            "code": 404,
+                        }),
+                    ));
+                }
+                merge_json(&mut resource, &patch);
+                let replicas = resource["spec"]["replicas"].as_i64().unwrap_or_default();
+                resource["metadata"]["resourceVersion"] = Value::String(
+                    (resource["metadata"]["resourceVersion"]
+                        .as_str()
+                        .unwrap_or("1")
+                        .parse::<u64>()
+                        .unwrap_or(1)
+                        + 1)
+                    .to_string(),
+                );
+                resource["status"] = serde_json::json!({
+                    "currentReplicas": replicas,
+                    "readyReplicas": replicas,
+                    "updatedReplicas": replicas,
+                });
+                Ok(desired_state_kube_response(
+                    StatusCode::OK,
+                    resource.clone(),
+                ))
+            }
+        }),
+        "default",
+    )
+}
+
+#[tokio::test]
+async fn paas_internal_desired_state_replay_reconverges_runtime_drift() {
+    use enclava_engine::apply::engine::ApplyEngine;
+
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let runtime = Arc::new(Mutex::new(desired_statefulset(1)));
+    let engine = Arc::new(ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let app = test_router(state).layer(Extension(engine));
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("drift-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-drift-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app stopped while runtime remains running");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let operation_id = format!("repair-drift-{suffix}");
+    let stopped = add_internal_headers(server.put(&path), "ignored-header-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    stopped.assert_status_ok();
+    let stopped_body: Value = stopped.json();
+    assert_eq!(stopped_body["runtime_state"], "stopped");
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
+
+    *runtime.lock().unwrap() = desired_statefulset(1);
+    let replay = add_internal_headers(server.put(&path), "ignored-replay-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    replay.assert_status_ok();
+    assert_eq!(replay.json::<Value>(), stopped_body);
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
+
+    let running_operation_id = format!("resume-drift-{suffix}");
+    let running = add_internal_headers(server.put(&path), "ignored-running-key")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": running_operation_id,
+        }))
+        .await;
+    running.assert_status_ok();
+    let running_body: Value = running.json();
+    assert_eq!(
+        running_body,
+        serde_json::json!({
+            "operation_id": running_operation_id,
+            "desired_state": "running",
+            "runtime_state": "running",
+        })
+    );
+
+    *runtime.lock().unwrap() = desired_statefulset(0);
+    let running_replay = add_internal_headers(server.put(&path), "ignored-running-replay-key")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": running_operation_id,
+        }))
+        .await;
+    running_replay.assert_status_ok();
+    assert_eq!(running_replay.json::<Value>(), running_body);
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
+
+    *runtime.lock().unwrap() = desired_statefulset(0);
+    let (first, second) = tokio::join!(
+        async {
+            add_internal_headers(server.put(&path), "ignored-concurrent-replay-one")
+                .json(&serde_json::json!({
+                    "desired_state": "running",
+                    "operation_id": running_operation_id,
+                }))
+                .await
+        },
+        async {
+            add_internal_headers(server.put(&path), "ignored-concurrent-replay-two")
+                .json(&serde_json::json!({
+                    "desired_state": "running",
+                    "operation_id": running_operation_id,
+                }))
+                .await
+        },
+    );
+    for response in [first, second] {
+        match response.status_code() {
+            StatusCode::OK => assert_eq!(response.json::<Value>(), running_body),
+            StatusCode::SERVICE_UNAVAILABLE => {
+                assert_eq!(response.json::<Value>()["error"], "desired_state_retryable")
+            }
+            status => panic!("unexpected concurrent replay status {status}"),
+        }
+    }
+    {
+        let concurrent_runtime = runtime.lock().unwrap();
+        assert_eq!(concurrent_runtime["spec"]["replicas"], 1);
+        assert_eq!(concurrent_runtime["metadata"]["resourceVersion"], "2");
+    }
+
+    *runtime.lock().unwrap() = Value::Null;
+    let missing = add_internal_headers(server.put(&path), "ignored-missing-replay-key")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": running_operation_id,
+        }))
+        .await;
+    missing.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let missing_body: Value = missing.json();
+    assert_eq!(
+        missing_body,
+        serde_json::json!({"error": "desired_state_retryable"})
+    );
+}
+
+#[tokio::test]
+async fn paas_internal_desired_state_replay_publishes_state_after_concurrent_mutation() {
+    let (mut state, pool) = setup_paas_managed_test_state().await;
+    let application_name = format!("desired-state-replay-{}", Uuid::new_v4());
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let options = database_url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .expect("parse regression database URL")
+        .application_name(&application_name);
+    state.db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .expect("connect named desired-state pool");
+
+    let runtime = Arc::new(Mutex::new(desired_statefulset(0)));
+    let engine = Arc::new(enclava_engine::apply::engine::ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let server = Arc::new(
+        axum_test::TestServer::builder()
+            .http_transport()
+            .build(test_router(state).layer(Extension(engine))),
+    );
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("replay-race-{}", &suffix[..12]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-race-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app stopped");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let operation_id = format!("stop-race-{suffix}");
+    add_internal_headers(server.put(&path), "ignored-initial-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await
+        .assert_status_ok();
+
+    let app_id: Uuid = sqlx::query_scalar("SELECT id FROM apps WHERE name = $1")
+        .bind(&app_name)
+        .fetch_one(&pool)
+        .await
+        .expect("load app id");
+    let (high, low) = app_id.as_u64_pair();
+    let mut opposite = pool.begin().await.expect("begin opposite mutation");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind((high ^ low) as i64)
+        .execute(&mut *opposite)
+        .await
+        .expect("hold app mutation lane");
+    *runtime.lock().unwrap() = desired_statefulset(1);
+
+    let replay_server = Arc::clone(&server);
+    let replay_path = path.clone();
+    let replay_operation_id = operation_id.clone();
+    let replay = tokio::spawn(async move {
+        add_internal_headers(replay_server.put(&replay_path), "ignored-replay-key")
+            .json(&serde_json::json!({
+                "desired_state": "stopped",
+                "operation_id": replay_operation_id,
+            }))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                      WHERE datname = current_database()
+                        AND application_name = $1
+                        AND wait_event_type = 'Lock'
+                 )",
+            )
+            .bind(&application_name)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect replay lock state");
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replay did not pause between lookup and mutation claim");
+
+    sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE id = $1")
+        .bind(app_id)
+        .execute(&mut *opposite)
+        .await
+        .expect("commit opposite desired-state mutation");
+    opposite.commit().await.expect("publish opposite mutation");
+
+    let response = replay.await.expect("join replay");
+    response.assert_status_ok();
+    assert_eq!(response.json::<Value>()["runtime_state"], "stopped");
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
+    let recorded_state: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load converged recorded state");
+    assert_eq!(recorded_state, "stopped");
+}
+
+#[tokio::test]
+async fn desired_state_replica_convergence_stops_resumes_and_retains_configuration() {
+    use enclava_engine::apply::{
+        cleanup::set_statefulset_desired_replicas, engine::ApplyEngine,
+        generation::MutationGeneration,
+    };
+
+    let state = Arc::new(Mutex::new(desired_statefulset(1)));
+    let engine = ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&state)),
+        Default::default(),
+    );
+
+    set_statefulset_desired_replicas(
+        &engine,
+        "desired-state-test",
+        "desired-state",
+        0,
+        std::time::Duration::from_secs(1),
+        MutationGeneration::new(2).unwrap(),
+    )
+    .await
+    .expect("stop converges");
+    {
+        let stopped = state.lock().unwrap();
+        assert_eq!(stopped["spec"]["replicas"], 0);
+        assert_eq!(stopped["metadata"]["annotations"]["retained"], "true");
+        assert_eq!(
+            stopped["spec"]["volumeClaimTemplates"][0]["metadata"]["name"],
+            "retained-data"
+        );
+    }
+
+    set_statefulset_desired_replicas(
+        &engine,
+        "desired-state-test",
+        "desired-state",
+        1,
+        std::time::Duration::from_secs(1),
+        MutationGeneration::new(3).unwrap(),
+    )
+    .await
+    .expect("resume converges");
+    assert_eq!(state.lock().unwrap()["status"]["readyReplicas"], 1);
 }
 
 #[tokio::test]

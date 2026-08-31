@@ -349,31 +349,33 @@ fn platform_release_enabled(trustee_policy_read_available: bool) -> bool {
         || env_nonempty("ENCLAVA_PLATFORM_RELEASE_PATH").is_some()
 }
 
-fn load_platform_release(enabled: bool) -> anyhow::Result<Option<PlatformReleaseEnvelope>> {
+fn validate_platform_release_runtime_class(
+    release_runtime_class: &str,
+    effective_runtime_class: &str,
+) -> anyhow::Result<()> {
+    if release_runtime_class != effective_runtime_class {
+        anyhow::bail!(
+            "signed platform release runtime class `{release_runtime_class}` does not match API runtime class `{effective_runtime_class}`"
+        );
+    }
+    Ok(())
+}
+
+fn load_platform_release(
+    enabled: bool,
+    effective_runtime_class: &str,
+) -> anyhow::Result<Option<PlatformReleaseEnvelope>> {
     if !enabled {
         return Ok(None);
     }
     let envelope = PlatformReleaseEnvelope::load_verified()
         .map_err(|e| anyhow::anyhow!("failed to load signed platform release: {e}"))?;
     let release = &envelope.payload;
-    // Compare against the *resolved* class, not the default: a signed release
-    // pins the runtime class its measurements describe, so the dev-runtime
-    // escape hatch (CAP_ALLOW_DEV_RUNTIME_CLASS) must not coexist with an
-    // enabled release. Workloads scheduled under the simulated CoCo class
-    // have no real TEE.
-    let runtime_class = enclava_engine::manifest::cc_init_data::try_runtime_class()
-        .map_err(|err| anyhow::anyhow!("invalid CAP runtime class configuration: {err}"))?;
-    check_release_runtime_class(&release.expected_runtime_class, &runtime_class)?;
+    validate_platform_release_runtime_class(
+        &release.expected_runtime_class,
+        effective_runtime_class,
+    )?;
     Ok(Some(envelope))
-}
-
-fn check_release_runtime_class(expected: &str, resolved: &str) -> anyhow::Result<()> {
-    if expected != resolved {
-        anyhow::bail!(
-            "signed platform release runtime class `{expected}` does not match API runtime class `{resolved}`"
-        );
-    }
-    Ok(())
 }
 
 fn release_env_value(
@@ -612,14 +614,24 @@ async fn main() {
     }
 
     let trustee_policy_read_available = env_flag("TRUSTEE_POLICY_READ_AVAILABLE");
-    let platform_release_envelope =
-        match load_platform_release(platform_release_enabled(trustee_policy_read_available)) {
-            Ok(release) => release,
-            Err(e) => {
-                eprintln!("startup refused: {e}");
-                std::process::exit(1);
-            }
-        };
+    let effective_runtime_class = match enclava_engine::manifest::cc_init_data::try_runtime_class()
+    {
+        Ok(runtime_class) => runtime_class,
+        Err(e) => {
+            eprintln!("startup refused: invalid runtime class configuration: {e}");
+            std::process::exit(1);
+        }
+    };
+    let platform_release_envelope = match load_platform_release(
+        platform_release_enabled(trustee_policy_read_available),
+        &effective_runtime_class,
+    ) {
+        Ok(release) => release,
+        Err(e) => {
+            eprintln!("startup refused: {e}");
+            std::process::exit(1);
+        }
+    };
     if let Some(envelope) = &platform_release_envelope {
         let release = &envelope.payload;
         tracing::info!(
@@ -947,6 +959,57 @@ mod tests {
         validate_edge_reconciliation_mode(true, false).unwrap();
         validate_edge_reconciliation_mode(false, true).unwrap();
         assert!(validate_edge_reconciliation_mode(true, true).is_err());
+    }
+
+    #[test]
+    fn platform_release_accepts_policy_validated_coco_dev_runtime_class() {
+        let runtime_class =
+            enclava_engine::manifest::cc_init_data::resolve_runtime_class_with_env(false, |name| {
+                match name {
+                    enclava_engine::manifest::cc_init_data::RUNTIME_CLASS_ENV => {
+                        Some("kata-qemu-coco-dev".to_string())
+                    }
+                    enclava_engine::manifest::cc_init_data::ALLOW_DEV_RUNTIME_CLASS_ENV => {
+                        Some("true".to_string())
+                    }
+                    _ => None,
+                }
+            })
+            .expect("explicit coco-dev policy permits the simulated runtime class");
+
+        validate_platform_release_runtime_class("kata-qemu-coco-dev", &runtime_class).unwrap();
+    }
+
+    #[test]
+    fn platform_release_runtime_class_mismatch_fails_closed() {
+        let error = validate_platform_release_runtime_class(
+            "kata-qemu-coco-dev",
+            enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS,
+        )
+        .expect_err("a signed release cannot select a different runtime class");
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match API runtime class")
+        );
+    }
+
+    #[test]
+    fn platform_release_accepts_production_default_runtime_class() {
+        let runtime_class =
+            enclava_engine::manifest::cc_init_data::resolve_runtime_class_with_env(false, |_| None)
+                .expect("production default runtime class");
+
+        assert_eq!(
+            runtime_class,
+            enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS
+        );
+        validate_platform_release_runtime_class(
+            enclava_engine::manifest::cc_init_data::DEFAULT_RUNTIME_CLASS,
+            &runtime_class,
+        )
+        .unwrap();
     }
 
     #[test]

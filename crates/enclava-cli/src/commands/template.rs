@@ -33,11 +33,13 @@ use crate::commands::app::{
     generate_log_key_for_app,
 };
 use crate::commands::ownership::MnemonicCapture;
+use crate::commands::{counted_progress, format_duration, timed_progress};
 
 const DEBIAN_SSH_NGROK_TEMPLATE: &str = "debian-ssh-ngrok";
 const DEBIAN_SSH_FRP_TEMPLATE: &str = "debian-ssh-frp";
 const DEFAULT_DEBIAN_SSH_TEMPLATE: &str = DEBIAN_SSH_FRP_TEMPLATE;
 const FRP_RELAY_HOST: &str = "relay.enclava.me";
+const DEFAULT_TEMPLATE_DEPLOY_TIMEOUT_SECONDS: u64 = 1800;
 const DEFAULT_SSH_TIMEOUT_SECONDS: u64 = 600;
 const TEMPLATE_CONFIG_DELIVERY_ATTEMPTS: usize = 121;
 const TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS: u64 = 2;
@@ -77,8 +79,8 @@ pub struct TemplateDeployArgs {
     /// Do not wait for stable SSH endpoint command readiness after config delivery.
     #[arg(long)]
     pub no_wait: bool,
-    /// Seconds to wait for the stable SSH endpoint command.
-    #[arg(long, default_value_t = DEFAULT_SSH_TIMEOUT_SECONDS)]
+    /// Seconds to wait for each TEE boot, platform config, and stable SSH readiness phase.
+    #[arg(long, default_value_t = DEFAULT_TEMPLATE_DEPLOY_TIMEOUT_SECONDS)]
     pub ssh_timeout_seconds: u64,
     /// File containing the initial storage password for non-interactive password-mode template deploys.
     #[arg(long = "storage-password-file", value_name = "PATH")]
@@ -201,6 +203,7 @@ async fn list() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let deploy_started = Instant::now();
     let instance_name = normalize_slug(&args.name)?;
     let explicit_stable_endpoint = args
         .ngrok_tcp_url
@@ -256,6 +259,8 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             .template("{spinner:.green} [{bar:30.cyan/blue}] {msg}")?
             .progress_chars("=> "),
     );
+    // Polls redraw this bar with real state. A steady ticker would race the
+    // password and one-time recovery-mnemonic terminal prompts.
     pb.set_message("Preparing template app...");
 
     let bootstrap_pubkey_hash =
@@ -392,6 +397,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
 
     let mut config_token = token.token.clone();
     let config_pairs = debian_ssh_config_pairs(public_keys);
+    pb.set_message(counted_progress("Customer config", 0, config_pairs.len()));
     deliver_template_config_with_retry(
         api,
         &mut tee,
@@ -402,6 +408,11 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         &config_pairs,
     )
     .await?;
+    pb.set_message(counted_progress(
+        "Customer config",
+        config_pairs.len(),
+        config_pairs.len(),
+    ));
     pb.set_position(4);
 
     let mut app_url = app_url_from_template_response_cap(&response.cap)?;
@@ -419,6 +430,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             stable_endpoint.as_str(),
             app_url.as_str(),
             Duration::from_secs(args.ssh_timeout_seconds),
+            &pb,
         )
         .await?;
         if let Some(url) = response.app_url {
@@ -427,7 +439,10 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         pb.set_position(5);
         (response.command, response.endpoint)
     };
-    pb.finish_with_message("Template deployed");
+    pb.finish_with_message(format!(
+        "Template deployed in {}",
+        format_duration(deploy_started.elapsed())
+    ));
 
     print!(
         "{}",
@@ -448,6 +463,12 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
             json: args.json,
         })?
     );
+    if !args.json {
+        println!(
+            "  Duration:   {}",
+            format_duration(deploy_started.elapsed())
+        );
+    }
     Ok(())
 }
 
@@ -582,6 +603,9 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
             ProgressBar::new_spinner()
         };
         pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}")?);
+        if !args.json {
+            pb.enable_steady_tick(Duration::from_millis(100));
+        }
         pb.set_message("Waiting for stable SSH endpoint command...");
         match wait_for_paas_ssh_command(
             &api,
@@ -590,6 +614,7 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
             stable_endpoint,
             expected_app_url.as_str(),
             Duration::from_secs(args.ssh_timeout_seconds),
+            &pb,
         )
         .await
         {
@@ -982,10 +1007,19 @@ async fn wait_for_template_bootstrap_endpoint(
     loop {
         fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
         if start.elapsed() > max_wait {
-            pb.abandon_with_message("Timeout waiting for ownership claim endpoint");
-            return Err("deploy timed out waiting for TEE ownership claim endpoint".into());
+            pb.abandon_with_message("TEE ownership timed out");
+            return Err(format!(
+                "TEE ownership for app {app_name} did not become ready within {}; run `enclava status --app {app_name}` for the latest state",
+                format_duration(max_wait)
+            )
+            .into());
         }
 
+        pb.set_message(timed_progress(
+            "TEE ownership: waiting for attested endpoint",
+            start.elapsed(),
+            max_wait,
+        ));
         if tee.is_none() {
             match api.get_unlock_endpoint(app_name).await {
                 Ok(endpoint) => {
@@ -995,7 +1029,11 @@ async fn wait_for_template_bootstrap_endpoint(
                     ));
                 }
                 Err(error) if should_retry_template_bootstrap_endpoint_error(&error) => {
-                    pb.set_message("Waiting for ownership claim endpoint...");
+                    pb.set_message(timed_progress(
+                        "TEE ownership: waiting for claim endpoint",
+                        start.elapsed(),
+                        max_wait,
+                    ));
                     tokio::time::sleep(poll_interval).await;
                     continue;
                 }
@@ -1023,11 +1061,19 @@ async fn wait_for_template_bootstrap_endpoint(
                     return Ok(false);
                 }
                 Err(_) => {
-                    pb.set_message("Waiting for ownership claim endpoint...");
+                    pb.set_message(timed_progress(
+                        "TEE ownership: waiting for claim endpoint",
+                        start.elapsed(),
+                        max_wait,
+                    ));
                 }
             },
             Err(_) => {
-                pb.set_message("Waiting for attested ownership claim endpoint...");
+                pb.set_message(timed_progress(
+                    "TEE ownership: waiting for attested endpoint",
+                    start.elapsed(),
+                    max_wait,
+                ));
             }
         }
 
@@ -1168,6 +1214,19 @@ async fn sync_template_config_key_with_retry(
     Err(format!("TEE config metadata sync failed for {key}").into())
 }
 
+fn managed_config_progress_message(
+    ready: usize,
+    total: usize,
+    elapsed: Duration,
+    timeout: Duration,
+) -> String {
+    timed_progress(
+        &counted_progress("Platform config", ready, total),
+        elapsed,
+        timeout,
+    )
+}
+
 async fn wait_for_paas_managed_config_keys(
     api: &ApiClient,
     instance_name: &str,
@@ -1185,7 +1244,14 @@ async fn wait_for_paas_managed_config_keys(
     if expected.is_empty() {
         return Ok(());
     }
-    let deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let deadline = start + timeout;
+    progress.set_message(managed_config_progress_message(
+        0,
+        expected.len(),
+        start.elapsed(),
+        timeout,
+    ));
     loop {
         fail_if_template_deployment_failed(api, instance_name, deployment_id).await?;
         match api.list_config_keys(instance_name).await {
@@ -1200,21 +1266,36 @@ async fn wait_for_paas_managed_config_keys(
                     .filter(|key| !present.contains(*key))
                     .cloned()
                     .collect::<Vec<_>>();
+                let ready = expected.len() - missing.len();
+                progress.set_message(managed_config_progress_message(
+                    ready,
+                    expected.len(),
+                    start.elapsed(),
+                    timeout,
+                ));
                 if missing.is_empty() {
                     return Ok(());
                 }
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "PaaS managed config did not become ready before timeout; missing keys: {}",
+                        "platform config for app {instance_name} timed out after {} ({ready}/{} ready); this command did not deliver customer config; missing entries: {}; inspect progress with `enclava config get --app {instance_name}`",
+                        format_duration(timeout),
+                        expected.len(),
                         missing.join(", ")
                     )
                     .into());
                 }
             }
             Err(error) if should_retry_template_config_sync_error(&error) => {
+                progress.set_message(timed_progress(
+                    "Platform config: status check retrying",
+                    start.elapsed(),
+                    timeout,
+                ));
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "PaaS managed config readiness check did not succeed before timeout: {error}"
+                        "platform config status for app {instance_name} did not become available within {}: {error}; this command did not deliver customer config; retry `enclava config get --app {instance_name}`",
+                        format_duration(timeout)
                     )
                     .into());
                 }
@@ -1824,13 +1905,24 @@ async fn wait_for_paas_ssh_command(
     stable_endpoint: &str,
     expected_app_url: &str,
     timeout: Duration,
+    progress: &ProgressBar,
 ) -> Result<SshCommandResponse, Box<dyn std::error::Error>> {
     let start = Instant::now();
     while start.elapsed() < timeout {
+        progress.set_message(timed_progress(
+            "Stable SSH endpoint: waiting for readiness",
+            start.elapsed(),
+            timeout,
+        ));
         fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
         let response = match api.get_template_ssh_command(app_name).await {
             Ok(response) => response,
             Err(error) if should_retry_paas_ssh_command_error(&error) => {
+                progress.set_message(timed_progress(
+                    "Stable SSH endpoint: status check retrying",
+                    start.elapsed(),
+                    timeout,
+                ));
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -1847,7 +1939,11 @@ async fn wait_for_paas_ssh_command(
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    Err(format!("timed out waiting for stable SSH endpoint command for app {app_name}").into())
+    Err(format!(
+        "stable SSH endpoint for app {app_name} did not become ready within {}; run `enclava template ssh-command --name {app_name} --wait` to continue waiting",
+        format_duration(timeout)
+    )
+    .into())
 }
 
 async fn latest_deployment_id(api: &ApiClient, app_name: &str) -> Result<Option<String>, ApiError> {
@@ -2479,6 +2575,33 @@ mod tests {
     };
     const VALID_ED25519_PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOlL21WHthjyXNuxzes5bVqCCqgyWDuMvXcWhOxRGL1P cli-test@example";
 
+    #[test]
+    fn template_deploy_default_covers_managed_config_delivery() {
+        use clap::Parser as _;
+
+        let cli = crate::commands::Cli::try_parse_from([
+            "enclava", "template", "deploy", "--name", "shell",
+        ])
+        .expect("template deploy arguments should parse");
+        let crate::commands::Command::Template(TemplateCommand::Deploy(args)) = cli.command else {
+            panic!("expected template deploy command");
+        };
+        assert_eq!(args.ssh_timeout_seconds, 1800);
+    }
+
+    #[test]
+    fn managed_config_progress_reports_safe_counts() {
+        assert_eq!(
+            managed_config_progress_message(
+                7,
+                13,
+                Duration::from_secs(372),
+                Duration::from_secs(1800),
+            ),
+            "[06:12 / 30:00] Platform config: 7/13"
+        );
+    }
+
     fn hosted_template_with_stable_ssh() -> HostedTemplate {
         HostedTemplate {
             slug: "debian-ssh-ngrok".to_string(),
@@ -2982,7 +3105,7 @@ mod tests {
             ssh_public_key_files: vec![],
             ngrok_tcp_url: None,
             no_wait: false,
-            ssh_timeout_seconds: DEFAULT_SSH_TIMEOUT_SECONDS,
+            ssh_timeout_seconds: DEFAULT_TEMPLATE_DEPLOY_TIMEOUT_SECONDS,
             storage_password_file: None,
             log_key: None,
             generate_log_key: None,
@@ -3222,6 +3345,10 @@ mod tests {
             .expect("template deploy writes customer config");
 
         assert!(
+            !body.contains("enable_steady_tick"),
+            "template deploy progress must not redraw during password and recovery-mnemonic prompts"
+        );
+        assert!(
             password_preflight < bootstrap_hash
                 && bootstrap_hash < ensure_app
                 && ensure_app < prepare_log_key
@@ -3390,6 +3517,22 @@ mod tests {
         assert!(body.contains("Waiting for stable SSH endpoint command..."));
         assert!(body.contains("Stable SSH endpoint command ready"));
         assert!(body.contains("Stable SSH endpoint command unavailable"));
+    }
+
+    #[test]
+    fn ssh_command_progress_does_not_guess_why_readiness_is_pending() {
+        let source = include_str!("template.rs");
+        let fn_start = source
+            .find("async fn wait_for_paas_ssh_command")
+            .expect("SSH command wait function exists");
+        let fn_end = source[fn_start..]
+            .find("async fn latest_deployment_id")
+            .expect("latest_deployment_id follows SSH command wait")
+            + fn_start;
+        let body = &source[fn_start..fn_end];
+
+        assert!(body.contains("Stable SSH endpoint: waiting for readiness"));
+        assert!(!body.contains("waiting for relay registration"));
     }
 
     #[test]

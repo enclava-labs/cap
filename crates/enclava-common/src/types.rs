@@ -13,7 +13,8 @@ pub enum Tier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum UnlockMode {
-    /// VMPCK-sealed, no user interaction needed on restart.
+    /// Owner seed wrapped for KBS-attestation-gated release; no user
+    /// interaction needed on restart.
     #[default]
     Auto,
     /// Requires user password via claim/unlock flow.

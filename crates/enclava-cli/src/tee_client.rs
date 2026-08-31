@@ -410,7 +410,7 @@ impl TeeClient {
         Ok(())
     }
 
-    /// Enable auto-unlock (seal owner seed with VMPCK).
+    /// Enable auto-unlock (KBS-attestation-gated seed wrap, not VMPCK sealing).
     pub async fn enable_auto_unlock(&self, password: &str) -> Result<(), TeeError> {
         let body = serde_json::json!({ "password": password });
         let resp = self
@@ -423,7 +423,7 @@ impl TeeClient {
         Ok(())
     }
 
-    /// Disable auto-unlock (remove sealed seed).
+    /// Disable auto-unlock (remove the KBS-gated seed wrap).
     pub async fn disable_auto_unlock(&self, password: &str) -> Result<(), TeeError> {
         let body = serde_json::json!({ "password": password });
         let resp = self
