@@ -21,7 +21,8 @@ On Debian/Ubuntu, install the native development packages:
 sudo apt-get install -y pkg-config libssl-dev libcryptsetup-dev clang libclang-dev
 ```
 
-If those packages are not available locally, run the rest of the workspace with:
+If the `libcryptsetup` packages are not available locally, run the rest of the
+workspace without `enclava-init` (`enclava-cli` still needs the OpenSSL headers):
 
 ```bash
 cargo test --workspace --exclude enclava-init
