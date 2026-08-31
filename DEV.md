@@ -14,11 +14,11 @@ cargo test --workspace --all-features
 Workspace tests include the API integration suite, so set `DATABASE_URL` to a
 disposable PostgreSQL database or use the targeted commands below.
 
-`enclava-init` links to `libcryptsetup`. On Debian/Ubuntu, install the same
-native packages CI uses:
+`enclava-cli` links to OpenSSL, and `enclava-init` links to `libcryptsetup`.
+On Debian/Ubuntu, install the native development packages:
 
 ```bash
-sudo apt-get install -y pkg-config libcryptsetup-dev clang libclang-dev
+sudo apt-get install -y pkg-config libssl-dev libcryptsetup-dev clang libclang-dev
 ```
 
 If those packages are not available locally, run the rest of the workspace with:
