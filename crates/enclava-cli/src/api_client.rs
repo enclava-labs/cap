@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 /// Typed HTTP client for the Enclava Platform API.
 pub struct ApiClient {
     base_url: String,
+    origin: String,
     http: reqwest::Client,
     auth_token: Option<String>,
     org_hint: Option<String>,
@@ -40,8 +41,16 @@ impl ApiClient {
             .build()
             .expect("failed to build HTTP client");
 
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let origin = reqwest::Url::parse(&base_url)
+            .ok()
+            .filter(|url| url.host().is_some())
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|| base_url.clone());
+
         Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
+            origin,
             http,
             auth_token,
             org_hint: None,
@@ -51,7 +60,7 @@ impl ApiClient {
     /// The API origin (scheme://host[:port]) used as the key for per-API
     /// state such as the platform-release baseline.
     pub fn origin(&self) -> &str {
-        &self.base_url
+        &self.origin
     }
 
     /// Create a client from CLI config and credentials.
@@ -957,7 +966,7 @@ pub fn loopback_http_url(raw: &str) -> bool {
 
 #[cfg(test)]
 mod loopback_tests {
-    use super::loopback_http_url;
+    use super::{ApiClient, loopback_http_url};
 
     #[test]
     fn only_exact_loopback_hosts_are_plain_http() {
@@ -980,6 +989,17 @@ mod loopback_tests {
             "",
         ] {
             assert!(!loopback_http_url(evil), "{evil}");
+        }
+    }
+
+    #[test]
+    fn api_origin_is_canonicalized_for_security_state() {
+        for (configured, expected) in [
+            ("https://EXAMPLE.com:443/", "https://example.com"),
+            ("https://example.com", "https://example.com"),
+            ("https://example.com:8443/api", "https://example.com:8443"),
+        ] {
+            assert_eq!(ApiClient::new(configured, None).origin(), expected);
         }
     }
 }

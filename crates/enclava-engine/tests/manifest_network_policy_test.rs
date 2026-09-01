@@ -430,9 +430,10 @@ fn egress_allowlist_renders_one_rule_per_entry() {
 }
 
 #[test]
-fn generated_policy_denies_metadata_and_link_local_space_regardless_of_allow_rules() {
+fn generated_policy_denies_non_public_dns_results_regardless_of_allow_rules() {
     // The hostname denylist is DNS-rebindable (a tenant-controlled FQDN can
-    // resolve into metadata/link-local space and ride a toFQDNs allow rule).
+    // resolve into private, metadata, or link-local space and ride a toFQDNs
+    // allow rule).
     // A Cilium egressDeny outranks every allow rule; it must always be
     // present and must not depend on the egress allowlist contents.
     // NOTE: the field is `toCIDR` (singular) — CiliumNetworkPolicy declares
@@ -442,14 +443,15 @@ fn generated_policy_denies_metadata_and_link_local_space_regardless_of_allow_rul
     let deny = &policy["spec"]["egressDeny"]
         .as_array()
         .expect("egressDeny must be an array");
-    assert!(
-        deny.iter().any(|rule| {
-            let cidrs = rule["toCIDR"].as_array();
-            cidrs.is_some_and(|c| c.iter().any(|x| x == "169.254.0.0/16"))
-                && cidrs.is_some_and(|c| c.iter().any(|x| x == "fd00:ec2::254/128"))
-                && cidrs.is_some_and(|c| c.iter().any(|x| x == "fe80::/10"))
-                && cidrs.is_some_and(|c| c.iter().all(|x| x != "fc00::/7"))
-        }),
-        "metadata and link-local addresses must be denied without blocking all IPv6 ULA space"
-    );
+    let cidrs = deny[0]["toCIDR"].as_array().expect("toCIDR array");
+    for cidr in [
+        "10.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+    ] {
+        assert!(cidrs.iter().any(|value| value == cidr), "missing {cidr}");
+    }
 }

@@ -13,7 +13,7 @@ const PLATFORM_DEFAULT_FQDNS: &[&str] = &[
 ];
 
 const PUBLIC_INTERNET_CIDR: &str = "0.0.0.0/0";
-const PUBLIC_INTERNET_DEFAULT_EXCLUDED_CIDRS: &[&str] = &[
+const IPV4_NON_PUBLIC_CIDRS: &[&str] = &[
     "0.0.0.0/8",
     "10.0.0.0/8",
     "100.64.0.0/10",
@@ -29,6 +29,8 @@ const PUBLIC_INTERNET_DEFAULT_EXCLUDED_CIDRS: &[&str] = &[
     "224.0.0.0/4",
     "240.0.0.0/4",
 ];
+
+const IPV6_NON_PUBLIC_CIDRS: &[&str] = &["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
 
 /// Generate a CiliumNetworkPolicy (cilium.io/v2 CRD).
 ///
@@ -183,14 +185,13 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
             "egress": egress,
             // Name-layer denylists (internal/metadata hostnames) are
             // bypassable by a tenant-controlled domain whose A/AAAA record
-            // points at internal space: `toFQDNs` authorizes whatever the
-            // DNS layer resolves. Deny rules outrank allow rules in Cilium,
-            // so metadata and link-local space is unreachable through ANY
-            // allow rule — no legitimate tenant egress ever touches it.
-            // (169.254.0.0/16 covers IPv4 link-local metadata endpoints;
-            // fd00:ec2::254/128 is AWS IMDS IPv6; fe80::/10 is IPv6 link-local.)
+            // points at non-public space: `toFQDNs` authorizes whatever the
+            // DNS layer resolves. Cilium CIDR selectors apply to external
+            // identities, not Cilium-managed endpoints, so this blocks DNS
+            // rebinding without overriding the explicit platform Service and
+            // endpoint rules above. Deny rules outrank every external allow.
             "egressDeny": [
-                { "toCIDR": ["169.254.0.0/16", "fd00:ec2::254/128", "fe80::/10"] }
+                { "toCIDR": IPV4_NON_PUBLIC_CIDRS.iter().chain(IPV6_NON_PUBLIC_CIDRS).copied().collect::<Vec<_>>() }
             ],
         }
     })
@@ -241,7 +242,7 @@ fn amd_kds_relay_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
 }
 
 fn public_internet_egress_rule(app: &ConfidentialApp) -> Value {
-    let mut excluded = PUBLIC_INTERNET_DEFAULT_EXCLUDED_CIDRS
+    let mut excluded = IPV4_NON_PUBLIC_CIDRS
         .iter()
         .map(|cidr| (*cidr).to_string())
         .collect::<Vec<_>>();
