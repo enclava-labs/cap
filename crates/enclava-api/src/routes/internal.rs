@@ -3450,16 +3450,13 @@ pub async fn put_paas_app_desired_state(
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
     let hash = request_hash(&body)?;
     let idempotency =
-        begin_idempotent_request(&state, &body.operation_id, "PUT", &path, &hash).await?;
-    let operation_id = match &idempotency {
-        IdempotencyBegin::Execute(lease) => lease.operation_id(),
-        IdempotencyBegin::Replay((status, response)) if !status.is_success() => {
-            return Ok((*status, Json(response.clone())));
-        }
-        IdempotencyBegin::Replay(_) => {
-            idempotency_operation_id(&body.operation_id, "PUT", &path, &hash)
-        }
-    };
+        match begin_idempotent_request(&state, &body.operation_id, "PUT", &path, &hash).await? {
+            IdempotencyBegin::Execute(lease) => lease,
+            IdempotencyBegin::Replay((status, response)) => {
+                return Ok((status, Json(response)));
+            }
+        };
+    let operation_id = idempotency.operation_id();
 
     let result: Result<IdempotencyResponse, InternalRouteError> = async {
         let (cap_org_id, _, _) = mapped_cap_org(&state, &paas_org_id).await?;
@@ -3495,7 +3492,25 @@ pub async fn put_paas_app_desired_state(
             vec![resource.clone()],
         )
         .await
-        .map_err(|_| json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"))?;
+        .map_err(|error| match error {
+            crate::mutation_leases::MutationLeaseError::Busy => {
+                json_error(StatusCode::CONFLICT, "app mutation already in progress")
+            }
+            _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"),
+        })?;
+        let claimed_status: crate::models::AppStatus =
+            sqlx::query_scalar("SELECT status FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&state.db)
+                .await
+                .map_err(|_| db_error())?;
+        if claimed_status == crate::models::AppStatus::Failed {
+            mutation.finish().await.map_err(|_| db_error())?;
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "failed applications require a successful redeployment before changing desired state",
+            ));
+        }
         let generation = mutation.resource_generation(&resource).ok_or_else(|| {
             json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
         })?;
@@ -3571,16 +3586,8 @@ pub async fn put_paas_app_desired_state(
         ))
     }
     .await;
-    match idempotency {
-        IdempotencyBegin::Execute(lease) => {
-            let (status, response) = complete_idempotent_result(lease, result).await?;
-            Ok((status, Json(response)))
-        }
-        IdempotencyBegin::Replay((status, _)) => {
-            let (_, response) = result?;
-            Ok((status, Json(response)))
-        }
-    }
+    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    Ok((status, Json(response)))
 }
 
 pub async fn get_paas_app_logs(

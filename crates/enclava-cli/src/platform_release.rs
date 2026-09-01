@@ -156,11 +156,9 @@ pub fn enforce_release_not_older_than_bundled(
     Ok(())
 }
 
-/// Ordering by the signed creation timestamp first, version identifier as a
-/// tiebreak only. `platform_release_version` is an opaque identifier with a
-/// non-monotonic hash suffix (`dev-2026.07.28-proxy-a8303c36`), so it must
-/// never be the primary ordering axis; `created_at` is signed and monotonic
-/// by construction.
+/// Ordering by the signed creation timestamp. `platform_release_version` is
+/// opaque, so distinct releases at the same timestamp are unorderable and
+/// fail closed rather than using the identifier as a tiebreak.
 fn release_is_older(candidate: &PlatformRelease, bundled: &PlatformRelease) -> bool {
     release_pair_is_older(
         (&candidate.platform_release_version, &candidate.created_at),
@@ -176,7 +174,7 @@ fn release_pair_is_older(candidate: (&str, &str), baseline: (&str, &str)) -> boo
         chrono::DateTime::parse_from_rfc3339(baseline.1),
     ) {
         (Ok(candidate_ts), Ok(baseline_ts)) => {
-            candidate_ts < baseline_ts || (candidate_ts == baseline_ts && candidate.0 < baseline.0)
+            candidate_ts < baseline_ts || (candidate_ts == baseline_ts && candidate.0 != baseline.0)
         }
         // A candidate whose signed timestamp does not parse cannot be shown
         // to be current; fail closed and treat it as older.
@@ -385,6 +383,11 @@ mod tests {
         assert!(release_is_older(&older, &newer));
         assert!(!release_is_older(&newer, &older));
         assert!(!release_is_older(&newer, &newer));
+
+        let same_time_a = release("release-ffffffff", "2026-08-15T00:00:00Z");
+        let same_time_b = release("release-00000000", "2026-08-15T00:00:00Z");
+        assert!(release_is_older(&same_time_a, &same_time_b));
+        assert!(release_is_older(&same_time_b, &same_time_a));
     }
 
     #[test]
@@ -428,6 +431,16 @@ mod tests {
         let newer = release("preprod-2026.08.01-y", "2026-08-01T00:00:00Z");
         enforce_release_not_older_than_last_accepted(&store, "https://preprod.api", &newer)
             .unwrap();
+
+        let equal_time_divergence = release("preprod-2026.08.01-other", "2026-08-01T00:00:00Z");
+        assert!(matches!(
+            enforce_release_not_older_than_last_accepted(
+                &store,
+                "https://preprod.api",
+                &equal_time_divergence,
+            ),
+            Err(PlatformReleaseError::ApiDowngradeRefused { .. })
+        ));
 
         // An older one is refused (replayed stale envelope from the same API).
         let stale = release("preprod-2026.07.30-z", "2026-07-30T00:00:00Z");
@@ -523,10 +536,10 @@ mod tests {
         older_created.created_at = "2000-01-01T00:00:00Z".to_string();
         assert!(release_is_older(&older_created, &bundled.payload));
 
-        let mut newer_version = bundled.payload.clone();
-        newer_version.platform_release_version =
-            format!("z-{}", newer_version.platform_release_version);
-        assert!(!release_is_older(&newer_version, &bundled.payload));
+        let mut divergent_version = bundled.payload.clone();
+        divergent_version.platform_release_version =
+            format!("z-{}", divergent_version.platform_release_version);
+        assert!(release_is_older(&divergent_version, &bundled.payload));
 
         assert!(!release_is_older(&bundled.payload, &bundled.payload));
     }

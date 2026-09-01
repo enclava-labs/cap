@@ -1656,7 +1656,7 @@ fn desired_state_kube_client(state: Arc<Mutex<Value>>) -> kube::Client {
 }
 
 #[tokio::test]
-async fn paas_internal_desired_state_replay_reconverges_runtime_drift() {
+async fn paas_internal_stale_desired_state_replay_does_not_undo_newer_intent() {
     use enclava_engine::apply::engine::ApplyEngine;
 
     let (state, pool) = setup_paas_managed_test_state().await;
@@ -1670,13 +1670,13 @@ async fn paas_internal_desired_state_replay_reconverges_runtime_drift() {
     let suffix = Uuid::new_v4().simple().to_string();
     let paas_org_id = format!("paas-org-{suffix}");
     let paas_user_id = format!("paas-user-{suffix}");
-    let org_name = format!("drift-{}", &suffix[..16]);
+    let org_name = format!("stale-replay-{}", &suffix[..12]);
     let app_name = format!("app-{}", &suffix[..12]);
 
     bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
     add_internal_headers(
         server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
-        &format!("desired-state-drift-app-{suffix}"),
+        &format!("desired-state-stale-app-{suffix}"),
     )
     .json(&serde_json::json!({"name": app_name}))
     .await
@@ -1685,10 +1685,10 @@ async fn paas_internal_desired_state_replay_reconverges_runtime_drift() {
         .bind(&app_name)
         .execute(&pool)
         .await
-        .expect("mark app stopped while runtime remains running");
+        .expect("mark app stopped");
 
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
-    let operation_id = format!("repair-drift-{suffix}");
+    let operation_id = format!("stop-before-resume-{suffix}");
     let stopped = add_internal_headers(server.put(&path), "ignored-header-key")
         .json(&serde_json::json!({
             "desired_state": "stopped",
@@ -1700,18 +1700,7 @@ async fn paas_internal_desired_state_replay_reconverges_runtime_drift() {
     assert_eq!(stopped_body["runtime_state"], "stopped");
     assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
 
-    *runtime.lock().unwrap() = desired_statefulset(1);
-    let replay = add_internal_headers(server.put(&path), "ignored-replay-key")
-        .json(&serde_json::json!({
-            "desired_state": "stopped",
-            "operation_id": operation_id,
-        }))
-        .await;
-    replay.assert_status_ok();
-    assert_eq!(replay.json::<Value>(), stopped_body);
-    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
-
-    let running_operation_id = format!("resume-drift-{suffix}");
+    let running_operation_id = format!("resume-after-stop-{suffix}");
     let running = add_internal_headers(server.put(&path), "ignored-running-key")
         .json(&serde_json::json!({
             "desired_state": "running",
@@ -1719,96 +1708,115 @@ async fn paas_internal_desired_state_replay_reconverges_runtime_drift() {
         }))
         .await;
     running.assert_status_ok();
-    let running_body: Value = running.json();
-    assert_eq!(
-        running_body,
-        serde_json::json!({
-            "operation_id": running_operation_id,
-            "desired_state": "running",
-            "runtime_state": "running",
-        })
-    );
-
-    *runtime.lock().unwrap() = desired_statefulset(0);
-    let running_replay = add_internal_headers(server.put(&path), "ignored-running-replay-key")
-        .json(&serde_json::json!({
-            "desired_state": "running",
-            "operation_id": running_operation_id,
-        }))
-        .await;
-    running_replay.assert_status_ok();
-    assert_eq!(running_replay.json::<Value>(), running_body);
+    assert_eq!(running.json::<Value>()["runtime_state"], "running");
     assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
 
-    *runtime.lock().unwrap() = desired_statefulset(0);
-    let (first, second) = tokio::join!(
-        async {
-            add_internal_headers(server.put(&path), "ignored-concurrent-replay-one")
-                .json(&serde_json::json!({
-                    "desired_state": "running",
-                    "operation_id": running_operation_id,
-                }))
-                .await
-        },
-        async {
-            add_internal_headers(server.put(&path), "ignored-concurrent-replay-two")
-                .json(&serde_json::json!({
-                    "desired_state": "running",
-                    "operation_id": running_operation_id,
-                }))
-                .await
-        },
-    );
-    for response in [first, second] {
-        match response.status_code() {
-            StatusCode::OK => assert_eq!(response.json::<Value>(), running_body),
-            StatusCode::SERVICE_UNAVAILABLE => {
-                assert_eq!(response.json::<Value>()["error"], "desired_state_retryable")
-            }
-            status => panic!("unexpected concurrent replay status {status}"),
-        }
-    }
-    {
-        let concurrent_runtime = runtime.lock().unwrap();
-        assert_eq!(concurrent_runtime["spec"]["replicas"], 1);
-        assert!(
-            concurrent_runtime["metadata"]["resourceVersion"]
-                .as_str()
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-                > 1
-        );
-        assert!(
-            concurrent_runtime["metadata"]["annotations"]
-                ["enclava.dev/cap-provider-mutation-generation"]
-                .as_str()
-                .unwrap()
-                .parse::<i64>()
-                .unwrap()
-                > 1
-        );
-    }
-
-    *runtime.lock().unwrap() = Value::Null;
-    let missing = add_internal_headers(server.put(&path), "ignored-missing-replay-key")
+    let stale_replay = add_internal_headers(server.put(&path), "ignored-stale-replay-key")
         .json(&serde_json::json!({
-            "desired_state": "running",
-            "operation_id": running_operation_id,
+            "desired_state": "stopped",
+            "operation_id": operation_id,
         }))
         .await;
-    missing.assert_status(StatusCode::SERVICE_UNAVAILABLE);
-    let missing_body: Value = missing.json();
-    assert_eq!(
-        missing_body,
-        serde_json::json!({"error": "desired_state_retryable"})
-    );
+    stale_replay.assert_status_ok();
+    assert_eq!(stale_replay.json::<Value>(), stopped_body);
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
+    let recorded_state: String =
+        sqlx::query_scalar("SELECT status::text FROM apps WHERE name = $1")
+            .bind(&app_name)
+            .fetch_one(&pool)
+            .await
+            .expect("load current desired state");
+    assert_eq!(recorded_state, "running");
 }
 
 #[tokio::test]
-async fn paas_internal_desired_state_replay_publishes_state_after_concurrent_mutation() {
+async fn paas_internal_desired_state_contention_retries_with_the_same_operation_id() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let runtime = Arc::new(Mutex::new(desired_statefulset(0)));
+    let engine = Arc::new(enclava_engine::apply::engine::ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(test_router(state).layer(Extension(engine)));
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("contention-{}", &suffix[..12]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-contention-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    let app_id: Uuid = sqlx::query_scalar("SELECT id FROM apps WHERE name = $1")
+        .bind(&app_name)
+        .fetch_one(&pool)
+        .await
+        .expect("load app id");
+    sqlx::query(
+        "INSERT INTO app_mutation_leases (
+             app_id, owner_token, operation_kind, operation_id, locked_until, reclaim_after
+         ) VALUES (
+             $1, $2, 'test_contention', $3,
+             clock_timestamp() + interval '5 minutes',
+             clock_timestamp() + interval '10 minutes'
+         )",
+    )
+    .bind(app_id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("hold durable app mutation lease");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let operation_id = format!("retry-contention-{suffix}");
+    let first = add_internal_headers(server.put(&path), "ignored-first-key")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": operation_id,
+        }))
+        .await;
+    first.assert_status(StatusCode::CONFLICT);
+    let first_body: Value = first.json();
+    assert_eq!(first_body["error"], "idempotency_request_in_progress");
+    assert_eq!(first_body["idempotency_disposition"], "deferred");
+
+    sqlx::query(
+        "UPDATE app_mutation_leases
+            SET owner_token = NULL,
+                operation_kind = NULL,
+                operation_id = NULL,
+                locked_until = NULL,
+                reclaim_after = NULL
+          WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .execute(&pool)
+    .await
+    .expect("release test mutation lease");
+
+    let retry = add_internal_headers(server.put(&path), "ignored-retry-key")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": operation_id,
+        }))
+        .await;
+    retry.assert_status_ok();
+    assert_eq!(retry.json::<Value>()["runtime_state"], "running");
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
+}
+
+#[tokio::test]
+async fn paas_internal_desired_state_rechecks_failed_status_after_claim() {
     let (mut state, pool) = setup_paas_managed_test_state().await;
-    let application_name = format!("desired-state-replay-{}", Uuid::new_v4());
+    let application_name = format!("desired-state-failed-race-{}", Uuid::new_v4());
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
     let options = database_url
@@ -1834,7 +1842,7 @@ async fn paas_internal_desired_state_replay_publishes_state_after_concurrent_mut
     let suffix = Uuid::new_v4().simple().to_string();
     let paas_org_id = format!("paas-org-{suffix}");
     let paas_user_id = format!("paas-user-{suffix}");
-    let org_name = format!("replay-race-{}", &suffix[..12]);
+    let org_name = format!("failed-race-{}", &suffix[..12]);
     let app_name = format!("app-{}", &suffix[..12]);
 
     bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
@@ -1852,15 +1860,6 @@ async fn paas_internal_desired_state_replay_publishes_state_after_concurrent_mut
         .expect("mark app stopped");
 
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
-    let operation_id = format!("stop-race-{suffix}");
-    add_internal_headers(server.put(&path), "ignored-initial-key")
-        .json(&serde_json::json!({
-            "desired_state": "stopped",
-            "operation_id": operation_id,
-        }))
-        .await
-        .assert_status_ok();
-
     let app_id: Uuid = sqlx::query_scalar("SELECT id FROM apps WHERE name = $1")
         .bind(&app_name)
         .fetch_one(&pool)
@@ -1873,16 +1872,15 @@ async fn paas_internal_desired_state_replay_publishes_state_after_concurrent_mut
         .execute(&mut *opposite)
         .await
         .expect("hold app mutation lane");
-    *runtime.lock().unwrap() = desired_statefulset(1);
 
-    let replay_server = Arc::clone(&server);
-    let replay_path = path.clone();
-    let replay_operation_id = operation_id.clone();
-    let replay = tokio::spawn(async move {
-        add_internal_headers(replay_server.put(&replay_path), "ignored-replay-key")
+    let request_server = Arc::clone(&server);
+    let request_path = path.clone();
+    let operation_id = format!("failed-race-{suffix}");
+    let request = tokio::spawn(async move {
+        add_internal_headers(request_server.put(&request_path), "ignored-race-key")
             .json(&serde_json::json!({
-                "desired_state": "stopped",
-                "operation_id": replay_operation_id,
+                "desired_state": "running",
+                "operation_id": operation_id,
             }))
             .await
     });
@@ -1899,7 +1897,7 @@ async fn paas_internal_desired_state_replay_publishes_state_after_concurrent_mut
             .bind(&application_name)
             .fetch_one(&pool)
             .await
-            .expect("inspect replay lock state");
+            .expect("inspect desired-state lock state");
             if waiting {
                 break;
             }
@@ -1907,25 +1905,38 @@ async fn paas_internal_desired_state_replay_publishes_state_after_concurrent_mut
         }
     })
     .await
-    .expect("replay did not pause between lookup and mutation claim");
+    .expect("desired-state request did not pause between lookup and mutation claim");
 
-    sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE id = $1")
+    sqlx::query("UPDATE apps SET status = 'failed'::app_status_enum WHERE id = $1")
         .bind(app_id)
         .execute(&mut *opposite)
         .await
-        .expect("commit opposite desired-state mutation");
-    opposite.commit().await.expect("publish opposite mutation");
+        .expect("publish failed deployment state");
+    opposite
+        .commit()
+        .await
+        .expect("commit failed deployment state");
 
-    let response = replay.await.expect("join replay");
-    response.assert_status_ok();
-    assert_eq!(response.json::<Value>()["runtime_state"], "stopped");
+    let response = request.await.expect("join desired-state request");
+    response.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<Value>()["error"],
+        "failed applications require a successful redeployment before changing desired state"
+    );
     assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
     let recorded_state: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
         .bind(app_id)
         .fetch_one(&pool)
         .await
-        .expect("load converged recorded state");
-    assert_eq!(recorded_state, "stopped");
+        .expect("load recorded state");
+    assert_eq!(recorded_state, "failed");
+    let lease_released: bool =
+        sqlx::query_scalar("SELECT owner_token IS NULL FROM app_mutation_leases WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect desired-state mutation lease");
+    assert!(lease_released);
 }
 
 #[tokio::test]
