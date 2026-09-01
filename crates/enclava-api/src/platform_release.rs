@@ -304,6 +304,12 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: "must be a concrete pinned generator version".to_string(),
         });
     }
+    chrono::DateTime::parse_from_rfc3339(&release.created_at).map_err(|error| {
+        PlatformReleaseError::InvalidField {
+            field: "created_at",
+            message: format!("must be RFC3339: {error}"),
+        }
+    })?;
     Ok(())
 }
 
@@ -365,6 +371,18 @@ mod tests {
         let err = validate_release_payload(&payload).unwrap_err();
         assert!(
             matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_tls_mode")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_unparseable_created_at() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.created_at = "not-a-timestamp".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "created_at")
         );
     }
 }

@@ -71,6 +71,19 @@ fn idempotency_deployment(app: &App) -> Deployment {
 }
 
 #[test]
+fn runtime_reapply_rejects_stopped_and_deleting_apps() {
+    assert_eq!(
+        runtime_reapply_status_error(AppStatus::Stopped),
+        Some("start the stopped app before deploying")
+    );
+    assert_eq!(
+        runtime_reapply_status_error(AppStatus::Deleting),
+        Some("app deletion is in progress")
+    );
+    assert_eq!(runtime_reapply_status_error(AppStatus::Running), None);
+}
+
+#[test]
 fn generic_deployment_response_reports_current_app_status_separately() {
     let mut app = idempotency_app();
     app.status = AppStatus::Running;

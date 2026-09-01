@@ -3498,17 +3498,53 @@ pub async fn put_paas_app_desired_state(
             }
             _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"),
         })?;
+        let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+        crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+            .await
+            .map_err(|_| db_error())?;
         let claimed_status: crate::models::AppStatus =
             sqlx::query_scalar("SELECT status FROM apps WHERE id = $1")
                 .bind(app_id)
-                .fetch_one(&state.db)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|_| db_error())?;
         if claimed_status == crate::models::AppStatus::Failed {
-            mutation.finish().await.map_err(|_| db_error())?;
+            mutation
+                .finish_in_tx(&mut tx)
+                .await
+                .map_err(|_| db_error())?;
+            tx.commit().await.map_err(|_| db_error())?;
             return Err(json_error(
                 StatusCode::CONFLICT,
                 "failed applications require a successful redeployment before changing desired state",
+            ));
+        }
+        let deployment_in_progress = body.desired_state == InternalAppDesiredState::Stopped
+            && sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1
+                       FROM deployment_apply_jobs
+                      WHERE app_id = $1
+                        AND state IN (
+                            'setup_pending', 'setting_up',
+                            'cleanup_pending', 'cleaning_up',
+                            'pending', 'running'
+                        )
+                 )",
+            )
+            .bind(app_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| db_error())?;
+        if deployment_in_progress {
+            mutation
+                .finish_in_tx(&mut tx)
+                .await
+                .map_err(|_| db_error())?;
+            tx.commit().await.map_err(|_| db_error())?;
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "current deployment generation is still in progress",
             ));
         }
         let generation = mutation.resource_generation(&resource).ok_or_else(|| {
@@ -3545,10 +3581,6 @@ pub async fn put_paas_app_desired_state(
             ));
         }
 
-        let mut tx = state.db.begin().await.map_err(|_| db_error())?;
-        crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
-            .await
-            .map_err(|_| db_error())?;
         let updated = sqlx::query(
             "UPDATE apps
                 SET status = $2::app_status_enum,

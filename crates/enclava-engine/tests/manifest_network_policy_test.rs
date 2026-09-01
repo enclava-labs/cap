@@ -450,6 +450,9 @@ fn generated_policy_denies_non_public_dns_results_by_default() {
         "169.254.0.0/16",
         "172.16.0.0/12",
         "192.168.0.0/16",
+        "64:ff9b::/96",
+        "64:ff9b:1::/48",
+        "2002::/16",
         "fc00::/7",
         "fe80::/10",
     ] {
@@ -473,6 +476,9 @@ fn internal_egress_opt_in_still_denies_metadata_and_link_local_results() {
     for cidr in [
         "100.100.100.200/32",
         "169.254.0.0/16",
+        "64:ff9b::/96",
+        "64:ff9b:1::/48",
+        "2002::/16",
         "fd00:ec2::254/128",
         "fe80::/10",
     ] {

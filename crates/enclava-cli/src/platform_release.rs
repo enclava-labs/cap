@@ -145,7 +145,7 @@ pub fn enforce_release_not_older_than_bundled(
     else {
         return Ok(());
     };
-    if release_is_older(release, &bundled.payload) {
+    if release_is_older(release, &bundled.payload)? {
         return Err(PlatformReleaseError::DowngradeRefused {
             override_version: release.platform_release_version.clone(),
             override_created: release.created_at.clone(),
@@ -159,7 +159,10 @@ pub fn enforce_release_not_older_than_bundled(
 /// Ordering by the signed creation timestamp. `platform_release_version` is
 /// opaque, so distinct releases at the same timestamp are unorderable and
 /// fail closed rather than using the identifier as a tiebreak.
-fn release_is_older(candidate: &PlatformRelease, bundled: &PlatformRelease) -> bool {
+fn release_is_older(
+    candidate: &PlatformRelease,
+    bundled: &PlatformRelease,
+) -> Result<bool, PlatformReleaseError> {
     release_pair_is_older(
         (&candidate.platform_release_version, &candidate.created_at),
         (&bundled.platform_release_version, &bundled.created_at),
@@ -168,20 +171,24 @@ fn release_is_older(candidate: &PlatformRelease, bundled: &PlatformRelease) -> b
 
 /// Same ordering on bare (version, created_at) pairs — shared by the
 /// API-baseline store, which persists only the pair.
-fn release_pair_is_older(candidate: (&str, &str), baseline: (&str, &str)) -> bool {
-    match (
-        chrono::DateTime::parse_from_rfc3339(candidate.1),
-        chrono::DateTime::parse_from_rfc3339(baseline.1),
-    ) {
-        (Ok(candidate_ts), Ok(baseline_ts)) => {
-            candidate_ts < baseline_ts || (candidate_ts == baseline_ts && candidate.0 != baseline.0)
+fn release_pair_is_older(
+    candidate: (&str, &str),
+    baseline: (&str, &str),
+) -> Result<bool, PlatformReleaseError> {
+    let candidate_ts = parse_release_timestamp(candidate.1)?;
+    let baseline_ts = parse_release_timestamp(baseline.1)?;
+    Ok(candidate_ts < baseline_ts || (candidate_ts == baseline_ts && candidate.0 != baseline.0))
+}
+
+fn parse_release_timestamp(
+    value: &str,
+) -> Result<chrono::DateTime<chrono::FixedOffset>, PlatformReleaseError> {
+    chrono::DateTime::parse_from_rfc3339(value).map_err(|error| {
+        PlatformReleaseError::InvalidField {
+            field: "created_at",
+            message: format!("must be RFC3339: {error}"),
         }
-        // A candidate whose signed timestamp does not parse cannot be shown
-        // to be current; fail closed and treat it as older.
-        (Err(_), Ok(_)) => true,
-        // Unorderable baseline (broken bundle): fall back to the identifier.
-        _ => candidate.0 < baseline.0,
-    }
+    })
 }
 
 pub fn verify_envelope(
@@ -344,6 +351,7 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: "must be a concrete pinned generator version".to_string(),
         });
     }
+    parse_release_timestamp(&release.created_at)?;
     Ok(())
 }
 
@@ -380,21 +388,27 @@ mod tests {
         // sorting lower) older, and vice versa.
         let older = release("dev-2026.07.28-proxy-ffffffff", "2026-07-28T00:00:00Z");
         let newer = release("dev-2026.08.15-proxy-00000000", "2026-08-15T00:00:00Z");
-        assert!(release_is_older(&older, &newer));
-        assert!(!release_is_older(&newer, &older));
-        assert!(!release_is_older(&newer, &newer));
+        assert!(release_is_older(&older, &newer).unwrap());
+        assert!(!release_is_older(&newer, &older).unwrap());
+        assert!(!release_is_older(&newer, &newer).unwrap());
 
         let same_time_a = release("release-ffffffff", "2026-08-15T00:00:00Z");
         let same_time_b = release("release-00000000", "2026-08-15T00:00:00Z");
-        assert!(release_is_older(&same_time_a, &same_time_b));
-        assert!(release_is_older(&same_time_b, &same_time_a));
+        assert!(release_is_older(&same_time_a, &same_time_b).unwrap());
+        assert!(release_is_older(&same_time_b, &same_time_a).unwrap());
     }
 
     #[test]
-    fn unparseable_candidate_timestamp_fails_closed_as_older() {
+    fn unparseable_candidate_timestamp_is_rejected() {
         let bundled = release("r1", "2026-08-15T00:00:00Z");
         let broken = release("r2", "not-a-timestamp");
-        assert!(release_is_older(&broken, &bundled));
+        assert!(matches!(
+            release_is_older(&broken, &bundled),
+            Err(PlatformReleaseError::InvalidField {
+                field: "created_at",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -410,6 +424,31 @@ mod tests {
                 .is_err()
         );
         assert!(api_served_release_before(&store, "https://api").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unparseable_baseline_timestamp_is_rejected_without_replacement() {
+        let dir = std::env::temp_dir().join(format!("pr-baseline-time-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("baselines.json");
+        let baseline = r#"{
+            "https://api": {
+                "platform_release_version": "r8",
+                "created_at": "not-a-timestamp"
+            }
+        }"#;
+        std::fs::write(&store, baseline).unwrap();
+
+        let incoming = release("r9", "2026-09-01T00:00:00Z");
+        assert!(matches!(
+            enforce_release_not_older_than_last_accepted(&store, "https://api", &incoming),
+            Err(PlatformReleaseError::InvalidField {
+                field: "created_at",
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read_to_string(&store).unwrap(), baseline);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -530,18 +569,18 @@ mod tests {
         let mut older_version = bundled.payload.clone();
         older_version.platform_release_version =
             format!("dev-2000.01.01-{}", older_version.platform_release_version);
-        assert!(release_is_older(&older_version, &bundled.payload));
+        assert!(release_is_older(&older_version, &bundled.payload).unwrap());
 
         let mut older_created = bundled.payload.clone();
         older_created.created_at = "2000-01-01T00:00:00Z".to_string();
-        assert!(release_is_older(&older_created, &bundled.payload));
+        assert!(release_is_older(&older_created, &bundled.payload).unwrap());
 
         let mut divergent_version = bundled.payload.clone();
         divergent_version.platform_release_version =
             format!("z-{}", divergent_version.platform_release_version);
-        assert!(release_is_older(&divergent_version, &bundled.payload));
+        assert!(release_is_older(&divergent_version, &bundled.payload).unwrap());
 
-        assert!(!release_is_older(&bundled.payload, &bundled.payload));
+        assert!(!release_is_older(&bundled.payload, &bundled.payload).unwrap());
     }
 
     #[test]
@@ -565,6 +604,18 @@ mod tests {
         let err = validate_release_payload(&payload).unwrap_err();
         assert!(
             matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_tls_mode")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_unparseable_created_at() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.created_at = "not-a-timestamp".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "created_at")
         );
     }
 }
@@ -630,12 +681,13 @@ fn enforce_release_not_older_than_last_accepted_locked(
     api_origin: &str,
     release: &PlatformRelease,
 ) -> Result<(), PlatformReleaseError> {
+    parse_release_timestamp(&release.created_at)?;
     let mut baseline = read_baseline(store_path)?;
     if let Some(last) = baseline.entries.get(api_origin)
         && release_pair_is_older(
             (&release.platform_release_version, &release.created_at),
             (&last.platform_release_version, &last.created_at),
-        )
+        )?
     {
         return Err(PlatformReleaseError::ApiDowngradeRefused {
             api: api_origin.to_string(),

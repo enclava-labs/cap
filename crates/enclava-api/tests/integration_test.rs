@@ -12,7 +12,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use enclava_api::{
     auth::jwt::issue_session_token,
     deploy::DeploymentApplySnapshot,
-    deployment_jobs::{DeploymentApplyJobPayload, insert_setup_job},
+    deployment_jobs::{DeploymentApplyJobPayload, insert_ready_job, insert_setup_job},
     models::{App, AppContainer, AppResources},
     signing_service::{AgentPolicyResponse, PolicyMetadata, SignedPolicyArtifact},
     state::{AppState, CapManagementMode, InternalAuthConfig},
@@ -1523,6 +1523,143 @@ async fn paas_internal_desired_state_contract_is_authenticated_mapped_and_idempo
         failed_start.json::<Value>()["error"],
         "failed applications require a successful redeployment before changing desired state"
     );
+}
+
+#[tokio::test]
+async fn paas_internal_stop_waits_for_pending_deployment_observation() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let runtime = Arc::new(Mutex::new(desired_statefulset(1)));
+    let engine = Arc::new(enclava_engine::apply::engine::ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(test_router(state).layer(Extension(engine)));
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("stop-pending-{}", &suffix[..12]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-pending-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app running");
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE name = $1")
+        .bind(&app_name)
+        .fetch_one(&pool)
+        .await
+        .expect("load pending-deployment app");
+    let deployment_id = Uuid::new_v4();
+    let image = "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let payload = DeploymentApplyJobPayload::new(
+        app.clone(),
+        DeploymentApplySnapshot::new(
+            vec![AppContainer {
+                id: Uuid::new_v4(),
+                app_id: app.id,
+                name: "app".to_string(),
+                image_ref: image.to_string(),
+                image_digest: Some(format!("sha256:{}", "aa".repeat(32))),
+                port: None,
+                command: None,
+                storage_paths: None,
+                workload_security_profile: Some("restricted".to_string()),
+                is_primary: true,
+            }],
+            AppResources {
+                app_id: app.id,
+                cpu_limit: "1".to_string(),
+                memory_limit: "1Gi".to_string(),
+                app_data_size: "5Gi".to_string(),
+                tls_data_size: "2Gi".to_string(),
+            },
+        ),
+        None,
+        "integration-test-api-pubkey".to_string(),
+        "https://api.example.test".to_string(),
+        None,
+        None,
+        None,
+        false,
+    );
+    let mut tx = pool.begin().await.expect("begin pending deployment seed");
+    sqlx::query(
+        "INSERT INTO deployments (
+             id, org_id, app_id, trigger, status, spec_snapshot, image_digest, manifest_hash
+         ) VALUES (
+             $1, $2, $3, 'api', 'watching', $4, $5, 'pending-observation-manifest'
+         )",
+    )
+    .bind(deployment_id)
+    .bind(app.org_id)
+    .bind(app.id)
+    .bind(serde_json::json!({
+        "image": image,
+        "image_digest": format!("sha256:{}", "aa".repeat(32)),
+        "log_encryption": null,
+    }))
+    .bind(format!("sha256:{}", "aa".repeat(32)))
+    .execute(&mut *tx)
+    .await
+    .expect("insert watching deployment");
+    insert_ready_job(&mut tx, deployment_id, deployment_id, &payload, false)
+        .await
+        .expect("insert pending observation job");
+    tx.commit().await.expect("commit pending deployment seed");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let operation_id = format!("stop-pending-{suffix}");
+    let body = serde_json::json!({
+        "desired_state": "stopped",
+        "operation_id": operation_id,
+    });
+    let deferred = add_internal_headers(server.put(&path), "ignored-stop-pending-key")
+        .json(&body)
+        .await;
+    deferred.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        deferred.json::<Value>()["error"],
+        "idempotency_request_in_progress"
+    );
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
+    let recorded_state: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load state after deferred stop");
+    assert_eq!(recorded_state, "running");
+
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'healthy'::deploy_status_enum, completed_at = clock_timestamp()
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&pool)
+    .await
+    .expect("complete watching deployment");
+    sqlx::query("UPDATE deployment_apply_jobs SET state = 'completed' WHERE deployment_id = $1")
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("complete pending observation job");
+
+    let stopped = add_internal_headers(server.put(&path), "ignored-stop-retry-key")
+        .json(&body)
+        .await;
+    stopped.assert_status_ok();
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
 }
 
 fn desired_statefulset(replicas: i32) -> Value {

@@ -528,6 +528,16 @@ enum AppMutation {
     Insert,
 }
 
+pub(crate) fn runtime_reapply_status_error(
+    status: crate::models::AppStatus,
+) -> Option<&'static str> {
+    match status {
+        crate::models::AppStatus::Deleting => Some("app deletion is in progress"),
+        crate::models::AppStatus::Stopped => Some("start the stopped app before deploying"),
+        _ => None,
+    }
+}
+
 fn deployment_setup_incomplete(deployment: &Deployment) -> bool {
     matches!(
         deployment
@@ -652,11 +662,10 @@ async fn deploy_app_candidate(
     body: DeployRequest,
     app_mutation: AppMutation,
 ) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
-    if app_mutation != AppMutation::Insert && app.status == crate::models::AppStatus::Stopped {
-        return Err(json_error(
-            StatusCode::CONFLICT,
-            "start the stopped app before deploying",
-        ));
+    if app_mutation != AppMutation::Insert
+        && let Some(error) = runtime_reapply_status_error(app.status)
+    {
+        return Err(json_error(StatusCode::CONFLICT, error));
     }
     let workload_security_profile =
         validate_workload_security_profile(body.workload_security_profile.as_deref())?;
@@ -1118,20 +1127,8 @@ async fn deploy_app_candidate(
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-        match current_status {
-            crate::models::AppStatus::Deleting => {
-                return Err(json_error(
-                    StatusCode::CONFLICT,
-                    "app deletion is in progress",
-                ));
-            }
-            crate::models::AppStatus::Stopped => {
-                return Err(json_error(
-                    StatusCode::CONFLICT,
-                    "start the stopped app before deploying",
-                ));
-            }
-            _ => {}
+        if let Some(error) = runtime_reapply_status_error(current_status) {
+            return Err(json_error(StatusCode::CONFLICT, error));
         }
     }
     if app_has_incomplete_deployment_setup(&mut tx, app.id)
