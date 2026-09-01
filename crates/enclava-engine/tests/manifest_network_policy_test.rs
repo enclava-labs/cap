@@ -2,6 +2,7 @@ use enclava_engine::manifest::network_policy::{
     cap_api_namespace_for_attestation, generate_network_policy,
 };
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::EgressRule;
 
 #[test]
 fn network_policy_api_version() {
@@ -430,7 +431,7 @@ fn egress_allowlist_renders_one_rule_per_entry() {
 }
 
 #[test]
-fn generated_policy_denies_non_public_dns_results_regardless_of_allow_rules() {
+fn generated_policy_denies_non_public_dns_results_by_default() {
     // The hostname denylist is DNS-rebindable (a tenant-controlled FQDN can
     // resolve into private, metadata, or link-local space and ride a toFQDNs
     // allow rule).
@@ -453,5 +454,31 @@ fn generated_policy_denies_non_public_dns_results_regardless_of_allow_rules() {
         "fe80::/10",
     ] {
         assert!(cidrs.iter().any(|value| value == cidr), "missing {cidr}");
+    }
+}
+
+#[test]
+fn internal_egress_opt_in_still_denies_metadata_and_link_local_results() {
+    let mut app = sample_app();
+    app.allow_internal_egress = true;
+    app.egress_allowlist = vec![EgressRule {
+        host: "database.internal".to_string(),
+        ports: vec![5432],
+    }];
+
+    let policy = generate_network_policy(&app);
+    let cidrs = policy["spec"]["egressDeny"][0]["toCIDR"]
+        .as_array()
+        .expect("toCIDR array");
+    for cidr in [
+        "100.100.100.200/32",
+        "169.254.0.0/16",
+        "fd00:ec2::254/128",
+        "fe80::/10",
+    ] {
+        assert!(cidrs.iter().any(|value| value == cidr), "missing {cidr}");
+    }
+    for cidr in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"] {
+        assert!(cidrs.iter().all(|value| value != cidr), "unexpected {cidr}");
     }
 }

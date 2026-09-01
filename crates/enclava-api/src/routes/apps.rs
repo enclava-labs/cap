@@ -464,10 +464,7 @@ fn enforce_egress_allowlist_host(host: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    if std::env::var("CAP_EGRESS_ALLOW_INTERNAL_HOSTS")
-        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-    {
+    if internal_egress_allowlist_enabled() {
         tracing::warn!(
             host = %host,
             reasons = ?reasons,
@@ -485,6 +482,12 @@ fn enforce_egress_allowlist_host(host: &str) -> Result<(), String> {
         "egress_allowlist host {host} targets an internal or rebinding-helper endpoint \
          ({reasons}); tenant egress to internal endpoints is not allowed"
     ))
+}
+
+pub(crate) fn internal_egress_allowlist_enabled() -> bool {
+    std::env::var("CAP_EGRESS_ALLOW_INTERNAL_HOSTS")
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 pub(crate) fn egress_allowlist_host_audit_reasons(host: &str) -> Vec<EgressAllowlistAuditReason> {

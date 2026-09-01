@@ -13,8 +13,7 @@ use enclava_cli::api_types::{
 use enclava_cli::config::{self, CliPaths};
 use enclava_cli::keyring::{
     OrgKeyringEnvelope, Role, fingerprint, load_trusted_owner, rotate_trusted_owner, sign_keyring,
-    single_member_keyring, store_keyring_envelope, store_keyring_envelope_force,
-    store_trusted_owner, verify_keyring,
+    single_member_keyring, store_keyring_envelope, store_trusted_owner, verify_keyring,
 };
 use enclava_cli::keys;
 
@@ -193,7 +192,7 @@ async fn verify_or_initialize_remote_keyring(
                 .into());
             }
             store_trusted_owner(&org_id, &envelope.signing_pubkey)?;
-            store_keyring_envelope_force(&org_id, &envelope)?;
+            store_keyring_envelope(&org_id, &envelope)?;
             Ok((org_id, org_name, fingerprint(&owner.public)))
         }
         Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {

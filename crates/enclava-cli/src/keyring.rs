@@ -322,14 +322,11 @@ pub fn store_keyring_envelope(
             Err(KeyringError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        store_keyring_envelope_force(org_id, envelope)
+        write_keyring_envelope(org_id, envelope)
     })
 }
 
-/// Cache a keyring envelope without rollback protection. Only for explicit
-/// recovery/bootstrap flows where the local cache is being deliberately
-/// re-established.
-pub fn store_keyring_envelope_force(
+fn write_keyring_envelope(
     org_id: &Uuid,
     envelope: &OrgKeyringEnvelope,
 ) -> Result<PathBuf, KeyringError> {
@@ -517,12 +514,12 @@ mod tests {
             }
         ));
 
-        // Newer versions are accepted; the explicit force path bypasses the
-        // check for documented recovery flows.
+        // Newer versions are accepted and remain the high-water mark.
         let mut v4 = sample_keyring(&owner);
         v4.version = 4;
-        store_keyring_envelope(&org_id, &sign_keyring(&owner, v4)).unwrap();
-        store_keyring_envelope_force(&org_id, &envelope_v2).unwrap();
+        let envelope_v4 = sign_keyring(&owner, v4);
+        store_keyring_envelope(&org_id, &envelope_v4).unwrap();
+        assert_eq!(load_keyring_envelope(&org_id).unwrap().keyring.version, 4);
 
         unsafe { std::env::remove_var("ENCLAVA_STATE_DIR") };
     }
