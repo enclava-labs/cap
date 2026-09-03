@@ -1348,6 +1348,23 @@ async fn claim_job(
     claimed_state: &str,
     only_deployment_id: Option<Uuid>,
 ) -> Result<Option<ClaimedJob>, DeploymentJobError> {
+    claim_job_candidate(
+        pool,
+        ready_state,
+        claimed_state,
+        only_deployment_id,
+        only_deployment_id.is_some(),
+    )
+    .await
+}
+
+async fn claim_job_candidate(
+    pool: &PgPool,
+    ready_state: &str,
+    claimed_state: &str,
+    only_deployment_id: Option<Uuid>,
+    bypass_recovery_delay: bool,
+) -> Result<Option<ClaimedJob>, DeploymentJobError> {
     let lock_token = Uuid::new_v4();
     let job = sqlx::query_as::<_, ClaimedJob>(
         "WITH candidate AS (
@@ -1358,7 +1375,7 @@ async fn claim_job(
                     (
                         state = $1
                         AND (
-                            $7::uuid IS NOT NULL
+                            $8
                             OR next_attempt_at <= clock_timestamp()
                         )
                     )
@@ -1391,6 +1408,7 @@ async fn claim_job(
     .bind(MAX_SUPPORTED_JOB_PAYLOAD_VERSION)
     .bind(LEASE_INTERVAL_SQL)
     .bind(only_deployment_id)
+    .bind(bypass_recovery_delay)
     .fetch_optional(pool)
     .await?;
     Ok(job)
@@ -2599,6 +2617,8 @@ mod tests {
     use enclava_engine::manifest::containers::ENCLAVA_WAIT_EXEC_PATH;
     use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
     use sqlx::types::Json;
+
+    static KBS_FENCE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn lease_heartbeat_does_not_duplicate_large_future_state() {
@@ -4129,10 +4149,16 @@ mod tests {
         assert!(lease.is_none());
         assert!(recovery_delayed);
         assert!(
-            claim_setup_job(&pool)
-                .await
-                .expect("dispatcher claim query")
-                .is_none()
+            claim_job_candidate(
+                &pool,
+                "setup_pending",
+                "setting_up",
+                Some(deployment_id),
+                false,
+            )
+            .await
+            .expect("dispatcher claim query")
+            .is_none()
         );
 
         let request_claim = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
@@ -4172,10 +4198,16 @@ mod tests {
         .execute(&pool)
         .await
         .expect("make recovery setup due");
-        let dispatcher = claim_setup_job(&pool)
-            .await
-            .expect("dispatcher claim")
-            .expect("dispatcher wins setup");
+        let dispatcher = claim_job_candidate(
+            &pool,
+            "setup_pending",
+            "setting_up",
+            Some(deployment_id),
+            false,
+        )
+        .await
+        .expect("dispatcher claim")
+        .expect("dispatcher wins setup");
         mark_setup_accepted(&pool, deployment_id, dispatcher.lock_token)
             .await
             .expect("dispatcher accepts setup");
@@ -4203,6 +4235,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_owned_dns_failure_preserves_typed_error_mapping() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
         let pool = database_test_pool().await;
         let (app, deployment_id, setup_handle, _payload) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
@@ -4515,6 +4548,7 @@ mod tests {
 
     #[tokio::test]
     async fn permit_wait_revalidates_latest_keyring_before_rendering() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
         let pool = database_test_pool().await;
         let (app, deployment_id, _setup_handle, payload) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
@@ -4588,6 +4622,7 @@ mod tests {
 
     #[tokio::test]
     async fn cross_app_kbs_fence_contention_requeues_without_terminal_failure() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
         let pool = database_test_pool().await;
         let (holder_app, _, _, _) = insert_job_fixture(&pool).await;
         let (queued_app, queued_deployment, _, _) = insert_job_fixture(&pool).await;
@@ -4677,6 +4712,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_apply_releases_pre_provider_app_and_resource_claims() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
         let pool = database_test_pool().await;
         let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
@@ -4957,6 +4993,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_dns_fence_contention_requeues_setup_without_failure() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
         let pool = database_test_pool().await;
         let (holder_app, _, _, _) = insert_job_fixture(&pool).await;
         let (queued_app, queued_deployment, _, _) = insert_job_fixture(&pool).await;

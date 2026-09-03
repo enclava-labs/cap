@@ -4,6 +4,7 @@ pub mod app_config;
 pub mod attestation;
 pub mod config;
 pub mod descriptor;
+mod fslock;
 pub mod keyring;
 pub mod keys;
 pub mod platform_release;

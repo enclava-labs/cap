@@ -615,7 +615,7 @@ fn end_to_end_chain_rejects_policy_pubkey_mismatch() {
 
 #[test]
 fn skipped_chain_is_fatal() {
-    let err = verify_chain_or_skip(None).unwrap_err();
+    let err = verify_chain_required(None).unwrap_err();
     assert!(matches!(err, InitError::TrusteePolicy(s) if s.contains("verification required")));
 }
 

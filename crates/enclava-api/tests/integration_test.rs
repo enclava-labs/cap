@@ -1,7 +1,10 @@
 //! Integration tests for API routes using testcontainers.
 
 use axum::{
-    Json as AxumJson, Router, extract::State as AxumState, http::StatusCode, routing::post,
+    Extension, Json as AxumJson, Router,
+    extract::State as AxumState,
+    http::{Method, Request, Response, StatusCode, header},
+    routing::post,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use chrono::{Duration, Utc};
@@ -9,7 +12,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use enclava_api::{
     auth::jwt::issue_session_token,
     deploy::DeploymentApplySnapshot,
-    deployment_jobs::{DeploymentApplyJobPayload, insert_setup_job},
+    deployment_jobs::{DeploymentApplyJobPayload, insert_ready_job, insert_setup_job},
     models::{App, AppContainer, AppResources},
     signing_service::{AgentPolicyResponse, PolicyMetadata, SignedPolicyArtifact},
     state::{AppState, CapManagementMode, InternalAuthConfig},
@@ -25,11 +28,17 @@ use enclava_common::{
     image::ImageRef,
 };
 use enclava_engine::{manifest::network_policy::generate_network_policy, types::AttestationConfig};
+use http_body_util::BodyExt;
+use kube::client::Body;
 use rand::rngs::OsRng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::{
+    io,
+    sync::{Arc, Mutex},
+};
+use tower::service_fn;
 use uuid::Uuid;
 
 const TEST_KBS_POLICY: &str = "package policy\n\ndefault allow := false\n";
@@ -1356,6 +1365,780 @@ async fn paas_internal_create_app_persists_cli_signer_identity() {
         .find(|rule| rule["toFQDNs"][0]["matchName"].as_str() == Some("relay.enclava.me"))
         .expect("relay egress rule");
     assert_eq!(relay_rule["toPorts"][0]["ports"][0]["port"], "20000");
+}
+
+#[tokio::test]
+async fn paas_internal_desired_state_contract_is_authenticated_mapped_and_idempotent() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let runtime = Arc::new(Mutex::new(desired_statefulset(0)));
+    let engine = Arc::new(enclava_engine::apply::engine::ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let app = test_router(state).layer(Extension(engine));
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("state-{}", &suffix[..16]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query(
+        "UPDATE apps
+            SET status = 'stopped'::app_status_enum,
+                signer_identity_subject = $2,
+                signer_identity_issuer = $3,
+                signer_identity_set_at = now()
+          WHERE name = $1",
+    )
+    .bind(&app_name)
+    .bind(github_signer_subject())
+    .bind(github_signer_issuer())
+    .execute(&pool)
+    .await
+    .expect("mark app stopped");
+
+    let deploy_while_stopped = add_internal_actor_headers(
+        server.post(&format!(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/deploy"
+        )),
+        &format!("deploy-stopped-{suffix}"),
+        &paas_user_id,
+    )
+    .json(&serde_json::json!({
+        "image": "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }))
+    .await;
+    deploy_while_stopped.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        deploy_while_stopped.json::<Value>()["error"],
+        "start the stopped app before deploying"
+    );
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    server
+        .put(&path)
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": format!("missing-auth-{suffix}"),
+        }))
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+
+    let operation_id = format!("stop-{suffix}");
+    let stopped = add_internal_headers(server.put(&path), "ignored-header-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    stopped.assert_status_ok();
+    let stopped_body: Value = stopped.json();
+    assert_eq!(
+        stopped_body,
+        serde_json::json!({
+            "operation_id": operation_id,
+            "desired_state": "stopped",
+            "runtime_state": "stopped",
+        })
+    );
+    assert_eq!(runtime.lock().unwrap()["metadata"]["resourceVersion"], "1");
+
+    let replay = add_internal_headers(server.put(&path), "another-ignored-header-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    replay.assert_status_ok();
+    assert_eq!(replay.json::<Value>(), stopped_body);
+
+    let conflict = add_internal_headers(server.put(&path), "ignored-conflict-header")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": operation_id,
+        }))
+        .await;
+    conflict.assert_status(StatusCode::CONFLICT);
+    assert_eq!(conflict.json::<Value>()["error"], "idempotency_key_reused");
+
+    let leaked_field = add_internal_headers(server.put(&path), "ignored-leak-header")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": format!("leak-{suffix}"),
+            "plan": "pro",
+        }))
+        .await;
+    leaked_field.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+
+    let unmapped = add_internal_headers(
+        server.put(&format!(
+            "/internal/paas/orgs/unmapped-{suffix}/apps/{app_name}/desired-state"
+        )),
+        "ignored-unmapped-header",
+    )
+    .json(&serde_json::json!({
+        "desired_state": "stopped",
+        "operation_id": format!("unmapped-{suffix}"),
+    }))
+    .await;
+    unmapped.assert_status(StatusCode::NOT_FOUND);
+
+    sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app running");
+    *runtime.lock().unwrap() = desired_statefulset(1);
+    let running = add_internal_headers(server.put(&path), "ignored-running-header")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": format!("running-{suffix}"),
+        }))
+        .await;
+    running.assert_status_ok();
+    assert_eq!(running.json::<Value>()["runtime_state"], "running");
+
+    sqlx::query("UPDATE apps SET status = 'failed'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app failed");
+    let failed_start = add_internal_headers(server.put(&path), "ignored-failed-header")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": format!("failed-{suffix}"),
+        }))
+        .await;
+    failed_start.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        failed_start.json::<Value>()["error"],
+        "failed applications require a successful redeployment before changing desired state"
+    );
+}
+
+#[tokio::test]
+async fn paas_internal_stop_waits_for_pending_deployment_observation() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let runtime = Arc::new(Mutex::new(desired_statefulset(1)));
+    let engine = Arc::new(enclava_engine::apply::engine::ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(test_router(state).layer(Extension(engine)));
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("stop-pending-{}", &suffix[..12]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-pending-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query("UPDATE apps SET status = 'running'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app running");
+    let app: App = sqlx::query_as("SELECT * FROM apps WHERE name = $1")
+        .bind(&app_name)
+        .fetch_one(&pool)
+        .await
+        .expect("load pending-deployment app");
+    let deployment_id = Uuid::new_v4();
+    let image = "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let payload = DeploymentApplyJobPayload::new(
+        app.clone(),
+        DeploymentApplySnapshot::new(
+            vec![AppContainer {
+                id: Uuid::new_v4(),
+                app_id: app.id,
+                name: "app".to_string(),
+                image_ref: image.to_string(),
+                image_digest: Some(format!("sha256:{}", "aa".repeat(32))),
+                port: None,
+                command: None,
+                storage_paths: None,
+                workload_security_profile: Some("restricted".to_string()),
+                is_primary: true,
+            }],
+            AppResources {
+                app_id: app.id,
+                cpu_limit: "1".to_string(),
+                memory_limit: "1Gi".to_string(),
+                app_data_size: "5Gi".to_string(),
+                tls_data_size: "2Gi".to_string(),
+            },
+        ),
+        None,
+        "integration-test-api-pubkey".to_string(),
+        "https://api.example.test".to_string(),
+        None,
+        None,
+        None,
+        false,
+    );
+    let mut tx = pool.begin().await.expect("begin pending deployment seed");
+    sqlx::query(
+        "INSERT INTO deployments (
+             id, org_id, app_id, trigger, status, spec_snapshot, image_digest, manifest_hash
+         ) VALUES (
+             $1, $2, $3, 'api', 'watching', $4, $5, 'pending-observation-manifest'
+         )",
+    )
+    .bind(deployment_id)
+    .bind(app.org_id)
+    .bind(app.id)
+    .bind(serde_json::json!({
+        "image": image,
+        "image_digest": format!("sha256:{}", "aa".repeat(32)),
+        "log_encryption": null,
+    }))
+    .bind(format!("sha256:{}", "aa".repeat(32)))
+    .execute(&mut *tx)
+    .await
+    .expect("insert watching deployment");
+    insert_ready_job(&mut tx, deployment_id, deployment_id, &payload, false)
+        .await
+        .expect("insert pending observation job");
+    tx.commit().await.expect("commit pending deployment seed");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let operation_id = format!("stop-pending-{suffix}");
+    let body = serde_json::json!({
+        "desired_state": "stopped",
+        "operation_id": operation_id,
+    });
+    let deferred = add_internal_headers(server.put(&path), "ignored-stop-pending-key")
+        .json(&body)
+        .await;
+    deferred.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        deferred.json::<Value>()["error"],
+        "idempotency_request_in_progress"
+    );
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
+    let recorded_state: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load state after deferred stop");
+    assert_eq!(recorded_state, "running");
+
+    sqlx::query(
+        "UPDATE deployments
+            SET status = 'healthy'::deploy_status_enum, completed_at = clock_timestamp()
+          WHERE id = $1",
+    )
+    .bind(deployment_id)
+    .execute(&pool)
+    .await
+    .expect("complete watching deployment");
+    sqlx::query("UPDATE deployment_apply_jobs SET state = 'completed' WHERE deployment_id = $1")
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("complete pending observation job");
+
+    let stopped = add_internal_headers(server.put(&path), "ignored-stop-retry-key")
+        .json(&body)
+        .await;
+    stopped.assert_status_ok();
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
+}
+
+fn desired_statefulset(replicas: i32) -> Value {
+    serde_json::json!({
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": {
+            "name": "desired-state",
+            "namespace": "desired-state-test",
+            "uid": "22222222-2222-2222-2222-222222222222",
+            "resourceVersion": "1",
+            "annotations": {
+                "enclava.dev/cap-provider-mutation-generation": "1",
+                "retained": "true",
+            },
+        },
+        "spec": {
+            "replicas": replicas,
+            "serviceName": "desired-state",
+            "selector": {"matchLabels": {"app": "desired-state"}},
+            "template": {
+                "metadata": {"labels": {"app": "desired-state"}},
+                "spec": {"containers": [{"name": "app", "image": "example.test/app:current"}]},
+            },
+            "volumeClaimTemplates": [{
+                "metadata": {"name": "retained-data"},
+                "spec": {"accessModes": ["ReadWriteOnce"]},
+            }],
+        },
+        "status": {
+            "currentReplicas": replicas,
+            "readyReplicas": replicas,
+            "updatedReplicas": replicas,
+        },
+    })
+}
+
+fn merge_json(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(target), Value::Object(patch)) => {
+            for (key, value) in patch {
+                merge_json(target.entry(key).or_insert(Value::Null), value);
+            }
+        }
+        (target, patch) => *target = patch.clone(),
+    }
+}
+
+fn desired_state_kube_response(status: StatusCode, body: Value) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string().into_bytes()))
+        .expect("fake Kubernetes response")
+}
+
+fn desired_state_kube_client(state: Arc<Mutex<Value>>) -> kube::Client {
+    kube::Client::new(
+        service_fn(move |request: Request<Body>| {
+            let state = Arc::clone(&state);
+            async move {
+                let method = request.method().clone();
+                if method == Method::GET {
+                    let resource = state.lock().expect("fake state poisoned").clone();
+                    if resource.is_null() {
+                        return Ok::<_, io::Error>(desired_state_kube_response(
+                            StatusCode::NOT_FOUND,
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "reason": "NotFound",
+                                "code": 404,
+                            }),
+                        ));
+                    }
+                    return Ok::<_, io::Error>(desired_state_kube_response(
+                        StatusCode::OK,
+                        resource,
+                    ));
+                }
+                if method != Method::PATCH {
+                    return Err(io::Error::other("unexpected fake Kubernetes request"));
+                }
+                let patch: Value = serde_json::from_slice(
+                    &request
+                        .into_body()
+                        .collect()
+                        .await
+                        .map_err(io::Error::other)?
+                        .to_bytes(),
+                )
+                .map_err(io::Error::other)?;
+                let mut resource = state.lock().expect("fake state poisoned");
+                if resource.is_null() {
+                    return Ok(desired_state_kube_response(
+                        StatusCode::NOT_FOUND,
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Status",
+                            "status": "Failure",
+                            "reason": "NotFound",
+                            "code": 404,
+                        }),
+                    ));
+                }
+                merge_json(&mut resource, &patch);
+                let replicas = resource["spec"]["replicas"].as_i64().unwrap_or_default();
+                resource["metadata"]["resourceVersion"] = Value::String(
+                    (resource["metadata"]["resourceVersion"]
+                        .as_str()
+                        .unwrap_or("1")
+                        .parse::<u64>()
+                        .unwrap_or(1)
+                        + 1)
+                    .to_string(),
+                );
+                resource["status"] = serde_json::json!({
+                    "currentReplicas": replicas,
+                    "readyReplicas": replicas,
+                    "updatedReplicas": replicas,
+                });
+                Ok(desired_state_kube_response(
+                    StatusCode::OK,
+                    resource.clone(),
+                ))
+            }
+        }),
+        "default",
+    )
+}
+
+#[tokio::test]
+async fn paas_internal_stale_desired_state_replay_does_not_undo_newer_intent() {
+    use enclava_engine::apply::engine::ApplyEngine;
+
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let runtime = Arc::new(Mutex::new(desired_statefulset(1)));
+    let engine = Arc::new(ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let app = test_router(state).layer(Extension(engine));
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("stale-replay-{}", &suffix[..12]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-stale-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app stopped");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let operation_id = format!("stop-before-resume-{suffix}");
+    let stopped = add_internal_headers(server.put(&path), "ignored-header-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    stopped.assert_status_ok();
+    let stopped_body: Value = stopped.json();
+    assert_eq!(stopped_body["runtime_state"], "stopped");
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
+
+    let running_operation_id = format!("resume-after-stop-{suffix}");
+    let running = add_internal_headers(server.put(&path), "ignored-running-key")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": running_operation_id,
+        }))
+        .await;
+    running.assert_status_ok();
+    assert_eq!(running.json::<Value>()["runtime_state"], "running");
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
+
+    let stale_replay = add_internal_headers(server.put(&path), "ignored-stale-replay-key")
+        .json(&serde_json::json!({
+            "desired_state": "stopped",
+            "operation_id": operation_id,
+        }))
+        .await;
+    stale_replay.assert_status_ok();
+    assert_eq!(stale_replay.json::<Value>(), stopped_body);
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
+    let recorded_state: String =
+        sqlx::query_scalar("SELECT status::text FROM apps WHERE name = $1")
+            .bind(&app_name)
+            .fetch_one(&pool)
+            .await
+            .expect("load current desired state");
+    assert_eq!(recorded_state, "running");
+}
+
+#[tokio::test]
+async fn paas_internal_desired_state_contention_retries_with_the_same_operation_id() {
+    let (state, pool) = setup_paas_managed_test_state().await;
+    let runtime = Arc::new(Mutex::new(desired_statefulset(0)));
+    let engine = Arc::new(enclava_engine::apply::engine::ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let server = axum_test::TestServer::builder()
+        .http_transport()
+        .build(test_router(state).layer(Extension(engine)));
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("contention-{}", &suffix[..12]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-contention-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    let app_id: Uuid = sqlx::query_scalar("SELECT id FROM apps WHERE name = $1")
+        .bind(&app_name)
+        .fetch_one(&pool)
+        .await
+        .expect("load app id");
+    sqlx::query(
+        "INSERT INTO app_mutation_leases (
+             app_id, owner_token, operation_kind, operation_id, locked_until, reclaim_after
+         ) VALUES (
+             $1, $2, 'test_contention', $3,
+             clock_timestamp() + interval '5 minutes',
+             clock_timestamp() + interval '10 minutes'
+         )",
+    )
+    .bind(app_id)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .expect("hold durable app mutation lease");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let operation_id = format!("retry-contention-{suffix}");
+    let first = add_internal_headers(server.put(&path), "ignored-first-key")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": operation_id,
+        }))
+        .await;
+    first.assert_status(StatusCode::CONFLICT);
+    let first_body: Value = first.json();
+    assert_eq!(first_body["error"], "idempotency_request_in_progress");
+    assert_eq!(first_body["idempotency_disposition"], "deferred");
+
+    sqlx::query(
+        "UPDATE app_mutation_leases
+            SET owner_token = NULL,
+                operation_kind = NULL,
+                operation_id = NULL,
+                locked_until = NULL,
+                reclaim_after = NULL
+          WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .execute(&pool)
+    .await
+    .expect("release test mutation lease");
+
+    let retry = add_internal_headers(server.put(&path), "ignored-retry-key")
+        .json(&serde_json::json!({
+            "desired_state": "running",
+            "operation_id": operation_id,
+        }))
+        .await;
+    retry.assert_status_ok();
+    assert_eq!(retry.json::<Value>()["runtime_state"], "running");
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 1);
+}
+
+#[tokio::test]
+async fn paas_internal_desired_state_rechecks_failed_status_after_claim() {
+    let (mut state, pool) = setup_paas_managed_test_state().await;
+    let application_name = format!("desired-state-failed-race-{}", Uuid::new_v4());
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let options = database_url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .expect("parse regression database URL")
+        .application_name(&application_name);
+    state.db = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .expect("connect named desired-state pool");
+
+    let runtime = Arc::new(Mutex::new(desired_statefulset(0)));
+    let engine = Arc::new(enclava_engine::apply::engine::ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&runtime)),
+        Default::default(),
+    ));
+    let server = Arc::new(
+        axum_test::TestServer::builder()
+            .http_transport()
+            .build(test_router(state).layer(Extension(engine))),
+    );
+    let suffix = Uuid::new_v4().simple().to_string();
+    let paas_org_id = format!("paas-org-{suffix}");
+    let paas_user_id = format!("paas-user-{suffix}");
+    let org_name = format!("failed-race-{}", &suffix[..12]);
+    let app_name = format!("app-{}", &suffix[..12]);
+
+    bootstrap_paas_internal_org(&server, &suffix, &paas_org_id, &paas_user_id, &org_name).await;
+    add_internal_headers(
+        server.post(&format!("/internal/paas/orgs/{paas_org_id}/apps")),
+        &format!("desired-state-race-app-{suffix}"),
+    )
+    .json(&serde_json::json!({"name": app_name}))
+    .await
+    .assert_status(StatusCode::CREATED);
+    sqlx::query("UPDATE apps SET status = 'stopped'::app_status_enum WHERE name = $1")
+        .bind(&app_name)
+        .execute(&pool)
+        .await
+        .expect("mark app stopped");
+
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let app_id: Uuid = sqlx::query_scalar("SELECT id FROM apps WHERE name = $1")
+        .bind(&app_name)
+        .fetch_one(&pool)
+        .await
+        .expect("load app id");
+    let (high, low) = app_id.as_u64_pair();
+    let mut opposite = pool.begin().await.expect("begin opposite mutation");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind((high ^ low) as i64)
+        .execute(&mut *opposite)
+        .await
+        .expect("hold app mutation lane");
+
+    let request_server = Arc::clone(&server);
+    let request_path = path.clone();
+    let operation_id = format!("failed-race-{suffix}");
+    let request = tokio::spawn(async move {
+        add_internal_headers(request_server.put(&request_path), "ignored-race-key")
+            .json(&serde_json::json!({
+                "desired_state": "running",
+                "operation_id": operation_id,
+            }))
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                      WHERE datname = current_database()
+                        AND application_name = $1
+                        AND wait_event_type = 'Lock'
+                 )",
+            )
+            .bind(&application_name)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect desired-state lock state");
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("desired-state request did not pause between lookup and mutation claim");
+
+    sqlx::query("UPDATE apps SET status = 'failed'::app_status_enum WHERE id = $1")
+        .bind(app_id)
+        .execute(&mut *opposite)
+        .await
+        .expect("publish failed deployment state");
+    opposite
+        .commit()
+        .await
+        .expect("commit failed deployment state");
+
+    let response = request.await.expect("join desired-state request");
+    response.assert_status(StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<Value>()["error"],
+        "failed applications require a successful redeployment before changing desired state"
+    );
+    assert_eq!(runtime.lock().unwrap()["spec"]["replicas"], 0);
+    let recorded_state: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load recorded state");
+    assert_eq!(recorded_state, "failed");
+    let lease_released: bool =
+        sqlx::query_scalar("SELECT owner_token IS NULL FROM app_mutation_leases WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("inspect desired-state mutation lease");
+    assert!(lease_released);
+}
+
+#[tokio::test]
+async fn desired_state_replica_convergence_stops_resumes_and_retains_configuration() {
+    use enclava_engine::apply::{
+        cleanup::set_statefulset_desired_replicas, engine::ApplyEngine,
+        generation::MutationGeneration,
+    };
+
+    let state = Arc::new(Mutex::new(desired_statefulset(1)));
+    let engine = ApplyEngine::new(
+        desired_state_kube_client(Arc::clone(&state)),
+        Default::default(),
+    );
+
+    set_statefulset_desired_replicas(
+        &engine,
+        "desired-state-test",
+        "desired-state",
+        0,
+        std::time::Duration::from_secs(1),
+        MutationGeneration::new(2).unwrap(),
+    )
+    .await
+    .expect("stop converges");
+    {
+        let stopped = state.lock().unwrap();
+        assert_eq!(stopped["spec"]["replicas"], 0);
+        assert_eq!(
+            stopped["metadata"]["annotations"]["enclava.dev/cap-provider-mutation-generation"],
+            "2"
+        );
+        assert_eq!(stopped["metadata"]["annotations"]["retained"], "true");
+        assert_eq!(
+            stopped["spec"]["volumeClaimTemplates"][0]["metadata"]["name"],
+            "retained-data"
+        );
+    }
+
+    set_statefulset_desired_replicas(
+        &engine,
+        "desired-state-test",
+        "desired-state",
+        0,
+        std::time::Duration::from_secs(1),
+        MutationGeneration::new(3).unwrap(),
+    )
+    .await
+    .expect("no-op stop advances generation fence");
+    assert_eq!(
+        state.lock().unwrap()["metadata"]["annotations"]["enclava.dev/cap-provider-mutation-generation"],
+        "3"
+    );
+
+    set_statefulset_desired_replicas(
+        &engine,
+        "desired-state-test",
+        "desired-state",
+        1,
+        std::time::Duration::from_secs(1),
+        MutationGeneration::new(4).unwrap(),
+    )
+    .await
+    .expect("resume converges");
+    assert_eq!(state.lock().unwrap()["status"]["readyReplicas"], 1);
 }
 
 #[tokio::test]

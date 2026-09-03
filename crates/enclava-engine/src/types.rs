@@ -66,6 +66,10 @@ pub struct ConfidentialApp {
     /// private RFC1918 exclusions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub public_internet_egress_excluded_cidrs: Vec<String>,
+    /// Operator-approved access to private address space for explicit FQDN
+    /// allowlist entries. Metadata and link-local ranges remain denied.
+    #[serde(default)]
+    pub allow_internal_egress: bool,
     /// Per-app FQDN egress allowlist (Phase 11). Default: empty -> no
     /// FQDN rules emitted. Each rule is rendered as a Cilium `toFQDNs`
     /// egress entry restricted to the listed TCP ports.

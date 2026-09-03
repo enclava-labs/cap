@@ -135,7 +135,7 @@ fn egress_allowlist_warn_only_audit_classifies_internal_and_rebinding_hosts() {
 }
 
 #[test]
-fn egress_allowlist_audit_is_warn_only_until_migration_enforces_it() {
+fn egress_allowlist_rejects_internal_and_rebinding_hosts() {
     let body: CreateAppRequest = serde_json::from_value(serde_json::json!({
         "name": "demo",
         "egress_allowlist": [
@@ -146,11 +146,28 @@ fn egress_allowlist_audit_is_warn_only_until_migration_enforces_it() {
     }))
     .unwrap();
 
-    let rules = validate_egress_allowlist(&body.egress_allowlist)
-        .expect("audit is warn-only and must not reject existing values");
-    assert_eq!(rules.len(), 3);
-    assert_eq!(rules[0].host, "metadata.google.internal");
-    assert_eq!(rules[0].ports, vec![80]);
+    let err = validate_egress_allowlist(&body.egress_allowlist)
+        .expect_err("internal/rebinding hosts must be rejected");
+    assert!(err.contains("metadata.google.internal"));
+    assert!(err.contains("metadata"));
+}
+
+#[test]
+fn egress_allowlist_internal_hosts_still_validate_public_hosts() {
+    let body: CreateAppRequest = serde_json::from_value(serde_json::json!({
+        "name": "demo",
+        "egress_allowlist": [
+            { "host": "api.stripe.com", "ports": [443] },
+            { "host": "objects.githubusercontent.com" }
+        ]
+    }))
+    .unwrap();
+
+    let rules = validate_egress_allowlist(&body.egress_allowlist).unwrap();
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].host, "api.stripe.com");
+    assert_eq!(rules[0].ports, vec![443]);
+    assert_eq!(rules[1].ports, vec![443]);
 }
 
 #[test]

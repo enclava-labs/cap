@@ -6,12 +6,10 @@
 //! Network fetch of the policy envelope from `GET /resource-policy/<id>/body`
 //! and the workload-attested artifact bundle from `GET
 //! /api/v1/workload/artifacts` is gated behind `Config.trustee_policy_read_available`.
-//! The flag defaults FALSE; while it's false the verifier emits a loud
-//! `tracing::error!` saying the Phase 3 Trustee patch hasn't shipped yet,
-//! and `verify_chain_or_skip` returns Ok(false) so the caller knows the
-//! release happened without policy verification. We do NOT fall back to a
-//! local descriptor file the way the earlier prototype did — that would be
-//! pretending to verify something we didn't.
+//! The flag defaults FALSE; while it's false startup fails with a hard error —
+//! seeds are never released without in-TEE policy verification. We do NOT fall
+//! back to a local descriptor file the way the earlier prototype did — that
+//! would be pretending to verify something we didn't.
 //!
 //! Descriptor hashing uses `enclava_common::descriptor`, the same module the
 //! CLI signer uses, so signer + verifier agree byte-for-byte across crates.
@@ -221,14 +219,14 @@ pub fn verify_chain(inputs: &VerifyInputs<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Returns true if the chain ran end-to-end. Missing verification inputs are
-/// fatal because seeds must not be released without Trustee policy verification.
-pub fn verify_chain_or_skip(inputs: Option<&VerifyInputs<'_>>) -> Result<bool> {
+/// Runs the full verification chain; there is no skip path. Missing
+/// verification inputs are fatal because seeds must not be released without
+/// Trustee policy verification. (Historically this returned `Ok(bool)` with a
+/// documented "skip" mode; that shape invited regressions toward
+/// release-without-verification and was removed.)
+pub fn verify_chain_required(inputs: Option<&VerifyInputs<'_>>) -> Result<()> {
     match inputs {
-        Some(i) => {
-            verify_chain(i)?;
-            Ok(true)
-        }
+        Some(i) => verify_chain(i),
         None => Err(InitError::TrusteePolicy(
             "in-TEE Trustee policy verification required before seed release".to_string(),
         )),

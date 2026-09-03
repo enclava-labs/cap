@@ -417,8 +417,9 @@ async fn commit_unlock_mode_transition(
             "app changed while unlock mode transition was validating; retry",
         ));
     }
-    if locked_app.status == crate::models::AppStatus::Deleting {
-        return Err(unlock_transition_conflict("app deletion is in progress"));
+    if let Some(error) = crate::routes::deployments::runtime_reapply_status_error(locked_app.status)
+    {
+        return Err(unlock_transition_conflict(error));
     }
 
     let locked_current = current_mode(&locked_app);
@@ -937,6 +938,9 @@ pub async fn update_unlock_mode(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
+    if let Some(error) = crate::routes::deployments::runtime_reapply_status_error(app.status) {
+        return Err(unlock_transition_conflict(error));
+    }
 
     let current = current_mode(&app);
     if !validate_transition(current, requested) {

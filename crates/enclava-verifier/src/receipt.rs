@@ -43,6 +43,12 @@ pub enum ReceiptError {
     Expired,
     #[error("appraisal receipt signature is invalid")]
     SignatureInvalid,
+    #[error("appraisal receipt policy is not the pinned policy")]
+    PolicyMismatch,
+    #[error("appraisal receipt challenge nonce is not the pinned nonce")]
+    NonceMismatch,
+    #[error("appraisal receipt target origin is not the pinned origin")]
+    OriginMismatch,
 }
 
 impl ReceiptError {
@@ -58,8 +64,59 @@ impl ReceiptError {
             Self::TimeInvalid => "APPRAISER_RECEIPT_TIME_INVALID",
             Self::Expired => "APPRAISER_RECEIPT_EXPIRED",
             Self::SignatureInvalid => "APPRAISER_RECEIPT_SIGNATURE_INVALID",
+            Self::PolicyMismatch => "APPRAISER_RECEIPT_POLICY_MISMATCH",
+            Self::NonceMismatch => "APPRAISER_RECEIPT_NONCE_MISMATCH",
+            Self::OriginMismatch => "APPRAISER_RECEIPT_ORIGIN_MISMATCH",
         }
     }
+}
+
+/// The values a relying party chose itself and expects to see echoed in a
+/// signed appraisal receipt. The appraiser is a public signing oracle: it
+/// signs results for whatever policy and evidence a requester supplies, so a
+/// receipt is only meaningful when the consumer pins these fields. All three
+/// are mandatory by construction — an `ExpectedReceipt` cannot be built with
+/// a binding absent, so the pinned verify path can never degrade into the
+/// unpinned one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedReceipt<'a> {
+    /// sha256 (hex) of the exact policy document the relying party appraised
+    /// under (must equal `AppraisalResult.policy_sha256`).
+    pub policy_sha256: &'a str,
+    /// The challenge nonce the relying party issued for this appraisal.
+    pub challenge_nonce: &'a str,
+    /// The target origin the relying party expected to be appraised.
+    pub target_origin: &'a str,
+}
+
+impl ExpectedReceipt<'_> {
+    fn matches(&self, result: &AppraisalResult) -> Result<(), ReceiptError> {
+        if result.policy_sha256 != self.policy_sha256 {
+            return Err(ReceiptError::PolicyMismatch);
+        }
+        if result.challenge_nonce != self.challenge_nonce {
+            return Err(ReceiptError::NonceMismatch);
+        }
+        if result.target_origin != self.target_origin {
+            return Err(ReceiptError::OriginMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// Verifies a signed appraisal response AND binds it to the relying party's
+/// own choices. This is the function consumers should call; a validly-signed
+/// PASS receipt produced under an attacker-chosen policy, nonce, or origin is
+/// rejected here.
+pub fn verify_appraisal_response_pinned(
+    response_bytes: &[u8],
+    policy: &AppraiserPolicy,
+    now_unix_seconds: u64,
+    expected: &ExpectedReceipt<'_>,
+) -> Result<AppraisalResponse, ReceiptError> {
+    let response = verify_appraisal_response(response_bytes, policy, now_unix_seconds)?;
+    expected.matches(&response.result)?;
+    Ok(response)
 }
 
 pub fn verify_appraisal_response(
@@ -248,6 +305,61 @@ mod tests {
             )
             .unwrap_err(),
             ReceiptError::KeyRevoked
+        );
+    }
+
+    #[test]
+    fn pinned_verification_rejects_attacker_chosen_policy_nonce_origin() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let policy = policy(&[(&key, "new", false)]);
+        let bytes = response(&key, "new", 1_000);
+
+        // Matching expectations pass.
+        assert!(
+            verify_appraisal_response_pinned(
+                &bytes,
+                &policy,
+                1_001,
+                &ExpectedReceipt {
+                    policy_sha256: &"22".repeat(32),
+                    challenge_nonce: &"33".repeat(32),
+                    target_origin: "https://example.com",
+                },
+            )
+            .is_ok()
+        );
+
+        // A validly-signed receipt appraised under a DIFFERENT policy (the
+        // appraiser signs whatever policy the requester posts) must be
+        // rejected when the relying party pinned its own policy hash.
+        let pinned = ExpectedReceipt {
+            policy_sha256: &"22".repeat(32),
+            challenge_nonce: &"33".repeat(32),
+            target_origin: "https://example.com",
+        };
+        let wrong_policy = ExpectedReceipt {
+            policy_sha256: &"44".repeat(32),
+            ..pinned.clone()
+        };
+        assert_eq!(
+            verify_appraisal_response_pinned(&bytes, &policy, 1_001, &wrong_policy).unwrap_err(),
+            ReceiptError::PolicyMismatch
+        );
+        let wrong_nonce = ExpectedReceipt {
+            challenge_nonce: &"55".repeat(32),
+            ..pinned.clone()
+        };
+        assert_eq!(
+            verify_appraisal_response_pinned(&bytes, &policy, 1_001, &wrong_nonce).unwrap_err(),
+            ReceiptError::NonceMismatch
+        );
+        let wrong_origin = ExpectedReceipt {
+            target_origin: "https://attacker.example",
+            ..pinned
+        };
+        assert_eq!(
+            verify_appraisal_response_pinned(&bytes, &policy, 1_001, &wrong_origin).unwrap_err(),
+            ReceiptError::OriginMismatch
         );
     }
 }

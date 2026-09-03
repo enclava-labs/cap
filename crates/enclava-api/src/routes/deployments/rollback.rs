@@ -140,11 +140,8 @@ pub async fn rollback(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
-    if app.status == crate::models::AppStatus::Deleting {
-        return Err(json_error(
-            StatusCode::CONFLICT,
-            "app deletion is in progress",
-        ));
+    if let Some(error) = super::runtime_reapply_status_error(app.status) {
+        return Err(json_error(StatusCode::CONFLICT, error));
     }
 
     let implicit_target = body.deployment_id.is_none();
@@ -334,6 +331,15 @@ pub async fn rollback(
     crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let current_status: crate::models::AppStatus =
+        sqlx::query_scalar("SELECT status FROM apps WHERE id = $1")
+            .bind(app.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    if let Some(error) = super::runtime_reapply_status_error(current_status) {
+        return Err(json_error(StatusCode::CONFLICT, error));
+    }
 
     if implicit_target {
         let selected = latest_implicit_rollback_target_in_tx(&mut tx, app.id)

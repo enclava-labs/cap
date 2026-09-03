@@ -666,6 +666,7 @@ fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> Confide
         },
         egress_mode: enclava_engine::types::EgressMode::Restricted,
         public_internet_egress_excluded_cidrs: Vec::new(),
+        allow_internal_egress: false,
         egress_allowlist: vec![],
         log_encryption: None,
         workload_artifact_binding: None,

@@ -777,6 +777,10 @@ pub(crate) fn build_confidential_app_from_rows(
         attestation: attestation_config.clone(),
         egress_mode,
         public_internet_egress_excluded_cidrs: public_internet_egress_excluded_cidrs_from_env(),
+        allow_internal_egress: crate::routes::apps::internal_egress_allowlist_enabled()
+            && app.egress_allowlist.0.iter().any(|rule| {
+                !crate::routes::apps::egress_allowlist_host_audit_reasons(&rule.host).is_empty()
+            }),
         egress_allowlist: app.egress_allowlist.0.clone(),
         log_encryption: None,
         workload_artifact_binding: None,
@@ -1528,6 +1532,7 @@ mod tests {
             },
             egress_mode: EgressMode::Restricted,
             public_internet_egress_excluded_cidrs: Vec::new(),
+            allow_internal_egress: false,
             egress_allowlist: Vec::new(),
             log_encryption: None,
             workload_artifact_binding: None,
@@ -1612,6 +1617,7 @@ mod tests {
             },
             egress_mode: EgressMode::Restricted,
             public_internet_egress_excluded_cidrs: Vec::new(),
+            allow_internal_egress: false,
             egress_allowlist: Vec::new(),
             log_encryption: None,
             workload_artifact_binding: None,

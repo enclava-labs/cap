@@ -84,6 +84,8 @@ pub enum AttestationError {
     SnpReportParse(String),
     #[error("AMD SNP VCEK chain verification failed: {0}")]
     AmdChain(String),
+    #[error("SNP guest policy allows DEBUG; refusing to trust a debuggable TEE")]
+    DebugPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -127,7 +129,20 @@ pub fn validate_snp_report_with_der_chain(
     (&chain, &report)
         .verify()
         .map_err(|err| AttestationError::AmdChain(err.to_string()))?;
+    ensure_snp_report_production_policy(&report)?;
     Ok(parsed_report_from_sev(&report))
+}
+
+/// A SNP guest launched with the DEBUG policy bit admits debugger access to
+/// its memory-encryption keys: it is never a trustworthy confidential
+/// workload, regardless of how valid its attestation chain is.
+pub fn ensure_snp_report_production_policy(
+    report: &sev::firmware::guest::AttestationReport,
+) -> Result<(), AttestationError> {
+    if report.policy.debug_allowed() {
+        return Err(AttestationError::DebugPolicy);
+    }
+    Ok(())
 }
 
 fn parsed_report_from_sev(report: &sev::firmware::guest::AttestationReport) -> ParsedSnpReport {

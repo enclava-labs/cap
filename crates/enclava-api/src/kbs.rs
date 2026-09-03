@@ -2532,10 +2532,18 @@ owner_resource_bindings := {}
             .iter()
             .map(|candidate| candidate.artifact.metadata.descriptor_core_hash.as_str())
             .collect();
-        assert_eq!(hashes.len(), 3);
         assert!(hashes.contains(source_artifact.metadata.descriptor_core_hash.as_str()));
         assert!(hashes.contains(legacy_artifact.metadata.descriptor_core_hash.as_str()));
         assert!(hashes.contains(retry_artifact.metadata.descriptor_core_hash.as_str()));
+        for excluded in [
+            &newer_artifact,
+            &failed_artifact,
+            &deleting_artifact,
+            &failed_job_artifact,
+            &old_artifact,
+        ] {
+            assert!(!hashes.contains(excluded.metadata.descriptor_core_hash.as_str()));
+        }
         assert!(candidates.iter().all(|candidate| candidate.required));
 
         for org_id in [

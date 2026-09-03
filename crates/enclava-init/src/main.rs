@@ -105,14 +105,9 @@ fn run() -> Result<()> {
     prepare_mount_ownership(&cfg)?;
 
     record_stage("verifying trustee policy").ok();
-    if !run_in_tee_verification(&cfg)? {
-        // Skipped because Phase 3 Trustee patch isn't deployed yet. The
-        // tracing::error above made this loud; we let the binary continue so
-        // staged rollout can proceed, but we log a final warning.
-        tracing::warn!(
-            "seeds released without in-TEE Trustee policy verification (TRUSTEE_POLICY_READ_AVAILABLE=false)"
-        );
-    }
+    // Fail-closed: any verification gap (missing inputs, missing policy-read
+    // availability) returns Err and aborts before seed release.
+    run_in_tee_verification(&cfg)?;
 
     record_stage("provisioning static tls certificate").ok();
     provision_static_tls_certificate(&cfg).context("provisioning static TLS certificate")?;
@@ -997,9 +992,9 @@ fn derive_volume_key(owner: &OwnerSeed, info: &str) -> Result<DerivedSeed> {
     Ok(derived)
 }
 
-fn run_in_tee_verification(cfg: &Config) -> Result<bool> {
+fn run_in_tee_verification(cfg: &Config) -> Result<()> {
     if !cfg.trustee_policy_read_available {
-        return Ok(trustee_verify::verify_chain_or_skip(None)?);
+        return Ok(trustee_verify::verify_chain_required(None)?);
     }
 
     let workload_url = cfg.workload_artifacts_url.as_deref().ok_or_else(|| {
@@ -1048,7 +1043,7 @@ fn run_in_tee_verification(cfg: &Config) -> Result<bool> {
         platform_trustee_policy_pubkey: signer_pk.as_ref(),
         signing_service_pubkey: signing_pk.as_ref(),
     };
-    trustee_verify::verify_chain_or_skip(Some(&inputs)).map_err(Into::into)
+    trustee_verify::verify_chain_required(Some(&inputs)).map_err(Into::into)
 }
 
 fn parse_pubkey(hex_str: &str) -> Result<ed25519_dalek::VerifyingKey> {

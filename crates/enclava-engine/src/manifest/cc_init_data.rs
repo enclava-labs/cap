@@ -294,6 +294,16 @@ pub fn resolve_runtime_class_with_env(
     let release_escape_hatch = lookup(ALLOW_DEV_RUNTIME_CLASS_ENV)
         .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"));
     if debug_assertions || release_escape_hatch {
+        // The hatch is a deliberate, release-legal operator opt-out (unlike the
+        // debug-only envs rejected by the API's env gates), so it must be
+        // loudly observable every time it takes effect: workload Pods scheduled
+        // under this class run without a real TEE.
+        if release_escape_hatch {
+            tracing::warn!(
+                "CAP_RUNTIME_CLASS={} resolved via CAP_ALLOW_DEV_RUNTIME_CLASS: simulated CoCo runtime in use; workloads have no real TEE and attestation against signed releases will fail",
+                COCO_DEV_RUNTIME_CLASS
+            );
+        }
         return Ok(COCO_DEV_RUNTIME_CLASS.to_string());
     }
     Err(RuntimeClassConfigError::DevRuntimeClassInRelease)
