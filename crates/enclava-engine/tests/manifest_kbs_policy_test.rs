@@ -179,10 +179,12 @@ fn multiple_apps_produce_multiple_bindings() {
 
 #[test]
 fn tls_binding_blank_signer_identities_render_as_empty_arrays() {
-    for value in [None, Some(""), Some("   \n")] {
+    // None / empty signer identities are rejected earlier by compute_cc_init_data,
+    // so only whitespace-only values can reach the binding entry.
+    for value in ["   ", " \n\t"] {
         let mut app = sample_app();
-        app.signer_identity_subject = value.map(str::to_string);
-        app.signer_identity_issuer = value.map(str::to_string);
+        app.signer_identity_subject = Some(value.to_string());
+        app.signer_identity_issuer = Some(value.to_string());
         let (_, binding) = generate_tls_binding_entry(&app);
         assert_eq!(
             binding["allowed_signer_identity_subjects"],
