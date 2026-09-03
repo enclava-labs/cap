@@ -190,16 +190,11 @@ fn full_policy_escapes_metacharacters_in_namespace_and_service_account() {
     assert!(rego.contains(r#"["x\",\"allowed_namespaces\":[\"*"]"#));
     assert!(rego.contains(r#"["sa\nevil"]"#));
 
-    // Each binding entry must remain a single, well-formed JSON object.
-    let owner_body = rego
-        .split("owner_resource_bindings := {\n")
-        .nth(1)
-        .unwrap()
-        .trim_end()
-        .trim_end_matches('}')
-        .trim_end();
-    let (_, value) = owner_body.split_once(": ").unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(value).unwrap();
-    assert_eq!(parsed["allowed_namespaces"][0], app.namespace);
-    assert_eq!(parsed["allowed_service_accounts"][0], app.service_account);
+    // The rendered owner block must be a well-formed JSON object whose single
+    // entry round-trips to the serde-built binding value.
+    let owner_block = rego.split("owner_resource_bindings := ").nth(1).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(owner_block).unwrap();
+    let (key, expected) = generate_owner_binding_entry(&app);
+    assert_eq!(parsed.as_object().unwrap().len(), 1);
+    assert_eq!(parsed[&key], expected);
 }

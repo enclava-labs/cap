@@ -38,8 +38,8 @@ pub fn generate_tls_binding_entry(app: &ConfidentialApp) -> (String, Value) {
         "allowed_images": [primary.image.digest_ref()],
         "allowed_image_tag_prefixes": [],
         "allowed_init_data_hashes": [init_data_hash],
-        "allowed_signer_identity_subjects": app.signer_identity_subject.as_ref().map(|s| vec![s]).unwrap_or_default(),
-        "allowed_signer_identity_issuers": app.signer_identity_issuer.as_ref().map(|s| vec![s]).unwrap_or_default(),
+        "allowed_signer_identity_subjects": optional_string_array(app.signer_identity_subject.as_deref()),
+        "allowed_signer_identity_issuers": optional_string_array(app.signer_identity_issuer.as_deref()),
         "allowed_namespaces": [&app.namespace],
         "allowed_service_accounts": [&app.service_account],
         "allowed_identity_hashes": [&app.tenant_instance_identity_hash]
@@ -55,6 +55,11 @@ pub fn generate_tls_binding_entry(app: &ConfidentialApp) -> (String, Value) {
 ///
 /// The output includes the full Rego file: package, imports, resource_bindings (frozen legacy),
 /// owner_resource_bindings (CAP-generated), and all the evaluation rules from the live policy.
+///
+/// Note: production reconciliation in enclava-api (`kbs.rs`) edits the live policy in place via
+/// `replace_owner_bindings_block` / `replace_tls_resource_bindings_block` using the individual
+/// `generate_*_binding_entry` values; this full-document generator is used for the OID-5
+/// full-generation flow and tests.
 pub fn generate_kbs_policy_rego(
     apps: &[&ConfidentialApp],
     legacy_resource_bindings_body: &str,
@@ -96,6 +101,13 @@ pub fn generate_kbs_policy_rego(
     rego.push_str("\n}\n");
 
     rego
+}
+
+fn optional_string_array(value: Option<&str>) -> Vec<&str> {
+    value
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| vec![v])
+        .unwrap_or_default()
 }
 
 /// Render a single `"key": {...}` map entry as Rego/JSON text, one field per
