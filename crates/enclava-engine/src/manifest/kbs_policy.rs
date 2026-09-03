@@ -38,8 +38,8 @@ pub fn generate_tls_binding_entry(app: &ConfidentialApp) -> (String, Value) {
         "allowed_images": [primary.image.digest_ref()],
         "allowed_image_tag_prefixes": [],
         "allowed_init_data_hashes": [init_data_hash],
-        "allowed_signer_identity_subjects": app.signer_identity_subject.as_ref().map(|s| vec![s]).unwrap_or_default(),
-        "allowed_signer_identity_issuers": app.signer_identity_issuer.as_ref().map(|s| vec![s]).unwrap_or_default(),
+        "allowed_signer_identity_subjects": optional_string_array(app.signer_identity_subject.as_deref()),
+        "allowed_signer_identity_issuers": optional_string_array(app.signer_identity_issuer.as_deref()),
         "allowed_namespaces": [&app.namespace],
         "allowed_service_accounts": [&app.service_account],
         "allowed_identity_hashes": [&app.tenant_instance_identity_hash]
@@ -55,6 +55,11 @@ pub fn generate_tls_binding_entry(app: &ConfidentialApp) -> (String, Value) {
 ///
 /// The output includes the full Rego file: package, imports, resource_bindings (frozen legacy),
 /// owner_resource_bindings (CAP-generated), and all the evaluation rules from the live policy.
+///
+/// Note: production reconciliation in enclava-api (`kbs.rs`) edits the live policy in place via
+/// `replace_owner_bindings_block` / `replace_tls_resource_bindings_block` using the individual
+/// `generate_*_binding_entry` values; this full-document generator is used for the OID-5
+/// full-generation flow and tests.
 pub fn generate_kbs_policy_rego(
     apps: &[&ConfidentialApp],
     legacy_resource_bindings_body: &str,
@@ -73,39 +78,8 @@ pub fn generate_kbs_policy_rego(
     let tls_entries: Vec<String> = apps
         .iter()
         .map(|app| {
-            let (key, _val) = generate_tls_binding_entry(app);
-            let primary = app
-                .primary_container()
-                .expect("app must have a primary container");
-            let (_encoded, init_data_hash) = compute_cc_init_data(app);
-            // Every interpolated value is a Rego string literal: Rego string
-            // syntax is JSON-compatible, so serialize through serde_json to
-            // guarantee escaping (prevents crafted namespaces/identities from
-            // injecting policy source).
-            format!(
-                "  {key}: {{\n\
-                 {indent}\"repository\": \"default\",\n\
-                 {indent}\"tag\": \"workload-secret-seed\",\n\
-                 {indent}\"allowed_images\": [{image_digest}],\n\
-                 {indent}\"allowed_image_tag_prefixes\": [],\n\
-                 {indent}\"allowed_init_data_hashes\": [{init_data_hash}],\n\
-                 {indent}\"allowed_signer_identity_subjects\": {signer_subjects},\n\
-                 {indent}\"allowed_signer_identity_issuers\": {signer_issuers},\n\
-                 {indent}\"allowed_namespaces\": [{namespace}],\n\
-                 {indent}\"allowed_service_accounts\": [{sa}],\n\
-                 {indent}\"allowed_identity_hashes\": [{hash}]\n\
-                 {indent2}}}",
-                key = rego_quoted_string(&key),
-                indent = "    ",
-                indent2 = "  ",
-                image_digest = rego_quoted_string(&primary.image.digest_ref()),
-                init_data_hash = rego_quoted_string(&init_data_hash),
-                signer_subjects = optional_string_array(app.signer_identity_subject.as_deref()),
-                signer_issuers = optional_string_array(app.signer_identity_issuer.as_deref()),
-                namespace = rego_quoted_string(&app.namespace),
-                sa = rego_quoted_string(&app.service_account),
-                hash = rego_quoted_string(&app.tenant_instance_identity_hash),
-            )
+            let (key, val) = generate_tls_binding_entry(app);
+            render_binding_entry(&key, &val)
         })
         .collect();
     if !legacy_resource_bindings_body.trim().is_empty() && !tls_entries.is_empty() {
@@ -119,22 +93,8 @@ pub fn generate_kbs_policy_rego(
     let entries: Vec<String> = apps
         .iter()
         .map(|app| {
-            let (key, _val) = generate_owner_binding_entry(app);
-            format!(
-                "  {key}: {{\n\
-                 {indent}\"repository\": \"default\",\n\
-                 {indent}\"allowed_tags\": [\"seed-encrypted\", \"seed-sealed\"],\n\
-                 {indent}\"allowed_namespaces\": [{namespace}],\n\
-                 {indent}\"allowed_service_accounts\": [{sa}],\n\
-                 {indent}\"allowed_identity_hashes\": [{hash}]\n\
-                 {indent2}}}",
-                key = rego_quoted_string(&key),
-                indent = "    ",
-                indent2 = "  ",
-                namespace = rego_quoted_string(&app.namespace),
-                sa = rego_quoted_string(&app.service_account),
-                hash = rego_quoted_string(&app.tenant_instance_identity_hash),
-            )
+            let (key, val) = generate_owner_binding_entry(app);
+            render_binding_entry(&key, &val)
         })
         .collect();
     rego.push_str(&entries.join(",\n"));
@@ -143,16 +103,28 @@ pub fn generate_kbs_policy_rego(
     rego
 }
 
-fn optional_string_array(value: Option<&str>) -> String {
+fn optional_string_array(value: Option<&str>) -> Vec<&str> {
     value
         .filter(|v| !v.trim().is_empty())
-        .map(|v| serde_json::to_string(&[v]).expect("string array serialization is infallible"))
-        .unwrap_or_else(|| "[]".to_string())
+        .map(|v| vec![v])
+        .unwrap_or_default()
 }
 
-/// A Rego string literal for an arbitrary value. Rego string syntax is
-/// JSON-compatible, so JSON serialization provides correct escaping; this
-/// keeps crafted identities or namespaces from injecting policy source.
-fn rego_quoted_string(value: &str) -> String {
-    serde_json::to_string(value).expect("string serialization is infallible")
+/// Render a single `"key": {...}` map entry as Rego/JSON text, one field per
+/// line. Key and every field value are serialized with serde_json so that
+/// quotes, newlines and other metacharacters in tenant-influenced fields are
+/// escaped and can never terminate a string literal.
+fn render_binding_entry(key: &str, value: &Value) -> String {
+    let to_json = |v: &Value| serde_json::to_string(v).expect("json serialization is infallible");
+    let fields = value
+        .as_object()
+        .expect("binding entry must be a JSON object")
+        .iter()
+        .map(|(k, v)| format!("    {}: {}", to_json(&Value::String(k.clone())), to_json(v)))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(
+        "  {}: {{\n{fields}\n  }}",
+        to_json(&Value::String(key.to_string()))
+    )
 }

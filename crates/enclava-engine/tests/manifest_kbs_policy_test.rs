@@ -178,6 +178,51 @@ fn multiple_apps_produce_multiple_bindings() {
 }
 
 #[test]
+fn tls_binding_blank_signer_identities_render_as_empty_arrays() {
+    // None / empty signer identities are rejected earlier by compute_cc_init_data,
+    // so only whitespace-only values can reach the binding entry.
+    for value in ["   ", " \n\t"] {
+        let mut app = sample_app();
+        app.signer_identity_subject = Some(value.to_string());
+        app.signer_identity_issuer = Some(value.to_string());
+        let (_, binding) = generate_tls_binding_entry(&app);
+        assert_eq!(
+            binding["allowed_signer_identity_subjects"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            binding["allowed_signer_identity_issuers"],
+            serde_json::json!([])
+        );
+        let rego = generate_kbs_policy_rego(&[&app], "");
+        assert!(rego.contains("\"allowed_signer_identity_subjects\": []"));
+        assert!(rego.contains("\"allowed_signer_identity_issuers\": []"));
+    }
+}
+
+#[test]
+fn full_policy_escapes_metacharacters_in_namespace_and_service_account() {
+    let mut app = sample_app();
+    app.namespace = "x\",\"allowed_namespaces\":[\"*".to_string();
+    app.service_account = "sa\nevil".to_string();
+    let apps = vec![&app];
+    let rego = generate_kbs_policy_rego(&apps, "");
+
+    assert!(!rego.contains("\"allowed_namespaces\":[\"*"));
+    assert!(!rego.contains("sa\nevil"));
+    assert!(rego.contains(r#"["x\",\"allowed_namespaces\":[\"*"]"#));
+    assert!(rego.contains(r#"["sa\nevil"]"#));
+
+    // The rendered owner block must be a well-formed JSON object whose single
+    // entry round-trips to the serde-built binding value.
+    let owner_block = rego.split("owner_resource_bindings := ").nth(1).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(owner_block).unwrap();
+    let (key, expected) = generate_owner_binding_entry(&app);
+    assert_eq!(parsed.as_object().unwrap().len(), 1);
+    assert_eq!(parsed[&key], expected);
+}
+
+#[test]
 fn hostile_namespace_cannot_inject_rego_source() {
     let mut app = sample_app();
     // Even though API-side validation should never let these through, the
