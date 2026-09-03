@@ -39,6 +39,25 @@ pub enum PlatformReleaseError {
     BadSignature(String),
     #[error("policy_template_sha256 does not match policy_template_text")]
     TemplateHashMismatch,
+    #[error(
+        "platform release downgrade refused: override is {override_version} ({override_created}) but the CLI bundles {bundled_version} ({bundled_created}); refusing a validly-signed stale release"
+    )]
+    DowngradeRefused {
+        override_version: String,
+        override_created: String,
+        bundled_version: String,
+        bundled_created: String,
+    },
+    #[error(
+        "platform release downgrade refused: API {api} previously served {last_version} ({last_created}) but now offers {incoming_version} ({incoming_created}); refusing a validly-signed stale release"
+    )]
+    ApiDowngradeRefused {
+        api: String,
+        incoming_version: String,
+        incoming_created: String,
+        last_version: String,
+        last_created: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,14 +114,81 @@ impl PlatformRelease {
 
 impl PlatformReleaseEnvelope {
     pub fn load_verified() -> Result<Self, PlatformReleaseError> {
+        let override_active = matches!(std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH"), Ok(path) if !path.trim().is_empty());
         let raw = match std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH") {
             Ok(path) if !path.trim().is_empty() => std::fs::read_to_string(Path::new(&path))?,
             _ => BUNDLED_PLATFORM_RELEASE.to_string(),
         };
         let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
         verify_envelope(envelope.clone())?;
+        // Downgrade protection: an env-path override may never be older than
+        // the release compiled into this binary. A validly-signed stale
+        // release (pinned to old measurements/sidecar digests) is exactly
+        // what a file-swap or env-var attack serves.
+        if override_active {
+            enforce_release_not_older_than_bundled(&envelope.payload)?;
+        }
         Ok(envelope)
     }
+}
+
+/// Reject `release` when it is older than the release compiled into this
+/// binary. Applied to every release source that did not itself come from the
+/// bundle: env-path overrides AND API-provided envelopes (a compromised API
+/// can serve an old, still-validly-signed envelope with a matching
+/// `current_platform_release_id`, otherwise the CLI would sign against
+/// stale measurements, policy, and sidecar digests).
+pub fn enforce_release_not_older_than_bundled(
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    let Ok(bundled) = serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+    else {
+        return Ok(());
+    };
+    if release_is_older(release, &bundled.payload)? {
+        return Err(PlatformReleaseError::DowngradeRefused {
+            override_version: release.platform_release_version.clone(),
+            override_created: release.created_at.clone(),
+            bundled_version: bundled.payload.platform_release_version.clone(),
+            bundled_created: bundled.payload.created_at.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Ordering by the signed creation timestamp. `platform_release_version` is
+/// opaque, so distinct releases at the same timestamp are unorderable and
+/// fail closed rather than using the identifier as a tiebreak.
+fn release_is_older(
+    candidate: &PlatformRelease,
+    bundled: &PlatformRelease,
+) -> Result<bool, PlatformReleaseError> {
+    release_pair_is_older(
+        (&candidate.platform_release_version, &candidate.created_at),
+        (&bundled.platform_release_version, &bundled.created_at),
+    )
+}
+
+/// Same ordering on bare (version, created_at) pairs — shared by the
+/// API-baseline store, which persists only the pair.
+fn release_pair_is_older(
+    candidate: (&str, &str),
+    baseline: (&str, &str),
+) -> Result<bool, PlatformReleaseError> {
+    let candidate_ts = parse_release_timestamp(candidate.1)?;
+    let baseline_ts = parse_release_timestamp(baseline.1)?;
+    Ok(candidate_ts < baseline_ts || (candidate_ts == baseline_ts && candidate.0 != baseline.0))
+}
+
+fn parse_release_timestamp(
+    value: &str,
+) -> Result<chrono::DateTime<chrono::FixedOffset>, PlatformReleaseError> {
+    chrono::DateTime::parse_from_rfc3339(value).map_err(|error| {
+        PlatformReleaseError::InvalidField {
+            field: "created_at",
+            message: format!("must be RFC3339: {error}"),
+        }
+    })
 }
 
 pub fn verify_envelope(
@@ -265,12 +351,163 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: "must be a concrete pinned generator version".to_string(),
         });
     }
+    parse_release_timestamp(&release.created_at)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn release(version: &str, created_at: &str) -> PlatformRelease {
+        PlatformRelease {
+            schema_version: "v1".into(),
+            platform_release_version: version.into(),
+            signing_service_url: "https://signing.example".into(),
+            signing_service_pubkey_hex: "00".repeat(32),
+            policy_template_id: "t".into(),
+            policy_template_sha256: "00".repeat(32),
+            policy_template_text: "".into(),
+            attestation_proxy_image: "img".into(),
+            caddy_ingress_image: "img".into(),
+            trustee_kbs_url: "https://kbs.example".into(),
+            trustee_kbs_ca_cert_pem: "".into(),
+            tenant_caddy_tls_mode: "letsencrypt".into(),
+            tenant_caddy_acme_ca: "https://acme-staging.example".into(),
+            expected_firmware_measurement: "00".repeat(48),
+            expected_runtime_class: "kata-qemu-snp".into(),
+            genpolicy_version: "0".into(),
+            created_at: created_at.into(),
+        }
+    }
+
+    #[test]
+    fn release_ordering_uses_the_signed_timestamp_not_the_version_suffix() {
+        // Identifiers carry a non-monotonic hash suffix: lexicographic
+        // comparison would call the NEWER release (newer timestamp, suffix
+        // sorting lower) older, and vice versa.
+        let older = release("dev-2026.07.28-proxy-ffffffff", "2026-07-28T00:00:00Z");
+        let newer = release("dev-2026.08.15-proxy-00000000", "2026-08-15T00:00:00Z");
+        assert!(release_is_older(&older, &newer).unwrap());
+        assert!(!release_is_older(&newer, &older).unwrap());
+        assert!(!release_is_older(&newer, &newer).unwrap());
+
+        let same_time_a = release("release-ffffffff", "2026-08-15T00:00:00Z");
+        let same_time_b = release("release-00000000", "2026-08-15T00:00:00Z");
+        assert!(release_is_older(&same_time_a, &same_time_b).unwrap());
+        assert!(release_is_older(&same_time_b, &same_time_a).unwrap());
+    }
+
+    #[test]
+    fn unparseable_candidate_timestamp_is_rejected() {
+        let bundled = release("r1", "2026-08-15T00:00:00Z");
+        let broken = release("r2", "not-a-timestamp");
+        assert!(matches!(
+            release_is_older(&broken, &bundled),
+            Err(PlatformReleaseError::InvalidField {
+                field: "created_at",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn malformed_baseline_fails_closed_instead_of_resetting_the_high_water_mark() {
+        let dir = std::env::temp_dir().join(format!("pr-baseline-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("baselines.json");
+        std::fs::write(&store, "{ not json").unwrap();
+
+        let ok_release = release("r9", "2026-09-01T00:00:00Z");
+        assert!(
+            enforce_release_not_older_than_last_accepted(&store, "https://api", &ok_release)
+                .is_err()
+        );
+        assert!(api_served_release_before(&store, "https://api").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unparseable_baseline_timestamp_is_rejected_without_replacement() {
+        let dir = std::env::temp_dir().join(format!("pr-baseline-time-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("baselines.json");
+        let baseline = r#"{
+            "https://api": {
+                "platform_release_version": "r8",
+                "created_at": "not-a-timestamp"
+            }
+        }"#;
+        std::fs::write(&store, baseline).unwrap();
+
+        let incoming = release("r9", "2026-09-01T00:00:00Z");
+        assert!(matches!(
+            enforce_release_not_older_than_last_accepted(&store, "https://api", &incoming),
+            Err(PlatformReleaseError::InvalidField {
+                field: "created_at",
+                ..
+            })
+        ));
+        assert_eq!(std::fs::read_to_string(&store).unwrap(), baseline);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn per_api_baseline_allows_older_than_bundle_but_refuses_api_downgrades() {
+        let dir = std::env::temp_dir().join(format!("pr-baseline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("baselines.json");
+
+        // A preprod API serving an OLDER-than-bundle release is fine the
+        // first time (the bundle is not that environment's high-water mark).
+        let api_release = release("preprod-2026.07.12-x", "2026-07-12T09:33:00Z");
+        enforce_release_not_older_than_last_accepted(&store, "https://preprod.api", &api_release)
+            .unwrap();
+
+        // Same release again (idempotent) and a NEWER one both pass.
+        enforce_release_not_older_than_last_accepted(&store, "https://preprod.api", &api_release)
+            .unwrap();
+        let newer = release("preprod-2026.08.01-y", "2026-08-01T00:00:00Z");
+        enforce_release_not_older_than_last_accepted(&store, "https://preprod.api", &newer)
+            .unwrap();
+
+        let equal_time_divergence = release("preprod-2026.08.01-other", "2026-08-01T00:00:00Z");
+        assert!(matches!(
+            enforce_release_not_older_than_last_accepted(
+                &store,
+                "https://preprod.api",
+                &equal_time_divergence,
+            ),
+            Err(PlatformReleaseError::ApiDowngradeRefused { .. })
+        ));
+
+        // An older one is refused (replayed stale envelope from the same API).
+        let stale = release("preprod-2026.07.30-z", "2026-07-30T00:00:00Z");
+        assert!(matches!(
+            enforce_release_not_older_than_last_accepted(&store, "https://preprod.api", &stale),
+            Err(PlatformReleaseError::ApiDowngradeRefused { .. })
+        ));
+
+        // A different API has its own baseline.
+        assert!(
+            enforce_release_not_older_than_last_accepted(&store, "https://other.api", &stale)
+                .is_ok()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn api_release_older_than_bundle_is_refused() {
+        // The bundled release is current by definition; anything with an
+        // older signed timestamp loses regardless of identifier.
+        let bundled = PlatformReleaseEnvelope::load_verified().unwrap();
+        let stale = release("zzz-newer-suffix", "2020-01-01T00:00:00Z");
+        assert!(matches!(
+            enforce_release_not_older_than_bundled(&stale),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
+        ));
+        drop(bundled);
+    }
 
     #[test]
     fn bundled_release_verifies_and_hashes_template() {
@@ -325,6 +562,28 @@ mod tests {
     }
 
     #[test]
+    fn older_override_release_is_detected() {
+        let bundled: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+
+        let mut older_version = bundled.payload.clone();
+        older_version.platform_release_version =
+            format!("dev-2000.01.01-{}", older_version.platform_release_version);
+        assert!(release_is_older(&older_version, &bundled.payload).unwrap());
+
+        let mut older_created = bundled.payload.clone();
+        older_created.created_at = "2000-01-01T00:00:00Z".to_string();
+        assert!(release_is_older(&older_created, &bundled.payload).unwrap());
+
+        let mut divergent_version = bundled.payload.clone();
+        divergent_version.platform_release_version =
+            format!("z-{}", divergent_version.platform_release_version);
+        assert!(release_is_older(&divergent_version, &bundled.payload).unwrap());
+
+        assert!(!release_is_older(&bundled.payload, &bundled.payload).unwrap());
+    }
+
+    #[test]
     fn release_payload_rejects_http_kbs_url() {
         let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
         let mut payload = raw.payload;
@@ -347,4 +606,110 @@ mod tests {
             matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_tls_mode")
         );
     }
+
+    #[test]
+    fn release_payload_rejects_unparseable_created_at() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.created_at = "not-a-timestamp".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "created_at")
+        );
+    }
+}
+
+/// Per-API anti-downgrade baseline. The bundled release is NOT a high-water
+/// mark for API-provided envelopes — a preprod API can legitimately serve an
+/// older active release than this CLI bundles. Instead, persist the newest
+/// release accepted from each API origin and refuse anything older than the
+/// last one that API served. The bundled-release baseline stays reserved for
+/// local env-path overrides (file-swap defense).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ApiReleaseBaseline {
+    /// api origin (scheme://host[:port]) -> last accepted release
+    #[serde(flatten)]
+    pub entries: std::collections::BTreeMap<String, BaselineEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BaselineEntry {
+    pub platform_release_version: String,
+    pub created_at: String,
+}
+
+/// Read the baseline store. Only a missing file means "first run": a
+/// baseline that exists but cannot be read or parsed fails closed —
+/// treating corruption as empty would accept a stale envelope and overwrite
+/// the high-water mark.
+fn read_baseline(store_path: &std::path::Path) -> Result<ApiReleaseBaseline, PlatformReleaseError> {
+    match std::fs::read_to_string(store_path) {
+        Ok(raw) => Ok(serde_json::from_str(&raw)?),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(ApiReleaseBaseline::default()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// True once this API origin has served a signed release. Used to fail
+/// closed when an API that previously supplied an envelope stops supplying
+/// one (a compromised API must not be able to drop the envelope and push
+/// signing back onto the local fallback).
+pub fn api_served_release_before(
+    store_path: &std::path::Path,
+    api_origin: &str,
+) -> Result<bool, PlatformReleaseError> {
+    Ok(read_baseline(store_path)?.entries.contains_key(api_origin))
+}
+
+pub fn enforce_release_not_older_than_last_accepted(
+    store_path: &std::path::Path,
+    api_origin: &str,
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    // The whole read/compare/write is serialized across processes: two
+    // concurrent deploys could otherwise both read the same state and one
+    // write a stale mark (or drop the other API's entry entirely).
+    let lock_path = store_path.with_extension("lock");
+    crate::fslock::with_file_lock(&lock_path, || {
+        enforce_release_not_older_than_last_accepted_locked(store_path, api_origin, release)
+    })
+}
+
+fn enforce_release_not_older_than_last_accepted_locked(
+    store_path: &std::path::Path,
+    api_origin: &str,
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    parse_release_timestamp(&release.created_at)?;
+    let mut baseline = read_baseline(store_path)?;
+    if let Some(last) = baseline.entries.get(api_origin)
+        && release_pair_is_older(
+            (&release.platform_release_version, &release.created_at),
+            (&last.platform_release_version, &last.created_at),
+        )?
+    {
+        return Err(PlatformReleaseError::ApiDowngradeRefused {
+            api: api_origin.to_string(),
+            incoming_version: release.platform_release_version.clone(),
+            incoming_created: release.created_at.clone(),
+            last_version: last.platform_release_version.clone(),
+            last_created: last.created_at.clone(),
+        });
+    }
+    let entry = BaselineEntry {
+        platform_release_version: release.platform_release_version.clone(),
+        created_at: release.created_at.clone(),
+    };
+    if baseline.entries.get(api_origin) != Some(&entry) {
+        baseline.entries.insert(api_origin.to_string(), entry);
+        let parent = store_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer_pretty(tmp.as_file_mut(), &baseline)?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(store_path).map_err(|error| error.error)?;
+    }
+    Ok(())
 }

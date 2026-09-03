@@ -9,6 +9,13 @@ struct ContextInput {
     observed_channel_spki_sha256: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ExpectedReceiptInput {
+    policy_sha256: String,
+    challenge_nonce: String,
+    target_origin: String,
+}
+
 #[wasm_bindgen]
 pub fn verify_bundle(bundle: &[u8], policy: &[u8], context_json: &str) -> Result<String, JsError> {
     Ok(serde_json::to_string(&verify_input(
@@ -27,6 +34,45 @@ pub fn verify_bundle_sha256(
     Ok(hex::encode(enclava_verifier::canonical_result_sha256(
         &verify_input(bundle, policy, context_json)?,
     )))
+}
+
+#[wasm_bindgen]
+pub fn verify_appraisal_response_pinned(
+    response: &[u8],
+    appraiser_policy_json: &str,
+    now_unix_seconds: u64,
+    expected_json: &str,
+) -> Result<String, JsError> {
+    verify_appraisal_input(
+        response,
+        appraiser_policy_json,
+        now_unix_seconds,
+        expected_json,
+    )
+    .map_err(|error| JsError::new(&error))
+}
+
+fn verify_appraisal_input(
+    response: &[u8],
+    appraiser_policy_json: &str,
+    now_unix_seconds: u64,
+    expected_json: &str,
+) -> Result<String, String> {
+    let policy = serde_json::from_str(appraiser_policy_json).map_err(|error| error.to_string())?;
+    let expected: ExpectedReceiptInput =
+        serde_json::from_str(expected_json).map_err(|error| error.to_string())?;
+    let verified = enclava_verifier::verify_appraisal_response_pinned(
+        response,
+        &policy,
+        now_unix_seconds,
+        &enclava_verifier::ExpectedReceipt {
+            policy_sha256: &expected.policy_sha256,
+            challenge_nonce: &expected.challenge_nonce,
+            target_origin: &expected.target_origin,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    serde_json::to_string(&verified).map_err(|error| error.to_string())
 }
 
 fn verify_input(
@@ -71,5 +117,17 @@ mod tests {
     fn rejects_malformed_context_before_verification() {
         assert!(decode_32("00", "challenge_nonce").is_err());
         assert!(decode_32(&"AA".repeat(32), "challenge_nonce").is_err());
+    }
+
+    #[test]
+    fn appraisal_export_requires_every_relying_party_binding() {
+        let error = verify_appraisal_input(
+            b"{}",
+            "{}",
+            0,
+            r#"{"policy_sha256":"00","challenge_nonce":"11"}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("target_origin"));
     }
 }

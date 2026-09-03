@@ -7,7 +7,7 @@
 //! `OK\n` or `ERR <reason>\n`.
 
 use base64::Engine as _;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 
@@ -53,9 +53,14 @@ pub fn bind_with_peer_gid(socket_path: &Path, peer_gid: Option<u32>) -> Result<U
 }
 
 fn read_request_line(stream: &mut UnixStream) -> Result<String> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let reader = BufReader::new(stream.try_clone()?);
+    // Bound the read BEFORE read_line: a peer that streams an unbounded line
+    // must not be able to grow the buffer indefinitely (memory-exhaustion
+    // from any locally connected process).
     let mut buf = String::new();
-    let n = reader.read_line(&mut buf)?;
+    let n = reader
+        .take((MAX_PASSWORD_LEN + 1) as u64)
+        .read_line(&mut buf)?;
     if n == 0 {
         return Err(InitError::Config("empty unlock request".into()));
     }
@@ -178,5 +183,35 @@ mod tests {
         drop(server_stream);
         let reply = handle.join().unwrap();
         assert_eq!(reply.trim(), "OK");
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_without_unbounded_buffer_growth() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("unlock.sock");
+        let listener = bind(&path).unwrap();
+
+        let path_clone = path.clone();
+        let handle = thread::spawn(move || {
+            let mut client = UnixStream::connect(&path_clone).unwrap();
+            // Vastly over the limit and never newline-terminated: the read
+            // must stop at the cap instead of consuming the stream.
+            client
+                .write_all(&vec![b'a'; 10 * MAX_PASSWORD_LEN])
+                .unwrap();
+            client.flush().unwrap();
+            let mut reply = String::new();
+            let mut reader = BufReader::new(client);
+            let _ = reader.read_line(&mut reply);
+            reply
+        });
+
+        let (mut server_stream, _) = listener.accept().unwrap();
+        let err = read_password_line(&mut server_stream).unwrap_err();
+        assert!(err.to_string().contains("too large"));
+        reply_err(&mut server_stream, "too large").unwrap();
+        drop(server_stream);
+        drop(listener);
+        let _ = handle.join().unwrap();
     }
 }

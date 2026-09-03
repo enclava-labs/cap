@@ -243,7 +243,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
         storage_password.ensure_available_for_password_mode("password-mode template deploy")?;
     }
     // Authenticate platform authority before keyring registration or app creation.
-    fetch_verified_platform_release(api).await?;
+    fetch_verified_platform_release(api, &ctx.paths).await?;
     let capture = if args.no_store_mnemonic {
         MnemonicCapture::Skip
     } else {
@@ -2069,9 +2069,11 @@ async fn fetch_direct_ssh_command(
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
         // The app command is non-secret and is validated against the PaaS-reserved endpoint.
-        // Preprod uses Let's Encrypt staging chains, so this fallback must not depend on
-        // public browser trust roots to confirm workload readiness.
-        .danger_accept_invalid_certs(true)
+        // TLS verification is only relaxed under the same debug-gated env vars that govern
+        // every other TEE channel (see accepts_invalid_tee_certs); release builds verify
+        // normally and simply lose this readiness fallback when the relay presents an
+        // untrusted (e.g. Let's Encrypt staging) chain.
+        .danger_accept_invalid_certs(enclava_cli::tee_client::accepts_invalid_tee_certs())
         .build()?;
     let response = match client
         .get(ssh_url)
@@ -3371,7 +3373,7 @@ mod tests {
         let body = &source[deploy_start..deploy_end];
 
         let verify_platform = body
-            .find("fetch_verified_platform_release(api).await?")
+            .find("fetch_verified_platform_release(api, &ctx.paths)")
             .expect("template deploy verifies the signed platform release");
         let bootstrap = body
             .find("template_bootstrap_pubkey_hash")

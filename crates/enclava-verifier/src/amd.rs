@@ -44,6 +44,14 @@ pub enum AmdVerificationError {
     RevocationDataExpired,
 }
 
+/// Maximum accepted RSA modulus size. AMD ARK/ASK use 4096-bit RSA; anything
+/// larger is rejected before any modular exponentiation so that an
+/// attacker-supplied key cannot force an unbounded `modpow` (CPU-exhaustion
+/// DoS on the public appraiser).
+const MAX_RSA_MODULUS_BITS: u64 = 8192;
+/// Maximum accepted RSA public-exponent size (AMD uses 65537).
+const MAX_RSA_EXPONENT_BITS: u64 = 64;
+
 pub fn verify_amd_revocation(
     ark_der: &[u8],
     ask_der: &[u8],
@@ -51,7 +59,17 @@ pub fn verify_amd_revocation(
     crl_der: &[u8],
     now_unix_seconds: u64,
     maximum_age_seconds: u64,
+    trusted_ark_sha256: &[[u8; 32]],
 ) -> Result<(), AmdVerificationError> {
+    // The CRL is verified with the ARK's RSA key. Only a policy-pinned ARK may
+    // reach that math: an unpinned, bundle-supplied ARK is attacker-chosen
+    // input (the certificate-chain path already enforces the same pin).
+    if !trusted_ark_sha256
+        .iter()
+        .any(|trusted| Sha256::digest(ark_der).as_slice() == trusted)
+    {
+        return Err(AmdVerificationError::UntrustedArk);
+    }
     let ark =
         Certificate::from_der(ark_der).map_err(|_| AmdVerificationError::InvalidCertificate)?;
     let ask =
@@ -281,7 +299,14 @@ fn verify_rsa_pss_sha384(
 
     let modulus = num_bigint::BigUint::from_bytes_be(modulus);
     let exponent = num_bigint::BigUint::from_bytes_be(exponent);
-    let modulus_bits = modulus.bits() as usize;
+    let modulus_bits = modulus.bits();
+    if modulus_bits == 0 || modulus_bits > MAX_RSA_MODULUS_BITS {
+        return false;
+    }
+    if exponent.bits() > MAX_RSA_EXPONENT_BITS {
+        return false;
+    }
+    let modulus_bits = modulus_bits as usize;
     let encoded_bits = modulus_bits.saturating_sub(1);
     let encoded_len = encoded_bits.div_ceil(8);
     if signature.len() != modulus_bits.div_ceil(8) || encoded_len < HASH_BYTES * 2 + 2 {
@@ -447,20 +472,22 @@ mod tests {
         let ask = fixture("ask");
         let vcek = fixture("vcek");
         let crl = fixture("crl");
+        let pinned: [u8; 32] = Sha256::digest(&ark).into();
+        let trusted = &[pinned];
         assert_eq!(
-            verify_amd_revocation(&ark, &ask, &vcek, &crl, 1_785_844_800, 30 * 86_400),
+            verify_amd_revocation(&ark, &ask, &vcek, &crl, 1_785_844_800, 30 * 86_400, trusted),
             Ok(())
         );
         assert_eq!(
-            verify_amd_revocation(&ask, &ask, &vcek, &crl, 1_785_844_800, 30 * 86_400),
-            Err(AmdVerificationError::InvalidRevocationList)
+            verify_amd_revocation(&ask, &ask, &vcek, &crl, 1_785_844_800, 30 * 86_400, trusted),
+            Err(AmdVerificationError::UntrustedArk)
         );
         assert_eq!(
-            verify_amd_revocation(&ark, &ask, &vcek, &crl, 1_787_227_200, 7 * 86_400),
+            verify_amd_revocation(&ark, &ask, &vcek, &crl, 1_787_227_200, 7 * 86_400, trusted),
             Err(AmdVerificationError::RevocationDataStale)
         );
         assert_eq!(
-            verify_amd_revocation(&ark, &ask, &vcek, &crl, 1_790_812_800, 90 * 86_400),
+            verify_amd_revocation(&ark, &ask, &vcek, &crl, 1_790_812_800, 90 * 86_400, trusted),
             Err(AmdVerificationError::RevocationDataExpired)
         );
 
@@ -487,8 +514,63 @@ mod tests {
                 &crl,
                 1_785_844_800,
                 30 * 86_400,
+                trusted,
             ),
             Err(AmdVerificationError::AskRevoked)
+        );
+    }
+
+    #[test]
+    fn revocation_rejects_unpinned_ark_before_any_rsa_math() {
+        let ark = fixture("ark");
+        let ask = fixture("ask");
+        let vcek = fixture("vcek");
+        let crl = fixture("crl");
+        // No pinned ARK (or a wrong pin) must be rejected before certificate
+        // parsing or `modpow`, so attacker-supplied RSA parameters can never
+        // drive the CRL verification path.
+        assert_eq!(
+            verify_amd_revocation(&ark, &ask, &vcek, &crl, 1_785_844_800, 30 * 86_400, &[]),
+            Err(AmdVerificationError::UntrustedArk)
+        );
+        assert_eq!(
+            verify_amd_revocation(
+                &ark,
+                &ask,
+                &vcek,
+                &crl,
+                1_785_844_800,
+                30 * 86_400,
+                &[[0; 32]],
+            ),
+            Err(AmdVerificationError::UntrustedArk)
+        );
+    }
+
+    #[test]
+    fn rsa_pss_rejects_oversized_modulus_and_exponent_quickly() {
+        // ~16 Kib modulus + oversized exponent: the historic CPU-exhaustion
+        // primitive. The caps must reject without spending measurable time.
+        let oversized_modulus = vec![0xff; 2048];
+        let oversized_exponent = vec![0xff; 64];
+        let signature = vec![0x00; 2048];
+        let start = std::time::Instant::now();
+        assert!(!verify_rsa_pss_sha384(
+            &oversized_modulus,
+            &[1],
+            b"message",
+            &signature
+        ));
+        assert!(!verify_rsa_pss_sha384(
+            &[0xff; 512],
+            &oversized_exponent,
+            b"message",
+            &[0x00; 512]
+        ));
+        assert!(!verify_rsa_pss_sha384(&[0x00], &[1], b"message", &[0]));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "oversized RSA parameters must be rejected before modpow"
         );
     }
 }

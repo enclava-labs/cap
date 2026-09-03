@@ -407,6 +407,18 @@ pub(crate) enum EgressAllowlistAuditReason {
     RebindingHelper,
 }
 
+impl EgressAllowlistAuditReason {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            EgressAllowlistAuditReason::Localhost => "localhost",
+            EgressAllowlistAuditReason::Metadata => "metadata",
+            EgressAllowlistAuditReason::KubernetesService => "kubernetes-service",
+            EgressAllowlistAuditReason::InternalDnsSuffix => "internal-dns-suffix",
+            EgressAllowlistAuditReason::RebindingHelper => "rebinding-helper",
+        }
+    }
+}
+
 pub(crate) fn validate_egress_allowlist(
     rules: &[CreateEgressAllowRule],
 ) -> Result<Vec<EgressRule>, String> {
@@ -426,7 +438,7 @@ pub(crate) fn validate_egress_allowlist(
             }
             enclava_common::validate::validate_fqdn(host)
                 .map_err(|e| format!("invalid egress_allowlist host: {e}"))?;
-            audit_egress_allowlist_host(host);
+            enforce_egress_allowlist_host(host)?;
 
             let ports = rule.ports.clone().unwrap_or_else(|| vec![443]);
             if ports.is_empty() || ports.contains(&0) {
@@ -441,17 +453,41 @@ pub(crate) fn validate_egress_allowlist(
         .collect()
 }
 
-fn audit_egress_allowlist_host(host: &str) {
+/// Internal, cluster, metadata, and DNS-rebinding helper hosts are rejected
+/// from tenant egress allowlists: opening TEE egress to the Kubernetes API
+/// server or cloud metadata endpoints is a platform-level risk, not a tenant
+/// preference. Operators with an explicit use case can opt in process-wide
+/// with `CAP_EGRESS_ALLOW_INTERNAL_HOSTS=true` (audited, logged per host).
+fn enforce_egress_allowlist_host(host: &str) -> Result<(), String> {
     let reasons = egress_allowlist_host_audit_reasons(host);
     if reasons.is_empty() {
-        return;
+        return Ok(());
     }
 
-    tracing::warn!(
-        host = %host,
-        reasons = ?reasons,
-        "egress_allowlist host matched internal/rebinding audit pattern; accepting in warn-only mode"
-    );
+    if internal_egress_allowlist_enabled() {
+        tracing::warn!(
+            host = %host,
+            reasons = ?reasons,
+            "egress_allowlist host matched internal/rebinding pattern; accepted because CAP_EGRESS_ALLOW_INTERNAL_HOSTS is set"
+        );
+        return Ok(());
+    }
+
+    let reasons = reasons
+        .iter()
+        .map(|reason| reason.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "egress_allowlist host {host} targets an internal or rebinding-helper endpoint \
+         ({reasons}); tenant egress to internal endpoints is not allowed"
+    ))
+}
+
+pub(crate) fn internal_egress_allowlist_enabled() -> bool {
+    std::env::var("CAP_EGRESS_ALLOW_INTERNAL_HOSTS")
+        .map(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
 }
 
 pub(crate) fn egress_allowlist_host_audit_reasons(host: &str) -> Vec<EgressAllowlistAuditReason> {

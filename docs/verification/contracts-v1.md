@@ -72,3 +72,16 @@ observe the live TLS connection. A policy requiring it cannot pass in that conte
 
 Machine-readable appraiser/result schemas are in `schema/`; stable codes are listed in
 `reason-codes-v1.md`. The canonical Rust receipt verifier is `verify_appraisal_response`.
+
+## Policy-signing-service authority fields
+
+The policy-signing-service bootstrap/rotate responses carry an
+`owner_pubkey_fingerprint` field. Despite the name, **it is `hex(raw 32-byte
+owner Ed25519 public key)`, not a SHA-256 digest**. Every in-repo
+"fingerprint" is a digest (`owner_key_fingerprint` in
+`enclava-api/src/routes/orgs.rs`, keyring fingerprints in
+`enclava-cli/src/keyring.rs`); this field is the sole exception because the
+encoding is owned by the policy-signing-service. Consumers byte-compare it
+against `hex::encode(<pubkey>)`; if the service ever emits a real digest those
+consistency checks fail closed (bootstrap/rotation refuses). Changing the
+encoding is a coordinated contract change (AGENTS.md blocking rules apply).

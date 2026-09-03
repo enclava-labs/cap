@@ -123,6 +123,8 @@ fn new_jti() -> String {
 
 fn session_validator() -> Validation {
     let mut validation = Validation::new(Algorithm::HS256);
+    // No expiry leeway: issued and validated on the same fleet of clocks.
+    validation.leeway = 0;
     validation.set_required_spec_claims(&["sub", "exp", "iat", "iss", "aud"]);
     validation.set_issuer(&[TOKEN_ISSUER]);
     validation.set_audience(&[SESSION_AUDIENCE]);
@@ -140,6 +142,9 @@ fn config_validator() -> Validation {
 
 fn signer_rotation_validator() -> Validation {
     let mut validation = Validation::new(Algorithm::HS256);
+    // Rotation tokens live 10 minutes; a 60 s default leeway would be 10% of
+    // their lifetime.
+    validation.leeway = 0;
     validation.set_required_spec_claims(&["sub", "exp", "iat", "iss", "aud"]);
     validation.set_issuer(&[TOKEN_ISSUER]);
     validation.set_audience(&[SIGNER_ROTATION_AUDIENCE]);

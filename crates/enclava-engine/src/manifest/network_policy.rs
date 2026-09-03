@@ -13,7 +13,7 @@ const PLATFORM_DEFAULT_FQDNS: &[&str] = &[
 ];
 
 const PUBLIC_INTERNET_CIDR: &str = "0.0.0.0/0";
-const PUBLIC_INTERNET_DEFAULT_EXCLUDED_CIDRS: &[&str] = &[
+const IPV4_NON_PUBLIC_CIDRS: &[&str] = &[
     "0.0.0.0/8",
     "10.0.0.0/8",
     "100.64.0.0/10",
@@ -28,6 +28,26 @@ const PUBLIC_INTERNET_DEFAULT_EXCLUDED_CIDRS: &[&str] = &[
     "203.0.113.0/24",
     "224.0.0.0/4",
     "240.0.0.0/4",
+];
+
+const IPV6_NON_PUBLIC_CIDRS: &[&str] = &[
+    "::/128",
+    "::1/128",
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
+    "2002::/16",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+];
+const METADATA_AND_LINK_LOCAL_CIDRS: &[&str] = &[
+    "100.100.100.200/32",
+    "169.254.0.0/16",
+    "64:ff9b::/96",
+    "64:ff9b:1::/48",
+    "2002::/16",
+    "fd00:ec2::254/128",
+    "fe80::/10",
 ];
 
 /// Generate a CiliumNetworkPolicy (cilium.io/v2 CRD).
@@ -166,6 +186,16 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
         egress.push(egress_rule_value(rule));
     }
 
+    let denied_cidrs = if app.allow_internal_egress {
+        METADATA_AND_LINK_LOCAL_CIDRS.to_vec()
+    } else {
+        IPV4_NON_PUBLIC_CIDRS
+            .iter()
+            .chain(IPV6_NON_PUBLIC_CIDRS)
+            .copied()
+            .collect()
+    };
+
     json!({
         "apiVersion": "cilium.io/v2",
         "kind": "CiliumNetworkPolicy",
@@ -181,6 +211,17 @@ pub fn generate_network_policy(app: &ConfidentialApp) -> Value {
             "endpointSelector": {},
             "ingress": ingress,
             "egress": egress,
+            // Name-layer denylists (internal/metadata hostnames) are
+            // bypassable by a tenant-controlled domain whose A/AAAA record
+            // points at non-public space: `toFQDNs` authorizes whatever the
+            // DNS layer resolves. Cilium CIDR selectors apply to external
+            // identities, not Cilium-managed endpoints. The audited operator
+            // opt-in permits private external services, but metadata and
+            // link-local endpoints remain unreachable. Deny rules outrank
+            // every external allow.
+            "egressDeny": [
+                { "toCIDR": denied_cidrs }
+            ],
         }
     })
 }
@@ -230,7 +271,7 @@ fn amd_kds_relay_egress_rules(app: &ConfidentialApp) -> Vec<Value> {
 }
 
 fn public_internet_egress_rule(app: &ConfidentialApp) -> Value {
-    let mut excluded = PUBLIC_INTERNET_DEFAULT_EXCLUDED_CIDRS
+    let mut excluded = IPV4_NON_PUBLIC_CIDRS
         .iter()
         .map(|cidr| (*cidr).to_string())
         .collect::<Vec<_>>();

@@ -50,6 +50,19 @@ pub async fn create_org(
     State(state): State<AppState>,
     Json(body): Json<CreateOrgRequest>,
 ) -> Result<(StatusCode, Json<OrgResponse>), (StatusCode, Json<serde_json::Value>)> {
+    // PaaS-managed instances provision orgs exclusively through the
+    // authenticated /internal/paas routes; a public signup must not be able
+    // to create (or name-squat) orgs on them.
+    crate::routes::apps::ensure_management_write_allowed(&state, &auth).await?;
+    if enclava_common::validate::validate_dns_label(&body.name).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_org_name",
+                "message": "name must be a DNS-safe lowercase organization name ([a-z0-9-], max 63 chars)"
+            })),
+        ));
+    }
     let org_id = Uuid::new_v4();
 
     if let Err(e) = crate::db::orgs::insert_org_pool(
@@ -1033,6 +1046,8 @@ pub async fn rotate_org_owner(
             })
             .await
             .map_err(crate::routes::deployments::signing_error_response)?;
+        // `owner_pubkey_fingerprint` is hex(raw pubkey) by cross-repo contract
+        // (see SigningServiceClient response docs) — not a digest.
         if rotated.org_id != org_id
             || rotated.owner_pubkey_fingerprint != hex::encode(replacement_owner)
         {
@@ -1332,6 +1347,43 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
+
+    #[tokio::test]
+    async fn create_org_rejects_non_dns_safe_names_before_database_access() {
+        let state = crate::test_support::lazy_state();
+        let auth = crate::test_support::auth_context(Role::Owner, &[]);
+        for bad_name in ["Acme", "acme corp", "acme_", "-acme", "acme-", ""] {
+            let err = create_org(
+                auth.clone(),
+                State(state.clone()),
+                Json(CreateOrgRequest {
+                    name: bad_name.to_string(),
+                    display_name: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "name {bad_name:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_org_refuses_public_signups_on_paas_managed_instances() {
+        let mut state = crate::test_support::lazy_state();
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        let auth = crate::test_support::auth_context(Role::Owner, &[]);
+        let err = create_org(
+            auth,
+            State(state),
+            Json(CreateOrgRequest {
+                name: "acme".to_string(),
+                display_name: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+    }
 
     #[test]
     fn signing_readiness_requires_both_authorities_to_agree() {

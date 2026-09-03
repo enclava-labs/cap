@@ -180,6 +180,10 @@ fn internal_routes() -> Router<AppState> {
             axum::routing::delete(routes::internal::delete_paas_app),
         )
         .route(
+            "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state",
+            axum::routing::put(routes::internal::put_paas_app_desired_state),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/logs",
             axum::routing::get(routes::internal::get_paas_app_logs),
         )

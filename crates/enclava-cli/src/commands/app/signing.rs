@@ -26,11 +26,39 @@ pub(crate) fn platform_release_from_deployment_context(
 
 pub(crate) async fn fetch_verified_platform_release(
     api: &ApiClient,
+    paths: &enclava_cli::config::CliPaths,
 ) -> Result<(DeploymentContextResponse, PlatformRelease), Box<dyn std::error::Error>> {
     let deployment_context = api.deployment_context().await?;
     let release = match platform_release_from_deployment_context(&deployment_context)? {
-        Some(release) => release,
-        None => PlatformRelease::load_verified()?,
+        Some(release) => {
+            // Anti-downgrade baseline is per-API (an environment may serve an
+            // older active release than this CLI bundles); the bundled
+            // baseline applies only to local env-path overrides.
+            enclava_cli::platform_release::enforce_release_not_older_than_last_accepted(
+                &paths.api_release_baseline,
+                api.origin(),
+                &release,
+            )?;
+            release
+        }
+        None => {
+            // Once this API has served a signed release, omitting the
+            // envelope is a compromise signal, not a normal fallback: fail
+            // closed instead of signing against the bundled release (whose
+            // measurements may not match what the cluster runs).
+            if enclava_cli::platform_release::api_served_release_before(
+                &paths.api_release_baseline,
+                api.origin(),
+            )? {
+                return Err(format!(
+                    "platform API previously served a signed release but now omits it; refusing to fall back. \
+                     If the API intentionally stopped serving releases, remove {} after verifying with the operator.",
+                    paths.api_release_baseline.display()
+                )
+                .into());
+            }
+            PlatformRelease::load_verified()?
+        }
     };
     Ok((deployment_context, release))
 }
@@ -196,6 +224,8 @@ pub(crate) async fn ensure_manual_deploy_keyring(
     };
     if signing_owner.org_id != org_id.to_string()
         || !confirmed_bootstrap_state(&signing_owner.state)
+        // `owner_pubkey_fingerprint` is hex(raw pubkey) by cross-repo contract
+        // (see enclava-api signing_service.rs docs) — not a digest.
         || signing_owner.owner_pubkey_fingerprint != hex::encode(owner_key.public.to_bytes())
     {
         return Err(
@@ -358,6 +388,7 @@ pub(crate) fn confidential_app_for_cc_hash(
         },
         egress_mode: enclava_engine::types::EgressMode::Restricted,
         public_internet_egress_excluded_cidrs: Vec::new(),
+        allow_internal_egress: false,
         egress_allowlist: Vec::new(),
         log_encryption,
         workload_artifact_binding: Some(workload_artifact_binding),
@@ -536,7 +567,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         );
     }
 
-    let (deployment_context, release) = fetch_verified_platform_release(api).await?;
+    let (deployment_context, release) = fetch_verified_platform_release(api, paths).await?;
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
     let _signing_service_pubkey = release.signing_service_pubkey_bytes()?;
     let proxy_image = enclava_common::image::ImageRef::parse(&release.attestation_proxy_image)?;

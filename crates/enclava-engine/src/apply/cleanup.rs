@@ -69,36 +69,73 @@ impl Default for CleanupReport {
     }
 }
 
-/// Scale a StatefulSet to 0 replicas and wait for all pods to terminate.
-pub async fn scale_statefulset_to_zero(
+/// Set a StatefulSet to zero or one replica and wait for the observed state.
+pub async fn set_statefulset_desired_replicas(
     engine: &ApplyEngine,
     namespace: &str,
     name: &str,
+    desired_replicas: i32,
     timeout_duration: Duration,
     generation: MutationGeneration,
 ) -> Result<(), ApplyError> {
+    if !matches!(desired_replicas, 0 | 1) {
+        return Err(ApplyError::ManifestGeneration(
+            "desired replicas must be zero or one".to_string(),
+        ));
+    }
     let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), namespace);
 
-    // Patch replicas to 0
+    let current = api.get(name).await?;
+    let live_generation = current
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(super::generation::MUTATION_GENERATION_ANNOTATION))
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value > 0);
+    let observed = current.status.as_ref();
+    if live_generation.is_some_and(|value| value == generation.get())
+        && current
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.replicas)
+            .unwrap_or(1)
+            == desired_replicas
+        && observed
+            .and_then(|status| status.current_replicas)
+            .unwrap_or(0)
+            == desired_replicas
+        && observed
+            .and_then(|status| status.ready_replicas)
+            .unwrap_or(0)
+            == desired_replicas
+        && observed
+            .and_then(|status| status.updated_replicas)
+            .unwrap_or(0)
+            == desired_replicas
+    {
+        return Ok(());
+    }
+
     let patch = json!({
         "apiVersion": "apps/v1",
         "kind": "StatefulSet",
-        "spec": { "replicas": 0 }
+        "spec": { "replicas": desired_replicas }
     });
     apply_existing_partial(&api, name, &patch, generation).await?;
-    tracing::info!(namespace = %namespace, statefulset = %name, "scaled StatefulSet to 0");
+    tracing::info!(namespace = %namespace, statefulset = %name, desired_replicas, "set StatefulSet desired replicas");
 
-    // Wait for pods to terminate
     let start = Instant::now();
     loop {
         if start.elapsed() >= timeout_duration {
             return Err(ApplyError::CleanupStepFailed {
-                step: "scale_to_zero".to_string(),
-                detail: format!("pods did not terminate within {timeout_duration:?}"),
+                step: "set_desired_replicas".to_string(),
+                detail: format!("replicas did not converge within {timeout_duration:?}"),
             });
         }
 
         let sts = api.get(name).await?;
+        let desired = sts.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
         let ready = sts
             .status
             .as_ref()
@@ -109,18 +146,39 @@ pub async fn scale_statefulset_to_zero(
             .as_ref()
             .and_then(|s| s.current_replicas)
             .unwrap_or(0);
+        let updated = sts
+            .status
+            .as_ref()
+            .and_then(|s| s.updated_replicas)
+            .unwrap_or(0);
 
-        if ready == 0 && current == 0 {
+        if desired == desired_replicas
+            && current == desired_replicas
+            && ready == desired_replicas
+            && updated == desired_replicas
+        {
             tracing::info!(
                 namespace = %namespace,
                 statefulset = %name,
-                "all pods terminated"
+                desired_replicas,
+                "StatefulSet replicas converged"
             );
             return Ok(());
         }
 
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+/// Scale a StatefulSet to 0 replicas and wait for all pods to terminate.
+pub async fn scale_statefulset_to_zero(
+    engine: &ApplyEngine,
+    namespace: &str,
+    name: &str,
+    timeout_duration: Duration,
+    generation: MutationGeneration,
+) -> Result<(), ApplyError> {
+    set_statefulset_desired_replicas(engine, namespace, name, 0, timeout_duration, generation).await
 }
 
 /// Delete a StatefulSet.

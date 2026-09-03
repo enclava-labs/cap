@@ -26,6 +26,7 @@ dialoguer = { workspace = true }
 indicatif = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 colored = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
@@ -45,10 +46,11 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 x509-cert = { workspace = true }
 sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl", "serde"] }
+fd-lock = "4.0.4"
+tempfile = "3"
 
 [features]
 prod-strict = []
 
 [dev-dependencies]
 enclava-engine = { path = "../enclava-engine", features = ["testutil"] }
-tempfile = "3"

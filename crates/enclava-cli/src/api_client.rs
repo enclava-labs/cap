@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 /// Typed HTTP client for the Enclava Platform API.
 pub struct ApiClient {
     base_url: String,
+    origin: String,
     http: reqwest::Client,
     auth_token: Option<String>,
     org_hint: Option<String>,
@@ -27,17 +28,39 @@ pub enum ApiError {
 impl ApiClient {
     /// Create a new API client.
     pub fn new(base_url: &str, auth_token: Option<String>) -> Self {
+        // The bearer token must only transit TLS. Plain http remains possible
+        // only for loopback development endpoints (a local API server),
+        // decided on the *parsed* host: a string-prefix test would let
+        // `http://localhost@evil.example` (userinfo) or
+        // `http://localhost.evil.example` (subdomain) send credentials to a
+        // remote host over cleartext.
+        let https_only = !loopback_http_url(base_url);
         let http = reqwest::Client::builder()
             .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
+            .https_only(https_only)
             .build()
             .expect("failed to build HTTP client");
 
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let origin = reqwest::Url::parse(&base_url)
+            .ok()
+            .filter(|url| url.host().is_some())
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_else(|| base_url.clone());
+
         Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
+            origin,
             http,
             auth_token,
             org_hint: None,
         }
+    }
+
+    /// The API origin (scheme://host[:port]) used as the key for per-API
+    /// state such as the platform-release baseline.
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     /// Create a client from CLI config and credentials.
@@ -915,5 +938,68 @@ mod tests {
             template_instance_idempotency_key(&changed_descriptor),
             "new signed descriptors for a destroyed/recreated app name must use a new idempotency key"
         );
+    }
+}
+
+/// True only for http URLs whose parsed host is exactly `localhost` or a
+/// loopback IP. Anything else — including https URLs and unparseable input —
+/// forces TLS.
+pub fn loopback_http_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    if url.scheme() != "http" {
+        return false;
+    }
+    match url.host_str() {
+        Some(host) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod loopback_tests {
+    use super::{ApiClient, loopback_http_url};
+
+    #[test]
+    fn only_exact_loopback_hosts_are_plain_http() {
+        for ok in [
+            "http://127.0.0.1:8080",
+            "http://localhost",
+            "http://LOCALHOST:3000",
+            "http://[::1]:9090",
+            "http://127.8.9.10",
+        ] {
+            assert!(loopback_http_url(ok), "{ok}");
+        }
+        for evil in [
+            "http://localhost.evil.example",
+            "http://localhost@evil.example",
+            "http://127.0.0.1.evil.example",
+            "http://evil.example",
+            "https://evil.example",
+            "not a url",
+            "",
+        ] {
+            assert!(!loopback_http_url(evil), "{evil}");
+        }
+    }
+
+    #[test]
+    fn api_origin_is_canonicalized_for_security_state() {
+        for (configured, expected) in [
+            ("https://EXAMPLE.com:443/", "https://example.com"),
+            ("https://example.com", "https://example.com"),
+            ("https://example.com:8443/api", "https://example.com:8443"),
+        ] {
+            assert_eq!(ApiClient::new(configured, None).origin(), expected);
+        }
     }
 }

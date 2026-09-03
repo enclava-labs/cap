@@ -2,6 +2,7 @@ use enclava_engine::manifest::network_policy::{
     cap_api_namespace_for_attestation, generate_network_policy,
 };
 use enclava_engine::testutil::sample_app;
+use enclava_engine::types::EgressRule;
 
 #[test]
 fn network_policy_api_version() {
@@ -427,4 +428,63 @@ fn egress_allowlist_renders_one_rule_per_entry() {
     assert_eq!(egress[8]["toFQDNs"][0]["matchName"], "api.stripe.com");
     assert_eq!(egress[8]["toPorts"][0]["ports"][0]["port"], "443");
     assert_eq!(egress[9]["toFQDNs"][0]["matchName"], "hooks.slack.com");
+}
+
+#[test]
+fn generated_policy_denies_non_public_dns_results_by_default() {
+    // The hostname denylist is DNS-rebindable (a tenant-controlled FQDN can
+    // resolve into private, metadata, or link-local space and ride a toFQDNs
+    // allow rule).
+    // A Cilium egressDeny outranks every allow rule; it must always be
+    // present and must not depend on the egress allowlist contents.
+    // NOTE: the field is `toCIDR` (singular) — CiliumNetworkPolicy declares
+    // no `toCIDRs`; the wrong name is rejected by SSA against the CRD.
+    let app = sample_app();
+    let policy = enclava_engine::manifest::network_policy::generate_network_policy(&app);
+    let deny = &policy["spec"]["egressDeny"]
+        .as_array()
+        .expect("egressDeny must be an array");
+    let cidrs = deny[0]["toCIDR"].as_array().expect("toCIDR array");
+    for cidr in [
+        "10.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "64:ff9b::/96",
+        "64:ff9b:1::/48",
+        "2002::/16",
+        "fc00::/7",
+        "fe80::/10",
+    ] {
+        assert!(cidrs.iter().any(|value| value == cidr), "missing {cidr}");
+    }
+}
+
+#[test]
+fn internal_egress_opt_in_still_denies_metadata_and_link_local_results() {
+    let mut app = sample_app();
+    app.allow_internal_egress = true;
+    app.egress_allowlist = vec![EgressRule {
+        host: "database.internal".to_string(),
+        ports: vec![5432],
+    }];
+
+    let policy = generate_network_policy(&app);
+    let cidrs = policy["spec"]["egressDeny"][0]["toCIDR"]
+        .as_array()
+        .expect("toCIDR array");
+    for cidr in [
+        "100.100.100.200/32",
+        "169.254.0.0/16",
+        "64:ff9b::/96",
+        "64:ff9b:1::/48",
+        "2002::/16",
+        "fd00:ec2::254/128",
+        "fe80::/10",
+    ] {
+        assert!(cidrs.iter().any(|value| value == cidr), "missing {cidr}");
+    }
+    for cidr in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"] {
+        assert!(cidrs.iter().all(|value| value != cidr), "unexpected {cidr}");
+    }
 }

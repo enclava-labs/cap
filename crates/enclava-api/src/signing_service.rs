@@ -87,6 +87,24 @@ pub struct SigningServiceClient {
     http: reqwest::Client,
 }
 
+/// Plain-http is only acceptable for loopback or cluster-internal service
+/// hosts (`.svc`, `.svc.cluster.local`): the bearer token must not transit
+/// cleartext on any network an off-cluster attacker can observe.
+pub(crate) fn plain_http_host_allowed(host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    let host = host.to_ascii_lowercase();
+    host.ends_with(".svc") || host.ends_with(".svc.cluster.local")
+}
+
 impl SigningServiceClient {
     pub fn new(
         base_url: String,
@@ -106,6 +124,17 @@ impl SigningServiceClient {
         if !matches!(base_url.scheme(), "http" | "https") {
             return Err(SigningServiceError::InvalidUrl(
                 "scheme must be http or https".to_string(),
+            ));
+        }
+        // The bearer token must not transit cleartext off-cluster, wherever
+        // the URL came from (env or signed platform release): this
+        // constructor is the single choke point. Plain http survives only
+        // for loopback and cluster-internal `.svc` hosts -- shipped
+        // releases legitimately sign in-cluster service URLs.
+        if base_url.scheme() == "http" && !plain_http_host_allowed(base_url.host_str()) {
+            return Err(SigningServiceError::InvalidUrl(
+                "signing service URL must be https outside loopback/cluster-internal hosts"
+                    .to_string(),
             ));
         }
         if !base_url.path().ends_with('/') {
@@ -276,6 +305,13 @@ pub struct BootstrapOrgRequest {
 pub struct BootstrapOrgResponse {
     pub org_id: Uuid,
     pub state: String,
+    /// CROSS-REPO CONTRACT (policy-signing-service): despite the name, this is
+    /// hex(raw 32-byte owner Ed25519 public key) — NOT a SHA-256 digest. Every
+    /// in-repo "fingerprint" IS a digest (see `owner_key_fingerprint` in
+    /// routes/orgs.rs). Consumers byte-compare it against hex::encode(pubkey);
+    /// if the service ever emits a real digest those checks fail closed.
+    /// Renaming or changing the encoding is a coordinated contract change per
+    /// the AGENTS.md blocking rules.
     pub owner_pubkey_fingerprint: String,
 }
 
@@ -302,6 +338,8 @@ pub struct RotateOwnerRequest {
 pub struct RotateOwnerResponse {
     pub org_id: Uuid,
     pub version: u64,
+    /// Same cross-repo contract as `BootstrapOrgResponse::owner_pubkey_fingerprint`:
+    /// hex(raw pubkey), not a digest.
     pub owner_pubkey_fingerprint: String,
     pub rotated_at: DateTime<Utc>,
 }

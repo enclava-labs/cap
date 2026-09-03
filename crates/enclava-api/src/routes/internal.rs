@@ -1,5 +1,5 @@
 use axum::{
-    Json,
+    Extension, Json,
     extract::{FromRequestParts, Path, Query, State},
     http::{HeaderMap, StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
@@ -8,6 +8,7 @@ use base64::{Engine as _, engine::general_purpose};
 use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::auth::middleware::{AuthContext, ManagementOrigin};
@@ -391,6 +392,29 @@ pub struct InternalCreateAppRequest {
     pub egress_allowlist: Vec<crate::routes::apps::CreateEgressAllowRule>,
     #[serde(default = "crate::routes::apps::default_egress_mode")]
     pub egress_mode: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InternalAppDesiredState {
+    Running,
+    Stopped,
+}
+
+impl InternalAppDesiredState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InternalAppDesiredStateRequest {
+    pub desired_state: InternalAppDesiredState,
+    pub operation_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -3406,6 +3430,192 @@ pub async fn delete_paas_app(
             };
         let response = serde_json::json!({"status": "deleted"});
         Ok((status, response))
+    }
+    .await;
+    let (status, response) = complete_idempotent_result(idempotency, result).await?;
+    Ok((status, Json(response)))
+}
+
+pub async fn put_paas_app_desired_state(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Path((paas_org_id, app_name)): Path<(String, String)>,
+    Extension(engine): Extension<Arc<enclava_engine::apply::engine::ApplyEngine>>,
+    Json(body): Json<InternalAppDesiredStateRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    validate_external_id(&paas_org_id, "paas_org_id")?;
+    validate_external_id(&body.operation_id, "operation_id")?;
+    crate::routes::apps::validate_app_name(&app_name)
+        .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
+    let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
+    let hash = request_hash(&body)?;
+    let idempotency =
+        match begin_idempotent_request(&state, &body.operation_id, "PUT", &path, &hash).await? {
+            IdempotencyBegin::Execute(lease) => lease,
+            IdempotencyBegin::Replay((status, response)) => {
+                return Ok((status, Json(response)));
+            }
+        };
+    let operation_id = idempotency.operation_id();
+
+    let result: Result<IdempotencyResponse, InternalRouteError> = async {
+        let (cap_org_id, _, _) = mapped_cap_org(&state, &paas_org_id).await?;
+        let (app_id, namespace, current_status): (Uuid, String, crate::models::AppStatus) =
+            sqlx::query_as(
+            "SELECT id, namespace, status
+               FROM apps
+              WHERE org_id = $1
+                AND name = $2
+                AND status <> 'deleting'::app_status_enum",
+        )
+        .bind(cap_org_id)
+        .bind(&app_name)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| db_error())?
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "application not found"))?;
+        if current_status == crate::models::AppStatus::Failed {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "failed applications require a successful redeployment before changing desired state",
+            ));
+        }
+        let desired_state = body.desired_state.as_str();
+        let resource =
+            crate::mutation_leases::ResourceFence::new("kubernetes_namespace", &namespace);
+        let mut mutation = crate::mutation_leases::claim(
+            &state,
+            app_id,
+            "app_desired_state",
+            operation_id,
+            false,
+            vec![resource.clone()],
+        )
+        .await
+        .map_err(|error| match error {
+            crate::mutation_leases::MutationLeaseError::Busy => {
+                json_error(StatusCode::CONFLICT, "app mutation already in progress")
+            }
+            _ => json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"),
+        })?;
+        let mut tx = state.db.begin().await.map_err(|_| db_error())?;
+        crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
+            .await
+            .map_err(|_| db_error())?;
+        let claimed_status: crate::models::AppStatus =
+            sqlx::query_scalar("SELECT status FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| db_error())?;
+        if claimed_status == crate::models::AppStatus::Failed {
+            mutation
+                .finish_in_tx(&mut tx)
+                .await
+                .map_err(|_| db_error())?;
+            tx.commit().await.map_err(|_| db_error())?;
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "failed applications require a successful redeployment before changing desired state",
+            ));
+        }
+        let deployment_in_progress = body.desired_state == InternalAppDesiredState::Stopped
+            && sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1
+                       FROM deployment_apply_jobs
+                      WHERE app_id = $1
+                        AND state IN (
+                            'setup_pending', 'setting_up',
+                            'cleanup_pending', 'cleaning_up',
+                            'pending', 'running'
+                        )
+                 )",
+            )
+            .bind(app_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| db_error())?;
+        if deployment_in_progress {
+            mutation
+                .finish_in_tx(&mut tx)
+                .await
+                .map_err(|_| db_error())?;
+            tx.commit().await.map_err(|_| db_error())?;
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "current deployment generation is still in progress",
+            ));
+        }
+        let generation = mutation.resource_generation(&resource).ok_or_else(|| {
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable")
+        })?;
+        let generation = enclava_engine::apply::generation::MutationGeneration::new(generation)
+            .map_err(|_| json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"))?;
+        let replicas = match body.desired_state {
+            InternalAppDesiredState::Running => 1,
+            InternalAppDesiredState::Stopped => 0,
+        };
+        let convergence = mutation
+            .guard_provider(
+                enclava_engine::apply::cleanup::set_statefulset_desired_replicas(
+                    &engine,
+                    &namespace,
+                    &app_name,
+                    replicas,
+                    std::time::Duration::from_secs(300),
+                    generation,
+                ),
+            )
+            .await
+            .map_err(|_| json_error(StatusCode::SERVICE_UNAVAILABLE, "desired_state_retryable"))?;
+        if let Err(error) = convergence {
+            tracing::warn!(
+                cap_app_id = %app_id,
+                outcome = error.public_code(),
+                "application desired-state convergence failed"
+            );
+            return Err(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "desired_state_retryable",
+            ));
+        }
+
+        let updated = sqlx::query(
+            "UPDATE apps
+                SET status = $2::app_status_enum,
+                    updated_at = now()
+              WHERE id = $1
+                AND org_id = $3
+                AND namespace = $4
+                AND status <> 'deleting'::app_status_enum",
+        )
+        .bind(app_id)
+        .bind(desired_state)
+        .bind(cap_org_id)
+        .bind(&namespace)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?;
+        if updated.rows_affected() != 1 {
+            return Err(json_error(
+                StatusCode::CONFLICT,
+                "application authority changed",
+            ));
+        }
+        mutation
+            .finish_in_tx(&mut tx)
+            .await
+            .map_err(|_| db_error())?;
+        tx.commit().await.map_err(|_| db_error())?;
+        Ok((
+            StatusCode::OK,
+            serde_json::json!({
+                "operation_id": body.operation_id,
+                "desired_state": desired_state,
+                "runtime_state": desired_state,
+            }),
+        ))
     }
     .await;
     let (status, response) = complete_idempotent_result(idempotency, result).await?;
