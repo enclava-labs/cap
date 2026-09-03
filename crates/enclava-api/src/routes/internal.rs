@@ -522,7 +522,7 @@ fn validate_external_id(
     Ok(())
 }
 
-pub(crate) fn validate_org_name(name: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+fn validate_org_name(name: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     if name.is_empty()
         || name.len() > 63
         || !name
