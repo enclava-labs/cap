@@ -178,6 +178,27 @@ fn multiple_apps_produce_multiple_bindings() {
 }
 
 #[test]
+fn tls_binding_blank_signer_identities_render_as_empty_arrays() {
+    for value in [None, Some(""), Some("   \n")] {
+        let mut app = sample_app();
+        app.signer_identity_subject = value.map(str::to_string);
+        app.signer_identity_issuer = value.map(str::to_string);
+        let (_, binding) = generate_tls_binding_entry(&app);
+        assert_eq!(
+            binding["allowed_signer_identity_subjects"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            binding["allowed_signer_identity_issuers"],
+            serde_json::json!([])
+        );
+        let rego = generate_kbs_policy_rego(&[&app], "");
+        assert!(rego.contains("\"allowed_signer_identity_subjects\": []"));
+        assert!(rego.contains("\"allowed_signer_identity_issuers\": []"));
+    }
+}
+
+#[test]
 fn full_policy_escapes_metacharacters_in_namespace_and_service_account() {
     let mut app = sample_app();
     app.namespace = "x\",\"allowed_namespaces\":[\"*".to_string();
