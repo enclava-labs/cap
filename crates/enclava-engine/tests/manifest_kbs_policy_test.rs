@@ -176,3 +176,30 @@ fn multiple_apps_produce_multiple_bindings() {
     assert!(rego.contains("cap-test-org-test-app-test-app-owner"));
     assert!(rego.contains("cap-test-org-test-app-2-test-app-2-owner"));
 }
+
+#[test]
+fn full_policy_escapes_metacharacters_in_namespace_and_service_account() {
+    let mut app = sample_app();
+    app.namespace = "x\",\"allowed_namespaces\":[\"*".to_string();
+    app.service_account = "sa\nevil".to_string();
+    let apps = vec![&app];
+    let rego = generate_kbs_policy_rego(&apps, "");
+
+    assert!(!rego.contains("\"allowed_namespaces\":[\"*"));
+    assert!(!rego.contains("sa\nevil"));
+    assert!(rego.contains(r#"["x\",\"allowed_namespaces\":[\"*"]"#));
+    assert!(rego.contains(r#"["sa\nevil"]"#));
+
+    // Each binding entry must remain a single, well-formed JSON object.
+    let owner_body = rego
+        .split("owner_resource_bindings := {\n")
+        .nth(1)
+        .unwrap()
+        .trim_end()
+        .trim_end_matches('}')
+        .trim_end();
+    let (_, value) = owner_body.split_once(": ").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(value).unwrap();
+    assert_eq!(parsed["allowed_namespaces"][0], app.namespace);
+    assert_eq!(parsed["allowed_service_accounts"][0], app.service_account);
+}

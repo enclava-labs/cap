@@ -50,6 +50,8 @@ pub async fn create_org(
     State(state): State<AppState>,
     Json(body): Json<CreateOrgRequest>,
 ) -> Result<(StatusCode, Json<OrgResponse>), (StatusCode, Json<serde_json::Value>)> {
+    super::internal::validate_org_name(&body.name)?;
+
     let org_id = Uuid::new_v4();
 
     if let Err(e) = crate::db::orgs::insert_org_pool(
