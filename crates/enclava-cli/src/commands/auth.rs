@@ -225,7 +225,7 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let use_nostr = if !args.email && !args.nostr {
         if default_uses_device_login(discovery.as_ref()) {
-            return device_login(args, paths, cli_config).await;
+            return device_login(args, paths, cli_config, discovery).await;
         }
 
         let available = supported_methods(discovery.as_ref(), "log in");
@@ -338,15 +338,25 @@ async fn device_login(
     args: LoginArgs,
     paths: CliPaths,
     cli_config: config::CliConfig,
+    discovery: Option<AuthDiscoveryResponse>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = ApiClient::new(&cli_config.api_url, None);
-    let start = client
-        .start_device_login(&DeviceLoginStartRequest {
-            org: args.org.clone(),
-            requested_org_slug: args.org.clone(),
-            requested_scopes: device_login_scopes(args.approve_logs),
-        })
-        .await?;
+    let start_request = DeviceLoginStartRequest {
+        org: args.org.clone(),
+        requested_org_slug: args.org.clone(),
+        requested_scopes: device_login_scopes(args.approve_logs),
+    };
+    let start = match discovery
+        .as_ref()
+        .and_then(|d| d.device_start_url.as_deref())
+    {
+        Some(endpoint_url) => {
+            client
+                .start_device_login_at(endpoint_url, &start_request)
+                .await?
+        }
+        None => client.start_device_login(&start_request).await?,
+    };
 
     println!("Open this URL to sign in:");
     println!("  {}", start.verification_uri);
@@ -364,11 +374,20 @@ async fn device_login(
     let mut interval = start.interval.max(1) as u64;
     loop {
         tokio::time::sleep(Duration::from_secs(interval)).await;
-        let poll = client
-            .poll_device_login(&DeviceLoginPollRequest {
-                device_code: start.device_code.clone(),
-            })
-            .await?;
+        let poll_request = DeviceLoginPollRequest {
+            device_code: start.device_code.clone(),
+        };
+        let poll = match discovery
+            .as_ref()
+            .and_then(|d| d.device_poll_url.as_deref())
+        {
+            Some(endpoint_url) => {
+                client
+                    .poll_device_login_at(endpoint_url, &poll_request)
+                    .await?
+            }
+            None => client.poll_device_login(&poll_request).await?,
+        };
 
         match poll.status.as_str() {
             "approved" => {
@@ -382,15 +401,18 @@ async fn device_login(
                     active_org_id: Some(auth.org_id.clone()),
                     active_org_name: Some(auth.org_name.clone()),
                 };
-                config::save_credentials(&paths, &creds)?;
 
                 let mut updated_config = cli_config;
+                if let Some(api_url) = discovery.as_ref().and_then(|d| d.api_url.as_deref()) {
+                    updated_config.api_url = api_url.trim_end_matches('/').to_string();
+                }
                 updated_config.org = Some(auth.org_name.clone());
                 updated_config.org_id = Some(auth.org_id.clone());
-                config::save_config(&paths, &updated_config)?;
 
                 let api = ApiClient::from_config(&updated_config, &creds);
                 let me = api.get_current_user().await?;
+                config::save_credentials(&paths, &creds)?;
+                config::save_config(&paths, &updated_config)?;
                 println!("Logged in as {}", me.display_name);
                 println!("Active org: {}", me.active_org.name);
                 return Ok(());

@@ -178,12 +178,17 @@ impl ApiClient {
         &self,
         req: &DeviceLoginStartRequest,
     ) -> Result<DeviceLoginStartResponse, ApiError> {
-        let resp = self
-            .http
-            .post(self.url("/auth/device/start"))
-            .json(req)
-            .send()
-            .await?;
+        self.start_device_login_at(&self.url("/auth/device/start"), req)
+            .await
+    }
+
+    pub async fn start_device_login_at(
+        &self,
+        endpoint_url: &str,
+        req: &DeviceLoginStartRequest,
+    ) -> Result<DeviceLoginStartResponse, ApiError> {
+        let endpoint_url = validated_device_endpoint(endpoint_url)?;
+        let resp = self.http.post(endpoint_url).json(req).send().await?;
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
     }
@@ -192,12 +197,17 @@ impl ApiClient {
         &self,
         req: &DeviceLoginPollRequest,
     ) -> Result<DeviceLoginPollResponse, ApiError> {
-        let resp = self
-            .http
-            .post(self.url("/auth/device/poll"))
-            .json(req)
-            .send()
-            .await?;
+        self.poll_device_login_at(&self.url("/auth/device/poll"), req)
+            .await
+    }
+
+    pub async fn poll_device_login_at(
+        &self,
+        endpoint_url: &str,
+        req: &DeviceLoginPollRequest,
+    ) -> Result<DeviceLoginPollResponse, ApiError> {
+        let endpoint_url = validated_device_endpoint(endpoint_url)?;
+        let resp = self.http.post(endpoint_url).json(req).send().await?;
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
     }
@@ -972,6 +982,28 @@ pub fn loopback_http_url(raw: &str) -> bool {
         }
         None => false,
     }
+}
+
+fn validated_device_endpoint(raw: &str) -> Result<&str, ApiError> {
+    let parsed = reqwest::Url::parse(raw).map_err(|_| ApiError::Api {
+        status: 0,
+        code: Some("invalid_auth_discovery".to_string()),
+        message: "device endpoint is not a valid absolute URL".to_string(),
+    })?;
+    if parsed.host().is_none()
+        || (parsed.scheme() != "https" && !loopback_http_url(raw))
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ApiError::Api {
+            status: 0,
+            code: Some("invalid_auth_discovery".to_string()),
+            message: "device endpoint must use HTTPS (or loopback HTTP) without credentials or a fragment"
+                .to_string(),
+        });
+    }
+    Ok(raw)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use enclava_cli::{
     api_client::{ApiClient, ApiError},
-    api_types::CreateTemplateInstanceRequest,
+    api_types::{CreateTemplateInstanceRequest, DeviceLoginPollRequest, DeviceLoginStartRequest},
 };
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -449,4 +449,100 @@ async fn auth_discovery_rejects_success_without_auth_methods() {
     let request = handle.join().unwrap();
     assert!(request.starts_with("GET /.well-known/enclava "));
     assert!(err.to_string().contains("error decoding response body"));
+}
+
+#[tokio::test]
+async fn device_login_uses_discovered_split_host_endpoints() {
+    let start_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let start_addr = start_listener.local_addr().unwrap();
+    let start_handle = std::thread::spawn(move || {
+        let (mut stream, _) = start_listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = r#"{"device_code":"device-secret","user_code":"ABCD-EFGH","verification_uri":"https://auth.example/cli/login","verification_uri_complete":"https://auth.example/cli/login?user_code=ABCD-EFGH","expires_in":600,"interval":1}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+    let poll_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let poll_addr = poll_listener.local_addr().unwrap();
+    let poll_handle = std::thread::spawn(move || {
+        let (mut stream, _) = poll_listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let body = r#"{"status":"pending","interval":1,"expires_in":599,"error":null,"auth":null}"#;
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let client = ApiClient::new("http://127.0.0.1:9", None);
+    let start = client
+        .start_device_login_at(
+            &format!("http://{start_addr}/remote/device/start"),
+            &DeviceLoginStartRequest {
+                org: None,
+                requested_org_slug: None,
+                requested_scopes: vec!["apps:read".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+    let poll = client
+        .poll_device_login_at(
+            &format!("http://{poll_addr}/remote/device/poll"),
+            &DeviceLoginPollRequest {
+                device_code: start.device_code,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        start_handle
+            .join()
+            .unwrap()
+            .starts_with("POST /remote/device/start ")
+    );
+    assert!(
+        poll_handle
+            .join()
+            .unwrap()
+            .starts_with("POST /remote/device/poll ")
+    );
+    assert_eq!(poll.status, "pending");
+}
+
+#[tokio::test]
+async fn discovered_device_endpoint_rejects_remote_plain_http() {
+    let client = ApiClient::new("http://127.0.0.1:9", None);
+    let err = client
+        .start_device_login_at(
+            "http://example.com/auth/device/start",
+            &DeviceLoginStartRequest {
+                org: None,
+                requested_org_slug: None,
+                requested_scopes: Vec::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("HTTPS"));
 }
