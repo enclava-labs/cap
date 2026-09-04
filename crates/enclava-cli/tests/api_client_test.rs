@@ -492,7 +492,7 @@ async fn device_login_uses_discovered_split_host_endpoints() {
         String::from_utf8_lossy(&buf[..n]).to_string()
     });
 
-    let client = ApiClient::new("http://127.0.0.1:9", None);
+    let client = ApiClient::new("https://frontend.example", None);
     let start = client
         .start_device_login_at(
             &format!("http://{start_addr}/remote/device/start"),

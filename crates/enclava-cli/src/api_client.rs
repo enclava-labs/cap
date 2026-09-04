@@ -34,12 +34,7 @@ impl ApiClient {
         // `http://localhost@evil.example` (userinfo) or
         // `http://localhost.evil.example` (subdomain) send credentials to a
         // remote host over cleartext.
-        let https_only = !loopback_http_url(base_url);
-        let http = reqwest::Client::builder()
-            .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
-            .https_only(https_only)
-            .build()
-            .expect("failed to build HTTP client");
+        let http = http_client_for(base_url);
 
         let base_url = base_url.trim_end_matches('/').to_string();
         let origin = reqwest::Url::parse(&base_url)
@@ -192,7 +187,12 @@ impl ApiClient {
         req: &DeviceLoginStartRequest,
     ) -> Result<DeviceLoginStartResponse, ApiError> {
         let endpoint_url = validated_device_endpoint(endpoint_url)?;
-        let resp = self.http.post(endpoint_url).json(req).send().await?;
+        let http = if loopback_http_url(endpoint_url) {
+            http_client_for(endpoint_url)
+        } else {
+            self.http.clone()
+        };
+        let resp = http.post(endpoint_url).json(req).send().await?;
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
     }
@@ -211,7 +211,12 @@ impl ApiClient {
         req: &DeviceLoginPollRequest,
     ) -> Result<DeviceLoginPollResponse, ApiError> {
         let endpoint_url = validated_device_endpoint(endpoint_url)?;
-        let resp = self.http.post(endpoint_url).json(req).send().await?;
+        let http = if loopback_http_url(endpoint_url) {
+            http_client_for(endpoint_url)
+        } else {
+            self.http.clone()
+        };
+        let resp = http.post(endpoint_url).json(req).send().await?;
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
     }
@@ -839,6 +844,14 @@ impl ApiClient {
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
     }
+}
+
+fn http_client_for(url: &str) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
+        .https_only(!loopback_http_url(url))
+        .build()
+        .expect("failed to build HTTP client")
 }
 
 fn path_segment(value: &str) -> String {
