@@ -39,11 +39,16 @@ pub struct AuthResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct AuthDiscoveryResponse {
-    pub api_mode: String,
-    pub api_url: String,
-    pub cli_login_url: String,
-    pub device_start_url: String,
-    pub device_poll_url: String,
+    #[serde(default)]
+    pub api_mode: Option<String>,
+    #[serde(default)]
+    pub api_url: Option<String>,
+    #[serde(default)]
+    pub cli_login_url: Option<String>,
+    #[serde(default)]
+    pub device_start_url: Option<String>,
+    #[serde(default)]
+    pub device_poll_url: Option<String>,
     pub auth_methods: Vec<String>,
 }
 

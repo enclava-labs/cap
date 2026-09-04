@@ -32,12 +32,19 @@ pub struct LoginArgs {
     pub email: bool,
 }
 
+const DIRECT_PROVIDERS: &[(&str, &str)] = &[("Email", "email"), ("Nostr (npub)", "nostr")];
+
 fn auth_method_error(
     discovery: Option<&AuthDiscoveryResponse>,
     provider: &str,
     action: &str,
 ) -> Option<String> {
     let discovery = discovery?;
+    if discovery.auth_methods.is_empty() {
+        return Some(format!(
+            "this target returned no supported {action} methods; check the API URL or contact support"
+        ));
+    }
     if discovery.auth_methods.contains(&provider.to_string()) {
         return None;
     }
@@ -61,8 +68,48 @@ fn auth_discovery_or_legacy(
         Err(ApiError::Api {
             status: 404 | 405, ..
         }) => Ok(None),
-        Err(ApiError::Http(e)) if !e.is_decode() => Ok(None),
         Err(e) => Err(Box::new(e)),
+    }
+}
+
+fn supported_methods(
+    discovery: Option<&AuthDiscoveryResponse>,
+    action: &str,
+) -> Vec<(&'static str, &'static str)> {
+    match discovery {
+        None => DIRECT_PROVIDERS.to_vec(),
+        Some(_) => DIRECT_PROVIDERS
+            .iter()
+            .copied()
+            .filter(|(_, provider)| auth_method_error(discovery, provider, action).is_none())
+            .collect(),
+    }
+}
+
+fn default_uses_device_login(discovery: Option<&AuthDiscoveryResponse>) -> bool {
+    discovery.is_none_or(|d| d.auth_methods.iter().any(|method| method == "device_code"))
+}
+
+fn no_supported_method_error(discovery: Option<&AuthDiscoveryResponse>, action: &str) -> String {
+    match discovery {
+        None => format!("no {action} methods are advertised by this target"),
+        Some(d) if d.auth_methods.is_empty() => format!(
+            "this target returned no supported {action} methods; check the API URL or contact support"
+        ),
+        Some(d) if d.auth_methods.len() == 1 && d.auth_methods[0] == "device_code" => {
+            if action == "sign up" {
+                "this target only supports device-code/browser registration; use `enclava login`"
+                    .into()
+            } else {
+                format!(
+                    "this target only supports device-code {action}; use `enclava login` and approve the device code in your browser"
+                )
+            }
+        }
+        Some(d) => format!(
+            "this target does not support direct {action}; supported methods: {}",
+            d.auth_methods.join(", ")
+        ),
     }
 }
 
@@ -72,73 +119,64 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = ApiClient::new(&cli_config.api_url, None);
     let discovery = auth_discovery_or_legacy(client.auth_discovery().await)?;
-    if let Some(discovery) = discovery.as_ref() {
-        let email_unsupported = auth_method_error(Some(discovery), "email", "sign up").is_some();
-        let nostr_unsupported = auth_method_error(Some(discovery), "nostr", "sign up").is_some();
-        if email_unsupported && nostr_unsupported {
-            return Err(if discovery.auth_methods == ["device_code"] {
-                "this target only supports device-code/browser registration; use `enclava login`"
-                    .into()
-            } else {
-                format!(
-                    "this target does not support direct sign up; supported methods: {}",
-                    discovery.auth_methods.join(", ")
-                )
-                .into()
-            });
-        }
+
+    let available = supported_methods(discovery.as_ref(), "sign up");
+    if available.is_empty() {
+        return Err(no_supported_method_error(discovery.as_ref(), "sign up").into());
     }
 
-    let methods = vec!["Email", "Nostr (npub)"];
-    let selection = Select::new()
-        .with_prompt("Sign up with")
-        .items(&methods)
-        .default(0)
-        .interact()?;
-
-    let req = match selection {
-        0 => {
-            let email: String = Input::new().with_prompt("Email").interact_text()?;
-            let password = Password::new()
-                .with_prompt("Password")
-                .with_confirmation("Confirm password", "Passwords don't match")
-                .interact()?;
-            let display_name: String = Input::new()
-                .with_prompt("Display name (optional)")
-                .allow_empty(true)
-                .interact_text()?;
-
-            SignupRequest {
-                provider: "email".to_string(),
-                email: Some(email),
-                password: Some(password),
-                npub: None,
-                display_name: if display_name.is_empty() {
-                    None
-                } else {
-                    Some(display_name)
-                },
-            }
-        }
-        1 => {
-            let npub: String = Input::new()
-                .with_prompt("Nostr public key (npub1...)")
-                .interact_text()?;
-
-            SignupRequest {
-                provider: "nostr".to_string(),
-                email: None,
-                password: None,
-                npub: Some(npub),
-                display_name: None,
-            }
-        }
-        _ => unreachable!(),
+    let provider = if available.len() == 1 {
+        available[0].1
+    } else {
+        let labels: Vec<_> = available.iter().map(|(l, _)| *l).collect();
+        let selection = Select::new()
+            .with_prompt("Sign up with")
+            .items(&labels)
+            .default(0)
+            .interact()?;
+        available[selection].1
     };
 
-    if let Some(err) = auth_method_error(discovery.as_ref(), &req.provider, "sign up") {
+    if let Some(err) = auth_method_error(discovery.as_ref(), provider, "sign up") {
         return Err(err.into());
     }
+
+    let req = if provider == "email" {
+        let email: String = Input::new().with_prompt("Email").interact_text()?;
+        let password = Password::new()
+            .with_prompt("Password")
+            .with_confirmation("Confirm password", "Passwords don't match")
+            .interact()?;
+        let display_name: String = Input::new()
+            .with_prompt("Display name (optional)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        SignupRequest {
+            provider: "email".to_string(),
+            email: Some(email),
+            password: Some(password),
+            npub: None,
+            display_name: if display_name.is_empty() {
+                None
+            } else {
+                Some(display_name)
+            },
+        }
+    } else {
+        let npub: String = Input::new()
+            .with_prompt("Nostr public key (npub1...)")
+            .interact_text()?;
+
+        SignupRequest {
+            provider: "nostr".to_string(),
+            email: None,
+            password: None,
+            npub: Some(npub),
+            display_name: None,
+        }
+    };
+
     let resp = client.signup(&req).await?;
 
     // Save credentials
@@ -182,27 +220,37 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if !args.email && !args.nostr {
-        return device_login(args, paths, cli_config).await;
-    }
+    let client = ApiClient::new(&cli_config.api_url, None);
+    let discovery = auth_discovery_or_legacy(client.auth_discovery().await)?;
 
-    let use_nostr = if args.nostr {
-        true
-    } else if args.email {
-        false
+    let use_nostr = if !args.email && !args.nostr {
+        if default_uses_device_login(discovery.as_ref()) {
+            return device_login(args, paths, cli_config).await;
+        }
+
+        let available = supported_methods(discovery.as_ref(), "log in");
+        if available.is_empty() {
+            return Err(no_supported_method_error(discovery.as_ref(), "log in").into());
+        }
+
+        let provider = if available.len() == 1 {
+            available[0].1
+        } else {
+            let labels: Vec<_> = available.iter().map(|(l, _)| *l).collect();
+            let selection = Select::new()
+                .with_prompt("Log in with")
+                .items(&labels)
+                .default(0)
+                .interact()?;
+            available[selection].1
+        };
+
+        provider == "nostr"
     } else {
-        let methods = vec!["Email", "Nostr (npub)"];
-        let selection = Select::new()
-            .with_prompt("Log in with")
-            .items(&methods)
-            .default(0)
-            .interact()?;
-        selection == 1
+        args.nostr
     };
 
-    let client = ApiClient::new(&cli_config.api_url, None);
     let provider = if use_nostr { "nostr" } else { "email" };
-    let discovery = auth_discovery_or_legacy(client.auth_discovery().await)?;
     if let Some(err) = auth_method_error(discovery.as_ref(), provider, "log in") {
         return Err(err.into());
     }
@@ -450,17 +498,18 @@ pub async fn logout() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiError, AuthDiscoveryResponse, auth_discovery_or_legacy, auth_method_error,
-        browser_safe_device_url,
+        ApiClient, ApiError, AuthDiscoveryResponse, auth_discovery_or_legacy, auth_method_error,
+        browser_safe_device_url, default_uses_device_login, no_supported_method_error,
+        supported_methods,
     };
 
     fn discovery(methods: &[&str]) -> AuthDiscoveryResponse {
         AuthDiscoveryResponse {
-            api_mode: "standalone".to_string(),
-            api_url: "https://api.example".to_string(),
-            cli_login_url: "https://api.example/auth/login".to_string(),
-            device_start_url: "https://api.example/auth/device/start".to_string(),
-            device_poll_url: "https://api.example/auth/device/poll".to_string(),
+            api_mode: Some("standalone".to_string()),
+            api_url: Some("https://api.example".to_string()),
+            cli_login_url: Some("https://api.example/auth/login".to_string()),
+            device_start_url: Some("https://api.example/auth/device/start".to_string()),
+            device_poll_url: Some("https://api.example/auth/device/poll".to_string()),
             auth_methods: methods.iter().map(|m| m.to_string()).collect(),
         }
     }
@@ -498,25 +547,30 @@ mod tests {
     }
 
     #[test]
+    fn auth_method_error_gives_actionable_empty_methods_message() {
+        let d = discovery(&[]);
+        let err = auth_method_error(Some(&d), "email", "log in").unwrap();
+        assert!(err.contains("no supported"));
+        assert!(err.contains("check the API URL or contact support"));
+    }
+
+    #[test]
     fn auth_discovery_or_legacy_treats_404_and_405_as_unavailable() {
-        assert!(
-            auth_discovery_or_legacy(Err(ApiError::Api {
-                status: 404,
-                code: None,
-                message: "HTTP 404".to_string(),
-            }))
-            .unwrap()
-            .is_none()
-        );
-        assert!(
-            auth_discovery_or_legacy(Err(ApiError::Api {
-                status: 405,
-                code: None,
-                message: "HTTP 405".to_string(),
-            }))
-            .unwrap()
-            .is_none()
-        );
+        let discovery = auth_discovery_or_legacy(Err(ApiError::Api {
+            status: 404,
+            code: None,
+            message: "HTTP 404".to_string(),
+        }))
+        .unwrap();
+        assert!(discovery.is_none());
+
+        let discovery = auth_discovery_or_legacy(Err(ApiError::Api {
+            status: 405,
+            code: None,
+            message: "HTTP 405".to_string(),
+        }))
+        .unwrap();
+        assert!(discovery.is_none());
     }
 
     #[test]
@@ -535,6 +589,57 @@ mod tests {
     fn auth_discovery_or_legacy_returns_discovery_on_success() {
         let d = discovery(&["email", "nostr"]);
         assert!(auth_discovery_or_legacy(Ok(d)).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn auth_discovery_or_legacy_returns_transport_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let client = ApiClient::new(&format!("http://{addr}"), None);
+        let result = client.auth_discovery().await;
+        assert!(auth_discovery_or_legacy(result).is_err());
+    }
+
+    #[test]
+    fn supported_methods_returns_all_when_discovery_unavailable() {
+        let methods = supported_methods(None, "sign up");
+        assert_eq!(methods.len(), 2);
+    }
+
+    #[test]
+    fn supported_methods_filters_to_advertised_choices() {
+        let d = discovery(&["device_code", "email"]);
+        let methods = supported_methods(Some(&d), "sign up");
+        assert_eq!(methods.len(), 1);
+        assert_eq!(methods[0].1, "email");
+    }
+
+    #[test]
+    fn supported_methods_returns_empty_for_device_code_only() {
+        let d = discovery(&["device_code"]);
+        let methods = supported_methods(Some(&d), "sign up");
+        assert!(methods.is_empty());
+    }
+
+    #[test]
+    fn default_login_uses_device_flow_only_when_legacy_or_advertised() {
+        assert!(default_uses_device_login(None));
+        assert!(default_uses_device_login(Some(&discovery(&[
+            "email",
+            "device_code"
+        ]))));
+        assert!(!default_uses_device_login(Some(&discovery(&["email"]))));
+        assert!(!default_uses_device_login(Some(&discovery(&[]))));
+    }
+
+    #[test]
+    fn no_supported_method_error_is_actionable_for_empty_auth_methods() {
+        let d = discovery(&[]);
+        let err = no_supported_method_error(Some(&d), "log in");
+        assert!(err.contains("no supported"));
+        assert!(err.contains("check the API URL or contact support"));
     }
 
     #[test]

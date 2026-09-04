@@ -341,16 +341,22 @@ async fn auth_discovery_gets_well_known_enclava_contract() {
 
     let request = handle.join().unwrap();
     assert!(request.starts_with("GET /.well-known/enclava "));
-    assert_eq!(discovery.api_mode, "hosted");
-    assert_eq!(discovery.api_url, "https://api.enclava.dev");
-    assert_eq!(discovery.cli_login_url, "https://auth.enclava.dev/login");
+    assert_eq!(discovery.api_mode.as_deref(), Some("hosted"));
     assert_eq!(
-        discovery.device_start_url,
-        "https://api.enclava.dev/auth/device/start"
+        discovery.api_url.as_deref(),
+        Some("https://api.enclava.dev")
     );
     assert_eq!(
-        discovery.device_poll_url,
-        "https://api.enclava.dev/auth/device/poll"
+        discovery.cli_login_url.as_deref(),
+        Some("https://auth.enclava.dev/login")
+    );
+    assert_eq!(
+        discovery.device_start_url.as_deref(),
+        Some("https://api.enclava.dev/auth/device/start")
+    );
+    assert_eq!(
+        discovery.device_poll_url.as_deref(),
+        Some("https://api.enclava.dev/auth/device/poll")
     );
     assert_eq!(discovery.auth_methods, ["device_code"]);
 }
@@ -394,6 +400,36 @@ async fn auth_discovery_rejects_malformed_success() {
         let mut buf = [0u8; 4096];
         let n = stream.read(&mut buf).unwrap();
         let body = "not json";
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let client = ApiClient::new(&format!("http://{addr}"), None);
+    let err = client.auth_discovery().await.unwrap_err();
+
+    let request = handle.join().unwrap();
+    assert!(request.starts_with("GET /.well-known/enclava "));
+    assert!(err.to_string().contains("error decoding response body"));
+}
+
+#[tokio::test]
+async fn auth_discovery_rejects_success_without_auth_methods() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = r#"{"api_mode":"hosted","api_url":"https://api.enclava.dev"}"#;
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
         stream
             .write_all(
                 format!(
