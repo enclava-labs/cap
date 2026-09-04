@@ -3,9 +3,10 @@ use dialoguer::{Input, Password, Select};
 use std::process::Command;
 use std::time::Duration;
 
-use enclava_cli::api_client::ApiClient;
+use enclava_cli::api_client::{ApiClient, ApiError};
 use enclava_cli::api_types::{
-    DeviceLoginPollRequest, DeviceLoginStartRequest, LoginRequest, SignupRequest,
+    AuthDiscoveryResponse, DeviceLoginPollRequest, DeviceLoginStartRequest, LoginRequest,
+    SignupRequest,
 };
 use enclava_cli::config::{self, CliPaths, Credentials};
 
@@ -31,9 +32,62 @@ pub struct LoginArgs {
     pub email: bool,
 }
 
+fn auth_method_error(
+    discovery: Option<&AuthDiscoveryResponse>,
+    provider: &str,
+    action: &str,
+) -> Option<String> {
+    let discovery = discovery?;
+    if discovery.auth_methods.contains(&provider.to_string()) {
+        return None;
+    }
+    if discovery.auth_methods.len() == 1 && discovery.auth_methods[0] == "device_code" {
+        Some(format!(
+            "this target only supports device-code {action}; use `enclava login` and approve the device code in your browser"
+        ))
+    } else {
+        Some(format!(
+            "this target does not support {provider} {action}; supported methods: {}",
+            discovery.auth_methods.join(", ")
+        ))
+    }
+}
+
+fn auth_discovery_or_legacy(
+    result: Result<AuthDiscoveryResponse, ApiError>,
+) -> Result<Option<AuthDiscoveryResponse>, Box<dyn std::error::Error>> {
+    match result {
+        Ok(discovery) => Ok(Some(discovery)),
+        Err(ApiError::Api {
+            status: 404 | 405, ..
+        }) => Ok(None),
+        Err(ApiError::Http(e)) if !e.is_decode() => Ok(None),
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
 pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
     let paths = CliPaths::resolve()?;
     let cli_config = config::load_config(&paths)?;
+
+    let client = ApiClient::new(&cli_config.api_url, None);
+    let discovery = auth_discovery_or_legacy(client.auth_discovery().await)?;
+    if let Some(discovery) = discovery.as_ref() {
+        let email_unsupported = auth_method_error(Some(discovery), "email", "sign up").is_some();
+        let nostr_unsupported = auth_method_error(Some(discovery), "nostr", "sign up").is_some();
+        if email_unsupported && nostr_unsupported {
+            return Err(if discovery.auth_methods == ["device_code"] {
+                "this target only supports device-code/browser registration; use `enclava login`"
+                    .into()
+            } else {
+                format!(
+                    "this target does not support direct sign up; supported methods: {}",
+                    discovery.auth_methods.join(", ")
+                )
+                .into()
+            });
+        }
+    }
 
     let methods = vec!["Email", "Nostr (npub)"];
     let selection = Select::new()
@@ -82,7 +136,9 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
         _ => unreachable!(),
     };
 
-    let client = ApiClient::new(&cli_config.api_url, None);
+    if let Some(err) = auth_method_error(discovery.as_ref(), &req.provider, "sign up") {
+        return Err(err.into());
+    }
     let resp = client.signup(&req).await?;
 
     // Save credentials
@@ -144,6 +200,13 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
         selection == 1
     };
 
+    let client = ApiClient::new(&cli_config.api_url, None);
+    let provider = if use_nostr { "nostr" } else { "email" };
+    let discovery = auth_discovery_or_legacy(client.auth_discovery().await)?;
+    if let Some(err) = auth_method_error(discovery.as_ref(), provider, "log in") {
+        return Err(err.into());
+    }
+
     let req = if use_nostr {
         let npub: String = Input::new()
             .with_prompt("Nostr public key (npub1...)")
@@ -201,7 +264,6 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let client = ApiClient::new(&cli_config.api_url, None);
     let resp = client.login(&req).await?;
 
     // Save credentials
@@ -387,7 +449,93 @@ pub async fn logout() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::browser_safe_device_url;
+    use super::{
+        ApiError, AuthDiscoveryResponse, auth_discovery_or_legacy, auth_method_error,
+        browser_safe_device_url,
+    };
+
+    fn discovery(methods: &[&str]) -> AuthDiscoveryResponse {
+        AuthDiscoveryResponse {
+            api_mode: "standalone".to_string(),
+            api_url: "https://api.example".to_string(),
+            cli_login_url: "https://api.example/auth/login".to_string(),
+            device_start_url: "https://api.example/auth/device/start".to_string(),
+            device_poll_url: "https://api.example/auth/device/poll".to_string(),
+            auth_methods: methods.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn auth_method_error_allows_legacy_standalone_when_discovery_unavailable() {
+        assert!(auth_method_error(None, "email", "log in").is_none());
+        assert!(auth_method_error(None, "nostr", "log in").is_none());
+    }
+
+    #[test]
+    fn auth_method_error_rejects_email_and_nostr_for_device_code_only_target() {
+        let d = discovery(&["device_code"]);
+        let email = auth_method_error(Some(&d), "email", "log in").unwrap();
+        let nostr = auth_method_error(Some(&d), "nostr", "log in").unwrap();
+        assert!(email.contains("device-code"));
+        assert!(email.contains("enclava login"));
+        assert!(nostr.contains("device-code"));
+    }
+
+    #[test]
+    fn auth_method_error_preserves_email_and_nostr_for_standalone_targets() {
+        let d = discovery(&["email", "nostr"]);
+        assert!(auth_method_error(Some(&d), "email", "log in").is_none());
+        assert!(auth_method_error(Some(&d), "nostr", "log in").is_none());
+    }
+
+    #[test]
+    fn auth_method_error_allows_advertised_method_and_rejects_others() {
+        let d = discovery(&["device_code", "email"]);
+        assert!(auth_method_error(Some(&d), "email", "log in").is_none());
+        let nostr = auth_method_error(Some(&d), "nostr", "log in").unwrap();
+        assert!(nostr.contains("supported methods"));
+        assert!(nostr.contains("device_code") && nostr.contains("email"));
+    }
+
+    #[test]
+    fn auth_discovery_or_legacy_treats_404_and_405_as_unavailable() {
+        assert!(
+            auth_discovery_or_legacy(Err(ApiError::Api {
+                status: 404,
+                code: None,
+                message: "HTTP 404".to_string(),
+            }))
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            auth_discovery_or_legacy(Err(ApiError::Api {
+                status: 405,
+                code: None,
+                message: "HTTP 405".to_string(),
+            }))
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn auth_discovery_or_legacy_propagates_other_api_errors() {
+        assert!(
+            auth_discovery_or_legacy(Err(ApiError::Api {
+                status: 500,
+                code: None,
+                message: "HTTP 500".to_string(),
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn auth_discovery_or_legacy_returns_discovery_on_success() {
+        let d = discovery(&["email", "nostr"]);
+        assert!(auth_discovery_or_legacy(Ok(d)).unwrap().is_some());
+    }
 
     #[test]
     fn accepts_https_device_urls() {

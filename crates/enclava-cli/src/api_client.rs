@@ -164,6 +164,16 @@ impl ApiClient {
         Ok(resp.json().await?)
     }
 
+    pub async fn auth_discovery(&self) -> Result<AuthDiscoveryResponse, ApiError> {
+        let resp = self
+            .http
+            .get(self.url("/.well-known/enclava"))
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
     pub async fn start_device_login(
         &self,
         req: &DeviceLoginStartRequest,

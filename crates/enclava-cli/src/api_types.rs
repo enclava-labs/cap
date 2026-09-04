@@ -37,6 +37,16 @@ pub struct AuthResponse {
     pub org_name: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AuthDiscoveryResponse {
+    pub api_mode: String,
+    pub api_url: String,
+    pub cli_login_url: String,
+    pub device_start_url: String,
+    pub device_poll_url: String,
+    pub auth_methods: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DeviceLoginStartRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
