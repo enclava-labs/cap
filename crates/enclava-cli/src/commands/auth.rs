@@ -294,7 +294,7 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Construct NIP-98 HTTP Auth event (kind 27235)
-        let api_url = format!("{auth_api_url}/auth/login");
+        let api_url = client.auth_login_url();
         let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
             .tag(
                 nostr::Tag::parse(["u".to_string(), api_url])
@@ -358,8 +358,8 @@ async fn device_login(
     cli_config: config::CliConfig,
     discovery: Option<AuthDiscoveryResponse>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = ApiClient::new(&cli_config.api_url, None);
     let authenticated_api_url = auth_api_url(&cli_config.api_url, discovery.as_ref())?;
+    let client = ApiClient::new(&authenticated_api_url, None);
     let start_request = DeviceLoginStartRequest {
         org: args.org.clone(),
         requested_org_slug: args.org.clone(),
@@ -687,9 +687,11 @@ mod tests {
     fn auth_api_url_prefers_and_validates_discovery() {
         let mut d = discovery(&["email"]);
         d.api_url = Some("https://split-api.example/v1/".to_string());
+        let api_url = auth_api_url("https://frontend.example", Some(&d)).unwrap();
+        assert_eq!(api_url, "https://split-api.example/v1");
         assert_eq!(
-            auth_api_url("https://frontend.example", Some(&d)).unwrap(),
-            "https://split-api.example/v1"
+            ApiClient::new(&api_url, None).auth_login_url(),
+            "https://split-api.example/v1/auth/login"
         );
 
         d.api_url = Some("http://split-api.example".to_string());

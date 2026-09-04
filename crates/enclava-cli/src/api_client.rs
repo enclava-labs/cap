@@ -156,12 +156,16 @@ impl ApiClient {
     pub async fn login(&self, req: &LoginRequest) -> Result<AuthResponse, ApiError> {
         let resp = self
             .http
-            .post(self.url("/auth/login"))
+            .post(self.auth_login_url())
             .json(req)
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
+    }
+
+    pub fn auth_login_url(&self) -> String {
+        self.url("/auth/login")
     }
 
     pub async fn auth_discovery(&self) -> Result<AuthDiscoveryResponse, ApiError> {
