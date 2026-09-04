@@ -3,7 +3,7 @@ use dialoguer::{Input, Password, Select};
 use std::process::Command;
 use std::time::Duration;
 
-use enclava_cli::api_client::{ApiClient, ApiError};
+use enclava_cli::api_client::{ApiClient, ApiError, validated_discovered_api_url};
 use enclava_cli::api_types::{
     AuthDiscoveryResponse, DeviceLoginPollRequest, DeviceLoginStartRequest, LoginRequest,
     SignupRequest,
@@ -90,6 +90,18 @@ fn default_uses_device_login(discovery: Option<&AuthDiscoveryResponse>) -> bool 
     discovery.is_none_or(|d| d.auth_methods.iter().any(|method| method == "device_code"))
 }
 
+fn auth_api_url(
+    configured_api_url: &str,
+    discovery: Option<&AuthDiscoveryResponse>,
+) -> Result<String, ApiError> {
+    let raw = discovery
+        .and_then(|value| value.api_url.as_deref())
+        .unwrap_or(configured_api_url);
+    Ok(validated_discovered_api_url(raw)?
+        .trim_end_matches('/')
+        .to_string())
+}
+
 fn no_supported_method_error(discovery: Option<&AuthDiscoveryResponse>, action: &str) -> String {
     match discovery {
         None => format!("no {action} methods are advertised by this target"),
@@ -117,8 +129,8 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
     let paths = CliPaths::resolve()?;
     let cli_config = config::load_config(&paths)?;
 
-    let client = ApiClient::new(&cli_config.api_url, None);
-    let discovery = auth_discovery_or_legacy(client.auth_discovery().await)?;
+    let discovery_client = ApiClient::new(&cli_config.api_url, None);
+    let discovery = auth_discovery_or_legacy(discovery_client.auth_discovery().await)?;
 
     let available = supported_methods(discovery.as_ref(), "sign up");
     if available.is_empty() {
@@ -140,6 +152,8 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(err) = auth_method_error(discovery.as_ref(), provider, "sign up") {
         return Err(err.into());
     }
+    let auth_api_url = auth_api_url(&cli_config.api_url, discovery.as_ref())?;
+    let client = ApiClient::new(&auth_api_url, None);
 
     let req = if provider == "email" {
         let email: String = Input::new().with_prompt("Email").interact_text()?;
@@ -191,6 +205,7 @@ pub async fn signup() -> Result<(), Box<dyn std::error::Error>> {
 
     // Save org
     let mut updated_config = cli_config;
+    updated_config.api_url = auth_api_url;
     updated_config.org = Some(resp.org_name.clone());
     updated_config.org_id = Some(resp.org_id.to_string());
     config::save_config(&paths, &updated_config)?;
@@ -220,8 +235,8 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let client = ApiClient::new(&cli_config.api_url, None);
-    let discovery = auth_discovery_or_legacy(client.auth_discovery().await)?;
+    let discovery_client = ApiClient::new(&cli_config.api_url, None);
+    let discovery = auth_discovery_or_legacy(discovery_client.auth_discovery().await)?;
 
     let use_nostr = if !args.email && !args.nostr {
         if default_uses_device_login(discovery.as_ref()) {
@@ -254,6 +269,8 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(err) = auth_method_error(discovery.as_ref(), provider, "log in") {
         return Err(err.into());
     }
+    let auth_api_url = auth_api_url(&cli_config.api_url, discovery.as_ref())?;
+    let client = ApiClient::new(&auth_api_url, None);
 
     let req = if use_nostr {
         let npub: String = Input::new()
@@ -277,7 +294,7 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Construct NIP-98 HTTP Auth event (kind 27235)
-        let api_url = format!("{}/auth/login", cli_config.api_url);
+        let api_url = format!("{auth_api_url}/auth/login");
         let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
             .tag(
                 nostr::Tag::parse(["u".to_string(), api_url])
@@ -326,6 +343,7 @@ pub async fn login(args: LoginArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Save org
     let mut updated_config = cli_config;
+    updated_config.api_url = auth_api_url;
     updated_config.org = Some(resp.org_name.clone());
     updated_config.org_id = Some(resp.org_id.to_string());
     config::save_config(&paths, &updated_config)?;
@@ -341,6 +359,7 @@ async fn device_login(
     discovery: Option<AuthDiscoveryResponse>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = ApiClient::new(&cli_config.api_url, None);
+    let authenticated_api_url = auth_api_url(&cli_config.api_url, discovery.as_ref())?;
     let start_request = DeviceLoginStartRequest {
         org: args.org.clone(),
         requested_org_slug: args.org.clone(),
@@ -403,18 +422,23 @@ async fn device_login(
                 };
 
                 let mut updated_config = cli_config;
-                if let Some(api_url) = discovery.as_ref().and_then(|d| d.api_url.as_deref()) {
-                    updated_config.api_url = api_url.trim_end_matches('/').to_string();
-                }
+                updated_config.api_url = authenticated_api_url;
                 updated_config.org = Some(auth.org_name.clone());
                 updated_config.org_id = Some(auth.org_id.clone());
 
-                let api = ApiClient::from_config(&updated_config, &creds);
-                let me = api.get_current_user().await?;
                 config::save_credentials(&paths, &creds)?;
                 config::save_config(&paths, &updated_config)?;
-                println!("Logged in as {}", me.display_name);
-                println!("Active org: {}", me.active_org.name);
+                let api = ApiClient::from_config(&updated_config, &creds);
+                match api.get_current_user().await {
+                    Ok(me) => {
+                        println!("Logged in as {}", me.display_name);
+                        println!("Active org: {}", me.active_org.name);
+                    }
+                    Err(error) => {
+                        println!("Logged in. Active org: {}", auth.org_name);
+                        eprintln!("Warning: could not load the current profile: {error}");
+                    }
+                }
                 return Ok(());
             }
             "pending" => {
@@ -520,10 +544,13 @@ pub async fn logout() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApiClient, ApiError, AuthDiscoveryResponse, auth_discovery_or_legacy, auth_method_error,
-        browser_safe_device_url, default_uses_device_login, no_supported_method_error,
-        supported_methods,
+        ApiClient, ApiError, AuthDiscoveryResponse, LoginArgs, auth_api_url,
+        auth_discovery_or_legacy, auth_method_error, browser_safe_device_url,
+        default_uses_device_login, device_login, no_supported_method_error, supported_methods,
     };
+    use enclava_cli::config::{self, CliConfig, CliPaths};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     fn discovery(methods: &[&str]) -> AuthDiscoveryResponse {
         AuthDiscoveryResponse {
@@ -654,6 +681,108 @@ mod tests {
         ]))));
         assert!(!default_uses_device_login(Some(&discovery(&["email"]))));
         assert!(!default_uses_device_login(Some(&discovery(&[]))));
+    }
+
+    #[test]
+    fn auth_api_url_prefers_and_validates_discovery() {
+        let mut d = discovery(&["email"]);
+        d.api_url = Some("https://split-api.example/v1/".to_string());
+        assert_eq!(
+            auth_api_url("https://frontend.example", Some(&d)).unwrap(),
+            "https://split-api.example/v1"
+        );
+
+        d.api_url = Some("http://split-api.example".to_string());
+        assert!(auth_api_url("https://frontend.example", Some(&d)).is_err());
+        assert_eq!(
+            auth_api_url("https://legacy.example/", None).unwrap(),
+            "https://legacy.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_device_session_survives_profile_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let responses = [
+                (
+                    "201 Created",
+                    r#"{"device_code":"device-secret","user_code":"ABCD-EFGH","verification_uri":"https://auth.example/cli/login","verification_uri_complete":"https://auth.example/cli/login?user_code=ABCD-EFGH","expires_in":600,"interval":1}"#,
+                ),
+                (
+                    "200 OK",
+                    r#"{"status":"approved","interval":1,"expires_in":599,"error":null,"auth":{"token":"redeemed-token","user_id":"user-id","org_id":"org-id","org_name":"example-org"}}"#,
+                ),
+                ("503 Service Unavailable", r#"{"message":"retry later"}"#),
+            ];
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap();
+                requests.push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
+            requests
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = CliPaths::from_root(temp.path().join("state")).unwrap();
+        let configured = CliConfig {
+            api_url: "http://127.0.0.1:9".to_string(),
+            org: None,
+            org_id: None,
+        };
+        let base = format!("http://{addr}");
+        let discovery = AuthDiscoveryResponse {
+            api_mode: Some("hosted".to_string()),
+            api_url: Some(base.clone()),
+            cli_login_url: None,
+            device_start_url: Some(format!("{base}/remote/device/start")),
+            device_poll_url: Some(format!("{base}/remote/device/poll")),
+            auth_methods: vec!["device_code".to_string()],
+        };
+
+        device_login(
+            LoginArgs {
+                no_browser: true,
+                api_url: None,
+                org: None,
+                approve_logs: false,
+                nostr: false,
+                email: false,
+            },
+            paths.clone(),
+            configured,
+            Some(discovery),
+        )
+        .await
+        .unwrap();
+
+        let saved_credentials = config::load_credentials(&paths).unwrap();
+        assert_eq!(
+            saved_credentials.session_token.as_deref(),
+            Some("redeemed-token")
+        );
+        assert_eq!(config::load_config(&paths).unwrap().api_url, base);
+        let requests = handle.join().unwrap();
+        assert!(requests[0].starts_with("POST /remote/device/start "));
+        assert!(requests[1].starts_with("POST /remote/device/poll "));
+        assert!(requests[2].starts_with("GET /users/me "));
+        assert!(
+            requests[2]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer redeemed-token")
+        );
     }
 
     #[test]

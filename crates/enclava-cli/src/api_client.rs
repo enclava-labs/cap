@@ -984,11 +984,11 @@ pub fn loopback_http_url(raw: &str) -> bool {
     }
 }
 
-fn validated_device_endpoint(raw: &str) -> Result<&str, ApiError> {
+fn validated_auth_url(raw: &str, label: &str) -> Result<reqwest::Url, ApiError> {
     let parsed = reqwest::Url::parse(raw).map_err(|_| ApiError::Api {
         status: 0,
         code: Some("invalid_auth_discovery".to_string()),
-        message: "device endpoint is not a valid absolute URL".to_string(),
+        message: format!("{label} is not a valid absolute URL"),
     })?;
     if parsed.host().is_none()
         || (parsed.scheme() != "https" && !loopback_http_url(raw))
@@ -999,8 +999,26 @@ fn validated_device_endpoint(raw: &str) -> Result<&str, ApiError> {
         return Err(ApiError::Api {
             status: 0,
             code: Some("invalid_auth_discovery".to_string()),
-            message: "device endpoint must use HTTPS (or loopback HTTP) without credentials or a fragment"
-                .to_string(),
+            message: format!(
+                "{label} must use HTTPS (or loopback HTTP) without credentials or a fragment"
+            ),
+        });
+    }
+    Ok(parsed)
+}
+
+fn validated_device_endpoint(raw: &str) -> Result<&str, ApiError> {
+    validated_auth_url(raw, "device endpoint")?;
+    Ok(raw)
+}
+
+pub fn validated_discovered_api_url(raw: &str) -> Result<&str, ApiError> {
+    let parsed = validated_auth_url(raw, "discovered API URL")?;
+    if parsed.query().is_some() {
+        return Err(ApiError::Api {
+            status: 0,
+            code: Some("invalid_auth_discovery".to_string()),
+            message: "discovered API URL must not contain a query".to_string(),
         });
     }
     Ok(raw)
@@ -1008,7 +1026,7 @@ fn validated_device_endpoint(raw: &str) -> Result<&str, ApiError> {
 
 #[cfg(test)]
 mod loopback_tests {
-    use super::{ApiClient, loopback_http_url};
+    use super::{ApiClient, loopback_http_url, validated_discovered_api_url};
 
     #[test]
     fn only_exact_loopback_hosts_are_plain_http() {
@@ -1042,6 +1060,20 @@ mod loopback_tests {
             ("https://example.com:8443/api", "https://example.com:8443"),
         ] {
             assert_eq!(ApiClient::new(configured, None).origin(), expected);
+        }
+    }
+
+    #[test]
+    fn discovered_api_url_requires_a_safe_absolute_base() {
+        assert!(validated_discovered_api_url("https://api.example.test/v1").is_ok());
+        assert!(validated_discovered_api_url("http://127.0.0.1:8080").is_ok());
+        for invalid in [
+            "http://api.example.test",
+            "https://user@api.example.test",
+            "https://api.example.test/#fragment",
+            "https://api.example.test/?query=value",
+        ] {
+            assert!(validated_discovered_api_url(invalid).is_err(), "{invalid}");
         }
     }
 }
