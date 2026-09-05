@@ -107,6 +107,7 @@ pub struct TemplateDeployArgs {
     #[arg(long)]
     pub json: bool,
     /// Emit deployment phase timing JSONL on stderr (SSH command readiness, not login).
+    /// Best-effort: process signals (including Ctrl-C) may omit terminal records.
     #[arg(long)]
     pub timings: bool,
     /// Persist the recovery mnemonic so `enclava key backup` can back it up (default).
@@ -280,6 +281,8 @@ impl<F: Fn(&[u8]) -> std::io::Result<()>> Drop for DeployTimer<'_, F> {
         }
         // Fixed phase categories deliberately exclude error messages and deployment data.
         // Total encloses all phases; nested durations must not be summed with total.
+        // Cancellation here means a dropped future, not process termination:
+        // preserve the CLI's existing SIGINT/SIGTERM behavior (no unwinding).
         let category = match self.outcome {
             "error" => serde_json::json!(self.phase),
             "cancelled" => serde_json::json!("cancelled"),
