@@ -42,6 +42,9 @@ blocking_rollout_rules:
     enclava-api that emits the new schema.
   - If CAP internal API response shape changes, update and test enclava-paas
     before deploying CAP API.
+  - If `/.well-known/enclava` or its `auth_methods` values (`device_code`,
+    `email`, `nostr`) change, update and test enclava-cli and enclava-paas
+    together before rollout.
   - If workload manifest fields or sidecar images change, update
     enclava-ops-manifests image references and verify live tenant pods.
 required_checks:

@@ -46,6 +46,74 @@ fn auth_response_matches_server_shape() {
 }
 
 #[test]
+fn auth_discovery_response_accepts_hosted_device_code_only() {
+    let body = serde_json::json!({
+        "api_mode": "hosted",
+        "api_url": "https://api.enclava.dev",
+        "cli_login_url": "https://auth.enclava.dev/login",
+        "device_start_url": "https://api.enclava.dev/auth/device/start",
+        "device_poll_url": "https://api.enclava.dev/auth/device/poll",
+        "auth_methods": ["device_code"]
+    });
+    let resp: AuthDiscoveryResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(resp.api_mode.as_deref(), Some("hosted"));
+    assert_eq!(resp.api_url.as_deref(), Some("https://api.enclava.dev"));
+    assert_eq!(
+        resp.cli_login_url.as_deref(),
+        Some("https://auth.enclava.dev/login")
+    );
+    assert_eq!(
+        resp.device_start_url.as_deref(),
+        Some("https://api.enclava.dev/auth/device/start")
+    );
+    assert_eq!(
+        resp.device_poll_url.as_deref(),
+        Some("https://api.enclava.dev/auth/device/poll")
+    );
+    assert_eq!(resp.auth_methods, ["device_code"]);
+}
+
+#[test]
+fn auth_discovery_response_accepts_standalone_email_and_nostr() {
+    let body = serde_json::json!({
+        "api_mode": "standalone",
+        "api_url": "https://api.standalone.dev",
+        "cli_login_url": "https://api.standalone.dev/auth/login",
+        "device_start_url": "https://api.standalone.dev/auth/device/start",
+        "device_poll_url": "https://api.standalone.dev/auth/device/poll",
+        "auth_methods": ["email", "nostr", "device_code"]
+    });
+    let resp: AuthDiscoveryResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(resp.api_mode.as_deref(), Some("standalone"));
+    assert!(resp.auth_methods.contains(&"email".to_string()));
+    assert!(resp.auth_methods.contains(&"nostr".to_string()));
+    assert!(resp.auth_methods.contains(&"device_code".to_string()));
+}
+
+#[test]
+fn auth_discovery_response_tolerates_optional_fields() {
+    let body = serde_json::json!({
+        "auth_methods": ["email"]
+    });
+    let resp: AuthDiscoveryResponse = serde_json::from_value(body).unwrap();
+    assert!(resp.api_mode.is_none());
+    assert!(resp.api_url.is_none());
+    assert!(resp.cli_login_url.is_none());
+    assert!(resp.device_start_url.is_none());
+    assert!(resp.device_poll_url.is_none());
+    assert_eq!(resp.auth_methods, ["email"]);
+}
+
+#[test]
+fn auth_discovery_response_requires_auth_methods() {
+    let body = serde_json::json!({
+        "api_mode": "hosted",
+        "api_url": "https://api.enclava.dev"
+    });
+    assert!(serde_json::from_value::<AuthDiscoveryResponse>(body).is_err());
+}
+
+#[test]
 fn current_user_accepts_deploy_eligibility_fields() {
     let body = serde_json::json!({
         "user_id": "c5277e9d-c1bc-4daa-bbb4-43a625952eec",
