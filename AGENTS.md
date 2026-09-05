@@ -1,10 +1,14 @@
 # Agent Notes
 
 ## Cluster Access
-- The Kubernetes cluster is reachable by SSH through `control1.encl`.
+- The development/test Kubernetes cluster is reachable through
+  `master.enc-work` and `worker.enc-work`; public test endpoints use
+  `*.dev.enclava.work`.
   Do instead: run cluster checks with commands such as
-  `ssh control1.encl kubectl ...` when local `kubectl` or kubeconfig is not
-  available.
+  `ssh master.enc-work sudo kubectl ...` when local `kubectl` or kubeconfig is
+  not available.
+- Do not operate on `control1.encl` or `*.preprod.enclava.dev`; that preprod
+  cluster must remain untouched unless the user explicitly re-authorizes it.
 
 ## Cross-Project Dependency Schema
 
