@@ -34,12 +34,7 @@ impl ApiClient {
         // `http://localhost@evil.example` (userinfo) or
         // `http://localhost.evil.example` (subdomain) send credentials to a
         // remote host over cleartext.
-        let https_only = !loopback_http_url(base_url);
-        let http = reqwest::Client::builder()
-            .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
-            .https_only(https_only)
-            .build()
-            .expect("failed to build HTTP client");
+        let http = http_client_for(base_url);
 
         let base_url = base_url.trim_end_matches('/').to_string();
         let origin = reqwest::Url::parse(&base_url)
@@ -156,8 +151,22 @@ impl ApiClient {
     pub async fn login(&self, req: &LoginRequest) -> Result<AuthResponse, ApiError> {
         let resp = self
             .http
-            .post(self.url("/auth/login"))
+            .post(self.auth_login_url())
             .json(req)
+            .send()
+            .await?;
+        let resp = self.check_response(resp).await?;
+        Ok(resp.json().await?)
+    }
+
+    pub fn auth_login_url(&self) -> String {
+        self.url("/auth/login")
+    }
+
+    pub async fn auth_discovery(&self) -> Result<AuthDiscoveryResponse, ApiError> {
+        let resp = self
+            .http
+            .get(self.url("/.well-known/enclava"))
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
@@ -168,12 +177,22 @@ impl ApiClient {
         &self,
         req: &DeviceLoginStartRequest,
     ) -> Result<DeviceLoginStartResponse, ApiError> {
-        let resp = self
-            .http
-            .post(self.url("/auth/device/start"))
-            .json(req)
-            .send()
-            .await?;
+        self.start_device_login_at(&self.url("/auth/device/start"), req)
+            .await
+    }
+
+    pub async fn start_device_login_at(
+        &self,
+        endpoint_url: &str,
+        req: &DeviceLoginStartRequest,
+    ) -> Result<DeviceLoginStartResponse, ApiError> {
+        let endpoint_url = validated_device_endpoint(endpoint_url)?;
+        let http = if loopback_http_url(endpoint_url) {
+            http_client_for(endpoint_url)
+        } else {
+            self.http.clone()
+        };
+        let resp = http.post(endpoint_url).json(req).send().await?;
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
     }
@@ -182,12 +201,22 @@ impl ApiClient {
         &self,
         req: &DeviceLoginPollRequest,
     ) -> Result<DeviceLoginPollResponse, ApiError> {
-        let resp = self
-            .http
-            .post(self.url("/auth/device/poll"))
-            .json(req)
-            .send()
-            .await?;
+        self.poll_device_login_at(&self.url("/auth/device/poll"), req)
+            .await
+    }
+
+    pub async fn poll_device_login_at(
+        &self,
+        endpoint_url: &str,
+        req: &DeviceLoginPollRequest,
+    ) -> Result<DeviceLoginPollResponse, ApiError> {
+        let endpoint_url = validated_device_endpoint(endpoint_url)?;
+        let http = if loopback_http_url(endpoint_url) {
+            http_client_for(endpoint_url)
+        } else {
+            self.http.clone()
+        };
+        let resp = http.post(endpoint_url).json(req).send().await?;
         let resp = self.check_response(resp).await?;
         Ok(resp.json().await?)
     }
@@ -817,6 +846,14 @@ impl ApiClient {
     }
 }
 
+fn http_client_for(url: &str) -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
+        .https_only(!loopback_http_url(url))
+        .build()
+        .expect("failed to build HTTP client")
+}
+
 fn path_segment(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -964,9 +1001,49 @@ pub fn loopback_http_url(raw: &str) -> bool {
     }
 }
 
+fn validated_auth_url(raw: &str, label: &str) -> Result<reqwest::Url, ApiError> {
+    let parsed = reqwest::Url::parse(raw).map_err(|_| ApiError::Api {
+        status: 0,
+        code: Some("invalid_auth_discovery".to_string()),
+        message: format!("{label} is not a valid absolute URL"),
+    })?;
+    if parsed.host().is_none()
+        || (parsed.scheme() != "https" && !loopback_http_url(raw))
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ApiError::Api {
+            status: 0,
+            code: Some("invalid_auth_discovery".to_string()),
+            message: format!(
+                "{label} must use HTTPS (or loopback HTTP) without credentials or a fragment"
+            ),
+        });
+    }
+    Ok(parsed)
+}
+
+fn validated_device_endpoint(raw: &str) -> Result<&str, ApiError> {
+    validated_auth_url(raw, "device endpoint")?;
+    Ok(raw)
+}
+
+pub fn validated_discovered_api_url(raw: &str) -> Result<&str, ApiError> {
+    let parsed = validated_auth_url(raw, "discovered API URL")?;
+    if parsed.query().is_some() {
+        return Err(ApiError::Api {
+            status: 0,
+            code: Some("invalid_auth_discovery".to_string()),
+            message: "discovered API URL must not contain a query".to_string(),
+        });
+    }
+    Ok(raw)
+}
+
 #[cfg(test)]
 mod loopback_tests {
-    use super::{ApiClient, loopback_http_url};
+    use super::{ApiClient, loopback_http_url, validated_discovered_api_url};
 
     #[test]
     fn only_exact_loopback_hosts_are_plain_http() {
@@ -1000,6 +1077,20 @@ mod loopback_tests {
             ("https://example.com:8443/api", "https://example.com:8443"),
         ] {
             assert_eq!(ApiClient::new(configured, None).origin(), expected);
+        }
+    }
+
+    #[test]
+    fn discovered_api_url_requires_a_safe_absolute_base() {
+        assert!(validated_discovered_api_url("https://api.example.test/v1").is_ok());
+        assert!(validated_discovered_api_url("http://127.0.0.1:8080").is_ok());
+        for invalid in [
+            "http://api.example.test",
+            "https://user@api.example.test",
+            "https://api.example.test/#fragment",
+            "https://api.example.test/?query=value",
+        ] {
+            assert!(validated_discovered_api_url(invalid).is_err(), "{invalid}");
         }
     }
 }
