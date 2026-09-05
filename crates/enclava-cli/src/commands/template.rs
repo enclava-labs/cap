@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Write as _,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -105,6 +106,9 @@ pub struct TemplateDeployArgs {
     /// Print machine-readable JSON with deployment, stable SSH endpoint, and stable SSH endpoint command details.
     #[arg(long)]
     pub json: bool,
+    /// Emit deployment phase timing JSONL on stderr (SSH command readiness, not login).
+    #[arg(long)]
+    pub timings: bool,
     /// Persist the recovery mnemonic so `enclava key backup` can back it up (default).
     #[arg(long, conflicts_with = "no_store_mnemonic")]
     pub store_mnemonic: bool,
@@ -202,7 +206,118 @@ async fn list() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DeployPhase {
+    Total,
+    DeployRequest,
+    BootstrapWait,
+    Ownership,
+    ManagedConfigEnqueue,
+    ManagedConfigWait,
+    CustomerConfigAttestation,
+    CustomerConfigWrite,
+    SshCommandReadiness,
+}
+
+struct DeployTimings<F: Fn(&[u8]) -> std::io::Result<()>> {
+    enabled: bool,
+    run_id: uuid::Uuid,
+    sink: F,
+}
+
+impl<F: Fn(&[u8]) -> std::io::Result<()>> DeployTimings<F> {
+    fn new(enabled: bool, sink: F) -> Self {
+        Self {
+            enabled,
+            run_id: uuid::Uuid::new_v4(),
+            sink,
+        }
+    }
+
+    async fn run<T, E>(
+        &self,
+        phase: DeployPhase,
+        work: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        let mut timer = DeployTimer {
+            timings: self,
+            phase,
+            start: Instant::now(),
+            outcome: "cancelled",
+        };
+        let result = work.await;
+        timer.outcome = if result.is_ok() { "success" } else { "error" };
+        result
+    }
+
+    async fn ssh_command<T, E>(
+        &self,
+        no_wait: bool,
+        work: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<Option<T>, E> {
+        if no_wait {
+            Ok(None)
+        } else {
+            self.run(DeployPhase::SshCommandReadiness, work)
+                .await
+                .map(Some)
+        }
+    }
+}
+
+struct DeployTimer<'a, F: Fn(&[u8]) -> std::io::Result<()>> {
+    timings: &'a DeployTimings<F>,
+    phase: DeployPhase,
+    start: Instant,
+    outcome: &'static str,
+}
+
+impl<F: Fn(&[u8]) -> std::io::Result<()>> Drop for DeployTimer<'_, F> {
+    fn drop(&mut self) {
+        if !self.timings.enabled {
+            return;
+        }
+        // Fixed phase categories deliberately exclude error messages and deployment data.
+        // Total encloses all phases; nested durations must not be summed with total.
+        let category = match self.outcome {
+            "error" => serde_json::json!(self.phase),
+            "cancelled" => serde_json::json!("cancelled"),
+            _ => serde_json::Value::Null,
+        };
+        let record = serde_json::json!({
+            "event": "template_deploy_timing",
+            "run_id": self.timings.run_id,
+            "phase": self.phase,
+            "elapsed_ms": self.start.elapsed().as_secs_f64() * 1000.0,
+            "outcome": self.outcome,
+            "error_category": category,
+        });
+        if let Ok(mut line) = serde_json::to_vec(&record) {
+            line.push(b'\n');
+            let _ = (self.timings.sink)(&line);
+        }
+    }
+}
+
 async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Error>> {
+    deploy_to_timing_sink(args, |line| std::io::stderr().lock().write_all(line)).await
+}
+
+async fn deploy_to_timing_sink(
+    args: TemplateDeployArgs,
+    sink: impl Fn(&[u8]) -> std::io::Result<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let timings = DeployTimings::new(args.timings, sink);
+    timings
+        .run(DeployPhase::Total, deploy_with_timings(args, &timings))
+        .await
+}
+
+async fn deploy_with_timings(
+    args: TemplateDeployArgs,
+    timings: &DeployTimings<impl Fn(&[u8]) -> std::io::Result<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let deploy_started = Instant::now();
     let instance_name = normalize_slug(&args.name)?;
     let explicit_stable_endpoint = args
@@ -249,7 +364,7 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     } else {
         MnemonicCapture::Store
     };
-    let pb = if args.json {
+    let pb = if args.json || args.timings {
         ProgressBar::hidden()
     } else {
         ProgressBar::new(5)
@@ -306,16 +421,19 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     pb.set_position(2);
     pb.set_message("Creating template instance...");
 
-    let response = match api
-        .create_template_instance(&CreateTemplateInstanceRequest {
-            template_slug: args.template.clone(),
-            instance_name: instance_name.clone(),
-            config: template_create_config(explicit_stable_endpoint.as_deref()),
-            bootstrap_pubkey_hash: bootstrap_pubkey_hash.clone(),
-            customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
-            org_keyring_blob: Some(signed_blobs.org_keyring_blob),
-            signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
-        })
+    let response = match timings
+        .run(
+            DeployPhase::DeployRequest,
+            api.create_template_instance(&CreateTemplateInstanceRequest {
+                template_slug: args.template.clone(),
+                instance_name: instance_name.clone(),
+                config: template_create_config(explicit_stable_endpoint.as_deref()),
+                bootstrap_pubkey_hash: bootstrap_pubkey_hash.clone(),
+                customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
+                org_keyring_blob: Some(signed_blobs.org_keyring_blob),
+                signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
+            }),
+        )
         .await
     {
         Ok(response) => response,
@@ -334,50 +452,67 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     pb.set_position(3);
     if template.unlock_mode == "password" {
         pb.set_message("Waiting for ownership claim endpoint...");
-        if wait_for_template_bootstrap_endpoint(
-            api,
-            &instance_name,
-            &deployment_id,
-            Duration::from_secs(args.ssh_timeout_seconds),
-            Duration::from_secs(3),
-            &pb,
-        )
-        .await?
-        {
-            claim_initial_ownership(
-                api,
-                &ctx.paths,
-                &ctx.cli_config,
-                &instance_name,
-                &storage_password,
-                capture,
+        if timings
+            .run(
+                DeployPhase::BootstrapWait,
+                wait_for_template_bootstrap_endpoint(
+                    api,
+                    &instance_name,
+                    &deployment_id,
+                    Duration::from_secs(args.ssh_timeout_seconds),
+                    Duration::from_secs(3),
+                    &pb,
+                ),
             )
-            .await?;
+            .await?
+        {
+            timings
+                .run(
+                    DeployPhase::Ownership,
+                    claim_initial_ownership(
+                        api,
+                        &ctx.paths,
+                        &ctx.cli_config,
+                        &instance_name,
+                        &storage_password,
+                        capture,
+                    ),
+                )
+                .await?;
         }
     }
     if !template.paas_managed_config_keys.is_empty() {
         pb.set_message("Delivering platform-managed config...");
-        let managed = api
-            .deliver_managed_template_config(&instance_name)
-            .await
-            .map_err(managed_template_config_api_error)?;
-        if !matches!(managed.status.as_str(), "queued" | "delivered") {
-            return Err(format!(
-                "PaaS managed config delivery returned unexpected status `{}`",
-                managed.status
-            )
-            .into());
-        }
+        timings
+            .run(DeployPhase::ManagedConfigEnqueue, async {
+                let managed = api
+                    .deliver_managed_template_config(&instance_name)
+                    .await
+                    .map_err(managed_template_config_api_error)?;
+                if !matches!(managed.status.as_str(), "queued" | "delivered") {
+                    return Err(format!(
+                        "PaaS managed config delivery returned unexpected status `{}`",
+                        managed.status
+                    )
+                    .into());
+                }
+                Ok::<(), Box<dyn std::error::Error>>(())
+            })
+            .await?;
         pb.set_message("Waiting for platform-managed config...");
-        wait_for_paas_managed_config_keys(
-            api,
-            &instance_name,
-            &template.paas_managed_config_keys,
-            &deployment_id,
-            Duration::from_secs(args.ssh_timeout_seconds),
-            &pb,
-        )
-        .await?;
+        timings
+            .run(
+                DeployPhase::ManagedConfigWait,
+                wait_for_paas_managed_config_keys(
+                    api,
+                    &instance_name,
+                    &template.paas_managed_config_keys,
+                    &deployment_id,
+                    Duration::from_secs(args.ssh_timeout_seconds),
+                    &pb,
+                ),
+            )
+            .await?;
     }
     pb.set_message("Delivering config to TEE...");
 
@@ -392,22 +527,31 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
     let tee_url = template_config_endpoint_url(tee_url)?;
     let mut tee_resolve_ip = token.tee_resolve_ip;
     let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
-    let mut tee = attest_template_config_tee_with_retry(tee).await?;
+    let mut tee = timings
+        .run(
+            DeployPhase::CustomerConfigAttestation,
+            attest_template_config_tee_with_retry(tee),
+        )
+        .await?;
     let mut tee_url = tee_url;
 
     let mut config_token = token.token.clone();
     let config_pairs = debian_ssh_config_pairs(public_keys);
     pb.set_message(counted_progress("Customer config", 0, config_pairs.len()));
-    deliver_template_config_with_retry(
-        api,
-        &mut tee,
-        &instance_name,
-        &mut config_token,
-        &mut tee_url,
-        &mut tee_resolve_ip,
-        &config_pairs,
-    )
-    .await?;
+    timings
+        .run(
+            DeployPhase::CustomerConfigWrite,
+            deliver_template_config_with_retry(
+                api,
+                &mut tee,
+                &instance_name,
+                &mut config_token,
+                &mut tee_url,
+                &mut tee_resolve_ip,
+                &config_pairs,
+            ),
+        )
+        .await?;
     pb.set_message(counted_progress(
         "Customer config",
         config_pairs.len(),
@@ -417,28 +561,31 @@ async fn deploy(args: TemplateDeployArgs) -> Result<(), Box<dyn std::error::Erro
 
     let mut app_url = app_url_from_template_response_cap(&response.cap)?;
 
-    let (ssh_command, ssh_endpoint) = if args.no_wait {
-        pb.set_position(5);
-        (None, None)
-    } else {
-        pb.set_position(4);
-        pb.set_message("Waiting for stable SSH endpoint command...");
-        let response = wait_for_paas_ssh_command(
-            api,
-            &instance_name,
-            &deployment_id,
-            stable_endpoint.as_str(),
-            app_url.as_str(),
-            Duration::from_secs(args.ssh_timeout_seconds),
-            &pb,
-        )
+    let ssh_response = timings
+        .ssh_command(args.no_wait, async {
+            pb.set_position(4);
+            pb.set_message("Waiting for stable SSH endpoint command...");
+            wait_for_paas_ssh_command(
+                api,
+                &instance_name,
+                &deployment_id,
+                stable_endpoint.as_str(),
+                app_url.as_str(),
+                Duration::from_secs(args.ssh_timeout_seconds),
+                &pb,
+            )
+            .await
+        })
         .await?;
+    let (ssh_command, ssh_endpoint) = if let Some(response) = ssh_response {
         if let Some(url) = response.app_url {
             app_url = normalize_paas_ssh_command_app_url(&url)?;
         }
-        pb.set_position(5);
         (response.command, response.endpoint)
+    } else {
+        (None, None)
     };
+    pb.set_position(5);
     pb.finish_with_message(format!(
         "Template deployed in {}",
         format_duration(deploy_started.elapsed())
@@ -2569,6 +2716,200 @@ fn ensure_ssh_command_matches_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn timing_records_success_error_cancel_and_redacts() {
+        let output = std::cell::RefCell::new(Vec::new());
+        let timings = DeployTimings::new(true, |line: &[u8]| {
+            output.borrow_mut().extend_from_slice(line);
+            Ok(())
+        });
+        assert_eq!(
+            timings
+                .run(DeployPhase::DeployRequest, async { Ok::<_, &str>(7) })
+                .await,
+            Ok(7)
+        );
+        assert_eq!(
+            timings
+                .run(DeployPhase::Ownership, async {
+                    Err::<(), _>("SECRET-token-password-config")
+                })
+                .await,
+            Err("SECRET-token-password-config")
+        );
+        let mut pending = Box::pin(timings.run(
+            DeployPhase::BootstrapWait,
+            std::future::pending::<Result<(), &str>>(),
+        ));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        let output = String::from_utf8(output.into_inner()).unwrap();
+        assert!(!output.contains("SECRET"));
+        let records: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 3);
+        for (record, outcome) in records.iter().zip(["success", "error", "cancelled"]) {
+            assert_eq!(record["event"], "template_deploy_timing");
+            assert_eq!(record["outcome"], outcome);
+            assert!(record["elapsed_ms"].is_number());
+            assert_eq!(record["run_id"], records[0]["run_id"]);
+        }
+        assert_eq!(records[1]["error_category"], "ownership");
+        assert_eq!(records[2]["error_category"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn timing_opt_out_and_sink_failure_do_not_affect_results() {
+        let timings = DeployTimings::new(false, |_: &[u8]| -> std::io::Result<()> {
+            panic!("disabled timing wrote output")
+        });
+        assert!(
+            timings
+                .run(DeployPhase::Total, async { Ok::<_, &str>(()) })
+                .await
+                .is_ok()
+        );
+        let timings = DeployTimings::new(true, |_: &[u8]| {
+            Err(std::io::Error::other("SECRET sink error"))
+        });
+        assert!(
+            timings
+                .run(DeployPhase::Total, async { Ok::<_, &str>(()) })
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn timing_flag_defaults_off_and_combines_with_json_no_wait() {
+        use clap::Parser as _;
+        for enabled in [false, true] {
+            let mut argv = vec![
+                "enclava",
+                "template",
+                "deploy",
+                "--name",
+                "shell",
+                "--json",
+                "--no-wait",
+            ];
+            if enabled {
+                argv.push("--timings");
+            }
+            let cli = crate::commands::Cli::try_parse_from(argv).unwrap();
+            let crate::commands::Command::Template(TemplateCommand::Deploy(args)) = cli.command
+            else {
+                panic!("deploy expected")
+            };
+            assert_eq!(args.timings, enabled);
+            assert!(args.json && args.no_wait);
+        }
+    }
+
+    #[tokio::test]
+    async fn timing_no_wait_never_polls_or_reports_ssh_work() {
+        let output = std::cell::RefCell::new(Vec::new());
+        let timings = DeployTimings::new(true, |line: &[u8]| {
+            output.borrow_mut().extend_from_slice(line);
+            Ok(())
+        });
+        let result = timings
+            .ssh_command(true, async {
+                panic!("no-wait polled SSH work");
+                #[allow(unreachable_code)]
+                Ok::<(), &str>(())
+            })
+            .await;
+        assert_eq!(result, Ok(None));
+        assert!(output.borrow().is_empty());
+        assert_eq!(
+            timings.ssh_command(false, async { Ok::<_, &str>(7) }).await,
+            Ok(Some(7))
+        );
+        let record: serde_json::Value = serde_json::from_slice(&output.borrow()).unwrap();
+        assert_eq!(record["phase"], "ssh_command_readiness");
+        assert_eq!(record["outcome"], "success");
+    }
+
+    #[tokio::test]
+    async fn timing_total_captures_validation_failure_without_remote_access() {
+        use clap::Parser as _;
+        for enabled in [false, true] {
+            let mut argv = vec![
+                "enclava",
+                "template",
+                "deploy",
+                "--name",
+                "SECRET/invalid",
+                "--json",
+            ];
+            if enabled {
+                argv.push("--timings");
+            }
+            let cli = crate::commands::Cli::try_parse_from(argv).unwrap();
+            let crate::commands::Command::Template(TemplateCommand::Deploy(args)) = cli.command
+            else {
+                panic!("deploy expected")
+            };
+            let output = std::cell::RefCell::new(Vec::new());
+            assert!(
+                deploy_to_timing_sink(args, |line| {
+                    output.borrow_mut().extend_from_slice(line);
+                    Ok(())
+                })
+                .await
+                .is_err()
+            );
+            if enabled {
+                let record: serde_json::Value = serde_json::from_slice(&output.borrow()).unwrap();
+                assert_eq!(record["phase"], "total");
+                assert_eq!(record["outcome"], "error");
+                assert!(
+                    !String::from_utf8(output.into_inner())
+                        .unwrap()
+                        .contains("SECRET")
+                );
+            } else {
+                assert!(output.borrow().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timing_does_not_change_stdout_json() {
+        let stderr = std::cell::RefCell::new(Vec::new());
+        let timings = DeployTimings::new(true, |line: &[u8]| {
+            stderr.borrow_mut().extend_from_slice(line);
+            Ok(())
+        });
+        let render = || {
+            deploy_response_output(DeployResponseOutput {
+                template_slug: "debian-ssh-ngrok",
+                instance_name: "SECRET-instance",
+                app_url: "https://shell.enclava.dev",
+                deployment_id: "SECRET-deployment",
+                stable_endpoint: Some("6.tcp.eu.ngrok.io:17958"),
+                ssh_command: None,
+                ssh_endpoint: None,
+                log_key_id: None,
+                log_private_key_file: None,
+                json: true,
+            })
+        };
+        let expected = render().unwrap();
+        let stdout = timings
+            .run(DeployPhase::Total, async { render() })
+            .await
+            .unwrap();
+        assert_eq!(stdout, expected);
+        let _: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert!(!stdout.contains("template_deploy_timing"));
+        let stderr = String::from_utf8(stderr.into_inner()).unwrap();
+        assert!(!stderr.contains("SECRET"));
+        let _: serde_json::Value = serde_json::from_str(&stderr).unwrap();
+    }
     use enclava_cli::api_types::{
         ConfigTokenResponse, HostedTemplateConfigValidation, HostedTemplateEgressRule,
         HostedTemplateResources,
@@ -3105,6 +3446,7 @@ mod tests {
             ssh_public_key_files: vec![],
             ngrok_tcp_url: None,
             no_wait: false,
+            timings: false,
             ssh_timeout_seconds: DEFAULT_TEMPLATE_DEPLOY_TIMEOUT_SECONDS,
             storage_password_file: None,
             log_key: None,
