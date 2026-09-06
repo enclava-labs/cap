@@ -17,6 +17,8 @@ pub struct AcmeConfig {
     pub directory_url: String,
     pub account_credentials_path: Option<PathBuf>,
     pub dns_propagation_wait: Duration,
+    pub dns_lookup_prefer_system: bool,
+    pub dns_lookup_timeout: Option<Duration>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -114,12 +116,7 @@ pub(crate) async fn issue_dns01_certificate_timed(
             if let Err(err) = timing
                 .measure(
                     Phase::DnsVisibility,
-                    wait_for_txt_record(
-                        &record_name,
-                        &record_value,
-                        acme_config.dns_propagation_wait,
-                        timing,
-                    ),
+                    wait_for_txt_record(&record_name, &record_value, acme_config, timing),
                 )
                 .await
             {
@@ -159,28 +156,19 @@ pub(crate) async fn issue_dns01_certificate_timed(
 async fn wait_for_txt_record(
     record_name: &str,
     expected_value: &str,
-    timeout: Duration,
+    config: &AcmeConfig,
     timing: RequestTiming,
 ) -> Result<(), AcmeError> {
-    if timeout.is_zero() {
+    if config.dns_propagation_wait.is_zero() {
         return Ok(());
     }
 
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + config.dns_propagation_wait;
     loop {
-        match lookup_txt(record_name, timing).await {
+        match lookup_txt(record_name, config, timing).await {
             Ok(values) if values.iter().any(|value| value == expected_value) => return Ok(()),
-            Ok(values) => tracing::info!(
-                record = %record_name,
-                expected = %expected_value,
-                observed = ?values,
-                "waiting for ACME DNS-01 TXT propagation"
-            ),
-            Err(err) => tracing::info!(
-                record = %record_name,
-                error = %err,
-                "waiting for ACME DNS-01 TXT lookup"
-            ),
+            Ok(_) => tracing::info!("waiting for ACME DNS-01 TXT propagation"),
+            Err(_) => tracing::info!("waiting for ACME DNS-01 TXT lookup"),
         }
 
         if tokio::time::Instant::now() >= deadline {
@@ -192,23 +180,63 @@ async fn wait_for_txt_record(
     }
 }
 
-async fn lookup_txt(name: &str, timing: RequestTiming) -> Result<Vec<String>, String> {
-    match timing
-        .measure(Phase::DnsExternalLookup, lookup_txt_external(name))
-        .await
-    {
-        Ok(values) => Ok(values),
-        Err(err) => {
-            tracing::warn!(
-                record = %name,
-                error = %err,
+async fn lookup_txt(
+    name: &str,
+    config: &AcmeConfig,
+    timing: RequestTiming,
+) -> Result<Vec<String>, String> {
+    lookup_txt_with_resolvers(config, timing, |system| async move {
+        if system {
+            lookup_txt_system(name).await
+        } else {
+            lookup_txt_external(name).await
+        }
+    })
+    .await
+}
+
+async fn lookup_txt_with_resolvers<F: std::future::Future<Output = Result<Vec<String>, String>>>(
+    config: &AcmeConfig,
+    timing: RequestTiming,
+    mut lookup: impl FnMut(bool) -> F,
+) -> Result<Vec<String>, String> {
+    let mut last_error = String::new();
+    for system in [
+        config.dns_lookup_prefer_system,
+        !config.dns_lookup_prefer_system,
+    ] {
+        let phase = if system {
+            Phase::DnsSystemLookup
+        } else {
+            Phase::DnsExternalLookup
+        };
+        let result = timing
+            .measure(phase, async {
+                let work = lookup(system);
+                match config.dns_lookup_timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, work)
+                        .await
+                        .map_err(|_| "DNS TXT lookup timed out".to_string())?,
+                    None => work.await,
+                }
+            })
+            .await;
+        match result {
+            // Empty or nonmatching answers still belong to this resolver. The
+            // propagation loop, not the fallback, checks the exact challenge.
+            Ok(values) => return Ok(values),
+            Err(err) => last_error = err,
+        }
+        if system == config.dns_lookup_prefer_system {
+            let message = if system {
+                "system DNS lookup failed; falling back to external resolver"
+            } else {
                 "external DNS lookup failed; falling back to system resolver"
-            );
-            timing
-                .measure(Phase::DnsSystemLookup, lookup_txt_system(name))
-                .await
+            };
+            tracing::warn!("{message}");
         }
     }
+    Err(last_error)
 }
 
 async fn lookup_txt_external(name: &str) -> Result<Vec<String>, String> {
@@ -301,6 +329,198 @@ async fn load_or_create_account(config: &AcmeConfig) -> Result<Account, AcmeErro
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn config(system: bool, timeout: Option<Duration>) -> AcmeConfig {
+        AcmeConfig {
+            directory_url: "https://acme.invalid/directory".into(),
+            account_credentials_path: None,
+            dns_propagation_wait: Duration::from_secs(30),
+            dns_lookup_prefer_system: system,
+            dns_lookup_timeout: timeout,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lookup_timings_follow_actual_order_and_do_not_log_answers_or_errors() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for system in [false, true] {
+            let logs = Arc::new(Mutex::new(Vec::new()));
+            let output = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_env_filter("enclava_api=debug,cap::workload_tls_timing=debug")
+                .with_writer(move || Writer(output.clone()))
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            lookup_txt_with_resolvers(&config(system, None), RequestTiming::new(), |resolver| {
+                std::future::ready(if resolver == system {
+                    Err("private-error".into())
+                } else {
+                    Ok(vec!["private-answer".into()])
+                })
+            })
+            .await
+            .unwrap();
+            let text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+            assert!(!text.contains("private-"));
+            let lines: Vec<_> = text
+                .lines()
+                .filter(|line| line.contains("event=\"workload_tls_timing\""))
+                .collect();
+            assert_eq!(lines.len(), 2);
+            let phases = if system {
+                ["dns_system_lookup", "dns_external_lookup"]
+            } else {
+                ["dns_external_lookup", "dns_system_lookup"]
+            };
+            for (line, phase) in lines.iter().zip(phases) {
+                assert!(line.contains(&format!("phase=\"{phase}\"")));
+            }
+            assert!(lines[0].contains("outcome=\"error\""));
+            assert!(lines[1].contains("outcome=\"success\""));
+            let seq = |line: &str| {
+                line.split_whitespace()
+                    .find(|field| field.starts_with("request_seq="))
+                    .unwrap()
+                    .to_owned()
+            };
+            assert_eq!(seq(lines[0]), seq(lines[1]));
+        }
+        let source = include_str!("acme.rs");
+        let wait = source
+            .split("async fn wait_for_txt_record")
+            .nth(1)
+            .unwrap()
+            .split("async fn lookup_txt")
+            .next()
+            .unwrap();
+        assert!(!wait.contains("expected ="));
+        assert!(!wait.contains("observed ="));
+        assert!(!wait.contains("error ="));
+        assert!(wait.contains("value == expected_value"));
+    }
+
+    #[tokio::test]
+    async fn resolver_success_including_negative_answers_never_falls_back() {
+        for system in [false, true] {
+            for values in [vec![], vec!["wrong".into()], vec!["expected".into()]] {
+                let mut calls = Vec::new();
+                let result = lookup_txt_with_resolvers(
+                    &config(system, None),
+                    RequestTiming::new(),
+                    |resolver| {
+                        calls.push(resolver);
+                        std::future::ready(Ok(values.clone()))
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(result, values);
+                assert_eq!(calls, vec![system]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_errors_fall_back_in_configured_order() {
+        for system in [false, true] {
+            for fallback in [Ok(vec!["expected".into()]), Err("secondary failed".into())] {
+                let mut calls = Vec::new();
+                let result = lookup_txt_with_resolvers(
+                    &config(system, None),
+                    RequestTiming::new(),
+                    |resolver| {
+                        calls.push(resolver);
+                        std::future::ready(if resolver == system {
+                            Err("primary failed".into())
+                        } else {
+                            fallback.clone()
+                        })
+                    },
+                )
+                .await;
+                assert_eq!(result, fallback);
+                assert_eq!(calls, vec![system, !system]);
+            }
+        }
+    }
+
+    struct DropFlag<'a>(&'a std::cell::Cell<bool>);
+    impl Drop for DropFlag<'_> {
+        fn drop(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_drops_primary_before_fallback_and_bounds_secondary() {
+        for system in [false, true] {
+            for secondary_stalls in [false, true] {
+                let dropped = std::cell::Cell::new(false);
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    lookup_txt_with_resolvers(
+                        &config(system, Some(Duration::from_millis(10))),
+                        RequestTiming::new(),
+                        |resolver| {
+                            let dropped = &dropped;
+                            async move {
+                                if resolver == system {
+                                    let _guard = DropFlag(dropped);
+                                    std::future::pending::<()>().await;
+                                } else {
+                                    assert!(dropped.get());
+                                    if secondary_stalls {
+                                        std::future::pending::<()>().await;
+                                    }
+                                }
+                                Ok(vec!["expected".into()])
+                            }
+                        },
+                    ),
+                )
+                .await
+                .expect("both attempts must be bounded");
+                assert!(dropped.get());
+                if secondary_stalls {
+                    assert_eq!(result.unwrap_err(), "DNS TXT lookup timed out");
+                } else {
+                    assert_eq!(result.unwrap(), vec!["expected"]);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unset_timeout_preserves_native_wait_and_outer_cancellation_drops_work() {
+        let dropped = std::cell::Cell::new(false);
+        let calls = std::cell::Cell::new(0);
+        let result = tokio::time::timeout(
+            Duration::from_millis(30),
+            lookup_txt_with_resolvers(&config(false, None), RequestTiming::new(), |_| async {
+                calls.set(calls.get() + 1);
+                let _guard = DropFlag(&dropped);
+                std::future::pending::<Result<Vec<String>, String>>().await
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(dropped.get());
+        assert_eq!(calls.get(), 1);
+    }
     #[test]
     fn dns01_challenge_is_marked_ready_after_propagation_wait() {
         let source = include_str!("acme.rs");
@@ -332,10 +552,6 @@ mod tests {
     #[test]
     fn dns01_txt_lookup_falls_back_when_external_dns_is_blocked() {
         let source = include_str!("acme.rs");
-        let lookup = source
-            .split("async fn lookup_txt")
-            .nth(1)
-            .expect("lookup_txt function");
         let fallback = source
             .split("async fn lookup_txt_system")
             .nth(1)
@@ -344,10 +560,6 @@ mod tests {
         assert!(
             fallback.contains("builder_tokio()"),
             "ACME DNS-01 TXT self-check must fall back to a fresh system resolver when pod egress to external DNS is blocked"
-        );
-        assert!(
-            lookup.contains("external DNS lookup failed; falling back to system resolver"),
-            "ACME DNS-01 TXT fallback should log external resolver failures for live diagnosis"
         );
     }
 }

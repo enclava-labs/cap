@@ -558,11 +558,50 @@ fn load_acme_config(attestation: Option<&AttestationConfig>) -> anyhow::Result<O
         .and_then(|value| value.parse::<u64>().ok())
         .map(std::time::Duration::from_secs)
         .unwrap_or_else(|| std::time::Duration::from_secs(30));
+    let prefer_system = match std::env::var("ACME_DNS_LOOKUP_PREFER_SYSTEM") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => anyhow::bail!("ACME_DNS_LOOKUP_PREFER_SYSTEM must be valid UTF-8"),
+    };
+    let timeout_seconds = match std::env::var("ACME_DNS_LOOKUP_TIMEOUT_SECONDS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => anyhow::bail!("ACME_DNS_LOOKUP_TIMEOUT_SECONDS must be valid UTF-8"),
+    };
+    let (dns_lookup_prefer_system, dns_lookup_timeout) =
+        parse_acme_dns_lookup_settings(prefer_system.as_deref(), timeout_seconds.as_deref())?;
     Ok(Some(AcmeConfig {
         directory_url,
         account_credentials_path,
         dns_propagation_wait,
+        dns_lookup_prefer_system,
+        dns_lookup_timeout,
     }))
+}
+
+fn parse_acme_dns_lookup_settings(
+    prefer_system: Option<&str>,
+    timeout_seconds: Option<&str>,
+) -> anyhow::Result<(bool, Option<std::time::Duration>)> {
+    let prefer_system = parse_fail_closed_switch("ACME_DNS_LOOKUP_PREFER_SYSTEM", prefer_system)?;
+    let timeout = timeout_seconds
+        .map(|value| {
+            let seconds = value.parse::<u64>().map_err(|_| {
+                anyhow::anyhow!("ACME_DNS_LOOKUP_TIMEOUT_SECONDS must be a positive integer")
+            })?;
+            anyhow::ensure!(
+                seconds > 0,
+                "ACME_DNS_LOOKUP_TIMEOUT_SECONDS must be positive"
+            );
+            let duration = std::time::Duration::from_secs(seconds);
+            anyhow::ensure!(
+                std::time::Instant::now().checked_add(duration).is_some(),
+                "ACME_DNS_LOOKUP_TIMEOUT_SECONDS is too large"
+            );
+            Ok::<_, anyhow::Error>(duration)
+        })
+        .transpose()?;
+    Ok((prefer_system, timeout))
 }
 
 fn load_trustee_attestation_verify_bearer_token(
@@ -916,6 +955,37 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acme_dns_settings_preserve_defaults_and_validate_explicit_values() {
+        assert_eq!(
+            parse_acme_dns_lookup_settings(None, None).unwrap(),
+            (false, None)
+        );
+        assert_eq!(
+            parse_acme_dns_lookup_settings(Some("true"), Some("2")).unwrap(),
+            (true, Some(std::time::Duration::from_secs(2)))
+        );
+        assert_eq!(
+            parse_acme_dns_lookup_settings(Some("false"), None).unwrap(),
+            (false, None)
+        );
+        for invalid in ["", "1", "TRUE", "yes", " true "] {
+            assert!(parse_acme_dns_lookup_settings(Some(invalid), None).is_err());
+        }
+        for invalid in [
+            "",
+            "0",
+            "-1",
+            "1.5",
+            "two",
+            " 2 ",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            assert!(parse_acme_dns_lookup_settings(None, Some(invalid)).is_err());
+        }
+    }
 
     #[test]
     fn release_runtime_class_binding_uses_the_resolved_class() {
