@@ -16,6 +16,9 @@ members = [
 edition = "2024"
 rust-version = "1.85"
 
+[profile.release]
+strip = true
+
 [workspace.dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
