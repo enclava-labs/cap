@@ -32,3 +32,5 @@ __pycache__/
 *.py[cod]
 .aislop/
 to-delete
+
+.planning/debug/
