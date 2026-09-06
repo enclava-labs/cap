@@ -4,11 +4,12 @@ FROM rust:1.88-alpine AS builder
 ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
 ENV ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX}
 
-RUN apk add --no-cache musl-dev git
+RUN apk add --no-cache musl-dev git perl make
 
 WORKDIR /build
 
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 COPY crates/ crates/
 
 # Build for musl (static binary)
