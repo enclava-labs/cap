@@ -213,6 +213,11 @@ enum DeployPhase {
     Total,
     DeployRequest,
     BootstrapWait,
+    BootstrapEndpointAcquisition,
+    BootstrapAttestation,
+    BootstrapChallenge,
+    BootstrapStateFallback,
+    BootstrapPollSleep,
     Ownership,
     ManagedConfigEnqueue,
     ManagedConfigWait,
@@ -280,7 +285,8 @@ impl<F: Fn(&[u8]) -> std::io::Result<()>> Drop for DeployTimer<'_, F> {
             return;
         }
         // Fixed phase categories deliberately exclude error messages and deployment data.
-        // Total encloses all phases; nested durations must not be summed with total.
+        // Total encloses all phases; bootstrap_wait also encloses repeated per-poll
+        // subphases. Nested durations must not be summed with their parent.
         // Cancellation here means a dropped future, not process termination:
         // preserve the CLI's existing SIGINT/SIGTERM behavior (no unwinding).
         let category = match self.outcome {
@@ -465,6 +471,7 @@ async fn deploy_with_timings(
                     Duration::from_secs(args.ssh_timeout_seconds),
                     Duration::from_secs(3),
                     &pb,
+                    timings,
                 ),
             )
             .await?
@@ -1150,6 +1157,7 @@ async fn wait_for_template_bootstrap_endpoint(
     max_wait: Duration,
     poll_interval: Duration,
     pb: &ProgressBar,
+    timings: &DeployTimings<impl Fn(&[u8]) -> std::io::Result<()>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut tee = None;
@@ -1171,7 +1179,13 @@ async fn wait_for_template_bootstrap_endpoint(
             max_wait,
         ));
         if tee.is_none() {
-            match api.get_unlock_endpoint(app_name).await {
+            match timings
+                .run(
+                    DeployPhase::BootstrapEndpointAcquisition,
+                    api.get_unlock_endpoint(app_name),
+                )
+                .await
+            {
                 Ok(endpoint) => {
                     tee = Some(TeeClient::new_for_ownership_probe_with_resolve_ip(
                         &endpoint.tee_url,
@@ -1184,7 +1198,12 @@ async fn wait_for_template_bootstrap_endpoint(
                         start.elapsed(),
                         max_wait,
                     ));
-                    tokio::time::sleep(poll_interval).await;
+                    let _ = timings
+                        .run(DeployPhase::BootstrapPollSleep, async {
+                            tokio::time::sleep(poll_interval).await;
+                            Ok::<(), std::convert::Infallible>(())
+                        })
+                        .await;
                     continue;
                 }
                 Err(error) => return Err(error.into()),
@@ -1194,15 +1213,27 @@ async fn wait_for_template_bootstrap_endpoint(
         let tee = tee
             .as_ref()
             .expect("TEE client must exist after endpoint acquisition");
-        match tee.attest_receipt_key().await {
-            Ok((_attestation, attested_tee)) => match attested_tee.bootstrap_challenge().await {
+        match timings
+            .run(DeployPhase::BootstrapAttestation, tee.attest_receipt_key())
+            .await
+        {
+            Ok((_attestation, attested_tee)) => match timings
+                .run(
+                    DeployPhase::BootstrapChallenge,
+                    attested_tee.bootstrap_challenge(),
+                )
+                .await
+            {
                 Ok(_) => {
                     pb.set_message("Ownership claim endpoint ready");
                     return Ok(true);
                 }
                 Err(err)
-                    if attested_tee
-                        .claim_state_is_successful()
+                    if timings
+                        .run(
+                            DeployPhase::BootstrapStateFallback,
+                            attested_tee.claim_state_is_successful(),
+                        )
                         .await
                         .unwrap_or(false) =>
                 {
@@ -1227,7 +1258,12 @@ async fn wait_for_template_bootstrap_endpoint(
             }
         }
 
-        tokio::time::sleep(poll_interval).await;
+        let _ = timings
+            .run(DeployPhase::BootstrapPollSleep, async {
+                tokio::time::sleep(poll_interval).await;
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .await;
     }
 }
 
@@ -2719,6 +2755,84 @@ fn ensure_ssh_command_matches_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bootstrap_subphase_timings_are_nested_fixed_and_opt_in() {
+        let phases = [
+            (
+                DeployPhase::BootstrapEndpointAcquisition,
+                "bootstrap_endpoint_acquisition",
+            ),
+            (DeployPhase::BootstrapAttestation, "bootstrap_attestation"),
+            (DeployPhase::BootstrapChallenge, "bootstrap_challenge"),
+            (
+                DeployPhase::BootstrapStateFallback,
+                "bootstrap_state_fallback",
+            ),
+            (DeployPhase::BootstrapPollSleep, "bootstrap_poll_sleep"),
+        ];
+        for (phase, label) in phases {
+            let disabled = DeployTimings::new(false, |_: &[u8]| -> std::io::Result<()> {
+                panic!("disabled nested timing wrote output")
+            });
+            assert_eq!(disabled.run(phase, async { Ok::<_, &str>(7) }).await, Ok(7));
+
+            let output = std::cell::RefCell::new(Vec::new());
+            let timings = DeployTimings::new(true, |line: &[u8]| {
+                output.borrow_mut().extend_from_slice(line);
+                Ok(())
+            });
+            let result = timings
+                .run(DeployPhase::BootstrapWait, async {
+                    timings.run(phase, async { Ok::<_, &str>(7) }).await?;
+                    timings
+                        .run(phase, async {
+                            Err::<(), _>("SECRET endpoint token evidence")
+                        })
+                        .await
+                })
+                .await;
+            assert_eq!(result, Err("SECRET endpoint token evidence"));
+            let mut pending = Box::pin(timings.run(
+                DeployPhase::BootstrapWait,
+                timings.run(phase, std::future::pending::<Result<(), &str>>()),
+            ));
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+            drop(pending);
+
+            let output = String::from_utf8(output.into_inner()).unwrap();
+            assert!(!output.contains("SECRET"));
+            let records: Vec<serde_json::Value> = output
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(records.len(), 5);
+            for (index, outcome) in ["success", "error", "error", "cancelled", "cancelled"]
+                .iter()
+                .enumerate()
+            {
+                let record = &records[index];
+                assert_eq!(record.as_object().unwrap().len(), 6);
+                assert_eq!(record["event"], "template_deploy_timing");
+                assert_eq!(
+                    record["phase"],
+                    if index == 2 || index == 4 {
+                        "bootstrap_wait"
+                    } else {
+                        label
+                    }
+                );
+                assert_eq!(record["outcome"], *outcome);
+                assert_eq!(record["run_id"], records[0]["run_id"]);
+                let elapsed = record["elapsed_ms"].as_f64().unwrap();
+                assert!(elapsed.is_finite() && elapsed >= 0.0);
+            }
+            assert!(records[0]["error_category"].is_null());
+            assert_eq!(records[1]["error_category"], label);
+            assert_eq!(records[3]["error_category"], "cancelled");
+        }
+    }
+
     #[tokio::test]
     async fn timing_records_success_error_cancel_and_redacts() {
         let output = std::cell::RefCell::new(Vec::new());
