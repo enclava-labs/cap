@@ -17,6 +17,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  check-cli:
+    name: Check enclava CLI compiles (${{ matrix.os-name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            os-name: windows
+          - os: macos-latest
+            os-name: macos
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check CLI
+        run: cargo check --bin enclava
+
   test:
     name: Test Rust workspace
     runs-on: ubuntu-latest

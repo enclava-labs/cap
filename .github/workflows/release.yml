@@ -10,19 +10,24 @@ env:
 jobs:
   build-linux:
     name: Build Linux binaries
-    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
             os: linux
             arch: x86_64
+            runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
             os: linux
             arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -31,9 +36,6 @@ jobs:
       - name: Build binary
         run: |
           cargo build --release --bin enclava --target ${{ matrix.target }}
-
-      - name: Strip binary
-        run: strip target/${{ matrix.target }}/release/enclava
 
       - name: Package binary
         run: |
@@ -45,6 +47,30 @@ jobs:
         with:
           name: enclava-${{ matrix.os }}-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/enclava-*.tar.gz
+
+  build-windows:
+    name: Build Windows binaries
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Vendored OpenSSL builds with no-asm automatically when nasm is absent.
+      - name: Build binary
+        run: cargo build --release --bin enclava --target x86_64-pc-windows-msvc
+
+      - name: Package binary
+        run: |
+          cd target/x86_64-pc-windows-msvc/release
+          tar czf enclava-windows-x86_64.tar.gz enclava.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enclava-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/enclava-windows-x86_64.tar.gz
 
   build-macos:
     name: Build macOS binaries
@@ -109,7 +135,7 @@ jobs:
 
   release:
     name: Create GitHub release
-    needs: [build-linux, build-macos, build-web-verifier]
+    needs: [build-linux, build-macos, build-windows, build-web-verifier]
     runs-on: ubuntu-latest
     permissions:
       contents: write

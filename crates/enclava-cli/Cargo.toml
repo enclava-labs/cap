@@ -49,6 +49,11 @@ sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl
 fd-lock = "4.0.4"
 tempfile = "3"
 
+# Vendor OpenSSL everywhere (sev's AMD chain verification needs it): static
+# musl builds, Windows/macOS CI runners, and cross-checks all lack a usable
+# system OpenSSL. Feature-unifies with sev's `openssl` usage.
+openssl = { version = "0.10", features = ["vendored"] }
+
 [features]
 prod-strict = []
 

@@ -15,6 +15,7 @@ RUN rustup target add x86_64-unknown-linux-musl
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 COPY crates ./crates
 
 RUN if [ "${BUILD_PROFILE}" = "release" ]; then \

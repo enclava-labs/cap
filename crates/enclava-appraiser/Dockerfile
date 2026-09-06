@@ -3,6 +3,7 @@ FROM rust:1.88-alpine AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 COPY crates/ crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --locked --release --bin enclava-appraiser && \

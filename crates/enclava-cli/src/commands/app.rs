@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions,
     io::IsTerminal,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -1639,13 +1638,17 @@ fn verify_private_log_key_permissions(path: &Path) -> Result<(), Box<dyn std::er
         )
         .into());
     }
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(format!(
-            "existing log private key {} has insecure permissions {mode:04o}; restrict it to owner-only access (for example, chmod 600)",
-            path.display()
-        )
-        .into());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "existing log private key {} has insecure permissions {mode:04o}; restrict it to owner-only access (for example, chmod 600)",
+                path.display()
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -1732,10 +1735,14 @@ fn write_private_log_key(path: &Path, key: &str) -> Result<(), Box<dyn std::erro
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(path)
         .map_err(|err| format!("failed to create log private key {}: {err}", path.display()))?;
     use std::io::Write as _;
