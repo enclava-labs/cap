@@ -1550,6 +1550,7 @@ fn should_retry_template_config_tee_error(error: &TeeError) -> bool {
 fn is_transient_template_config_attestation_error(message: &str) -> bool {
     message.starts_with("TEE TCP connect failed:")
         || message.starts_with("TEE TLS handshake failed:")
+        || message == "TEE TLS handshake timed out"
         || message == "TEE did not present a certificate"
         || message == "TEE certificate chain is empty"
 }
@@ -5077,6 +5078,7 @@ mod tests {
         for message in [
             "TEE TCP connect failed: failed to lookup address information: Name or service not known",
             "TEE TLS handshake failed: tls handshake eof",
+            "TEE TLS handshake timed out",
             "TEE did not present a certificate",
             "TEE certificate chain is empty",
         ] {
@@ -5089,6 +5091,8 @@ mod tests {
             "TEE host is not a valid DNS name",
             "certificate parse failed: bad certificate",
             "SNP report validation failed",
+            "unknown attestation failure",
+            "TEE TLS handshake timed out: unrecognized detail",
         ] {
             assert!(!should_retry_template_config_tee_error(
                 &TeeError::Attestation(message.to_string())

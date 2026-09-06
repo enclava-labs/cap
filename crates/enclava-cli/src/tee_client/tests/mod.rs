@@ -62,6 +62,9 @@ fn private_resolve_ip_fallback_is_limited_to_tcp_connect_errors() {
     assert!(!is_tee_tcp_connect_error(&TeeError::Attestation(
         "TEE TLS handshake failed: invalid certificate".to_string()
     )));
+    assert!(!is_tee_tcp_connect_error(&TeeError::Attestation(
+        "TEE TLS handshake timed out".to_string()
+    )));
 }
 
 #[test]
