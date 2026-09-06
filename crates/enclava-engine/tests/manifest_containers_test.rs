@@ -240,14 +240,24 @@ fn app_container_uses_tcp_readiness_without_liveness() {
         k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
     );
     assert!(readiness.http_get.is_none());
+    assert_eq!(readiness.initial_delay_seconds, Some(0));
+    assert_eq!(readiness.period_seconds, Some(10));
 }
 
 #[test]
 fn password_app_container_omits_startup_probe_while_waiting_for_unlock() {
     let c = build_app_container(&sample_password_app());
     assert!(c.startup_probe.is_none());
-    assert!(c.readiness_probe.is_some());
     assert!(c.liveness_probe.is_none());
+
+    let readiness = c.readiness_probe.as_ref().unwrap();
+    assert_eq!(
+        readiness.tcp_socket.as_ref().unwrap().port,
+        k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(3000)
+    );
+    assert!(readiness.http_get.is_none());
+    assert_eq!(readiness.initial_delay_seconds, Some(0));
+    assert_eq!(readiness.period_seconds, Some(10));
 }
 
 // === Attestation proxy ===
@@ -527,6 +537,9 @@ fn caddy_container_internal_tls_uses_high_port() {
         tcp.port,
         k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(10443)
     );
+    assert!(probe.http_get.is_none());
+    assert_eq!(probe.initial_delay_seconds, Some(0));
+    assert_eq!(probe.period_seconds, Some(15));
 }
 
 #[test]
