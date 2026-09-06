@@ -36,7 +36,7 @@ pub enum Command {
     /// Generate enclava.toml for manual deployment
     Init,
     /// Prepare this repository for Enclava deployment
-    Prepare,
+    Prepare(prepare::PrepareArgs),
     /// Create a new app from enclava.toml
     Create(app::CreateArgs),
     /// Deploy or update an app
@@ -90,7 +90,7 @@ pub async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Whoami => auth::whoami().await,
         Command::Logout => auth::logout().await,
         Command::Init => init::init().await,
-        Command::Prepare => prepare::prepare().await,
+        Command::Prepare(args) => prepare::prepare(args).await,
         Command::Create(args) => app::create(args).await,
         Command::Deploy(args) => app::deploy(args).await,
         Command::Status(args) => app::status(args).await,

@@ -256,6 +256,19 @@ pub fn store_trusted_owner(org_id: &Uuid, pubkey: &VerifyingKey) -> Result<(), K
     Ok(())
 }
 
+/// Replace the locally trusted owner pubkey after an explicit recovery flow.
+///
+/// Normal TOFU updates must continue to use `store_trusted_owner`, which
+/// refuses to overwrite a different owner key.
+pub fn replace_trusted_owner(org_id: &Uuid, pubkey: &VerifyingKey) -> Result<(), KeyringError> {
+    let path = owner_pubkey_path(org_id)?;
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, pubkey.to_bytes())?;
+    set_file_0600(&tmp);
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
 pub fn load_keyring_envelope(org_id: &Uuid) -> Result<OrgKeyringEnvelope, KeyringError> {
     let raw = fs::read_to_string(keyring_envelope_path(org_id)?)?;
     Ok(serde_json::from_str(&raw)?)

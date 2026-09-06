@@ -118,6 +118,9 @@ jobs:
           context: .
           push: true
           tags: ${{{{ env.REGISTRY }}}}/${{{{ env.IMAGE_NAME }}}}:${{{{ github.sha }}}}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{{{ github.repository }}}}
+            org.opencontainers.image.revision=${{{{ github.sha }}}}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -283,6 +286,8 @@ mod tests {
         assert!(workflow.contains("cosign"));
         assert!(workflow.contains("attest-build-provenance"));
         assert!(workflow.contains("sbom-action"));
+        assert!(workflow.contains("org.opencontainers.image.source=https://github.com/"));
+        assert!(workflow.contains("org.opencontainers.image.revision=${{ github.sha }}"));
         assert!(workflow.contains("enclava deploy --image"));
         assert!(!workflow.contains("ENCLAVA_API_KEY"));
     }
