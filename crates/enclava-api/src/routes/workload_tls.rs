@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::state::AppState;
+use crate::workload_tls_timing::{Phase, RequestTiming};
 
 #[derive(Debug, Deserialize)]
 pub struct CertificateRequest {
@@ -28,6 +29,21 @@ pub async fn dns01_certificate(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CertificateRequest>,
+) -> impl IntoResponse {
+    let timing = RequestTiming::new();
+    let mut total = timing.start(Phase::BrokerTotal);
+    let response = dns01_certificate_inner(state, headers, body, timing)
+        .await
+        .into_response();
+    total.finish(response.status().is_success());
+    response
+}
+
+async fn dns01_certificate_inner(
+    state: AppState,
+    headers: HeaderMap,
+    body: CertificateRequest,
+    timing: RequestTiming,
 ) -> impl IntoResponse {
     let Some(token) = crate::routes::workload::attestation_bearer(&headers) else {
         return (
@@ -58,7 +74,13 @@ pub async fn dns01_certificate(
             .into_response();
     };
 
-    let claims = match verify_attestation(&state, verify_url, token).await {
+    let claims = match timing
+        .measure(
+            Phase::Attestation,
+            verify_attestation(&state, verify_url, token),
+        )
+        .await
+    {
         Ok(claims) => claims,
         Err(response) => return *response,
     };
@@ -78,14 +100,18 @@ pub async fn dns01_certificate(
             .into_response();
     };
 
-    let row = match sqlx::query_as::<_, DescriptorRow>(
-        "SELECT descriptor_payload
+    let row = match timing
+        .measure(
+            Phase::ArtifactLookup,
+            sqlx::query_as::<_, DescriptorRow>(
+                "SELECT descriptor_payload
          FROM workload_artifacts
          WHERE descriptor_core_hash = $1",
-    )
-    .bind(descriptor_core_hash)
-    .fetch_optional(&state.db)
-    .await
+            )
+            .bind(descriptor_core_hash)
+            .fetch_optional(&state.db),
+        )
+        .await
     {
         Ok(Some(row)) => row,
         Ok(None) => {
@@ -130,12 +156,13 @@ pub async fn dns01_certificate(
         }
     };
 
-    match crate::acme::issue_dns01_certificate(
+    match crate::acme::issue_dns01_certificate_timed(
         &state.http_client,
         dns_config,
         acme_config,
         &body.hostnames,
         &csr_der,
+        timing,
     )
     .await
     {

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::dns::{self, DnsConfig};
+use crate::workload_tls_timing::{Phase, RequestTiming};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{CLOUDFLARE, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
@@ -47,17 +48,50 @@ pub async fn issue_dns01_certificate(
     hostnames: &[String],
     csr_der: &[u8],
 ) -> Result<String, AcmeError> {
-    let account = load_or_create_account(acme_config).await?;
+    issue_dns01_certificate_timed(
+        http_client,
+        dns_config,
+        acme_config,
+        hostnames,
+        csr_der,
+        RequestTiming::new(),
+    )
+    .await
+}
+
+pub(crate) async fn issue_dns01_certificate_timed(
+    http_client: &reqwest::Client,
+    dns_config: &DnsConfig,
+    acme_config: &AcmeConfig,
+    hostnames: &[String],
+    csr_der: &[u8],
+    timing: RequestTiming,
+) -> Result<String, AcmeError> {
+    let account = timing
+        .measure(Phase::AcmeAccount, load_or_create_account(acme_config))
+        .await?;
     let identifiers = hostnames
         .iter()
         .map(|host| Identifier::Dns(host.clone()))
         .collect::<Vec<_>>();
-    let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
+    let mut order = timing
+        .measure(
+            Phase::AcmeOrder,
+            account.new_order(&NewOrder::new(&identifiers)),
+        )
+        .await?;
 
     let mut challenge_records = Vec::new();
     {
         let mut authorizations = order.authorizations();
-        while let Some(result) = authorizations.next().await {
+        loop {
+            let mut authorization = timing.start(Phase::AcmeAuthorization);
+            let result = authorizations.next().await;
+            authorization.finish(result.as_ref().is_none_or(Result::is_ok));
+            drop(authorization);
+            let Some(result) = result else {
+                break;
+            };
             let mut authz = result?;
             match authz.status {
                 AuthorizationStatus::Pending => {}
@@ -70,33 +104,55 @@ pub async fn issue_dns01_certificate(
             let hostname = challenge.identifier().to_string();
             let record_name = format!("_acme-challenge.{hostname}");
             let record_value = challenge.key_authorization().dns_value();
-            let record =
-                dns::create_txt_record(http_client, dns_config, &record_name, &record_value)
-                    .await?;
+            let record = timing
+                .measure(
+                    Phase::DnsCreate,
+                    dns::create_txt_record(http_client, dns_config, &record_name, &record_value),
+                )
+                .await?;
             challenge_records.push(record);
-            if let Err(err) = wait_for_txt_record(
-                &record_name,
-                &record_value,
-                acme_config.dns_propagation_wait,
-            )
-            .await
+            if let Err(err) = timing
+                .measure(
+                    Phase::DnsVisibility,
+                    wait_for_txt_record(
+                        &record_name,
+                        &record_value,
+                        acme_config.dns_propagation_wait,
+                        timing,
+                    ),
+                )
+                .await
             {
-                cleanup_challenges(http_client, dns_config, &challenge_records).await;
+                cleanup_challenges(http_client, dns_config, &challenge_records, timing).await;
                 return Err(err);
             }
-            challenge.set_ready().await?;
+            timing
+                .measure(Phase::AcmeChallengeReady, challenge.set_ready())
+                .await?;
         }
     }
 
-    let status = order.poll_ready(&RetryPolicy::default()).await?;
+    let status = timing
+        .measure(
+            Phase::AcmeOrderReady,
+            order.poll_ready(&RetryPolicy::default()),
+        )
+        .await?;
     if status != OrderStatus::Ready {
-        cleanup_challenges(http_client, dns_config, &challenge_records).await;
+        cleanup_challenges(http_client, dns_config, &challenge_records, timing).await;
         return Err(AcmeError::OrderStatus(status));
     }
 
-    order.finalize_csr(csr_der).await?;
-    let cert_chain = order.poll_certificate(&RetryPolicy::default()).await?;
-    cleanup_challenges(http_client, dns_config, &challenge_records).await;
+    timing
+        .measure(Phase::AcmeFinalize, order.finalize_csr(csr_der))
+        .await?;
+    let cert_chain = timing
+        .measure(
+            Phase::AcmeCertificate,
+            order.poll_certificate(&RetryPolicy::default()),
+        )
+        .await?;
+    cleanup_challenges(http_client, dns_config, &challenge_records, timing).await;
     Ok(cert_chain)
 }
 
@@ -104,6 +160,7 @@ async fn wait_for_txt_record(
     record_name: &str,
     expected_value: &str,
     timeout: Duration,
+    timing: RequestTiming,
 ) -> Result<(), AcmeError> {
     if timeout.is_zero() {
         return Ok(());
@@ -111,7 +168,7 @@ async fn wait_for_txt_record(
 
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match lookup_txt(record_name).await {
+        match lookup_txt(record_name, timing).await {
             Ok(values) if values.iter().any(|value| value == expected_value) => return Ok(()),
             Ok(values) => tracing::info!(
                 record = %record_name,
@@ -135,8 +192,11 @@ async fn wait_for_txt_record(
     }
 }
 
-async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
-    match lookup_txt_external(name).await {
+async fn lookup_txt(name: &str, timing: RequestTiming) -> Result<Vec<String>, String> {
+    match timing
+        .measure(Phase::DnsExternalLookup, lookup_txt_external(name))
+        .await
+    {
         Ok(values) => Ok(values),
         Err(err) => {
             tracing::warn!(
@@ -144,7 +204,9 @@ async fn lookup_txt(name: &str) -> Result<Vec<String>, String> {
                 error = %err,
                 "external DNS lookup failed; falling back to system resolver"
             );
-            lookup_txt_system(name).await
+            timing
+                .measure(Phase::DnsSystemLookup, lookup_txt_system(name))
+                .await
         }
     }
 }
@@ -186,9 +248,16 @@ async fn cleanup_challenges(
     http_client: &reqwest::Client,
     dns_config: &DnsConfig,
     records: &[dns::DnsRecordHandle],
+    timing: RequestTiming,
 ) {
     for record in records {
-        if let Err(err) = dns::delete_txt_record(http_client, dns_config, record).await {
+        if let Err(err) = timing
+            .measure(
+                Phase::DnsCleanup,
+                dns::delete_txt_record(http_client, dns_config, record),
+            )
+            .await
+        {
             tracing::warn!(
                 record = %record.hostname(),
                 error = %err,

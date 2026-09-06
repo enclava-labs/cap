@@ -19,6 +19,7 @@ pub mod routes;
 pub mod signing_service;
 pub mod source_provider;
 pub mod state;
+mod workload_tls_timing;
 
 use axum::{
     Json, Router,
