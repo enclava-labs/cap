@@ -11,6 +11,7 @@ RUN apt-get update && \
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 COPY crates/ crates/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -51,6 +52,7 @@ RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+COPY vendor/ vendor/
 COPY crates/ crates/
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
