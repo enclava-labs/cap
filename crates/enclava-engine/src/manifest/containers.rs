@@ -468,7 +468,7 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
                 ),
                 ..Default::default()
             }),
-            initial_delay_seconds: Some(180),
+            initial_delay_seconds: Some(0),
             period_seconds: Some(10),
             ..Default::default()
         }),
@@ -1045,7 +1045,7 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
                 port: k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(tls_port),
                 ..Default::default()
             }),
-            initial_delay_seconds: Some(180),
+            initial_delay_seconds: Some(0),
             period_seconds: Some(15),
             ..Default::default()
         }),
