@@ -17,10 +17,15 @@ use std::{fmt::Debug, time::Duration};
 use super::engine::{ApplyEngine, ApplyError};
 
 pub const MUTATION_GENERATION_ANNOTATION: &str = "enclava.dev/cap-provider-mutation-generation";
-const MAX_CONFLICT_RETRIES: usize = 12;
+// ponytail: bounded but patient — total worst-case conflict wait ≈ 60 s, well
+// inside the 180 s mutation lease and job deadlines. Controllers routinely
+// rewrite status for minutes; the old 12×≤200 ms (~1.9 s) budget terminally
+// failed live deploys against ordinary concurrent writers (staging
+// 2026-09-13: gens 3d869f2c/69dff1f3/4b1b3ef7, mutation_conflict_exhausted).
+const MAX_CONFLICT_RETRIES: usize = 64;
 
 fn conflict_retry_delay(attempt: usize) -> Duration {
-    Duration::from_millis(25 * (1 << attempt.min(3)))
+    Duration::from_millis((25 * (1 << attempt.min(5))).min(1000))
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -237,6 +242,11 @@ where
         }
     }
 
+    tracing::warn!(
+        kind = kind::<K>(),
+        retries = MAX_CONFLICT_RETRIES,
+        "mutation conflicts exhausted (kind only; names excluded)"
+    );
     Err(ApplyError::MutationConflictExhausted {
         kind: kind::<K>(),
         name: name.to_string(),
@@ -314,6 +324,11 @@ where
         }
     }
 
+    tracing::warn!(
+        kind = kind::<K>(),
+        retries = MAX_CONFLICT_RETRIES,
+        "mutation conflicts exhausted (kind only; names excluded)"
+    );
     Err(ApplyError::MutationConflictExhausted {
         kind: kind::<K>(),
         name: name.to_string(),
@@ -361,6 +376,11 @@ where
         }
     }
 
+    tracing::warn!(
+        kind = kind::<K>(),
+        retries = MAX_CONFLICT_RETRIES,
+        "mutation conflicts exhausted (kind only; names excluded)"
+    );
     Err(ApplyError::MutationConflictExhausted {
         kind: kind::<K>(),
         name: name.to_string(),
@@ -389,8 +409,65 @@ mod tests {
     #[test]
     fn conflict_retry_backoff_is_bounded() {
         assert_eq!(conflict_retry_delay(0), Duration::from_millis(25));
-        assert_eq!(conflict_retry_delay(3), Duration::from_millis(200));
-        assert_eq!(conflict_retry_delay(100), Duration::from_millis(200));
+        assert_eq!(conflict_retry_delay(5), Duration::from_millis(800));
+        assert_eq!(conflict_retry_delay(6), Duration::from_millis(800));
+        assert_eq!(conflict_retry_delay(100), Duration::from_millis(800));
+        // The total budget must stay patient (~45–90 s) so ordinary
+        // controller churn cannot terminally fail a deployment, yet remain
+        // far below the 180 s mutation lease and bounded job deadlines.
+        let total: Duration = (0..MAX_CONFLICT_RETRIES).map(conflict_retry_delay).sum();
+        assert!(total >= Duration::from_secs(45), "total {total:?}");
+        assert!(total <= Duration::from_secs(90), "total {total:?}");
+    }
+
+    #[tokio::test]
+    async fn concurrent_writer_churn_cannot_terminally_fail_apply() {
+        // Regression (staging 2026-09-13): a Kubernetes controller bumping
+        // resourceVersion for longer than the old ~1.9 s conflict budget made
+        // apply_resource exhaust mutation conflicts and terminally fail the
+        // deployment (live: gens 3d869f2c/69dff1f3/4b1b3ef7). A bounded
+        // concurrent writer that stops must not defeat the apply.
+        let state = Arc::new(Mutex::new(FakeState::with_statefulset()));
+        let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
+        let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), "fence-test");
+        let desired: StatefulSet = serde_json::from_value(json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {"name": "fenced", "namespace": "fence-test"},
+            "spec": {
+                "replicas": 1,
+                "serviceName": "fenced-service",
+                "selector": {"matchLabels": {"app": "fenced"}},
+                "template": {
+                    "metadata": {"labels": {"app": "fenced"}},
+                    "spec": {"containers": [{"name": "workload", "image": "example.test/workload:current"}]},
+                },
+            },
+        }))
+        .unwrap();
+
+        // Controller-style concurrent writer: every PATCH/PUT of the fenced
+        // resource is preempted by a resourceVersion bump for 2.5 s — beyond
+        // the previous total budget (~1.9 s), inside the new one (~48 s).
+        state.lock().unwrap().churn_until =
+            Some(std::time::Instant::now() + Duration::from_millis(2500));
+
+        let applied = apply_resource(
+            &engine,
+            &api,
+            &desired,
+            MutationGeneration::new(2).unwrap(),
+            false,
+            true,
+        )
+        .await;
+        applied.expect("apply survives a bounded concurrent writer");
+        let locked = state.lock().unwrap();
+        assert_eq!(
+            locked.resource.as_ref().unwrap()["metadata"]["annotations"]
+                [MUTATION_GENERATION_ANNOTATION],
+            "2"
+        );
     }
 
     #[derive(Default)]
@@ -407,6 +484,10 @@ mod tests {
         pause_delete: Pause,
         pause_create: Pause,
         rejected_preconditions: usize,
+        /// While `Some(until)`, every PATCH/PUT of the fenced resource first
+        /// bumps its resourceVersion — a controller-style concurrent writer
+        /// landing inside each read-modify-write window.
+        churn_until: Option<std::time::Instant>,
     }
 
     impl FakeState {
@@ -418,6 +499,7 @@ mod tests {
                 pause_delete: Pause::default(),
                 pause_create: Pause::default(),
                 rejected_preconditions: 0,
+                churn_until: None,
             }
         }
 
@@ -429,6 +511,7 @@ mod tests {
                 pause_delete: Pause::default(),
                 pause_create: Pause::default(),
                 rejected_preconditions: 0,
+                churn_until: None,
             }
         }
 
@@ -477,6 +560,7 @@ mod tests {
                 pause_delete: Pause::default(),
                 pause_create: Pause::default(),
                 rejected_preconditions: 0,
+                churn_until: None,
             }
         }
     }
@@ -584,6 +668,17 @@ mod tests {
     ) -> Result<Response<Body>, io::Error> {
         let payload: Value = serde_json::from_slice(body).map_err(io::Error::other)?;
         let mut locked = state.lock().expect("fake state poisoned");
+        if matches!(method, Method::PATCH | Method::PUT)
+            && locked
+                .churn_until
+                .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            let rv = locked.next_resource_version;
+            locked.next_resource_version += 1;
+            if let Some(resource) = locked.resource.as_mut() {
+                resource["metadata"]["resourceVersion"] = json!(rv.to_string());
+            }
+        }
         match method {
             Method::PUT => {
                 let Some(current) = locked.resource.clone() else {
