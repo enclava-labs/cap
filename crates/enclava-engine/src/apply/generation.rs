@@ -265,7 +265,7 @@ where
 {
     let patch_params = PatchParams::default();
 
-    for _ in 0..MAX_CONFLICT_RETRIES {
+    for attempt in 0..MAX_CONFLICT_RETRIES {
         let current = match api.get(name).await {
             Ok(current) => current,
             Err(kube::Error::Api(error)) if error.code == 404 => {
@@ -319,7 +319,10 @@ where
                 verify_applied_generation(&applied, generation)?;
                 return Ok(applied);
             }
-            Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => continue,
+            Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
+                tokio::time::sleep(conflict_retry_delay(attempt)).await;
+                continue;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -345,7 +348,7 @@ pub async fn delete_resource<K>(
 where
     K: Resource + Clone + Debug + DeserializeOwned,
 {
-    for _ in 0..MAX_CONFLICT_RETRIES {
+    for attempt in 0..MAX_CONFLICT_RETRIES {
         let current = match api.get(name).await {
             Ok(current) => current,
             Err(kube::Error::Api(error)) if error.code == 404 => return Ok(false),
@@ -371,7 +374,10 @@ where
             Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 404 => {
                 return Ok(false);
             }
-            Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => continue,
+            Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
+                tokio::time::sleep(conflict_retry_delay(attempt)).await;
+                continue;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -1078,6 +1084,34 @@ mod tests {
                 .get("volumeMounts")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_writer_churn_cannot_terminally_fail_partial_apply() {
+        // Regression (staging 2026-09-13, gen e3cf547b): the partial merge
+        // path retried 409s with NO delay, exhausting any retry budget in
+        // milliseconds against a controller-style concurrent writer.
+        let state = Arc::new(Mutex::new(FakeState::with_statefulset()));
+        let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
+        let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), "fence-test");
+
+        state.lock().unwrap().churn_until =
+            Some(std::time::Instant::now() + Duration::from_millis(2500));
+
+        apply_existing_partial(
+            &api,
+            "fenced",
+            &json!({
+                "apiVersion": "apps/v1",
+                "kind": "StatefulSet",
+                "spec": { "replicas": 0 },
+            }),
+            MutationGeneration::new(2).unwrap(),
+        )
+        .await
+        .expect("partial apply survives a bounded concurrent writer");
+        let locked = state.lock().unwrap();
+        assert_eq!(locked.resource.as_ref().unwrap()["spec"]["replicas"], 0);
     }
 
     #[tokio::test]
