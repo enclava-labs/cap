@@ -177,9 +177,11 @@ where
                     .map(|fields| &fields.0)
                     .and_then(flatten_owned_paths)
                 {
-                    Some(owned) => owned
-                        .iter()
-                        .all(|path| conflict != path && !conflict.starts_with(&format!("{path}."))),
+                    Some(owned) => owned.iter().all(|path| {
+                        conflict != path
+                            && !conflict.starts_with(&format!("{path}."))
+                            && !conflict.starts_with(&format!("{path}["))
+                    }),
                     None => false,
                 }
             })
@@ -252,7 +254,7 @@ where
         field_manager: Some(engine.config().field_manager.clone()),
         ..PostParams::default()
     };
-    let mut reclaim_own_fields = false;
+    let mut force_against: Option<String> = None;
     for attempt in 0..MAX_CONFLICT_RETRIES {
         let current = match api.get(name).await {
             Ok(current) => Some(current),
@@ -263,7 +265,15 @@ where
         if let Some(current) = current {
             ensure_not_stale(&current, generation)?;
             let trusted = only_trusted_field_managers(&current, &engine.config().field_manager);
-            let patch_params = if force || trusted || reclaim_own_fields {
+            // A forced reclaim is authorized only against the exact
+            // resourceVersion whose ownership was classified: any foreign
+            // write (including a pure ownership change) bumps the version,
+            // silently deauthorizes the force, and falls back to the
+            // no-force probe with a fresh classification.
+            let authorized = force_against.is_some_and(|version| {
+                current.meta().resource_version.as_deref() == Some(version.as_str())
+            });
+            let patch_params = if force || trusted || authorized {
                 PatchParams::apply(&engine.config().field_manager).force()
             } else {
                 PatchParams::apply(&engine.config().field_manager)
@@ -290,33 +300,41 @@ where
                 Err(ApplyError::Kube(kube::Error::Api(error))) if error.code == 409 => {
                     let conflicts = field_manager_conflict_fields(&error);
                     if conflicts.is_empty() {
+                        // transient resourceVersion conflict: a forced
+                        // reclaim never survives a version change
+                        force_against = None;
                         tokio::time::sleep(conflict_retry_delay(attempt)).await;
                         continue;
                     }
-                    if !reclaim_own_fields {
-                        match api.get(name).await {
-                            Ok(live)
-                                if conflicts_reclaimable_by_force(
+                    if !authorized {
+                        let escalation = match api.get(name).await {
+                            Ok(live) => {
+                                let reclaimable = conflicts_reclaimable_by_force(
                                     &live,
                                     &conflicts,
                                     &engine.config().field_manager,
-                                ) =>
-                            {
-                                tracing::info!(
-                                    kind = kind::<K>(),
-                                    conflicts = ?conflicts,
-                                    "SSA conflicts limited to this manager's own Update ownership; forcing to reclaim own fields"
                                 );
-                                reclaim_own_fields = true;
-                                continue;
+                                live.meta()
+                                    .resource_version
+                                    .clone()
+                                    .filter(|version| !version.is_empty())
+                                    .filter(|_| reclaimable)
                             }
-                            Ok(_) => {}
                             Err(error) => return Err(error.into()),
+                        };
+                        if let Some(version) = escalation {
+                            tracing::info!(
+                                kind = kind::<K>(),
+                                conflict_count = conflicts.len(),
+                                "SSA conflicts limited to this manager's own Update ownership; forcing to reclaim own fields"
+                            );
+                            force_against = Some(version);
+                            continue;
                         }
                     }
                     tracing::warn!(
                         kind = kind::<K>(),
-                        conflicts = ?conflicts,
+                        conflict_count = conflicts.len(),
                         "unresolved SSA field-manager conflict on externally owned fields; failing closed"
                     );
                     return Err(ApplyError::Kube(kube::Error::Api(error)));
@@ -601,6 +619,10 @@ mod tests {
         rejected_preconditions: usize,
         /// Server-side-apply PATCH requests received for the fenced resource.
         ssa_attempts: usize,
+        /// When `Some`, the next forced SSA PATCH is preempted by a foreign
+        /// writer that takes the container image and bumps the
+        /// resourceVersion before the forced write is evaluated.
+        hijack_next_force: Option<String>,
         /// While `Some(until)`, every PATCH/PUT of the fenced resource first
         /// bumps its resourceVersion — a controller-style concurrent writer
         /// landing inside each read-modify-write window.
@@ -617,6 +639,7 @@ mod tests {
                 pause_create: Pause::default(),
                 rejected_preconditions: 0,
                 ssa_attempts: 0,
+                hijack_next_force: None,
                 churn_until: None,
             }
         }
@@ -630,6 +653,7 @@ mod tests {
                 pause_create: Pause::default(),
                 rejected_preconditions: 0,
                 ssa_attempts: 0,
+                hijack_next_force: None,
                 churn_until: None,
             }
         }
@@ -680,6 +704,7 @@ mod tests {
                 pause_create: Pause::default(),
                 rejected_preconditions: 0,
                 ssa_attempts: 0,
+                hijack_next_force: None,
                 churn_until: None,
             }
         }
@@ -714,9 +739,6 @@ mod tests {
                                         "f:template": {
                                             "f:metadata": {"f:annotations": {
                                                 "f:unrelated-template": {},
-                                            }},
-                                            "f:spec": {"f:containers": {
-                                                "k:{\"name\":\"workload\"}": {"f:image": {}},
                                             }},
                                         },
                                     },
@@ -767,6 +789,7 @@ mod tests {
                 pause_create: Pause::default(),
                 rejected_preconditions: 0,
                 ssa_attempts: 0,
+                hijack_next_force: None,
                 churn_until: None,
             }
         }
@@ -915,7 +938,8 @@ mod tests {
                 updated["metadata"]["resourceVersion"] =
                     json!(locked.next_resource_version.to_string());
                 let manager = query_param(query, "fieldManager").unwrap_or("fake-unknown");
-                record_update_ownership(&mut updated, manager, false);
+                let owned = document_leaf_paths(&updated);
+                record_update_ownership(&mut updated, &owned, manager, false);
                 locked.next_resource_version += 1;
                 locked.resource = Some(updated);
                 Ok(json_response(
@@ -924,6 +948,34 @@ mod tests {
                 ))
             }
             Method::PATCH => {
+                let is_apply = content_type.contains("apply-patch");
+                let force = query.contains("force=true");
+                if is_apply
+                    && force
+                    && let Some(image) = locked.hijack_next_force.take()
+                {
+                    let bumped = locked.next_resource_version.to_string();
+                    locked.next_resource_version += 1;
+                    let resource = locked.resource.as_mut().expect("resource exists");
+                    resource["spec"]["template"]["spec"]["containers"][0]["image"] = json!(image);
+                    let managed = resource["metadata"]["managedFields"]
+                        .as_array_mut()
+                        .expect("managedFields present");
+                    if !managed.iter().any(|entry| {
+                        entry.get("manager").and_then(Value::as_str) == Some("tampering-controller")
+                    }) {
+                        managed.push(json!({
+                            "manager": "tampering-controller",
+                            "operation": "Update",
+                            "apiVersion": "apps/v1",
+                            "fieldsType": "FieldsV1",
+                            "fieldsV1": {"f:spec": {"f:template": {"f:spec": {
+                                "f:containers": {"k:{\"name\":\"workload\"}": {"f:image": {}}},
+                            }}}},
+                        }));
+                    }
+                    resource["metadata"]["resourceVersion"] = json!(bumped);
+                }
                 let Some(current) = locked.resource.clone() else {
                     return Ok(status_response(StatusCode::NOT_FOUND, "NotFound"));
                 };
@@ -939,11 +991,10 @@ mod tests {
                 }
                 let resource_version = locked.next_resource_version.to_string();
                 locked.next_resource_version += 1;
-                if content_type.contains("apply-patch") {
+                if is_apply {
                     // The API server defaults a PATCH without fieldManager to
                     // an unrelated manager name; merges sent by CAP carry it.
                     let manager = query_param(query, "fieldManager").unwrap_or("kubectl-patch");
-                    let force = query.contains("force=true");
                     locked.ssa_attempts += 1;
                     return Ok(apply_ssa(
                         &mut locked,
@@ -958,7 +1009,8 @@ mod tests {
                 merge_value(&mut updated, &payload);
                 updated["metadata"]["resourceVersion"] = json!(resource_version);
                 let manager = query_param(query, "fieldManager").unwrap_or("kubectl-patch");
-                record_update_ownership(&mut updated, manager, true);
+                let owned = document_leaf_paths(&payload);
+                record_update_ownership(&mut updated, &owned, manager, true);
                 locked.resource = Some(updated);
                 Ok(json_response(
                     StatusCode::OK,
@@ -988,7 +1040,8 @@ mod tests {
                 locked.next_resource_version += 1;
                 let mut created = configmap_value(generation, &resource_version, value);
                 let manager = query_param(query, "fieldManager").unwrap_or("fake-unknown");
-                record_update_ownership(&mut created, manager, false);
+                let owned = document_leaf_paths(&payload);
+                record_update_ownership(&mut created, &owned, manager, false);
                 locked.resource = Some(created);
                 Ok(json_response(
                     StatusCode::CREATED,
@@ -1036,6 +1089,49 @@ mod tests {
                 merge_value(target.entry(key.clone()).or_insert(Value::Null), value);
             }
         }
+    }
+
+    /// Test-local flattener for the fake API server. Deliberately NOT the
+    /// production walker: it renders associative keys as `[name=x]` while
+    /// the real API server quotes values (`[name="x"]`), so regressions
+    /// that depend on bracket notation cannot silently pass through a
+    /// shared formatter. Production rejects those entries fail-closed.
+    fn fake_flatten_owned_paths(fields_v1: &Value) -> Option<Vec<String>> {
+        fn walk(node: &Value, prefix: String, paths: &mut Vec<String>) -> Option<()> {
+            let object = node.as_object()?;
+            for (key, child) in object {
+                let segment = match key.strip_prefix("f:") {
+                    Some(field) => field.to_string(),
+                    None => {
+                        let list_key = key.strip_prefix("k:")?;
+                        let value: std::collections::BTreeMap<String, Value> =
+                            serde_json::from_str(list_key).ok()?;
+                        if value.len() != 1 {
+                            return None;
+                        }
+                        let (name, marker) = value.into_iter().next()?;
+                        format!("[{}={}]", name, marker.as_str()?)
+                    }
+                };
+                let path = if prefix.is_empty() || segment.starts_with('[') {
+                    format!("{prefix}{segment}")
+                } else {
+                    format!("{prefix}.{segment}")
+                };
+                if child
+                    .as_object()
+                    .is_some_and(|children| children.is_empty())
+                {
+                    paths.push(path);
+                } else {
+                    walk(child, path, paths)?;
+                }
+            }
+            Some(())
+        }
+        let mut paths = Vec::new();
+        walk(fields_v1, String::new(), &mut paths)?;
+        Some(paths)
     }
 
     fn query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
@@ -1086,9 +1182,7 @@ mod tests {
                 if entry_manager == manager && operation == "Apply" {
                     continue;
                 }
-                let owned = entry
-                    .get("fieldsV1")
-                    .and_then(super::super::fields_v1::flatten_owned_paths);
+                let owned = entry.get("fieldsV1").and_then(fake_flatten_owned_paths);
                 match owned {
                     None => conflicts.push((String::new(), entry_manager.to_string())),
                     Some(paths) => {
@@ -1143,15 +1237,11 @@ mod tests {
             );
         }
         let mut updated = current.clone();
-        for (path, loser) in &conflicts {
-            if let Some(managed) = updated
-                .pointer_mut("/metadata/managedFields")
-                .and_then(Value::as_array_mut)
-            {
-                remove_owned_path(managed, loser, path);
-            }
-        }
         merge_value(&mut updated, payload);
+        // ponytail: the fake does not model field-by-field ownership
+        // transfer out of losing managers; the applier's Apply entry below
+        // and the surviving foreign entries are what the regressions
+        // assert. Add faithful transfer if a regression ever needs it.
         let owned_paths = document_leaf_paths(payload);
         updated["metadata"]["managedFields"] = updated
             .pointer("/metadata/managedFields")
@@ -1170,8 +1260,7 @@ mod tests {
 
     /// Record Update ownership for a PUT/POST/merge-PATCH writer. Merge
     /// patches union into an existing entry; replaces rewrite it.
-    fn record_update_ownership(resource: &mut Value, manager: &str, merge: bool) {
-        let paths = document_leaf_paths(resource);
+    fn record_update_ownership(resource: &mut Value, owned: &[String], manager: &str, merge: bool) {
         let metadata = resource
             .get_mut("metadata")
             .and_then(Value::as_object_mut)
@@ -1189,7 +1278,7 @@ mod tests {
         match existing {
             Some(entry) if merge => {
                 let mut tree = entry.get("fieldsV1").cloned().unwrap_or_else(|| json!({}));
-                merge_fields_tree(&mut tree, &build_fields_tree(&paths));
+                merge_fields_tree(&mut tree, &build_fields_tree(owned));
                 entry["fieldsV1"] = tree;
             }
             _ => {
@@ -1203,50 +1292,9 @@ mod tests {
                     "operation": "Update",
                     "apiVersion": "v1",
                     "fieldsType": "FieldsV1",
-                    "fieldsV1": build_fields_tree(&paths),
+                    "fieldsV1": build_fields_tree(owned),
                 }));
             }
-        }
-    }
-
-    fn remove_owned_path(managed: &mut Vec<Value>, loser: &str, path: &str) {
-        let keys: Vec<String> = split_path(path).iter().map(|s| fkey_for(s)).collect();
-        for entry in managed.iter_mut().filter(|entry| {
-            entry.get("manager").and_then(Value::as_str) == Some(loser)
-                && entry.get("subresource").is_none()
-        }) {
-            if let Some(fields) = entry.get_mut("fieldsV1") {
-                remove_path(fields, &keys);
-            }
-        }
-        // entries left owning nothing are dropped, mirroring the API server
-        managed.retain(|entry| {
-            entry.get("manager").and_then(Value::as_str) != Some(loser)
-                || entry.get("subresource").is_some()
-                || entry
-                    .get("fieldsV1")
-                    .and_then(Value::as_object)
-                    .is_some_and(|fields| !fields.is_empty())
-        });
-    }
-
-    fn remove_path(node: &mut Value, keys: &[String]) {
-        let Some((first, rest)) = keys.split_first() else {
-            return;
-        };
-        let Some(child) = node.get_mut(first) else {
-            return;
-        };
-        if rest.is_empty() {
-            node.as_object_mut().map(|object| object.remove(first));
-            return;
-        }
-        remove_path(child, rest);
-        if child
-            .as_object()
-            .is_some_and(|children| children.is_empty())
-        {
-            node.as_object_mut().map(|object| object.remove(first));
         }
     }
 
@@ -2074,5 +2122,98 @@ mod tests {
             ApplyError::Kube(kube::Error::Api(status)) if status.code == 409
         ));
         assert_eq!(state.lock().unwrap().ssa_attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn foreign_write_during_escalation_deauthorizes_the_force() {
+        // A forced reclaim is authorized only against the exact
+        // resourceVersion whose ownership was classified. A foreign writer
+        // taking the container image between classification and the forced
+        // write must bump the resourceVersion, void the authorization, and
+        // make the next classification fail closed instead of
+        // force-overwriting the foreign value.
+        let state = Arc::new(Mutex::new(FakeState::with_shared_statefulset()));
+        state.lock().unwrap().hijack_next_force = Some(
+            "example.test/workload@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .to_string(),
+        );
+        let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
+        let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), "fence-test");
+        let desired = desired_shared_statefulset(
+            "example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+
+        let error = apply_resource(
+            &engine,
+            &api,
+            &desired,
+            MutationGeneration::new(5).unwrap(),
+            false,
+            true,
+        )
+        .await
+        .expect_err("ownership change during escalation must fail closed");
+        assert!(matches!(
+            error,
+            ApplyError::Kube(kube::Error::Api(status)) if status.code == 409
+        ));
+        let locked = state.lock().unwrap();
+        // no-force probe (1), deauthorized forced write rejected by the
+        // resourceVersion precondition before evaluation, re-classifying
+        // no-force probe (2)
+        assert_eq!(locked.ssa_attempts, 2);
+        assert_eq!(
+            locked.rejected_preconditions, 1,
+            "the forced write must be rejected against the bumped version"
+        );
+        let resource = locked.resource.as_ref().unwrap();
+        assert_eq!(
+            resource
+                .pointer("/spec/template/spec/containers/0/image")
+                .and_then(Value::as_str),
+            Some(
+                "example.test/workload@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            ),
+            "the foreign value must not be force-overwritten"
+        );
+        assert_eq!(
+            resource
+                .pointer(&annotation_pointer())
+                .and_then(Value::as_str),
+            Some("4"),
+            "live object untouched"
+        );
+    }
+
+    #[test]
+    fn server_quoted_cause_fields_classify_against_owned_subtrees() {
+        // Literal API-server cause notation, independent of any formatter:
+        // associative markers arrive quoted as [name="workload"].
+        let live: StatefulSet = serde_json::from_value(json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {
+                "name": "fenced",
+                "managedFields": [
+                    {"manager": "enclava-platform", "operation": "Update", "apiVersion": "apps/v1", "fieldsType": "FieldsV1", "fieldsV1": {}},
+                    {"manager": "kubectl-patch", "operation": "Update", "apiVersion": "apps/v1", "fieldsType": "FieldsV1",
+                     "fieldsV1": {"f:spec": {"f:containers": {}}}},
+                ],
+            },
+        }))
+        .unwrap();
+        // a coarse external owner of spec.containers covers the bracketed
+        // descendant and blocks the force
+        assert!(!conflicts_reclaimable_by_force(
+            &live,
+            &["spec.containers[name=\"workload\"].image".to_string()],
+            "enclava-platform",
+        ));
+        // an unrelated external leaf does not cover the annotation
+        assert!(conflicts_reclaimable_by_force(
+            &live,
+            &["metadata.annotations.enclava.dev/cap-provider-mutation-generation".to_string()],
+            "enclava-platform",
+        ));
     }
 }

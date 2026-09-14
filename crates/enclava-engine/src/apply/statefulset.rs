@@ -40,7 +40,9 @@ pub async fn apply_statefulset(
             tracing::warn!(
                 namespace = %namespace,
                 statefulset = %name,
-                conflict = %ae.message,
+                code = ae.code,
+                reason = %ae.reason,
+                cause_count = ae.details.as_ref().map(|details| details.causes.len()).unwrap_or(0),
                 "SSA conflict on attestation-critical resource: refusing to overwrite \
                  fields owned by another manager. Investigate before re-applying."
             );

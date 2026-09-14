@@ -3,18 +3,20 @@
 //!
 //! This is deliberately not a general SSA simulator. It flattens one
 //! managed-fields entry into the dotted field-path notation the API server
-//! uses in `Status.details.causes[].field`, and refuses (`None`) on any shape
-//! it cannot attribute so callers can fail closed.
+//! uses in `Status.details.causes[].field`, and refuses (`None`) on any
+//! shape it cannot attribute so callers can fail closed.
 
 use serde_json::Value;
 
 /// Flatten a managed-fields `fieldsV1` document into the dotted paths it
 /// owns, in `StatusCause::field` notation with the leading dot stripped.
 ///
-/// `f:name` names a field; `k:{"name":"x"}` names an associative-list element
-/// (rendered `[name=x]`). An empty object marks a leaf owning that path and
+/// `f:name` names a field; an empty object marks a leaf owning that path and
 /// everything below it. `None` means the document claims fields this walker
-/// cannot attribute; callers must treat that as owning everything.
+/// cannot attribute (associative-list keys, set members, malformed shapes);
+/// callers must treat that as owning everything, because the API server
+/// renders associative markers with quoted values (`[name="x"]`) that this
+/// walker does not attempt to reproduce.
 pub(super) fn flatten_owned_paths(fields_v1: &Value) -> Option<Vec<String>> {
     let mut paths = Vec::new();
     flatten_into(fields_v1, String::new(), &mut paths)?;
@@ -46,17 +48,7 @@ fn segment(key: &str) -> Option<String> {
     if let Some(field) = key.strip_prefix("f:") {
         return (!field.is_empty()).then(|| field.to_string());
     }
-    if let Some(list_key) = key.strip_prefix("k:") {
-        let value: std::collections::BTreeMap<String, Value> =
-            serde_json::from_str(list_key).ok()?;
-        if value.len() != 1 {
-            return None;
-        }
-        let (name, marker) = value.into_iter().next()?;
-        Some(format!("[{}={}]", name, marker.as_str()?))
-    } else {
-        None
-    }
+    None
 }
 
 #[cfg(test)]
@@ -65,7 +57,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn flattens_fields_annotations_and_associative_lists() {
+    fn flattens_fields_and_annotations() {
         let fields = json!({
             "f:metadata": {
                 "f:annotations": {
@@ -74,11 +66,7 @@ mod tests {
             },
             "f:spec": {
                 "f:replicas": {},
-                "f:containers": {
-                    "k:{\"name\":\"workload\"}": {
-                        "f:image": {}
-                    }
-                }
+                "f:serviceName": {}
             }
         });
         let mut paths = flatten_owned_paths(&fields).expect("attributable");
@@ -87,8 +75,8 @@ mod tests {
             paths,
             vec![
                 "metadata.annotations.enclava.dev/cap-provider-mutation-generation",
-                "spec.containers[name=workload].image",
                 "spec.replicas",
+                "spec.serviceName",
             ]
         );
     }
@@ -101,12 +89,14 @@ mod tests {
 
     #[test]
     fn unattributable_shapes_fail_closed() {
-        assert_eq!(flatten_owned_paths(&json!({"v:8080": {}})), None);
-        assert_eq!(flatten_owned_paths(&json!({"f:spec": "scalar"})), None);
+        // associative-list keys: the API server renders these with quoted
+        // values (`[name="x"]`) in cause fields; refuse rather than guess
         assert_eq!(
-            flatten_owned_paths(&json!({"k:{\"name\":\"a\",\"x\":\"b\"}": {}})),
+            flatten_owned_paths(&json!({"k:{\"name\":\"workload\"}": {}})),
             None
         );
+        assert_eq!(flatten_owned_paths(&json!({"v:8080": {}})), None);
+        assert_eq!(flatten_owned_paths(&json!({"f:spec": "scalar"})), None);
         assert_eq!(flatten_owned_paths(&json!("not-an-object")), None);
     }
 }
