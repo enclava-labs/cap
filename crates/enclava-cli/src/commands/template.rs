@@ -858,7 +858,6 @@ fn template_create_app_request(
         required_template_value(template.signer_subject.as_deref(), "signer_subject")?;
     let signer_identity_issuer =
         required_template_value(template.signer_issuer.as_deref(), "signer_issuer")?;
-    let storage_defaults = StorageSection::default();
     Ok(CreateAppRequest {
         name: instance_name.to_string(),
         port: template.port,
@@ -866,7 +865,7 @@ fn template_create_app_request(
         unlock_mode: template.unlock_mode.clone(),
         bootstrap_pubkey_hash: bootstrap_pubkey_hash.map(str::to_string),
         storage_size: template.resources.storage.clone(),
-        tls_storage_size: storage_defaults.tls_size,
+        tls_storage_size: template.resources.tls_storage.clone(),
         storage_paths: template.storage_paths.clone(),
         cpu: template.resources.cpu.clone(),
         memory: template.resources.memory.clone(),
@@ -900,7 +899,6 @@ async fn template_bootstrap_pubkey_hash(
 }
 
 fn template_app_config(template: &HostedTemplate, instance_name: &str) -> AppConfig {
-    let storage_defaults = StorageSection::default();
     AppConfig {
         app: AppSection {
             name: instance_name.to_string(),
@@ -910,7 +908,7 @@ fn template_app_config(template: &HostedTemplate, instance_name: &str) -> AppCon
         storage: StorageSection {
             paths: template.storage_paths.clone(),
             size: template.resources.storage.clone(),
-            tls_size: storage_defaults.tls_size,
+            tls_size: template.resources.tls_storage.clone(),
         },
         unlock: UnlockSection {
             mode: template.unlock_mode.clone(),
@@ -3249,6 +3247,7 @@ mod tests {
                 cpu: "1".to_string(),
                 memory: "1Gi".to_string(),
                 storage: "10Gi".to_string(),
+                tls_storage: "2Gi".to_string(),
             },
             storage_paths: vec![],
             egress_allowlist: vec![HostedTemplateEgressRule {

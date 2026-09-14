@@ -180,7 +180,10 @@ pub fn cap_app_oci_runtime_spec(input: CapAppOciRuntimeSpecInput) -> OciRuntimeS
         resources: Resources {
             requests: vec![
                 named_value("cpu", CAP_APP_CPU_REQUEST),
-                named_value("memory", CAP_APP_MEMORY_REQUEST),
+                named_value(
+                    "memory",
+                    &enclava_engine::manifest::shape::app_memory_request(&input.memory_limit),
+                ),
             ],
             limits: vec![
                 named_value("cpu", &input.cpu_limit),

@@ -389,6 +389,10 @@ pub struct DeployResources {
     pub cpu: Option<String>,
     pub memory: Option<String>,
     pub storage: Option<String>,
+    /// Absent must serialize identically to pre-field requests: the field is
+    /// skipped so retried deployments still match their persisted snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_storage: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -827,6 +831,55 @@ async fn deploy_app_candidate(
     });
     let mut candidate_resources = base_resources;
     if let Some(resources) = body.resources.as_ref() {
+        // Storage sizes render into StatefulSet volumeClaimTemplates, which
+        // Kubernetes treats as immutable. Once a workload has been rendered
+        // (a live/in-flight deployment, or a failed one that recorded a
+        // manifest hash) changing either size would persist a candidate the
+        // apply can never converge; refuse before touching anything.
+        // Pre-created apps and definitively pre-apply failures can still set
+        // their initial sizes.
+        if app_mutation != AppMutation::Insert {
+            let has_rendered_workload: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM deployments
+                     WHERE app_id = $1
+                       AND (status <> 'failed'::deploy_status_enum
+                            OR manifest_hash IS NOT NULL))",
+            )
+            .bind(app.id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+            if has_rendered_workload {
+                for (field, requested, persisted) in [
+                    (
+                        "storage",
+                        resources.storage.as_deref(),
+                        candidate_resources.app_data_size.as_str(),
+                    ),
+                    (
+                        "tls_storage",
+                        resources.tls_storage.as_deref(),
+                        candidate_resources.tls_data_size.as_str(),
+                    ),
+                ] {
+                    // Compare quantities numerically: "5Gi" and "5120Mi" are
+                    // the same immutable claim size, not a resize.
+                    let changed = requested.is_some_and(|requested| {
+                        !crate::entitlements::binary_quantities_equal(requested, persisted)
+                    });
+                    if changed {
+                        return Err(deploy_blocked_response(
+                            StatusCode::CONFLICT,
+                            "storage_resize_unsupported",
+                            format!(
+                                "changing {field} on an existing app would modify the StatefulSet volume claim template, which is immutable; create a new app instead"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
         if let Some(cpu) = resources.cpu.as_ref() {
             candidate_resources.cpu_limit = cpu.clone();
         }
@@ -835,6 +888,9 @@ async fn deploy_app_candidate(
         }
         if let Some(storage) = resources.storage.as_ref() {
             candidate_resources.app_data_size = storage.clone();
+        }
+        if let Some(tls_storage) = resources.tls_storage.as_ref() {
+            candidate_resources.tls_data_size = tls_storage.clone();
         }
     }
 
@@ -941,6 +997,18 @@ async fn deploy_app_candidate(
         let binding = artifacts.binding();
         app_spec.workload_artifact_binding = Some(binding.clone());
         app_spec.log_encryption = log_encryption.clone();
+
+        // The descriptor must bind the same RuntimeClass the renderer resolves
+        // for this app's shape — refuse descriptors signed for a different
+        // class than what the pod will actually run under.
+        let resolved_class = enclava_engine::manifest::shape::resolved_runtime_class(&app_spec);
+        if artifacts.descriptor.expected_runtime_class != resolved_class {
+            return Err(signing_error_response(
+                crate::signing_service::SigningServiceError::Mismatch(
+                    "expected_runtime_class".into(),
+                ),
+            ));
+        }
 
         let signed = resolve_signed_policy_artifact(
             &state,
@@ -1507,6 +1575,28 @@ pub use rollback::rollback;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deploy_resources_without_tls_storage_serializes_legacy_form() {
+        let resources = DeployResources {
+            cpu: Some("1".to_string()),
+            memory: Some("128Mi".to_string()),
+            storage: None,
+            tls_storage: None,
+        };
+        let json = serde_json::to_value(&resources).expect("serialize resources");
+        // Absent tls_storage must not appear; pre-upgrade persisted snapshots
+        // carry no such key and retry comparisons hash this exact shape.
+        assert_eq!(
+            json,
+            serde_json::json!({"cpu": "1", "memory": "128Mi", "storage": null})
+        );
+
+        // A pre-upgrade payload without the key still deserializes.
+        let decoded: DeployResources =
+            serde_json::from_value(serde_json::json!({"cpu": "1"})).expect("decode legacy");
+        assert!(decoded.tls_storage.is_none());
+    }
 
     async fn database_test_pool() -> sqlx::PgPool {
         let database_url = std::env::var("DATABASE_URL")

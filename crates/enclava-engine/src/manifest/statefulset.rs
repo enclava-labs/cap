@@ -18,7 +18,11 @@ use crate::manifest::volumes::{build_volume_claim_templates, build_volumes};
 use crate::types::ConfidentialApp;
 
 pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
-    let cc_init_data_options = cc_init_data::CcInitDataOptions::from_env();
+    let mut cc_init_data_options = cc_init_data::CcInitDataOptions::from_env();
+    // The RuntimeClass is a per-app function of the signed memory limit; bind
+    // the resolved value into cc_init_data so the descriptor's expected hash
+    // covers exactly what the pod runs under.
+    cc_init_data_options.runtime_class = crate::manifest::shape::resolved_runtime_class(app);
     let runtime_class = cc_init_data_options.runtime_class.clone();
     let kbs_url = cc_init_data_options.kbs_url.clone();
     let (cc_init_data_encoded, cc_init_data_hash) =
@@ -56,6 +60,12 @@ pub fn generate_statefulset(app: &ConfidentialApp) -> StatefulSet {
         crate::types::TENANT_INSTANCE_ANNOTATION.to_string(),
         app.name.clone(),
     );
+    if let Some(baseline) = crate::manifest::shape::vm_baseline_annotation(&app.resources.memory) {
+        annotations.insert(
+            "io.katacontainers.config.hypervisor.default_memory".to_string(),
+            baseline,
+        );
+    }
 
     let legacy = legacy_bootstrap_enabled();
 

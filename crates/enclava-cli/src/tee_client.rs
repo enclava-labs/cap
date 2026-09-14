@@ -1,6 +1,10 @@
 use std::{
+    collections::HashMap,
+    io::{ErrorKind, Read},
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{
@@ -29,6 +33,32 @@ use crate::attestation::{tee_tls_transcript_hash, validate_snp_report_with_der_c
 
 const AMD_KDS_BASE_URL: &str = "https://kdsintf.amd.com";
 const AMD_KDS_VCEK_MAX_ATTEMPTS: usize = 8;
+/// Cached VCEK bytes are collateral, not a verdict: the TTL only bounds reuse
+/// of certificate material that every attestation still re-validates end to
+/// end. Fresh SNP reports, nonce bindings, TLS bindings, and chain checks are
+/// unaffected by the cache.
+const AMD_KDS_VCEK_CACHE_TTL: Duration = Duration::from_secs(3600);
+const AMD_KDS_VCEK_CACHE_MAX_ENTRIES: usize = 256;
+const AMD_KDS_VCEK_DISK_CACHE_MAX_ENTRIES: usize = 512;
+/// Cross-process fills serialize on a fixed pool of lock files selected by
+/// hashing the normalized cache key. A fixed slot count keeps `.lock` inode
+/// usage bounded no matter how many distinct identities are attempted —
+/// including identities whose fills always fail and therefore never write a
+/// `.der` entry. Same-key processes always contend on the same slot;
+/// distinct keys contend only on a digest-mod-slots collision.
+const AMD_KDS_VCEK_LOCK_POOL_SLOTS: u64 = 64;
+/// A `Retry-After` hint is honored only up to this cap; an oversized or absent
+/// value falls back to the bounded jittered schedule.
+const AMD_KDS_VCEK_RETRY_AFTER_CAP: Duration = Duration::from_secs(120);
+/// Cross-process single-flight waits on a per-key file lock. A live fill is
+/// bounded by the retry budget, so waiting longer means the lock is stale.
+const AMD_KDS_VCEK_LOCK_WAIT_CAP: Duration = Duration::from_secs(600);
+const AMD_KDS_VCEK_LOCK_POLL: Duration = Duration::from_millis(50);
+/// Override the AMD KDS host root (scheme://authority, no path), e.g. to point
+/// at a reachable caching relay. Workstation defaults stay direct AMD.
+const AMD_KDS_BASE_URL_ENV: &str = "ENCLAVA_AMD_KDS_BASE_URL";
+/// Override the on-disk VCEK cache directory (tests and offline isolation).
+const AMD_KDS_CACHE_DIR_ENV: &str = "ENCLAVA_KDS_CACHE_DIR";
 pub const DEFAULT_TEE_REQUEST_TIMEOUT_SECONDS: u64 = 180;
 pub const OWNERSHIP_TEE_REQUEST_TIMEOUT_SECONDS: u64 = 900;
 pub const OWNERSHIP_TEE_PROBE_TIMEOUT_SECONDS: u64 = 15;
@@ -1156,12 +1186,16 @@ async fn fetch_snp_der_chain_from_kds(snp_report_bytes: &[u8]) -> Result<SnpDerC
             TeeError::Attestation("attestation evidence SNP report is malformed".to_string())
         })?;
     let (ark_der, ask_der) = builtin_snp_ca_der_chain(&report)?;
-    let vcek_url = amd_kds_vcek_url(&report, AMD_KDS_BASE_URL)?;
+    let vcek_url = amd_kds_vcek_url(&report, &amd_kds_base_url())?;
+    let key = vcek_cache_key(&report)?;
     let client = reqwest::Client::builder()
         .https_only(true)
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let vcek_der = fetch_amd_kds_vcek_der(&client, &vcek_url).await?;
+    let vcek_der = fetch_amd_kds_vcek_der_cached(&client, &vcek_url, &key, kds_cache_dir())
+        .await?
+        .as_ref()
+        .clone();
 
     Ok(SnpDerChain {
         ark_der,
@@ -1174,7 +1208,7 @@ fn amd_kds_vcek_should_retry(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
-fn amd_kds_vcek_retry_delay(attempt_index: usize) -> std::time::Duration {
+fn amd_kds_vcek_retry_delay(attempt_index: usize) -> Duration {
     let seconds = match attempt_index {
         0 => 2,
         1 => 5,
@@ -1182,9 +1216,31 @@ fn amd_kds_vcek_retry_delay(attempt_index: usize) -> std::time::Duration {
         3 => 20,
         _ => 30,
     };
-    std::time::Duration::from_secs(seconds)
+    Duration::from_secs(seconds)
 }
 
+/// A valid `Retry-After` delta-seconds value is honored up to a fixed cap;
+/// otherwise the backoff schedule is jittered to [50%, 150%) so callers
+/// released together do not retry in lockstep. The outer attempt bound in
+/// `fetch_amd_kds_vcek_der` is unchanged, and no nested loop may multiply it.
+fn amd_kds_vcek_sleep_duration(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    if let Some(delay) = retry_after {
+        return delay.min(AMD_KDS_VCEK_RETRY_AFTER_CAP);
+    }
+    let jitter = (OsRng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+    amd_kds_vcek_retry_delay(attempt).mul_f64(0.5 + jitter)
+}
+
+/// `Retry-After` in delta-seconds only. An HTTP-date or malformed value falls
+/// back to the jittered schedule rather than being trusted.
+fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
+    let seconds: u64 = value?.to_str().ok()?.trim().parse().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+/// Error strings deliberately carry only the HTTP status or a coarse transport
+/// class: the request URL embeds the chip HWID and must not reach logs or
+/// user-facing errors.
 async fn fetch_amd_kds_vcek_der(
     client: &reqwest::Client,
     vcek_url: &str,
@@ -1196,33 +1252,35 @@ async fn fetch_amd_kds_vcek_der(
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
+                    let retry_after =
+                        parse_retry_after(resp.headers().get(reqwest::header::RETRY_AFTER));
                     if amd_kds_vcek_should_retry(status) && attempt + 1 < AMD_KDS_VCEK_MAX_ATTEMPTS
                     {
-                        tokio::time::sleep(amd_kds_vcek_retry_delay(attempt)).await;
+                        tokio::time::sleep(amd_kds_vcek_sleep_duration(attempt, retry_after)).await;
                         continue;
                     }
                     return Err(TeeError::Attestation(format!(
-                        "AMD KDS VCEK fetch failed: HTTP status {status} for url ({vcek_url})"
+                        "AMD KDS VCEK fetch failed: HTTP status {status}"
                     )));
                 }
 
-                return resp
-                    .bytes()
-                    .await
-                    .map(|bytes| bytes.to_vec())
-                    .map_err(|err| {
-                        TeeError::Attestation(format!("AMD KDS VCEK body read failed: {err}"))
-                    });
+                return read_vcek_body(resp).await;
             }
             Err(err) => {
-                let message = err.to_string();
+                // Coarse class only: `reqwest::Error` strings embed the full
+                // request URL, including the HWID.
+                let class = if err.is_timeout() {
+                    "timeout"
+                } else {
+                    "transport"
+                };
                 if attempt + 1 < AMD_KDS_VCEK_MAX_ATTEMPTS {
-                    last_error = Some(message);
-                    tokio::time::sleep(amd_kds_vcek_retry_delay(attempt)).await;
+                    last_error = Some(class);
+                    tokio::time::sleep(amd_kds_vcek_sleep_duration(attempt, None)).await;
                     continue;
                 }
                 return Err(TeeError::Attestation(format!(
-                    "AMD KDS VCEK request failed: {message}"
+                    "AMD KDS VCEK request failed: {class}"
                 )));
             }
         }
@@ -1230,8 +1288,426 @@ async fn fetch_amd_kds_vcek_der(
 
     Err(TeeError::Attestation(format!(
         "AMD KDS VCEK request failed after retries: {}",
-        last_error.unwrap_or_else(|| "unknown error".to_string())
+        last_error.unwrap_or("unknown error")
     )))
+}
+
+/// Bounded VCEK body read: a KDS or relay must not stream unbounded bytes
+/// into verifier memory. 64 KiB covers every real certificate with headroom.
+async fn read_vcek_body(mut response: reqwest::Response) -> Result<Vec<u8>, TeeError> {
+    const MAX_DER_BYTES: usize = 64 * 1024;
+    let too_large = || TeeError::Attestation("AMD KDS VCEK body exceeds 64 KiB".to_string());
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_DER_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| TeeError::Attestation("AMD KDS VCEK body read failed".to_string()))?
+    {
+        if chunk.len() > MAX_DER_BYTES - body.len() {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Cache key for VCEK collateral: normalized product generation, hardware
+/// identity, and the complete reported TCB tuple (including Turin's `fmc`).
+/// Any firmware/TCB change produces a different key, so cached bytes can never
+/// satisfy a report that needed a different certificate.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct VcekCacheKey {
+    product: String,
+    hw_id: String,
+    fmc: Option<u8>,
+    bootloader: u8,
+    tee: u8,
+    snp: u8,
+    microcode: u8,
+}
+
+impl VcekCacheKey {
+    /// Stable filename-safe form; hashed so the HWID never lands on disk or in
+    /// file names.
+    fn digest(&self) -> String {
+        let canonical = format!(
+            "{}|{}|{}|{:02}|{:02}|{:02}|{:02}",
+            self.product,
+            self.hw_id,
+            self.fmc.map(|v| format!("{v:02}")).unwrap_or_default(),
+            self.bootloader,
+            self.tee,
+            self.snp,
+            self.microcode,
+        );
+        hex::encode(Sha256::digest(canonical.as_bytes()))
+    }
+}
+
+fn vcek_cache_key(
+    report: &sev::firmware::guest::AttestationReport,
+) -> Result<VcekCacheKey, TeeError> {
+    let (generation, hw_id) = snp_report_kds_identity(report)?;
+    let tcb = report.reported_tcb;
+    Ok(VcekCacheKey {
+        product: generation.titlecase(),
+        hw_id,
+        fmc: tcb.fmc,
+        bootloader: tcb.bootloader,
+        tee: tcb.tee,
+        snp: tcb.snp,
+        microcode: tcb.microcode,
+    })
+}
+
+struct CachedVcek {
+    der: Arc<Vec<u8>>,
+    expires_at: Instant,
+}
+
+fn vcek_cache() -> &'static Mutex<HashMap<VcekCacheKey, CachedVcek>> {
+    static CACHE: OnceLock<Mutex<HashMap<VcekCacheKey, CachedVcek>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn vcek_fill_locks() -> &'static Mutex<HashMap<VcekCacheKey, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<VcekCacheKey, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn vcek_cache_get(key: &VcekCacheKey) -> Option<Arc<Vec<u8>>> {
+    let mut cache = vcek_cache().lock().expect("VCEK cache mutex poisoned");
+    match cache.get(key) {
+        Some(entry) if entry.expires_at > Instant::now() => Some(entry.der.clone()),
+        Some(_) => {
+            cache.remove(key);
+            None
+        }
+        None => None,
+    }
+}
+
+fn vcek_cache_insert(key: VcekCacheKey, der: Arc<Vec<u8>>, expires_at: Instant) {
+    let mut cache = vcek_cache().lock().expect("VCEK cache mutex poisoned");
+    if cache.len() >= AMD_KDS_VCEK_CACHE_MAX_ENTRIES {
+        let now = Instant::now();
+        cache.retain(|_, entry| entry.expires_at > now);
+    }
+    while cache.len() >= AMD_KDS_VCEK_CACHE_MAX_ENTRIES {
+        let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.expires_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+    cache.insert(key, CachedVcek { der, expires_at });
+}
+
+/// Per-key in-process fill lock for single-flight collapse. Bounded map; once
+/// full, unknown keys share a process-wide fallback lock, which still
+/// collapses concurrent fills for the same missing key.
+// ponytail: cold keys serialize after 256 identities; evict idle locks if this matters.
+fn vcek_fill_lock(key: &VcekCacheKey) -> Arc<tokio::sync::Mutex<()>> {
+    static FALLBACK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    let mut locks = vcek_fill_locks()
+        .lock()
+        .expect("VCEK fill-lock map poisoned");
+    if let Some(lock) = locks.get(key) {
+        return lock.clone();
+    }
+    if locks.len() >= AMD_KDS_VCEK_CACHE_MAX_ENTRIES {
+        return FALLBACK
+            .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+    }
+    locks
+        .entry(key.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Parse the fetched VCEK and compute its cache expiry: the earlier of the
+/// certificate's own `not_after` and the bounded cache TTL. A body that is not
+/// a certificate currently inside its validity window is rejected and never
+/// cached, so a 429/error body can never become cached "certificate" bytes.
+fn vcek_der_expiry(der: &[u8]) -> Result<Instant, TeeError> {
+    let certificate = x509_cert::Certificate::from_der(der).map_err(|_| {
+        TeeError::Attestation("AMD KDS VCEK response is not a certificate".to_string())
+    })?;
+    let validity = certificate.tbs_certificate.validity;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| TeeError::Attestation("system clock predates UNIX epoch".to_string()))?;
+    let not_before = validity.not_before.to_unix_duration();
+    let not_after = validity.not_after.to_unix_duration();
+    if now < not_before || now >= not_after {
+        return Err(TeeError::Attestation(
+            "AMD KDS VCEK is outside its validity period".to_string(),
+        ));
+    }
+    Ok(Instant::now() + (not_after - now).min(AMD_KDS_VCEK_CACHE_TTL))
+}
+
+/// On-disk cache shared by concurrent `enclava` invocations: a short-lived
+/// process alone cannot collapse same-key fetches across processes. Entries
+/// are `vcek-<sha256(key)>.der`; cross-process single-flight uses one of
+/// `AMD_KDS_VCEK_LOCK_POOL_SLOTS` pooled `vcek-lock-<NN>.lock` files. The
+/// digest keeps the HWID out of file names.
+fn kds_cache_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var(AMD_KDS_CACHE_DIR_ENV) {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    dirs::cache_dir().map(|base| base.join("enclava").join("kds-vcek"))
+}
+
+fn vcek_disk_paths(dir: &Path, key: &VcekCacheKey) -> (PathBuf, PathBuf) {
+    let digest = key.digest();
+    (
+        dir.join(format!("vcek-{digest}.der")),
+        vcek_disk_lock_path(dir, &digest),
+    )
+}
+
+/// The pooled cross-process fill lock for a normalized key digest. Pool
+/// files are permanent shared infrastructure: they are never evicted and
+/// are never treated as orphans by the sweep below.
+fn vcek_disk_lock_path(dir: &Path, key_digest: &str) -> PathBuf {
+    let slot =
+        u64::from_str_radix(&key_digest[..16], 16).unwrap_or(0) % AMD_KDS_VCEK_LOCK_POOL_SLOTS;
+    dir.join(format!("vcek-lock-{slot:02}.lock"))
+}
+
+/// Read a disk-cached VCEK only if it is fresh, parseable, and still inside
+/// its certificate validity window. Corrupt or expired entries are removed
+/// and reported as a miss.
+fn vcek_disk_get(dir: &Path, key: &VcekCacheKey) -> Option<Vec<u8>> {
+    let (der_path, _) = vcek_disk_paths(dir, key);
+    let metadata = std::fs::metadata(&der_path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let fetched_at = metadata.modified().ok()?;
+    if fetched_at.elapsed().ok()? > AMD_KDS_VCEK_CACHE_TTL {
+        let _ = std::fs::remove_file(&der_path);
+        return None;
+    }
+    let mut der = Vec::new();
+    std::fs::File::open(&der_path)
+        .ok()?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut der)
+        .ok()?;
+    if der.is_empty() || der.len() > 64 * 1024 || vcek_der_expiry(&der).is_err() {
+        let _ = std::fs::remove_file(&der_path);
+        return None;
+    }
+    Some(der)
+}
+
+/// Best-effort atomic write plus oldest-first eviction. The caller has already
+/// validated the DER; failures only lose sharing, never correctness.
+fn vcek_disk_put(dir: &Path, key: &VcekCacheKey, der: &[u8]) {
+    let (der_path, _) = vcek_disk_paths(dir, key);
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let tmp = der_path.with_extension(format!("{}.tmp", std::process::id()));
+    if std::fs::write(&tmp, der).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    if std::fs::rename(&tmp, &der_path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    evict_vcek_disk_cache(dir);
+}
+
+fn evict_vcek_disk_cache(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut cached: Vec<(SystemTime, PathBuf)> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if !name.starts_with("vcek-") || !name.ends_with(".der") {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            Some((modified, entry.path()))
+        })
+        .collect();
+    if cached.len() <= AMD_KDS_VCEK_DISK_CACHE_MAX_ENTRIES {
+        return;
+    }
+    cached.sort_by_key(|(modified, _)| *modified);
+    let excess = cached.len() - AMD_KDS_VCEK_DISK_CACHE_MAX_ENTRIES;
+    for (_, path) in cached.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Remove leftover per-key `vcek-<digest>.lock` files from before the pooled
+/// lock scheme — and any future orphan `.lock` file — when no matching
+/// `.der` entry exists. A file is only unlinked while this process holds
+/// its flock, which proves no live filler is serialized on that inode. A
+/// concurrent opener that has not yet locked can still observe the stale
+/// path briefly; the worst case is one lost single-flight collapse for an
+/// orphan key, never a freshness or correctness change.
+fn sweep_orphan_vcek_locks(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // Pool slots are shared infrastructure, never orphans.
+        if name.starts_with("vcek-lock-") || !name.starts_with("vcek-") || !name.ends_with(".lock")
+        {
+            continue;
+        }
+        let der = dir.join(format!("{}.der", &name[..name.len() - ".lock".len()]));
+        if der.exists() {
+            continue;
+        }
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path())
+        else {
+            continue;
+        };
+        let mut lock = fd_lock::RwLock::new(file);
+        let Ok(_guard) = lock.try_write() else {
+            continue;
+        };
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
+/// Single-flight VCEK fetch. In-process, callers for the same product/HWID/TCB
+/// key share one fill through a per-key mutex; across `enclava` invocations a
+/// per-key file lock plays the same role. A warm memory or disk entry is
+/// reused without an upstream request. The cached value is only DER
+/// certificate bytes; chain/identity/validity verification runs on every
+/// attestation regardless of the cache.
+async fn fetch_amd_kds_vcek_der_cached(
+    client: &reqwest::Client,
+    vcek_url: &str,
+    key: &VcekCacheKey,
+    cache_dir: Option<PathBuf>,
+) -> Result<Arc<Vec<u8>>, TeeError> {
+    if let Some(der) = vcek_cache_get(key) {
+        return Ok(der);
+    }
+    let fill = vcek_fill_lock(key);
+    let _guard = fill.lock().await;
+    // A concurrent caller may have filled this key while we queued on it.
+    if let Some(der) = vcek_cache_get(key) {
+        return Ok(der);
+    }
+    vcek_fill_from_upstream(client, vcek_url, key, cache_dir).await
+}
+
+/// The disk-cache layer of a fill: warm on-disk entries are reused, and the
+/// per-key file lock serializes fills across concurrent `enclava` processes.
+async fn vcek_fill_from_upstream(
+    client: &reqwest::Client,
+    vcek_url: &str,
+    key: &VcekCacheKey,
+    cache_dir: Option<PathBuf>,
+) -> Result<Arc<Vec<u8>>, TeeError> {
+    if let Some(dir) = cache_dir.as_deref()
+        && let Some(der) = vcek_disk_get(dir, key)
+    {
+        let expires_at = vcek_der_expiry(&der)?;
+        let der = Arc::new(der);
+        vcek_cache_insert(key.clone(), der.clone(), expires_at);
+        return Ok(der);
+    }
+
+    // Cross-process single-flight: hold the key's pooled lock slot while
+    // filling. Missing lock support only loses cross-process collapse, never
+    // freshness.
+    let mut file_lock = cache_dir.as_deref().and_then(|dir| {
+        let (_, lock_path) = vcek_disk_paths(dir, key);
+        std::fs::create_dir_all(dir).ok()?;
+        let file = std::fs::File::create(lock_path).ok()?;
+        Some(fd_lock::RwLock::new(file))
+    });
+    let _file_guard = match file_lock.as_mut() {
+        Some(lock) => {
+            let deadline = Instant::now() + AMD_KDS_VCEK_LOCK_WAIT_CAP;
+            loop {
+                match lock.try_write() {
+                    Ok(guard) => break Some(guard),
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err(TeeError::Attestation(
+                                "AMD KDS VCEK cache lock wait exceeded".to_string(),
+                            ));
+                        }
+                        tokio::time::sleep(AMD_KDS_VCEK_LOCK_POLL).await;
+                    }
+                    // Unexpected lock errors disable cross-process collapse
+                    // for this fill rather than blocking verification.
+                    Err(_) => break None,
+                }
+            }
+        }
+        None => None,
+    };
+    // Another process may have filled the key while we waited on the lock.
+    if let Some(dir) = cache_dir.as_deref()
+        && let Some(der) = vcek_disk_get(dir, key)
+    {
+        let expires_at = vcek_der_expiry(&der)?;
+        let der = Arc::new(der);
+        vcek_cache_insert(key.clone(), der.clone(), expires_at);
+        return Ok(der);
+    }
+
+    // Best-effort sweep of orphaned per-key lock files while this fill is
+    // already serialized on its slot. Sweeps are idempotent and never
+    // remove pool slots or in-use locks.
+    if let Some(dir) = cache_dir.as_deref() {
+        sweep_orphan_vcek_locks(dir);
+    }
+
+    let der = Arc::new(fetch_amd_kds_vcek_der(client, vcek_url).await?);
+    let expires_at = vcek_der_expiry(&der)?;
+    if let Some(dir) = cache_dir.as_deref() {
+        vcek_disk_put(dir, key, &der);
+    }
+    vcek_cache_insert(key.clone(), der.clone(), expires_at);
+    Ok(der)
 }
 
 fn builtin_snp_ca_der_chain(
@@ -1286,10 +1762,20 @@ fn ark_is_pinned_to_builtin_root(ark_der: &[u8]) -> bool {
     pinned.iter().any(|root| root == ark_der)
 }
 
-fn amd_kds_vcek_url(
+fn amd_kds_base_url() -> String {
+    std::env::var(AMD_KDS_BASE_URL_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| AMD_KDS_BASE_URL.to_string())
+}
+
+/// Normalized KDS lookup identity for a report: the processor generation
+/// (product) plus the product-correct hardware-ID encoding. Every check here
+/// is a precondition for a KDS lookup, so the cache key shares it with the URL
+/// to keep both on identical normalization.
+fn snp_report_kds_identity(
     report: &sev::firmware::guest::AttestationReport,
-    base_url: &str,
-) -> Result<String, TeeError> {
+) -> Result<(sev::Generation, String), TeeError> {
     if report.chip_id == [0u8; 64] {
         return Err(TeeError::Attestation(
             "SNP report masks chip_id; cannot fetch VCEK from AMD KDS".to_string(),
@@ -1301,10 +1787,27 @@ fn amd_kds_vcek_url(
                 .to_string(),
         ));
     }
-
     let generation = snp_report_generation(report)?;
+    // AMD KDS spec 57230: Turin uses the first eight CHIP_ID bytes.
+    let hw_id = if matches!(generation, sev::Generation::Turin) {
+        if report.chip_id[8..].iter().any(|byte| *byte != 0) {
+            return Err(TeeError::Attestation(
+                "invalid Turin chip_id padding".to_string(),
+            ));
+        }
+        hex::encode(&report.chip_id[..8])
+    } else {
+        hex::encode(report.chip_id)
+    };
+    Ok((generation, hw_id))
+}
+
+fn amd_kds_vcek_url(
+    report: &sev::firmware::guest::AttestationReport,
+    base_url: &str,
+) -> Result<String, TeeError> {
+    let (generation, hw_id) = snp_report_kds_identity(report)?;
     let tcb = report.reported_tcb;
-    let hw_id = hex::encode(report.chip_id);
     let base = base_url.trim_end_matches('/');
     if matches!(generation, sev::Generation::Turin) {
         let fmc = tcb.fmc.ok_or_else(|| {

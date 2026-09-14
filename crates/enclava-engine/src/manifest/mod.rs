@@ -16,6 +16,7 @@ pub mod network_policy;
 pub mod resource_quota;
 pub mod service;
 pub mod service_account;
+pub mod shape;
 pub mod startup;
 pub mod statefulset;
 pub mod verification_material;

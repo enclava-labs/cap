@@ -392,6 +392,13 @@ pub struct InternalCreateAppRequest {
     pub egress_allowlist: Vec<crate::routes::apps::CreateEgressAllowRule>,
     #[serde(default = "crate::routes::apps::default_egress_mode")]
     pub egress_mode: String,
+    /// Optional initial resource overrides (cpu/memory/storage/tls_storage).
+    /// Absent fields keep the hosted defaults; values are still checked
+    /// against the org's entitlement before the app is committed. Skipped in
+    /// serialization so replayed pre-upgrade requests keep their persisted
+    /// idempotency fingerprint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<crate::routes::deployments::DeployResources>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -3039,6 +3046,7 @@ struct InternalCreateAppIdentity<'a> {
     egress_mode: &'a str,
     app_host: &'a str,
     tee_host: &'a str,
+    resources: &'a crate::models::AppResources,
 }
 
 #[derive(sqlx::FromRow)]
@@ -3132,10 +3140,10 @@ async fn adopt_exact_internal_app(
         && row.egress_allowlist == expected_egress
         && row.egress_mode == expected.egress_mode
         && row.signer_identity_issuer == expected.body.signer_identity_issuer
-        && row.cpu_limit.as_deref() == Some("1")
-        && row.memory_limit.as_deref() == Some("1Gi")
-        && row.app_data_size.as_deref() == Some("5Gi")
-        && row.tls_data_size.as_deref() == Some("2Gi");
+        && row.cpu_limit.as_deref() == Some(expected.resources.cpu_limit.as_str())
+        && row.memory_limit.as_deref() == Some(expected.resources.memory_limit.as_str())
+        && row.app_data_size.as_deref() == Some(expected.resources.app_data_size.as_str())
+        && row.tls_data_size.as_deref() == Some(expected.resources.tls_data_size.as_str());
     if !exact {
         return Err(idempotency_resource_conflict_error());
     }
@@ -3226,6 +3234,31 @@ pub async fn create_paas_app(
     let egress_mode = crate::routes::apps::validate_egress_mode(&body.egress_mode)
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
 
+    // Effective resource row: hosted defaults overlaid with any caller
+    // overrides. Computed before adoption so replayed create requests compare
+    // against what this call would actually persist.
+    let mut resources = crate::models::AppResources {
+        app_id,
+        cpu_limit: "1".to_string(),
+        memory_limit: "1Gi".to_string(),
+        app_data_size: "5Gi".to_string(),
+        tls_data_size: "2Gi".to_string(),
+    };
+    if let Some(overrides) = body.resources.as_ref() {
+        if let Some(cpu) = overrides.cpu.as_ref() {
+            resources.cpu_limit = cpu.clone();
+        }
+        if let Some(memory) = overrides.memory.as_ref() {
+            resources.memory_limit = memory.clone();
+        }
+        if let Some(storage) = overrides.storage.as_ref() {
+            resources.app_data_size = storage.clone();
+        }
+        if let Some(tls_storage) = overrides.tls_storage.as_ref() {
+            resources.tls_data_size = tls_storage.clone();
+        }
+    }
+
     if idempotency.reclaimed() {
         let expected = InternalCreateAppIdentity {
             app_id,
@@ -3236,6 +3269,7 @@ pub async fn create_paas_app(
             egress_mode: egress_mode.as_str(),
             app_host: &app_host,
             tee_host: &tee_host,
+            resources: &resources,
         };
         if let Some(response) = adopt_exact_internal_app(&state, &expected).await? {
             return Ok((StatusCode::CREATED, response));
@@ -3274,13 +3308,6 @@ pub async fn create_paas_app(
         )
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
 
-    let resources = crate::models::AppResources {
-        app_id,
-        cpu_limit: "1".to_string(),
-        memory_limit: "1Gi".to_string(),
-        app_data_size: "5Gi".to_string(),
-        tls_data_size: "2Gi".to_string(),
-    };
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
     crate::entitlements::lock_org_entitlement_lane(&mut tx, cap_org_id)
         .await
@@ -5363,6 +5390,30 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use sqlx::Connection;
+
+    #[test]
+    fn create_app_request_without_resources_serializes_legacy_form() {
+        let request = InternalCreateAppRequest {
+            name: "app".to_string(),
+            unlock_mode: "auto".to_string(),
+            bootstrap_pubkey_hash: None,
+            signer_identity_subject: None,
+            signer_identity_issuer: None,
+            egress_allowlist: Vec::new(),
+            egress_mode: crate::routes::apps::default_egress_mode(),
+            resources: None,
+        };
+        let json = serde_json::to_value(&request).expect("serialize create request");
+        // Absent resources must not appear: replayed pre-upgrade requests are
+        // compared to their persisted fingerprint, which has no such key.
+        assert!(json.get("resources").is_none());
+
+        // A pre-upgrade payload without the key still deserializes.
+        let decoded: InternalCreateAppRequest =
+            serde_json::from_value(serde_json::json!({"name": "app"}))
+                .expect("decode legacy create request");
+        assert!(decoded.resources.is_none());
+    }
 
     async fn database_test_pool() -> sqlx::PgPool {
         let database_url = std::env::var("DATABASE_URL")
@@ -9480,6 +9531,7 @@ mod tests {
             signer_identity_issuer: None,
             egress_allowlist: Vec::new(),
             egress_mode: "restricted".to_string(),
+            resources: None,
         };
         let first = create_paas_app(
             InternalAuth {
@@ -9538,6 +9590,7 @@ mod tests {
             signer_identity_issuer: None,
             egress_allowlist: Vec::new(),
             egress_mode: "restricted".to_string(),
+            resources: None,
         };
         let retried = create_paas_app(
             InternalAuth {

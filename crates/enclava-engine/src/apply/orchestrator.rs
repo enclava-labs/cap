@@ -136,7 +136,7 @@ pub async fn apply_and_watch(
     // Generate manifests
     let manifests = generate_all_manifests(app);
 
-    crate::manifest::cc_init_data::verify_runtime_class_binding(&manifests.statefulset)
+    crate::manifest::cc_init_data::verify_runtime_class_binding(&manifests.statefulset, app)
         .map_err(ApplyError::ManifestGeneration)?;
 
     // Apply all

@@ -3532,3 +3532,111 @@ async fn signer_rotation_token_rotates_signer_end_to_end() {
         Some(previous_issuer)
     );
 }
+
+#[tokio::test]
+async fn existing_app_storage_resize_is_refused_before_persistence() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let suffix = Uuid::new_v4().simple().to_string();
+    let app_name = format!("resize-{}", &suffix[..12]);
+    let (session_token, org_id) = signup_owner(&server, "storage-resize").await;
+    let image = "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": app_name,
+            "unlock_mode": "auto",
+        }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let persisted_app: enclava_api::models::App =
+        sqlx::query_as("SELECT * FROM apps WHERE org_id = $1 AND name = $2")
+            .bind(org_id)
+            .bind(&app_name)
+            .fetch_one(&pool)
+            .await
+            .expect("created app");
+
+    // Seed a rendered workload: a healthy deployment with a recorded manifest
+    // hash marks the app as having applied volumeClaimTemplates.
+    sqlx::query(
+        "INSERT INTO deployments (
+             id, org_id, app_id, trigger, status, spec_snapshot, image_digest, manifest_hash
+         ) VALUES (
+             $1, $2, $3, 'api', 'healthy', '{}'::jsonb, $4, 'seeded-manifest-hash'
+         )",
+    )
+    .bind(Uuid::new_v4())
+    .bind(org_id)
+    .bind(persisted_app.id)
+    .bind("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    .execute(&pool)
+    .await
+    .expect("seed rendered deployment");
+
+    for resources in [
+        serde_json::json!({ "tls_storage": "4Gi" }),
+        serde_json::json!({ "storage": "6Gi" }),
+    ] {
+        let response = server
+            .post(&format!("/apps/{app_name}/deploy"))
+            .add_header("x-forwarded-for", "127.0.0.1")
+            .authorization_bearer(&session_token)
+            .json(&serde_json::json!({ "image": image, "resources": resources }))
+            .await;
+        response.assert_status(StatusCode::CONFLICT);
+        let body: Value = response.json();
+        assert_eq!(
+            body["reason"], "storage_resize_unsupported",
+            "expected storage_resize_unsupported for {resources}: {body}"
+        );
+    }
+
+    // Numerically equal quantities are not resizes and must pass the guard.
+    let same_size = server
+        .post(&format!("/apps/{app_name}/deploy"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "image": image,
+            "resources": { "tls_storage": "2048Mi" },
+        }))
+        .await;
+    let same_size_body: Value = same_size.json();
+    assert_ne!(
+        same_size_body["reason"], "storage_resize_unsupported",
+        "equal TLS quantity was refused as a resize: {same_size_body}"
+    );
+
+    // An app without a rendered workload can still set its initial sizes.
+    let fresh_app_name = format!("fresh-{}", &suffix[..12]);
+    server
+        .post("/apps")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "name": fresh_app_name,
+            "unlock_mode": "auto",
+        }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    let first_deploy = server
+        .post(&format!("/apps/{fresh_app_name}/deploy"))
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "image": image,
+            "resources": { "storage": "6Gi", "tls_storage": "4Gi" },
+        }))
+        .await;
+    let first_deploy_body: Value = first_deploy.json();
+    assert_ne!(
+        first_deploy_body["reason"], "storage_resize_unsupported",
+        "initial size selection was refused as a resize: {first_deploy_body}"
+    );
+}

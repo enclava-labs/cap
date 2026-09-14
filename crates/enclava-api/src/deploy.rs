@@ -1629,6 +1629,147 @@ mod tests {
         assert!(descriptor_storage_paths(&descriptor).is_empty());
         assert!(app.primary_container().unwrap().storage_paths.is_empty());
     }
+
+    /// A Kubernetes API double with configurable readiness and an empty pod list.
+    fn rollout_client(ready: bool) -> kube::Client {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+
+        kube::Client::new(
+            service_fn(move |request: Request<Body>| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let path = request.uri().path().to_string();
+                let _ = request.into_body().collect().await;
+                let value = if path.ends_with("/pods") {
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "items": [],
+                    })
+                } else {
+                    serde_json::json!({
+                        "apiVersion": "apps/v1",
+                        "kind": "StatefulSet",
+                        "metadata": {
+                            "name": "queued-app",
+                            "namespace": "cap-queued-app",
+                            "generation": 1,
+                        },
+                        "spec": { "replicas": 1 },
+                        "status": {
+                            "observedGeneration": 1,
+                            "replicas": 1,
+                            "readyReplicas": i32::from(ready),
+                            "currentReplicas": i32::from(ready),
+                            "updatedReplicas": i32::from(ready),
+                        },
+                    })
+                };
+                Ok::<_, std::io::Error>(
+                    Response::builder()
+                        .status(200)
+                        .body(Body::from(serde_json::to_vec(&value).unwrap()))
+                        .unwrap(),
+                )
+            }),
+            "default",
+        )
+    }
+
+    fn rollout_test_engine() -> ApplyEngine {
+        ApplyEngine::new(
+            rollout_client(false),
+            enclava_engine::apply::types::ApplyConfig {
+                rollout_timeout: std::time::Duration::from_secs(600),
+                poll_interval: std::time::Duration::from_millis(5),
+                ..enclava_engine::apply::types::ApplyConfig::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn rollout_watch_slice_returns_nonterminal_while_budget_remains() {
+        // An owner-waiting workload must release its worker slot between
+        // observation slices instead of holding it for the full rollout
+        // timeout.
+        let outcome = DeploymentRollout::observe_only(
+            queued_apply_app(),
+            rollout_test_engine(),
+            "slice-manifest".to_string(),
+            chrono::Utc::now(),
+        )
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(outcome.deploy_status, "watching");
+        assert_eq!(outcome.app_status, "creating");
+        assert!(!outcome.terminal);
+        assert_eq!(outcome.manifest_hash, "slice-manifest");
+    }
+
+    #[tokio::test]
+    async fn rollout_watch_respects_anchored_cumulative_deadline() {
+        // A restarted observer anchors at `observing_since`: once the
+        // cumulative rollout budget is spent, the slice ends immediately and
+        // returns the engine timeout classification instead of restarting a
+        // fresh 600s wait.
+        let mut auto_app = queued_apply_app();
+        auto_app.unlock_mode = crate::models::UnlockMode::Auto;
+        let outcome = DeploymentRollout::observe_only(
+            auto_app,
+            rollout_test_engine(),
+            "deadline-manifest".to_string(),
+            chrono::Utc::now() - chrono::Duration::seconds(601),
+        )
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(outcome.deploy_status, "failed");
+        assert_eq!(outcome.app_status, "failed");
+        assert!(outcome.terminal);
+        assert_eq!(outcome.error_code, Some("deployment_rollout_failed"));
+    }
+
+    #[tokio::test]
+    async fn rollout_watch_observes_late_owner_unlock_after_deadline() {
+        let engine = ApplyEngine::new(
+            rollout_client(true),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        );
+        let outcome = DeploymentRollout::observe_only(
+            queued_apply_app(),
+            engine,
+            "late-unlock-manifest".to_string(),
+            chrono::Utc::now() - chrono::Duration::seconds(601),
+        )
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(outcome.deploy_status, "healthy");
+        assert_eq!(outcome.app_status, "running");
+        assert!(outcome.terminal);
+    }
+
+    #[tokio::test]
+    async fn rollout_watch_password_timeout_stays_nonterminal_for_owner_wait() {
+        // Password-mode creates classify an exhausted rollout budget as a
+        // continuing owner wait, but the observation slice still returns
+        // promptly so the worker slot is released between probes.
+        let outcome = DeploymentRollout::observe_only(
+            queued_apply_app(),
+            rollout_test_engine(),
+            "password-manifest".to_string(),
+            chrono::Utc::now() - chrono::Duration::seconds(601),
+        )
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(outcome.deploy_status, "watching");
+        assert_eq!(outcome.app_status, "creating");
+        assert!(!outcome.terminal);
+    }
 }
 
 pub async fn set_deployment_status(
@@ -1644,7 +1785,11 @@ pub async fn set_deployment_status(
          SET status = $1::deploy_status_enum,
              manifest_hash = COALESCE($2, manifest_hash),
              error_message = $3,
-             completed_at = CASE WHEN $4 THEN now() ELSE completed_at END
+             completed_at = CASE WHEN $4 THEN now() ELSE completed_at END,
+             observing_since = CASE
+                 WHEN $1 = 'watching' THEN COALESCE(observing_since, clock_timestamp())
+                 ELSE observing_since
+             END
          WHERE id = $5",
     )
     .bind(status)
@@ -1796,16 +1941,24 @@ async fn restart_statefulset_for_ingress(
     Ok(())
 }
 
+/// One rollout-observation slice. A durable watcher owns no mutation fence, so
+/// this bound is also the maximum time a waiting workload keeps a worker slot
+/// before the job is released for the next dispatch.
+const ROLLOUT_OBSERVATION_SLICE: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// A rollout handle returned after Kubernetes accepted the rendered manifests.
 ///
 /// Callers must await [`DeploymentRollout::watch`]. Durable deployment workers
-/// keep their database lease alive while doing so, allowing a replacement API
-/// process to re-apply and resume observation after a crash.
+/// publish each observed outcome under their job lease, so a replacement API
+/// process resumes observation after a crash without re-applying manifests.
 pub struct DeploymentRollout {
     app: App,
     engine: ApplyEngine,
-    app_spec: ConfidentialApp,
-    manifest_hash: String,
+    namespace: String,
+    workload_name: String,
+    pub(crate) manifest_hash: String,
+    observing_since: chrono::DateTime<chrono::Utc>,
+    observation_slice: std::time::Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1818,14 +1971,83 @@ pub struct DeploymentRolloutOutcome {
 }
 
 impl DeploymentRollout {
-    /// Observe Kubernetes only. The durable job owner publishes this bounded
-    /// outcome after atomically revalidating its database lease.
+    /// Read-only rollout observer for a generation whose durable deployment
+    /// row is already `watching`. It shares the recorded manifest hash and the
+    /// anchored observation window, and performs no provider mutation.
+    pub(crate) fn observe_only(
+        app: App,
+        engine: ApplyEngine,
+        manifest_hash: String,
+        observing_since: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        let namespace = app.namespace.clone();
+        let workload_name = app.name.clone();
+        Self {
+            app,
+            engine,
+            namespace,
+            workload_name,
+            manifest_hash,
+            observing_since,
+            observation_slice: ROLLOUT_OBSERVATION_SLICE,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_observation_slice(mut self, slice: std::time::Duration) -> Self {
+        self.observation_slice = slice;
+        self
+    }
+
+    /// Observe Kubernetes only, in one bounded slice. The durable job owner
+    /// publishes this outcome after atomically revalidating its lease. When
+    /// the slice elapses while cumulative rollout budget remains, the outcome
+    /// is a nonterminal `watching` so the worker releases its slot and the
+    /// job resumes observation on the next dispatch. The total
+    /// `rollout_timeout` is anchored at `observing_since`, so restarted
+    /// observation cannot extend a rollout deadline forever.
     pub async fn watch(self) -> DeploymentRolloutOutcome {
         let previous_app_status = self.app.status;
         let unlock_mode = self.app.unlock_mode;
-        let result = watch_rollout(&self.engine, &self.app_spec.namespace, &self.app_spec.name)
-            .await
-            .map_err(|error| error.public_code().to_string());
+        let total = self.engine.config().rollout_timeout;
+        let elapsed = chrono::Utc::now()
+            .signed_duration_since(self.observing_since)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+        let remaining = total.saturating_sub(elapsed);
+        // Owner wait is deliberately nonterminal. Keep observing after its
+        // initial budget expires so a later unlock can still become healthy.
+        let owner_wait = unlock_mode == crate::models::UnlockMode::Password
+            && previous_app_status == AppStatus::Creating;
+        let slice = if owner_wait && remaining.is_zero() {
+            self.observation_slice
+        } else {
+            remaining.min(self.observation_slice)
+        };
+        let result = match tokio::time::timeout(
+            slice,
+            watch_rollout(&self.engine, &self.namespace, &self.workload_name),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|error| error.public_code().to_string()),
+            Err(_) if remaining > self.observation_slice => {
+                // Slice elapsed with rollout budget remaining: return a
+                // nonterminal observation so the worker frees its slot.
+                return DeploymentRolloutOutcome {
+                    deploy_status: "watching",
+                    app_status: app_status_label(previous_app_status),
+                    error_code: None,
+                    terminal: false,
+                    manifest_hash: self.manifest_hash,
+                };
+            }
+            // The cumulative rollout budget is exhausted; preserve the engine
+            // timeout classification for this generation.
+            Err(_) => Ok(EngineDeployStatus::timed_out(&format!(
+                "rollout did not complete within {total:?}"
+            ))),
+        };
         let outcome = classify_rollout_result(result, previous_app_status, unlock_mode);
         DeploymentRolloutOutcome {
             deploy_status: outcome.deploy_status,
@@ -1834,6 +2056,16 @@ impl DeploymentRollout {
             terminal: outcome.terminal,
             manifest_hash: self.manifest_hash,
         }
+    }
+}
+
+fn app_status_label(status: AppStatus) -> &'static str {
+    match status {
+        AppStatus::Creating => "creating",
+        AppStatus::Running => "running",
+        AppStatus::Stopped => "stopped",
+        AppStatus::Failed => "failed",
+        AppStatus::Deleting => "deleting",
     }
 }
 
@@ -1984,13 +2216,15 @@ pub async fn apply_deployment_manifests(
     }
     crate::edge::ensure_haproxy_routes(&pool, &edge_config, Some(edge_config_generation), &routes)
         .await?;
-    set_deployment_status(&pool, deployment_id, "watching", Some(&hash), None, false).await?;
 
     Ok(Some(DeploymentRollout {
         app,
         engine,
-        app_spec,
+        namespace: app_spec.namespace.clone(),
+        workload_name: app_spec.name.clone(),
         manifest_hash: hash,
+        observing_since: chrono::Utc::now(),
+        observation_slice: ROLLOUT_OBSERVATION_SLICE,
     }))
 }
 
