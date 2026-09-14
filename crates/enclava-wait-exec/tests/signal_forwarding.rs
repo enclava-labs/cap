@@ -1,9 +1,73 @@
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[test]
+fn disabled_logging_does_not_block_on_unread_host_pipes() {
+    let dir = env::temp_dir().join(format!(
+        "enclava-wait-exec-unread-pipe-test-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("ready"), "ready\n").unwrap();
+    // Exceed pipe capacity on both streams. Kata denies ReadStreamRequest;
+    // leave the read ends open but unread until the payload finishes.
+    let script = "i=0; while [ $i -lt 100000 ]; do printf 'test-output-line\\n'; printf 'test-error-line\\n' >&2; i=$((i + 1)); done";
+    let mut wrapper = Command::new(env!("CARGO_BIN_EXE_enclava-wait-exec"))
+        .args(["/bin/sh", "-c", script])
+        .env("ENCLAVA_CONTAINER_NAME", "web")
+        .env("ENCLAVA_STARTED_DIR", dir.join("started"))
+        .env("ENCLAVA_INIT_READY_FILE", dir.join("ready"))
+        .env_remove("ENCLAVA_LOG_ENCRYPTION_KEY_ID")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = wrapper.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            wrapper.kill().unwrap();
+            wrapper.wait().unwrap();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    wrapper
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    wrapper
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    fs::remove_dir_all(dir).unwrap();
+    assert!(
+        status.is_some(),
+        "payload blocked on unread host output pipes"
+    );
+    assert!(status.unwrap().success());
+    assert!(
+        stdout.is_empty() && stderr.is_empty(),
+        "plaintext reached host pipes"
+    );
+}
 
 #[test]
 fn encrypted_log_wrapper_forwards_sigterm_to_child() {

@@ -97,6 +97,7 @@ fn report_failure(error: &anyhow::Error) {
 }
 
 fn run() -> Result<()> {
+    let mut stats = init_stats::BootStats::begin();
     record_stage("loading config").ok();
     let cfg_path = std::env::var("ENCLAVA_INIT_CONFIG")
         .map(PathBuf::from)
@@ -113,36 +114,52 @@ fn run() -> Result<()> {
     }
 
     record_stage("waiting for owner seed").ok();
+    let phase = stats.elapsed_ms();
     let owner = match cfg.mode {
         Mode::Password => acquire_owner_seed_password(&cfg)?,
         Mode::Autounlock => acquire_owner_seed_autounlock(&cfg)?,
     };
+    stats.record_owner_seed(phase);
     clear_error_file(&error_file_path());
 
     record_stage("opening luks volumes").ok();
-    open_luks_volumes(&cfg, &owner)?;
+    open_luks_volumes(&cfg, &owner, &mut stats)?;
     record_stage("preparing mount ownership").ok();
     prepare_mount_ownership(&cfg)?;
 
     record_stage("verifying trustee policy").ok();
     // Fail-closed: any verification gap (missing inputs, missing policy-read
     // availability) returns Err and aborts before seed release.
+    let phase = stats.elapsed_ms();
     run_in_tee_verification(&cfg)?;
+    stats.record_tee_verify(phase);
 
     record_stage("provisioning static tls certificate").ok();
     provision_static_tls_certificate(&cfg).context("provisioning static TLS certificate")?;
     record_stage("writing component seeds").ok();
+    let phase = stats.elapsed_ms();
     write_per_component_seeds(&cfg, &owner)?;
+    stats.record_component_seeds(phase);
 
     if stay_alive {
         record_stage("waiting for workload containers").ok();
         let workload_namespaces = wait_for_container_start_sentinels(&cfg)
             .context("waiting for workload containers before bind-mounting decrypted volumes")?;
         record_stage("binding workload mount namespaces").ok();
+        let phase = stats.elapsed_ms();
         bind_mounts_into_workload_namespaces(&cfg, &workload_namespaces)
             .context("binding decrypted mounts into workload namespaces")?;
+        stats.record_bind_mounts(phase);
         record_stage("seeding caddy runtime handoff").ok();
         seed_caddy_runtime_handoff(&cfg).context("seeding caddy runtime handoff")?;
+    }
+
+    // Write the numeric boot summary before flipping ready so consumers
+    // polling the ready file never observe readiness without the record.
+    // Telemetry is best-effort: a failed write must not block the workload.
+    let stats_path = init_stats::stats_path_for(&ready_file);
+    if let Err(err) = stats.write(&stats_path) {
+        tracing::warn!(path = %stats_path.display(), error = %err, "failed to write init stats");
     }
 
     if stay_alive {
@@ -203,6 +220,8 @@ fn started_dir_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/run/enclava/containers"))
 }
 
+#[path = "main/init_stats.rs"]
+mod init_stats;
 #[path = "main/namespace_bind.rs"]
 mod namespace_bind;
 #[cfg(test)]
@@ -753,19 +772,28 @@ fn kbs_proxy_health_status_is_ready(status: u16) -> bool {
     status == 200 || status == 423
 }
 
-fn open_luks_volumes(cfg: &Config, owner: &OwnerSeed) -> Result<()> {
+fn open_luks_volumes(
+    cfg: &Config,
+    owner: &OwnerSeed,
+    stats: &mut init_stats::BootStats,
+) -> Result<()> {
     if dev_no_luks_override() {
         tracing::warn!("ENCLAVA_INIT_DEV_NO_LUKS=true — skipping luks open (debug builds only)");
         return Ok(());
     }
-    open_one_volume(&cfg.state, owner)
+    let state_phase = stats.elapsed_ms();
+    let state_opened = open_one_volume(&cfg.state, owner)
         .with_context(|| format!("opening state volume {}", cfg.state.device))?;
-    open_one_volume(&cfg.tls_state, owner)
+    stats.record_state_volume(state_phase, state_opened.formatted);
+    let tls_phase = stats.elapsed_ms();
+    let tls_opened = open_one_volume(&cfg.tls_state, owner)
         .with_context(|| format!("opening tls-state volume {}", cfg.tls_state.device))?;
+    stats.record_tls_volume(tls_phase, tls_opened.formatted);
+    stats.record_post_luks_memory();
     Ok(())
 }
 
-fn open_one_volume(vol: &VolumeConfig, owner: &OwnerSeed) -> Result<()> {
+fn open_one_volume(vol: &VolumeConfig, owner: &OwnerSeed) -> Result<luks::LuksOpened> {
     let key = derive_volume_key(owner, &vol.hkdf_info)?;
     let device = Path::new(&vol.device);
     let opened = luks::format_if_unformatted_then_open(device, &vol.mapping_name, &key)?;
@@ -776,7 +804,7 @@ fn open_one_volume(vol: &VolumeConfig, owner: &OwnerSeed) -> Result<()> {
         mount = %vol.mount_path,
         "opened luks volume"
     );
-    Ok(())
+    Ok(opened)
 }
 
 fn prepare_mount_ownership(cfg: &Config) -> Result<()> {

@@ -60,7 +60,14 @@ fn run(argv: Vec<OsString>) -> Result<(), String> {
         let code = run_with_encrypted_logs(program, args, logs)?;
         process::exit(code);
     }
-    let err = Command::new(&program).args(&args).exec();
+    // Without encrypted logging there is no permitted output reader:
+    // ReadStreamRequest is denied by the agent policy. Inheriting those pipes
+    // eventually blocks a chatty payload (and its recovery path) on write.
+    let err = Command::new(&program)
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .exec();
     Err(format!(
         "failed to exec {}: {err}",
         PathBuf::from(program).display()

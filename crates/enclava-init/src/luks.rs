@@ -35,6 +35,10 @@ static KEY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 pub struct LuksOpened {
     pub mapper_path: PathBuf,
+    /// True when this call formatted a fresh device (LUKS format + mkfs) rather
+    /// than opening an existing volume. Numeric telemetry only; the decision
+    /// itself stays in `format_decision`.
+    pub formatted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,7 +145,10 @@ pub fn open(device: &Path, mapping_name: &str, key: &DerivedSeed) -> Result<Luks
     let mapper_path = PathBuf::from(format!("/dev/mapper/{mapping_name}"));
     if mapper_path.exists() {
         validate_existing_mapper(device, mapping_name, key)?;
-        return Ok(LuksOpened { mapper_path });
+        return Ok(LuksOpened {
+            mapper_path,
+            formatted: false,
+        });
     }
 
     if let Err(cli_err) = open_with_cryptsetup_cli(device, mapping_name, key) {
@@ -158,7 +165,10 @@ pub fn open(device: &Path, mapping_name: &str, key: &DerivedSeed) -> Result<Luks
         })?;
     }
 
-    Ok(LuksOpened { mapper_path })
+    Ok(LuksOpened {
+        mapper_path,
+        formatted: false,
+    })
 }
 
 fn validate_existing_mapper(device: &Path, mapping_name: &str, key: &DerivedSeed) -> Result<()> {
@@ -218,9 +228,10 @@ pub fn format_if_unformatted_then_open(
     if needs_mkfs {
         format(device, key)?;
     }
-    let opened = open(device, mapping_name, key)?;
+    let mut opened = open(device, mapping_name, key)?;
     if needs_mkfs {
         mkfs_ext4(&opened.mapper_path)?;
+        opened.formatted = true;
     }
     Ok(opened)
 }
