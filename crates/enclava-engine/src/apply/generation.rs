@@ -1043,10 +1043,17 @@ mod tests {
                     ));
                 }
                 let mut updated = current;
+                // ownership follows changed or added fields, as the API
+                // server does for Update writers
+                let owned: Vec<String> = document_leaf_paths(&payload)
+                    .into_iter()
+                    .filter(|path| {
+                        value_at(&updated, path).as_ref() != value_at(&payload, path).as_ref()
+                    })
+                    .collect();
                 merge_value(&mut updated, &payload);
                 updated["metadata"]["resourceVersion"] = json!(resource_version);
                 let manager = query_param(query, "fieldManager").unwrap_or("kubectl-patch");
-                let owned = document_leaf_paths(&payload);
                 record_update_ownership(&mut updated, &owned, manager, true);
                 locked.resource = Some(updated);
                 Ok(json_response(
@@ -1190,10 +1197,11 @@ mod tests {
         "managedFields",
     ];
 
-    /// Apply-patch handling with SSA ownership semantics: Update entries
-    /// conflict on value changes, Apply entries on any touch, same-manager
-    /// Apply entries merge, and `force` resolves conflicts by transferring
-    /// ownership of exactly the conflicting paths.
+    /// Apply-patch handling with SSA ownership semantics: owners conflict
+    /// when the incoming apply modifies or adds one of their fields
+    /// (identical values share ownership), same-manager Apply entries
+    /// merge, and `force` accepts the write without modeling the server's
+    /// field-by-field transfer out of losing owners.
     fn apply_ssa(
         state: &mut FakeState,
         current: Value,
