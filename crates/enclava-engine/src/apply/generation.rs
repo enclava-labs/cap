@@ -270,9 +270,9 @@ where
             // write (including a pure ownership change) bumps the version,
             // silently deauthorizes the force, and falls back to the
             // no-force probe with a fresh classification.
-            let authorized = force_against.is_some_and(|version| {
-                current.meta().resource_version.as_deref() == Some(version.as_str())
-            });
+            let authorized = force_against
+                .as_deref()
+                .is_some_and(|version| current.meta().resource_version.as_deref() == Some(version));
             let patch_params = if force || trusted || authorized {
                 PatchParams::apply(&engine.config().field_manager).force()
             } else {
@@ -284,7 +284,7 @@ where
                 .clone()
                 .ok_or_else(|| ApplyError::MissingResourceIdentity(kind::<K>()))?;
             let mut desired = resource.clone();
-            desired.meta_mut().resource_version = Some(resource_version);
+            desired.meta_mut().resource_version = Some(resource_version.clone());
             annotate(&mut desired, generation);
             let applied = if exact_when_trusted && trusted {
                 super::bounded_kube_write(api.replace(name, &post_params, &desired)).await
@@ -307,13 +307,28 @@ where
                         continue;
                     }
                     if !authorized {
+                        let mut stale_evidence = false;
                         let escalation = match api.get(name).await {
                             Ok(live) => {
-                                let reclaimable = conflicts_reclaimable_by_force(
-                                    &live,
-                                    &conflicts,
-                                    &engine.config().field_manager,
-                                );
+                                // The failed PATCH's causes were evaluated
+                                // against the exact version it submitted; a
+                                // re-read at any other version cannot vouch
+                                // for that cause list (a foreign writer may
+                                // have taken fields the stale list omits).
+                                // Re-probe instead of authorizing force.
+                                let fresh =
+                                    live.meta().resource_version.as_deref().is_some_and(
+                                        |version| version == resource_version.as_str(),
+                                    );
+                                if !fresh {
+                                    stale_evidence = true;
+                                }
+                                let reclaimable = fresh
+                                    && conflicts_reclaimable_by_force(
+                                        &live,
+                                        &conflicts,
+                                        &engine.config().field_manager,
+                                    );
                                 live.meta()
                                     .resource_version
                                     .clone()
@@ -329,6 +344,12 @@ where
                                 "SSA conflicts limited to this manager's own Update ownership; forcing to reclaim own fields"
                             );
                             force_against = Some(version);
+                            continue;
+                        }
+                        if stale_evidence {
+                            // cause list predates the live object: fall back
+                            // to a fresh no-force probe under the normal budget
+                            tokio::time::sleep(conflict_retry_delay(attempt)).await;
                             continue;
                         }
                     }
@@ -623,6 +644,13 @@ mod tests {
         /// writer that takes the container image and bumps the
         /// resourceVersion before the forced write is evaluated.
         hijack_next_force: Option<String>,
+        /// When `Some`, the next no-force SSA PATCH that would return 409
+        /// first has a foreign writer take `spec.template.spec.runtimeClassName`
+        /// and bump the resourceVersion — then the already-evaluated (stale)
+        /// cause list is returned, modeling the response-late race.
+        hijack_next_conflict: Option<String>,
+        /// PUT replacements received for the fenced resource.
+        replace_attempts: usize,
         /// While `Some(until)`, every PATCH/PUT of the fenced resource first
         /// bumps its resourceVersion — a controller-style concurrent writer
         /// landing inside each read-modify-write window.
@@ -640,6 +668,8 @@ mod tests {
                 rejected_preconditions: 0,
                 ssa_attempts: 0,
                 hijack_next_force: None,
+                hijack_next_conflict: None,
+                replace_attempts: 0,
                 churn_until: None,
             }
         }
@@ -654,6 +684,8 @@ mod tests {
                 rejected_preconditions: 0,
                 ssa_attempts: 0,
                 hijack_next_force: None,
+                hijack_next_conflict: None,
+                replace_attempts: 0,
                 churn_until: None,
             }
         }
@@ -705,6 +737,8 @@ mod tests {
                 rejected_preconditions: 0,
                 ssa_attempts: 0,
                 hijack_next_force: None,
+                hijack_next_conflict: None,
+                replace_attempts: 0,
                 churn_until: None,
             }
         }
@@ -790,6 +824,8 @@ mod tests {
                 rejected_preconditions: 0,
                 ssa_attempts: 0,
                 hijack_next_force: None,
+                hijack_next_conflict: None,
+                replace_attempts: 0,
                 churn_until: None,
             }
         }
@@ -940,6 +976,7 @@ mod tests {
                 let manager = query_param(query, "fieldManager").unwrap_or("fake-unknown");
                 let owned = document_leaf_paths(&updated);
                 record_update_ownership(&mut updated, &owned, manager, false);
+                locked.replace_attempts += 1;
                 locked.next_resource_version += 1;
                 locked.resource = Some(updated);
                 Ok(json_response(
@@ -1190,11 +1227,10 @@ mod tests {
                             let Some(desired) = value_at(payload, &path) else {
                                 continue;
                             };
-                            let conflicting = if operation == "Apply" {
-                                true
-                            } else {
-                                value_at(&current, &path).as_ref() != Some(&desired)
-                            };
+                            // Conflicts arise from modified or added fields
+                            // for both Update and Apply ownership; applying
+                            // an identical value shares ownership.
+                            let conflicting = value_at(&current, &path).as_ref() != Some(&desired);
                             if conflicting {
                                 conflicts.push((path, entry_manager.to_string()));
                             }
@@ -1204,6 +1240,34 @@ mod tests {
             }
         }
         if !conflicts.is_empty() && !force {
+            if let Some(runtime_class_name) = state.hijack_next_conflict.take() {
+                // a foreign writer lands after the server evaluated the
+                // conflicts but before the client reads the response: the
+                // returned cause list is stale by construction
+                let bumped = state.next_resource_version.to_string();
+                state.next_resource_version += 1;
+                if let Some(resource) = state.resource.as_mut() {
+                    resource["spec"]["template"]["spec"]["runtimeClassName"] =
+                        json!(runtime_class_name);
+                    let managed = resource["metadata"]["managedFields"]
+                        .as_array_mut()
+                        .expect("managedFields present");
+                    if !managed.iter().any(|entry| {
+                        entry.get("manager").and_then(Value::as_str) == Some("tampering-controller")
+                    }) {
+                        managed.push(json!({
+                            "manager": "tampering-controller",
+                            "operation": "Update",
+                            "apiVersion": "apps/v1",
+                            "fieldsType": "FieldsV1",
+                            "fieldsV1": {"f:spec": {"f:template": {"f:spec": {
+                                "f:runtimeClassName": {},
+                            }}}},
+                        }));
+                    }
+                    resource["metadata"]["resourceVersion"] = json!(bumped);
+                }
+            }
             let causes: Vec<Value> = conflicts
                 .iter()
                 .map(|(field, loser)| {
@@ -1270,6 +1334,36 @@ mod tests {
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .expect("managedFields is an array");
+        if merge {
+            // Update writes acquire the changed fields, removing those
+            // claims from other owners; entries left owning nothing drop.
+            // ponytail: paths whose final segment contains dots (annotation
+            // keys) are not removed from other owners — no fixture relies on
+            // that transfer; add greedy matching if one ever does.
+            for entry in entries.iter_mut().filter(|entry| {
+                entry.get("manager").and_then(Value::as_str) != Some(manager)
+                    && entry.get("subresource").is_none()
+            }) {
+                if let Some(fields) = entry.get_mut("fieldsV1") {
+                    for path in owned {
+                        remove_path(
+                            fields,
+                            &split_path(path)
+                                .iter()
+                                .map(|s| fkey_for(s))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                }
+            }
+            entries.retain(|entry| {
+                entry.get("subresource").is_some()
+                    || entry
+                        .get("fieldsV1")
+                        .and_then(Value::as_object)
+                        .is_some_and(|fields| !fields.is_empty())
+            });
+        }
         let existing = entries.iter_mut().find(|entry| {
             entry.get("manager").and_then(Value::as_str) == Some(manager)
                 && entry.get("subresource").is_none()
@@ -1295,6 +1389,26 @@ mod tests {
                     "fieldsV1": build_fields_tree(owned),
                 }));
             }
+        }
+    }
+
+    fn remove_path(node: &mut Value, keys: &[String]) {
+        let Some((first, rest)) = keys.split_first() else {
+            return;
+        };
+        let Some(child) = node.get_mut(first) else {
+            return;
+        };
+        if rest.is_empty() {
+            node.as_object_mut().map(|object| object.remove(first));
+            return;
+        }
+        remove_path(child, rest);
+        if child
+            .as_object()
+            .is_some_and(|children| children.is_empty())
+        {
+            node.as_object_mut().map(|object| object.remove(first));
         }
     }
 
@@ -1879,6 +1993,7 @@ mod tests {
                         "annotations": {"unrelated-template": "preserved"},
                     },
                     "spec": {
+                        "runtimeClassName": "kata-clh-snp",
                         "containers": [{
                             "name": "workload",
                             "image": image,
@@ -2077,6 +2192,29 @@ mod tests {
             Some("6")
         );
         assert_eq!(resource.pointer("/spec/replicas"), Some(&json!(1)));
+        // real Update semantics: the DR merge patches (attributed to CAP's
+        // field manager) acquired spec.replicas, so the replicas-only
+        // foreign owner was left with nothing and dropped, and the final
+        // generation apply ran as an exact trusted replacement
+        assert!(
+            resource
+                .pointer("/metadata/managedFields")
+                .and_then(Value::as_array)
+                .expect("managedFields present")
+                .iter()
+                .all(|entry| {
+                    entry.get("subresource").is_some()
+                        || entry.get("manager").and_then(Value::as_str) == Some("enclava-platform")
+                })
+        );
+        assert_eq!(
+            locked.replace_attempts, 1,
+            "final apply used exact replacement"
+        );
+        assert_eq!(
+            locked.ssa_attempts, 0,
+            "no SSA probing on the trusted object"
+        );
     }
 
     #[tokio::test]
@@ -2175,6 +2313,57 @@ mod tests {
                 "example.test/workload@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
             ),
             "the foreign value must not be force-overwritten"
+        );
+        assert_eq!(
+            resource
+                .pointer(&annotation_pointer())
+                .and_then(Value::as_str),
+            Some("4"),
+            "live object untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_conflict_evidence_cannot_authorize_force() {
+        // The 409's causes were evaluated against the version the failed
+        // PATCH submitted. If a foreign writer takes a field (here
+        // runtimeClassName) between that evaluation and the classification
+        // re-read, the stale cause list omits it: the mismatched
+        // resourceVersion must void the escalation and the fresh probe must
+        // fail closed on the foreign field.
+        let state = Arc::new(Mutex::new(FakeState::with_shared_statefulset()));
+        state.lock().unwrap().hijack_next_conflict = Some("kata-tampered".to_string());
+        let engine = ApplyEngine::new(fake_client(Arc::clone(&state)), Default::default());
+        let api: Api<StatefulSet> = Api::namespaced(engine.client().clone(), "fence-test");
+        let desired = desired_shared_statefulset(
+            "example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+
+        let error = apply_resource(
+            &engine,
+            &api,
+            &desired,
+            MutationGeneration::new(5).unwrap(),
+            false,
+            true,
+        )
+        .await
+        .expect_err("stale cause evidence must not authorize force");
+        assert!(matches!(
+            error,
+            ApplyError::Kube(kube::Error::Api(status)) if status.code == 409
+        ));
+        let locked = state.lock().unwrap();
+        // stale-evidence probe (1), fresh probe failing closed (2); no
+        // forced write is ever submitted
+        assert_eq!(locked.ssa_attempts, 2);
+        let resource = locked.resource.as_ref().unwrap();
+        assert_eq!(
+            resource
+                .pointer("/spec/template/spec/runtimeClassName")
+                .and_then(Value::as_str),
+            Some("kata-tampered"),
+            "the foreign runtime class must not be force-overwritten"
         );
         assert_eq!(
             resource
