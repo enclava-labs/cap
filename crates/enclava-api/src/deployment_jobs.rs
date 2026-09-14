@@ -16,10 +16,12 @@ use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
 use crate::deploy::{
-    ApplyDeploymentManifestsRequest, DeploymentApplySnapshot, DeploymentRolloutOutcome,
+    ApplyDeploymentManifestsRequest, DeploymentApplySnapshot, DeploymentRollout,
+    DeploymentRolloutOutcome,
 };
-use crate::models::{App, DeployStatus};
+use crate::models::{App, AppStatus, DeployStatus};
 use crate::state::AppState;
+use enclava_engine::apply::engine::ApplyEngine;
 use enclava_engine::types::{AttestationConfig, LogEncryptionConfig};
 
 pub const DEPLOYMENT_SETUP_STATE: &str = "setup_state";
@@ -1440,56 +1442,32 @@ async fn process_apply_job(
     .await;
 
     match result {
-        Ok(Ok(JobApplyOutcome::Applied(outcome, mut mutation))) => {
-            let published = match publish_rollout_outcome_with_mutation(
-                &state.db,
-                &job,
-                &outcome,
-                Some(&mut mutation),
-            )
-            .await
-            {
+        Ok(Ok(JobApplyOutcome::Applied(outcome))) => {
+            // The watcher owns no mutation lease: publication is fenced by the
+            // job lock token and generation, so a superseded or deleting
+            // generation fails closed here without releasing anything.
+            match publish_rollout_outcome_with_mutation(&state.db, &job, &outcome, None).await {
                 Err(error) => {
                     tracing::error!(
                         deployment_id = %deployment_id,
                         error_code = error.code(),
                         "failed to publish durable deployment rollout outcome"
                     );
-                    false
                 }
-                Ok(()) => {
-                    if outcome.deploy_status == "failed" {
-                        match reconcile_pending_kbs_with_mutation(&state, &mutation).await {
-                            Ok(()) => {
-                                if let Err(error) =
-                                    release_kbs_resource(&state.db, &mut mutation).await
-                                {
-                                    tracing::error!(
-                                        deployment_id = %deployment_id,
-                                        error_code = error.code(),
-                                        "failed to release reconciled rollout KBS fence"
-                                    );
-                                }
-                            }
-                            Err(error) => tracing::error!(
-                                deployment_id = %deployment_id,
-                                error_code = error.code(),
-                                "failed rollout revocation remains durably pending"
-                            ),
-                        }
+                Ok(()) if outcome.deploy_status == "failed" => {
+                    // The publish transaction already enqueued the signed-policy
+                    // revocation. Converge it under a freshly claimed global
+                    // fence; the periodic reconciler covers a lost race.
+                    if let Err(error) = reconcile_pending_kbs_for_apply(&state, deployment_id).await
+                    {
+                        tracing::error!(
+                            deployment_id = %deployment_id,
+                            error_code = error.code(),
+                            "failed rollout revocation remains durably pending"
+                        );
                     }
-                    true
                 }
-            };
-            if published
-                && outcome.deploy_status == "failed"
-                && let Err(error) = mutation.release_after_provider_quarantine().await
-            {
-                tracing::error!(
-                    deployment_id = %deployment_id,
-                    error_code = DeploymentJobError::from(error).code(),
-                    "failed to bound terminal deployment mutation leases"
-                );
+                Ok(()) => {}
             }
         }
         Ok(Ok(JobApplyOutcome::AlreadyTerminal)) => {
@@ -1685,10 +1663,10 @@ async fn fail_unreadable_job(pool: &PgPool, claimed: &ClaimedJob, claimed_state:
 
 #[derive(Debug)]
 enum JobApplyOutcome {
-    Applied(
-        DeploymentRolloutOutcome,
-        crate::mutation_leases::AppMutationLease,
-    ),
+    /// A rollout outcome whose worker holds no mutation lease. Publication is
+    /// fenced by the job lock token under the app deployment lane, so a
+    /// superseded or deleting generation fails closed.
+    Applied(DeploymentRolloutOutcome),
     ApplyFailed(DeploymentJobError, crate::mutation_leases::AppMutationLease),
     AlreadyTerminal,
 }
@@ -1699,10 +1677,35 @@ async fn apply_claimed_job(
     payload: &DeploymentApplyJobPayload,
 ) -> Result<JobApplyOutcome, DeploymentJobError> {
     payload.validate_for_app(job.app_id, job.org_id)?;
-    let primary_image_digest = validate_canonical_source_snapshot(&state.db, job, payload).await?;
     if deployment_is_terminal(&state.db, job.deployment_id).await? {
         return Ok(JobApplyOutcome::AlreadyTerminal);
     }
+    // A previous worker may already have made this generation durable as
+    // 'watching' before losing its job lease. Resume read-only observation
+    // without claiming any mutation fence; the job lock token remains the
+    // publication authority.
+    match claim_rollout_observation(state, job).await? {
+        Some(RolloutObservation::AlreadyTerminal) => {
+            return Ok(JobApplyOutcome::AlreadyTerminal);
+        }
+        Some(RolloutObservation::Watching {
+            app,
+            manifest_hash,
+            observing_since,
+        }) => {
+            let engine = ApplyEngine::try_default()
+                .await
+                .map_err(|error| DeploymentJobError::Apply(error.into()))?;
+            let outcome =
+                DeploymentRollout::observe_only(*app, engine, manifest_hash, observing_since)
+                    .watch()
+                    .await;
+            return Ok(JobApplyOutcome::Applied(outcome));
+        }
+        None => {}
+    }
+
+    let primary_image_digest = validate_canonical_source_snapshot(&state.db, job, payload).await?;
 
     // Preflight before queueing on the semaphore, then repeat after capacity is
     // granted. The latest org keyring can change while this future waits.
@@ -1764,9 +1767,138 @@ async fn apply_claimed_job(
         authority_lane.commit().await?;
         return Ok(JobApplyOutcome::AlreadyTerminal);
     };
+    // Commit the observation marker and fence release together. A crash before
+    // commit must resume apply/reconciliation, never bypass retained fences.
+    begin_rollout_observation(
+        &mut authority_lane,
+        job,
+        &rollout.manifest_hash,
+        &mut mutation,
+    )
+    .await?;
     authority_lane.commit().await?;
-    let outcome = mutation.guard_provider(rollout.watch()).await?;
-    Ok(JobApplyOutcome::Applied(outcome, mutation))
+    let outcome = rollout.watch().await;
+    Ok(JobApplyOutcome::Applied(outcome))
+}
+
+async fn begin_rollout_observation(
+    tx: &mut Transaction<'_, Postgres>,
+    job: &ClaimedJob,
+    manifest_hash: &str,
+    mutation: &mut crate::mutation_leases::AppMutationLease,
+) -> Result<(), DeploymentJobError> {
+    lock_owned_running_job(tx, job).await?;
+    let result = sqlx::query(
+        "UPDATE deployments
+            SET status = 'watching'::deploy_status_enum,
+                observing_since = COALESCE(observing_since, clock_timestamp())
+          WHERE id = $1 AND app_id = $2 AND org_id = $3
+            AND status = 'applying'::deploy_status_enum AND manifest_hash = $4",
+    )
+    .bind(job.deployment_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
+    .bind(manifest_hash)
+    .execute(&mut **tx)
+    .await?;
+    if result.rows_affected() != 1 {
+        return Err(DeploymentJobError::LeaseLost);
+    }
+    mutation.finish_in_tx(tx).await?;
+    Ok(())
+}
+
+/// Observation context for a generation a previous worker already made durable
+/// as `watching`. Claiming this context deliberately takes no mutation fence:
+/// watching is a read-only provider operation, the job lock token fences
+/// publication, and supersession can safely terminalize the row underneath a
+/// late watcher.
+enum RolloutObservation {
+    /// The row is terminal, deleting, or otherwise fenced out of publishing.
+    AlreadyTerminal,
+    /// Resume read-only observation of this exact manifest hash.
+    Watching {
+        app: Box<App>,
+        manifest_hash: String,
+        observing_since: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+async fn claim_rollout_observation(
+    state: &AppState,
+    job: &ClaimedJob,
+) -> Result<Option<RolloutObservation>, DeploymentJobError> {
+    // Legacy rows lack the atomic observation marker: reconcile their retained
+    // provider fences through apply before allowing read-only resumption.
+    let watching_hint = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployments
+              WHERE id = $1
+                AND app_id = $2
+                AND org_id = $3
+                AND status = 'watching'::deploy_status_enum
+                AND manifest_hash IS NOT NULL
+                AND observing_since IS NOT NULL
+         )",
+    )
+    .bind(job.deployment_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
+    .fetch_one(&state.db)
+    .await?;
+    if !watching_hint {
+        return Ok(None);
+    }
+
+    let mut tx = state.db.begin().await?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, job.app_id).await?;
+    lock_owned_running_job(&mut tx, job).await?;
+    let watched = sqlx::query_as::<
+        _,
+        (
+            DeployStatus,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        ),
+    >(
+        "SELECT status, manifest_hash, observing_since
+           FROM deployments
+          WHERE id = $1
+            AND app_id = $2
+            AND org_id = $3
+          FOR UPDATE",
+    )
+    .bind(job.deployment_id)
+    .bind(job.app_id)
+    .bind(job.org_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(DeploymentJobError::LeaseLost)?;
+    let app = sqlx::query_as::<_, App>("SELECT * FROM apps WHERE id = $1")
+        .bind(job.app_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(DeploymentJobError::LeaseLost)?;
+    let resumable = watched.0 == DeployStatus::Watching
+        && watched.1.is_some()
+        && watched.2.is_some()
+        && app.status != AppStatus::Deleting;
+    if !resumable {
+        tx.commit().await?;
+        // A pending/applying row cannot reappear after 'watching'; a terminal
+        // or deleting row means this job is already fenced out of publishing.
+        return Ok(Some(RolloutObservation::AlreadyTerminal));
+    }
+    let observation = RolloutObservation::Watching {
+        app: Box::new(app),
+        manifest_hash: watched.1.expect("resumable rows record a manifest hash"),
+        observing_since: watched
+            .2
+            .expect("resumable rows record an observation anchor"),
+    };
+    tx.commit().await?;
+    Ok(Some(observation))
 }
 
 async fn acquire_apply_permit_and_revalidate(
@@ -2160,6 +2292,31 @@ async fn reconcile_pending_kbs_with_mutation(
             state.kbs_policy.as_ref(),
         ))
         .await??;
+    Ok(())
+}
+
+/// Converge a durably enqueued signed-policy change after the apply worker
+/// released its mutation lease for observation. The global fence is claimed
+/// only for the provider call itself; a `Busy` claim is safe to skip because
+/// the periodic reconciler converges the same durable intent.
+async fn reconcile_pending_kbs_for_apply(
+    state: &AppState,
+    operation_id: Uuid,
+) -> Result<(), DeploymentJobError> {
+    let lease = crate::mutation_leases::claim_resources(
+        state,
+        "deployment_apply_kbs_reconcile",
+        operation_id,
+        vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+    )
+    .await?;
+    lease
+        .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
+            &state.db,
+            state.kbs_policy.as_ref(),
+        ))
+        .await??;
+    lease.finish().await?;
     Ok(())
 }
 
@@ -4707,6 +4864,225 @@ mod tests {
                 .execute(&pool)
                 .await
                 .expect("clean KBS contention fixture");
+        }
+    }
+
+    #[tokio::test]
+    async fn watching_generation_holds_no_shared_fences_for_other_tenants() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
+        let pool = database_test_pool().await;
+        let (waiting_app, waiting_deployment, _, _) = insert_job_fixture(&pool).await;
+        let (peer_app, _peer_deployment, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.side_effect_admission = Arc::new(tokio::sync::Semaphore::new(2));
+
+        let setup = claim_job(
+            &pool,
+            "setup_pending",
+            "setting_up",
+            Some(waiting_deployment),
+        )
+        .await
+        .expect("claim waiting-tenant setup")
+        .expect("waiting-tenant setup exists");
+        mark_setup_accepted(&pool, waiting_deployment, setup.lock_token)
+            .await
+            .expect("accept waiting-tenant setup");
+        let apply = claim_job(&pool, "pending", "running", Some(waiting_deployment))
+            .await
+            .expect("claim waiting-tenant apply")
+            .expect("waiting-tenant apply exists");
+
+        // The apply fence set: one private namespace, the two global shared
+        // fences, and per-hostname edge routes.
+        let mut waiting_fences = vec![
+            crate::mutation_leases::ResourceFence::new(
+                "kubernetes_namespace",
+                &waiting_app.namespace,
+            ),
+            crate::mutation_leases::ResourceFence::kbs_policy(),
+            crate::mutation_leases::ResourceFence::edge_config(),
+            crate::mutation_leases::ResourceFence::edge(&waiting_app.domain),
+        ];
+        if let Some(tee_domain) = waiting_app.tee_domain.as_deref() {
+            waiting_fences.push(crate::mutation_leases::ResourceFence::edge(tee_domain));
+        }
+        let mut mutation = crate::mutation_leases::claim(
+            &state,
+            waiting_app.id,
+            "deployment_apply",
+            waiting_deployment,
+            false,
+            waiting_fences,
+        )
+        .await
+        .expect("claim waiting-tenant apply fences");
+
+        // While the apply mutation is live, a different tenant contending for
+        // the global shared fences is fenced out.
+        let blocked = crate::mutation_leases::claim(
+            &state,
+            peer_app.id,
+            "deployment_apply",
+            Uuid::new_v4(),
+            false,
+            vec![
+                crate::mutation_leases::ResourceFence::kbs_policy(),
+                crate::mutation_leases::ResourceFence::edge_config(),
+            ],
+        )
+        .await
+        .expect_err("live shared fences reject a second tenant");
+        assert!(matches!(
+            blocked,
+            crate::mutation_leases::MutationLeaseError::Busy
+        ));
+
+        // An upgraded legacy watcher must reconcile old fences, not skip apply.
+        sqlx::query(
+            "UPDATE deployments SET status = 'watching', manifest_hash = 'legacy' WHERE id = $1",
+        )
+        .bind(waiting_deployment)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            claim_rollout_observation(&state, &apply)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Stage a successful provider apply, then use the production transition
+        // that atomically publishes watching and releases every mutation fence.
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'applying'::deploy_status_enum,
+                    manifest_hash = $2
+              WHERE id = $1",
+        )
+        .bind(waiting_deployment)
+        .bind("waiting-tenant-manifest")
+        .execute(&pool)
+        .await
+        .expect("stage applied manifest hash");
+        let mut authority_lane = pool
+            .begin()
+            .await
+            .expect("begin waiting-tenant fence release");
+        crate::deploy::lock_app_deployment_lane(&mut authority_lane, waiting_app.id)
+            .await
+            .expect("lock waiting-tenant lane");
+        begin_rollout_observation(
+            &mut authority_lane,
+            &apply,
+            "waiting-tenant-manifest",
+            &mut mutation,
+        )
+        .await
+        .expect("release shared fences atomically with observation marker");
+        // Simulate losing the commit: neither the marker nor fence release may
+        // become visible, so recovery still takes the mutation path.
+        authority_lane.rollback().await.unwrap();
+        let staged: (String, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("SELECT status::text, observing_since FROM deployments WHERE id = $1")
+                .bind(waiting_deployment)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(staged, ("applying".to_string(), None));
+        assert!(
+            claim_rollout_observation(&state, &apply)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut authority_lane = pool.begin().await.unwrap();
+        crate::deploy::lock_app_deployment_lane(&mut authority_lane, waiting_app.id)
+            .await
+            .unwrap();
+        begin_rollout_observation(
+            &mut authority_lane,
+            &apply,
+            "waiting-tenant-manifest",
+            &mut mutation,
+        )
+        .await
+        .unwrap();
+        authority_lane
+            .commit()
+            .await
+            .expect("commit fence release with watching marker");
+        assert!(matches!(
+            claim_rollout_observation(&state, &apply).await.unwrap(),
+            Some(RolloutObservation::Watching { .. })
+        ));
+
+        // The peer tenant deploys while the waiting tenant keeps observing:
+        // the global KBS and edge-config fences are free.
+        let peer = crate::mutation_leases::claim(
+            &state,
+            peer_app.id,
+            "deployment_apply",
+            Uuid::new_v4(),
+            false,
+            vec![
+                crate::mutation_leases::ResourceFence::kbs_policy(),
+                crate::mutation_leases::ResourceFence::edge_config(),
+            ],
+        )
+        .await
+        .expect("peer tenant claims shared fences while A watches");
+
+        // The waiting generation stays resumable: a bounded observation slice
+        // returns the job to pending without any mutation fence.
+        publish_rollout_outcome(
+            &pool,
+            &apply,
+            &DeploymentRolloutOutcome {
+                deploy_status: "watching",
+                app_status: "creating",
+                error_code: None,
+                terminal: false,
+                manifest_hash: "waiting-tenant-manifest".to_string(),
+            },
+        )
+        .await
+        .expect("publish bounded nonterminal observation");
+        let (job_state, deployment_status): (String, String) = sqlx::query_as(
+            "SELECT job.state, deployment.status::text
+               FROM deployment_apply_jobs AS job
+               JOIN deployments AS deployment ON deployment.id = job.deployment_id
+              WHERE job.deployment_id = $1",
+        )
+        .bind(waiting_deployment)
+        .fetch_one(&pool)
+        .await
+        .expect("load resumable watching state");
+        assert_eq!(job_state, "pending");
+        assert_eq!(deployment_status, "watching");
+
+        peer.finish().await.expect("release peer shared fences");
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE (resource_scope = 'kubernetes_namespace' AND resource_key = $1)
+                 OR (resource_scope = 'edge_route' AND resource_key IN ($2, $3))
+                 OR (resource_scope IN ('kbs_policy', 'edge_config')
+                     AND resource_key = 'global')",
+        )
+        .bind(&waiting_app.namespace)
+        .bind(&waiting_app.domain)
+        .bind(waiting_app.tee_domain.as_deref().unwrap_or(""))
+        .execute(&pool)
+        .await
+        .expect("clean shared fence rows");
+        for org_id in [waiting_app.org_id, peer_app.org_id] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(org_id)
+                .execute(&pool)
+                .await
+                .expect("clean watching isolation fixture");
         }
     }
 

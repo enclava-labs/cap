@@ -1491,6 +1491,25 @@ pub(crate) async fn delete_app_before(
         .await
         .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeRoute, error))?;
+    // The shared edge config is durably reconciled: release it before the
+    // bounded DNS/namespace waits so unrelated tenants can mutate routes.
+    // Per-hostname edge fences stay claimed until the app row is deleted.
+    let mut fence_tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| internal_server_error())?;
+    delete_mutation
+        .release_resource_in_tx(
+            &mut fence_tx,
+            &crate::mutation_leases::ResourceFence::edge_config(),
+        )
+        .await
+        .map_err(|_| internal_server_error())?;
+    fence_tx
+        .commit()
+        .await
+        .map_err(|_| internal_server_error())?;
 
     if state.dns.is_some() {
         delete_mutation
@@ -1620,7 +1639,25 @@ pub(crate) async fn delete_app_before(
         .await
         .map_err(|_| internal_server_error())?
         .map_err(|error| app_delete_failure(deleting_app.id, AppDeleteFailure::KbsPolicy, error))?;
-
+    // The global KBS policy is durably reconciled; release the shared fence
+    // before the final publication transaction so an unrelated app's policy
+    // mutation never queues behind this app's remaining row cleanup.
+    let mut fence_tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| internal_server_error())?;
+    delete_mutation
+        .release_resource_in_tx(
+            &mut fence_tx,
+            &crate::mutation_leases::ResourceFence::kbs_policy(),
+        )
+        .await
+        .map_err(|_| internal_server_error())?;
+    fence_tx
+        .commit()
+        .await
+        .map_err(|_| internal_server_error())?;
     sqlx::query(
         "INSERT INTO audit_log (org_id, app_id, user_id, action)
          VALUES ($1, $2, $3, 'app.delete')",
