@@ -1778,8 +1778,14 @@ async fn restart_statefulset_for_ingress(
             }
         }
     });
-    enclava_engine::apply::generation::apply_existing_partial(&api, name, &patch, generation)
-        .await?;
+    enclava_engine::apply::generation::apply_existing_partial(
+        &api,
+        name,
+        &patch,
+        generation,
+        &engine.config().field_manager,
+    )
+    .await?;
 
     tracing::info!(
         namespace = %namespace,

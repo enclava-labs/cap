@@ -1,6 +1,7 @@
 pub mod cleanup;
 pub mod drift;
 pub mod engine;
+pub mod fields_v1;
 pub mod gateway;
 pub mod generation;
 pub mod namespace;
