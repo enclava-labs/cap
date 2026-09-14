@@ -40,6 +40,13 @@ const AMD_KDS_VCEK_MAX_ATTEMPTS: usize = 8;
 const AMD_KDS_VCEK_CACHE_TTL: Duration = Duration::from_secs(3600);
 const AMD_KDS_VCEK_CACHE_MAX_ENTRIES: usize = 256;
 const AMD_KDS_VCEK_DISK_CACHE_MAX_ENTRIES: usize = 512;
+/// Cross-process fills serialize on a fixed pool of lock files selected by
+/// hashing the normalized cache key. A fixed slot count keeps `.lock` inode
+/// usage bounded no matter how many distinct identities are attempted —
+/// including identities whose fills always fail and therefore never write a
+/// `.der` entry. Same-key processes always contend on the same slot;
+/// distinct keys contend only on a digest-mod-slots collision.
+const AMD_KDS_VCEK_LOCK_POOL_SLOTS: u64 = 64;
 /// A `Retry-After` hint is honored only up to this cap; an oversized or absent
 /// value falls back to the bounded jittered schedule.
 const AMD_KDS_VCEK_RETRY_AFTER_CAP: Duration = Duration::from_secs(120);
@@ -1453,8 +1460,9 @@ fn vcek_der_expiry(der: &[u8]) -> Result<Instant, TeeError> {
 
 /// On-disk cache shared by concurrent `enclava` invocations: a short-lived
 /// process alone cannot collapse same-key fetches across processes. Entries
-/// are `vcek-<sha256(key)>.der` plus a sibling `.lock` file; the digest keeps
-/// the HWID out of file names.
+/// are `vcek-<sha256(key)>.der`; cross-process single-flight uses one of
+/// `AMD_KDS_VCEK_LOCK_POOL_SLOTS` pooled `vcek-lock-<NN>.lock` files. The
+/// digest keeps the HWID out of file names.
 fn kds_cache_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var(AMD_KDS_CACHE_DIR_ENV) {
         let dir = dir.trim();
@@ -1469,8 +1477,17 @@ fn vcek_disk_paths(dir: &Path, key: &VcekCacheKey) -> (PathBuf, PathBuf) {
     let digest = key.digest();
     (
         dir.join(format!("vcek-{digest}.der")),
-        dir.join(format!("vcek-{digest}.lock")),
+        vcek_disk_lock_path(dir, &digest),
     )
+}
+
+/// The pooled cross-process fill lock for a normalized key digest. Pool
+/// files are permanent shared infrastructure: they are never evicted and
+/// are never treated as orphans by the sweep below.
+fn vcek_disk_lock_path(dir: &Path, key_digest: &str) -> PathBuf {
+    let slot =
+        u64::from_str_radix(&key_digest[..16], 16).unwrap_or(0) % AMD_KDS_VCEK_LOCK_POOL_SLOTS;
+    dir.join(format!("vcek-lock-{slot:02}.lock"))
 }
 
 /// Read a disk-cached VCEK only if it is fresh, parseable, and still inside
@@ -1555,6 +1572,46 @@ fn evict_vcek_disk_cache(dir: &Path) {
     }
 }
 
+/// Remove leftover per-key `vcek-<digest>.lock` files from before the pooled
+/// lock scheme — and any future orphan `.lock` file — when no matching
+/// `.der` entry exists. A file is only unlinked while this process holds
+/// its flock, which proves no live filler is serialized on that inode. A
+/// concurrent opener that has not yet locked can still observe the stale
+/// path briefly; the worst case is one lost single-flight collapse for an
+/// orphan key, never a freshness or correctness change.
+fn sweep_orphan_vcek_locks(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        // Pool slots are shared infrastructure, never orphans.
+        if name.starts_with("vcek-lock-") || !name.starts_with("vcek-") || !name.ends_with(".lock")
+        {
+            continue;
+        }
+        let der = dir.join(format!("{}.der", &name[..name.len() - ".lock".len()]));
+        if der.exists() {
+            continue;
+        }
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path())
+        else {
+            continue;
+        };
+        let mut lock = fd_lock::RwLock::new(file);
+        let Ok(_guard) = lock.try_write() else {
+            continue;
+        };
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
 /// Single-flight VCEK fetch. In-process, callers for the same product/HWID/TCB
 /// key share one fill through a per-key mutex; across `enclava` invocations a
 /// per-key file lock plays the same role. A warm memory or disk entry is
@@ -1596,8 +1653,9 @@ async fn vcek_fill_from_upstream(
         return Ok(der);
     }
 
-    // Cross-process single-flight: hold the per-key file lock while filling.
-    // Missing lock support only loses cross-process collapse, never freshness.
+    // Cross-process single-flight: hold the key's pooled lock slot while
+    // filling. Missing lock support only loses cross-process collapse, never
+    // freshness.
     let mut file_lock = cache_dir.as_deref().and_then(|dir| {
         let (_, lock_path) = vcek_disk_paths(dir, key);
         std::fs::create_dir_all(dir).ok()?;
@@ -1634,6 +1692,13 @@ async fn vcek_fill_from_upstream(
         let der = Arc::new(der);
         vcek_cache_insert(key.clone(), der.clone(), expires_at);
         return Ok(der);
+    }
+
+    // Best-effort sweep of orphaned per-key lock files while this fill is
+    // already serialized on its slot. Sweeps are idempotent and never
+    // remove pool slots or in-use locks.
+    if let Some(dir) = cache_dir.as_deref() {
+        sweep_orphan_vcek_locks(dir);
     }
 
     let der = Arc::new(fetch_amd_kds_vcek_der(client, vcek_url).await?);

@@ -1684,7 +1684,7 @@ async fn apply_claimed_job(
     // 'watching' before losing its job lease. Resume read-only observation
     // without claiming any mutation fence; the job lock token remains the
     // publication authority.
-    match claim_rollout_observation(state, job).await? {
+    match claim_rollout_observation(state, job, payload).await? {
         Some(RolloutObservation::AlreadyTerminal) => {
             return Ok(JobApplyOutcome::AlreadyTerminal);
         }
@@ -1777,8 +1777,22 @@ async fn apply_claimed_job(
     )
     .await?;
     authority_lane.commit().await?;
-    let outcome = rollout.watch().await;
+    let outcome = watch_committed_rollout(rollout, mutation).await;
     Ok(JobApplyOutcome::Applied(outcome))
+}
+
+/// Read-only observation of a generation whose durable fences were released
+/// by the observation-marker commit. The lease's only remaining resource is
+/// its process-local side-effect admission permit: a watch can occupy this
+/// worker for a full observation slice, so the permit must be released
+/// before watching. Otherwise enough queued watchers could exhaust admission
+/// capacity and block unrelated mutations.
+async fn watch_committed_rollout(
+    rollout: DeploymentRollout,
+    mutation: crate::mutation_leases::AppMutationLease,
+) -> DeploymentRolloutOutcome {
+    drop(mutation);
+    rollout.watch().await
 }
 
 async fn begin_rollout_observation(
@@ -1827,6 +1841,7 @@ enum RolloutObservation {
 async fn claim_rollout_observation(
     state: &AppState,
     job: &ClaimedJob,
+    payload: &DeploymentApplyJobPayload,
 ) -> Result<Option<RolloutObservation>, DeploymentJobError> {
     // Legacy rows lack the atomic observation marker: reconcile their retained
     // provider fences through apply before allowing read-only resumption.
@@ -1891,7 +1906,12 @@ async fn claim_rollout_observation(
         return Ok(Some(RolloutObservation::AlreadyTerminal));
     }
     let observation = RolloutObservation::Watching {
-        app: Box::new(app),
+        // Classify exactly like the original observer: apply may already have
+        // persisted the transient 'creating' status onto the app row, so the
+        // resumed observer must take its classification inputs (status and
+        // unlock mode) from the accepted job payload, not the mutated row.
+        // Only the liveness check above consults the current row.
+        app: Box::new(payload.app.clone()),
         manifest_hash: watched.1.expect("resumable rows record a manifest hash"),
         observing_since: watched
             .2
@@ -4871,7 +4891,7 @@ mod tests {
     async fn watching_generation_holds_no_shared_fences_for_other_tenants() {
         let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
         let pool = database_test_pool().await;
-        let (waiting_app, waiting_deployment, _, _) = insert_job_fixture(&pool).await;
+        let (waiting_app, waiting_deployment, _, waiting_payload) = insert_job_fixture(&pool).await;
         let (peer_app, _peer_deployment, _, _) = insert_job_fixture(&pool).await;
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
@@ -4948,7 +4968,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            claim_rollout_observation(&state, &apply)
+            claim_rollout_observation(&state, &apply, &waiting_payload)
                 .await
                 .unwrap()
                 .is_none()
@@ -4993,7 +5013,7 @@ mod tests {
                 .unwrap();
         assert_eq!(staged, ("applying".to_string(), None));
         assert!(
-            claim_rollout_observation(&state, &apply)
+            claim_rollout_observation(&state, &apply, &waiting_payload)
                 .await
                 .unwrap()
                 .is_none()
@@ -5015,7 +5035,9 @@ mod tests {
             .await
             .expect("commit fence release with watching marker");
         assert!(matches!(
-            claim_rollout_observation(&state, &apply).await.unwrap(),
+            claim_rollout_observation(&state, &apply, &waiting_payload)
+                .await
+                .unwrap(),
             Some(RolloutObservation::Watching { .. })
         ));
 
@@ -5084,6 +5106,274 @@ mod tests {
                 .await
                 .expect("clean watching isolation fixture");
         }
+    }
+
+    /// A Kubernetes API double that runs `probe` on every request and reports
+    /// a permanently not-ready StatefulSet with an empty pod list.
+    fn probing_rollout_engine(probe: Arc<dyn Fn() + Send + Sync>) -> ApplyEngine {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+
+        ApplyEngine::new(
+            kube::Client::new(
+                service_fn(move |request: Request<Body>| {
+                    let probe = probe.clone();
+                    async move {
+                        probe();
+                        let path = request.uri().path().to_string();
+                        let _ = request.into_body().collect().await;
+                        let value = if path.ends_with("/pods") {
+                            serde_json::json!({
+                                "apiVersion": "v1",
+                                "kind": "PodList",
+                                "items": [],
+                            })
+                        } else {
+                            serde_json::json!({
+                                "apiVersion": "apps/v1",
+                                "kind": "StatefulSet",
+                                "metadata": {
+                                    "name": "probed",
+                                    "namespace": "cap-probed",
+                                    "generation": 1,
+                                },
+                                "spec": { "replicas": 1 },
+                                "status": {
+                                    "observedGeneration": 1,
+                                    "replicas": 1,
+                                    "readyReplicas": 0,
+                                    "currentReplicas": 0,
+                                    "updatedReplicas": 0,
+                                },
+                            })
+                        };
+                        Ok::<_, std::io::Error>(
+                            Response::builder()
+                                .status(200)
+                                .body(Body::from(serde_json::to_vec(&value).unwrap()))
+                                .unwrap(),
+                        )
+                    }
+                }),
+                "default",
+            ),
+            enclava_engine::apply::types::ApplyConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn watching_rollout_releases_admission_slot_before_observing() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, _) = insert_job_fixture(&pool).await;
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        // One slot: the watching deployment's own claim exhausts admission.
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        state.side_effect_admission = admission.clone();
+
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim admission-test setup")
+            .expect("admission-test setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept admission-test setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim admission-test apply")
+            .expect("admission-test apply exists");
+
+        let mut mutation = crate::mutation_leases::claim(
+            &state,
+            app.id,
+            "deployment_apply",
+            deployment_id,
+            false,
+            vec![crate::mutation_leases::ResourceFence::new(
+                "kubernetes_namespace",
+                &app.namespace,
+            )],
+        )
+        .await
+        .expect("claim admission-test apply fences");
+        assert_eq!(
+            admission.available_permits(),
+            0,
+            "the claimed mutation exhausts the single admission slot"
+        );
+
+        // The probe runs inside watch_rollout's Kubernetes request: the
+        // admission slot must already be free once observation starts.
+        let observed_free = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = {
+            let observed_free = observed_free.clone();
+            let admission = admission.clone();
+            Arc::new(move || {
+                if admission.available_permits() > 0 {
+                    observed_free.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+        let engine = probing_rollout_engine(probe);
+
+        // Publish the durable watching marker and release every mutation
+        // fence, exactly as apply_claimed_job commits before watching.
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'applying'::deploy_status_enum,
+                    manifest_hash = $2
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .bind("admission-manifest")
+        .execute(&pool)
+        .await
+        .expect("stage applied manifest");
+        let mut authority_lane = pool.begin().await.expect("begin marker commit");
+        crate::deploy::lock_app_deployment_lane(&mut authority_lane, app.id)
+            .await
+            .expect("lock admission-test lane");
+        begin_rollout_observation(
+            &mut authority_lane,
+            &apply,
+            "admission-manifest",
+            &mut mutation,
+        )
+        .await
+        .expect("publish observation marker and release fences");
+        authority_lane.commit().await.expect("commit marker");
+
+        let rollout = DeploymentRollout::observe_only(
+            app.clone(),
+            engine,
+            "admission-manifest".to_string(),
+            chrono::Utc::now() - chrono::Duration::seconds(601),
+        );
+        let outcome = watch_committed_rollout(rollout, mutation).await;
+        assert!(
+            observed_free.load(std::sync::atomic::Ordering::SeqCst),
+            "a watching rollout must release its side-effect admission slot before observing"
+        );
+        assert_eq!(admission.available_permits(), 1);
+        assert_eq!(outcome.manifest_hash, "admission-manifest");
+
+        // The durable fences were released at commit, independently of the
+        // process-local admission slot.
+        let app_owned: bool = sqlx::query_scalar(
+            "SELECT owner_token IS NOT NULL FROM app_mutation_leases WHERE app_id = $1",
+        )
+        .bind(app.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read released app claim");
+        assert!(!app_owned);
+
+        sqlx::query(
+            "DELETE FROM external_resource_mutation_leases
+              WHERE resource_scope = 'kubernetes_namespace' AND resource_key = $1",
+        )
+        .bind(&app.namespace)
+        .execute(&pool)
+        .await
+        .expect("clean admission-test fence rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean admission-test fixture");
+    }
+
+    #[tokio::test]
+    async fn resumed_observer_uses_accepted_payload_not_mutated_app_row() {
+        let _kbs_fence_guard = KBS_FENCE_TEST_LOCK.lock().await;
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _, mut payload) = insert_job_fixture(&pool).await;
+        // The accepted payload describes an update of a previously-running
+        // password-mode app.
+        payload.app.status = AppStatus::Running;
+        payload.app.unlock_mode = crate::models::UnlockMode::Password;
+
+        let setup = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim resumption-test setup")
+            .expect("resumption-test setup exists");
+        mark_setup_accepted(&pool, deployment_id, setup.lock_token)
+            .await
+            .expect("accept resumption-test setup");
+        let apply = claim_job(&pool, "pending", "running", Some(deployment_id))
+            .await
+            .expect("claim resumption-test apply")
+            .expect("resumption-test apply exists");
+
+        // Before the simulated crash: apply already persisted the transient
+        // 'creating' status onto the app row (the password app's unlock mode
+        // is unchanged) and committed the durable watching marker.
+        sqlx::query(
+            "UPDATE apps
+                SET status = 'creating'::app_status_enum,
+                    unlock_mode = 'password'::unlock_enum
+              WHERE id = $1",
+        )
+        .bind(app.id)
+        .execute(&pool)
+        .await
+        .expect("stage mutated app row");
+        sqlx::query(
+            "UPDATE deployments
+                SET status = 'watching'::deploy_status_enum,
+                    manifest_hash = 'resumed-manifest',
+                    observing_since = clock_timestamp() - interval '700 seconds'
+              WHERE id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("stage durable watching marker");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let observation = claim_rollout_observation(&state, &apply, &payload)
+            .await
+            .expect("resumable observation claim");
+        let Some(RolloutObservation::Watching {
+            app: observed,
+            manifest_hash,
+            observing_since,
+        }) = observation
+        else {
+            panic!("watching generation must be resumable");
+        };
+        // The current row says 'creating' (apply persisted it); the accepted
+        // payload still classifies this generation as a redeploy of a
+        // previously-running password app.
+        assert_eq!(observed.status, AppStatus::Running);
+        assert_eq!(observed.unlock_mode, crate::models::UnlockMode::Password);
+        assert_eq!(manifest_hash, "resumed-manifest");
+
+        // A resumed observer must NOT wait for the owner: with the rollout
+        // budget already exhausted, the redeploy classifies a timeout as a
+        // terminal healthy publication. (A parked owner wait would hold this
+        // future for a full observation slice.)
+        let engine = probing_rollout_engine(Arc::new(|| {}));
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            DeploymentRollout::observe_only(*observed, engine, manifest_hash, observing_since)
+                .watch(),
+        )
+        .await
+        .expect("resumed observation must not park in an owner wait");
+        assert_eq!(outcome.deploy_status, "healthy");
+        assert_eq!(outcome.app_status, "running");
+        assert!(outcome.terminal);
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("clean resumption-test fixture");
     }
 
     #[tokio::test]

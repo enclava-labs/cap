@@ -689,6 +689,64 @@ async fn vcek_disk_lock_collapses_concurrent_fills_across_process_layers() {
 }
 
 #[tokio::test]
+async fn vcek_disk_lock_pool_bounds_lock_files_across_failed_fills() {
+    let directory = tempfile::tempdir().unwrap();
+    let dir_path = directory.path().to_path_buf();
+    let (address, _requests, server) =
+        counting_upstream("400 Bad Request", b"upstream diagnostic".to_vec(), None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/vcek");
+    let dir = Some(dir_path.clone());
+
+    // A legacy per-key orphan lock (no matching .der) is swept on the next
+    // fill; one with a live .der sibling is left alone.
+    let orphan_name = format!("vcek-{}.lock", "ab".repeat(32));
+    let paired_name = format!("vcek-{}.lock", "cd".repeat(32));
+    std::fs::write(dir_path.join(&orphan_name), b"").unwrap();
+    std::fs::write(dir_path.join(&paired_name), b"").unwrap();
+    std::fs::write(
+        dir_path.join(format!("vcek-{}.der", "cd".repeat(32))),
+        b"placeholder",
+    )
+    .unwrap();
+
+    // Every fill fails before writing a `.der`: only the bounded lock pool
+    // may accumulate, never one lock file per attempted identity.
+    let fills = super::AMD_KDS_VCEK_LOCK_POOL_SLOTS as usize + 64;
+    for suffix in 0..fills {
+        let key = test_vcek_key(suffix as u8);
+        super::vcek_fill_from_upstream(&client, &url, &key, dir.clone())
+            .await
+            .unwrap_err();
+    }
+    server.abort();
+
+    let names: Vec<String> = std::fs::read_dir(&dir_path)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .collect();
+    let locks = names.iter().filter(|name| name.ends_with(".lock")).count();
+    assert!(
+        locks <= super::AMD_KDS_VCEK_LOCK_POOL_SLOTS as usize + 1,
+        "{fills} failed distinct-key fills must leave only pooled slots plus the paired legacy lock, got {locks}"
+    );
+    assert!(locks > 0, "pool slots were exercised");
+    assert!(
+        !names.iter().any(|name| name == &orphan_name),
+        "orphan lock without a .der sibling must be swept"
+    );
+    assert!(
+        names.iter().any(|name| name == &paired_name),
+        "lock with a live .der sibling must be retained"
+    );
+    assert_eq!(
+        names.iter().filter(|name| name.ends_with(".der")).count(),
+        1,
+        "failed fills never write certificate bytes"
+    );
+}
+
+#[tokio::test]
 async fn vcek_fetch_errors_do_not_leak_url_or_hwid() {
     let (address, _requests, server) =
         counting_upstream("400 Bad Request", b"upstream diagnostic".to_vec(), None).await;
