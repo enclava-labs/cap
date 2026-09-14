@@ -3,7 +3,8 @@ use super::{
 };
 use sev::parser::ByteParser;
 use std::net::IpAddr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -413,6 +414,372 @@ async fn evidence_chain_with_unpinned_ark_falls_back_to_kds_and_fails_closed() {
     // validation rejected the fabricated chain. Both are acceptable; silently
     // trusting the embedded chain is not.
     assert!(err.to_string().contains("KDS") || err.to_string().contains("DER"));
+}
+
+/// A currently-valid certificate body the cache must accept. The builtin ARK
+/// only needs to parse as X.509 inside its validity window; chain validation
+/// is exercised elsewhere.
+fn valid_cert_der() -> Vec<u8> {
+    sev::certs::snp::builtin::milan::ark()
+        .unwrap()
+        .to_der()
+        .unwrap()
+}
+
+fn test_vcek_key(suffix: u8) -> super::VcekCacheKey {
+    super::VcekCacheKey {
+        product: "Genoa".to_string(),
+        hw_id: hex::encode([suffix; 64]),
+        fmc: None,
+        bootloader: 1,
+        tee: 2,
+        snp: 3,
+        microcode: suffix,
+    }
+}
+
+/// Minimal HTTP/1 upstream counting requests. Each response is `status` plus
+/// `body`; `retry_after` adds a `Retry-After` header when set.
+async fn counting_upstream(
+    status: &'static str,
+    body: Vec<u8>,
+    retry_after: Option<u64>,
+) -> (
+    std::net::SocketAddr,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = requests.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let counter = counter.clone();
+            let status = status.to_string();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = [0; 8192];
+                let Ok(n) = stream.read(&mut request).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                counter.fetch_add(1, Ordering::Relaxed);
+                let retry_after = retry_after
+                    .map(|value| format!("Retry-After: {value}\r\n"))
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{retry_after}\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            });
+        }
+    });
+    (address, requests, server)
+}
+
+#[tokio::test]
+async fn vcek_cache_collapses_concurrent_same_key_fills_and_serves_warm_hits() {
+    let vcek = valid_cert_der();
+    let (address, requests, server) = counting_upstream("200 OK", vcek.clone(), None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/vcek");
+    let key = test_vcek_key(0x51);
+    let results = futures::future::join_all(
+        (0..8).map(|_| super::fetch_amd_kds_vcek_der_cached(&client, &url, &key, None)),
+    )
+    .await;
+    assert!(results.iter().all(|result| result.is_ok()));
+    for result in &results {
+        assert_eq!(result.as_ref().unwrap().as_slice(), vcek.as_slice());
+    }
+    // Single-flight: eight concurrent callers share one upstream fill.
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    // Warm cache hit must not touch the upstream again.
+    let warm = super::fetch_amd_kds_vcek_der_cached(&client, &url, &key, None)
+        .await
+        .unwrap();
+    assert_eq!(warm.as_slice(), vcek.as_slice());
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn vcek_cache_keeps_different_hwid_tcb_keys_separate() {
+    let vcek = valid_cert_der();
+    let (address, requests, server) = counting_upstream("200 OK", vcek, None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/vcek");
+    let mut key_a = test_vcek_key(0x52);
+    let mut key_b = test_vcek_key(0x52);
+    key_b.microcode += 1; // changed firmware/TCB must not reuse cached collateral
+    for key in [&key_a, &key_b] {
+        super::fetch_amd_kds_vcek_der_cached(&client, &url, key, None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    key_a.hw_id = hex::encode([0x53; 64]);
+    super::fetch_amd_kds_vcek_der_cached(&client, &url, &key_a, None)
+        .await
+        .unwrap();
+    assert_eq!(requests.load(Ordering::Relaxed), 3);
+    server.abort();
+}
+
+#[tokio::test]
+async fn vcek_cache_never_stores_noncertificate_or_expired_bodies() {
+    use x509_cert::der::{Decode, Encode};
+
+    // A 200 body that is not a certificate must error and never be cached.
+    let (address, requests, server) =
+        counting_upstream("200 OK", b"not-a-certificate".to_vec(), None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/vcek");
+    let key = test_vcek_key(0x54);
+    let error = super::fetch_amd_kds_vcek_der_cached(&client, &url, &key, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("not a certificate"));
+    // The rejection is not cached: a second call retries the upstream.
+    assert!(
+        super::fetch_amd_kds_vcek_der_cached(&client, &url, &key, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    server.abort();
+
+    // A certificate outside its validity window is rejected the same way.
+    let mut expired = x509_cert::Certificate::from_der(&valid_cert_der()).unwrap();
+    expired.tbs_certificate.validity.not_after = expired.tbs_certificate.validity.not_before;
+    let (address, requests, server) =
+        counting_upstream("200 OK", expired.to_der().unwrap(), None).await;
+    let url = format!("http://{address}/vcek");
+    let key = test_vcek_key(0x55);
+    let error = super::fetch_amd_kds_vcek_der_cached(&client, &url, &key, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("validity period"));
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn vcek_fill_is_bounded_cancellable_and_error_responses_are_uncached() {
+    // `Retry-After: 0` keeps the eight-attempt bound fast while exercising
+    // the honored-hint path; each attempt still reaches the upstream.
+    let (address, requests, server) =
+        counting_upstream("429 Too Many Requests", b"rate limited".to_vec(), Some(0)).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/vcek");
+    let key = test_vcek_key(0x56);
+    let error = super::fetch_amd_kds_vcek_der_cached(&client, &url, &key, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("429"));
+    // The 429 body is never cached as certificate bytes: the error path is
+    // bounded at eight attempts and a second call retries the upstream.
+    assert_eq!(requests.load(Ordering::Relaxed), 8);
+    assert!(
+        super::fetch_amd_kds_vcek_der_cached(&client, &url, &key, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(requests.load(Ordering::Relaxed), 16);
+    server.abort();
+
+    // A large Retry-After sleep is cancellable, and cancellation releases the
+    // fill lock so the next caller retries instead of waiting forever.
+    let (address, requests, server) =
+        counting_upstream("429 Too Many Requests", b"rate limited".to_vec(), Some(600)).await;
+    let url = format!("http://{address}/vcek");
+    let key = test_vcek_key(0x57);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            super::fetch_amd_kds_vcek_der_cached(&client, &url, &key, None)
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            super::fetch_amd_kds_vcek_der_cached(&client, &url, &key, None)
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn vcek_disk_cache_reuses_valid_material_and_rejects_corrupt_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    let vcek = valid_cert_der();
+    let (address, requests, server) = counting_upstream("200 OK", vcek.clone(), None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/vcek");
+    let key = test_vcek_key(0x58);
+    let dir = Some(directory.path().to_path_buf());
+
+    // The disk layer is the cross-process path: a second fill must reuse the
+    // entry the first fill wrote, without an upstream request.
+    let first = super::vcek_fill_from_upstream(&client, &url, &key, dir.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.as_slice(), vcek.as_slice());
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    let second = super::vcek_fill_from_upstream(&client, &url, &key, dir.clone())
+        .await
+        .unwrap();
+    assert_eq!(second.as_slice(), vcek.as_slice());
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+
+    // A corrupt on-disk entry is removed and refetched, never returned.
+    let (der_path, _) = super::vcek_disk_paths(directory.path(), &key);
+    std::fs::write(&der_path, b"garbage").unwrap();
+    let third = super::vcek_fill_from_upstream(&client, &url, &key, dir)
+        .await
+        .unwrap();
+    assert_eq!(third.as_slice(), vcek.as_slice());
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    server.abort();
+}
+
+#[test]
+fn vcek_disk_cache_rejects_oversized_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let key = test_vcek_key(0x60);
+    let (path, _) = super::vcek_disk_paths(directory.path(), &key);
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(1024 * 1024)
+        .unwrap();
+    assert!(super::vcek_disk_get(directory.path(), &key).is_none());
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn vcek_disk_lock_collapses_concurrent_fills_across_process_layers() {
+    let directory = tempfile::tempdir().unwrap();
+    let vcek = valid_cert_der();
+    let (address, requests, server) = counting_upstream("200 OK", vcek, None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/vcek");
+    let key = test_vcek_key(0x59);
+    // Bypassing the in-process mutex simulates two `enclava` processes:
+    // concurrent fills must still collapse on the per-key file lock.
+    let results = futures::future::join_all((0..4).map(|_| {
+        super::vcek_fill_from_upstream(&client, &url, &key, Some(directory.path().to_path_buf()))
+    }))
+    .await;
+    assert!(results.iter().all(|result| result.is_ok()));
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn vcek_fetch_errors_do_not_leak_url_or_hwid() {
+    let (address, _requests, server) =
+        counting_upstream("400 Bad Request", b"upstream diagnostic".to_vec(), None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/vcek/{}", "9f".repeat(64));
+    let error = super::fetch_amd_kds_vcek_der(&client, &url)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("400"));
+    assert!(!error.contains(&address.to_string()));
+    assert!(!error.contains("9f"));
+    assert!(!error.contains("upstream diagnostic"));
+    server.abort();
+}
+
+#[test]
+fn kds_retry_delay_honors_bounded_retry_after_and_jitter() {
+    assert_eq!(
+        super::amd_kds_vcek_sleep_duration(0, Some(Duration::from_secs(7))),
+        Duration::from_secs(7)
+    );
+    assert_eq!(
+        super::amd_kds_vcek_sleep_duration(0, Some(Duration::from_secs(3600))),
+        Duration::from_secs(120)
+    );
+    for attempt in 0..8 {
+        let delay = super::amd_kds_vcek_sleep_duration(attempt, None);
+        let base = super::amd_kds_vcek_retry_delay(attempt);
+        assert!(delay >= base / 2 && delay < base * 3 / 2);
+    }
+    for malformed in ["not-a-number", "", "-5", "99999999999999999999"] {
+        let header = reqwest::header::HeaderValue::from_str(malformed);
+        let parsed = header
+            .as_ref()
+            .ok()
+            .and_then(|value| super::parse_retry_after(Some(value)));
+        if let Ok(value) = malformed.parse::<u64>() {
+            assert_eq!(parsed, Some(Duration::from_secs(value)));
+        } else {
+            assert_eq!(parsed, None);
+        }
+    }
+}
+
+#[test]
+fn amd_kds_base_url_defaults_to_direct_amd_and_honors_override() {
+    let _lock = env_lock();
+    unsafe {
+        std::env::remove_var(super::AMD_KDS_BASE_URL_ENV);
+    }
+    assert_eq!(super::amd_kds_base_url(), super::AMD_KDS_BASE_URL);
+    unsafe {
+        std::env::set_var(
+            super::AMD_KDS_BASE_URL_ENV,
+            "https://amd-kds-relay.example:8443",
+        );
+    }
+    assert_eq!(
+        super::amd_kds_base_url(),
+        "https://amd-kds-relay.example:8443"
+    );
+    unsafe {
+        std::env::remove_var(super::AMD_KDS_BASE_URL_ENV);
+    }
+}
+
+#[test]
+fn turin_vcek_url_uses_eight_byte_hwid_per_kds_spec() {
+    let mut report = sev::firmware::guest::AttestationReport {
+        version: 3,
+        cpuid_fam_id: Some(0x1a),
+        cpuid_mod_id: Some(0x02),
+        reported_tcb: sev::firmware::host::TcbVersion {
+            fmc: Some(3),
+            bootloader: 1,
+            tee: 2,
+            snp: 4,
+            microcode: 5,
+        },
+        ..Default::default()
+    };
+    report.chip_id[..8].copy_from_slice(&[0xcd; 8]);
+    let url = super::amd_kds_vcek_url(&report, "https://kdsintf.amd.com").unwrap();
+    assert_eq!(
+        url,
+        "https://kdsintf.amd.com/vcek/v1/Turin/cdcdcdcdcdcdcdcd?fmcSPL=03&blSPL=01&teeSPL=02&snpSPL=04&ucodeSPL=05"
+    );
+    // Nonzero padding past the first eight bytes is rejected.
+    report.chip_id[9] = 1;
+    assert!(super::amd_kds_vcek_url(&report, "https://kdsintf.amd.com").is_err());
 }
 
 #[test]
