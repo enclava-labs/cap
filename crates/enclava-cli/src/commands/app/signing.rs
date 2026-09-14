@@ -693,7 +693,10 @@ pub(crate) async fn build_signed_deploy_blobs(
         api_signing_pubkey,
         independent_verification: true,
         expected_firmware_measurement: release.expected_firmware_measurement_bytes()?,
-        expected_runtime_class: release.expected_runtime_class.clone(),
+        expected_runtime_class: enclava_engine::manifest::shape::runtime_class_for(
+            &app_config.resources.memory,
+            &release.expected_runtime_class,
+        ),
         kbs_resource_path: format!(
             "default/{}-{}-owner/seed-encrypted",
             app.namespace, app.name
@@ -738,7 +741,10 @@ pub(crate) async fn build_signed_deploy_blobs(
         kbs_url: release.trustee_kbs_url.clone(),
         kbs_ca_cert_pem: (!release.trustee_kbs_ca_cert_pem.trim().is_empty())
             .then(|| release.trustee_kbs_ca_cert_pem.clone()),
-        runtime_class: cc_init_data::runtime_class(),
+        runtime_class: enclava_engine::manifest::shape::runtime_class_for(
+            &app_config.resources.memory,
+            &cc_init_data::runtime_class(),
+        ),
     };
     let cc_init_data_hash: [u8; 32] =
         Sha256::digest(cc_init_data::build_toml_with_options(&cc_app, &cc_init_options).as_bytes())

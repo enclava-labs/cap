@@ -79,7 +79,57 @@ pub fn generate_sni_route_configmap(app: &ConfidentialApp) -> ConfigMap {
 }
 
 /// Generate an EnvoyProxy parameters resource for the tenant Gateway.
+///
+/// Small-shape apps additionally pin the gateway Deployment to tenant-capable
+/// worker nodes and lower the envoy/shutdown-manager *requests* to the chosen
+/// 128Mi split; limits stay whatever the gateway template already has. The
+/// EnvoyProxy CRD only exposes `envoyDeployment.container` for the main envoy
+/// container, so the shutdown-manager request goes through the CRD's
+/// strategic-merge `patch` field instead.
 pub fn generate_envoy_proxy(app: &ConfidentialApp) -> Value {
+    let mut kubernetes = json!({
+        "envoyService": {
+            "type": "ClusterIP",
+            "externalTrafficPolicy": "Local"
+        }
+    });
+    if let Some(containers) = crate::manifest::shape::gateway_container_requests(
+        crate::manifest::shape::shape_for_app(app),
+    ) {
+        let (node_key, node_value) = crate::manifest::shape::WORKER_NODE_LABEL;
+        let mut envoy_deployment = json!({
+            "pod": {
+                "nodeSelector": { node_key: node_value }
+            }
+        });
+        for (name, cpu, memory) in containers {
+            let resources = json!({
+                "resources": {
+                    "requests": { "cpu": cpu, "memory": memory }
+                }
+            });
+            if name == "envoy" {
+                envoy_deployment["container"] = resources;
+            } else {
+                envoy_deployment["patch"] = json!({
+                    "type": "StrategicMerge",
+                    "value": {
+                        "spec": {
+                            "template": {
+                                "spec": {
+                                    "containers": [{
+                                        "name": name,
+                                        "resources": resources["resources"],
+                                    }]
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        kubernetes["envoyDeployment"] = envoy_deployment;
+    }
     json!({
         "apiVersion": "gateway.envoyproxy.io/v1alpha1",
         "kind": "EnvoyProxy",
@@ -96,12 +146,7 @@ pub fn generate_envoy_proxy(app: &ConfidentialApp) -> Value {
             },
             "provider": {
                 "type": "Kubernetes",
-                "kubernetes": {
-                    "envoyService": {
-                        "type": "ClusterIP",
-                        "externalTrafficPolicy": "Local"
-                    }
-                }
+                "kubernetes": kubernetes
             }
         }
     })

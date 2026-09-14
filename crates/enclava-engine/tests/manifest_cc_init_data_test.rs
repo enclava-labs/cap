@@ -406,7 +406,7 @@ fn verify_runtime_class_binding_passes_for_default_render() {
     use enclava_engine::manifest::cc_init_data::verify_runtime_class_binding;
     let app = sample_app();
     let manifests = enclava_engine::manifest::generate_all_manifests(&app);
-    verify_runtime_class_binding(&manifests.statefulset)
+    verify_runtime_class_binding(&manifests.statefulset, &app)
         .expect("default app must bind runtime class");
 }
 

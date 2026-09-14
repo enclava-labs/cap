@@ -447,8 +447,16 @@ pub fn build_app_container(app: &ConfidentialApp) -> Container {
         resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
             requests: Some({
                 let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity("512Mi".to_string()));
-                m.insert("cpu".to_string(), Quantity("250m".to_string()));
+                m.insert(
+                    "memory".to_string(),
+                    Quantity(crate::manifest::shape::app_memory_request(
+                        &app.resources.memory,
+                    )),
+                );
+                m.insert(
+                    "cpu".to_string(),
+                    Quantity(crate::manifest::shape::APP_CPU_REQUEST.to_string()),
+                );
                 m
             }),
             limits: Some({
@@ -750,7 +758,10 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env_field_ref("ATTESTATION_POD_NAME", "metadata.name"),
         env_field_ref("ATTESTATION_POD_NAMESPACE", "metadata.namespace"),
         env("ATTESTATION_PROFILE", "coco-sev-snp"),
-        env("ATTESTATION_RUNTIME_CLASS", &cc_init_data::runtime_class()),
+        env(
+            "ATTESTATION_RUNTIME_CLASS",
+            &crate::manifest::shape::resolved_runtime_class(app),
+        ),
         env("ATTESTATION_WORKLOAD_IMAGE", &primary.image.digest_ref()),
         env("ATTESTATION_BIND", "127.0.0.1"),
         env("ATTESTATION_TLS_BIND", "0.0.0.0"),
@@ -816,20 +827,30 @@ pub fn build_attestation_proxy_container(app: &ConfidentialApp) -> Container {
         env: Some(env_vars),
         volume_mounts: Some(proxy_volume_mounts(app, legacy)),
         security_context: Some(proxy_security_context(legacy)),
-        resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
-            requests: Some({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity("128Mi".to_string()));
-                m.insert("cpu".to_string(), Quantity("100m".to_string()));
-                m
-            }),
-            limits: Some({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity("256Mi".to_string()));
-                m.insert("cpu".to_string(), Quantity("500m".to_string()));
-                m
-            }),
-            ..Default::default()
+        resources: Some({
+            let (mem_req, mem_lim) =
+                crate::manifest::shape::sidecar_memory(crate::manifest::shape::shape_for_app(app));
+            k8s_openapi::api::core::v1::ResourceRequirements {
+                requests: Some({
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("memory".to_string(), Quantity(mem_req.to_string()));
+                    m.insert(
+                        "cpu".to_string(),
+                        Quantity(crate::manifest::shape::SIDECAR_CPU_REQUEST.to_string()),
+                    );
+                    m
+                }),
+                limits: Some({
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("memory".to_string(), Quantity(mem_lim.to_string()));
+                    m.insert(
+                        "cpu".to_string(),
+                        Quantity(crate::manifest::shape::SIDECAR_CPU_LIMIT.to_string()),
+                    );
+                    m
+                }),
+                ..Default::default()
+            }
         }),
         readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
             http_get: Some(k8s_openapi::api::core::v1::HTTPGetAction {
@@ -1025,20 +1046,30 @@ pub fn build_caddy_container(app: &ConfidentialApp) -> Container {
         volume_devices,
         volume_mounts: Some(volume_mounts),
         security_context: Some(security_context),
-        resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
-            requests: Some({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity("128Mi".to_string()));
-                m.insert("cpu".to_string(), Quantity("100m".to_string()));
-                m
-            }),
-            limits: Some({
-                let mut m = std::collections::BTreeMap::new();
-                m.insert("memory".to_string(), Quantity("256Mi".to_string()));
-                m.insert("cpu".to_string(), Quantity("500m".to_string()));
-                m
-            }),
-            ..Default::default()
+        resources: Some({
+            let (mem_req, mem_lim) =
+                crate::manifest::shape::sidecar_memory(crate::manifest::shape::shape_for_app(app));
+            k8s_openapi::api::core::v1::ResourceRequirements {
+                requests: Some({
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("memory".to_string(), Quantity(mem_req.to_string()));
+                    m.insert(
+                        "cpu".to_string(),
+                        Quantity(crate::manifest::shape::SIDECAR_CPU_REQUEST.to_string()),
+                    );
+                    m
+                }),
+                limits: Some({
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("memory".to_string(), Quantity(mem_lim.to_string()));
+                    m.insert(
+                        "cpu".to_string(),
+                        Quantity(crate::manifest::shape::SIDECAR_CPU_LIMIT.to_string()),
+                    );
+                    m
+                }),
+                ..Default::default()
+            }
         }),
         readiness_probe: Some(k8s_openapi::api::core::v1::Probe {
             tcp_socket: Some(k8s_openapi::api::core::v1::TCPSocketAction {

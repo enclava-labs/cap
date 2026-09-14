@@ -11,35 +11,41 @@ use crate::types::ConfidentialApp;
 /// Includes the full resource set: CPU, memory, storage, PVCs, pods, services,
 /// load balancers (0), node ports (0), secrets, configmaps.
 pub fn generate_resource_quota(app: &ConfidentialApp) -> ResourceQuota {
+    use crate::manifest::shape;
     let mut hard = BTreeMap::new();
 
+    let ws = shape::shape_for_app(app);
+    let app_mem_req = shape::app_memory_request(&app.resources.memory);
+    let (sidecar_req, sidecar_lim) = shape::sidecar_memory(ws);
+    let (rc_cpu, rc_mem) = shape::rc_overhead(ws);
+
     let request_cpu = vec![
-        "250m", // workload
-        "100m", // attestation-proxy
-        "100m", // tenant-ingress
-        "50m",  // enclava-init sidecar
-        "1",    // kata-qemu-snp overhead
+        shape::APP_CPU_REQUEST,     // workload
+        shape::SIDECAR_CPU_REQUEST, // attestation-proxy
+        shape::SIDECAR_CPU_REQUEST, // tenant-ingress
+        shape::INIT_CPU_REQUEST,    // enclava-init sidecar
+        rc_cpu,                     // RuntimeClass overhead
     ];
     let limit_cpu = vec![
         app.resources.cpu.as_str(), // workload
-        "500m",                     // attestation-proxy
-        "500m",                     // tenant-ingress
-        "250m",                     // enclava-init sidecar
-        "1",                        // kata-qemu-snp overhead
+        shape::SIDECAR_CPU_LIMIT,   // attestation-proxy
+        shape::SIDECAR_CPU_LIMIT,   // tenant-ingress
+        shape::INIT_CPU_LIMIT,      // enclava-init sidecar
+        rc_cpu,                     // RuntimeClass overhead
     ];
     let request_memory = vec![
-        "512Mi", // workload
-        "128Mi", // attestation-proxy
-        "128Mi", // tenant-ingress
-        "64Mi",  // enclava-init sidecar
-        "4Gi",   // kata-qemu-snp overhead
+        app_mem_req.as_str(),       // workload
+        sidecar_req,                // attestation-proxy
+        sidecar_req,                // tenant-ingress
+        shape::INIT_MEMORY_REQUEST, // enclava-init sidecar
+        rc_mem,                     // RuntimeClass overhead
     ];
     let limit_memory = vec![
         app.resources.memory.as_str(), // workload
-        "256Mi",                       // attestation-proxy
-        "256Mi",                       // tenant-ingress
-        "512Mi",                       // enclava-init sidecar
-        "4Gi",                         // kata-qemu-snp overhead
+        sidecar_lim,                   // attestation-proxy
+        sidecar_lim,                   // tenant-ingress
+        shape::INIT_MEMORY_LIMIT,      // enclava-init sidecar
+        rc_mem,                        // RuntimeClass overhead
     ];
 
     hard.insert(
@@ -153,7 +159,20 @@ fn sum_memory_quantities(values: &[&str]) -> String {
     if total_mib % 1024.0 == 0.0 {
         format!("{}Gi", (total_mib / 1024.0) as i64)
     } else {
-        format!("{}Mi", total_mib as i64)
+        // Round up: the quota must never admit less than the pod actually
+        // requests when a fractional-MiB app request is summed.
+        format!("{}Mi", total_mib.ceil() as i64)
+    }
+}
+
+fn storage_mib(value: &str) -> Option<f64> {
+    let (num, suffix) = split_quantity(value);
+    let parsed: f64 = num.parse().ok()?;
+    match suffix {
+        "Ti" | "TiB" => Some(parsed * 1024.0 * 1024.0),
+        "Gi" | "GiB" => Some(parsed * 1024.0),
+        "Mi" | "MiB" => Some(parsed),
+        _ => None,
     }
 }
 
@@ -171,5 +190,17 @@ fn sum_storage_quantities(a: &str, b: &str) -> String {
         return format!("{total}{a_suffix}");
     }
 
-    a.to_string()
+    // Mixed units: normalize to MiB so e.g. "5Gi" + "512Mi" yields "5632Mi"
+    // instead of silently dropping the TLS volume's request.
+    match (storage_mib(a), storage_mib(b)) {
+        (Some(a_mib), Some(b_mib)) => {
+            let total = a_mib + b_mib;
+            if total % 1024.0 == 0.0 {
+                format!("{}Gi", (total / 1024.0) as i64)
+            } else {
+                format!("{}Mi", total.ceil() as i64)
+            }
+        }
+        _ => a.to_string(),
+    }
 }

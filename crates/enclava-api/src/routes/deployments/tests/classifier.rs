@@ -587,11 +587,13 @@ fn idempotent_retry_preserves_none_partial_and_full_resource_requests() {
             cpu: Some("750m".to_string()),
             memory: None,
             storage: None,
+            tls_storage: None,
         }),
         Some(DeployResources {
             cpu: Some("2".to_string()),
             memory: Some("3Gi".to_string()),
             storage: Some("7Gi".to_string()),
+            tls_storage: Some("4Gi".to_string()),
         }),
     ];
 

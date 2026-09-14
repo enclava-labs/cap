@@ -300,6 +300,12 @@ pub struct HostedTemplateResources {
     pub cpu: String,
     pub memory: String,
     pub storage: String,
+    #[serde(default = "default_hosted_tls_storage")]
+    pub tls_storage: String,
+}
+
+fn default_hosted_tls_storage() -> String {
+    "2Gi".to_string()
 }
 
 impl Default for HostedTemplateResources {
@@ -308,6 +314,7 @@ impl Default for HostedTemplateResources {
             cpu: "1".to_string(),
             memory: "1Gi".to_string(),
             storage: "5Gi".to_string(),
+            tls_storage: default_hosted_tls_storage(),
         }
     }
 }

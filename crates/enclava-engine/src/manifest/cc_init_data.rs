@@ -58,7 +58,11 @@ impl CcInitDataOptions {
 /// - cdh.toml: confidential data hub config pointing to KBS
 /// - identity.toml: tenant/instance identity for ownership binding
 pub fn build_toml(app: &ConfidentialApp) -> String {
-    build_toml_with_options(app, &CcInitDataOptions::from_env())
+    let mut options = CcInitDataOptions::from_env();
+    // The RuntimeClass bound into cc_init_data is the per-app resolved class:
+    // small-shape apps hash a different class than the deployment default.
+    options.runtime_class = crate::manifest::shape::resolved_runtime_class(app);
+    build_toml_with_options(app, &options)
 }
 
 pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOptions) -> String {
@@ -508,10 +512,13 @@ fn encode_and_hash_toml(toml: &str) -> (String, String) {
 
 /// Verify that the rendered StatefulSet's `runtimeClassName` matches what
 /// cc_init_data binds. Phase 11: deploy fails fast if the chain breaks.
+/// The expected class is per-app: standard workloads keep the deployment
+/// default, small-shape workloads resolve to the dedicated small class.
 pub fn verify_runtime_class_binding(
     sts: &k8s_openapi::api::apps::v1::StatefulSet,
+    app: &crate::types::ConfidentialApp,
 ) -> Result<(), String> {
-    let expected = runtime_class();
+    let expected = crate::manifest::shape::resolved_runtime_class(app);
     let actual = sts
         .spec
         .as_ref()

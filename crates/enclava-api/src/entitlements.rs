@@ -6,6 +6,12 @@ use crate::models::AppResources;
 
 const ORG_ENTITLEMENT_LANE_DOMAIN: i32 = 0x454e_544c;
 
+/// Hard platform ceiling for the TLS data volume: it holds caddy certificate
+/// state, so the 2Gi default is already generous; the cap keeps a
+/// caller-supplied `tls_storage` override from claiming unbounded shared
+/// storage outside the app-data entitlement.
+const MAX_TLS_DATA_SIZE: &str = "8Gi";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntitlementLimits {
     pub name: String,
@@ -302,6 +308,17 @@ fn parse_binary_mib(value: &str, field: &'static str) -> Result<ScaledDecimal, S
     ScaledDecimal::parse(number, field)?.checked_mul(multiplier, field)
 }
 
+/// Compare normalized quantities without losing decimal precision to floats.
+pub(crate) fn binary_quantities_equal(left: &str, right: &str) -> bool {
+    match (
+        parse_binary_mib(left, "storage"),
+        parse_binary_mib(right, "storage"),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
 /// Validate the exact candidate resource row that will be committed and
 /// serialized into a durable apply job.
 pub fn validate_resource_limits(
@@ -391,6 +408,40 @@ pub fn validate_resource_limits(
             allowed: limits.max_storage.clone(),
         });
     }
+
+    // TLS data size has no entitlement cap (platform-managed cert volume),
+    // but a caller-supplied override must parse and stay under a fixed
+    // platform ceiling before it is persisted and rendered into a PVC
+    // quantity; an unbounded override could starve shared storage.
+    let requested_tls =
+        parse_binary_mib(&resources.tls_data_size, "tls_storage").map_err(|message| {
+            ResourceLimitError::Invalid {
+                field: "tls_storage",
+                message,
+            }
+        })?;
+    let allowed_tls =
+        parse_binary_mib(MAX_TLS_DATA_SIZE, "platform.tls_storage_max").map_err(|message| {
+            ResourceLimitError::Invalid {
+                field: "platform.tls_storage_max",
+                message,
+            }
+        })?;
+    if requested_tls
+        .cmp_exact(allowed_tls)
+        .map_err(|message| ResourceLimitError::Invalid {
+            field: "tls_storage",
+            message,
+        })?
+        .is_gt()
+    {
+        return Err(ResourceLimitError::Exceeded {
+            code: "platform_tls_storage_limit",
+            field: "tls_storage",
+            requested: resources.tls_data_size.clone(),
+            allowed: MAX_TLS_DATA_SIZE.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -468,6 +519,15 @@ pub async fn entitlement_decision_for_org(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn storage_quantity_equality_preserves_precision() {
+        assert!(super::binary_quantities_equal("5Gi", "5120Mi"));
+        assert!(!super::binary_quantities_equal(
+            "5Gi",
+            "5.0000000000000001Gi"
+        ));
+    }
+
     use super::*;
 
     async fn database_test_pool() -> PgPool {
@@ -585,11 +645,23 @@ mod tests {
 
         // The deploy API's resources.storage field governs app_data_size.
         // TLS storage is configured separately and does not consume that
-        // authority limit.
+        // authority limit, but the platform ceiling still bounds it.
         resources.app_data_size = "1Gi".to_string();
-        resources.tls_data_size = "100Gi".to_string();
+        resources.tls_data_size = "4Gi".to_string();
         validate_resource_limits(&resources, &unit_limits)
             .expect("separate TLS storage does not alter app-data limit");
+        resources.tls_data_size = "8193Mi".to_string();
+        assert!(matches!(
+            validate_resource_limits(&resources, &unit_limits),
+            Err(ResourceLimitError::Exceeded {
+                code: "platform_tls_storage_limit",
+                field: "tls_storage",
+                ..
+            })
+        ));
+        resources.tls_data_size = "8Gi".to_string();
+        validate_resource_limits(&resources, &unit_limits)
+            .expect("TLS storage at the platform ceiling is accepted");
     }
 
     #[tokio::test]
