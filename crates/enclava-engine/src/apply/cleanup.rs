@@ -122,7 +122,14 @@ pub async fn set_statefulset_desired_replicas(
         "kind": "StatefulSet",
         "spec": { "replicas": desired_replicas }
     });
-    apply_existing_partial(&api, name, &patch, generation).await?;
+    apply_existing_partial(
+        &api,
+        name,
+        &patch,
+        generation,
+        &engine.config().field_manager,
+    )
+    .await?;
     tracing::info!(namespace = %namespace, statefulset = %name, desired_replicas, "set StatefulSet desired replicas");
 
     let start = Instant::now();
