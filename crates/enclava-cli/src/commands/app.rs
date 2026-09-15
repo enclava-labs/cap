@@ -459,6 +459,12 @@ pub async fn deploy(args: DeployArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let req = DeployRequest {
         image: Some(args.image.clone()),
+        resources: DeployResourcesSpec {
+            cpu: app_config.resources.cpu.clone(),
+            memory: app_config.resources.memory.clone(),
+            storage: app_config.storage.size.clone(),
+            tls_storage: app_config.storage.tls_size.clone(),
+        },
         customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
         org_keyring_blob: Some(signed_blobs.org_keyring_blob),
         signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),

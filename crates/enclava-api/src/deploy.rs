@@ -1770,6 +1770,28 @@ mod tests {
         assert_eq!(outcome.app_status, "creating");
         assert!(!outcome.terminal);
     }
+
+    #[tokio::test]
+    async fn rollout_watch_password_timeout_stays_nonterminal_for_failed_app_redeploy() {
+        // The job payload freezes the app snapshot at accept time, so a
+        // redeploy of a previously-failed app carries status "failed". The
+        // apply already persisted "creating" for the new rollout; the stale
+        // snapshot must not terminalize a legitimate owner wait.
+        let mut app = queued_apply_app();
+        app.status = AppStatus::Failed;
+        let outcome = DeploymentRollout::observe_only(
+            app,
+            rollout_test_engine(),
+            "password-redeploy-manifest".to_string(),
+            chrono::Utc::now() - chrono::Duration::seconds(601),
+        )
+        .with_observation_slice(std::time::Duration::from_millis(50))
+        .watch()
+        .await;
+        assert_eq!(outcome.deploy_status, "watching");
+        assert_eq!(outcome.app_status, "creating");
+        assert!(!outcome.terminal);
+    }
 }
 
 pub async fn set_deployment_status(
@@ -2007,7 +2029,16 @@ impl DeploymentRollout {
     /// `rollout_timeout` is anchored at `observing_since`, so restarted
     /// observation cannot extend a rollout deadline forever.
     pub async fn watch(self) -> DeploymentRolloutOutcome {
-        let previous_app_status = self.app.status;
+        // `self.app` is the snapshot frozen into the job payload at accept
+        // time. `apply_deployment_manifests` has already persisted status
+        // "creating" for this rollout, so a pre-existing terminal "failed"
+        // must not drive classification: a redeployed failed app is creating
+        // again, and password-mode owner wait must stay nonterminal rather
+        // than terminalizing on the stale snapshot.
+        let previous_app_status = match self.app.status {
+            AppStatus::Failed => AppStatus::Creating,
+            status => status,
+        };
         let unlock_mode = self.app.unlock_mode;
         let total = self.engine.config().rollout_timeout;
         let elapsed = chrono::Utc::now()
