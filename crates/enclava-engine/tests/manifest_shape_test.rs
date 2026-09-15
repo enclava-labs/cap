@@ -83,7 +83,7 @@ fn small_app_renders_small_pod_shape() {
         annotations
             .get("io.katacontainers.config.hypervisor.default_memory")
             .map(String::as_str),
-        Some("1024")
+        Some("1536")
     );
     assert_eq!(
         annotations
@@ -97,14 +97,15 @@ fn small_app_renders_small_pod_shape() {
         memory_of(container(spec, "web")),
         ("128Mi".into(), "128Mi".into())
     );
-    // Sidecars on the small budget.
+    // Sidecars keep the standard budget: their claim-path working set is
+    // fixed platform overhead that does not shrink with the app.
     assert_eq!(
         memory_of(container(spec, "attestation-proxy")),
-        ("64Mi".into(), "64Mi".into())
+        ("128Mi".into(), "256Mi".into())
     );
     assert_eq!(
         memory_of(container(spec, "tenant-ingress")),
-        ("64Mi".into(), "64Mi".into())
+        ("128Mi".into(), "256Mi".into())
     );
     // enclava-init keeps the 512Mi ceiling (Argon2 cost is not weakened);
     // it is a regular container alongside the app, not an init container.
@@ -153,16 +154,16 @@ fn small_app_cross_artifact_agreement() {
         .expect("small app must bind runtime class");
 
     // ResourceQuota agrees with the small shape: app request 128 + sidecars
-    // 64+64 + init 64 + RuntimeClass overhead 1536 = 1856Mi requested; limits
-    // 128+64+64+512+1536 = 2304Mi.
+    // 128+128 + init 64 + RuntimeClass overhead 1536 = 1984Mi requested;
+    // limits 128+256+256+512+1536 = 2688Mi.
     let hard = manifests
         .resource_quota
         .spec
         .as_ref()
         .and_then(|s| s.hard.as_ref())
         .expect("quota hard limits");
-    assert_eq!(hard.get("requests.memory").unwrap().0, "1856Mi");
-    assert_eq!(hard.get("limits.memory").unwrap().0, "2304Mi");
+    assert_eq!(hard.get("requests.memory").unwrap().0, "1984Mi");
+    assert_eq!(hard.get("limits.memory").unwrap().0, "2688Mi");
     // CPU: 250+100+100+50+500m = 1000m; limits 1 + 500+500+250+500m = 2750m.
     assert_eq!(hard.get("requests.cpu").unwrap().0, "1");
     assert_eq!(hard.get("limits.cpu").unwrap().0, "2750m");
@@ -221,8 +222,8 @@ fn fractional_small_limit_quota_rounds_up() {
         .as_ref()
         .and_then(|s| s.hard.as_ref())
         .expect("quota hard limits");
-    // 128.5 + 64 + 64 + 64 + 1536 = 1856.5Mi -> 1857Mi.
-    assert_eq!(hard.get("requests.memory").unwrap().0, "1857Mi");
+    // 128.5 + 128 + 128 + 64 + 1536 = 1984.5Mi -> 1985Mi.
+    assert_eq!(hard.get("requests.memory").unwrap().0, "1985Mi");
 }
 
 #[test]

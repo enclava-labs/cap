@@ -212,12 +212,24 @@ pub struct AppResponse {
 #[derive(Debug, Serialize)]
 pub struct DeployRequest {
     pub image: Option<String>,
+    /// Declared resource shape, re-asserted on every deploy so the persisted
+    /// app resources stay bound to the signed descriptor even when
+    /// `enclava.toml` changed since app creation.
+    pub resources: DeployResourcesSpec,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub customer_descriptor_blob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub org_keyring_blob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signed_policy_artifact: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeployResourcesSpec {
+    pub cpu: String,
+    pub memory: String,
+    pub storage: String,
+    pub tls_storage: String,
 }
 
 #[derive(Debug, Deserialize)]

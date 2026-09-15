@@ -213,11 +213,26 @@ fn app_response_accepts_phase7_fields_when_server_exposes_them() {
 fn deploy_request_serializes_signed_artifact_blobs() {
     let req = DeployRequest {
         image: Some("registry.example.com/acme/web@sha256:abc".to_string()),
+        resources: DeployResourcesSpec {
+            cpu: "1".to_string(),
+            memory: "128Mi".to_string(),
+            storage: "2Gi".to_string(),
+            tls_storage: "1Gi".to_string(),
+        },
         customer_descriptor_blob: Some(r#"{"descriptor":{}}"#.to_string()),
         org_keyring_blob: Some(r#"{"keyring":{}}"#.to_string()),
         signed_policy_artifact: Some(r#"{"metadata":{}}"#.to_string()),
     };
     let value = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        value["resources"],
+        serde_json::json!({
+            "cpu": "1",
+            "memory": "128Mi",
+            "storage": "2Gi",
+            "tls_storage": "1Gi",
+        })
+    );
     assert_eq!(
         value["customer_descriptor_blob"],
         serde_json::json!(r#"{"descriptor":{}}"#)

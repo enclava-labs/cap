@@ -11,8 +11,8 @@
 //!   is below the standard app request (512Mi). Such limits are otherwise
 //!   undeployable (request must not exceed limit), so gating on them cannot
 //!   regress an existing workload. Small apps render with the app request
-//!   lowered to the limit, 64Mi sidecar budgets, a 1024Mi Kata baseline via the
-//!   allow-listed `default_memory` annotation, the dedicated small
+//!   lowered to the limit, standard sidecar budgets, a 1536Mi Kata baseline via
+//!   the allow-listed `default_memory` annotation, the dedicated small
 //!   RuntimeClass, and that class's 1536Mi/500m overhead in the quota.
 //!
 //! Everything here is a pure function of `app.resources.memory`, which flows
@@ -27,8 +27,11 @@ use crate::types::ConfidentialApp;
 /// deployment-global default.
 pub const SMALL_RUNTIME_CLASS: &str = "kata-qemu-snp-small";
 
-/// Kata `default_memory` annotation (MiB) for small-shape pods.
-pub const SMALL_VM_BASELINE_MIB: u32 = 1024;
+/// Kata `default_memory` annotation (MiB) for small-shape pods. Matches the
+/// RuntimeClass podFixed overhead carried in the tenant quota so accounting
+/// stays exact, and leaves room for worst-case simultaneous peaks (claim-time
+/// proxy burst + init Argon2 + guest OS) that exceed the container requests.
+pub const SMALL_VM_BASELINE_MIB: u32 = 1536;
 
 /// RuntimeClass podFixed overhead carried in the tenant ResourceQuota.
 pub const STANDARD_RC_OVERHEAD_CPU: &str = "1";
@@ -41,8 +44,14 @@ pub const APP_CPU_REQUEST: &str = "250m";
 pub const STANDARD_APP_MEMORY_REQUEST: &str = "512Mi";
 pub const STANDARD_SIDECAR_MEMORY_REQUEST: &str = "128Mi";
 pub const STANDARD_SIDECAR_MEMORY_LIMIT: &str = "256Mi";
-pub const SMALL_SIDECAR_MEMORY_REQUEST: &str = "64Mi";
-pub const SMALL_SIDECAR_MEMORY_LIMIT: &str = "64Mi";
+/// Small-shape sidecars keep the standard budget. Sidecar working set is
+/// fixed platform overhead, not density-scalable: the attestation proxy's
+/// claim path (TLS, attestation, seed envelope, KBS handoff) demonstrably
+/// exceeds 64Mi and a request below the working set would make the pod a
+/// prime eviction candidate under node pressure — exactly the regime the
+/// density test exercises.
+pub const SMALL_SIDECAR_MEMORY_REQUEST: &str = "128Mi";
+pub const SMALL_SIDECAR_MEMORY_LIMIT: &str = "256Mi";
 pub const INIT_MEMORY_REQUEST: &str = "64Mi";
 /// enclava-init keeps its 512Mi ceiling in every shape: Argon2 must not be
 /// weakened for density.
@@ -245,7 +254,7 @@ mod tests {
             SMALL_RUNTIME_CLASS
         );
         assert_eq!(runtime_class_for("1Gi", "kata-qemu-snp"), "kata-qemu-snp");
-        assert_eq!(vm_baseline_annotation("128Mi"), Some("1024".to_string()));
+        assert_eq!(vm_baseline_annotation("128Mi"), Some("1536".to_string()));
         assert_eq!(vm_baseline_annotation("1Gi"), None);
         assert_eq!(rc_overhead(WorkloadShape::Small), ("500m", "1536Mi"));
         assert_eq!(rc_overhead(WorkloadShape::Standard), ("1", "4Gi"));
