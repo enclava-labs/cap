@@ -128,17 +128,23 @@ pub fn validate_app_name_legacy(s: &str) -> Result<(), ValidateError> {
 }
 
 /// Platform app name for **new names** (admission): a Kubernetes DNS-1123
-/// label (1–63 chars, `[a-z0-9-]`) that starts and ends with a letter or
-/// digit, carries no consecutive hyphens, is none of the reserved system
-/// names, and is not all digits. The API's create path delegates here, so
-/// the CLI can validate scaffolds against exactly the rules the server
-/// enforces. Existing state must use [`validate_app_name_legacy`].
+/// label (1–63 chars, `[a-z0-9-]`) that starts with a lowercase letter,
+/// ends with a letter or digit, carries no consecutive hyphens, and is
+/// none of the reserved system names. The API's create path delegates
+/// here, so the CLI can validate scaffolds against exactly the rules the
+/// server enforces. Existing state must use [`validate_app_name_legacy`].
 pub fn validate_app_name(s: &str) -> Result<(), ValidateError> {
     validate_app_name_legacy(s)?;
-    // Deliberate platform constraint (d475553): app names propagate to
-    // Kubernetes service names, which must not be all-numeric.
-    if s.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ValidateError::InvalidAppName("must not be all digits"));
+    // Kubernetes Service names are RFC 1035 labels and must start with a
+    // letter; the app name is used verbatim as the Service name
+    // (enclava-engine manifest/service.rs), so a digit-led name would pass
+    // admission and then fail every deploy at manifest apply. Subsumes
+    // d475553's "must not be all digits" rule (every all-digit name
+    // starts with a digit).
+    if !s.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return Err(ValidateError::InvalidAppName(
+            "must start with a lowercase letter (Kubernetes service-name rules)",
+        ));
     }
     Ok(())
 }
@@ -315,14 +321,17 @@ mod tests {
     }
 
     #[test]
-    fn app_name_rejects_all_digits() {
-        // K8s service names must not be all-numeric (d475553); admission
-        // rejects them, but legacy state (mnemonics for apps the old API
-        // admitted) must keep loading.
+    fn app_name_admission_requires_a_leading_letter() {
+        // K8s Service names are RFC 1035 labels: the first character must be
+        // a letter, and the app name is the Service name verbatim. This
+        // subsumes d475553's all-digit rule; legacy state (names the old API
+        // admitted) must keep loading through validate_app_name_legacy.
         assert!(validate_app_name("123").is_err());
-        assert!(validate_app_name("0").is_err());
+        assert!(validate_app_name("1app").is_err());
+        assert!(validate_app_name("app1").is_ok());
         assert!(validate_app_name("a1").is_ok());
         assert!(validate_app_name_legacy("123").is_ok());
+        assert!(validate_app_name_legacy("1app").is_ok());
         assert!(validate_app_name_legacy("Bad_Name").is_err());
         assert!(validate_app_name_legacy("default").is_err());
     }

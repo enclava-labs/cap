@@ -235,8 +235,8 @@ pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     enclava_common::validate::validate_app_name(&app_name).map_err(|err| {
         format!(
             "invalid app name `{app_name}` ({err}); pass --app-name with a lowercase \
-             [a-z0-9-] name: alphanumeric edges, no consecutive hyphens, at most \
-             63 chars, not all digits, no reserved system names"
+             [a-z0-9-] name: starting with a letter, alphanumeric edges, no consecutive \
+             hyphens, at most 63 chars, no reserved system names"
         )
     })?;
     // Kubernetes container ports must be 1-65535; a 0 would only surface as
@@ -296,7 +296,7 @@ mod tests {
             "-leading-dash",         // leading '-'
             "default",               // reserved system name
             "foo--bar",              // consecutive hyphens
-            "1234",                  // all digits (K8s service-name rule)
+            "1app",                  // digit-led: invalid K8s service name
             "a".repeat(64).as_str(), // over the 63-char limit
         ] {
             assert!(
