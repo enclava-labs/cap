@@ -150,12 +150,22 @@ fn print_report(report: &PrepareReport) {
     println!("  git push");
 }
 
-pub async fn prepare() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(clap::Args)]
+pub struct PrepareArgs {
+    /// Update existing Enclava files without the interactive confirmation
+    #[arg(long)]
+    pub yes: bool,
+}
+
+pub async fn prepare(args: PrepareArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let report = prepare_project_with_confirmation(&cwd, |paths| {
         println!("Found existing:");
         for path in paths {
             println!("  {}", relative_display(&cwd, path));
+        }
+        if args.yes {
+            return Ok(true);
         }
         Confirm::new()
             .with_prompt("Update existing Enclava files?")

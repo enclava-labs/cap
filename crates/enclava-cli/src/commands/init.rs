@@ -1,4 +1,5 @@
 use dialoguer::Input;
+use enclava_cli::app_config::AppConfig;
 use std::path::Path;
 
 /// Detect EXPOSE port from a Dockerfile.
@@ -21,6 +22,11 @@ pub(crate) fn detect_dockerfile_port(path: &Path) -> Option<u16> {
 }
 
 /// Default app name derived from the current project directory.
+fn interactive_session() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
 pub(crate) fn default_app_name(cwd: &Path) -> String {
     let raw = cwd
         .file_name()
@@ -161,7 +167,17 @@ jobs:
     )
 }
 
-pub async fn init() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(clap::Args)]
+pub struct InitArgs {
+    /// App name to write into enclava.toml (non-interactive; defaults to the directory name)
+    #[arg(long)]
+    pub app_name: Option<String>,
+    /// Port to write into enclava.toml (non-interactive; defaults to the Dockerfile EXPOSE or 3000)
+    #[arg(long)]
+    pub port: Option<u16>,
+}
+
+pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
 
     // Check if enclava.toml already exists
@@ -186,19 +202,58 @@ pub async fn init() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Get app name (default to directory name)
-    let app_name: String = Input::new()
-        .with_prompt("App name")
-        .default(default_app_name(&cwd))
-        .interact_text()?;
+    // Get app name (default to directory name; --app-name or a non-interactive
+    // session takes the deterministic default instead of prompting). Both the
+    // name and port prompts render on stderr (dialoguer 0.11 uses
+    // Term::stderr()) and fail when it is redirected, so require terminal
+    // stdin AND stderr before prompting — same rule as the password paths.
+    let app_name: String = match args.app_name {
+        Some(name) => name,
+        None if interactive_session() => Input::new()
+            .with_prompt("App name")
+            .default(default_app_name(&cwd))
+            .interact_text()?,
+        None => default_app_name(&cwd),
+    };
 
-    let port: u16 = Input::new()
-        .with_prompt("Port")
-        .default(detected_port.unwrap_or(3000))
-        .interact_text()?;
+    let port: u16 = match args.port {
+        Some(port) => port,
+        None if interactive_session() => Input::new()
+            .with_prompt("Port")
+            .default(detected_port.unwrap_or(3000))
+            .interact_text()?,
+        None => detected_port.unwrap_or(3000),
+    };
+
+    // Validate the name against the canonical app-name rules BEFORE writing
+    // anything: an invalid name (from --app-name or the directory-derived
+    // default) would otherwise scaffold a project that `create` later rejects,
+    // and the existing enclava.toml then blocks a corrected rerun. These are
+    // the name-level rules the scaffold can check; the org-dependent
+    // namespace budget (cap-{org}-{app} ≤ 63) stays with `create`, which
+    // knows both operands and reports an actionable error.
+    enclava_common::validate::validate_app_name(&app_name).map_err(|err| {
+        format!(
+            "invalid app name `{app_name}` ({err}); pass --app-name with a lowercase \
+             [a-z0-9-] name: starting with a letter, alphanumeric edges, no consecutive \
+             hyphens, at most 63 chars, no reserved system names"
+        )
+    })?;
+    // Kubernetes container ports must be 1-65535; a 0 would only surface as
+    // a manifest rejection at deploy time, so fail the scaffold early.
+    if port == 0 {
+        return Err(format!(
+            "invalid port {port} from --port or image EXPOSE: pass --port with a \
+             TCP port between 1 and 65535"
+        )
+        .into());
+    }
 
     // Write enclava.toml
     let toml_content = generate_enclava_toml(&app_name, port);
+    // Parse the generated TOML before it lands on disk so a generation bug
+    // fails here instead of poisoning the next command that loads it.
+    AppConfig::parse(&toml_content)?;
     std::fs::write(&toml_path, &toml_content)?;
     println!();
     println!("Creating enclava.toml... done");
@@ -229,6 +284,32 @@ pub async fn init() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_rejects_names_the_platform_would_reject_and_parses_generated_toml() {
+        // The same canonical validator init applies before writing anything:
+        // invalid explicit --app-name values and unusable directory-derived
+        // defaults must fail BEFORE enclava.toml exists (a written-but-invalid
+        // scaffold blocks the corrected rerun).
+        for bad in [
+            "Bad_Name",              // uppercase + underscore: not a DNS-1123 label
+            "-leading-dash",         // leading '-'
+            "default",               // reserved system name
+            "foo--bar",              // consecutive hyphens
+            "1app",                  // digit-led: invalid K8s service name
+            "a".repeat(64).as_str(), // over the 63-char limit
+        ] {
+            assert!(
+                enclava_common::validate::validate_app_name(bad).is_err(),
+                "{bad} must be rejected before scaffolding"
+            );
+        }
+        assert!(enclava_common::validate::validate_app_name("my-app-1").is_ok());
+
+        // The generated TOML must parse before it is written to disk.
+        let toml_content = generate_enclava_toml("my-app-1", 3000);
+        AppConfig::parse(&toml_content).expect("generated enclava.toml must parse as AppConfig");
+    }
 
     #[test]
     fn detect_port_from_expose() {

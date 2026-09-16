@@ -159,6 +159,10 @@ impl StoragePasswordInput {
         .into())
     }
 
+    pub(crate) fn is_from_file(&self) -> bool {
+        self.value.is_some()
+    }
+
     fn initial_claim_password(&self) -> Result<String, Box<dyn std::error::Error>> {
         match &self.value {
             Some(value) => Ok(value.clone()),
@@ -180,23 +184,16 @@ impl StoragePasswordInput {
 }
 
 fn read_storage_password_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let value = std::fs::read_to_string(path)
-        .map_err(|err| {
-            format!(
-                "failed to read storage password file {}: {err}",
-                path.display()
-            )
-        })?
-        .trim_end_matches(['\r', '\n'])
-        .to_string();
-    if value.is_empty() {
-        Err(format!("storage password file {} is empty", path.display()).into())
-    } else {
-        Ok(value)
-    }
+    Ok(enclava_cli::keys::read_secret_file(
+        path,
+        "storage password",
+    )?)
 }
 
 fn storage_password_prompt_available() -> bool {
+    // Both terminals, mirroring secret_from_file_or_prompt's prompted path:
+    // dialoguer renders password prompts on stderr, so a piped stderr cannot
+    // host the prompt. Recorded-output runs (`2>&1 | tee`) use the file flags.
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
@@ -1589,6 +1586,7 @@ pub(crate) async fn claim_initial_ownership(
         &active.org_name,
         app_name,
         capture,
+        storage_password.is_from_file(),
     )?;
 
     let endpoint = api.get_unlock_endpoint(app_name).await?;

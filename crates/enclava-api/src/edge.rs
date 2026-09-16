@@ -1,5 +1,5 @@
 use enclava_common::validate::{
-    ValidateError, validate_app_name, validate_fqdn, validate_org_slug,
+    ValidateError, validate_app_name_legacy, validate_fqdn, validate_org_slug,
 };
 use k8s_openapi::api::{
     apps::v1::DaemonSet,
@@ -746,7 +746,7 @@ pub fn backend_name_for(
     tag: BackendTag,
 ) -> Result<String, EdgeRouteError> {
     validate_org_slug(org_slug)?;
-    validate_app_name(app_name)?;
+    validate_app_name_legacy(app_name)?;
     let sanitized = app_name.replace('-', "_");
     Ok(format!("be_cap_{org_slug}_{sanitized}_{}", tag.as_str()))
 }
@@ -790,7 +790,7 @@ async fn resolve_existing_service_address(
     app_name: &str,
     namespace: &str,
 ) -> Result<Option<String>, EdgeRouteError> {
-    validate_app_name(app_name)
+    validate_app_name_legacy(app_name)
         .map_err(|_| EdgeRouteError::InvalidAppName(format!("invalid app name: {app_name}")))?;
     let service_api: Api<Service> = Api::namespaced(client, namespace);
     let service = match service_api.get(app_name).await {
@@ -825,7 +825,7 @@ pub async fn resolve_gateway_address(
     app_name: &str,
     namespace: &str,
 ) -> Result<Option<IpAddr>, EdgeRouteError> {
-    validate_app_name(app_name)
+    validate_app_name_legacy(app_name)
         .map_err(|_| EdgeRouteError::InvalidAppName(format!("invalid app name: {app_name}")))?;
     let client = Client::try_default().await?;
     let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &gateway_api_resource());
