@@ -274,8 +274,9 @@ mod tests {
         for bad in [
             "Bad_Name",              // uppercase + underscore: not a DNS-1123 label
             "-leading-dash",         // leading '-'
-            "1234",                  // all digits
-            "a".repeat(33).as_str(), // over the 32-char limit
+            "default",               // reserved system name
+            "foo--bar",              // consecutive hyphens
+            "a".repeat(64).as_str(), // over the 63-char limit
         ] {
             assert!(
                 enclava_common::validate::validate_app_name(bad).is_err(),

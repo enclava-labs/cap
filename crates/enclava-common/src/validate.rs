@@ -22,7 +22,6 @@ pub enum ValidateError {
 
 const MAX_DNS_LABEL_LEN: usize = 63;
 const MAX_FQDN_LEN: usize = 253;
-const MAX_APP_NAME_LEN: usize = 32;
 const ORG_SLUG_LEN: usize = 8;
 const IMAGE_DIGEST_HEX_LEN: usize = 64;
 const IMAGE_DIGEST_PREFIX: &str = "sha256:";
@@ -75,21 +74,54 @@ pub fn validate_org_slug(s: &str) -> Result<(), ValidateError> {
     Ok(())
 }
 
-/// DNS-1123 label with extra constraint length ≤ 32.
+/// Platform app name: a Kubernetes DNS-1123 label (1–63 chars, `[a-z0-9-]`)
+/// that starts and ends with a letter or digit, carries no consecutive
+/// hyphens, and is none of the reserved system names. This is the single
+/// source of truth — the API's create path delegates here, so the CLI can
+/// validate scaffolds against exactly the rules the server enforces.
 pub fn validate_app_name(s: &str) -> Result<(), ValidateError> {
+    const RESERVED: [&str; 14] = [
+        "kubernetes",
+        "kube",
+        "kube-system",
+        "kube-public",
+        "kube-node-lease",
+        "default",
+        "kube-service-account",
+        "kube-root-ca",
+        "config",
+        "health",
+        "status",
+        "metrics",
+        "prometheus",
+        "grafana",
+    ];
     if s.is_empty() {
         return Err(ValidateError::InvalidAppName("empty"));
     }
-    if s.len() > MAX_APP_NAME_LEN {
-        return Err(ValidateError::InvalidAppName("exceeds 32 characters"));
+    if s.len() > MAX_DNS_LABEL_LEN {
+        return Err(ValidateError::InvalidAppName("exceeds 63 characters"));
     }
-    validate_dns_label(s).map_err(|_| {
-        ValidateError::InvalidAppName(
-            "must be a DNS-1123 label: [a-z0-9-], no leading/trailing '-'",
-        )
-    })?;
-    if s.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ValidateError::InvalidAppName("must not be all digits"));
+    if RESERVED.contains(&s) {
+        return Err(ValidateError::InvalidAppName("reserved system name"));
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(ValidateError::InvalidAppName("must contain only [a-z0-9-]"));
+    }
+    if !s.starts_with(|c: char| c.is_ascii_alphanumeric())
+        || !s.ends_with(|c: char| c.is_ascii_alphanumeric())
+    {
+        return Err(ValidateError::InvalidAppName(
+            "must start and end with a letter or digit",
+        ));
+    }
+    if s.contains("--") {
+        return Err(ValidateError::InvalidAppName(
+            "must not contain consecutive hyphens",
+        ));
     }
     Ok(())
 }
@@ -260,33 +292,35 @@ mod tests {
     fn app_name_accepts_valid() {
         assert!(validate_app_name("api").is_ok());
         assert!(validate_app_name("my-app").is_ok());
-        let s = "a".repeat(32);
+        assert!(validate_app_name("a1b2-c3").is_ok());
+        let s = "a".repeat(63);
         assert!(validate_app_name(&s).is_ok());
+        // All-digit names are valid: they match the API's create rules
+        // (RFC 1123 dropped the alpha requirement).
+        assert!(validate_app_name("123").is_ok());
     }
 
     #[test]
     fn app_name_rejects_oversized() {
-        let s = "a".repeat(33);
+        let s = "a".repeat(64);
         assert!(validate_app_name(&s).is_err());
     }
 
     #[test]
-    fn app_name_inherits_dns_label_rules() {
-        assert!(validate_app_name("").is_err());
-        assert!(validate_app_name("My-App").is_err());
-        assert!(validate_app_name("-app").is_err());
-        assert!(validate_app_name("app-").is_err());
-        assert!(validate_app_name("..").is_err());
-        assert!(validate_app_name("a\0b").is_err());
-        assert!(validate_app_name("café").is_err());
-    }
-
-    #[test]
-    fn app_name_rejects_all_digits() {
-        // Stricter than validate_dns_label: app names propagate to K8s
-        // service / SA names which must not be all-numeric.
-        assert!(validate_app_name("123").is_err());
-        assert!(validate_app_name("0").is_err());
+    fn app_name_rejects_reserved_and_hyphen_shapes() {
+        for name in [
+            "default",    // reserved system name
+            "kubernetes", // reserved system name
+            "foo--bar",   // consecutive hyphens
+            "My-App",     // uppercase
+            "-app",       // leading hyphen
+            "app-",       // trailing hyphen
+            "a\0b",       // control character
+            "café",       // non-ASCII
+            "",
+        ] {
+            assert!(validate_app_name(name).is_err(), "{name}");
+        }
     }
 
     #[test]
