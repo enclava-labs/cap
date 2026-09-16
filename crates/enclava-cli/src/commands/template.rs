@@ -24,16 +24,17 @@ use enclava_cli::{
     },
     config::{self, CliPaths},
     keys,
-    tee_client::{TeeClient, TeeError},
+    tee_client::{TeeClient, TeeError, parse_terminal_bootstrap_error},
 };
 use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
     BootstrapEndpointStatusDecision, DeploymentWait, SignedDeployBlobParams, StoragePasswordInput,
     bootstrap_endpoint_status_decision, build_signed_deploy_blobs, claim_initial_ownership,
-    deployment_bound_terminal_bootstrap_error,
+    deployment_bound_tee_status, deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
-    fetch_verified_platform_release, generate_log_key_for_app, tee_terminal_diagnostic_probe_due,
+    fetch_verified_platform_release, generate_log_key_for_app,
+    tee_supplemental_fields_are_consistent, tee_terminal_diagnostic_probe_due, tee_unlock_state,
     terminal_bootstrap_failure_message, terminal_diagnostic_budget,
     terminal_diagnostic_probe_with_budget,
 };
@@ -597,6 +598,7 @@ async fn deploy_with_timings(
                 api,
                 &instance_name,
                 deployment,
+                template.unlock_mode == "password",
                 stable_endpoint.as_str(),
                 app_url.as_str(),
                 Duration::from_secs(args.ssh_timeout_seconds),
@@ -786,6 +788,7 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
             &api,
             &instance_name,
             DeploymentWait::new(&latest_deployment_id),
+            app.unlock_mode == "password",
             stable_endpoint,
             expected_app_url.as_str(),
             Duration::from_secs(args.ssh_timeout_seconds),
@@ -2220,10 +2223,26 @@ fn is_reserved_http_app_host(host: &str) -> bool {
         || host.ends_with(".invalid")
 }
 
+/// Wait for the PaaS to report a stable SSH endpoint command for an app.
+///
+/// `password_mode` is the app's unlock mode as the CALLER already knows it
+/// (the deploy flow from the hosted template config, `ssh_command` from its
+/// own `get_app`): the wait must not look it up itself — a one-shot lookup
+/// here would either freeze a transient API failure into "non-password" for
+/// the whole wait or stall past the wait's own deadline on the shared 900s
+/// request timeout. The deploy-time mode is authoritative for this rollout;
+/// mid-wait mode changes are not re-sampled.
+///
+/// The relock stop requires a trusted deployment expectation: the deploy
+/// flow has one, while the standalone `template ssh-command --wait`
+/// resumption deliberately passes none, so that path retains the full-timeout
+/// behavior (a stale TEE's state must never be attributed to an unbound wait).
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_paas_ssh_command(
     api: &ApiClient,
     app_name: &str,
     deployment: DeploymentWait<'_>,
+    password_mode: bool,
     stable_endpoint: &str,
     expected_app_url: &str,
     timeout: Duration,
@@ -2239,23 +2258,32 @@ async fn wait_for_paas_ssh_command(
             timeout,
         ));
         fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
-        // Post-claim wait: a terminal bootstrap diagnostic (e.g. ACME issuance
-        // failure) must stop this loop promptly with the stable code instead
-        // of waiting out the full SSH timeout. The probe is bound to the
-        // expected deployment via CAP before and after the attested read; a
-        // `pending`/unknown deployment id never binds, so the probe is
-        // skipped rather than guessing.
+        // Post-claim wait: one deployment-bound attested status read covers
+        // both stop conditions -- a terminal bootstrap diagnostic, and a
+        // password-mode relock (the pod rolled, the TEE came back locked, and
+        // no server-side process will unlock it; only `enclava unlock`
+        // converges the deployment). The read binds the endpoint to the
+        // expected deployment first, so a stale TEE's state is never
+        // attributed to this rollout; a `pending`/unknown deployment id never
+        // binds, so the probe is skipped rather than guessing.
         if tee_terminal_diagnostic_probe_due(&mut terminal_probe_at)
-            && let Some(diagnostic) = deployment_bound_terminal_bootstrap_error(
-                api,
-                app_name,
-                deployment,
-                start + timeout,
-            )
-            .await
+            && let Some(status) =
+                deployment_bound_tee_status(api, app_name, deployment, start + timeout).await
         {
-            progress.abandon_with_message("TEE bootstrap failed");
-            return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
+            if let Some(diagnostic) = parse_terminal_bootstrap_error(&status) {
+                progress.abandon_with_message("TEE bootstrap failed");
+                return Err(terminal_bootstrap_failure_message(app_name, &diagnostic).into());
+            }
+            if password_mode
+                && tee_supplemental_fields_are_consistent(&status)
+                && tee_unlock_state(&status) == "locked"
+            {
+                progress.abandon_with_message("TEE relocked (password mode): unlock required");
+                return Err(format!(
+                    "app {app_name} relocked after the update (password mode): run `enclava unlock --app {app_name}` to finish, then `enclava template ssh-command --name {app_name} --wait`"
+                )
+                .into());
+            }
         }
         let response = match api.get_template_ssh_command(app_name).await {
             Ok(response) => response,
@@ -4152,6 +4180,77 @@ mod tests {
     }
 
     #[test]
+    fn ssh_command_wait_receives_password_mode_from_caller_metadata() {
+        // The unlock mode must come from metadata each caller already holds
+        // (deploy flow: the hosted template config; ssh_command: its own
+        // get_app fetch with error propagation). A lookup inside the wait
+        // would freeze one transient API failure into "non-password" for the
+        // whole wait, or stall past the wait's deadline on the shared 900s
+        // request timeout.
+        let source = include_str!("template.rs");
+        let fn_start = source
+            .find("async fn wait_for_paas_ssh_command")
+            .expect("SSH command wait function exists");
+        let fn_end = source[fn_start..]
+            .find("async fn latest_deployment_id")
+            .expect("latest_deployment_id follows SSH command wait")
+            + fn_start;
+        let body = &source[fn_start..fn_end];
+
+        assert!(
+            !body.contains("get_app"),
+            "the wait must not look up app metadata itself"
+        );
+
+        let deploy_call = source
+            .find("async fn deploy_with_timings")
+            .expect("deploy flow exists");
+        let deploy_body = &source[deploy_call..fn_start];
+        assert!(
+            deploy_body.contains("template.unlock_mode == \"password\""),
+            "the deploy flow must pass its hosted-template unlock mode"
+        );
+        assert!(
+            source.contains("app.unlock_mode == \"password\""),
+            "the ssh_command resumption must pass its get_app unlock mode"
+        );
+    }
+
+    #[test]
+    fn ssh_command_wait_names_password_mode_relock_when_detected() {
+        // An operator-blocked TEE (password-mode relock after a roll) must stop
+        // the wait with unlock guidance, not time out advising the operator to
+        // keep waiting. The stop is a detected state on a deployment-bound
+        // attested read and gated on the app's unlock mode — never a guess.
+        let source = include_str!("template.rs");
+        let fn_start = source
+            .find("async fn wait_for_paas_ssh_command")
+            .expect("SSH command wait function exists");
+        let fn_end = source[fn_start..]
+            .find("async fn latest_deployment_id")
+            .expect("latest_deployment_id follows SSH command wait")
+            + fn_start;
+        let body = &source[fn_start..fn_end];
+
+        assert!(
+            body.contains("enclava unlock --app {app_name}"),
+            "the relock stop must name the unlock command: {body}"
+        );
+        assert!(
+            body.contains("password_mode"),
+            "the relock stop must be gated on the app's unlock mode"
+        );
+        assert!(
+            body.contains("tee_unlock_state(&status) == \"locked\""),
+            "the relock stop must key off the detected TEE state"
+        );
+        assert!(
+            body.contains("deployment_bound_tee_status"),
+            "the status read must be deployment-bound, not guessed"
+        );
+    }
+
+    #[test]
     fn ssh_command_endpoint_match_requires_reserved_address() {
         ensure_ssh_command_matches_endpoint(
             "ssh -p 17958 user@6.tcp.eu.ngrok.io",
@@ -5353,16 +5452,21 @@ mod tests {
             "the terminal decision must outrank the already-claimed fallback"
         );
 
-        for marker in [
-            "async fn wait_for_paas_managed_config_keys",
-            "async fn wait_for_paas_ssh_command",
+        for (marker, probe) in [
+            (
+                "async fn wait_for_paas_managed_config_keys",
+                "deployment_bound_terminal_bootstrap_error",
+            ),
+            (
+                "async fn wait_for_paas_ssh_command",
+                "deployment_bound_tee_status",
+            ),
         ] {
             let start = source.find(marker).unwrap();
             let end = source[start..].find("\nasync fn ").unwrap() + start;
             let body = &source[start..end];
             assert!(
-                body.contains("deployment_bound_terminal_bootstrap_error")
-                    && body.contains("terminal_bootstrap_failure_message"),
+                body.contains(probe) && body.contains("terminal_bootstrap_failure_message"),
                 "{marker} must stop on deployment-bound verified terminal bootstrap diagnostics"
             );
         }

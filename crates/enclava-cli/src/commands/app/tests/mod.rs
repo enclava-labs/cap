@@ -2685,7 +2685,7 @@ mod terminal_diagnostics {
         // verification -> predicate -> reader: the launch-identity predicate
         // must gate the bounded status read.
         let reader_start = source
-            .find("async fn terminal_diagnostic_on_attested")
+            .find("async fn bound_tee_status_on_attested")
             .unwrap();
         let reader_end = source[reader_start..].find("\nasync fn ").unwrap() + reader_start;
         let reader = &source[reader_start..reader_end];
