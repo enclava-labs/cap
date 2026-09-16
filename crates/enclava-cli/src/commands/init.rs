@@ -276,6 +276,7 @@ mod tests {
             "-leading-dash",         // leading '-'
             "default",               // reserved system name
             "foo--bar",              // consecutive hyphens
+            "1234",                  // all digits (K8s service-name rule)
             "a".repeat(64).as_str(), // over the 63-char limit
         ] {
             assert!(

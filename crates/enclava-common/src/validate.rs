@@ -123,6 +123,13 @@ pub fn validate_app_name(s: &str) -> Result<(), ValidateError> {
             "must not contain consecutive hyphens",
         ));
     }
+    // Deliberate platform constraint (d475553): app names propagate to
+    // Kubernetes service names, which must not be all-numeric. The
+    // consolidation wires this into the create path for the first time —
+    // before, only the CLI-side validator enforced it.
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ValidateError::InvalidAppName("must not be all digits"));
+    }
     Ok(())
 }
 
@@ -295,9 +302,15 @@ mod tests {
         assert!(validate_app_name("a1b2-c3").is_ok());
         let s = "a".repeat(63);
         assert!(validate_app_name(&s).is_ok());
-        // All-digit names are valid: they match the API's create rules
-        // (RFC 1123 dropped the alpha requirement).
-        assert!(validate_app_name("123").is_ok());
+    }
+
+    #[test]
+    fn app_name_rejects_all_digits() {
+        // K8s service names must not be all-numeric (d475553); the shared
+        // validator is the enforcement point for that platform constraint.
+        assert!(validate_app_name("123").is_err());
+        assert!(validate_app_name("0").is_err());
+        assert!(validate_app_name("a1").is_ok());
     }
 
     #[test]
