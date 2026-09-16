@@ -1,11 +1,12 @@
 use super::{
     AppDeleteFailure, CreateAppRequest, EgressAllowlistAuditReason, RotateSignerRequest,
-    SignerRotationTokenRequest, app_delete_failure, create_app,
+    SignerRotationTokenRequest, WorkloadTeardownDecision, app_delete_failure, create_app,
     delete_tenant_namespace_with_timeouts, derive_identity, egress_allowlist_host_audit_reasons,
-    issue_signer_rotation_token_route, list_apps, request_workload_teardown,
-    requires_workload_teardown, validate_egress_allowlist, validate_egress_mode,
-    workload_teardown_instance_id,
+    issue_signer_rotation_token_route, list_apps, post_workload_teardown,
+    request_workload_teardown, requires_workload_teardown, validate_egress_allowlist,
+    validate_egress_mode, workload_teardown_http_failure, workload_teardown_instance_id,
 };
+use crate::auth::middleware::AuthContext;
 use crate::models::{App, AppStatus, Role, UnlockMode};
 use axum::Json;
 use axum::extract::{Path, State};
@@ -49,6 +50,44 @@ fn captured_warn_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::dispatcher::DefaultGua
 fn captured_log_text(logs: &Arc<Mutex<Vec<u8>>>) -> String {
     String::from_utf8(logs.lock().expect("captured log mutex").clone())
         .expect("captured logs are UTF-8")
+}
+
+fn teardown_test_app(auth: &AuthContext, status: AppStatus, domain: &str) -> App {
+    App {
+        id: uuid::Uuid::new_v4(),
+        org_id: auth.org_id,
+        name: "secret-app-name-sentinel".to_string(),
+        namespace: "secret-namespace-sentinel".to_string(),
+        instance_id: "a826eb13-12345678".to_string(),
+        tenant_id: "a826eb13".to_string(),
+        service_account: "cap-demo-sa".to_string(),
+        bootstrap_owner_pubkey_hash: "00".repeat(32),
+        tenant_instance_identity_hash: "11".repeat(32),
+        unlock_mode: UnlockMode::Password,
+        domain: domain.to_string(),
+        tee_domain: Some(domain.to_string()),
+        custom_domain: None,
+        status,
+        signer_identity_subject: None,
+        signer_identity_issuer: None,
+        signer_identity_set_at: None,
+        source_provider: None,
+        source_repository: None,
+        egress_allowlist: sqlx::types::Json(Vec::new()),
+        egress_mode: "restricted".to_string(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+fn unreachable_tee_state() -> crate::state::AppState {
+    let mut state = crate::test_support::lazy_state();
+    state.tee_http_client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    state
 }
 
 #[test]
@@ -235,9 +274,9 @@ fn teardown_token_instance_id_matches_attestation_proxy_owner_instance_id() {
 }
 
 #[test]
-fn running_and_deleting_apps_require_workload_teardown_endpoint() {
+fn running_apps_require_workload_teardown_endpoint() {
     assert!(requires_workload_teardown(AppStatus::Running));
-    assert!(requires_workload_teardown(AppStatus::Deleting));
+    assert!(!requires_workload_teardown(AppStatus::Deleting));
     assert!(!requires_workload_teardown(AppStatus::Creating));
     assert!(!requires_workload_teardown(AppStatus::Failed));
     assert!(!requires_workload_teardown(AppStatus::Stopped));
@@ -375,9 +414,17 @@ async fn unreachable_running_workload_teardown_blocks_deletion_and_diagnostics_a
     };
 
     let (logs, guard) = captured_warn_logs();
-    let (status, Json(body)) = request_workload_teardown(&state, &auth, &app)
-        .await
-        .expect_err("unreachable workload teardown endpoint must block deletion");
+    let (status, Json(body)) = request_workload_teardown(
+        &state,
+        &auth,
+        &app,
+        WorkloadTeardownDecision {
+            required: true,
+            completed: false,
+        },
+    )
+    .await
+    .expect_err("unreachable workload teardown endpoint must block deletion");
     drop(guard);
 
     let diagnostics = captured_log_text(&logs);
@@ -396,6 +443,109 @@ async fn unreachable_running_workload_teardown_blocks_deletion_and_diagnostics_a
             "tenant-controlled teardown data escaped into the delete error response"
         );
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_and_creating_apps_skip_unreachable_workload_teardown() {
+    let state = unreachable_tee_state();
+    let auth = crate::test_support::auth_context(Role::Admin, &["apps:write"]);
+
+    for status in [AppStatus::Creating, AppStatus::Failed, AppStatus::Stopped] {
+        let app = teardown_test_app(&auth, status, "secret-teardown-host.invalid");
+        let (logs, guard) = captured_warn_logs();
+        request_workload_teardown(
+            &state,
+            &auth,
+            &app,
+            WorkloadTeardownDecision {
+                required: requires_workload_teardown(status),
+                completed: false,
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{status:?} app delete must not require TEE teardown"));
+        drop(guard);
+        let diagnostics = captured_log_text(&logs);
+        assert!(
+            !diagnostics.contains("app_delete_teardown_unavailable"),
+            "{status:?} app delete contacted an unreachable TEE"
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn completed_workload_teardown_skips_unreachable_retry() {
+    let state = unreachable_tee_state();
+    let auth = crate::test_support::auth_context(Role::Admin, &["apps:write"]);
+    let app = teardown_test_app(&auth, AppStatus::Deleting, "secret-teardown-host.invalid");
+
+    let (logs, guard) = captured_warn_logs();
+    request_workload_teardown(
+        &state,
+        &auth,
+        &app,
+        WorkloadTeardownDecision {
+            required: true,
+            completed: true,
+        },
+    )
+    .await
+    .expect("retry after successful teardown must proceed while the TEE is gone");
+    drop(guard);
+
+    let diagnostics = captured_log_text(&logs);
+    assert!(!diagnostics.contains("app_delete_teardown_unavailable"));
+}
+
+#[test]
+fn locked_running_workload_teardown_blocks_deletion_and_diagnostics_are_bounded() {
+    const SECRET: &str = "upstream-locked-body-sentinel";
+    let app_id = uuid::Uuid::new_v4();
+    let (logs, guard) = captured_warn_logs();
+    let (status, Json(body)) = workload_teardown_http_failure(app_id, StatusCode::LOCKED);
+    drop(guard);
+
+    let diagnostics = captured_log_text(&logs);
+    let response = serde_json::to_string(&body).expect("delete error response serializes");
+    assert_eq!(status, StatusCode::LOCKED);
+    assert_eq!(body["error"], "app_delete_teardown_locked");
+    assert!(diagnostics.contains(&app_id.to_string()));
+    assert!(diagnostics.contains("app_delete_teardown_locked"));
+    assert!(!diagnostics.contains(SECRET));
+    assert!(!response.contains(SECRET));
+}
+
+#[tokio::test]
+async fn locked_running_workload_teardown_http_status_fails_destroy() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = axum::Router::new().route(
+        "/.well-known/confidential/teardown",
+        axum::routing::post(|| async { StatusCode::LOCKED }),
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+
+    let mut state = crate::test_support::lazy_state();
+    state.tee_http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let auth = crate::test_support::auth_context(Role::Admin, &["apps:write"]);
+    let app = teardown_test_app(&auth, AppStatus::Running, "secret-teardown-host.invalid");
+    let url = format!("http://{address}/.well-known/confidential/teardown");
+
+    let (logs, guard) = captured_warn_logs();
+    let (status, Json(body)) = post_workload_teardown(&state, &app, "teardown-token", &url)
+        .await
+        .expect_err("locked password-mode TEE must block destroy");
+    drop(guard);
+    task.abort();
+
+    let diagnostics = captured_log_text(&logs);
+    assert_eq!(status, StatusCode::LOCKED);
+    assert_eq!(body["error"], "app_delete_teardown_locked");
+    assert!(diagnostics.contains(&app.id.to_string()));
+    assert!(!diagnostics.contains("secret-app-name-sentinel"));
+    assert!(!diagnostics.contains("secret-namespace-sentinel"));
+    assert!(!diagnostics.contains("secret-teardown-host.invalid"));
+    assert!(!diagnostics.contains(&url));
 }
 
 #[test]
@@ -475,6 +625,31 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
                 .find("enqueue_signed_policy_revocation_if_active")
                 .expect("app deletion enqueues signed-policy revocation"),
         "app deletion must preserve KBS authorization until workload teardown completes"
+    );
+    assert!(
+        deletion
+            .contains("WHEN status = 'deleting'::app_status_enum THEN workload_teardown_required"),
+        "app deletion must persist the pre-delete teardown decision across retries"
+    );
+    assert!(
+        deletion.contains("requires_workload_teardown(phase_app.status)"),
+        "app deletion must decide teardown from the status before the deleting transition"
+    );
+    assert!(
+        !deletion.contains("requires_workload_teardown(deleting_app.status)"),
+        "app deletion must not re-derive teardown from the post-transition Deleting status"
+    );
+    assert!(
+        teardown.contains("workload_teardown_completed_at"),
+        "successful teardown must persist a durable completion marker"
+    );
+    assert!(
+        teardown.contains("app_delete_teardown_already_completed"),
+        "retries must skip TEE teardown after the completion marker is set"
+    );
+    assert!(
+        teardown.contains("AppDeleteFailure::TeardownLocked"),
+        "a locked TEE must fail destroy through a stable teardown error code"
     );
     for failure in [
         "app_delete_dns_failure",
