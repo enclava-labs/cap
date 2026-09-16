@@ -281,16 +281,19 @@ pub(crate) fn validate_recovery_mnemonic_sink_mode(
     Ok(())
 }
 
-/// Unattended claims stay disabled until response-loss recovery exists: the TEE
-/// hands out recovery material exactly once and rejects a second claim, so a
-/// claim whose response is lost in an unattended run strands the mnemonic
+/// A terminal on stdin is the operative attendance signal for a claim: prompts
+/// are read from stdin, and a human is present to answer them. A redirected
+/// stderr (e.g. `2>&1 | tee`, the standard record-everything pattern) does NOT
+/// make a session unattended — tee mirrors the prompts back to the terminal,
+/// and the one-time mnemonic is persisted to the protected local keystore in
+/// addition to being printed — so only stdin decides. Unattended claims (no
+/// terminal on stdin) stay disabled until response-loss recovery exists: the
+/// TEE hands out recovery material exactly once and rejects a second claim, so
+/// a claim whose response is lost in an unattended run strands the mnemonic
 /// irrecoverably with nobody watching. Interactive claims at least fail loudly
 /// in front of the operator who just set the unlock password.
-pub(crate) fn claim_session_is_interactive(
-    stdin_is_terminal: bool,
-    stderr_is_terminal: bool,
-) -> bool {
-    stdin_is_terminal && stderr_is_terminal
+pub(crate) fn claim_session_is_interactive(stdin_is_terminal: bool) -> bool {
+    stdin_is_terminal
 }
 
 fn ensure_claim_session_for(interactive: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -298,10 +301,11 @@ fn ensure_claim_session_for(interactive: bool) -> Result<(), Box<dyn std::error:
         return Ok(());
     }
     Err(
-        "ownership claims require an interactive terminal: unattended (CI/script) claims are \
+        "ownership claims require an interactive terminal on stdin: unattended (CI/script) claims are \
          disabled until response-loss recovery is supported. The TEE returns the one-time \
          recovery mnemonic only once, so a lost response in an unattended run is unrecoverable. \
-         Run `enclava claim` (or a deploy that auto-claims) from an interactive shell."
+         Run `enclava claim` (or a deploy that auto-claims) from an interactive shell; \
+         redirecting output (e.g. `2>&1 | tee`) is supported."
             .into(),
     )
 }
@@ -324,7 +328,7 @@ pub(crate) fn prepare_recovery_mnemonic_sink(
         org,
         app,
         capture,
-        claim_session_is_interactive(io::stdin().is_terminal(), io::stderr().is_terminal()),
+        claim_session_is_interactive(io::stdin().is_terminal()),
     )
 }
 
@@ -818,10 +822,9 @@ mod tests {
 
     #[test]
     fn claim_session_interactivity_matrix() {
-        assert!(claim_session_is_interactive(true, true));
-        assert!(!claim_session_is_interactive(true, false));
-        assert!(!claim_session_is_interactive(false, true));
-        assert!(!claim_session_is_interactive(false, false));
+        // stdin decides; a redirected stderr (`2>&1 | tee`) is still attended.
+        assert!(claim_session_is_interactive(true));
+        assert!(!claim_session_is_interactive(false));
     }
 
     #[test]
