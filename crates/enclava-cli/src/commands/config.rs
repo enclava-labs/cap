@@ -92,14 +92,20 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
                     TeeClient::new_with_resolve_ip(tee_domain, token_resp.tee_resolve_ip)
                 });
             let (_attestation, tee) = tee.attest_receipt_key().await?;
+            let mut note_printed = false;
             for (key, value) in &pairs {
                 tee.config_set(key, value, &token_resp.token).await?;
+                // The value is live in the TEE store from here on; emit the
+                // application note before any later step can fail the command.
+                if !note_printed {
+                    println!("{CONFIG_APPLICATION_NOTE}");
+                    note_printed = true;
+                }
                 api.sync_config_key(&app_name, key, false).await?;
                 println!("Set {key}");
             }
 
             println!("Config updated ({} key(s)).", pairs.len());
-            println!("{CONFIG_APPLICATION_NOTE}");
         }
 
         ConfigCommand::Get { app } => {
@@ -139,12 +145,14 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
                 });
             let (_attestation, tee) = tee.attest_receipt_key().await?;
             tee.config_unset(&key, &token_resp.token).await?;
+            // The key is removed from the TEE store from here on; emit the
+            // application note before any later step can fail the command.
+            println!("{CONFIG_APPLICATION_NOTE}");
 
             // Delete metadata from API
             api.delete_config_meta(&app_name, &key).await?;
 
             println!("Unset {key}.");
-            println!("{CONFIG_APPLICATION_NOTE}");
         }
     }
     Ok(())
@@ -196,15 +204,18 @@ mod tests {
             + set_start;
         let set_body = &source[set_start..get_start];
 
-        let updated = set_body
-            .find("Config updated")
-            .expect("set prints a completion line");
+        let tee_write = set_body
+            .find("config_set")
+            .expect("set writes values to the TEE");
         let note = set_body
             .find("CONFIG_APPLICATION_NOTE")
             .expect("set names the next-boot application contract");
+        let sync = set_body
+            .find("sync_config_key")
+            .expect("set syncs key metadata after the TEE write");
         assert!(
-            updated < note,
-            "set prints the application note after the completion line"
+            tee_write < note && note < sync,
+            "set prints the application note after the first TEE mutation and before the metadata sync can fail the command"
         );
 
         let unset_start = source
@@ -213,15 +224,18 @@ mod tests {
         let tests_start = source.find("#[cfg(test)]").expect("tests module exists");
         let unset_body = &source[unset_start..tests_start];
 
-        let unset_done = unset_body
-            .find("Unset {key}")
-            .expect("unset prints a completion line");
+        let tee_delete = unset_body
+            .find("config_unset")
+            .expect("unset deletes the key from the TEE");
         let unset_note = unset_body
             .find("CONFIG_APPLICATION_NOTE")
             .expect("unset names the next-boot application contract");
+        let meta_delete = unset_body
+            .find("delete_config_meta")
+            .expect("unset deletes key metadata after the TEE deletion");
         assert!(
-            unset_done < unset_note,
-            "unset prints the application note after the completion line"
+            tee_delete < unset_note && unset_note < meta_delete,
+            "unset prints the application note after the TEE deletion and before the metadata delete can fail the command"
         );
     }
 
