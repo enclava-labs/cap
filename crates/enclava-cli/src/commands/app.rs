@@ -1674,6 +1674,7 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
         .as_ref()
         .map(stable_ssh_endpoint_state_from_app)
         .unwrap_or(StableSshEndpointState::NotStableTemplate);
+    let mut tee_acme_retry_after: Option<String> = None;
     if let Ok(endpoint) = api.get_unlock_endpoint(&app_name).await {
         let tee = TeeClient::new_for_ownership_with_resolve_ip(
             &endpoint.tee_url,
@@ -1682,6 +1683,10 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
         if let Ok((_attestation, attested_tee)) = tee.attest_receipt_key().await
             && let Ok(tee_status_json) = attested_tee.status_json().await
         {
+            tee_acme_retry_after = tee_status_json
+                .get("acme_retry_after")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
             let state = tee_unlock_state(&tee_status_json);
             status.status = status_with_attested_tee_state(&status.status, state);
             if status.tee_status.is_none() {
@@ -1743,6 +1748,9 @@ pub async fn status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> 
     }
     if let Some(tee_error) = &status.tee_error {
         println!("TEE error: {}", tee_error.red());
+    }
+    if let Some(retry_after) = &tee_acme_retry_after {
+        println!("TEE wait:  acme_rate_limited, retrying after {retry_after}");
     }
     if let Some(deployed) = &status.last_deployed {
         println!("Deployed: {deployed}");

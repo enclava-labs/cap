@@ -90,6 +90,219 @@ const TLS_KEY_BINDING_PROBE: &[u8] = b"enclava-init tls certificate key binding 
 /// treated as an unbounded (malformed) body and never read into memory.
 const MAX_BROKER_RESPONSE_BYTES: usize = 64 * 1024;
 
+/// Farthest a single honored ACME `retry_after` deadline may lie in the
+/// future. A broker deadline beyond this is not waited on: provisioning
+/// fails terminally with the preserved diagnostic instead of parking the
+/// bootstrap for an operator-invisible span. Four hours comfortably covers
+/// the Let's Encrypt rate-limit windows observed in production telemetry
+/// (~40-minute order spacing) while still bounding the certificate phase.
+const ACME_RETRY_MAX_WAIT_SECS: i64 = 4 * 60 * 60;
+
+/// Most rate-limit waits honored per provisioning call. A provider that
+/// keeps answering `acme_rate_limited` cannot hold the workload in the
+/// certificate phase forever.
+const ACME_RETRY_MAX_ROUNDS: u32 = 12;
+
+/// Location of the persisted rate-limit deadline relative to the
+/// confidential persistent root, next to the retained key. Surviving a pod
+/// restart is the whole point: a restarted init resumes the honored wait
+/// instead of submitting a fresh ACME order and compounding the limit.
+const ACME_RETRY_RELATIVE_PATH: &str = "certificates/acme-retry.json";
+
+/// Bound on the persisted marker size; the marker is a three-field JSON
+/// document and anything larger is treated as corrupt.
+const MAX_ACME_RETRY_MARKER_BYTES: u64 = 4 * 1024;
+
+/// Clock/sleep seam for the ACME rate-limit wait. Production uses the
+/// real clock and thread sleep; tests inject a deterministic fake so the
+/// wait logic is exercised without wall-clock delays.
+pub(crate) struct AcmeWait {
+    /// Runtime marker file the attestation proxy polls so a certificate
+    /// cooldown never degrades into an `unlock_timeout` ownership error.
+    /// Best-effort: observability only, never a provisioning failure.
+    pub cooldown_file: PathBuf,
+    pub now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    pub sleep_until: Box<dyn Fn(DateTime<Utc>) + Send + Sync>,
+}
+
+impl AcmeWait {
+    fn production(cooldown_file: &Path) -> Self {
+        Self {
+            cooldown_file: cooldown_file.to_path_buf(),
+            now: Box::new(Utc::now),
+            sleep_until: Box::new(|deadline| {
+                loop {
+                    let remaining = deadline - Utc::now();
+                    let Ok(remaining) = remaining.to_std() else {
+                        return;
+                    };
+                    // Chunk the wait so clock adjustments settle and shutdown
+                    // signals are observed reasonably promptly.
+                    std::thread::sleep(remaining.min(Duration::from_secs(60)));
+                }
+            }),
+        }
+    }
+}
+
+/// Persisted rate-limit deadline, bound to the exact request it was
+/// issued for so stale markers never suppress a different request's
+/// issuance. The fingerprint hashes the retained key and the configured
+/// hostnames — not the CSR DER, whose signature is not deterministic
+/// across serializations.
+#[derive(Debug, Serialize, Deserialize)]
+struct AcmeRetryMarker {
+    version: u32,
+    request_sha256: String,
+    retry_after: String,
+}
+
+/// Stable fingerprint of the issuance request a persisted deadline
+/// applies to: the private key PEM and the exact configured hostname list.
+fn acme_request_fingerprint(key_pem: &str, hostnames: &[String]) -> String {
+    let mut input = key_pem.as_bytes().to_vec();
+    input.push(0);
+    for hostname in hostnames {
+        input.extend_from_slice(hostname.as_bytes());
+        input.push(0);
+    }
+    hex::encode(Sha256::digest(&input))
+}
+
+fn acme_retry_marker_path(persistent_root: &Path) -> PathBuf {
+    persistent_root.join(ACME_RETRY_RELATIVE_PATH)
+}
+
+/// Read the persisted cooldown deadline for this CSR, honoring the same
+/// bounds as a live broker response: UTC-only RFC 3339, horizon-limited,
+/// and no farther out than a single honored wait. Corrupt, oversized,
+/// mismatched, or expired markers are removed and ignored — a fresh order
+/// is then the correct recovery.
+fn persisted_retry_deadline(
+    persistent_root: &Path,
+    request_sha256: &str,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let path = acme_retry_marker_path(persistent_root);
+    let drop_marker = |why: &str| {
+        if let Err(err) = std::fs::remove_file(&path) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                reason = why,
+                "failed to remove unusable persisted ACME retry marker"
+            );
+        }
+        None
+    };
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return drop_marker("unreadable"),
+    };
+    if !metadata.is_file() || metadata.len() > MAX_ACME_RETRY_MARKER_BYTES {
+        return drop_marker("invalid");
+    }
+    let body = match std::fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(_) => return drop_marker("unreadable"),
+    };
+    let marker = match serde_json::from_str::<AcmeRetryMarker>(&body) {
+        Ok(marker) => marker,
+        Err(_) => return drop_marker("malformed"),
+    };
+    if marker.version != 1 || marker.request_sha256 != request_sha256 {
+        return drop_marker("mismatched");
+    }
+    let deadline = SafeBootstrapDiagnostic::parse_retry_after(&marker.retry_after, now)
+        .filter(|deadline| *deadline > now)
+        .filter(|deadline| (*deadline - now).num_seconds() <= ACME_RETRY_MAX_WAIT_SECS);
+    match deadline {
+        Some(deadline) => Some(deadline),
+        None => drop_marker("expired-or-out-of-bounds"),
+    }
+}
+
+fn persist_retry_deadline(
+    persistent_root: &Path,
+    request_sha256: &str,
+    deadline: DateTime<Utc>,
+) -> Result<()> {
+    let marker = AcmeRetryMarker {
+        version: 1,
+        request_sha256: request_sha256.to_string(),
+        retry_after: deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    };
+    let body = serde_json::to_vec(&marker).context("encoding ACME retry marker")?;
+    writes::atomic_write(&acme_retry_marker_path(persistent_root), &body, 0o600)
+        .context("persisting ACME retry deadline")
+}
+
+fn clear_persisted_retry_deadline(persistent_root: &Path) {
+    let path = acme_retry_marker_path(persistent_root);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to clear persisted ACME retry deadline"
+        ),
+    }
+}
+
+/// Publish the non-terminal cooldown marker consumed by the attestation
+/// proxy's init-ready watch: `{"error":"acme_rate_limited","terminal":false,
+/// "retry_after":<UTC>,"retry_after_unix":<secs>}`. The proxy uses the
+/// integer deadline to extend its wait instead of degrading the
+/// certificate cooldown into a terminal ownership error, and surfaces the
+/// RFC 3339 field on the attested status endpoint for operators.
+fn write_acme_cooldown_marker(path: &Path, deadline: DateTime<Utc>) {
+    let body = serde_json::json!({
+        "error": "acme_rate_limited",
+        "terminal": false,
+        "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "retry_after_unix": deadline.timestamp(),
+    })
+    .to_string();
+    if let Err(err) = writes::atomic_write(path, format!("{body}\n").as_bytes(), 0o644) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to write ACME cooldown marker"
+        );
+    }
+}
+
+fn clear_acme_cooldown_marker(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to clear ACME cooldown marker"
+        ),
+    }
+}
+
+/// A broker diagnostic is a waitable rate-limit cooldown only when it is
+/// the exact typed code carrying a validated deadline that is still in the
+/// future and within the single-wait bound. Missing, elapsed, or
+/// over-horizon deadlines stay terminal.
+fn waitable_rate_limit(
+    diagnostic: &SafeBootstrapDiagnostic,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if diagnostic.code != SafeDiagnosticCode::AcmeRateLimited {
+        return None;
+    }
+    diagnostic
+        .retry_after
+        .filter(|deadline| *deadline > now)
+        .filter(|deadline| (*deadline - now).num_seconds() <= ACME_RETRY_MAX_WAIT_SECS)
+}
+
 /// Typed terminal TLS broker failure carrying only the safe, bounded
 /// diagnostic — never raw response text, HTTP detail, or provider prose.
 ///
@@ -179,19 +392,62 @@ fn read_response_body_bounded(
     }
 }
 
-pub fn provision_static_tls_certificate(cfg: &Config, persistent_root: &Path) -> Result<()> {
-    provision_with_trust_anchors(cfg, persistent_root, TLS_SERVER_ROOTS)
+/// Provision the static TLS certificate, waiting through bounded ACME
+/// rate-limit cooldowns instead of failing terminally on the first
+/// `acme_rate_limited` response.
+///
+/// `cooldown_file` is the runtime marker the attestation proxy polls
+/// (e.g. `/run/enclava/init-acme-cooldown`): while a rate-limit wait is in
+/// progress it carries `{"error":"acme_rate_limited","terminal":false,
+/// "retry_after":...}` so the proxy's init-ready watch extends its own
+/// deadline instead of degrading the wait into an ownership error, and the
+/// attested status endpoint can surface the pending retry to operators.
+pub fn provision_static_tls_certificate(
+    cfg: &Config,
+    persistent_root: &Path,
+    cooldown_file: &Path,
+) -> Result<()> {
+    provision_with_policy(
+        cfg,
+        persistent_root,
+        TLS_SERVER_ROOTS,
+        &AcmeWait::production(cooldown_file),
+    )
 }
 
 /// Same as [`provision_static_tls_certificate`], with the trust anchor set
-/// injected by the in-module tests (synthetic independently trusted anchors).
-/// Production callers reach this only through
-/// [`provision_static_tls_certificate`], which always passes the public
-/// `webpki-roots` store; there is no configuration path that alters anchors.
+/// injected by the in-module tests (synthetic independently trusted
+/// anchors) and a wait policy that panics if code under test tries to
+/// sleep — tests exercising the retry path call
+/// [`provision_with_policy`] with a fake clock instead. Production callers
+/// reach this only through [`provision_static_tls_certificate`], which
+/// always passes the public `webpki-roots` store; there is no
+/// configuration path that alters anchors.
+#[cfg(test)]
 fn provision_with_trust_anchors(
     cfg: &Config,
     persistent_root: &Path,
     trust_anchors: &[TrustAnchor<'_>],
+) -> Result<()> {
+    provision_with_policy(
+        cfg,
+        persistent_root,
+        trust_anchors,
+        &AcmeWait {
+            cooldown_file: persistent_root.join("init-acme-cooldown"),
+            now: Box::new(Utc::now),
+            sleep_until: Box::new(|deadline| {
+                panic!("unexpected ACME rate-limit wait for {deadline}")
+            }),
+        },
+    )
+}
+
+fn provision_with_policy(
+    cfg: &Config,
+    persistent_root: &Path,
+    trust_anchors: &[TrustAnchor<'_>],
+    wait: &AcmeWait,
 ) -> Result<()> {
     let Some(broker_url) = cfg.tls_certificate_broker_url.as_deref() else {
         return Ok(());
@@ -238,12 +494,26 @@ fn provision_with_trust_anchors(
 
     let key_pair = load_or_generate_key(&key_path)?;
     let csr_der = build_csr_der(&cfg.tls_certificate_hostnames, &key_pair)?;
-    let token = trustee_verify::resolve_kbs_attestation_token(
-        std::env::var("KBS_ATTESTATION_TOKEN").ok().as_deref(),
-        &cfg.kbs_attestation_token_url,
-        Duration::from_secs(15),
-    )
-    .context("resolving KBS attestation token for TLS certificate broker")?;
+    let request_sha256 =
+        acme_request_fingerprint(&key_pair.serialize_pem(), &cfg.tls_certificate_hostnames);
+
+    // A restart while an earlier cooldown was being honored resumes the
+    // wait before submitting a new order — every broker POST is itself an
+    // ACME order and would compound the rate limit.
+    if let Some(deadline) = persisted_retry_deadline(persistent_root, &request_sha256, (wait.now)())
+    {
+        tracing::info!(
+            retry_after = %deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "resuming persisted ACME rate-limit cooldown"
+        );
+        write_acme_cooldown_marker(&wait.cooldown_file, deadline);
+        (wait.sleep_until)(deadline);
+    } else {
+        // A container restart inside the same pod keeps /run/enclava; a
+        // cooldown marker left by a previous run whose persisted deadline
+        // is gone or unusable must not keep extending the proxy's watch.
+        clear_acme_cooldown_marker(&wait.cooldown_file);
+    }
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(180))
@@ -251,35 +521,70 @@ fn provision_with_trust_anchors(
         .context("building TLS certificate broker client")?;
     let request = CertificateRequest {
         hostnames: &cfg.tls_certificate_hostnames,
-        csr_der_base64: base64::engine::general_purpose::STANDARD.encode(csr_der),
+        csr_der_base64: base64::engine::general_purpose::STANDARD.encode(&csr_der),
         cc_init_data_hash: local_cc_init_data_hash(cfg)?,
     };
-    let mut response = client
-        .post(broker_url)
-        .header("Authorization", format!("Attestation {token}"))
-        .json(&request)
-        .send()
-        .context("requesting TLS certificate from broker")?;
-    let status = response.status();
-    let body = read_response_body_bounded(&mut response, MAX_BROKER_RESPONSE_BYTES);
-    if !status.is_success() {
-        // Terminal broker failure: consume the bounded body as the safe
-        // contract and stop. Unknown, malformed, or unbounded bodies
-        // degrade to the generic safe issuance failure; the raw body, the
-        // HTTP status, and any provider detail never enter the error, the
-        // log, or the typed diagnostic.
+    let mut rate_limit_rounds = 0u32;
+    let body = loop {
+        // The attestation token is resolved per attempt: it can expire
+        // while a cooldown is being waited out.
+        let token = trustee_verify::resolve_kbs_attestation_token(
+            std::env::var("KBS_ATTESTATION_TOKEN").ok().as_deref(),
+            &cfg.kbs_attestation_token_url,
+            Duration::from_secs(15),
+        )
+        .context("resolving KBS attestation token for TLS certificate broker")?;
+        let mut response = client
+            .post(broker_url)
+            .header("Authorization", format!("Attestation {token}"))
+            .json(&request)
+            .send()
+            .context("requesting TLS certificate from broker")?;
+        let status = response.status();
+        let body = read_response_body_bounded(&mut response, MAX_BROKER_RESPONSE_BYTES);
+        if status.is_success() {
+            break body;
+        }
+        // Broker failure: consume the bounded body as the safe contract.
+        // Unknown, malformed, or unbounded bodies degrade to the generic
+        // safe issuance failure; the raw body, the HTTP status, and any
+        // provider detail never enter the error, the log, or the typed
+        // diagnostic.
         let diagnostic = match body.as_deref() {
-            Some(bytes) => broker_failure_diagnostic(bytes, Utc::now()),
+            Some(bytes) => broker_failure_diagnostic(bytes, (wait.now)()),
             None => SafeBootstrapDiagnostic::acme_failed(),
         };
+        let now = (wait.now)();
+        let cooldown = waitable_rate_limit(&diagnostic, now)
+            .filter(|_| rate_limit_rounds < ACME_RETRY_MAX_ROUNDS);
+        let Some(deadline) = cooldown else {
+            clear_acme_cooldown_marker(&wait.cooldown_file);
+            tracing::warn!(
+                error = diagnostic.code.as_str(),
+                terminal = true,
+                retry_after = diagnostic.retry_after_rfc3339().as_deref(),
+                "static TLS certificate broker issuance attempt failed"
+            );
+            return Err(anyhow::Error::new(TlsBrokerFailure { diagnostic }));
+        };
+        // Waitable cooldown: persist the deadline so a pod restart resumes
+        // it instead of burning another order, publish the non-terminal
+        // marker the proxy's init-ready watch honors, then wait.
+        rate_limit_rounds += 1;
+        persist_retry_deadline(persistent_root, &request_sha256, deadline)
+            .context("recording ACME rate-limit cooldown")?;
+        write_acme_cooldown_marker(&wait.cooldown_file, deadline);
         tracing::warn!(
             error = diagnostic.code.as_str(),
-            terminal = true,
-            retry_after = diagnostic.retry_after_rfc3339().as_deref(),
-            "static TLS certificate broker issuance attempt failed"
+            terminal = false,
+            retry_after = %deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            round = rate_limit_rounds,
+            "ACME rate limit honored; waiting before certificate issuance retry"
         );
-        return Err(anyhow::Error::new(TlsBrokerFailure { diagnostic }));
-    }
+        (wait.sleep_until)(deadline);
+    };
+    clear_acme_cooldown_marker(&wait.cooldown_file);
+    clear_persisted_retry_deadline(persistent_root);
     // A success status still has to decode as the bounded certificate
     // response; an unbounded or malformed body is a failed issuance.
     let body: CertificateResponse = body
@@ -1145,7 +1450,12 @@ hkdf-info = "tls-state-luks-key"
         let synthetic_chain = full_chain_pem(&[&chain.chain_pem, &synthetic_root.cert.pem()]);
         let persistent = write_retained_state(dir.path(), &synthetic_chain, &chain.leaf_key_pem);
 
-        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
         let message = format!("{error:#}");
         assert!(
             message.contains("validation failed"),
@@ -1211,7 +1521,12 @@ hkdf-info = "tls-state-luks-key"
         let persistent = dir.path().join("persistent");
         std::fs::create_dir_all(cert_path(&persistent)).unwrap();
 
-        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
         let message = format!("{error:#}");
         assert!(
             message.contains("not a regular file"),
@@ -1233,7 +1548,12 @@ hkdf-info = "tls-state-luks-key"
         )
         .unwrap();
 
-        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
         let message = format!("{error:#}");
         assert!(
             message.contains("symbolic link"),
@@ -1253,7 +1573,12 @@ hkdf-info = "tls-state-luks-key"
         std::fs::create_dir_all(cert_path(&persistent).parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&real, cert_path(&persistent)).unwrap();
 
-        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
         let message = format!("{error:#}");
         assert!(
             message.contains("symbolic link"),
@@ -1321,7 +1646,12 @@ hkdf-info = "tls-state-luks-key"
         let persistent = dir.path().join("persistent");
         writes::atomic_write(&key_path(&persistent), key_pem.as_bytes(), 0o600).unwrap();
 
-        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
         let message = format!("{error:#}");
         assert!(
             message.contains("KBS attestation token"),
@@ -1343,7 +1673,12 @@ hkdf-info = "tls-state-luks-key"
         std::os::unix::fs::symlink(persistent.join("does-not-exist.key"), key_path(&persistent))
             .unwrap();
 
-        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
         let message = format!("{error:#}");
         assert!(
             message.contains("symbolic link"),
@@ -1524,7 +1859,9 @@ hkdf-info = "tls-state-luks-key"
     #[test]
     fn broker_terminal_failure_reaches_provisioning_error_as_typed_diagnostic() {
         let dir = tempdir().unwrap();
-        let deadline = Utc::now() + TimeDelta::hours(2);
+        // Beyond the honored single-wait bound: the diagnostic is preserved
+        // but the production wait policy must not actually sleep here.
+        let deadline = Utc::now() + TimeDelta::seconds(ACME_RETRY_MAX_WAIT_SECS + 3600);
         let deadline_rfc3339 = deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let body = json!({
             "error": "acme_rate_limited",
@@ -1543,7 +1880,12 @@ hkdf-info = "tls-state-luks-key"
         );
         let persistent = dir.path().join("persistent");
 
-        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
 
         let failure = error
             .downcast_ref::<TlsBrokerFailure>()
@@ -1576,7 +1918,12 @@ hkdf-info = "tls-state-luks-key"
         );
         let persistent = dir.path().join("persistent");
 
-        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
 
         let failure = error
             .downcast_ref::<TlsBrokerFailure>()
@@ -1611,7 +1958,12 @@ hkdf-info = "tls-state-luks-key"
         );
         let persistent = dir.path().join("persistent");
 
-        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
 
         let failure = error
             .downcast_ref::<TlsBrokerFailure>()
@@ -1639,7 +1991,12 @@ hkdf-info = "tls-state-luks-key"
         );
         let persistent = dir.path().join("persistent");
 
-        let error = provision_static_tls_certificate(&cfg, &persistent).unwrap_err();
+        let error = provision_static_tls_certificate(
+            &cfg,
+            &persistent,
+            &dir.path().join("init-acme-cooldown"),
+        )
+        .unwrap_err();
 
         let failure = error
             .downcast_ref::<TlsBrokerFailure>()
@@ -1650,5 +2007,514 @@ hkdf-info = "tls-state-luks-key"
         );
         assert_eq!(failure.diagnostic.retry_after, None);
         assert!(!format!("{error:#}").contains(SYNTHETIC_PROVIDER_SENTINEL));
+    }
+
+    /// Scripted variant of [`spawn_local_broker`]: `GET /kbs-token` always
+    /// serves a token; every other request (broker POST) pops the next
+    /// `(status_line, body)` response, repeating the last one when the
+    /// script is exhausted. `events` records `"post"` for each broker POST
+    /// so tests can assert ordering against waits.
+    fn spawn_scripted_broker(
+        broker_script: Vec<(String, String)>,
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let script = std::sync::Arc::new(std::sync::Mutex::new(
+            broker_script
+                .into_iter()
+                .collect::<std::collections::VecDeque<_>>(),
+        ));
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) => break,
+                        Ok(_) => head.push(byte[0]),
+                        Err(_) => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let content_length = head
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut request_body = vec![0u8; content_length];
+                if content_length > 0 {
+                    stream.read_exact(&mut request_body).ok();
+                }
+                let (status_line, body) = if head.starts_with("GET /kbs-token") {
+                    (
+                        "200 OK".to_string(),
+                        "{\"token\":\"test-token\"}".to_string(),
+                    )
+                } else {
+                    events.lock().unwrap().push("post".to_string());
+                    let mut script = script.lock().unwrap();
+                    match script.len() {
+                        0 => panic!("broker script exhausted"),
+                        1 => script.front().unwrap().clone(),
+                        _ => script.pop_front().unwrap(),
+                    }
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).ok();
+                stream.flush().ok();
+            }
+        });
+        (base, handle)
+    }
+
+    /// Mint a leaf for an explicitly supplied key — needed when the broker
+    /// success response must validate against the retained workload key.
+    fn mint_leaf_for_key(
+        issuer_params: &CertificateParams,
+        issuer_key: &KeyPair,
+        leaf_key: &KeyPair,
+        hostnames: &[&str],
+    ) -> String {
+        let leaf_params =
+            CertificateParams::new(hostnames.iter().map(|h| h.to_string()).collect::<Vec<_>>())
+                .unwrap();
+        leaf_params
+            .signed_by(leaf_key, &Issuer::from_params(issuer_params, issuer_key))
+            .unwrap()
+            .pem()
+    }
+
+    /// Deterministic ACME wait: a fake clock that `sleep_until` advances
+    /// to the deadline, recording each requested wake time and an event.
+    struct FakeClock {
+        now: std::sync::Mutex<DateTime<Utc>>,
+        sleeps: std::sync::Mutex<Vec<DateTime<Utc>>>,
+    }
+
+    fn fake_wait(
+        cooldown_file: PathBuf,
+        start: DateTime<Utc>,
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> (AcmeWait, std::sync::Arc<FakeClock>) {
+        let clock = std::sync::Arc::new(FakeClock {
+            now: std::sync::Mutex::new(start),
+            sleeps: std::sync::Mutex::new(Vec::new()),
+        });
+        let now_clock = clock.clone();
+        let sleep_clock = clock.clone();
+        (
+            AcmeWait {
+                cooldown_file,
+                now: Box::new(move || *now_clock.now.lock().unwrap()),
+                sleep_until: Box::new(move |deadline| {
+                    events.lock().unwrap().push("sleep".to_string());
+                    sleep_clock.sleeps.lock().unwrap().push(deadline);
+                    *sleep_clock.now.lock().unwrap() = deadline;
+                }),
+            },
+            clock,
+        )
+    }
+
+    fn rate_limited_body(retry_after: Option<DateTime<Utc>>) -> String {
+        json!({
+            "error": "acme_rate_limited",
+            "terminal": true,
+            "retry_after": retry_after
+                .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+        })
+        .to_string()
+    }
+
+    /// Workload key + a valid anchored chain minted for it, with only the
+    /// key retained on the persistent root (interrupted-first-issuance
+    /// state): issuance must POST and then succeed with the chain.
+    fn seed_retained_key_and_chain(dir: &Path, hostnames: &[&str]) -> (TestRoot, String, PathBuf) {
+        let root = mint_root("Enclava Test Root CA");
+        let leaf_key = KeyPair::generate().unwrap();
+        let chain_pem = mint_leaf_for_key(&root.params, &root.key, &leaf_key, hostnames);
+        let persistent = dir.join("persistent");
+        writes::atomic_write(
+            &key_path(&persistent),
+            leaf_key.serialize_pem().as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let full_chain = full_chain_pem(&[&chain_pem, &root.cert.pem()]);
+        (root, full_chain, persistent)
+    }
+
+    #[test]
+    fn rate_limited_cooldown_waits_then_retries_to_success() {
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = DateTime::from_timestamp(1789000000, 0).unwrap();
+        let deadline = start + TimeDelta::minutes(30);
+        let (root, chain_pem, persistent) = seed_retained_key_and_chain(dir.path(), TEST_HOSTNAMES);
+        let anchors = [root.anchor()];
+        let success_body = json!({"certificate_chain_pem": chain_pem}).to_string();
+        let (base, _server) = spawn_scripted_broker(
+            vec![
+                (
+                    "503 Service Unavailable".to_string(),
+                    rate_limited_body(Some(deadline)),
+                ),
+                ("200 OK".to_string(), success_body),
+            ],
+            events.clone(),
+        );
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let cooldown = dir.path().join("init-acme-cooldown");
+        let (wait, clock) = fake_wait(cooldown.clone(), start, events.clone());
+
+        provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap();
+
+        assert_eq!(*clock.sleeps.lock().unwrap(), vec![deadline]);
+        assert_eq!(*events.lock().unwrap(), vec!["post", "sleep", "post"]);
+        // The certificate landed and both markers were cleared.
+        assert!(cert_path(&persistent).exists());
+        assert!(!acme_retry_marker_path(&persistent).exists());
+        assert!(!cooldown.exists());
+    }
+
+    #[test]
+    fn rate_limited_without_deadline_stays_terminal_without_waiting() {
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (base, _server) = spawn_scripted_broker(
+            vec![(
+                "503 Service Unavailable".to_string(),
+                rate_limited_body(None),
+            )],
+            events,
+        );
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let persistent = dir.path().join("persistent");
+        // The cfg(test) seam panics on any attempted wait — a regression
+        // that turns this into a cooldown fails loudly.
+        let root = mint_root("R");
+        let error = provision_with_trust_anchors(&cfg, &persistent, &[root.anchor()]).unwrap_err();
+        let failure = error.downcast_ref::<TlsBrokerFailure>().unwrap();
+        assert_eq!(failure.diagnostic.code, SafeDiagnosticCode::AcmeRateLimited);
+        assert_eq!(failure.diagnostic.retry_after, None);
+    }
+
+    #[test]
+    fn rate_limited_beyond_wait_bound_stays_terminal() {
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = DateTime::from_timestamp(1789000000, 0).unwrap();
+        // One second past the single-wait bound.
+        let deadline = start + TimeDelta::seconds(ACME_RETRY_MAX_WAIT_SECS + 1);
+        let (base, _server) = spawn_scripted_broker(
+            vec![(
+                "503 Service Unavailable".to_string(),
+                rate_limited_body(Some(deadline)),
+            )],
+            events.clone(),
+        );
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let persistent = dir.path().join("persistent");
+        let (wait, clock) = fake_wait(dir.path().join("init-acme-cooldown"), start, events.clone());
+        let root = mint_root("R");
+        let anchors = [root.anchor()];
+
+        let error = provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap_err();
+
+        let failure = error.downcast_ref::<TlsBrokerFailure>().unwrap();
+        assert_eq!(failure.diagnostic.code, SafeDiagnosticCode::AcmeRateLimited);
+        assert_eq!(failure.diagnostic.retry_after, Some(deadline));
+        assert!(clock.sleeps.lock().unwrap().is_empty());
+        assert_eq!(*events.lock().unwrap(), vec!["post"]);
+    }
+
+    /// Broker that answers every POST with `acme_rate_limited` carrying a
+    /// deadline `period_secs` ahead of the injected clock — used to prove
+    /// the retry-rounds bound against a provider that never stops
+    /// rate-limiting.
+    fn spawn_rate_limited_broker(
+        now: std::sync::Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+        period_secs: i64,
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) => break,
+                        Ok(_) => head.push(byte[0]),
+                        Err(_) => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let content_length = head
+                    .to_ascii_lowercase()
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut request_body = vec![0u8; content_length];
+                if content_length > 0 {
+                    stream.read_exact(&mut request_body).ok();
+                }
+                let (status_line, body) = if head.starts_with("GET /kbs-token") {
+                    (
+                        "200 OK".to_string(),
+                        "{\"token\":\"test-token\"}".to_string(),
+                    )
+                } else {
+                    events.lock().unwrap().push("post".to_string());
+                    let deadline = now() + TimeDelta::seconds(period_secs);
+                    (
+                        "503 Service Unavailable".to_string(),
+                        rate_limited_body(Some(deadline)),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).ok();
+                stream.flush().ok();
+            }
+        });
+        (base, handle)
+    }
+
+    #[test]
+    fn rate_limited_rounds_are_bounded_then_terminal() {
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = DateTime::from_timestamp(1789000000, 0).unwrap();
+        let persistent = dir.path().join("persistent");
+        let (wait, clock) = fake_wait(dir.path().join("init-acme-cooldown"), start, events.clone());
+        let now_fn = {
+            let clock = clock.clone();
+            move || *clock.now.lock().unwrap()
+        };
+        let (base, _server) =
+            spawn_rate_limited_broker(std::sync::Arc::new(now_fn), 1800, events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let root = mint_root("R");
+        let anchors = [root.anchor()];
+
+        let error = provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap_err();
+
+        // Every round is honored, then the cap converts the last
+        // diagnostic into a terminal failure — the provider can never
+        // hold the certificate phase open forever.
+        let failure = error.downcast_ref::<TlsBrokerFailure>().unwrap();
+        assert_eq!(failure.diagnostic.code, SafeDiagnosticCode::AcmeRateLimited);
+        assert_eq!(
+            clock.sleeps.lock().unwrap().len() as u32,
+            ACME_RETRY_MAX_ROUNDS
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| *e == "post")
+                .count() as u32,
+            ACME_RETRY_MAX_ROUNDS + 1
+        );
+        // The final diagnostic keeps the provider's last deadline.
+        assert_eq!(
+            failure.diagnostic.retry_after,
+            Some(start + TimeDelta::seconds(1800 * (ACME_RETRY_MAX_ROUNDS as i64 + 1)))
+        );
+    }
+
+    #[test]
+    fn waitable_rate_limit_predicate_is_exact() {
+        let now = DateTime::from_timestamp(1789000000, 0).unwrap();
+        let fresh = SafeBootstrapDiagnostic {
+            code: SafeDiagnosticCode::AcmeRateLimited,
+            retry_after: Some(now + TimeDelta::minutes(30)),
+        };
+        assert_eq!(
+            waitable_rate_limit(&fresh, now),
+            Some(now + TimeDelta::minutes(30))
+        );
+        // Elapsed, absent, and out-of-bounds deadlines are not waitable.
+        for retry_after in [
+            Some(now - TimeDelta::minutes(1)),
+            None,
+            Some(now + TimeDelta::seconds(ACME_RETRY_MAX_WAIT_SECS + 1)),
+        ] {
+            let diagnostic = SafeBootstrapDiagnostic {
+                code: SafeDiagnosticCode::AcmeRateLimited,
+                retry_after,
+            };
+            assert_eq!(waitable_rate_limit(&diagnostic, now), None);
+        }
+        // Non-rate-limit codes are never waitable.
+        let other = SafeBootstrapDiagnostic::acme_failed();
+        assert_eq!(waitable_rate_limit(&other, now), None);
+    }
+
+    #[test]
+    fn persisted_deadline_resumes_wait_before_new_order() {
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = DateTime::from_timestamp(1789000000, 0).unwrap();
+        let deadline = start + TimeDelta::minutes(45);
+        let (root, chain_pem, persistent) = seed_retained_key_and_chain(dir.path(), TEST_HOSTNAMES);
+        let anchors = [root.anchor()];
+        // Bind the persisted marker to the exact request the retained key
+        // and configured hostnames produce.
+        let hosts: Vec<String> = TEST_HOSTNAMES.iter().map(|h| h.to_string()).collect();
+        let fingerprint = acme_request_fingerprint(
+            &std::fs::read_to_string(key_path(&persistent)).unwrap(),
+            &hosts,
+        );
+        persist_retry_deadline(&persistent, &fingerprint, deadline).unwrap();
+        let success_body = json!({"certificate_chain_pem": chain_pem}).to_string();
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), success_body)], events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (wait, clock) = fake_wait(dir.path().join("init-acme-cooldown"), start, events.clone());
+
+        provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap();
+
+        // The wait resumed before any broker POST: no order was burned.
+        assert_eq!(*clock.sleeps.lock().unwrap(), vec![deadline]);
+        assert_eq!(*events.lock().unwrap(), vec!["sleep", "post"]);
+        assert!(cert_path(&persistent).exists());
+        assert!(!acme_retry_marker_path(&persistent).exists());
+    }
+
+    #[test]
+    fn mismatched_persisted_deadline_is_dropped_and_ignored() {
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = DateTime::from_timestamp(1789000000, 0).unwrap();
+        let deadline = start + TimeDelta::minutes(45);
+        let (root, chain_pem, persistent) = seed_retained_key_and_chain(dir.path(), TEST_HOSTNAMES);
+        let anchors = [root.anchor()];
+        // A marker bound to a different CSR must not suppress issuance.
+        persist_retry_deadline(&persistent, &"00".repeat(32), deadline).unwrap();
+        let success_body = json!({"certificate_chain_pem": chain_pem}).to_string();
+        let (base, _server) =
+            spawn_scripted_broker(vec![("200 OK".to_string(), success_body)], events.clone());
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let (wait, clock) = fake_wait(dir.path().join("init-acme-cooldown"), start, events.clone());
+
+        provision_with_policy(&cfg, &persistent, &anchors, &wait).unwrap();
+
+        assert!(clock.sleeps.lock().unwrap().is_empty());
+        assert_eq!(*events.lock().unwrap(), vec!["post"]);
+        assert!(!acme_retry_marker_path(&persistent).exists());
+    }
+
+    #[test]
+    fn cooldown_marker_carries_non_terminal_safe_contract() {
+        let dir = tempdir().unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let start = DateTime::from_timestamp(1789000000, 0).unwrap();
+        let deadline = start + TimeDelta::minutes(30);
+        let cooldown = dir.path().join("init-acme-cooldown");
+        // Observed marker content while the wait is in progress.
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let (base, _server) = spawn_scripted_broker(
+            vec![(
+                "503 Service Unavailable".to_string(),
+                rate_limited_body(Some(deadline)),
+            )],
+            events,
+        );
+        let cfg = broker_config_with_endpoints(
+            dir.path(),
+            TEST_HOSTNAMES,
+            &format!("{base}/broker"),
+            &format!("{base}/kbs-token"),
+        );
+        let persistent = dir.path().join("persistent");
+        let clock = std::sync::Arc::new(FakeClock {
+            now: std::sync::Mutex::new(start),
+            sleeps: std::sync::Mutex::new(Vec::new()),
+        });
+        let observed_in_sleep = observed.clone();
+        let cooldown_in_sleep = cooldown.clone();
+        let now_clock = clock.clone();
+        let sleep_clock = clock.clone();
+        let wait = AcmeWait {
+            cooldown_file: cooldown.clone(),
+            now: Box::new(move || *now_clock.now.lock().unwrap()),
+            sleep_until: Box::new(move |d| {
+                *observed_in_sleep.lock().unwrap() =
+                    std::fs::read_to_string(&cooldown_in_sleep).ok();
+                sleep_clock.sleeps.lock().unwrap().push(d);
+                *sleep_clock.now.lock().unwrap() = d;
+            }),
+        };
+        let root = mint_root("R");
+        let anchors = [root.anchor()];
+
+        // The wait happens; the second POST is an unroutable-address
+        // failure only if the script breaks — the marker was observed
+        // during the wait, which is what this test asserts.
+        let _ = provision_with_policy(&cfg, &persistent, &anchors, &wait);
+
+        let marker = observed
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("cooldown marker must exist while waiting");
+        let parsed: serde_json::Value = serde_json::from_str(&marker).unwrap();
+        assert_eq!(
+            parsed,
+            json!({
+                "error": "acme_rate_limited",
+                "terminal": false,
+                "retry_after": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "retry_after_unix": deadline.timestamp(),
+            })
+        );
     }
 }

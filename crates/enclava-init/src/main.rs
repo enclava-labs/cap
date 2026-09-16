@@ -16,6 +16,7 @@ use enclava_init::{
 
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
 const DEFAULT_ERROR_FILE: &str = "/run/enclava/init-error";
+const DEFAULT_ACME_COOLDOWN_FILE: &str = "/run/enclava/init-acme-cooldown";
 const DEFAULT_KBS_PROXY_HEALTH_WAIT_SECONDS: u64 = 300;
 const DEFAULT_KBS_PROXY_HEALTH_POLL_SECONDS: u64 = 2;
 const KBS_PROXY_HEALTH_REQUEST_TIMEOUT_SECONDS: u64 = 5;
@@ -206,6 +207,12 @@ fn error_file_path() -> PathBuf {
     std::env::var("ENCLAVA_INIT_ERROR_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_ERROR_FILE))
+}
+
+fn acme_cooldown_file_path() -> PathBuf {
+    std::env::var("ENCLAVA_INIT_ACME_COOLDOWN_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ACME_COOLDOWN_FILE))
 }
 
 fn stage_file_path() -> PathBuf {
@@ -927,7 +934,11 @@ where
 
 fn provision_static_tls_certificate(cfg: &Config) -> Result<()> {
     let persistent = caddy_tls_bind_dir(Path::new(&cfg.tls_state.mount_path));
-    tls_certificate::provision_static_tls_certificate(cfg, &persistent)?;
+    tls_certificate::provision_static_tls_certificate(
+        cfg,
+        &persistent,
+        &acme_cooldown_file_path(),
+    )?;
     let caddy_identity = numeric_identity(cfg.caddy_uid, cfg.caddy_gid);
     for path in [
         tls_certificate::cert_path(&persistent),
