@@ -67,6 +67,10 @@ pub enum KeyringCommand {
         org_id: String,
         /// Hex-encoded owner pubkey (32 bytes / 64 hex chars)
         owner_pubkey: String,
+        /// Trust the pinned --owner-pubkey without the interactive confirmation
+        /// (the fingerprint is still printed; verification stays your responsibility)
+        #[arg(long)]
+        yes: bool,
     },
     /// Fetch, verify against trusted owner pubkey, and cache the latest keyring.
     Fetch {
@@ -410,6 +414,7 @@ async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Erro
         KeyringCommand::Trust {
             org_id,
             owner_pubkey,
+            yes,
         } => {
             let org = Uuid::parse_str(&org_id)?;
             let pk = parse_pubkey(&owner_pubkey)?;
@@ -419,10 +424,11 @@ async fn run_keyring(cmd: KeyringCommand) -> Result<(), Box<dyn std::error::Erro
                  Verify this fingerprint with the org owner over an out-of-band channel.",
                 fingerprint(&pk)
             );
-            let confirm = dialoguer::Confirm::new()
-                .with_prompt("Confirm trust on first use?")
-                .default(false)
-                .interact()?;
+            let confirm = yes
+                || dialoguer::Confirm::new()
+                    .with_prompt("Confirm trust on first use?")
+                    .default(false)
+                    .interact()?;
             if !confirm {
                 return Err("trust declined".into());
             }

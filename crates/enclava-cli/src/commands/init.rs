@@ -161,7 +161,18 @@ jobs:
     )
 }
 
-pub async fn init() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(clap::Args)]
+pub struct InitArgs {
+    /// App name to write into enclava.toml (non-interactive; defaults to the directory name)
+    #[arg(long)]
+    pub app_name: Option<String>,
+    /// Port to write into enclava.toml (non-interactive; defaults to the Dockerfile EXPOSE or 3000)
+    #[arg(long)]
+    pub port: Option<u16>,
+}
+
+pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::IsTerminal;
     let cwd = std::env::current_dir()?;
 
     // Check if enclava.toml already exists
@@ -186,16 +197,25 @@ pub async fn init() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Get app name (default to directory name)
-    let app_name: String = Input::new()
-        .with_prompt("App name")
-        .default(default_app_name(&cwd))
-        .interact_text()?;
+    // Get app name (default to directory name; --app-name or a non-interactive
+    // session takes the deterministic default instead of prompting)
+    let app_name: String = match args.app_name {
+        Some(name) => name,
+        None if std::io::stdin().is_terminal() => Input::new()
+            .with_prompt("App name")
+            .default(default_app_name(&cwd))
+            .interact_text()?,
+        None => default_app_name(&cwd),
+    };
 
-    let port: u16 = Input::new()
-        .with_prompt("Port")
-        .default(detected_port.unwrap_or(3000))
-        .interact_text()?;
+    let port: u16 = match args.port {
+        Some(port) => port,
+        None if std::io::stdin().is_terminal() => Input::new()
+            .with_prompt("Port")
+            .default(detected_port.unwrap_or(3000))
+            .interact_text()?,
+        None => detected_port.unwrap_or(3000),
+    };
 
     // Write enclava.toml
     let toml_content = generate_enclava_toml(&app_name, port);
