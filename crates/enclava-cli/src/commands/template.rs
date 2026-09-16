@@ -598,6 +598,7 @@ async fn deploy_with_timings(
                 api,
                 &instance_name,
                 deployment,
+                template.unlock_mode == "password",
                 stable_endpoint.as_str(),
                 app_url.as_str(),
                 Duration::from_secs(args.ssh_timeout_seconds),
@@ -787,6 +788,7 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
             &api,
             &instance_name,
             DeploymentWait::new(&latest_deployment_id),
+            app.unlock_mode == "password",
             stable_endpoint,
             expected_app_url.as_str(),
             Duration::from_secs(args.ssh_timeout_seconds),
@@ -2221,10 +2223,26 @@ fn is_reserved_http_app_host(host: &str) -> bool {
         || host.ends_with(".invalid")
 }
 
+/// Wait for the PaaS to report a stable SSH endpoint command for an app.
+///
+/// `password_mode` is the app's unlock mode as the CALLER already knows it
+/// (the deploy flow from the hosted template config, `ssh_command` from its
+/// own `get_app`): the wait must not look it up itself — a one-shot lookup
+/// here would either freeze a transient API failure into "non-password" for
+/// the whole wait or stall past the wait's own deadline on the shared 900s
+/// request timeout. The deploy-time mode is authoritative for this rollout;
+/// mid-wait mode changes are not re-sampled.
+///
+/// The relock stop requires a trusted deployment expectation: the deploy
+/// flow has one, while the standalone `template ssh-command --wait`
+/// resumption deliberately passes none, so that path retains the full-timeout
+/// behavior (a stale TEE's state must never be attributed to an unbound wait).
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_paas_ssh_command(
     api: &ApiClient,
     app_name: &str,
     deployment: DeploymentWait<'_>,
+    password_mode: bool,
     stable_endpoint: &str,
     expected_app_url: &str,
     timeout: Duration,
@@ -2233,13 +2251,6 @@ async fn wait_for_paas_ssh_command(
     let deployment_id = deployment.deployment_id;
     let start = Instant::now();
     let mut terminal_probe_at: Option<Instant> = None;
-    // Password-mode apps relock after every roll by design; only for them is a
-    // locked TEE an operator action (`enclava unlock`) rather than a transient
-    // boot state, so the relock stop below is gated on the app's unlock mode.
-    let password_mode = api
-        .get_app(app_name)
-        .await
-        .is_ok_and(|app| app.unlock_mode == "password");
     while start.elapsed() < timeout {
         progress.set_message(timed_progress(
             "Stable SSH endpoint: waiting for readiness",
@@ -4166,6 +4177,43 @@ mod tests {
 
         assert!(body.contains("Stable SSH endpoint: waiting for readiness"));
         assert!(!body.contains("waiting for relay registration"));
+    }
+
+    #[test]
+    fn ssh_command_wait_receives_password_mode_from_caller_metadata() {
+        // The unlock mode must come from metadata each caller already holds
+        // (deploy flow: the hosted template config; ssh_command: its own
+        // get_app fetch with error propagation). A lookup inside the wait
+        // would freeze one transient API failure into "non-password" for the
+        // whole wait, or stall past the wait's deadline on the shared 900s
+        // request timeout.
+        let source = include_str!("template.rs");
+        let fn_start = source
+            .find("async fn wait_for_paas_ssh_command")
+            .expect("SSH command wait function exists");
+        let fn_end = source[fn_start..]
+            .find("async fn latest_deployment_id")
+            .expect("latest_deployment_id follows SSH command wait")
+            + fn_start;
+        let body = &source[fn_start..fn_end];
+
+        assert!(
+            !body.contains("get_app"),
+            "the wait must not look up app metadata itself"
+        );
+
+        let deploy_call = source
+            .find("async fn deploy_with_timings")
+            .expect("deploy flow exists");
+        let deploy_body = &source[deploy_call..fn_start];
+        assert!(
+            deploy_body.contains("template.unlock_mode == \"password\""),
+            "the deploy flow must pass its hosted-template unlock mode"
+        );
+        assert!(
+            source.contains("app.unlock_mode == \"password\""),
+            "the ssh_command resumption must pass its get_app unlock mode"
+        );
     }
 
     #[test]
