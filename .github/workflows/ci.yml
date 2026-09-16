@@ -196,10 +196,25 @@ jobs:
           cargo build --release -p enclava-cli --features prod-strict
           cargo build --release -p enclava-init --features prod-strict
         env:
-          # CI-compile-only: this job does not publish images. Prefer the repo
-          # secret when set; otherwise use the well-known test fixture so
-          # scheduled compile checks still run. Never a Dockerfile default.
-          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX || '5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd' }}
+          # CI-compile-only: this job does not publish images. Do not fall back
+          # to the committed fixture; prod-strict rejects that root.
+          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
+
+      - name: Verify prod-strict rejects the fixture root
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        env:
+          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+        run: |
+          if cargo check --release -p enclava-cli --features prod-strict > /tmp/prod-strict-fixture.log 2>&1; then
+            cat /tmp/prod-strict-fixture.log
+            echo "enclava-cli prod-strict unexpectedly accepted the committed fixture root"
+            exit 1
+          fi
+          if ! grep -q "prod-strict builds must not pin the committed fixture platform-release root" /tmp/prod-strict-fixture.log; then
+            cat /tmp/prod-strict-fixture.log
+            echo "prod-strict fixture rejection did not report the expected compile error"
+            exit 1
+          fi
 
       - name: Verify prod-strict rejects debug-only features
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')

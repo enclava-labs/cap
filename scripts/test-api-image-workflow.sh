@@ -77,6 +77,7 @@ for required in \
   "scripts/verify-api-image-ref.sh --cosign dist/enclava-api-image.txt" \
   "name: enclava-api-release-manifest" \
   "scripts/test-api-image-workflow.sh" \
+  "scripts/require-platform-release-root.sh" \
   "scripts/test-verify-api-image-ref.sh" \
   "scripts/verify-api-image-ref.bash" \
   "sh -n scripts/verify-api-image-ref.sh" \
@@ -154,10 +155,34 @@ grep -Fq -- "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=5b9437adeaffbe8f41b13d96ed
   || fail "PR validation must pass the test-only fixture as an explicit build-arg"
 grep -Fq -- "secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" <<<"$publish_block" \
   || fail "publisher must pass secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX"
-grep -Fq -- "secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be set" <<<"$publish_block" \
-  || fail "publisher must fail closed when the platform-release root secret is empty"
-if grep -Fq -- "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd" <<<"$publish_block"; then
-  fail "publisher must not hardcode the committed fixture pubkey"
+grep -Fq -- "scripts/require-platform-release-root.sh" <<<"$publish_block" \
+  || fail "publisher must run the production platform-release root gate"
+if grep -Fq -- "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd" <<<"$publish_block"; then
+  fail "publisher must not pass the committed fixture as a build-arg"
+fi
+
+ROOT_GATE="$ROOT_DIR/scripts/require-platform-release-root.sh"
+bash -n "$ROOT_GATE" || fail "scripts/require-platform-release-root.sh is not valid bash"
+[[ -x "$ROOT_GATE" ]] || fail "scripts/require-platform-release-root.sh must be executable"
+grep -Fq -- '^[0-9a-f]{64}$' "$ROOT_GATE" \
+  || fail "root gate must require a 32-byte hex pubkey"
+grep -Fq -- "must not be the committed dev fixture pubkey" "$ROOT_GATE" \
+  || fail "root gate must reject the committed fixture pubkey"
+
+gate_rejects() {
+  local value="$1"
+  local reason="$2"
+  if ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX="$value" "$ROOT_GATE" >/tmp/platform-release-root-gate.out 2>/tmp/platform-release-root-gate.err; then
+    fail "root gate must reject $reason"
+  fi
+}
+gate_rejects "" "an empty root"
+gate_rejects "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd" "the committed fixture"
+gate_rejects "5B9437ADEAFFBE8F41B13D96ED49D2F51CD6C266CD8ECC284B0552EC4912B8DD" "the committed fixture (uppercase)"
+gate_rejects "not-a-key" "a non-hex root"
+if ! ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX="0000000000000000000000000000000000000000000000000000000000000001" \
+  "$ROOT_GATE"; then
+  fail "root gate must accept a non-fixture 32-byte hex pubkey"
 fi
 
 if grep -Fq "id-token: write" <<<"$validate_block" \

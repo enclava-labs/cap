@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/api-image.yml"
       - "scripts/render-api-release-manifest.sh"
+      - "scripts/require-platform-release-root.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
       - "scripts/verify-api-image-ref.bash"
@@ -24,6 +25,7 @@ on:
     paths:
       - ".github/workflows/api-image.yml"
       - "scripts/render-api-release-manifest.sh"
+      - "scripts/require-platform-release-root.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
       - "scripts/verify-api-image-ref.bash"
@@ -173,11 +175,7 @@ jobs:
       - name: Require platform-release root
         env:
           ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
-        run: |
-          if [[ -z "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" ]]; then
-            echo "::error::secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be set" >&2
-            exit 1
-          fi
+        run: bash scripts/require-platform-release-root.sh
 
       - name: Build and push
         id: build
