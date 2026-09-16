@@ -31,8 +31,9 @@ const IMAGE_DIGEST_PREFIX: &str = "sha256:";
 /// All-digit labels are valid here — RFC 1123 §2.1 dropped the
 /// "must contain at least one alpha" rule from RFC 952, and the platform's
 /// 8-hex `org_slug` may be all-digit (e.g. `12345678`) which must round-trip
-/// through `app_hostname()` cleanly. Stricter caller types (e.g. K8s service
-/// names) layer their own all-digit rejection on top.
+/// through `app_hostname()` cleanly. Stricter caller types layer extra
+/// rules on top (app-name admission requires a leading letter, per
+/// Kubernetes service-name rules).
 pub fn validate_dns_label(s: &str) -> Result<(), ValidateError> {
     if s.is_empty() {
         return Err(ValidateError::InvalidDnsLabel("empty"));
@@ -74,12 +75,12 @@ pub fn validate_org_slug(s: &str) -> Result<(), ValidateError> {
     Ok(())
 }
 
-/// App names the create API admitted before the all-digit admission rule
-/// was consolidated here: identical shape rules, but all-digit names are
-/// accepted. This is the validator for **existing state** — mnemonic files,
-/// edge routing, and anything keyed by an app name the server may already
-/// hold — so legacy all-digit apps keep working. New-name admission
-/// (`create`, `init`) uses [`validate_app_name`].
+/// App names the create API admitted before admission rules were
+/// consolidated here: identical shape rules, but digit-led names (e.g.
+/// `1app`, `123`) are accepted. This is the validator for **existing
+/// state** — mnemonic files, edge routing, and anything keyed by an app
+/// name the server may already hold — so legacy apps keep working.
+/// New-name admission (`create`, `init`) uses [`validate_app_name`].
 pub fn validate_app_name_legacy(s: &str) -> Result<(), ValidateError> {
     const RESERVED: [&str; 14] = [
         "kubernetes",
