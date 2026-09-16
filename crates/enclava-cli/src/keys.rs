@@ -702,6 +702,7 @@ pub fn read_secret_file(path: &Path, kind: &str) -> Result<String, KeysError> {
     }
     Ok(value)
 }
+
 /// The directory containing `path`'s entry, normalized for bare relative
 /// filenames (`""` from `Path::new("backup.json").parent()`, or `None` for a
 /// root path) to the current directory `"."` so the sync target can be opened.

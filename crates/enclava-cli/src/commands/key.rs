@@ -638,8 +638,11 @@ async fn setup(
             &me.active_org.id,
             &me.active_org.name,
         )?;
+        // An interrupted first run leaves the just-written backup here; it was
+        // encrypted with --new-passphrase-file, so a retry that only repeats
+        // that flag can still decrypt it (crash-safe retry for automation).
         let passphrase = secret_from_file_or_prompt(
-            passphrase_file,
+            passphrase_file.or(new_passphrase_file),
             "passphrase",
             "Backup passphrase",
             None,
@@ -746,8 +749,10 @@ async fn rotate_owner(
             &me.active_org.id,
             &me.active_org.name,
         )?;
+        // Same crash-safe retry as setup: an interrupted rotation leaves the
+        // replacement backup, encrypted with --new-passphrase-file.
         let passphrase = secret_from_file_or_prompt(
-            passphrase_file,
+            passphrase_file.or(new_passphrase_file),
             "passphrase",
             "Backup passphrase",
             None,

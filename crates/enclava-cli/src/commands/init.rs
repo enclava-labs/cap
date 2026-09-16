@@ -1,4 +1,5 @@
 use dialoguer::Input;
+use enclava_cli::app_config::AppConfig;
 use std::path::Path;
 
 /// Detect EXPOSE port from a Dockerfile.
@@ -217,8 +218,22 @@ pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => detected_port.unwrap_or(3000),
     };
 
+    // Validate the name against the canonical app-name rules BEFORE writing
+    // anything: an invalid name (from --app-name or the directory-derived
+    // default) would otherwise scaffold a project that `create` later rejects,
+    // and the existing enclava.toml then blocks a corrected rerun.
+    enclava_common::validate::validate_app_name(&app_name).map_err(|err| {
+        format!(
+            "invalid app name `{app_name}` ({err}); pass --app-name with a DNS-1123 label: \
+             lowercase [a-z0-9-], no leading/trailing '-', at most 32 chars, not all digits"
+        )
+    })?;
+
     // Write enclava.toml
     let toml_content = generate_enclava_toml(&app_name, port);
+    // Parse the generated TOML before it lands on disk so a generation bug
+    // fails here instead of poisoning the next command that loads it.
+    AppConfig::parse(&toml_content)?;
     std::fs::write(&toml_path, &toml_content)?;
     println!();
     println!("Creating enclava.toml... done");
@@ -249,6 +264,30 @@ pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_rejects_names_the_platform_would_reject_and_parses_generated_toml() {
+        // The same canonical validator init applies before writing anything:
+        // invalid explicit --app-name values and unusable directory-derived
+        // defaults must fail BEFORE enclava.toml exists (a written-but-invalid
+        // scaffold blocks the corrected rerun).
+        for bad in [
+            "Bad_Name",              // uppercase + underscore: not a DNS-1123 label
+            "-leading-dash",         // leading '-'
+            "1234",                  // all digits
+            "a".repeat(33).as_str(), // over the 32-char limit
+        ] {
+            assert!(
+                enclava_common::validate::validate_app_name(bad).is_err(),
+                "{bad} must be rejected before scaffolding"
+            );
+        }
+        assert!(enclava_common::validate::validate_app_name("my-app-1").is_ok());
+
+        // The generated TOML must parse before it is written to disk.
+        let toml_content = generate_enclava_toml("my-app-1", 3000);
+        AppConfig::parse(&toml_content).expect("generated enclava.toml must parse as AppConfig");
+    }
 
     #[test]
     fn detect_port_from_expose() {
