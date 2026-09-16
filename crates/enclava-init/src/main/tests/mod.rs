@@ -732,6 +732,44 @@ fn password_unlock_socket_is_reached_before_waiting_on_workload_namespaces() {
 }
 
 #[test]
+fn dockerfile_defaults_to_locked_release_profile() {
+    let dockerfile = include_str!("../../../Dockerfile").replace("\r\n", "\n");
+    assert!(
+        dockerfile.contains("ARG BUILD_PROFILE=release"),
+        "enclava-init image default BUILD_PROFILE must be release"
+    );
+    assert!(
+        !dockerfile.contains("ARG BUILD_PROFILE=debug"),
+        "enclava-init image must not default to debug"
+    );
+
+    let cargo_build_lines: Vec<&str> = dockerfile
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("cargo build"))
+        .collect();
+    assert!(
+        !cargo_build_lines.is_empty(),
+        "Dockerfile must contain cargo build lines"
+    );
+    for line in cargo_build_lines {
+        assert!(
+            line.contains("--locked"),
+            "cargo build in Dockerfile must use --locked: {line}"
+        );
+    }
+}
+
+#[test]
+fn prod_strict_cannot_skip_luks() {
+    let source = include_str!("../../main.rs").replace("\r\n", "\n");
+    assert!(
+        source.contains("cfg!(all(debug_assertions, not(feature = \"prod-strict\")))"),
+        "dev_no_luks_override must compile out when prod-strict is enabled"
+    );
+}
+
+#[test]
 fn workload_pid_fallback_finds_wait_exec_process_by_container_name() {
     let dir = tempdir().unwrap();
     let proc_dir = dir.path().join("123");

@@ -74,10 +74,10 @@ jobs:
       - name: Select build profile
         id: build_profile
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            echo "profile=release" >> "$GITHUB_OUTPUT"
-          else
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
             echo "profile=debug" >> "$GITHUB_OUTPUT"
+          else
+            echo "profile=release" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and push

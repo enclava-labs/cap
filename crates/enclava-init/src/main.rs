@@ -1152,7 +1152,7 @@ fn read_hex32(v: &toml::Value, key: &str) -> Result<[u8; 32]> {
 }
 
 fn dev_no_luks_override() -> bool {
-    cfg!(debug_assertions)
+    cfg!(all(debug_assertions, not(feature = "prod-strict")))
         && std::env::var("ENCLAVA_INIT_DEV_NO_LUKS")
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false)
