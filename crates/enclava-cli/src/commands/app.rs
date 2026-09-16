@@ -806,13 +806,29 @@ pub(crate) async fn terminal_diagnostic_probe_with_budget(
     attested: Option<&TeeClient>,
     budget: Duration,
 ) -> Option<TerminalBootstrapError> {
+    bound_tee_status_probe_with_budget(api, app_name, deployment, attested, budget)
+        .await
+        .and_then(|body| parse_terminal_bootstrap_error(&body))
+}
+
+/// Attested, deployment-bound `/status` read shared by the wait-loop probes:
+/// the terminal-diagnostic probe's launch-identity binding discipline, but
+/// returning the bounded status body so callers can also act on runtime
+/// state (e.g. a password-mode relock) from the same read.
+async fn bound_tee_status_probe_with_budget(
+    api: &ApiClient,
+    app_name: &str,
+    deployment: DeploymentWait<'_>,
+    attested: Option<&TeeClient>,
+    budget: Duration,
+) -> Option<serde_json::Value> {
     if budget.is_zero() {
         return None;
     }
     tokio::time::timeout(budget, async {
         let expectation = deployment.expectation?;
         match attested {
-            Some(attested) => terminal_diagnostic_on_attested(attested, expectation).await,
+            Some(attested) => bound_tee_status_on_attested(attested, expectation).await,
             None => {
                 let endpoint = api.get_unlock_endpoint(app_name).await.ok()?;
                 let tee = TeeClient::new_for_ownership_probe_with_resolve_ip(
@@ -820,7 +836,7 @@ pub(crate) async fn terminal_diagnostic_probe_with_budget(
                     endpoint.tee_resolve_ip,
                 );
                 let (_attestation, attested_tee) = tee.attest_receipt_key().await.ok()?;
-                terminal_diagnostic_on_attested(&attested_tee, expectation).await
+                bound_tee_status_on_attested(&attested_tee, expectation).await
             }
         }
     })
@@ -829,13 +845,13 @@ pub(crate) async fn terminal_diagnostic_probe_with_budget(
     .flatten()
 }
 
-/// Read a terminal diagnostic over an attested (SPKI-pinned) client, but only
-/// when the client's verified SNP HOST_DATA binds it to the expected
+/// Read the bounded `/status` body over an attested (SPKI-pinned) client, but
+/// only when the client's verified SNP HOST_DATA binds it to the expected
 /// deployment's launch hash.
-async fn terminal_diagnostic_on_attested(
+async fn bound_tee_status_on_attested(
     attested: &TeeClient,
     expectation: &TrustedDeploymentExpectation,
-) -> Option<TerminalBootstrapError> {
+) -> Option<serde_json::Value> {
     // HOST_DATA alone is hypervisor-supplied launch input: the authenticated
     // firmware measurement must match the existing expectation as well, or
     // the endpoint is not proven to execute this deployment's expected
@@ -847,11 +863,27 @@ async fn terminal_diagnostic_on_attested(
     ) {
         return None;
     }
-    attested
-        .bounded_status_json()
-        .await
-        .ok()
-        .and_then(|body| parse_terminal_bootstrap_error(&body))
+    attested.bounded_status_json().await.ok()
+}
+
+/// Deployment-bound attested `/status` read for waits that must act on
+/// runtime state beyond terminal diagnostics (e.g. a password-mode relock in
+/// the template SSH wait). An unbound, unreadable, or timed-out endpoint
+/// yields `None` and the caller keeps waiting — never a guessed state.
+pub(crate) async fn deployment_bound_tee_status(
+    api: &ApiClient,
+    app_name: &str,
+    deployment: DeploymentWait<'_>,
+    wait_deadline: Instant,
+) -> Option<serde_json::Value> {
+    bound_tee_status_probe_with_budget(
+        api,
+        app_name,
+        deployment,
+        None,
+        terminal_diagnostic_budget(Some(wait_deadline)),
+    )
+    .await
 }
 
 /// Deployment-bound terminal-diagnostic probe for waits that do not hold an
@@ -1451,7 +1483,7 @@ async fn ensure_password_storage_unlocked_for_config(
     }
 }
 
-fn tee_unlock_state(status: &serde_json::Value) -> &str {
+pub(crate) fn tee_unlock_state(status: &serde_json::Value) -> &str {
     status
         .get("unlock_state")
         .or_else(|| status.get("state"))
@@ -1460,7 +1492,7 @@ fn tee_unlock_state(status: &serde_json::Value) -> &str {
         .unwrap_or("unknown")
 }
 
-fn tee_supplemental_fields_are_consistent(status: &serde_json::Value) -> bool {
+pub(crate) fn tee_supplemental_fields_are_consistent(status: &serde_json::Value) -> bool {
     let live_state = tee_unlock_state(status);
     let optional_field_matches = |name: &str, expected: &str| match status.get(name) {
         None | Some(serde_json::Value::Null) => true,
