@@ -62,7 +62,7 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
 /// Config values are consumed by the workload at boot (injected env / config
 /// files); a running process keeps previously-consumed values until it
 /// restarts, so there is no non-disruptive live re-application path.
-const CONFIG_APPLICATION_NOTE: &str = "Note: config values apply to the workload at its next boot (pod restart or redeploy) — a running app may keep using previously-consumed values until then.";
+const CONFIG_APPLICATION_NOTE: &str = "Note: config values apply to the workload at its next boot (restart/redeploy; in password mode, after the subsequent unlock) — a running app may keep using previously-consumed values until then.";
 
 pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
