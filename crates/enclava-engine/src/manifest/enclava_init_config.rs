@@ -8,22 +8,39 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 
 use crate::manifest::cc_init_data;
+use crate::manifest::containers::UNLOCK_SOCKET_PATH;
 use crate::types::{ConfidentialApp, WorkloadSecurityProfile};
 use enclava_common::canonical::ce_v1_hash;
 use enclava_common::types::UnlockMode;
+use serde::Serialize;
 
 pub(crate) const LOCAL_OWNER_SEED_RESOURCE_URL: &str = "http://127.0.0.1:8081/internal/owner-seed";
 pub(crate) const LOCAL_KBS_ATTESTATION_TOKEN_URL: &str =
     "http://127.0.0.1:8006/aa/token?token_type=kbs";
 const LOCAL_WORKLOAD_ARTIFACTS_PATH: &str = "/etc/enclava-init/workload-artifacts.json";
 const LOCAL_TRUSTEE_POLICY_PATH: &str = "/etc/enclava-init/trustee-policy.json";
-const APP_UID: u32 = 10001;
-const APP_GID: u32 = 10001;
-const ROOT_UID: u32 = 0;
-const ROOT_GID: u32 = 0;
-const CADDY_UID: u32 = 10002;
-const CADDY_GID: u32 = 10002;
-const ROOT_ONLY_MANAGED_CONFIG_DIR_MODE: u32 = 0o700;
+pub(crate) const STATE_ROOT: &str = "/state";
+pub(crate) const UNLOCK_SOCKET: &str = UNLOCK_SOCKET_PATH;
+pub(crate) const ATTEMPTS_PATH: &str = "/run/enclava-unlock/unlock-attempts";
+pub(crate) const STATE_MAPPING_NAME: &str = "cap-state";
+pub(crate) const STATE_MOUNT_PATH: &str = "/state";
+pub(crate) const STATE_HKDF_INFO: &str = "state-luks-key";
+pub(crate) const TLS_STATE_MAPPING_NAME: &str = "cap-tls-state";
+pub(crate) const TLS_STATE_MOUNT_PATH: &str = "/state/tls-state";
+pub(crate) const TLS_STATE_HKDF_INFO: &str = "tls-state-luks-key";
+pub(crate) const APP_UID: u32 = 10001;
+pub(crate) const APP_GID: u32 = 10001;
+pub(crate) const ROOT_UID: u32 = 0;
+pub(crate) const ROOT_GID: u32 = 0;
+pub(crate) const CADDY_UID: u32 = 10002;
+pub(crate) const CADDY_GID: u32 = 10002;
+pub(crate) const ROOT_ONLY_MANAGED_CONFIG_DIR_MODE: u32 = 0o700;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct AppBindMountClaim {
+    pub subdir: String,
+    pub mount_path: String,
+}
 
 pub fn configmap_name(app_name: &str) -> String {
     format!("{app_name}-enclava-init")
@@ -71,13 +88,13 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     };
     let mut out = String::new();
     out.push_str(&format!("mode = \"{mode}\"\n"));
-    out.push_str("state-root = \"/state\"\n");
-    out.push_str("unlock-socket = \"/run/enclava-unlock/unlock.sock\"\n");
-    out.push_str("attempts-path = \"/run/enclava-unlock/unlock-attempts\"\n");
+    out.push_str(&format!("state-root = \"{STATE_ROOT}\"\n"));
+    out.push_str(&format!("unlock-socket = \"{UNLOCK_SOCKET}\"\n"));
+    out.push_str(&format!("attempts-path = \"{ATTEMPTS_PATH}\"\n"));
     out.push_str(&format!("app-uid = {}\n", primary_app_uid(app)));
     out.push_str(&format!("app-gid = {}\n", primary_app_gid(app)));
     if primary_uses_root_workload_identity(app) {
-        out.push_str("managed-config-gid = 0\n");
+        out.push_str(&format!("managed-config-gid = {ROOT_GID}\n"));
         out.push_str(&format!(
             "managed-config-dir-mode = {ROOT_ONLY_MANAGED_CONFIG_DIR_MODE}\n"
         ));
@@ -151,27 +168,25 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
         "device = \"{}\"\n",
         app.storage.app_data.device_path
     ));
-    out.push_str("mapping-name = \"cap-state\"\n");
-    out.push_str("mount-path = \"/state\"\n");
-    out.push_str("hkdf-info = \"state-luks-key\"\n");
+    out.push_str(&format!("mapping-name = \"{STATE_MAPPING_NAME}\"\n"));
+    out.push_str(&format!("mount-path = \"{STATE_MOUNT_PATH}\"\n"));
+    out.push_str(&format!("hkdf-info = \"{STATE_HKDF_INFO}\"\n"));
     out.push_str("\n[tls-state]\n");
     out.push_str(&format!(
         "device = \"{}\"\n",
         app.storage.tls_data.device_path
     ));
-    out.push_str("mapping-name = \"cap-tls-state\"\n");
-    out.push_str("mount-path = \"/state/tls-state\"\n");
-    out.push_str("hkdf-info = \"tls-state-luks-key\"\n");
+    out.push_str(&format!("mapping-name = \"{TLS_STATE_MAPPING_NAME}\"\n"));
+    out.push_str(&format!("mount-path = \"{TLS_STATE_MOUNT_PATH}\"\n"));
+    out.push_str(&format!("hkdf-info = \"{TLS_STATE_HKDF_INFO}\"\n"));
 
-    if let Some(primary) = app.primary_container() {
-        for path in &primary.storage_paths {
-            out.push_str("\n[[app-bind-mounts]]\n");
-            out.push_str(&format!(
-                "subdir = {}\n",
-                toml_string(&storage_subdir(path))
-            ));
-            out.push_str(&format!("mount-path = {}\n", toml_string(path)));
-        }
+    for mount in app_bind_mounts(app) {
+        out.push_str("\n[[app-bind-mounts]]\n");
+        out.push_str(&format!("subdir = {}\n", toml_string(&mount.subdir)));
+        out.push_str(&format!(
+            "mount-path = {}\n",
+            toml_string(&mount.mount_path)
+        ));
     }
 
     if let Some(log_encryption) = app.log_encryption.as_ref() {
@@ -198,7 +213,7 @@ fn render_config_toml(app: &ConfidentialApp) -> String {
     out
 }
 
-fn primary_uses_root_workload_identity(app: &ConfidentialApp) -> bool {
+pub(crate) fn primary_uses_root_workload_identity(app: &ConfidentialApp) -> bool {
     app.primary_container().is_some_and(|primary| {
         matches!(
             primary.workload_security_profile,
@@ -207,7 +222,7 @@ fn primary_uses_root_workload_identity(app: &ConfidentialApp) -> bool {
     })
 }
 
-fn primary_app_uid(app: &ConfidentialApp) -> u32 {
+pub(crate) fn primary_app_uid(app: &ConfidentialApp) -> u32 {
     if primary_uses_root_workload_identity(app) {
         ROOT_UID
     } else {
@@ -215,12 +230,35 @@ fn primary_app_uid(app: &ConfidentialApp) -> u32 {
     }
 }
 
-fn primary_app_gid(app: &ConfidentialApp) -> u32 {
+pub(crate) fn primary_app_gid(app: &ConfidentialApp) -> u32 {
     if primary_uses_root_workload_identity(app) {
         ROOT_GID
     } else {
         APP_GID
     }
+}
+
+pub(crate) fn app_bind_mounts(app: &ConfidentialApp) -> Vec<AppBindMountClaim> {
+    app.primary_container()
+        .map(|primary| {
+            primary
+                .storage_paths
+                .iter()
+                .map(|path| AppBindMountClaim {
+                    subdir: storage_subdir(path),
+                    mount_path: path.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn app_bind_mounts_json(app: &ConfidentialApp) -> String {
+    serde_json::to_string(&app_bind_mounts(app)).expect("bind mount serialization is infallible")
+}
+
+pub(crate) fn trustee_policy_read_available_claim(available: bool) -> &'static str {
+    if available { "true" } else { "false" }
 }
 
 pub(crate) fn argon2_salt_hex(app: &ConfidentialApp) -> String {

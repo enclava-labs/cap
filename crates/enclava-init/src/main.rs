@@ -13,6 +13,7 @@ use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
     kbs_fetch, log_relay, luks, seeds, socket, tls_certificate, trustee_verify, unlock, writes,
 };
+use serde::Deserialize;
 
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
 const DEFAULT_ERROR_FILE: &str = "/run/enclava/init-error";
@@ -407,7 +408,14 @@ fn acquire_owner_seed_password(cfg: &Config) -> Result<OwnerSeed> {
 
 fn validate_configmap_transport_against_signed_cc_init_data(cfg: &Config) -> Result<()> {
     if !cfg.trustee_policy_read_available {
-        return Ok(());
+        if cfg!(feature = "prod-strict") {
+            anyhow::bail!(
+                "prod-strict refuses trustee_policy_read_available=false; signed cc_init_data verification cannot be skipped"
+            );
+        }
+        if cfg.cc_init_data_path.is_none() {
+            return Ok(());
+        }
     }
     let cc_path = cfg
         .cc_init_data_path
@@ -444,41 +452,230 @@ fn validate_configmap_transport_against_signed_cc_init_data(cfg: &Config) -> Res
     }
     require_signed_config_match(
         data,
-        "workload_artifacts_url",
-        cfg.workload_artifacts_url.as_deref(),
-        "workload-artifacts-url",
-    )?;
-    require_optional_signed_config_match(
-        data,
-        "tls_certificate_broker_url",
-        cfg.tls_certificate_broker_url.as_deref(),
-        "tls-certificate-broker-url",
-    )?;
-    require_optional_signed_string_list_match(
-        data,
-        "tls_certificate_hostnames",
-        &cfg.tls_certificate_hostnames,
-        "tls-certificate-hostnames",
+        "state_device",
+        Some(&cfg.state.device),
+        "state.device",
     )?;
     require_signed_config_match(
         data,
-        "trustee_policy_url",
-        cfg.trustee_policy_url.as_deref(),
-        "trustee-policy-url",
+        "state_mapping_name",
+        Some(&cfg.state.mapping_name),
+        "state.mapping-name",
     )?;
-    require_optional_signed_config_match(
+    require_signed_config_match(
         data,
-        "platform_trustee_policy_pubkey_hex",
-        cfg.platform_trustee_policy_pubkey_hex.as_deref(),
-        "platform-trustee-policy-pubkey-hex",
+        "state_mount_path",
+        Some(&cfg.state.mount_path),
+        "state.mount-path",
     )?;
-    require_optional_signed_config_match(
+    require_signed_config_match(
         data,
-        "signing_service_pubkey_hex",
-        cfg.signing_service_pubkey_hex.as_deref(),
-        "signing-service-pubkey-hex",
+        "state_hkdf_info",
+        Some(&cfg.state.hkdf_info),
+        "state.hkdf-info",
     )?;
+    require_signed_config_match(
+        data,
+        "tls_state_device",
+        Some(&cfg.tls_state.device),
+        "tls-state.device",
+    )?;
+    require_signed_config_match(
+        data,
+        "tls_state_mapping_name",
+        Some(&cfg.tls_state.mapping_name),
+        "tls-state.mapping-name",
+    )?;
+    require_signed_config_match(
+        data,
+        "tls_state_mount_path",
+        Some(&cfg.tls_state.mount_path),
+        "tls-state.mount-path",
+    )?;
+    require_signed_config_match(
+        data,
+        "tls_state_hkdf_info",
+        Some(&cfg.tls_state.hkdf_info),
+        "tls-state.hkdf-info",
+    )?;
+    require_signed_config_match(
+        data,
+        "unlock_socket",
+        Some(&cfg.unlock_socket),
+        "unlock-socket",
+    )?;
+    require_signed_config_match(
+        data,
+        "attempts_path",
+        Some(&cfg.attempts_path),
+        "attempts-path",
+    )?;
+    require_signed_config_match(data, "state_root", Some(&cfg.state_root), "state-root")?;
+    require_signed_u32_match(data, "app_uid", cfg.app_uid, "app-uid")?;
+    require_signed_u32_match(data, "app_gid", cfg.app_gid, "app-gid")?;
+    require_signed_u32_match(data, "caddy_uid", cfg.caddy_uid, "caddy-uid")?;
+    require_signed_u32_match(data, "caddy_gid", cfg.caddy_gid, "caddy-gid")?;
+    require_optional_signed_u32_match(
+        data,
+        "managed_config_gid",
+        cfg.managed_config_gid,
+        "managed-config-gid",
+    )?;
+    require_optional_signed_u32_match(
+        data,
+        "managed_config_dir_mode",
+        cfg.managed_config_dir_mode,
+        "managed-config-dir-mode",
+    )?;
+    require_signed_app_bind_mounts_match(data, &cfg.app_bind_mounts)?;
+    require_signed_config_match(
+        data,
+        "trustee_policy_read_available",
+        Some(if cfg.trustee_policy_read_available {
+            "true"
+        } else {
+            "false"
+        }),
+        "trustee-policy-read-available",
+    )?;
+    if cfg.trustee_policy_read_available {
+        require_signed_config_match(
+            data,
+            "workload_artifacts_url",
+            cfg.workload_artifacts_url.as_deref(),
+            "workload-artifacts-url",
+        )?;
+        require_optional_signed_config_match(
+            data,
+            "tls_certificate_broker_url",
+            cfg.tls_certificate_broker_url.as_deref(),
+            "tls-certificate-broker-url",
+        )?;
+        require_optional_signed_string_list_match(
+            data,
+            "tls_certificate_hostnames",
+            &cfg.tls_certificate_hostnames,
+            "tls-certificate-hostnames",
+        )?;
+        require_signed_config_match(
+            data,
+            "trustee_policy_url",
+            cfg.trustee_policy_url.as_deref(),
+            "trustee-policy-url",
+        )?;
+        require_optional_signed_config_match(
+            data,
+            "platform_trustee_policy_pubkey_hex",
+            cfg.platform_trustee_policy_pubkey_hex.as_deref(),
+            "platform-trustee-policy-pubkey-hex",
+        )?;
+        require_optional_signed_config_match(
+            data,
+            "signing_service_pubkey_hex",
+            cfg.signing_service_pubkey_hex.as_deref(),
+            "signing-service-pubkey-hex",
+        )?;
+    }
 
+    Ok(())
+}
+
+fn require_signed_u32_match(
+    data: &toml::map::Map<String, toml::Value>,
+    signed_key: &str,
+    config_value: u32,
+    config_key: &str,
+) -> Result<()> {
+    let signed = signed_u32_claim(data, signed_key)?;
+    if signed != config_value {
+        anyhow::bail!(
+            "ConfigMap {config_key} does not match signed cc_init_data claim {signed_key}"
+        );
+    }
+    Ok(())
+}
+
+fn require_optional_signed_u32_match(
+    data: &toml::map::Map<String, toml::Value>,
+    signed_key: &str,
+    config_value: Option<u32>,
+    config_key: &str,
+) -> Result<()> {
+    match (data.get(signed_key), config_value) {
+        (Some(value), Some(config)) => {
+            let signed = parse_signed_u32(value, signed_key)?;
+            if signed != config {
+                anyhow::bail!(
+                    "ConfigMap {config_key} does not match signed cc_init_data claim {signed_key}"
+                );
+            }
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        (Some(_), None) => anyhow::bail!("config missing {config_key}"),
+        (None, Some(_)) => anyhow::bail!("cc_init_data missing signed claim {signed_key}"),
+    }
+}
+
+fn signed_u32_claim(data: &toml::map::Map<String, toml::Value>, signed_key: &str) -> Result<u32> {
+    let value = data
+        .get(signed_key)
+        .ok_or_else(|| anyhow!("cc_init_data missing signed claim {signed_key}"))?;
+    parse_signed_u32(value, signed_key)
+}
+
+fn parse_signed_u32(value: &toml::Value, signed_key: &str) -> Result<u32> {
+    if let Some(int) = value.as_integer() {
+        return u32::try_from(int)
+            .map_err(|_| anyhow!("cc_init_data claim {signed_key} is out of range"));
+    }
+    if let Some(text) = value.as_str() {
+        return text
+            .parse::<u32>()
+            .map_err(|_| anyhow!("cc_init_data claim {signed_key} is not a u32"));
+    }
+    Err(anyhow!("cc_init_data claim {signed_key} is not an integer"))
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SignedAppBindMount {
+    subdir: String,
+    mount_path: String,
+}
+
+fn require_signed_app_bind_mounts_match(
+    data: &toml::map::Map<String, toml::Value>,
+    mounts: &[enclava_init::config::AppBindMountConfig],
+) -> Result<()> {
+    let signed = data
+        .get("app_bind_mounts")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| anyhow!("cc_init_data missing signed claim app_bind_mounts"))?;
+    let signed_mounts: Vec<SignedAppBindMount> = serde_json::from_str(signed)
+        .with_context(|| "parsing cc_init_data claim app_bind_mounts JSON list")?;
+    if signed_mounts.len() != mounts.len()
+        || signed_mounts.iter().zip(mounts).any(|(signed, config)| {
+            signed.subdir != config.subdir || signed.mount_path != config.mount_path
+        })
+    {
+        anyhow::bail!(
+            "ConfigMap app-bind-mounts does not match signed cc_init_data claim app_bind_mounts"
+        );
+    }
+    for mount in mounts {
+        validate_app_bind_mount_path(&mount.mount_path)?;
+    }
+    Ok(())
+}
+
+fn validate_app_bind_mount_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        anyhow::bail!("app bind mount mount_path must be absolute: {path}");
+    }
+    if path.split('/').any(|segment| segment == "..") {
+        anyhow::bail!("app bind mount mount_path must not contain '..' path segments: {path}");
+    }
     Ok(())
 }
 
