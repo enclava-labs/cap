@@ -7,7 +7,7 @@ use enclava_cli::tee_client::TeeClient;
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
-    /// Set one or more config secrets (delivered direct to TEE)
+    /// Set one or more config secrets (written to the TEE config store; applied at the workload's next boot)
     Set {
         /// KEY=VALUE pairs
         #[arg(required = true)]
@@ -22,7 +22,7 @@ pub enum ConfigCommand {
         #[arg(long)]
         app: Option<String>,
     },
-    /// Remove a config secret
+    /// Remove a config secret (takes effect at the workload's next boot)
     Unset {
         /// Key to remove
         key: String,
@@ -59,6 +59,11 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
     Ok((key.to_string(), value.to_string()))
 }
 
+/// Config values are consumed by the workload at boot (injected env / config
+/// files); a running process keeps previously-consumed values until it
+/// restarts, so there is no non-disruptive live re-application path.
+const CONFIG_APPLICATION_NOTE: &str = "Note: config values apply to the workload at its next boot (pod restart or redeploy) — a running app may keep using previously-consumed values until then.";
+
 pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         ConfigCommand::Set { vars, app } => {
@@ -94,6 +99,7 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             println!("Config updated ({} key(s)).", pairs.len());
+            println!("{CONFIG_APPLICATION_NOTE}");
         }
 
         ConfigCommand::Get { app } => {
@@ -138,6 +144,7 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
             api.delete_config_meta(&app_name, &key).await?;
 
             println!("Unset {key}.");
+            println!("{CONFIG_APPLICATION_NOTE}");
         }
     }
     Ok(())
@@ -175,6 +182,47 @@ mod tests {
         assert_eq!(vars.len(), 1);
         assert_eq!(app.as_deref(), Some("shell"));
         assert_eq!(super::resolve_app_name(&app).unwrap(), "shell");
+    }
+
+    #[test]
+    fn config_set_and_unset_print_next_boot_application_note() {
+        let source = include_str!("config.rs");
+        let set_start = source
+            .find("ConfigCommand::Set { vars, app } =>")
+            .expect("set command branch exists");
+        let get_start = source[set_start..]
+            .find("ConfigCommand::Get")
+            .expect("get command branch follows set")
+            + set_start;
+        let set_body = &source[set_start..get_start];
+
+        let updated = set_body
+            .find("Config updated")
+            .expect("set prints a completion line");
+        let note = set_body
+            .find("CONFIG_APPLICATION_NOTE")
+            .expect("set names the next-boot application contract");
+        assert!(
+            updated < note,
+            "set prints the application note after the completion line"
+        );
+
+        let unset_start = source
+            .find("ConfigCommand::Unset { key, app } =>")
+            .expect("unset command branch exists");
+        let tests_start = source.find("#[cfg(test)]").expect("tests module exists");
+        let unset_body = &source[unset_start..tests_start];
+
+        let unset_done = unset_body
+            .find("Unset {key}")
+            .expect("unset prints a completion line");
+        let unset_note = unset_body
+            .find("CONFIG_APPLICATION_NOTE")
+            .expect("unset names the next-boot application contract");
+        assert!(
+            unset_done < unset_note,
+            "unset prints the application note after the completion line"
+        );
     }
 
     #[test]
