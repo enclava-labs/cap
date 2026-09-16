@@ -531,18 +531,39 @@ mod tests {
     }
 
     #[test]
-    fn tagged_cli_release_build_pins_bundled_release_root() {
-        let envelope: PlatformReleaseEnvelope =
-            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+    fn cli_dockerfile_requires_platform_release_root_build_arg() {
+        let dockerfile = include_str!("../Dockerfile").replace("\r\n", "\n");
+        assert!(
+            !dockerfile.contains("ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX="),
+            "CLI Dockerfile must not default the platform-release root"
+        );
+        assert!(
+            dockerfile.contains(
+                "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg"
+            )
+        );
+        assert!(dockerfile.contains("cargo build --locked --release --bin enclava"));
+    }
+
+    #[test]
+    fn tagged_cli_release_build_requires_platform_release_root_secret() {
         let workflow = include_str!("../../../.github/workflows/release.yml");
         // Windows checkouts use CRLF (autocrlf); normalize before matching.
         let workflow = workflow.replace("\r\n", "\n");
-        let expected = format!(
-            "\nenv:\n  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: {}\n",
-            envelope.signing_pubkey
-        );
+        let expected = "\nenv:\n  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}\n";
 
-        assert!(workflow.contains(&expected));
+        assert!(
+            workflow.contains(expected),
+            "release workflow must take the root from a required secret, not a committed fixture"
+        );
+        assert!(
+            !workflow.contains(TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX),
+            "release workflow must not hardcode the committed dev fixture pubkey"
+        );
+        assert!(
+            workflow.contains("secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be set"),
+            "release workflow must fail closed when the root secret is empty"
+        );
         assert_eq!(
             workflow
                 .matches("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX:")

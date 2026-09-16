@@ -5,11 +5,23 @@ on:
     tags: ['v*']
 
 env:
-  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
 
 jobs:
+  require-platform-release-root:
+    name: Require platform-release root
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX is empty
+        run: |
+          if [ -z "${ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX}" ]; then
+            echo "::error::secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be set" >&2
+            exit 1
+          fi
+
   build-linux:
     name: Build Linux binaries
+    needs: require-platform-release-root
     strategy:
       matrix:
         include:
@@ -50,6 +62,7 @@ jobs:
 
   build-windows:
     name: Build Windows binaries
+    needs: require-platform-release-root
     runs-on: windows-latest
 
     steps:
@@ -78,6 +91,7 @@ jobs:
 
   build-macos:
     name: Build macOS binaries
+    needs: require-platform-release-root
     runs-on: macos-latest
     strategy:
       matrix:

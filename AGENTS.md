@@ -63,5 +63,5 @@ required_checks:
   - ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=... rustup run stable cargo build --release --bin enclava
   - ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=... rustup run stable cargo build --release -p enclava-init --features prod-strict
   - sudo docker build -f crates/enclava-init/Dockerfile -t enclava-init:local .
-  - sudo docker build -f crates/enclava-api/Dockerfile -t enclava-api:local .
+  - sudo docker build -f crates/enclava-api/Dockerfile --build-arg ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=... -t enclava-api:local .
 ```

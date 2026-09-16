@@ -182,7 +182,10 @@ jobs:
           cargo build --release --bin enclava-api
           cargo build --release --bin enclava
         env:
-          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+          # CI-compile-only: this job does not publish images. Prefer the repo
+          # secret when set; otherwise use the well-known test fixture so
+          # scheduled compile checks still run. Never a Dockerfile default.
+          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX || '5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd' }}
 
       - name: Build prod-strict release path
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
@@ -193,7 +196,10 @@ jobs:
           cargo build --release -p enclava-cli --features prod-strict
           cargo build --release -p enclava-init --features prod-strict
         env:
-          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+          # CI-compile-only: this job does not publish images. Prefer the repo
+          # secret when set; otherwise use the well-known test fixture so
+          # scheduled compile checks still run. Never a Dockerfile default.
+          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX || '5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd' }}
 
       - name: Verify prod-strict rejects debug-only features
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')

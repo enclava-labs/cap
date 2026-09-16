@@ -129,10 +129,36 @@ for required in \
   "cargo build --locked --bin enclava-api --bin cap-migrate" \
   "COPY --from=debug-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate" \
   "cargo build --locked --release --bin enclava-api --bin cap-migrate" \
-  "COPY --from=release-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate"; do
+  "COPY --from=release-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate" \
+  "ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" \
+  "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg"; do
   grep -Fq -- "$required" "$DOCKERFILE" \
     || fail "API image Dockerfile is missing: $required"
 done
+if grep -Eq '^ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=' "$DOCKERFILE"; then
+  fail "API Dockerfile must not default ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX"
+fi
+[[ "$(grep -cE '^ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX$' "$DOCKERFILE")" -eq 2 ]] \
+  || fail "API Dockerfile must declare ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX with no default in both builder stages"
+[[ "$(grep -cF 'ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg' "$DOCKERFILE")" -eq 2 ]] \
+  || fail "API Dockerfile must fail the build when the platform-release root is empty"
+
+grep -Fq -- "Local-compose-only well-known fixture; must never be a Dockerfile default." "$COMPOSE" \
+  || fail "compose must label the fixture as local-compose-only"
+grep -Fq -- "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd" "$COMPOSE" \
+  || fail "compose must pass the well-known local fixture as an explicit build-arg"
+
+grep -Fq -- "Test-only well-known fixture; never a Dockerfile default. PR validation only." <<<"$validate_block" \
+  || fail "PR validation must label the fixture as test-only"
+grep -Fq -- "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd" <<<"$validate_block" \
+  || fail "PR validation must pass the test-only fixture as an explicit build-arg"
+grep -Fq -- "secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" <<<"$publish_block" \
+  || fail "publisher must pass secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX"
+grep -Fq -- "secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be set" <<<"$publish_block" \
+  || fail "publisher must fail closed when the platform-release root secret is empty"
+if grep -Fq -- "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd" <<<"$publish_block"; then
+  fail "publisher must not hardcode the committed fixture pubkey"
+fi
 
 if grep -Fq "id-token: write" <<<"$validate_block" \
   || grep -Fq "packages: write" <<<"$validate_block"; then
