@@ -39,6 +39,8 @@ pub enum KeysError {
     NoHome,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Message(String),
     #[error("invalid key file (expected 32 bytes, got {0})")]
     InvalidLength(usize),
     #[error("signature verification failed: {0}")]
@@ -677,6 +679,28 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     fs::rename(&tmp, path)?;
     sync_parent_dir(path)?;
     Ok(())
+}
+
+/// Read a secret (password, passphrase) from a file: content is used verbatim
+/// except for a trailing newline, and an empty file is rejected so a truncated
+/// secret source can never silently become an empty credential.
+pub fn read_secret_file(path: &Path, kind: &str) -> Result<String, KeysError> {
+    let value = fs::read_to_string(path)
+        .map_err(|err| {
+            KeysError::Message(format!(
+                "failed to read {kind} file {}: {err}",
+                path.display()
+            ))
+        })?
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    if value.is_empty() {
+        return Err(KeysError::Message(format!(
+            "{kind} file {} is empty",
+            path.display()
+        )));
+    }
+    Ok(value)
 }
 /// The directory containing `path`'s entry, normalized for bare relative
 /// filenames (`""` from `Path::new("backup.json").parent()`, or `None` for a

@@ -20,6 +20,9 @@ pub struct ClaimArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
+    /// Read the initial unlock password from a file (non-interactive; trailing newline trimmed). Replaces the password prompt and its confirmation.
+    #[arg(long)]
+    pub password_file: Option<PathBuf>,
     /// Persist the recovery mnemonic to the protected local keystore so `enclava key backup` can back it up (default).
     #[arg(long, conflicts_with = "no_store_mnemonic")]
     pub store_mnemonic: bool,
@@ -33,6 +36,9 @@ pub struct UnlockArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
+    /// Read the unlock password from a file (non-interactive; trailing newline trimmed).
+    #[arg(long)]
+    pub password_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -53,6 +59,12 @@ pub struct ChangePasswordArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
+    /// Read the current password from a file (non-interactive; trailing newline trimmed).
+    #[arg(long)]
+    pub current_password_file: Option<PathBuf>,
+    /// Read the new password from a file (non-interactive; trailing newline trimmed).
+    #[arg(long)]
+    pub new_password_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -65,6 +77,9 @@ pub enum AutoUnlockCommand {
         /// Digest-pinned container image to bind into the signed redeploy descriptor.
         #[arg(long)]
         image: String,
+        /// Read the unlock password from a file (non-interactive; trailing newline trimmed).
+        #[arg(long)]
+        password_file: Option<PathBuf>,
     },
     /// Remove the KBS-gated seed wrap, require password on restart
     Disable {
@@ -74,6 +89,9 @@ pub enum AutoUnlockCommand {
         /// Digest-pinned container image to bind into the signed redeploy descriptor.
         #[arg(long)]
         image: String,
+        /// Read the unlock password from a file (non-interactive; trailing newline trimmed).
+        #[arg(long)]
+        password_file: Option<PathBuf>,
     },
 }
 
@@ -169,10 +187,13 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     let signature = URL_SAFE_NO_PAD.encode(signature_bytes.to_bytes());
 
     // Step 4: Get password
-    let password = Password::new()
-        .with_prompt("Set unlock password")
-        .with_confirmation("Confirm password", "Passwords don't match")
-        .interact()?;
+    let password = secret_from_file_or_prompt(
+        args.password_file.as_deref(),
+        "password",
+        "Set unlock password",
+        Some(("Confirm password", "Passwords don't match")),
+        "--password-file",
+    )?;
 
     // Step 5: Claim
     let result = match tee
@@ -383,7 +404,13 @@ pub async fn unlock(args: UnlockArgs) -> Result<(), Box<dyn std::error::Error>> 
         TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
-    let password = Password::new().with_prompt("Unlock password").interact()?;
+    let password = secret_from_file_or_prompt(
+        args.password_file.as_deref(),
+        "password",
+        "Unlock password",
+        None,
+        "--password-file",
+    )?;
 
     println!("Unlocking {app_name}...");
     tee.unlock(&password).await?;
@@ -466,7 +493,7 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
     };
 
     let new_password = match args.new_password_file.as_ref() {
-        Some(path) => read_new_password_file(path)?,
+        Some(path) => keys::read_secret_file(path, "new password")?,
         None => Password::new()
             .with_prompt("New unlock password")
             .with_confirmation("Confirm password", "Passwords don't match")
@@ -529,18 +556,6 @@ fn read_mnemonic_file(path: &Path) -> Result<String, Box<dyn std::error::Error>>
 }
 
 /// Read the new unlock password from a file, trimming a single trailing newline. Mirrors
-/// `--storage-password-file`: no confirmation prompt when read from a file, and interior
-/// whitespace is preserved (only `\r`/`\n` are stripped from the end).
-fn read_new_password_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let value = std::fs::read_to_string(path)?
-        .trim_end_matches(['\r', '\n'])
-        .to_string();
-    if value.is_empty() {
-        return Err(format!("new password file {} is empty", path.display()).into());
-    }
-    Ok(value)
-}
-
 fn recovery_restart_guidance(err: &TeeError) -> Option<&'static str> {
     if matches!(
         err,
@@ -562,6 +577,54 @@ fn recovery_restart_guidance(err: &TeeError) -> Option<&'static str> {
     None
 }
 
+/// Resolve a secret from a file, or from a terminal prompt: a provided file
+/// replaces the prompt and any confirmation prompt with it (the caller
+/// confirms by providing the file), while having neither a file nor a
+/// terminal is a hard error that names the flag — mirroring how
+/// `deploy --storage-password-file` behaves for non-interactive sessions.
+pub(crate) fn secret_from_file_or_prompt(
+    file: Option<&Path>,
+    kind: &str,
+    prompt: &str,
+    confirmation: Option<(&str, &str)>,
+    flag: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    secret_from_file_or_prompt_for_session(
+        file,
+        kind,
+        prompt,
+        confirmation,
+        flag,
+        io::stdin().is_terminal(),
+    )
+}
+
+/// Testable core of [`secret_from_file_or_prompt`] with the session
+/// interactivity supplied by the caller.
+pub(crate) fn secret_from_file_or_prompt_for_session(
+    file: Option<&Path>,
+    kind: &str,
+    prompt: &str,
+    confirmation: Option<(&str, &str)>,
+    flag: &str,
+    stdin_is_terminal: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(path) = file {
+        return Ok(keys::read_secret_file(path, kind)?);
+    }
+    if !stdin_is_terminal {
+        return Err(format!(
+            "an interactive terminal or {flag} <PATH> is required to provide the password non-interactively"
+        )
+        .into());
+    }
+    let mut password = Password::new().with_prompt(prompt);
+    if let Some((confirmation_prompt, mismatch)) = confirmation {
+        password = password.with_confirmation(confirmation_prompt, mismatch);
+    }
+    Ok(password.interact()?)
+}
+
 fn prompt_recovery_mnemonic() -> Result<String, Box<dyn std::error::Error>> {
     Ok(Input::new()
         .with_prompt("Recovery mnemonic (BIP39)")
@@ -575,12 +638,21 @@ pub async fn change_password(args: ChangePasswordArgs) -> Result<(), Box<dyn std
     let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
-    let current = Password::new().with_prompt("Current password").interact()?;
+    let current = secret_from_file_or_prompt(
+        args.current_password_file.as_deref(),
+        "current password",
+        "Current password",
+        None,
+        "--current-password-file",
+    )?;
 
-    let new_password = Password::new()
-        .with_prompt("New password")
-        .with_confirmation("Confirm new password", "Passwords don't match")
-        .interact()?;
+    let new_password = secret_from_file_or_prompt(
+        args.new_password_file.as_deref(),
+        "new password",
+        "New password",
+        Some(("Confirm new password", "Passwords don't match")),
+        "--new-password-file",
+    )?;
 
     println!("Changing password for {app_name}...");
     tee.change_password(&current, &new_password).await?;
@@ -590,7 +662,11 @@ pub async fn change_password(args: ChangePasswordArgs) -> Result<(), Box<dyn std
 
 pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        AutoUnlockCommand::Enable { app, image } => {
+        AutoUnlockCommand::Enable {
+            app,
+            image,
+            password_file,
+        } => {
             let app_name = resolve_app_name(&app)?;
             let (api, paths) = build_api_client()?;
             let cli_config = config::load_config(&paths)?;
@@ -615,9 +691,13 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
             let (transition_attestation, tee) = tee.attest_receipt_key().await?;
 
-            let password = Password::new()
-                .with_prompt("Unlock password (to authorize auto-unlock wrapping)")
-                .interact()?;
+            let password = secret_from_file_or_prompt(
+                password_file.as_deref(),
+                "password",
+                "Unlock password (to authorize auto-unlock wrapping)",
+                None,
+                "--password-file",
+            )?;
 
             println!("Enabling auto-unlock for {app_name}...");
             tee.enable_auto_unlock(&password).await?;
@@ -654,7 +734,11 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             println!("Auto-unlock enabled. Restarts no longer require a password.");
             Ok(())
         }
-        AutoUnlockCommand::Disable { app, image } => {
+        AutoUnlockCommand::Disable {
+            app,
+            image,
+            password_file,
+        } => {
             let app_name = resolve_app_name(&app)?;
             let (api, paths) = build_api_client()?;
             let cli_config = config::load_config(&paths)?;
@@ -679,9 +763,13 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
             let (transition_attestation, tee) = tee.attest_receipt_key().await?;
 
-            let password = Password::new()
-                .with_prompt("Unlock password (to remove auto-unlock wrapping)")
-                .interact()?;
+            let password = secret_from_file_or_prompt(
+                password_file.as_deref(),
+                "password",
+                "Unlock password (to remove auto-unlock wrapping)",
+                None,
+                "--password-file",
+            )?;
 
             println!("Disabling auto-unlock for {app_name}...");
             tee.disable_auto_unlock(&password).await?;
@@ -1119,18 +1207,58 @@ mod tests {
     }
 
     #[test]
-    fn read_new_password_file_trims_trailing_newline_and_rejects_empty() {
+    fn read_secret_file_trims_trailing_newline_and_rejects_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pw.txt");
         std::fs::write(&path, "s3cret-pw\n").unwrap();
-        assert_eq!(read_new_password_file(&path).unwrap(), "s3cret-pw");
+        assert_eq!(
+            keys::read_secret_file(&path, "new password").unwrap(),
+            "s3cret-pw"
+        );
 
         // interior/leading whitespace preserved; only trailing newline trimmed
         std::fs::write(&path, "  lead keep \r\n").unwrap();
-        assert_eq!(read_new_password_file(&path).unwrap(), "  lead keep ");
+        assert_eq!(
+            keys::read_secret_file(&path, "new password").unwrap(),
+            "  lead keep "
+        );
 
         let empty = tmp.path().join("empty.txt");
         std::fs::write(&empty, "\n").unwrap();
-        assert!(read_new_password_file(&empty).is_err());
+        assert!(keys::read_secret_file(&empty, "new password").is_err());
+    }
+
+    #[test]
+    fn secret_from_file_or_prompt_reads_file_and_names_flag_without_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pw.txt");
+        std::fs::write(&path, "from-file\n").unwrap();
+        assert_eq!(
+            secret_from_file_or_prompt(
+                Some(&path),
+                "password",
+                "Unlock password",
+                None,
+                "--password-file",
+            )
+            .unwrap(),
+            "from-file"
+        );
+
+        // No file and no terminal on stdin: hard error naming the flag.
+        let err = secret_from_file_or_prompt_for_session(
+            None,
+            "password",
+            "Unlock password",
+            None,
+            "--password-file",
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("--password-file"),
+            "error should name the flag: {err}"
+        );
     }
 }
