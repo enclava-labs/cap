@@ -13,7 +13,7 @@ COPY vendor/ vendor/
 COPY crates/ crates/
 
 # Build for musl (static binary)
-RUN cargo build --release --bin enclava && \
+RUN cargo build --locked --release --bin enclava && \
     strip /build/target/release/enclava
 
 FROM alpine:3.20

@@ -11,7 +11,8 @@ use enclava_init::config::{Config, Mode, VolumeConfig};
 use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
-    kbs_fetch, log_relay, luks, seeds, socket, tls_certificate, trustee_verify, unlock, writes,
+    dev_no_luks_override, kbs_fetch, log_relay, luks, seeds, socket, tls_certificate,
+    trustee_verify, unlock, writes,
 };
 
 const DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
@@ -1149,13 +1150,6 @@ fn read_hex32(v: &toml::Value, key: &str) -> Result<[u8; 32]> {
         .ok_or_else(|| anyhow!("cc_init_data.data.{key} missing or not string"))?;
     let raw = hex::decode(s).with_context(|| format!("decoding {key}"))?;
     raw.try_into().map_err(|_| anyhow!("{key} not 32 bytes"))
-}
-
-fn dev_no_luks_override() -> bool {
-    cfg!(all(debug_assertions, not(feature = "prod-strict")))
-        && std::env::var("ENCLAVA_INIT_DEV_NO_LUKS")
-            .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-            .unwrap_or(false)
 }
 
 fn write_per_component_seeds(cfg: &Config, owner: &OwnerSeed) -> Result<()> {
