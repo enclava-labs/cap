@@ -336,7 +336,7 @@ async fn tenant_namespace_delete_is_bounded_when_provider_read_hangs() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn unreachable_running_workload_teardown_is_best_effort_and_diagnostics_are_bounded() {
+async fn unreachable_running_workload_teardown_blocks_deletion_and_diagnostics_are_bounded() {
     const SECRET_APP_NAME: &str = "secret-app-name-sentinel";
     const SECRET_NAMESPACE: &str = "secret-namespace-sentinel";
     const SECRET_DOMAIN: &str = "secret-teardown-host.invalid";
@@ -375,18 +375,25 @@ async fn unreachable_running_workload_teardown_is_best_effort_and_diagnostics_ar
     };
 
     let (logs, guard) = captured_warn_logs();
-    request_workload_teardown(&state, &auth, &app)
+    let (status, Json(body)) = request_workload_teardown(&state, &auth, &app)
         .await
-        .expect("unreachable workload teardown endpoint must not block deletion");
+        .expect_err("unreachable workload teardown endpoint must block deletion");
     drop(guard);
 
     let diagnostics = captured_log_text(&logs);
+    let response = serde_json::to_string(&body).expect("delete error response serializes");
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"], "app_delete_teardown_unavailable");
     assert!(diagnostics.contains(&app.id.to_string()));
     assert!(diagnostics.contains("app_delete_teardown_unavailable"));
     for secret in [SECRET_APP_NAME, SECRET_NAMESPACE, SECRET_DOMAIN] {
         assert!(
             !diagnostics.contains(secret),
             "tenant-controlled teardown data escaped into diagnostics"
+        );
+        assert!(
+            !response.contains(secret),
+            "tenant-controlled teardown data escaped into the delete error response"
         );
     }
 }

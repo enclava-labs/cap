@@ -287,8 +287,11 @@ async fn request_workload_teardown(
     {
         Ok(response) => response,
         Err(_) => {
-            let _ = app_delete_failure(app.id, AppDeleteFailure::TeardownEndpoint, "unreachable");
-            return Ok(());
+            return Err(app_delete_failure(
+                app.id,
+                AppDeleteFailure::TeardownEndpoint,
+                "unreachable",
+            ));
         }
     };
 
@@ -296,12 +299,11 @@ async fn request_workload_teardown(
         return Ok(());
     }
 
-    let _ = app_delete_failure(
+    Err(app_delete_failure(
         app.id,
         AppDeleteFailure::TeardownEndpoint,
         response.status().as_u16(),
-    );
-    Ok(())
+    ))
 }
 
 /// Comprehensive app name validation. The canonical ruleset lives in
