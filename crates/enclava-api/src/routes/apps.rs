@@ -311,6 +311,14 @@ pub(crate) fn validate_app_name(name: &str) -> Result<(), String> {
     enclava_common::validate::validate_app_name(name).map_err(|error| error.to_string())
 }
 
+/// Legacy-tolerant validation for handlers that address **stored state** —
+/// delete / desired-state / proofs / routing for an app that may predate the
+/// all-digit admission rule. New-name admission must use
+/// [`validate_app_name`].
+pub(crate) fn validate_app_name_for_existing(name: &str) -> Result<(), String> {
+    enclava_common::validate::validate_app_name_legacy(name).map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateAppRequest {
     pub name: String,
