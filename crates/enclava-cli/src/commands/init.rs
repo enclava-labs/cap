@@ -22,6 +22,11 @@ pub(crate) fn detect_dockerfile_port(path: &Path) -> Option<u16> {
 }
 
 /// Default app name derived from the current project directory.
+fn interactive_session() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
 pub(crate) fn default_app_name(cwd: &Path) -> String {
     let raw = cwd
         .file_name()
@@ -173,7 +178,6 @@ pub struct InitArgs {
 }
 
 pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::IsTerminal;
     let cwd = std::env::current_dir()?;
 
     // Check if enclava.toml already exists
@@ -199,10 +203,13 @@ pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Get app name (default to directory name; --app-name or a non-interactive
-    // session takes the deterministic default instead of prompting)
+    // session takes the deterministic default instead of prompting). Both the
+    // name and port prompts render on stderr (dialoguer 0.11 uses
+    // Term::stderr()) and fail when it is redirected, so require terminal
+    // stdin AND stderr before prompting — same rule as the password paths.
     let app_name: String = match args.app_name {
         Some(name) => name,
-        None if std::io::stdin().is_terminal() => Input::new()
+        None if interactive_session() => Input::new()
             .with_prompt("App name")
             .default(default_app_name(&cwd))
             .interact_text()?,
@@ -211,7 +218,7 @@ pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let port: u16 = match args.port {
         Some(port) => port,
-        None if std::io::stdin().is_terminal() => Input::new()
+        None if interactive_session() => Input::new()
             .with_prompt("Port")
             .default(detected_port.unwrap_or(3000))
             .interact_text()?,
@@ -221,13 +228,26 @@ pub async fn init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Validate the name against the canonical app-name rules BEFORE writing
     // anything: an invalid name (from --app-name or the directory-derived
     // default) would otherwise scaffold a project that `create` later rejects,
-    // and the existing enclava.toml then blocks a corrected rerun.
+    // and the existing enclava.toml then blocks a corrected rerun. These are
+    // the name-level rules the scaffold can check; the org-dependent
+    // namespace budget (cap-{org}-{app} ≤ 63) stays with `create`, which
+    // knows both operands and reports an actionable error.
     enclava_common::validate::validate_app_name(&app_name).map_err(|err| {
         format!(
-            "invalid app name `{app_name}` ({err}); pass --app-name with a DNS-1123 label: \
-             lowercase [a-z0-9-], no leading/trailing '-', at most 32 chars, not all digits"
+            "invalid app name `{app_name}` ({err}); pass --app-name with a lowercase \
+             [a-z0-9-] name: alphanumeric edges, no consecutive hyphens, at most \
+             63 chars, not all digits, no reserved system names"
         )
     })?;
+    // Kubernetes container ports must be 1-65535; a 0 would only surface as
+    // a manifest rejection at deploy time, so fail the scaffold early.
+    if port == 0 {
+        return Err(format!(
+            "invalid port {port} from --port or image EXPOSE: pass --port with a \
+             TCP port between 1 and 65535"
+        )
+        .into());
+    }
 
     // Write enclava.toml
     let toml_content = generate_enclava_toml(&app_name, port);

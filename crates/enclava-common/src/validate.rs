@@ -74,12 +74,13 @@ pub fn validate_org_slug(s: &str) -> Result<(), ValidateError> {
     Ok(())
 }
 
-/// Platform app name: a Kubernetes DNS-1123 label (1–63 chars, `[a-z0-9-]`)
-/// that starts and ends with a letter or digit, carries no consecutive
-/// hyphens, and is none of the reserved system names. This is the single
-/// source of truth — the API's create path delegates here, so the CLI can
-/// validate scaffolds against exactly the rules the server enforces.
-pub fn validate_app_name(s: &str) -> Result<(), ValidateError> {
+/// App names the create API admitted before the all-digit admission rule
+/// was consolidated here: identical shape rules, but all-digit names are
+/// accepted. This is the validator for **existing state** — mnemonic files,
+/// edge routing, and anything keyed by an app name the server may already
+/// hold — so legacy all-digit apps keep working. New-name admission
+/// (`create`, `init`) uses [`validate_app_name`].
+pub fn validate_app_name_legacy(s: &str) -> Result<(), ValidateError> {
     const RESERVED: [&str; 14] = [
         "kubernetes",
         "kube",
@@ -123,10 +124,19 @@ pub fn validate_app_name(s: &str) -> Result<(), ValidateError> {
             "must not contain consecutive hyphens",
         ));
     }
+    Ok(())
+}
+
+/// Platform app name for **new names** (admission): a Kubernetes DNS-1123
+/// label (1–63 chars, `[a-z0-9-]`) that starts and ends with a letter or
+/// digit, carries no consecutive hyphens, is none of the reserved system
+/// names, and is not all digits. The API's create path delegates here, so
+/// the CLI can validate scaffolds against exactly the rules the server
+/// enforces. Existing state must use [`validate_app_name_legacy`].
+pub fn validate_app_name(s: &str) -> Result<(), ValidateError> {
+    validate_app_name_legacy(s)?;
     // Deliberate platform constraint (d475553): app names propagate to
-    // Kubernetes service names, which must not be all-numeric. The
-    // consolidation wires this into the create path for the first time —
-    // before, only the CLI-side validator enforced it.
+    // Kubernetes service names, which must not be all-numeric.
     if s.bytes().all(|b| b.is_ascii_digit()) {
         return Err(ValidateError::InvalidAppName("must not be all digits"));
     }
@@ -306,11 +316,15 @@ mod tests {
 
     #[test]
     fn app_name_rejects_all_digits() {
-        // K8s service names must not be all-numeric (d475553); the shared
-        // validator is the enforcement point for that platform constraint.
+        // K8s service names must not be all-numeric (d475553); admission
+        // rejects them, but legacy state (mnemonics for apps the old API
+        // admitted) must keep loading.
         assert!(validate_app_name("123").is_err());
         assert!(validate_app_name("0").is_err());
         assert!(validate_app_name("a1").is_ok());
+        assert!(validate_app_name_legacy("123").is_ok());
+        assert!(validate_app_name_legacy("Bad_Name").is_err());
+        assert!(validate_app_name_legacy("default").is_err());
     }
 
     #[test]

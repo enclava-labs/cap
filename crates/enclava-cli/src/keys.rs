@@ -15,7 +15,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use enclava_common::validate::validate_app_name;
+use enclava_common::validate::validate_app_name_legacy;
 use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -816,7 +816,10 @@ pub fn app_mnemonic_path(paths: &CliPaths, org: &str, app: &str) -> PathBuf {
 }
 
 fn validate_app_mnemonic_name(app: &str) -> Result<(), KeysError> {
-    validate_app_name(app).map_err(|e| {
+    // Legacy-tolerant: the mnemonic store holds state for apps the create
+    // API admitted under its original rules (all-digit names included), so
+    // admission-time restrictions must not lock their recovery material out.
+    validate_app_name_legacy(app).map_err(|e| {
         KeysError::InvalidBackup(format!("invalid recovery mnemonic app name `{app}`: {e}"))
     })
 }
