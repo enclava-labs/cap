@@ -153,9 +153,9 @@ mod tests {
         // presence: debug exactly in the pull_request branch, release
         // exactly in the else branch. Swapping the branches must fail.
         let pr_branch = select
-            .split("= \"pull_request\" ]; then")
+            .split("if [ \"${GITHUB_EVENT_NAME}\" = \"pull_request\" ]; then")
             .nth(1)
-            .expect("pull_request branch")
+            .expect("pull_request branch (exact = comparison)")
             .split("else")
             .next()
             .expect("pull_request branch body");
@@ -211,8 +211,9 @@ mod tests {
         );
 
         assert!(
-            workflow.contains("org.enclava.build-profile="),
-            "pushed images must carry an org.enclava.build-profile label so verifiers can reject debug digests"
+            workflow
+                .contains("org.enclava.build-profile=${{ steps.build_profile.outputs.profile }}"),
+            "pushed images must carry an org.enclava.build-profile label derived from the selected profile so verifiers can reject debug digests"
         );
     }
 }
