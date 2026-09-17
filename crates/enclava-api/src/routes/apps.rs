@@ -1463,6 +1463,18 @@ pub(crate) async fn delete_app_before(
         return Ok(StatusCode::NO_CONTENT);
     };
     if deleting_app.status != AppStatus::Deleting {
+        // Defensive: the phase transaction committed 'deleting' under this
+        // lane moments ago, so this is not expected to fire. Release in the
+        // held lane transaction all the same — dropping the lease here would
+        // abandon the shared fences through reclaim quarantine.
+        delete_mutation
+            .finish_in_tx(&mut delete_lane)
+            .await
+            .map_err(|_| internal_server_error())?;
+        delete_lane
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "app deletion phase is invalid"})),
