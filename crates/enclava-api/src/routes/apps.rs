@@ -315,7 +315,7 @@ pub(crate) async fn post_workload_teardown(
         // timeout shorter than the proxy's own would report a slow success as
         // a failure, and the retry would then hit the proxy's non-idempotent
         // teardown (404 on the erased wrap -> 500) and wedge the delete.
-        .timeout(std::time::Duration::from_secs(45))
+        .timeout(std::time::Duration::from_secs(60))
         .send()
         .await
     {
@@ -1480,7 +1480,7 @@ pub(crate) async fn delete_app_before(
         .await
         .map_err(|_| internal_server_error())?;
 
-    delete_mutation
+    let teardown = delete_mutation
         .guard_provider(request_workload_teardown(
             &state,
             &auth,
@@ -1491,7 +1491,25 @@ pub(crate) async fn delete_app_before(
             },
         ))
         .await
-        .map_err(|_| internal_server_error())??;
+        .map_err(|_| internal_server_error())?;
+    if let Err(failure) = teardown {
+        // A failed teardown exits before any fenced resource is touched, but
+        // merely dropping the lease would hold the cluster-wide edge_config
+        // and kbs_policy fences through reclaim quarantine (~9 min), blocking
+        // every tenant's deploys until then. Nothing in this attempt wrote
+        // provider state yet, so release durably in the already-held lane
+        // transaction (finish() would re-take the advisory lane lock and
+        // deadlock) and surface the failure for a same-key retry.
+        delete_mutation
+            .finish_in_tx(&mut delete_lane)
+            .await
+            .map_err(|_| internal_server_error())?;
+        delete_lane
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
+        return Err(failure);
+    }
 
     // The running workload needs its current KBS authorization to erase the
     // owner seed. Revoke that authorization only after teardown has completed.

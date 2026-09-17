@@ -656,7 +656,7 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
         "a locked TEE must fail destroy through a stable teardown error code"
     );
     assert!(
-        teardown.contains("Duration::from_secs(45)"),
+        teardown.contains("Duration::from_secs(60)"),
         "the teardown client timeout must out-wait the proxy's two 20 s KBS deletes"
     );
     let migration = include_str!("../../../../migrations/0048_app_workload_teardown_state.sql");

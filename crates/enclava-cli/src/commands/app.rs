@@ -2581,11 +2581,11 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     }) = &result
     {
         let hint = match code.as_str() {
-            "app_delete_teardown_locked" => Some(
-                "the confidential workload is locked; unlock it with its storage password (`enclava unlock --app <name>`), then retry destroy",
-            ),
+            "app_delete_teardown_locked" => Some(format!(
+                "the confidential workload is locked; unlock it with its storage password (`enclava unlock --app {app_name}`), then retry destroy"
+            )),
             "app_delete_teardown_unavailable" => Some(
-                "the confidential workload teardown did not complete; the app stays in 'deleting' -- wait for the workload to become reachable and retry destroy, or contact the operator if it keeps failing",
+                "the confidential workload teardown did not complete; the app stays in 'deleting' -- wait for the workload to become reachable and retry destroy, or contact the operator if it keeps failing".to_string(),
             ),
             _ => None,
         };

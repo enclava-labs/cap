@@ -1679,7 +1679,7 @@ async fn complete_app_delete_result(
                 == Some("app_delete_teardown_locked");
         if status.is_server_error() || teardown_locked {
             let (deferred_status, Json(mut deferred_body)) = defer_idempotent_request(lease).await;
-            if teardown_locked {
+            if teardown_locked && deferred_status == StatusCode::CONFLICT {
                 deferred_body["cause"] = serde_json::json!("app_delete_teardown_locked");
             }
             return Err((deferred_status, Json(deferred_body)));
@@ -9392,6 +9392,11 @@ mod tests {
                 "exactly one failed teardown attempt before the marker"
             );
             assert_eq!(
+                stdout.matches("app_delete_teardown_unavailable").count(),
+                2,
+                "the failed step must be the workload teardown"
+            );
+            assert_eq!(
                 stdout
                     .matches("app_delete_teardown_already_completed")
                     .count(),
@@ -9407,7 +9412,9 @@ mod tests {
             .init();
         let (mut state, auth, app_name, app_id) = app_delete_fixture().await;
         // A running app holds confidential state: teardown is required and the
-        // pre-delete decision must survive the deleting transition.
+        // pre-delete decision must survive the deleting transition. The
+        // fixture's .test tee domain fails teardown resolution instantly
+        // (reserved TLD, no resolver dependency beyond NXDOMAIN).
         sqlx::query("UPDATE apps SET status = 'running' WHERE id = $1")
             .bind(app_id)
             .execute(&state.db)
@@ -9474,6 +9481,22 @@ mod tests {
             ("deleting".into(), true, false, true),
             "unreachable teardown must block the delete before KBS revocation"
         );
+        // The failed teardown must release the shared fences immediately: an
+        // abandoned lease would hold cluster-wide edge_config and kbs_policy
+        // through reclaim quarantine and stall every tenant's deploys.
+        let shared_fences: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM external_resource_mutation_leases
+              WHERE resource_key = 'global'
+                AND resource_scope IN ('edge_config', 'kbs_policy')
+                AND owner_token IS NOT NULL",
+        )
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            shared_fences, 0,
+            "a failed teardown must not abandon the shared mutation fences"
+        );
         // Simulate the durable marker left by a previously successful teardown
         // (or the documented operator recovery for an already-erased wrap).
         sqlx::query(
@@ -9483,10 +9506,8 @@ mod tests {
         .execute(&state.db)
         .await
         .unwrap();
-        sqlx::query("UPDATE app_mutation_leases SET locked_until = clock_timestamp() - interval '2 seconds', reclaim_after = clock_timestamp() - interval '1 second' WHERE app_id = $1")
-            .bind(app_id).execute(&state.db).await.unwrap();
-        sqlx::query("UPDATE external_resource_mutation_leases SET locked_until = clock_timestamp() - interval '2 seconds', reclaim_after = clock_timestamp() - interval '1 second' WHERE operation_id = $1 AND reclaim_after <> 'infinity'::timestamptz")
-            .bind(app_id).execute(&state.db).await.unwrap();
+        // Only the idempotency lease needs expiring: the mutation fences were
+        // durably released above, so the retry re-claims them normally.
         expire_idempotency_lease(&state.db, &key).await;
         let (status, _) = delete_paas_app(
             internal_test_auth(),
