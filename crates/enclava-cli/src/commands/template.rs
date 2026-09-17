@@ -2071,12 +2071,13 @@ fn should_retry_template_config_tee_error(error: &TeeError) -> bool {
     }
 }
 
-/// Cap for attempts whose connect burns the full TCP timeout (10s each):
-/// 20 attempts x (10s + 2s sleep) spans the nominal delivery window, so the
-/// retryable timeout class cannot stretch an unreachable endpoint past the
-/// phase's documented budget. Fast-failure classes keep the full 121-attempt
-/// budget.
-const TEMPLATE_CONFIG_SLOW_CONNECT_ATTEMPT_CAP: usize = 20;
+/// Cap for attempts in the slow connect-timeout class. One attest attempt
+/// can burn up to two sequential 10s connects (configured-IP connect, then
+/// the DNS fallback when a resolve IP was supplied), so 10 attempts x
+/// (2 x 10s + 2s sleep) spans the nominal delivery window: the retryable
+/// timeout class cannot stretch an unreachable endpoint past the phase's
+/// documented budget. Fast-failure classes keep the full 121-attempt budget.
+const TEMPLATE_CONFIG_SLOW_CONNECT_ATTEMPT_CAP: usize = 10;
 
 /// The one slow class among the retryable attestation failures: an exact TCP
 /// connect timeout (its io-error sibling usually fails fast).
@@ -6183,9 +6184,10 @@ mod tests {
             message: "{\"error\":\"locked\"}".to_string(),
         }));
         // The slow cap spans, but does not exceed, the nominal delivery
-        // window (sleep budget plus one in-flight attempt).
+        // window (sleep budget plus one in-flight attempt), counting BOTH
+        // connects of the resolve-IP fallback path per attempt.
         let slow_worst_case = TEMPLATE_CONFIG_SLOW_CONNECT_ATTEMPT_CAP as u64
-            * (10 + TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS);
+            * (2 * 10 + TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS);
         let nominal_window = TEMPLATE_CONFIG_DELIVERY_ATTEMPTS.saturating_sub(1) as u64
             * TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS
             + 10;
