@@ -1427,6 +1427,7 @@ async fn deliver_template_config_with_retry(
         post_lock_note_printed: false,
         timings_mode: target.timings_mode,
         observed_lock: false,
+        engaged_deadline: None,
     };
     for (index, (key, value)) in pairs.iter().enumerate() {
         if let Err(error) = delivery.set_key(key, value).await {
@@ -1434,9 +1435,10 @@ async fn deliver_template_config_with_retry(
             // delivery, not the (sticky) wait history: a terminal 403 from a
             // token refresh or an attestation failure is not repaired by
             // unlocking, and prescribing it would bury the real cause.
-            let owner_blocked = error
-                .downcast_ref::<TeeError>()
-                .is_some_and(is_locked_template_config_error);
+            let owner_blocked = delivery.password_mode
+                && error
+                    .downcast_ref::<TeeError>()
+                    .is_some_and(is_locked_template_config_error);
             return Err(undelivered_template_config_error(
                 target.instance_name,
                 &pairs[index..],
@@ -1449,7 +1451,7 @@ async fn deliver_template_config_with_retry(
             api,
             target.instance_name,
             key,
-            delivery.owner_wait_deadline(),
+            delivery.request_deadline(),
         )
         .await
         {
@@ -1525,6 +1527,10 @@ struct TemplateConfigDeliveryState<'a> {
     /// the consecutive-lock window: a success after a lock raced the
     /// workload's boot regardless of intervening transient errors.
     observed_lock: bool,
+    /// The phase deadline captured when the owner-wait first engaged.
+    /// Sticky for the delivery: a successful write clears the lock window
+    /// but must not discard the deadline the post-write sync still needs.
+    engaged_deadline: Option<Instant>,
 }
 
 impl TemplateConfigDeliveryState<'_> {
@@ -1610,6 +1616,9 @@ impl TemplateConfigDeliveryState<'_> {
         if !self.owner_wait_engaged(Instant::now()) {
             return;
         }
+        if self.engaged_deadline.is_none() {
+            self.engaged_deadline = self.delivery_started.checked_add(self.owner_wait_budget);
+        }
         let label = format!(
             "Customer config: TEE locked (password mode) — run `enclava unlock --app {}`",
             self.instance_name
@@ -1642,17 +1651,20 @@ impl TemplateConfigDeliveryState<'_> {
         ));
     }
 
-    /// The deadline nested retry helpers (token refresh, re-attestation)
-    /// must honor while the owner-wait is engaged: while waiting on the
-    /// owner they may run until the phase deadline instead of stopping at
-    /// their own default budgets, and never past it. Unengaged deliveries
-    /// pass `None` and keep today's exact behavior.
-    fn owner_wait_deadline(&self) -> Option<Instant> {
-        self.owner_wait_engaged(Instant::now()).then(|| {
-            self.delivery_started
-                .checked_add(self.owner_wait_budget)
-                .unwrap_or_else(Instant::now)
-        })
+    /// The phase deadline for in-flight requests and nested retry helpers
+    /// (token refresh, re-attestation, key-metadata sync): active while a
+    /// password-mode lock is even a candidate (a stalled request must not
+    /// outlive the budget waiting for the persistence threshold) and
+    /// retained for the rest of the delivery once engaged — a successful
+    /// write clears the lock window but not this deadline. Deliveries with
+    /// no password-mode lock state pass `None` and keep today's exact
+    /// behavior.
+    fn request_deadline(&self) -> Option<Instant> {
+        if !self.password_mode || (self.locked_since.is_none() && self.engaged_deadline.is_none()) {
+            return None;
+        }
+        self.engaged_deadline
+            .or_else(|| self.delivery_started.checked_add(self.owner_wait_budget))
     }
 
     async fn set_key(&mut self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1663,7 +1675,7 @@ impl TemplateConfigDeliveryState<'_> {
             // in-flight request too: the API client's own 900s cap would
             // otherwise let one stalled write run far past the phase budget.
             let config_set = self.tee.config_set(key, value, self.config_token);
-            let result = match self.owner_wait_deadline() {
+            let result = match self.request_deadline() {
                 Some(deadline) => match tokio::time::timeout(
                     deadline.saturating_duration_since(Instant::now()),
                     config_set,
@@ -1688,7 +1700,7 @@ impl TemplateConfigDeliveryState<'_> {
                         return Err(error.into());
                     }
                     self.note_delivery_error(&error);
-                    let nested_deadline = self.owner_wait_deadline();
+                    let nested_deadline = self.request_deadline();
                     let refreshed = refresh_template_config_token_with_retry(
                         self.api,
                         self.instance_name,
@@ -6037,8 +6049,14 @@ mod tests {
              sticky wait history"
         );
         assert!(
-            source.contains("fn owner_wait_deadline"),
-            "nested retry helpers need the phase deadline while engaged"
+            deliver_fn.contains("delivery.password_mode"),
+            "auto-unlock apps self-unlock: a locked terminal error must not \\
+             prescribe a manual unlock for them"
+        );
+        assert!(
+            source.contains("fn request_deadline"),
+            "nested retry helpers need the phase deadline while a lock is a \\
+             candidate or the wait is engaged"
         );
         let refresh_arm_fn = source
             .find("async fn refresh_template_config_token_with_retry")
@@ -6439,6 +6457,7 @@ mod tests {
             post_lock_note_printed: false,
             timings_mode: false,
             observed_lock: false,
+            engaged_deadline: None,
         };
         state
             .set_key("SKEY", "value")
@@ -6524,6 +6543,7 @@ mod tests {
             post_lock_note_printed: false,
             timings_mode: false,
             observed_lock: false,
+            engaged_deadline: None,
         };
         assert!(
             state.terminal_bootstrap_stop().await.is_none(),
