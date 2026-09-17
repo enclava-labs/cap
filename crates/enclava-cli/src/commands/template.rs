@@ -563,10 +563,22 @@ async fn deploy_with_timings(
     let tee_url = template_config_endpoint_url(tee_url)?;
     let mut tee_resolve_ip = token.tee_resolve_ip;
     let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
+    // Aggregate deadline for the initial attestation: the nominal delivery
+    // window (sleep budget plus one in-flight attempt). A silently
+    // unreachable endpoint whose connect attempts each burn the full TCP
+    // timeout must not outlive the phase's documented window just because
+    // every attempt is slow (the timeout variant is retryable, so without
+    // this cap the loop could stretch to ~24 minutes).
+    let attest_deadline = Instant::now()
+        + Duration::from_secs(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS.saturating_sub(1) as u64
+                * TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS
+                + 10,
+        );
     let mut tee = timings
         .run(
             DeployPhase::CustomerConfigAttestation,
-            attest_template_config_tee_with_retry(tee, None),
+            attest_template_config_tee_with_retry(tee, Some(attest_deadline)),
         )
         .await?;
     let mut tee_url = tee_url;
@@ -1548,7 +1560,7 @@ impl TemplateConfigDeliveryState<'_> {
             self.instance_name,
             self.deployment,
             Some(self.tee),
-            terminal_diagnostic_budget(None),
+            terminal_diagnostic_budget(self.request_deadline()),
         )
         .await?;
         Some(terminal_bootstrap_failure_message(
@@ -1584,15 +1596,16 @@ impl TemplateConfigDeliveryState<'_> {
 
     /// An operator notice on a channel that never corrupts a machine
     /// stream: the bar when visible; under `--timings` stderr is the timing
-    /// JSONL stream, so the notice rides it as a distinct JSON event
-    /// (works for `--json --timings` too, where stdout holds the final
-    /// JSON document); with a hidden bar and no `--timings`, stderr is
-    /// free-form text.
-    fn announce(&self, line: &str) {
+    /// JSONL stream, so the notice rides it as a categorical JSON event —
+    /// kind only, never the operator-facing text, which embeds the
+    /// deployment identifier the stream is designed to exclude (works for
+    /// `--json --timings` too, where stdout holds the final JSON document);
+    /// with a hidden bar and no `--timings`, stderr is free-form text.
+    fn announce(&self, kind: &str, line: &str) {
         if !self.progress.is_hidden() {
             self.progress.println(line);
         } else if self.timings_mode {
-            let record = serde_json::json!({"event": "template_deploy_notice", "message": line});
+            let record = serde_json::json!({"event": "template_deploy_notice", "kind": kind});
             eprintln!("{record}");
         } else {
             eprintln!("{line}");
@@ -1613,6 +1626,14 @@ impl TemplateConfigDeliveryState<'_> {
             self.locked_since,
             self.owner_wait_engaged(Instant::now()),
         );
+        self.update_guidance_surface();
+    }
+
+    /// Render the unlock guidance (clocked bar message + one announce)
+    /// when the owner-wait is engaged. Called between retries and at the
+    /// lock-persistence threshold wake, so a stalled in-flight request
+    /// cannot leave the guidance invisible while the threshold passes.
+    fn update_guidance_surface(&mut self) {
         if !self.owner_wait_engaged(Instant::now()) {
             return;
         }
@@ -1630,10 +1651,23 @@ impl TemplateConfigDeliveryState<'_> {
         ));
         if !self.owner_wait_announced {
             self.owner_wait_announced = true;
-            self.announce(&format!(
-                "{label} — config delivery continues automatically."
-            ));
+            self.announce(
+                "owner_wait_guidance",
+                &format!("{label} — config delivery continues automatically."),
+            );
         }
+    }
+
+    /// While a password-mode lock is still a candidate (persistence window
+    /// running, not yet engaged), the instant the guidance threshold
+    /// expires — the delivery wakes there even if the in-flight request is
+    /// stalled.
+    fn guidance_wake(&self) -> Option<Instant> {
+        if !self.password_mode || self.engaged_deadline.is_some() {
+            return None;
+        }
+        self.locked_since
+            .map(|locked_since| locked_since + TEMPLATE_CONFIG_LOCKED_GUIDANCE_DELAY)
     }
 
     /// A write that succeeds after any `423 locked` observation may have
@@ -1646,9 +1680,10 @@ impl TemplateConfigDeliveryState<'_> {
             return;
         }
         self.post_lock_note_printed = true;
-        self.announce(&format!(
-            "Config delivered while the TEE was unlocking: {CONFIG_APPLICATION_NOTE}"
-        ));
+        self.announce(
+            "post_lock_boot_note",
+            &format!("Config delivered while the TEE was unlocking: {CONFIG_APPLICATION_NOTE}"),
+        );
     }
 
     /// The phase deadline for in-flight requests and nested retry helpers
@@ -1671,19 +1706,37 @@ impl TemplateConfigDeliveryState<'_> {
         let mut attempt = 0usize;
         loop {
             attempt += 1;
-            // While the owner-wait is engaged, the deadline bounds the
-            // in-flight request too: the API client's own 900s cap would
-            // otherwise let one stalled write run far past the phase budget.
+            // The phase deadline bounds the in-flight request too (the API
+            // client's own 900s cap would otherwise let one stalled write run
+            // far past the phase budget), and while a lock is still a
+            // candidate the loop also wakes when the guidance threshold
+            // expires, so a stalled request cannot leave the unlock guidance
+            // invisible while the threshold passes.
+            let deadline = self.request_deadline();
+            let wake = match (deadline, self.guidance_wake()) {
+                (Some(deadline), Some(wake)) => Some(deadline.min(wake)),
+                (deadline, wake) => deadline.or(wake),
+            };
             let config_set = self.tee.config_set(key, value, self.config_token);
-            let result = match self.request_deadline() {
-                Some(deadline) => match tokio::time::timeout(
-                    deadline.saturating_duration_since(Instant::now()),
+            let result = match wake {
+                Some(wake) => match tokio::time::timeout(
+                    wake.saturating_duration_since(Instant::now()),
                     config_set,
                 )
                 .await
                 {
                     Ok(result) => result,
-                    Err(_elapsed) => return Err(OWNER_WAIT_DEADLINE_EXCEEDED.into()),
+                    Err(_elapsed) => {
+                        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            return Err(OWNER_WAIT_DEADLINE_EXCEEDED.into());
+                        }
+                        // Threshold wake: surface the guidance, then re-issue
+                        // the write (the stalled attempt is abandoned, not
+                        // resumed).
+                        self.update_guidance_surface();
+                        tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                        continue;
+                    }
                 },
                 None => config_set.await,
             };
@@ -6072,7 +6125,7 @@ mod tests {
              gate the next iteration"
         );
         let set_key_fn2 = source.find("async fn set_key").expect("set_key exists");
-        let set_key_body2 = &source[set_key_fn2..set_key_fn2 + 2000];
+        let set_key_body2 = &source[set_key_fn2..set_key_fn2 + 3000];
         assert!(
             set_key_body2.contains("tokio::time::timeout"),
             "the deadline must also cut an in-flight config write"
