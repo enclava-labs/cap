@@ -15,7 +15,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use enclava_common::validate::validate_app_name;
+use enclava_common::validate::validate_app_name_legacy;
 use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -39,6 +39,8 @@ pub enum KeysError {
     NoHome,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Message(String),
     #[error("invalid key file (expected 32 bytes, got {0})")]
     InvalidLength(usize),
     #[error("signature verification failed: {0}")]
@@ -678,6 +680,29 @@ pub fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), KeysError> {
     sync_parent_dir(path)?;
     Ok(())
 }
+
+/// Read a secret (password, passphrase) from a file: content is used verbatim
+/// except for a trailing newline, and an empty file is rejected so a truncated
+/// secret source can never silently become an empty credential.
+pub fn read_secret_file(path: &Path, kind: &str) -> Result<String, KeysError> {
+    let value = fs::read_to_string(path)
+        .map_err(|err| {
+            KeysError::Message(format!(
+                "failed to read {kind} file {}: {err}",
+                path.display()
+            ))
+        })?
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    if value.is_empty() {
+        return Err(KeysError::Message(format!(
+            "{kind} file {} is empty",
+            path.display()
+        )));
+    }
+    Ok(value)
+}
+
 /// The directory containing `path`'s entry, normalized for bare relative
 /// filenames (`""` from `Path::new("backup.json").parent()`, or `None` for a
 /// root path) to the current directory `"."` so the sync target can be opened.
@@ -791,7 +816,10 @@ pub fn app_mnemonic_path(paths: &CliPaths, org: &str, app: &str) -> PathBuf {
 }
 
 fn validate_app_mnemonic_name(app: &str) -> Result<(), KeysError> {
-    validate_app_name(app).map_err(|e| {
+    // Legacy-tolerant: the mnemonic store holds state for apps the create
+    // API admitted under its original rules (all-digit names included), so
+    // admission-time restrictions must not lock their recovery material out.
+    validate_app_name_legacy(app).map_err(|e| {
         KeysError::InvalidBackup(format!("invalid recovery mnemonic app name `{app}`: {e}"))
     })
 }
