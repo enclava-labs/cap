@@ -7,7 +7,7 @@ use enclava_cli::tee_client::TeeClient;
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
-    /// Set one or more config secrets (delivered direct to TEE)
+    /// Set one or more config secrets (written to the TEE config store; applied at the workload's next boot)
     Set {
         /// KEY=VALUE pairs
         #[arg(required = true)]
@@ -22,7 +22,7 @@ pub enum ConfigCommand {
         #[arg(long)]
         app: Option<String>,
     },
-    /// Remove a config secret
+    /// Remove a config secret (takes effect at the workload's next boot)
     Unset {
         /// Key to remove
         key: String,
@@ -59,6 +59,11 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
     Ok((key.to_string(), value.to_string()))
 }
 
+/// Config values are consumed by the workload at boot (injected env / config
+/// files); a running process keeps previously-consumed values until it
+/// restarts, so there is no non-disruptive live re-application path.
+pub(crate) const CONFIG_APPLICATION_NOTE: &str = "Note: config values apply to the workload at its next boot (restart/redeploy; in password mode, after the subsequent unlock) — a running app may keep using previously-consumed values until then.";
+
 pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         ConfigCommand::Set { vars, app } => {
@@ -87,8 +92,15 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
                     TeeClient::new_with_resolve_ip(tee_domain, token_resp.tee_resolve_ip)
                 });
             let (_attestation, tee) = tee.attest_receipt_key().await?;
+            let mut note_printed = false;
             for (key, value) in &pairs {
                 tee.config_set(key, value, &token_resp.token).await?;
+                // The value is live in the TEE store from here on; emit the
+                // application note before any later step can fail the command.
+                if !note_printed {
+                    println!("{CONFIG_APPLICATION_NOTE}");
+                    note_printed = true;
+                }
                 api.sync_config_key(&app_name, key, false).await?;
                 println!("Set {key}");
             }
@@ -133,6 +145,9 @@ pub async fn run(cmd: ConfigCommand) -> Result<(), Box<dyn std::error::Error>> {
                 });
             let (_attestation, tee) = tee.attest_receipt_key().await?;
             tee.config_unset(&key, &token_resp.token).await?;
+            // The key is removed from the TEE store from here on; emit the
+            // application note before any later step can fail the command.
+            println!("{CONFIG_APPLICATION_NOTE}");
 
             // Delete metadata from API
             api.delete_config_meta(&app_name, &key).await?;
@@ -175,6 +190,53 @@ mod tests {
         assert_eq!(vars.len(), 1);
         assert_eq!(app.as_deref(), Some("shell"));
         assert_eq!(super::resolve_app_name(&app).unwrap(), "shell");
+    }
+
+    #[test]
+    fn config_set_and_unset_print_next_boot_application_note() {
+        let source = include_str!("config.rs");
+        let set_start = source
+            .find("ConfigCommand::Set { vars, app } =>")
+            .expect("set command branch exists");
+        let get_start = source[set_start..]
+            .find("ConfigCommand::Get")
+            .expect("get command branch follows set")
+            + set_start;
+        let set_body = &source[set_start..get_start];
+
+        let tee_write = set_body
+            .find("config_set")
+            .expect("set writes values to the TEE");
+        let note = set_body
+            .find("CONFIG_APPLICATION_NOTE")
+            .expect("set names the next-boot application contract");
+        let sync = set_body
+            .find("sync_config_key")
+            .expect("set syncs key metadata after the TEE write");
+        assert!(
+            tee_write < note && note < sync,
+            "set prints the application note after the first TEE mutation and before the metadata sync can fail the command"
+        );
+
+        let unset_start = source
+            .find("ConfigCommand::Unset { key, app } =>")
+            .expect("unset command branch exists");
+        let tests_start = source.find("#[cfg(test)]").expect("tests module exists");
+        let unset_body = &source[unset_start..tests_start];
+
+        let tee_delete = unset_body
+            .find("config_unset")
+            .expect("unset deletes the key from the TEE");
+        let unset_note = unset_body
+            .find("CONFIG_APPLICATION_NOTE")
+            .expect("unset names the next-boot application contract");
+        let meta_delete = unset_body
+            .find("delete_config_meta")
+            .expect("unset deletes key metadata after the TEE deletion");
+        assert!(
+            tee_delete < unset_note && unset_note < meta_delete,
+            "unset prints the application note after the TEE deletion and before the metadata delete can fail the command"
+        );
     }
 
     #[test]

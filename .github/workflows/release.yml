@@ -5,11 +5,37 @@ on:
     tags: ['v*']
 
 env:
-  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
+  ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON }}
 
 jobs:
+  require-platform-release-root:
+    name: Require platform-release root
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Materialize production platform-release envelope
+        run: |
+          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
+            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
+          fi
+
+      - name: Require production platform-release root
+        run: bash scripts/require-platform-release-root.sh
+
+      # The shell gate can only compare pubkeys; verify the full envelope
+      # signature and payload invariants before any artifact is built.
+      - name: Verify bundled platform-release envelope
+        run: |
+          cargo run --locked --release -p enclava-cli --example platform-release -- verify \
+            crates/enclava-cli/platform-release.json "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX"
+
   build-linux:
     name: Build Linux binaries
+    needs: require-platform-release-root
     strategy:
       matrix:
         include:
@@ -33,9 +59,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Materialize production platform-release envelope
+        shell: bash
+        run: |
+          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
+            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
+          fi
+
       - name: Build binary
         run: |
-          cargo build --release --bin enclava --target ${{ matrix.target }}
+          cargo build --release --bin enclava --features prod-strict --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
@@ -50,6 +83,7 @@ jobs:
 
   build-windows:
     name: Build Windows binaries
+    needs: require-platform-release-root
     runs-on: windows-latest
 
     steps:
@@ -57,11 +91,20 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Materialize the production envelope before compiling so the CLI's
+      # bundled fallback (include_str!) is signed by the pinned root.
+      - name: Materialize production platform-release envelope
+        shell: bash
+        run: |
+          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
+            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
+          fi
+
       # Vendored OpenSSL builds with no-asm automatically when nasm is absent.
       # crt-static: link the MSVC runtime statically so the artifact runs on
       # machines without the Visual C++ redistributable.
       - name: Build binary
-        run: cargo build --release --bin enclava --target x86_64-pc-windows-msvc
+        run: cargo build --release --bin enclava --features prod-strict --target x86_64-pc-windows-msvc
         env:
           RUSTFLAGS: -C target-feature=+crt-static
 
@@ -78,6 +121,7 @@ jobs:
 
   build-macos:
     name: Build macOS binaries
+    needs: require-platform-release-root
     runs-on: macos-latest
     strategy:
       matrix:
@@ -96,9 +140,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Materialize production platform-release envelope
+        shell: bash
+        run: |
+          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
+            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
+          fi
+
       - name: Build binary
         run: |
-          cargo build --release --bin enclava --target ${{ matrix.target }}
+          cargo build --release --bin enclava --features prod-strict --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
@@ -113,6 +164,7 @@ jobs:
 
   build-web-verifier:
     name: Build local HTML/WASM verifier
+    needs: require-platform-release-root
     runs-on: ubuntu-latest
 
     steps:

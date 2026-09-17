@@ -304,56 +304,19 @@ async fn request_workload_teardown(
     Ok(())
 }
 
-/// Comprehensive app name validation
+/// Comprehensive app name validation. The canonical ruleset lives in
+/// `enclava_common::validate::validate_app_name` (shared with the CLI) so
+/// both surfaces reject identically; this wrapper only adapts the error type.
 pub(crate) fn validate_app_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || name.len() > 63 {
-        return Err("app name must be between 1 and 63 characters".to_string());
-    }
+    enclava_common::validate::validate_app_name(name).map_err(|error| error.to_string())
+}
 
-    // Reserved names (Kubernetes system names)
-    let reserved = [
-        "kubernetes",
-        "kube",
-        "kube-system",
-        "kube-public",
-        "kube-node-lease",
-        "default",
-        "kube-service-account",
-        "kube-root-ca",
-        "config",
-        "health",
-        "status",
-        "metrics",
-        "prometheus",
-        "grafana",
-    ];
-    if reserved.contains(&name) {
-        return Err(format!("'{name}' is a reserved name"));
-    }
-
-    // Character validation (Kubernetes DNS-1123 subdomain)
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    {
-        return Err(
-            "app name must contain only lowercase letters, digits, and hyphens".to_string(),
-        );
-    }
-
-    // Must start and end with alphanumeric
-    if !name.chars().next().unwrap().is_ascii_alphanumeric()
-        || !name.chars().last().unwrap().is_ascii_alphanumeric()
-    {
-        return Err("app name must start and end with a letter or digit".to_string());
-    }
-
-    if name.contains("--") {
-        return Err("app name cannot contain consecutive hyphens".to_string());
-    }
-
-    // No leading/trailing hyphens (already covered by alphanumeric check)
-    Ok(())
+/// Legacy-tolerant validation for handlers that address **stored state** —
+/// delete / desired-state / proofs / routing for an app that may predate
+/// the admission rules consolidated here (digit-led names). New-name
+/// admission must use [`validate_app_name`].
+pub(crate) fn validate_app_name_for_existing(name: &str) -> Result<(), String> {
+    enclava_common::validate::validate_app_name_legacy(name).map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Deserialize)]

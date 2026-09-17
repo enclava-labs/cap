@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+use super::ownership::secret_from_file_or_prompt;
 use enclava_cli::api_client::ApiClient;
 use enclava_cli::api_types::{
     BootstrapSigningServiceRequest, CurrentUserResponse, OrgKeyringResponse, PutOrgKeyringRequest,
@@ -32,6 +33,9 @@ pub enum KeyCommand {
         /// Overwrite an existing backup file
         #[arg(long)]
         force: bool,
+        /// Read the passphrase for the new backup from a file (non-interactive; trailing newline trimmed). Replaces the passphrase prompt and its confirmation.
+        #[arg(long)]
+        new_passphrase_file: Option<PathBuf>,
     },
     /// Restore an encrypted recovery-seed backup
     Restore {
@@ -43,6 +47,9 @@ pub enum KeyCommand {
         /// Overwrite an existing local recovery seed
         #[arg(long)]
         force: bool,
+        /// Read the passphrase of the existing backup from a file (non-interactive; trailing newline trimmed).
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
     },
     /// Create recoverable organization signing authority
     Setup {
@@ -52,6 +59,12 @@ pub enum KeyCommand {
         /// Organization name or ID; defaults to the active organization
         #[arg(long)]
         org: Option<String>,
+        /// Read the passphrase of an existing backup at --backup-out from a file (non-interactive; trailing newline trimmed).
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        /// Read the passphrase for a newly written backup from a file (non-interactive; trailing newline trimmed). Replaces the passphrase prompt and its confirmation.
+        #[arg(long)]
+        new_passphrase_file: Option<PathBuf>,
     },
     /// Rotate the organization owner key with an encrypted replacement backup
     RotateOwner {
@@ -67,30 +80,67 @@ pub enum KeyCommand {
         /// Skip the final interactive confirmation
         #[arg(long)]
         yes: bool,
+        /// Read the passphrase of an existing replacement backup at --backup-out from a file (non-interactive; trailing newline trimmed).
+        #[arg(long)]
+        passphrase_file: Option<PathBuf>,
+        /// Read the passphrase for a newly written replacement backup from a file (non-interactive; trailing newline trimmed). Replaces the passphrase prompt and its confirmation.
+        #[arg(long)]
+        new_passphrase_file: Option<PathBuf>,
     },
 }
 
 pub async fn run(cmd: KeyCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         KeyCommand::Status => status().await,
-        KeyCommand::Backup { output, org, force } => backup(output, org, force).await,
+        KeyCommand::Backup {
+            output,
+            org,
+            force,
+            new_passphrase_file,
+        } => backup(output, org, force, new_passphrase_file.as_deref()).await,
         KeyCommand::Restore {
             input,
             input_file,
             force,
+            passphrase_file,
         } => {
             let input = input.or(input_file).ok_or(
                 "backup file is required, for example `enclava key restore enclava-recovery.json`",
             )?;
-            restore(input, force).await
+            restore(input, force, passphrase_file.as_deref()).await
         }
-        KeyCommand::Setup { backup_out, org } => setup(backup_out, org).await,
+        KeyCommand::Setup {
+            backup_out,
+            org,
+            passphrase_file,
+            new_passphrase_file,
+        } => {
+            setup(
+                backup_out,
+                org,
+                passphrase_file.as_deref(),
+                new_passphrase_file.as_deref(),
+            )
+            .await
+        }
         KeyCommand::RotateOwner {
             backup_out,
             org,
             reason,
             yes,
-        } => rotate_owner(backup_out, org, reason, yes).await,
+            passphrase_file,
+            new_passphrase_file,
+        } => {
+            rotate_owner(
+                backup_out,
+                org,
+                reason,
+                yes,
+                passphrase_file.as_deref(),
+                new_passphrase_file.as_deref(),
+            )
+            .await
+        }
     }
 }
 
@@ -276,19 +326,6 @@ async fn status() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn prompt_backup_passphrase() -> Result<String, Box<dyn std::error::Error>> {
-    Ok(dialoguer::Password::new()
-        .with_prompt("Backup passphrase")
-        .with_confirmation("Confirm backup passphrase", "Passphrases do not match")
-        .interact()?)
-}
-
-fn prompt_restore_passphrase() -> Result<String, Box<dyn std::error::Error>> {
-    Ok(dialoguer::Password::new()
-        .with_prompt("Backup passphrase")
-        .interact()?)
-}
-
 fn logged_out_backup_metadata(
     org: Option<String>,
 ) -> (keys::RecoveryBackupMetadata, Option<String>) {
@@ -367,6 +404,7 @@ async fn backup(
     output: PathBuf,
     org: Option<String>,
     force: bool,
+    new_passphrase_file: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if output.exists() && !force {
         return Err(format!(
@@ -420,7 +458,13 @@ async fn backup(
             .collect(),
         None => Vec::new(),
     };
-    let passphrase = prompt_backup_passphrase()?;
+    let passphrase = secret_from_file_or_prompt(
+        new_passphrase_file,
+        "passphrase",
+        "Backup passphrase",
+        Some(("Confirm backup passphrase", "Passphrases do not match")),
+        "--new-passphrase-file",
+    )?;
     let backup =
         keys::encrypt_recovery_backup_with_metadata(&seed, &passphrase, metadata, &mnemonics)?;
     let raw = serde_json::to_vec_pretty(&backup)?;
@@ -447,11 +491,21 @@ async fn backup(
     Ok(())
 }
 
-async fn restore(input: PathBuf, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn restore(
+    input: PathBuf,
+    force: bool,
+    passphrase_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let paths = CliPaths::resolve()?;
     let raw = std::fs::read_to_string(&input)?;
     let backup: keys::RecoveryBackup = serde_json::from_str(&raw)?;
-    let passphrase = prompt_restore_passphrase()?;
+    let passphrase = secret_from_file_or_prompt(
+        passphrase_file,
+        "passphrase",
+        "Backup passphrase",
+        None,
+        "--passphrase-file",
+    )?;
     let keys::DecryptedBackup { seed, mnemonics } =
         keys::decrypt_recovery_backup(&backup, &passphrase)?;
     let existing_seed = keys::load_recovery_seed(&paths)?;
@@ -558,7 +612,12 @@ fn write_encrypted_backup(
     Ok(())
 }
 
-async fn setup(backup_out: PathBuf, org: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn setup(
+    backup_out: PathBuf,
+    org: Option<String>,
+    passphrase_file: Option<&Path>,
+    new_passphrase_file: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let paths = CliPaths::resolve()?;
     let (api, me) = current_user(&paths)
         .await?
@@ -579,12 +638,27 @@ async fn setup(backup_out: PathBuf, org: Option<String>) -> Result<(), Box<dyn s
             &me.active_org.id,
             &me.active_org.name,
         )?;
-        let passphrase = prompt_restore_passphrase()?;
+        // An interrupted first run leaves the just-written backup here; it was
+        // encrypted with --new-passphrase-file, so a retry that only repeats
+        // that flag can still decrypt it (crash-safe retry for automation).
+        let passphrase = secret_from_file_or_prompt(
+            passphrase_file.or(new_passphrase_file),
+            "passphrase",
+            "Backup passphrase",
+            None,
+            "--passphrase-file",
+        )?;
         keys::decrypt_recovery_backup(&backup, &passphrase)?.seed
     } else {
         let seed = existing_seed.unwrap_or_else(keys::generate_recovery_seed);
         let owner = keys::derive_org_owner_key(user_id, org_id, &seed)?;
-        let passphrase = prompt_backup_passphrase()?;
+        let passphrase = secret_from_file_or_prompt(
+            new_passphrase_file,
+            "passphrase",
+            "Backup passphrase",
+            Some(("Confirm backup passphrase", "Passphrases do not match")),
+            "--new-passphrase-file",
+        )?;
         write_encrypted_backup(
             &backup_out,
             &seed,
@@ -648,6 +722,8 @@ async fn rotate_owner(
     org: Option<String>,
     reason: String,
     yes: bool,
+    passphrase_file: Option<&Path>,
+    new_passphrase_file: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if reason.trim().is_empty() {
         return Err("rotation reason cannot be empty".into());
@@ -673,12 +749,26 @@ async fn rotate_owner(
             &me.active_org.id,
             &me.active_org.name,
         )?;
-        let passphrase = prompt_restore_passphrase()?;
+        // Same crash-safe retry as setup: an interrupted rotation leaves the
+        // replacement backup, encrypted with --new-passphrase-file.
+        let passphrase = secret_from_file_or_prompt(
+            passphrase_file.or(new_passphrase_file),
+            "passphrase",
+            "Backup passphrase",
+            None,
+            "--passphrase-file",
+        )?;
         keys::decrypt_recovery_backup(&backup, &passphrase)?.seed
     } else {
         let seed = keys::generate_recovery_seed();
         let replacement = keys::derive_org_owner_key(user_id, org_id, &seed)?;
-        let passphrase = prompt_backup_passphrase()?;
+        let passphrase = secret_from_file_or_prompt(
+            new_passphrase_file,
+            "passphrase",
+            "Backup passphrase",
+            Some(("Confirm backup passphrase", "Passphrases do not match")),
+            "--new-passphrase-file",
+        )?;
         write_encrypted_backup(
             &backup_out,
             &seed,

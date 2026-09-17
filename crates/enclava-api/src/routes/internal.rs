@@ -3565,7 +3565,7 @@ pub async fn delete_paas_app(
     Json(body): Json<serde_json::Value>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
-    crate::routes::apps::validate_app_name(&app_name)
+    crate::routes::apps::validate_app_name_for_existing(&app_name)
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
     let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}");
@@ -3614,7 +3614,7 @@ pub async fn put_paas_app_desired_state(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
     validate_external_id(&body.operation_id, "operation_id")?;
-    crate::routes::apps::validate_app_name(&app_name)
+    crate::routes::apps::validate_app_name_for_existing(&app_name)
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
     let path = format!("/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state");
     let hash = request_hash(&body)?;
@@ -3842,7 +3842,7 @@ pub async fn get_paas_proof_bundle(
     Query(query): Query<InternalProofBundleQuery>,
 ) -> Result<Response, InternalRouteError> {
     validate_external_id(&paas_org_id, "paas_org_id")?;
-    crate::routes::apps::validate_app_name(&app_name)
+    crate::routes::apps::validate_app_name_for_existing(&app_name)
         .map_err(|error| json_error(StatusCode::BAD_REQUEST, error))?;
     let nonce: [u8; 32] = general_purpose::URL_SAFE_NO_PAD
         .decode(&query.nonce)

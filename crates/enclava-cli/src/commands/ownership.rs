@@ -20,6 +20,9 @@ pub struct ClaimArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
+    /// Read the initial unlock password from a file (non-interactive; trailing newline trimmed). Replaces the password prompt and its confirmation; you are responsible for observing the claim result — the one-time recovery mnemonic is stored to the protected local keystore, never printed.
+    #[arg(long)]
+    pub password_file: Option<PathBuf>,
     /// Persist the recovery mnemonic to the protected local keystore so `enclava key backup` can back it up (default).
     #[arg(long, conflicts_with = "no_store_mnemonic")]
     pub store_mnemonic: bool,
@@ -33,6 +36,9 @@ pub struct UnlockArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
+    /// Read the unlock password from a file (non-interactive; trailing newline trimmed).
+    #[arg(long)]
+    pub password_file: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -53,6 +59,12 @@ pub struct ChangePasswordArgs {
     /// App name (defaults to enclava.toml app.name)
     #[arg(long)]
     pub app: Option<String>,
+    /// Read the current password from a file (non-interactive; trailing newline trimmed).
+    #[arg(long)]
+    pub current_password_file: Option<PathBuf>,
+    /// Read the new password from a file (non-interactive; trailing newline trimmed).
+    #[arg(long)]
+    pub new_password_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -65,6 +77,9 @@ pub enum AutoUnlockCommand {
         /// Digest-pinned container image to bind into the signed redeploy descriptor.
         #[arg(long)]
         image: String,
+        /// Read the unlock password from a file (non-interactive; trailing newline trimmed).
+        #[arg(long)]
+        password_file: Option<PathBuf>,
     },
     /// Remove the KBS-gated seed wrap, require password on restart
     Disable {
@@ -74,6 +89,9 @@ pub enum AutoUnlockCommand {
         /// Digest-pinned container image to bind into the signed redeploy descriptor.
         #[arg(long)]
         image: String,
+        /// Read the unlock password from a file (non-interactive; trailing newline trimmed).
+        #[arg(long)]
+        password_file: Option<PathBuf>,
     },
 }
 
@@ -136,7 +154,13 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     // recovery mnemonic exactly once and rejects a second claim, so an unsafe
     // sink mode, an unattended session, or an unwritable keystore must abort
     // here, while the claim can still be cancelled without side effects.
-    prepare_recovery_mnemonic_sink(&paths, &me.active_org.name, &app_name, capture)?;
+    prepare_recovery_mnemonic_sink(
+        &paths,
+        &me.active_org.name,
+        &app_name,
+        capture,
+        args.password_file.is_some(),
+    )?;
 
     let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
     let tee =
@@ -169,10 +193,13 @@ pub async fn claim(args: ClaimArgs) -> Result<(), Box<dyn std::error::Error>> {
     let signature = URL_SAFE_NO_PAD.encode(signature_bytes.to_bytes());
 
     // Step 4: Get password
-    let password = Password::new()
-        .with_prompt("Set unlock password")
-        .with_confirmation("Confirm password", "Passwords don't match")
-        .interact()?;
+    let password = secret_from_file_or_prompt(
+        args.password_file.as_deref(),
+        "password",
+        "Set unlock password",
+        Some(("Confirm password", "Passwords don't match")),
+        "--password-file",
+    )?;
 
     // Step 5: Claim
     let result = match tee
@@ -260,27 +287,60 @@ pub(crate) fn validate_recovery_mnemonic_sink_mode(
     Ok(())
 }
 
-/// Unattended claims stay disabled until response-loss recovery exists: the TEE
-/// hands out recovery material exactly once and rejects a second claim, so a
-/// claim whose response is lost in an unattended run strands the mnemonic
-/// irrecoverably with nobody watching. Interactive claims at least fail loudly
-/// in front of the operator who just set the unlock password.
+/// Attendance for an ownership claim, in two shapes.
+///
+/// Prompted claim: dialoguer renders the password prompt on stderr and
+/// errors when stderr is not a terminal, so both stdin and stderr must be
+/// terminals. A session with a terminal stdin but redirected stderr
+/// (`2>&1 | tee`) is refused up front with an error pointing at
+/// `--password-file` as the way to run a recorded-output claim, instead of
+/// failing later inside the prompt.
+///
+/// Password from a file: no prompt is rendered, so the explicit flag is the
+/// operator's acknowledgment that they are responsible for observing the
+/// claim result; a terminal on stdin keeps the claim in front of a present
+/// operator (foreground exit status), while CI and scripts (no terminal on
+/// stdin) stay refused pending response-loss recovery. The one-time mnemonic
+/// is persisted to the protected local keystore and never printed, so nothing
+/// depends on captured output; a lost response halts with a stable error
+/// wherever the operator directed their output. The TEE hands out recovery
+/// material exactly once and rejects a second claim, so a lost response
+/// strands the mnemonic irrecoverably — that residual is why unattended
+/// claims without a terminal stay disabled.
 pub(crate) fn claim_session_is_interactive(
     stdin_is_terminal: bool,
     stderr_is_terminal: bool,
+    password_from_file: bool,
 ) -> bool {
-    stdin_is_terminal && stderr_is_terminal
+    if password_from_file {
+        stdin_is_terminal
+    } else {
+        stdin_is_terminal && stderr_is_terminal
+    }
 }
 
-fn ensure_claim_session_for(interactive: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if interactive {
+fn ensure_claim_session_for(
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+    password_from_file: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if claim_session_is_interactive(stdin_is_terminal, stderr_is_terminal, password_from_file) {
         return Ok(());
     }
+    if stdin_is_terminal && !stderr_is_terminal && !password_from_file {
+        return Err(
+            "the claim password prompt cannot be shown while stderr is redirected (e.g. `2>&1 | tee`): \
+             pass --password-file <PATH> to claim with recorded output. Unattended (CI/script) \
+             claims remain disabled until response-loss recovery is supported."
+                .into(),
+        );
+    }
     Err(
-        "ownership claims require an interactive terminal: unattended (CI/script) claims are \
+        "ownership claims require an interactive terminal on stdin: unattended (CI/script) claims are \
          disabled until response-loss recovery is supported. The TEE returns the one-time \
          recovery mnemonic only once, so a lost response in an unattended run is unrecoverable. \
-         Run `enclava claim` (or a deploy that auto-claims) from an interactive shell."
+         Run `enclava claim` (or a deploy that auto-claims) from an interactive shell; \
+         recorded-output runs (`2>&1 | tee`) are supported with --password-file."
             .into(),
     )
 }
@@ -297,27 +357,32 @@ pub(crate) fn prepare_recovery_mnemonic_sink(
     org: &str,
     app: &str,
     capture: MnemonicCapture,
+    password_from_file: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     prepare_recovery_mnemonic_sink_for_session(
         paths,
         org,
         app,
         capture,
-        claim_session_is_interactive(io::stdin().is_terminal(), io::stderr().is_terminal()),
+        io::stdin().is_terminal(),
+        io::stderr().is_terminal(),
+        password_from_file,
     )
 }
 
 /// Testable core of [`prepare_recovery_mnemonic_sink`] with the session
-/// interactivity supplied by the caller.
+/// terminals and password source supplied by the caller.
 pub(crate) fn prepare_recovery_mnemonic_sink_for_session(
     paths: &CliPaths,
     org: &str,
     app: &str,
     capture: MnemonicCapture,
-    interactive_session: bool,
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+    password_from_file: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_recovery_mnemonic_sink_mode(capture)?;
-    ensure_claim_session_for(interactive_session)?;
+    ensure_claim_session_for(stdin_is_terminal, stderr_is_terminal, password_from_file)?;
     keys::prepare_app_mnemonic_sink(paths, org, app)
         .map_err(|e| format!("recovery mnemonic sink is not ready for the claim: {e}").into())
 }
@@ -383,7 +448,13 @@ pub async fn unlock(args: UnlockArgs) -> Result<(), Box<dyn std::error::Error>> 
         TeeClient::new_for_ownership_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
-    let password = Password::new().with_prompt("Unlock password").interact()?;
+    let password = secret_from_file_or_prompt(
+        args.password_file.as_deref(),
+        "password",
+        "Unlock password",
+        None,
+        "--password-file",
+    )?;
 
     println!("Unlocking {app_name}...");
     tee.unlock(&password).await?;
@@ -466,7 +537,7 @@ pub async fn recover(args: RecoverArgs) -> Result<(), Box<dyn std::error::Error>
     };
 
     let new_password = match args.new_password_file.as_ref() {
-        Some(path) => read_new_password_file(path)?,
+        Some(path) => keys::read_secret_file(path, "new password")?,
         None => Password::new()
             .with_prompt("New unlock password")
             .with_confirmation("Confirm password", "Passwords don't match")
@@ -529,18 +600,6 @@ fn read_mnemonic_file(path: &Path) -> Result<String, Box<dyn std::error::Error>>
 }
 
 /// Read the new unlock password from a file, trimming a single trailing newline. Mirrors
-/// `--storage-password-file`: no confirmation prompt when read from a file, and interior
-/// whitespace is preserved (only `\r`/`\n` are stripped from the end).
-fn read_new_password_file(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let value = std::fs::read_to_string(path)?
-        .trim_end_matches(['\r', '\n'])
-        .to_string();
-    if value.is_empty() {
-        return Err(format!("new password file {} is empty", path.display()).into());
-    }
-    Ok(value)
-}
-
 fn recovery_restart_guidance(err: &TeeError) -> Option<&'static str> {
     if matches!(
         err,
@@ -562,6 +621,58 @@ fn recovery_restart_guidance(err: &TeeError) -> Option<&'static str> {
     None
 }
 
+/// Resolve a secret from a file, or from a terminal prompt: a provided file
+/// replaces the prompt and any confirmation prompt with it (the caller
+/// confirms by providing the file). Prompting requires a terminal on BOTH
+/// stdin and stderr — dialoguer renders password prompts on stderr and
+/// errors on a non-terminal stderr — so having neither a file nor both
+/// terminals is a hard error that names the flag, mirroring how
+/// `deploy --storage-password-file` behaves for non-interactive sessions.
+pub(crate) fn secret_from_file_or_prompt(
+    file: Option<&Path>,
+    kind: &str,
+    prompt: &str,
+    confirmation: Option<(&str, &str)>,
+    flag: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    secret_from_file_or_prompt_for_session(
+        file,
+        kind,
+        prompt,
+        confirmation,
+        flag,
+        io::stdin().is_terminal(),
+        io::stderr().is_terminal(),
+    )
+}
+
+/// Testable core of [`secret_from_file_or_prompt`] with the session
+/// terminals supplied by the caller.
+pub(crate) fn secret_from_file_or_prompt_for_session(
+    file: Option<&Path>,
+    kind: &str,
+    prompt: &str,
+    confirmation: Option<(&str, &str)>,
+    flag: &str,
+    stdin_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(path) = file {
+        return Ok(keys::read_secret_file(path, kind)?);
+    }
+    if !(stdin_is_terminal && stderr_is_terminal) {
+        return Err(format!(
+            "an interactive terminal or {flag} <PATH> is required to provide the {kind} non-interactively"
+        )
+        .into());
+    }
+    let mut password = Password::new().with_prompt(prompt);
+    if let Some((confirmation_prompt, mismatch)) = confirmation {
+        password = password.with_confirmation(confirmation_prompt, mismatch);
+    }
+    Ok(password.interact()?)
+}
+
 fn prompt_recovery_mnemonic() -> Result<String, Box<dyn std::error::Error>> {
     Ok(Input::new()
         .with_prompt("Recovery mnemonic (BIP39)")
@@ -575,12 +686,21 @@ pub async fn change_password(args: ChangePasswordArgs) -> Result<(), Box<dyn std
     let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
     let (_attestation, tee) = tee.attest_receipt_key().await?;
 
-    let current = Password::new().with_prompt("Current password").interact()?;
+    let current = secret_from_file_or_prompt(
+        args.current_password_file.as_deref(),
+        "current password",
+        "Current password",
+        None,
+        "--current-password-file",
+    )?;
 
-    let new_password = Password::new()
-        .with_prompt("New password")
-        .with_confirmation("Confirm new password", "Passwords don't match")
-        .interact()?;
+    let new_password = secret_from_file_or_prompt(
+        args.new_password_file.as_deref(),
+        "new password",
+        "New password",
+        Some(("Confirm new password", "Passwords don't match")),
+        "--new-password-file",
+    )?;
 
     println!("Changing password for {app_name}...");
     tee.change_password(&current, &new_password).await?;
@@ -590,13 +710,28 @@ pub async fn change_password(args: ChangePasswordArgs) -> Result<(), Box<dyn std
 
 pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
-        AutoUnlockCommand::Enable { app, image } => {
+        AutoUnlockCommand::Enable {
+            app,
+            image,
+            password_file,
+        } => {
             let app_name = resolve_app_name(&app)?;
             let (api, paths) = build_api_client()?;
             let cli_config = config::load_config(&paths)?;
             let creds = config::load_credentials(&paths)?;
             let app_config = AppConfig::find_and_load()?;
             let app_meta = api.get_app(&app_name).await?;
+            // Resolve the local password source before any remote mutation:
+            // blob signing bootstraps the org keyring/signing authority, and a
+            // missing or unreadable --password-file must not leave that
+            // half-done for a command that never ran.
+            let password = secret_from_file_or_prompt(
+                password_file.as_deref(),
+                "password",
+                "Unlock password (to authorize auto-unlock wrapping)",
+                None,
+                "--password-file",
+            )?;
             println!("Signing auto-unlock redeploy descriptor for {app_name}...");
             let signed_blobs =
                 super::app::build_signed_deploy_blobs(super::app::SignedDeployBlobParams {
@@ -614,10 +749,6 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
             let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
             let (transition_attestation, tee) = tee.attest_receipt_key().await?;
-
-            let password = Password::new()
-                .with_prompt("Unlock password (to authorize auto-unlock wrapping)")
-                .interact()?;
 
             println!("Enabling auto-unlock for {app_name}...");
             tee.enable_auto_unlock(&password).await?;
@@ -654,13 +785,28 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             println!("Auto-unlock enabled. Restarts no longer require a password.");
             Ok(())
         }
-        AutoUnlockCommand::Disable { app, image } => {
+        AutoUnlockCommand::Disable {
+            app,
+            image,
+            password_file,
+        } => {
             let app_name = resolve_app_name(&app)?;
             let (api, paths) = build_api_client()?;
             let cli_config = config::load_config(&paths)?;
             let creds = config::load_credentials(&paths)?;
             let app_config = AppConfig::find_and_load()?;
             let app_meta = api.get_app(&app_name).await?;
+            // Resolve the local password source before any remote mutation:
+            // blob signing bootstraps the org keyring/signing authority, and a
+            // missing or unreadable --password-file must not leave that
+            // half-done for a command that never ran.
+            let password = secret_from_file_or_prompt(
+                password_file.as_deref(),
+                "password",
+                "Unlock password (to remove auto-unlock wrapping)",
+                None,
+                "--password-file",
+            )?;
             println!("Signing password-mode redeploy descriptor for {app_name}...");
             let signed_blobs =
                 super::app::build_signed_deploy_blobs(super::app::SignedDeployBlobParams {
@@ -678,10 +824,6 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
             let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
             let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
             let (transition_attestation, tee) = tee.attest_receipt_key().await?;
-
-            let password = Password::new()
-                .with_prompt("Unlock password (to remove auto-unlock wrapping)")
-                .interact()?;
 
             println!("Disabling auto-unlock for {app_name}...");
             tee.disable_auto_unlock(&password).await?;
@@ -730,10 +872,27 @@ mod tests {
 
     #[test]
     fn claim_session_interactivity_matrix() {
-        assert!(claim_session_is_interactive(true, true));
-        assert!(!claim_session_is_interactive(true, false));
-        assert!(!claim_session_is_interactive(false, true));
-        assert!(!claim_session_is_interactive(false, false));
+        // Prompted claims need both terminals: dialoguer renders the password
+        // prompt on stderr and errors on a non-terminal stderr.
+        assert!(claim_session_is_interactive(true, true, false));
+        assert!(!claim_session_is_interactive(true, false, false));
+        assert!(!claim_session_is_interactive(false, true, false));
+        assert!(!claim_session_is_interactive(false, false, false));
+        // File-based claims render no prompt: an operator-present stdin is the
+        // attendance signal, so recorded-output runs (`2>&1 | tee`) work.
+        assert!(claim_session_is_interactive(true, true, true));
+        assert!(claim_session_is_interactive(true, false, true));
+        assert!(!claim_session_is_interactive(false, true, true));
+        assert!(!claim_session_is_interactive(false, false, true));
+    }
+
+    #[test]
+    fn prompted_claim_under_redirected_stderr_points_at_password_file() {
+        let err = ensure_claim_session_for(true, false, false)
+            .expect_err("prompted claim under redirected stderr must be refused early");
+        let message = err.to_string();
+        assert!(message.contains("--password-file"), "{message}");
+        assert!(message.contains("2>&1 | tee"), "{message}");
     }
 
     #[test]
@@ -760,6 +919,8 @@ mod tests {
             "shell1",
             MnemonicCapture::Skip,
             true,
+            true,
+            false,
         )
         .expect_err("unsafe sink mode must be rejected pre-claim");
 
@@ -778,6 +939,8 @@ mod tests {
             "org-a",
             "shell1",
             MnemonicCapture::Store,
+            false,
+            false,
             false,
         )
         .expect_err("unattended claims must be rejected pre-claim");
@@ -807,6 +970,8 @@ mod tests {
             "shell1",
             MnemonicCapture::Store,
             true,
+            true,
+            false,
         )
         .expect_err("unwritable sink must be rejected before the claim");
 
@@ -832,6 +997,8 @@ mod tests {
                 "shell1",
                 MnemonicCapture::Store,
                 true,
+                true,
+                false,
             )
             .expect_err("blocked real destination must be rejected before the claim");
 
@@ -863,6 +1030,8 @@ mod tests {
             "shell1",
             MnemonicCapture::Store,
             true,
+            true,
+            false,
         )
         .expect_err("blocked temp path must fail preflight");
 
@@ -885,6 +1054,8 @@ mod tests {
                 "shell1",
                 MnemonicCapture::Store,
                 true,
+                true,
+                false,
             )
             .expect("interactive store-mode sink must be prepared");
 
@@ -903,6 +1074,8 @@ mod tests {
                 "shell1",
                 MnemonicCapture::Store,
                 true,
+                true,
+                false,
             )
             .expect_err("non-Unix must refuse sink preparation before the claim");
             assert!(
@@ -1119,18 +1292,63 @@ mod tests {
     }
 
     #[test]
-    fn read_new_password_file_trims_trailing_newline_and_rejects_empty() {
+    fn read_secret_file_trims_trailing_newline_and_rejects_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("pw.txt");
         std::fs::write(&path, "s3cret-pw\n").unwrap();
-        assert_eq!(read_new_password_file(&path).unwrap(), "s3cret-pw");
+        assert_eq!(
+            keys::read_secret_file(&path, "new password").unwrap(),
+            "s3cret-pw"
+        );
 
         // interior/leading whitespace preserved; only trailing newline trimmed
         std::fs::write(&path, "  lead keep \r\n").unwrap();
-        assert_eq!(read_new_password_file(&path).unwrap(), "  lead keep ");
+        assert_eq!(
+            keys::read_secret_file(&path, "new password").unwrap(),
+            "  lead keep "
+        );
 
         let empty = tmp.path().join("empty.txt");
         std::fs::write(&empty, "\n").unwrap();
-        assert!(read_new_password_file(&empty).is_err());
+        assert!(keys::read_secret_file(&empty, "new password").is_err());
+    }
+
+    #[test]
+    fn secret_from_file_or_prompt_reads_file_and_names_flag_without_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pw.txt");
+        std::fs::write(&path, "from-file\n").unwrap();
+        assert_eq!(
+            secret_from_file_or_prompt(
+                Some(&path),
+                "password",
+                "Unlock password",
+                None,
+                "--password-file",
+            )
+            .unwrap(),
+            "from-file"
+        );
+
+        // No file and no terminal on the prompt path: hard error naming the
+        // flag. Redirected stderr alone is also refused — dialoguer renders
+        // password prompts on stderr and errors on a non-terminal stderr.
+        for (stdin_is_terminal, stderr_is_terminal) in [(false, false), (true, false)] {
+            let err = secret_from_file_or_prompt_for_session(
+                None,
+                "password",
+                "Unlock password",
+                None,
+                "--password-file",
+                stdin_is_terminal,
+                stderr_is_terminal,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("--password-file"),
+                "error should name the flag: {err}"
+            );
+        }
     }
 }

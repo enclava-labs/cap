@@ -182,7 +182,10 @@ jobs:
           cargo build --release --bin enclava-api
           cargo build --release --bin enclava
         env:
-          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+          # CI-compile-only: this job does not publish images. Prefer the repo
+          # secret when set; otherwise use the well-known test fixture so
+          # scheduled compile checks still run. Never a Dockerfile default.
+          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX || '5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd' }}
 
       - name: Build prod-strict release path
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
@@ -193,7 +196,52 @@ jobs:
           cargo build --release -p enclava-cli --features prod-strict
           cargo build --release -p enclava-init --features prod-strict
         env:
-          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+          # CI-compile-only: this job does not publish images. Do not fall back
+          # to the committed fixture; prod-strict rejects that root.
+          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
+
+      - name: Verify prod-strict rejects invalid platform-release roots
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        env:
+          FIXTURE_ROOT: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
+        run: |
+          # The fixture root must fail for every shipped binary crate.
+          for crate in enclava-cli enclava-api; do
+            if ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX="$FIXTURE_ROOT" \
+              cargo check --release -p "$crate" --features prod-strict > /tmp/prod-strict-fixture.log 2>&1; then
+              cat /tmp/prod-strict-fixture.log
+              echo "$crate prod-strict unexpectedly accepted the committed fixture root"
+              exit 1
+            fi
+            if ! grep -q "prod-strict builds must not pin the committed fixture platform-release root" /tmp/prod-strict-fixture.log; then
+              cat /tmp/prod-strict-fixture.log
+              echo "$crate prod-strict fixture rejection did not report the expected compile error"
+              exit 1
+            fi
+          done
+          # Missing (unset and empty) and malformed roots must fail the
+          # compile for both crates too, not defer to runtime errors.
+          for crate in enclava-cli enclava-api; do
+            for value in "" "not-a-key" "5b94"; do
+              if ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX="$value" \
+                cargo check --release -p "$crate" --features prod-strict > /tmp/prod-strict-invalid.log 2>&1; then
+                cat /tmp/prod-strict-invalid.log
+                echo "$crate prod-strict unexpectedly accepted root: '$value'"
+                exit 1
+              fi
+              if ! grep -q "prod-strict builds require ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX to be set to a 32-byte hex pubkey" /tmp/prod-strict-invalid.log; then
+                cat /tmp/prod-strict-invalid.log
+                echo "$crate prod-strict invalid-root rejection did not report the expected compile error"
+                exit 1
+              fi
+            done
+            if env -u ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX \
+              cargo check --release -p "$crate" --features prod-strict > /tmp/prod-strict-unset.log 2>&1; then
+              cat /tmp/prod-strict-unset.log
+              echo "$crate prod-strict unexpectedly accepted an unset root"
+              exit 1
+            fi
+          done
 
       - name: Verify prod-strict rejects debug-only features
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
