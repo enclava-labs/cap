@@ -242,15 +242,30 @@ mod tests {
             !workflow.contains("outputs:"),
             "registry outputs bypass the push gate; only the gated push: property may publish"
         );
-        assert!(
-            workflow.contains("BUILD_PROFILE=${{ steps.build_profile.outputs.profile }}"),
-            "build-args must consume the selected build profile, not a hardcoded one"
-        );
-
-        assert!(
-            workflow
-                .contains("org.enclava.build-profile=${{ steps.build_profile.outputs.profile }}"),
-            "pushed images must carry an org.enclava.build-profile label derived from the selected profile so verifiers can reject debug digests"
-        );
+        let build_block = workflow
+            .split("- name: Build and push")
+            .nth(1)
+            .expect("Build and push step")
+            .split("\n      - name:")
+            .next()
+            .expect("Build and push step body");
+        for (prefix, what) in [
+            (
+                "BUILD_PROFILE=",
+                "build-args must consume the selected build profile, not a hardcoded one",
+            ),
+            (
+                "org.enclava.build-profile=",
+                "pushed images must carry an org.enclava.build-profile label derived from the selected profile so verifiers can reject debug digests",
+            ),
+        ] {
+            let lines: Vec<&str> = build_block
+                .lines()
+                .filter(|l| l.trim_start().starts_with(prefix))
+                .collect();
+            let expected = prefix.to_string() + "${{ steps.build_profile.outputs.profile }}";
+            assert_eq!(lines.len(), 1, "{what}");
+            assert_eq!(lines[0].trim(), expected, "{what}");
+        }
     }
 }
