@@ -38,6 +38,7 @@ use crate::commands::app::{
     terminal_bootstrap_failure_message, terminal_diagnostic_budget,
     terminal_diagnostic_probe_with_budget,
 };
+use crate::commands::config::CONFIG_APPLICATION_NOTE;
 use crate::commands::ownership::{MnemonicCapture, mnemonic_capture_from_flags};
 use crate::commands::{counted_progress, format_duration, timed_progress};
 
@@ -49,6 +50,28 @@ const DEFAULT_TEMPLATE_DEPLOY_TIMEOUT_SECONDS: u64 = 1800;
 const DEFAULT_SSH_TIMEOUT_SECONDS: u64 = 600;
 const TEMPLATE_CONFIG_DELIVERY_ATTEMPTS: usize = 121;
 const TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS: u64 = 2;
+/// Terminal marker when the owner-wait deadline cuts an in-flight request.
+/// Typed (not string-boxed) so the undelivered-config report can classify
+/// it as owner-blocked — the exact scenario the unlock recovery targets —
+/// without pattern-matching message text.
+const OWNER_WAIT_DEADLINE_EXCEEDED_MESSAGE: &str =
+    "owner-wait deadline reached with the TEE request still in flight";
+
+#[derive(Debug)]
+struct OwnerWaitDeadlineExceeded;
+
+impl std::fmt::Display for OwnerWaitDeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(OWNER_WAIT_DEADLINE_EXCEEDED_MESSAGE)
+    }
+}
+
+impl std::error::Error for OwnerWaitDeadlineExceeded {}
+/// How long a password-mode TEE must keep reporting `423 locked` before the
+/// delivery treats it as an owner-blocked relock (unlock guidance + extended
+/// wait) instead of rollout noise. Must exceed the claim/unlock window of a
+/// first deploy.
+const TEMPLATE_CONFIG_LOCKED_GUIDANCE_DELAY: Duration = Duration::from_secs(30);
 const MAX_SSH_COMMAND_BYTES: usize = 256;
 
 #[derive(Subcommand)]
@@ -85,7 +108,8 @@ pub struct TemplateDeployArgs {
     /// Do not wait for stable SSH endpoint command readiness after config delivery.
     #[arg(long)]
     pub no_wait: bool,
-    /// Seconds to wait for each TEE boot, platform config, and stable SSH readiness phase.
+    /// Seconds to wait for each TEE boot, platform config (including the password-mode
+    /// config-delivery owner wait when a redeploy relocks the TEE), and stable SSH readiness phase.
     #[arg(long, default_value_t = DEFAULT_TEMPLATE_DEPLOY_TIMEOUT_SECONDS)]
     pub ssh_timeout_seconds: u64,
     /// File containing the initial storage password for non-interactive password-mode template deploys.
@@ -553,10 +577,13 @@ async fn deploy_with_timings(
     let tee_url = template_config_endpoint_url(tee_url)?;
     let mut tee_resolve_ip = token.tee_resolve_ip;
     let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
+    // No aggregate deadline here: the slow-connect attempt cap inside the
+    // retry loop bounds the unreachable-endpoint case without reducing the
+    // 121-attempt coverage fast-failure rollouts rely on.
     let mut tee = timings
         .run(
             DeployPhase::CustomerConfigAttestation,
-            attest_template_config_tee_with_retry(tee),
+            attest_template_config_tee_with_retry(tee, None),
         )
         .await?;
     let mut tee_url = tee_url;
@@ -572,6 +599,10 @@ async fn deploy_with_timings(
                 DeliverTemplateConfigTarget {
                     instance_name: &instance_name,
                     deployment,
+                    password_mode: template.unlock_mode == "password",
+                    owner_wait_budget: Duration::from_secs(args.ssh_timeout_seconds),
+                    progress: &pb,
+                    timings_mode: args.timings,
                 },
                 &mut tee,
                 &mut config_token,
@@ -1373,6 +1404,17 @@ fn should_retry_api_transport_error(error: &reqwest::Error) -> bool {
 struct DeliverTemplateConfigTarget<'a> {
     instance_name: &'a str,
     deployment: DeploymentWait<'a>,
+    /// Caller-supplied deploy metadata: a password-mode TEE that relocked
+    /// during the roll is waiting on the owner, so the delivery extends its
+    /// budget and says so instead of surfacing a raw 423. Auto-unlock apps
+    /// self-unlock and keep the default budget.
+    password_mode: bool,
+    owner_wait_budget: Duration,
+    progress: &'a ProgressBar,
+    /// Output mode for operator notices: `--timings` owns stderr as a
+    /// JSONL stream, so notices ride it as structured events instead of
+    /// free-form text. Caller-supplied deploy metadata.
+    timings_mode: bool,
 }
 
 async fn deliver_template_config_with_retry(
@@ -1393,12 +1435,91 @@ async fn deliver_template_config_with_retry(
         tee_url,
         tee_resolve_ip,
         terminal_probe_at: None,
+        locked_since: None,
+        password_mode: target.password_mode,
+        owner_wait_budget: target.owner_wait_budget,
+        delivery_started: Instant::now(),
+        progress: target.progress,
+        owner_wait_announced: false,
+        post_lock_note_printed: false,
+        timings_mode: target.timings_mode,
+        observed_lock: false,
+        engaged_deadline: None,
     };
-    for (key, value) in pairs {
-        delivery.set_key(key, value).await?;
-        sync_template_config_key_with_retry(api, target.instance_name, key).await?;
+    for (index, (key, value)) in pairs.iter().enumerate() {
+        if let Err(error) = delivery.set_key(key, value).await {
+            // The unlock prescription follows the error that terminated the
+            // delivery, not the (sticky) wait history: a terminal 403 from a
+            // token refresh or an attestation failure is not repaired by
+            // unlocking, and prescribing it would bury the real cause.
+            let owner_blocked = delivery.password_mode
+                && (error
+                    .downcast_ref::<TeeError>()
+                    .is_some_and(is_locked_template_config_error)
+                    || (error.downcast_ref::<OwnerWaitDeadlineExceeded>().is_some()
+                        && delivery.owner_wait_ever_engaged()));
+            return Err(undelivered_template_config_error(
+                target.instance_name,
+                &pairs[index..],
+                error.as_ref(),
+                owner_blocked,
+            )
+            .into());
+        }
+        if let Err(error) = sync_template_config_key_with_retry(
+            api,
+            target.instance_name,
+            key,
+            delivery.request_deadline(),
+        )
+        .await
+        {
+            // Distinct failure class from an undelivered value: the value is
+            // in the TEE store; only the platform's key metadata lags.
+            return Err(format!(
+                "config value delivered to the TEE store, but the platform key sync failed \\
+                 for {key}: {error}. The platform may not report this key as managed until a \\
+                 later sync succeeds."
+            )
+            .into());
+        }
     }
     Ok(())
+}
+
+/// Name every key the terminal failure abandons, with the recovery path.
+/// The deployment itself keeps running on the previous config, so the
+/// operator must know exactly what did not land and how to re-deliver it.
+/// The unlock prescription is reserved for an owner-blocked (persistent
+/// password-mode lock) failure; other causes get the plain re-delivery path
+/// so the reported error stays the actionable signal.
+fn undelivered_template_config_error(
+    instance_name: &str,
+    undelivered: &[(&'static str, String)],
+    source: &(dyn std::error::Error + '_),
+    owner_blocked: bool,
+) -> String {
+    let keys = undelivered
+        .iter()
+        .map(|(key, _)| *key)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let recovery = if owner_blocked {
+        format!(
+            "Unlock the TEE (`enclava unlock --app {instance_name}`), then re-deliver with \
+             `enclava config set --app {instance_name} <KEY>=<VALUE>`."
+        )
+    } else {
+        format!(
+            "Once the reported cause is resolved, re-deliver with \
+             `enclava config set --app {instance_name} <KEY>=<VALUE>`."
+        )
+    };
+    format!(
+        "customer config NOT delivered: {keys}. The deployment continues without them \
+         (a redeploy keeps running its previous config; a first deploy stores no values \
+         at all). {recovery} {CONFIG_APPLICATION_NOTE} Last error: {source}"
+    )
 }
 
 struct TemplateConfigDeliveryState<'a> {
@@ -1410,6 +1531,26 @@ struct TemplateConfigDeliveryState<'a> {
     tee_url: &'a mut String,
     tee_resolve_ip: &'a mut Option<std::net::IpAddr>,
     terminal_probe_at: Option<Instant>,
+    /// When the TEE last started reporting `423 locked` without interruption
+    /// before the owner-wait engaged. Cleared by non-locked outcomes while
+    /// still unengaged (flapping rollout noise must not accumulate
+    /// persistence); sticky once engaged.
+    locked_since: Option<Instant>,
+    password_mode: bool,
+    owner_wait_budget: Duration,
+    delivery_started: Instant,
+    progress: &'a ProgressBar,
+    owner_wait_announced: bool,
+    post_lock_note_printed: bool,
+    timings_mode: bool,
+    /// Whether ANY locked response was observed this delivery, independent of
+    /// the consecutive-lock window: a success after a lock raced the
+    /// workload's boot regardless of intervening transient errors.
+    observed_lock: bool,
+    /// The phase deadline captured when the owner-wait first engaged.
+    /// Sticky for the delivery: a successful write clears the lock window
+    /// but must not discard the deadline the post-write sync still needs.
+    engaged_deadline: Option<Instant>,
 }
 
 impl TemplateConfigDeliveryState<'_> {
@@ -1427,7 +1568,7 @@ impl TemplateConfigDeliveryState<'_> {
             self.instance_name,
             self.deployment,
             Some(self.tee),
-            terminal_diagnostic_budget(None),
+            terminal_diagnostic_budget(self.request_deadline()),
         )
         .await?;
         Some(terminal_bootstrap_failure_message(
@@ -1436,17 +1577,213 @@ impl TemplateConfigDeliveryState<'_> {
         ))
     }
 
+    /// Whether the owner-wait applies (see
+    /// `template_config_owner_wait_engaged`). Sticky for the phase once
+    /// true: the TEE was verifiably owner-blocked, and a transport or
+    /// token-refresh blip must not retract the guidance or end the wait.
+    fn owner_wait_engaged(&self, now: Instant) -> bool {
+        template_config_owner_wait_engaged(self.password_mode, self.locked_since, now)
+    }
+
+    /// Whether the owner-wait ever engaged during this delivery (the
+    /// captured deadline is sticky). A candidate-only lock that never
+    /// crossed the persistence threshold must not select unlock recovery.
+    fn owner_wait_ever_engaged(&self) -> bool {
+        self.engaged_deadline.is_some()
+    }
+
+    /// The delivery keeps retrying through the default attempt budget, and
+    /// beyond it while the owner-wait is engaged and its budget lasts. A
+    /// password-mode lock candidate that appeared late in the default
+    /// window (e.g. transient rollout errors consumed most of it) gets
+    /// grace to reach the persistence threshold rather than dying with the
+    /// attempt budget mid-window.
+    fn delivery_continues(&self, attempt: usize) -> bool {
+        let now = Instant::now();
+        let engaged = self.owner_wait_engaged(now);
+        template_config_delivery_continues(
+            attempt,
+            engaged,
+            self.delivery_started.elapsed() < self.owner_wait_budget,
+            self.password_mode && self.locked_since.is_some() && !engaged,
+        )
+    }
+
+    /// An operator notice on a channel that never corrupts a machine
+    /// stream: the bar when visible; under `--timings` stderr is the timing
+    /// JSONL stream, so the notice rides it as a structured JSON event —
+    /// kind plus a static, identifier-free action string. The operator-
+    /// facing text embeds the deployment identifier the stream is designed
+    /// to exclude, so it stays off it; the action still tells the operator
+    /// how to unblock delivery (works for `--json --timings` too, where
+    /// stdout holds the final JSON document); with a hidden bar and no
+    /// `--timings`, stderr is free-form text.
+    fn announce(&self, kind: &str, action: &str, line: &str) {
+        if !self.progress.is_hidden() {
+            self.progress.println(line);
+        } else if self.timings_mode {
+            let record = serde_json::json!({
+                "event": "template_deploy_notice",
+                "kind": kind,
+                "action": action,
+            });
+            eprintln!("{record}");
+        } else {
+            eprintln!("{line}");
+        }
+    }
+
+    /// Track locked persistence, and while the owner-wait is engaged keep a
+    /// clocked guidance message on the progress bar (the same elapsed/total
+    /// format every other wait phase renders — a silent retry loop is
+    /// indistinguishable from an instant failure). Hidden bars never render
+    /// `set_message`, so the engagement is also announced once on a free
+    /// channel: the operator action must stay visible in non-interactive
+    /// modes too.
+    fn note_delivery_error(&mut self, error: &TeeError) {
+        self.observed_lock |= is_locked_template_config_error(error);
+        self.locked_since = template_config_next_locked_since(
+            error,
+            self.locked_since,
+            self.owner_wait_engaged(Instant::now()),
+        );
+        self.update_guidance_surface();
+    }
+
+    /// Render the unlock guidance (clocked bar message + one announce)
+    /// when the owner-wait is engaged. Called between retries and at the
+    /// lock-persistence threshold wake, so a stalled in-flight request
+    /// cannot leave the guidance invisible while the threshold passes.
+    fn update_guidance_surface(&mut self) {
+        if !self.owner_wait_engaged(Instant::now()) {
+            return;
+        }
+        if self.engaged_deadline.is_none() {
+            self.engaged_deadline = self.delivery_started.checked_add(self.owner_wait_budget);
+        }
+        let label = format!(
+            "Customer config: TEE locked (password mode) — run `enclava unlock --app {}`",
+            self.instance_name
+        );
+        self.progress.set_message(timed_progress(
+            &label,
+            self.delivery_started.elapsed(),
+            self.owner_wait_budget,
+        ));
+        if !self.owner_wait_announced {
+            self.owner_wait_announced = true;
+            self.announce(
+                "owner_wait_guidance",
+                "run `enclava unlock --app <app>`; config delivery continues automatically",
+                &format!("{label} — config delivery continues automatically."),
+            );
+        }
+    }
+
+    /// While a password-mode lock is still a candidate (persistence window
+    /// running, not yet engaged), the instant the guidance threshold
+    /// expires — the delivery wakes there even if the in-flight request is
+    /// stalled.
+    fn guidance_wake(&self) -> Option<Instant> {
+        if !self.password_mode || self.engaged_deadline.is_some() {
+            return None;
+        }
+        self.locked_since
+            .map(|locked_since| locked_since + TEMPLATE_CONFIG_LOCKED_GUIDANCE_DELAY)
+    }
+
+    /// A write that succeeds after any `423 locked` observation may have
+    /// missed the workload's boot: the operator's unlock starts the
+    /// workload, and container creation races this delivery. The delivered
+    /// value is guaranteed only from the NEXT boot, so say so once on a
+    /// free channel.
+    fn report_post_lock_delivery(&mut self) {
+        if !self.observed_lock || self.post_lock_note_printed {
+            return;
+        }
+        self.post_lock_note_printed = true;
+        self.announce(
+            "post_lock_boot_note",
+            "delivered values apply at the workload's next boot",
+            &format!("Config delivered while the TEE was unlocking: {CONFIG_APPLICATION_NOTE}"),
+        );
+    }
+
+    /// The phase deadline for in-flight requests and nested retry helpers
+    /// (token refresh, re-attestation, key-metadata sync): active while a
+    /// password-mode lock is even a candidate (a stalled request must not
+    /// outlive the budget waiting for the persistence threshold) and
+    /// retained for the rest of the delivery once engaged — a successful
+    /// write clears the lock window but not this deadline. Deliveries with
+    /// no password-mode lock state pass `None` and keep today's exact
+    /// behavior.
+    fn request_deadline(&self) -> Option<Instant> {
+        if !self.password_mode || (self.locked_since.is_none() && self.engaged_deadline.is_none()) {
+            return None;
+        }
+        self.engaged_deadline
+            .or_else(|| self.delivery_started.checked_add(self.owner_wait_budget))
+    }
+
     async fn set_key(&mut self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
-        for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
-            match self.tee.config_set(key, value, self.config_token).await {
-                Ok(()) => return Ok(()),
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            // The phase deadline bounds the in-flight request too (the API
+            // client's own 900s cap would otherwise let one stalled write run
+            // far past the phase budget), and while a lock is still a
+            // candidate the loop also wakes when the guidance threshold
+            // expires, so a stalled request cannot leave the unlock guidance
+            // invisible while the threshold passes.
+            let deadline = self.request_deadline();
+            let wake = match (deadline, self.guidance_wake()) {
+                (Some(deadline), Some(wake)) => Some(deadline.min(wake)),
+                (deadline, wake) => deadline.or(wake),
+            };
+            let config_set = self.tee.config_set(key, value, self.config_token);
+            let result = match wake {
+                Some(wake) => match tokio::time::timeout(
+                    wake.saturating_duration_since(Instant::now()),
+                    config_set,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                            return Err(OwnerWaitDeadlineExceeded.into());
+                        }
+                        // Threshold wake: surface the guidance, then re-issue
+                        // the write (the stalled attempt is abandoned, not
+                        // resumed).
+                        self.update_guidance_surface();
+                        template_config_sleep_until_retry(deadline).await;
+                        continue;
+                    }
+                },
+                None => config_set.await,
+            };
+            match result {
+                Ok(()) => {
+                    self.report_post_lock_delivery();
+                    // A success is a non-locked outcome: the persistence
+                    // window must not leak into the next key's delivery.
+                    self.locked_since = None;
+                    return Ok(());
+                }
                 Err(error) if should_refresh_template_config_token(&error) => {
-                    if attempt == TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
+                    if !self.delivery_continues(attempt) {
                         return Err(error.into());
                     }
-                    let refreshed =
-                        refresh_template_config_token_with_retry(self.api, self.instance_name, key)
-                            .await?;
+                    self.note_delivery_error(&error);
+                    let nested_deadline = self.request_deadline();
+                    let refreshed = refresh_template_config_token_with_retry(
+                        self.api,
+                        self.instance_name,
+                        key,
+                        nested_deadline,
+                    )
+                    .await?;
                     let refreshed_tee_url =
                         refreshed_template_config_endpoint_url(&refreshed, self.tee_url)?;
                     let refreshed_tee_resolve_ip =
@@ -1458,7 +1795,9 @@ impl TemplateConfigDeliveryState<'_> {
                             &refreshed_tee_url,
                             refreshed_tee_resolve_ip,
                         );
-                        *self.tee = attest_template_config_tee_with_retry(refreshed_tee).await?;
+                        *self.tee =
+                            attest_template_config_tee_with_retry(refreshed_tee, nested_deadline)
+                                .await?;
                         *self.tee_url = refreshed_tee_url;
                         *self.tee_resolve_ip = refreshed_tee_resolve_ip;
                     }
@@ -1466,60 +1805,115 @@ impl TemplateConfigDeliveryState<'_> {
                     if let Some(message) = self.terminal_bootstrap_stop().await {
                         return Err(message.into());
                     }
-                    tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                    template_config_sleep_until_retry(deadline).await;
                 }
-                Err(error)
-                    if should_retry_template_config_tee_error(&error)
-                        && attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS =>
-                {
+                Err(error) if should_retry_template_config_tee_error(&error) => {
+                    if !self.delivery_continues(attempt) {
+                        return Err(error.into());
+                    }
+                    self.note_delivery_error(&error);
                     if let Some(message) = self.terminal_bootstrap_stop().await {
                         return Err(message.into());
                     }
-                    tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                    template_config_sleep_until_retry(deadline).await;
                 }
                 Err(error) => return Err(error.into()),
             }
         }
-        Err(format!("TEE config write failed for {key}").into())
     }
 }
 
 async fn attest_template_config_tee_with_retry(
     tee: TeeClient,
+    deadline: Option<Instant>,
 ) -> Result<TeeClient, Box<dyn std::error::Error>> {
-    for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
-        match tee.attest_receipt_key().await {
+    let mut attempt = 0usize;
+    let mut slow_connect_attempts = 0usize;
+    loop {
+        attempt += 1;
+        // The deadline bounds the in-flight attestation too, not just
+        // whether another iteration starts.
+        let attest = tee.attest_receipt_key();
+        let result = match deadline {
+            Some(deadline) => match tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                attest,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    return Err(
+                        "customer-config attestation deadline reached with the request still in flight"
+                            .into(),
+                    );
+                }
+            },
+            None => attest.await,
+        };
+        match result {
             Ok((_attestation, attested_tee)) => return Ok(attested_tee),
             Err(error)
                 if should_retry_template_config_tee_error(&error)
-                    && attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS =>
+                    && template_config_nested_retry_continues(attempt, deadline) =>
             {
-                tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                // Slow connect attempts have their own, smaller budget so a
+                // silently unreachable endpoint cannot stretch the loop past
+                // the nominal window; fast-failure classes keep the full
+                // attempt budget.
+                if is_slow_template_config_attest_attempt(&error) {
+                    slow_connect_attempts += 1;
+                    if slow_connect_attempts >= TEMPLATE_CONFIG_SLOW_CONNECT_ATTEMPT_CAP {
+                        return Err(error.into());
+                    }
+                }
+                template_config_sleep_until_retry(deadline).await;
             }
             Err(error) => return Err(error.into()),
         }
     }
-    Err("TEE attestation failed before config delivery".into())
 }
 
 async fn sync_template_config_key_with_retry(
     api: &ApiClient,
     instance_name: &str,
     key: &str,
+    deadline: Option<Instant>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
-        match api.sync_config_key(instance_name, key, false).await {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        // The deadline bounds iteration and the in-flight request alike, so
+        // a stalled sync cannot hold the deploy open past the phase budget
+        // once the value is already stored.
+        let sync = api.sync_config_key(instance_name, key, false);
+        let result = match deadline {
+            Some(deadline) => {
+                match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), sync)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        return Err(format!(
+                        "owner-wait deadline reached while syncing config key metadata for {key}"
+                    )
+                    .into());
+                    }
+                }
+            }
+            None => sync.await,
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(error)
                 if should_retry_template_config_sync_error(&error)
-                    && attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS =>
+                    && template_config_nested_retry_continues(attempt, deadline) =>
             {
-                tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                template_config_sleep_until_retry(deadline).await;
             }
             Err(error) => return Err(error.into()),
         }
     }
-    Err(format!("TEE config metadata sync failed for {key}").into())
 }
 
 fn managed_config_progress_message(
@@ -1635,15 +2029,40 @@ async fn refresh_template_config_token_with_retry(
     api: &ApiClient,
     instance_name: &str,
     key: &str,
+    deadline: Option<Instant>,
 ) -> Result<enclava_cli::api_types::ConfigTokenResponse, Box<dyn std::error::Error>> {
-    for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
-        match api.get_config_token(instance_name).await {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        // The deadline bounds the in-flight token request too, so a
+        // stalled response cannot run past the phase budget.
+        let token = api.get_config_token(instance_name);
+        let response = match deadline {
+            Some(deadline) => {
+                match tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    token,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(_elapsed) => {
+                        return Err(format!(
+                            "owner-wait deadline reached while refreshing the config token for {key}"
+                        )
+                        .into());
+                    }
+                }
+            }
+            None => token.await,
+        };
+        match response {
             Ok(response) => return Ok(response),
             Err(error)
                 if should_retry_template_config_sync_error(&error)
-                    && attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS =>
+                    && template_config_nested_retry_continues(attempt, deadline) =>
             {
-                tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                template_config_sleep_until_retry(deadline).await;
             }
             Err(error) => {
                 return Err(format!(
@@ -1653,7 +2072,6 @@ async fn refresh_template_config_token_with_retry(
             }
         }
     }
-    Err(format!("TEE config token refresh failed while writing {key}").into())
 }
 
 fn refreshed_template_config_endpoint_url(
@@ -1668,6 +2086,18 @@ fn refreshed_template_config_endpoint_url(
 
 fn template_config_delivery_retry_delay() -> Duration {
     Duration::from_secs(TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS)
+}
+
+/// Pace a retry sleep, never past a supplied deadline: a retry admitted
+/// just before the deadline must not sleep the full delay beyond the
+/// remaining budget before the next iteration can observe expiry.
+async fn template_config_sleep_until_retry(deadline: Option<Instant>) {
+    let delay = match deadline {
+        Some(deadline) => template_config_delivery_retry_delay()
+            .min(deadline.saturating_duration_since(Instant::now())),
+        None => template_config_delivery_retry_delay(),
+    };
+    tokio::time::sleep(delay).await;
 }
 
 fn should_refresh_template_config_token(error: &TeeError) -> bool {
@@ -1685,12 +2115,108 @@ fn should_retry_template_config_tee_error(error: &TeeError) -> bool {
     }
 }
 
+/// Cap for attempts in the slow connect-timeout class. One attest attempt
+/// can burn up to two sequential 10s connects (configured-IP connect, then
+/// the DNS fallback when a resolve IP was supplied), so 10 attempts x
+/// (2 x 10s + 2s sleep) spans the nominal delivery window: the retryable
+/// timeout class cannot stretch an unreachable endpoint past the phase's
+/// documented budget. Fast-failure classes keep the full 121-attempt budget.
+const TEMPLATE_CONFIG_SLOW_CONNECT_ATTEMPT_CAP: usize = 10;
+
+/// The one slow class among the retryable attestation failures: an exact TCP
+/// connect timeout (its io-error sibling usually fails fast).
+fn is_slow_template_config_attest_attempt(error: &TeeError) -> bool {
+    matches!(
+        error,
+        TeeError::Attestation(message) if message == "TEE TCP connect timed out"
+    )
+}
+
 fn is_transient_template_config_attestation_error(message: &str) -> bool {
     message.starts_with("TEE TCP connect failed:")
+        || message == "TEE TCP connect timed out"
         || message.starts_with("TEE TLS handshake failed:")
         || message == "TEE TLS handshake timed out"
         || message == "TEE did not present a certificate"
         || message == "TEE certificate chain is empty"
+}
+
+/// A `423 locked` from the TEE config endpoint: the replacement workload
+/// booted password-locked and is waiting on the owner. The ownership gate
+/// emits `error` and `state` as `"locked"` together in the 423 body; the
+/// match is quote-delimited so the 202 `"state":"unlocking"` shape (the
+/// claim/unlock window of a first deploy) cannot substring-match as locked.
+fn is_locked_template_config_error(error: &TeeError) -> bool {
+    match error {
+        TeeError::Tee {
+            status: 423,
+            message,
+        } => message.contains("\"error\":\"locked\"") || message.contains("\"state\":\"locked\""),
+        _ => false,
+    }
+}
+
+/// Password mode plus an uninterrupted `423 locked` window of at least the
+/// guidance delay: rollout noise and first-deploy claim/unlock races settle
+/// well inside it, an owner-blocked relock does not.
+fn template_config_owner_wait_engaged(
+    password_mode: bool,
+    locked_since: Option<Instant>,
+    now: Instant,
+) -> bool {
+    password_mode
+        && locked_since.is_some_and(|locked_since| {
+            now.duration_since(locked_since) >= TEMPLATE_CONFIG_LOCKED_GUIDANCE_DELAY
+        })
+}
+
+fn template_config_delivery_continues(
+    attempt: usize,
+    owner_wait_engaged: bool,
+    before_deadline: bool,
+    lock_pending: bool,
+) -> bool {
+    // A password-mode lock candidate or an engaged owner-wait is bounded by
+    // the owner-wait budget regardless of the attempt count — an expired
+    // budget terminates it even before the persistence threshold would
+    // engage (short --ssh-timeout-seconds). A candidate is inherently
+    // short-lived: it either crosses the threshold (still budget-bounded)
+    // or a non-locked outcome clears it. Without either, the ordinary
+    // attempt budget governs (rollout-coverage, unchanged).
+    if owner_wait_engaged || lock_pending {
+        return before_deadline;
+    }
+    attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS
+}
+
+/// Nested retry helpers (token refresh, re-attestation, key-metadata sync):
+/// without a deadline they keep their default attempt budget; a supplied
+/// deadline REPLACES that budget — retries continue until it, never past
+/// it, so fast-failing responses cannot sleep-loop to attempt 121 after
+/// the phase budget has elapsed (an in-flight timeout cannot cut a future
+/// that is already ready).
+fn template_config_nested_retry_continues(attempt: usize, deadline: Option<Instant>) -> bool {
+    match deadline {
+        Some(deadline) => Instant::now() < deadline,
+        None => attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+    }
+}
+
+/// Next value of the locked-persistence window: a locked response keeps or
+/// starts it, any other outcome clears it unless the owner-wait already
+/// engaged (sticky), so a transport blip mid-wait cannot end the wait.
+fn template_config_next_locked_since(
+    error: &TeeError,
+    locked_since: Option<Instant>,
+    engaged: bool,
+) -> Option<Instant> {
+    if is_locked_template_config_error(error) {
+        Some(locked_since.unwrap_or_else(Instant::now))
+    } else if engaged {
+        locked_since
+    } else {
+        None
+    }
 }
 
 fn should_retry_template_config_sync_error(error: &ApiError) -> bool {
@@ -5332,6 +5858,7 @@ mod tests {
         );
         for message in [
             "TEE TCP connect failed: failed to lookup address information: Name or service not known",
+            "TEE TCP connect timed out",
             "TEE TLS handshake failed: tls handshake eof",
             "TEE TLS handshake timed out",
             "TEE did not present a certificate",
@@ -5366,6 +5893,384 @@ mod tests {
         }
         assert!(!should_retry_template_config_sync_error(
             &ApiError::NotAuthenticated
+        ));
+    }
+
+    #[test]
+    fn template_config_locked_error_detection_is_quote_delimited() {
+        let locked_body = "{\"error\":\"locked\",\"message\":\"Pod is locked. POST /unlock with password to proceed.\",\"state\":\"locked\"}";
+
+        // The observed live body and its individual quoted forms.
+        assert!(is_locked_template_config_error(&TeeError::Tee {
+            status: 423,
+            message: locked_body.to_string(),
+        }));
+        for message in ["{\"error\":\"locked\"}", "{\"state\":\"locked\"}"] {
+            assert!(is_locked_template_config_error(&TeeError::Tee {
+                status: 423,
+                message: message.to_string(),
+            }));
+        }
+
+        // An unlocking TEE reports a 202 body with only
+        // `"state":"unlocking"" (the ownership gate itself always emits
+        // error+state as "locked" together); the quote-delimited match must
+        // not substring-match it as locked.
+        assert!(!is_locked_template_config_error(&TeeError::Tee {
+            status: 423,
+            message: "{\"state\":\"unlocking\"}".to_string(),
+        }));
+        assert!(!is_locked_template_config_error(&TeeError::Tee {
+            status: 423,
+            message: "Pod is locked. POST /unlock with password to proceed.".to_string(),
+        }));
+        assert!(!is_locked_template_config_error(&TeeError::Tee {
+            status: 423,
+            message: "{\"error\":\"rate_limited\"}".to_string(),
+        }));
+        for status in [409, 429, 500] {
+            assert!(!is_locked_template_config_error(&TeeError::Tee {
+                status,
+                message: locked_body.to_string(),
+            }));
+        }
+        assert!(!is_locked_template_config_error(&TeeError::Attestation(
+            "locked".to_string()
+        )));
+    }
+
+    #[test]
+    fn template_config_owner_wait_engages_only_on_persistent_password_mode_lock() {
+        let now = Instant::now();
+
+        assert!(template_config_owner_wait_engaged(
+            true,
+            Some(now - TEMPLATE_CONFIG_LOCKED_GUIDANCE_DELAY),
+            now
+        ));
+        assert!(!template_config_owner_wait_engaged(
+            true,
+            Some(now - TEMPLATE_CONFIG_LOCKED_GUIDANCE_DELAY + Duration::from_secs(1)),
+            now
+        ));
+        assert!(!template_config_owner_wait_engaged(true, None, now));
+        // Auto-unlock apps self-unlock: the owner-wait never engages.
+        assert!(!template_config_owner_wait_engaged(
+            false,
+            Some(now - Duration::from_secs(600)),
+            now
+        ));
+    }
+
+    #[test]
+    fn template_config_delivery_continues_past_default_budget_only_when_engaged() {
+        let none = (false, false, false);
+        let engaged = (true, true, false);
+        assert!(template_config_delivery_continues(
+            1, none.0, none.1, none.2
+        ));
+        assert!(template_config_delivery_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS - 1,
+            none.0,
+            none.1,
+            none.2
+        ));
+        assert!(template_config_delivery_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            engaged.0,
+            engaged.1,
+            engaged.2
+        ));
+        assert!(template_config_delivery_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS * 10,
+            engaged.0,
+            engaged.1,
+            engaged.2
+        ));
+        assert!(!template_config_delivery_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            false,
+            true,
+            false
+        ));
+        assert!(!template_config_delivery_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            true,
+            false,
+            false
+        ));
+        // An engaged wait is budget-bounded even inside the ordinary attempt
+        // count (a short --ssh-timeout-seconds must be honored), and so is a
+        // not-yet-engaged password-mode lock candidate.
+        assert!(!template_config_delivery_continues(1, true, false, false));
+        assert!(!template_config_delivery_continues(1, false, false, true));
+        // A password-mode lock candidate that appeared late in the default
+        // window gets grace to cross the persistence threshold even though
+        // the attempt budget expired mid-window — while the budget lasts.
+        assert!(template_config_delivery_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            false,
+            true,
+            true
+        ));
+        // Without a candidate or engagement, the ordinary attempt budget
+        // governs regardless of the clock (rollout coverage is
+        // attempt-based).
+        assert!(template_config_delivery_continues(1, false, false, false));
+        assert!(!template_config_delivery_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            false,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn template_config_locked_persistence_is_sticky_once_engaged() {
+        let locked = || TeeError::Tee {
+            status: 423,
+            message: "{\"error\":\"locked\",\"state\":\"locked\"}".to_string(),
+        };
+        let transport = || TeeError::Attestation("TEE TCP connect timed out".to_string());
+        let since = Instant::now();
+
+        // A locked response starts (or keeps) the window.
+        assert!(template_config_next_locked_since(&locked(), None, false).is_some());
+        assert_eq!(
+            template_config_next_locked_since(&locked(), Some(since), false),
+            Some(since)
+        );
+        // Non-locked outcomes clear an unengaged window (flapping noise must
+        // not accumulate persistence) but cannot end an engaged wait.
+        assert_eq!(
+            template_config_next_locked_since(&transport(), Some(since), false),
+            None
+        );
+        assert_eq!(
+            template_config_next_locked_since(&transport(), Some(since), true),
+            Some(since)
+        );
+    }
+
+    #[test]
+    fn undelivered_template_config_error_names_keys_and_recovery() {
+        let pairs = [
+            ("DEBIAN_SSH_AUTHORIZED_KEYS", "value-a".to_string()),
+            ("EXTRA_FLAG", "value-b".to_string()),
+        ];
+        let source = TeeError::Tee {
+            status: 423,
+            message: "{\"error\":\"locked\"}".to_string(),
+        };
+
+        // Owner-blocked failure: prescribe the unlock, then a re-delivery
+        // command that actually parses (`config set` takes KEY=VALUE pairs
+        // and must be pointed at the hosted app — there is no local
+        // enclava.toml to default from).
+        let message = undelivered_template_config_error("shell", &pairs[..], &source, true);
+
+        assert!(message.contains("NOT delivered: DEBIAN_SSH_AUTHORIZED_KEYS, EXTRA_FLAG"));
+        assert!(message.contains("enclava unlock --app shell"));
+        assert!(message.contains("enclava config set --app shell <KEY>=<VALUE>"));
+        assert!(message.contains(CONFIG_APPLICATION_NOTE));
+        assert!(message.contains("Last error: TEE error (423)"));
+        assert!(message.contains("The deployment continues without them"));
+        assert!(message.contains("a first deploy stores no values"));
+
+        // Other failures keep the reported error as the actionable signal —
+        // no unlock prescription.
+        let generic = undelivered_template_config_error("shell", &pairs[..], &source, false);
+        assert!(generic.contains("enclava config set --app shell <KEY>=<VALUE>"));
+        assert!(!generic.contains("Unlock the TEE"));
+
+        let from_second_key =
+            undelivered_template_config_error("shell", &pairs[1..], &source, true);
+        assert!(from_second_key.contains("EXTRA_FLAG"));
+        assert!(!from_second_key.contains("DEBIAN_SSH_AUTHORIZED_KEYS"));
+    }
+
+    #[test]
+    fn template_config_delivery_owner_wait_is_wired_to_deploy_metadata() {
+        // The owner-wait is caller-supplied deploy metadata (unlock mode + the
+        // shared ssh-timeout budget), never a lookup from inside the wait,
+        // and the delivery loop must consult it on both retry arms.
+        let source = include_str!("template.rs");
+
+        assert!(
+            source.contains("password_mode: template.unlock_mode == \"password\""),
+            "the deploy call site must pass the detected unlock mode"
+        );
+        assert!(
+            source.contains("owner_wait_budget: Duration::from_secs(args.ssh_timeout_seconds)"),
+            "the owner-wait budget must ride the shared ssh-timeout knob"
+        );
+
+        let fn_start = source.find("async fn set_key").expect("set_key exists");
+        let fn_end = source
+            .find("async fn attest_template_config_tee_with_retry")
+            .expect("attest retry follows the delivery state impl");
+        let body = &source[fn_start..fn_end];
+        let refresh_arm = body
+            .find("should_refresh_template_config_token")
+            .expect("refresh arm");
+        let retry_arm = body
+            .rfind("should_retry_template_config_tee_error")
+            .expect("retry arm");
+        for arm in [refresh_arm, retry_arm] {
+            let arm_body = &body[arm..];
+            assert!(
+                arm_body.contains("delivery_continues(attempt)"),
+                "both retry arms must honor the continuation predicate"
+            );
+            assert!(
+                arm_body.contains("note_delivery_error(&error)"),
+                "both retry arms must track locked persistence"
+            );
+        }
+
+        assert!(
+            source.contains("enclava unlock --app {}"),
+            "the guidance message must name the unlock command"
+        );
+        let announce_fn = source
+            .find("fn announce")
+            .expect("operator notice channel selection exists");
+        let announce_body = &source[announce_fn..announce_fn + 1200];
+        assert!(
+            announce_body.contains("is_hidden()"),
+            "hidden bars never render bar output; notices need a channel"
+        );
+        assert!(
+            announce_body.contains("timings_mode")
+                && announce_body.contains("template_deploy_notice"),
+            "stderr is the timing JSONL stream whenever --timings is set: notices \
+             must ride it as structured events, never free-form text"
+        );
+        assert!(
+            source.contains("timings_mode: args.timings"),
+            "output mode must be caller-supplied deploy metadata"
+        );
+        let set_key_fn = source.find("async fn set_key").expect("set_key exists");
+        let set_key_body = &source[set_key_fn..set_key_fn + 4000];
+        assert!(
+            set_key_body.contains("report_post_lock_delivery"),
+            "a write that lands after an unlock may have missed the workload's \
+             boot and must say so"
+        );
+        let deliver_fn = source
+            .split_once("async fn deliver_template_config_with_retry")
+            .unwrap()
+            .1
+            .split_once("struct TemplateConfigDeliveryState")
+            .unwrap()
+            .0;
+        assert!(
+            deliver_fn.contains("undelivered_template_config_error"),
+            "a terminal delivery failure must name the abandoned keys"
+        );
+        assert!(
+            deliver_fn.contains("downcast_ref::<TeeError>()"),
+            "the unlock prescription must follow the terminal error, not the \\
+             sticky wait history"
+        );
+        assert!(
+            deliver_fn.contains("delivery.password_mode"),
+            "auto-unlock apps self-unlock: a locked terminal error must not \\
+             prescribe a manual unlock for them"
+        );
+        assert!(
+            source.contains("fn request_deadline"),
+            "nested retry helpers need the phase deadline while a lock is a \\
+             candidate or the wait is engaged"
+        );
+        let refresh_arm_fn = source
+            .find("async fn refresh_template_config_token_with_retry")
+            .expect("refresh helper exists");
+        let refresh_body = &source[refresh_arm_fn..refresh_arm_fn + 2000];
+        assert!(
+            refresh_body.contains("template_config_nested_retry_continues"),
+            "the token-refresh retry loop must honor the owner-wait deadline"
+        );
+        assert!(
+            refresh_body.contains("tokio::time::timeout"),
+            "the deadline must also cut an in-flight token request, not only \
+             gate the next iteration"
+        );
+        let set_key_fn2 = source.find("async fn set_key").expect("set_key exists");
+        let set_key_body2 = &source[set_key_fn2..set_key_fn2 + 3000];
+        assert!(
+            set_key_body2.contains("tokio::time::timeout"),
+            "the deadline must also cut an in-flight config write"
+        );
+        assert!(
+            set_key_body2.contains("self.locked_since = None;"),
+            "a successful write is a non-locked outcome: the persistence window \
+             must not leak into the next key's delivery"
+        );
+        assert!(
+            deliver_fn.contains("platform key sync failed"),
+            "a sync failure after a successful TEE write is a distinct failure \
+             class and must be distinguishable from an undelivered value"
+        );
+    }
+
+    #[test]
+    fn template_config_slow_connect_class_and_cap() {
+        assert!(is_slow_template_config_attest_attempt(
+            &TeeError::Attestation("TEE TCP connect timed out".to_string())
+        ));
+        // Fast-failure classes are not slow attempts.
+        for message in [
+            "TEE TCP connect failed: Connection refused",
+            "TEE TLS handshake timed out",
+            "TEE did not present a certificate",
+        ] {
+            assert!(!is_slow_template_config_attest_attempt(
+                &TeeError::Attestation(message.to_string())
+            ));
+        }
+        assert!(!is_slow_template_config_attest_attempt(&TeeError::Tee {
+            status: 423,
+            message: "{\"error\":\"locked\"}".to_string(),
+        }));
+        // The slow cap spans, but does not exceed, the nominal delivery
+        // window (sleep budget plus one in-flight attempt), counting BOTH
+        // connects of the resolve-IP fallback path per attempt.
+        let slow_worst_case = TEMPLATE_CONFIG_SLOW_CONNECT_ATTEMPT_CAP as u64
+            * (2 * 10 + TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS);
+        let nominal_window = TEMPLATE_CONFIG_DELIVERY_ATTEMPTS.saturating_sub(1) as u64
+            * TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS
+            + 10;
+        assert!(slow_worst_case <= nominal_window);
+    }
+
+    #[test]
+    fn template_config_nested_retry_continues_honors_deadline() {
+        // Default budget first, deadline-bounded extension only while one is
+        // supplied and unexpired.
+        assert!(template_config_nested_retry_continues(1, None));
+        assert!(template_config_nested_retry_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS - 1,
+            None
+        ));
+        assert!(template_config_nested_retry_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            Some(Instant::now() + Duration::from_secs(60))
+        ));
+        assert!(!template_config_nested_retry_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            None
+        ));
+        assert!(!template_config_nested_retry_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            Some(Instant::now() - Duration::from_secs(1))
+        ));
+        // A supplied deadline replaces the attempt budget: an expired
+        // deadline stops the loop even with attempts remaining, so
+        // fast-failing responses cannot outlive the phase budget.
+        assert!(!template_config_nested_retry_continues(
+            1,
+            Some(Instant::now() - Duration::from_secs(1))
         ));
     }
 
@@ -5695,6 +6600,7 @@ mod tests {
         let mut config_token = "token".to_string();
         let mut tee_url = tee_url;
         let mut tee_resolve_ip: Option<std::net::IpAddr> = Some(tee_address.ip());
+        let progress = ProgressBar::hidden();
         let mut state = TemplateConfigDeliveryState {
             api: &api,
             tee: &mut tee,
@@ -5704,6 +6610,16 @@ mod tests {
             tee_url: &mut tee_url,
             tee_resolve_ip: &mut tee_resolve_ip,
             terminal_probe_at: None,
+            locked_since: None,
+            password_mode: false,
+            owner_wait_budget: Duration::from_secs(1800),
+            delivery_started: Instant::now(),
+            progress: &progress,
+            owner_wait_announced: false,
+            post_lock_note_printed: false,
+            timings_mode: false,
+            observed_lock: false,
+            engaged_deadline: None,
         };
         state
             .set_key("SKEY", "value")
@@ -5770,6 +6686,7 @@ mod tests {
         let mut config_token = "token".to_string();
         let mut tee_url = tee_url;
         let mut tee_resolve_ip: Option<std::net::IpAddr> = Some(tee_address.ip());
+        let progress = ProgressBar::hidden();
         let mut state = TemplateConfigDeliveryState {
             api: &api,
             tee: &mut tee,
@@ -5779,6 +6696,16 @@ mod tests {
             tee_url: &mut tee_url,
             tee_resolve_ip: &mut tee_resolve_ip,
             terminal_probe_at: None,
+            locked_since: None,
+            password_mode: false,
+            owner_wait_budget: Duration::from_secs(1800),
+            delivery_started: Instant::now(),
+            progress: &progress,
+            owner_wait_announced: false,
+            post_lock_note_printed: false,
+            timings_mode: false,
+            observed_lock: false,
+            engaged_deadline: None,
         };
         assert!(
             state.terminal_bootstrap_stop().await.is_none(),
