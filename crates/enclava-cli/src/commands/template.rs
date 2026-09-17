@@ -1734,7 +1734,7 @@ impl TemplateConfigDeliveryState<'_> {
                         // the write (the stalled attempt is abandoned, not
                         // resumed).
                         self.update_guidance_surface();
-                        tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                        template_config_sleep_until_retry(deadline).await;
                         continue;
                     }
                 },
@@ -1782,7 +1782,7 @@ impl TemplateConfigDeliveryState<'_> {
                     if let Some(message) = self.terminal_bootstrap_stop().await {
                         return Err(message.into());
                     }
-                    tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                    template_config_sleep_until_retry(deadline).await;
                 }
                 Err(error) if should_retry_template_config_tee_error(&error) => {
                     if !self.delivery_continues(attempt) {
@@ -1792,7 +1792,7 @@ impl TemplateConfigDeliveryState<'_> {
                     if let Some(message) = self.terminal_bootstrap_stop().await {
                         return Err(message.into());
                     }
-                    tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                    template_config_sleep_until_retry(deadline).await;
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -1844,7 +1844,7 @@ async fn attest_template_config_tee_with_retry(
                         return Err(error.into());
                     }
                 }
-                tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                template_config_sleep_until_retry(deadline).await;
             }
             Err(error) => return Err(error.into()),
         }
@@ -1886,7 +1886,7 @@ async fn sync_template_config_key_with_retry(
                 if should_retry_template_config_sync_error(&error)
                     && template_config_nested_retry_continues(attempt, deadline) =>
             {
-                tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                template_config_sleep_until_retry(deadline).await;
             }
             Err(error) => return Err(error.into()),
         }
@@ -2039,7 +2039,7 @@ async fn refresh_template_config_token_with_retry(
                 if should_retry_template_config_sync_error(&error)
                     && template_config_nested_retry_continues(attempt, deadline) =>
             {
-                tokio::time::sleep(template_config_delivery_retry_delay()).await;
+                template_config_sleep_until_retry(deadline).await;
             }
             Err(error) => {
                 return Err(format!(
@@ -2063,6 +2063,18 @@ fn refreshed_template_config_endpoint_url(
 
 fn template_config_delivery_retry_delay() -> Duration {
     Duration::from_secs(TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS)
+}
+
+/// Pace a retry sleep, never past a supplied deadline: a retry admitted
+/// just before the deadline must not sleep the full delay beyond the
+/// remaining budget before the next iteration can observe expiry.
+async fn template_config_sleep_until_retry(deadline: Option<Instant>) {
+    let delay = match deadline {
+        Some(deadline) => template_config_delivery_retry_delay()
+            .min(deadline.saturating_duration_since(Instant::now())),
+        None => template_config_delivery_retry_delay(),
+    };
+    tokio::time::sleep(delay).await;
 }
 
 fn should_refresh_template_config_token(error: &TeeError) -> bool {
