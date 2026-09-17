@@ -80,8 +80,6 @@ pub struct ApplyConfig {
     pub rollout_timeout: Duration,
     /// Polling interval for rollout status checks.
     pub poll_interval: Duration,
-    /// Timeout for the teardown proxy HTTP call during cleanup.
-    pub teardown_proxy_timeout: Duration,
     /// Timeout for waiting on PVC deletion during cleanup.
     pub pvc_delete_timeout: Duration,
     /// Timeout for waiting on namespace deletion during cleanup.
@@ -94,7 +92,6 @@ impl Default for ApplyConfig {
             field_manager: "enclava-platform".to_string(),
             rollout_timeout: Duration::from_secs(600),
             poll_interval: Duration::from_secs(5),
-            teardown_proxy_timeout: Duration::from_secs(30),
             pvc_delete_timeout: Duration::from_secs(120),
             namespace_delete_timeout: Duration::from_secs(120),
         }

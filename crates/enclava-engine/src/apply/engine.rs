@@ -58,9 +58,6 @@ pub enum ApplyError {
     #[error("cleanup step '{step}' failed: {detail}")]
     CleanupStepFailed { step: String, detail: String },
 
-    #[error("teardown proxy notification failed: {0}")]
-    TeardownProxyFailed(String),
-
     #[error("manifest generation error: {0}")]
     ManifestGeneration(String),
 
@@ -88,7 +85,6 @@ impl ApplyError {
             Self::RolloutTimeout(_, _) => "rollout_timeout",
             Self::RolloutFailed(_) => "rollout_failed",
             Self::CleanupStepFailed { .. } => "cleanup_failed",
-            Self::TeardownProxyFailed(_) => "teardown_proxy_failed",
             Self::ManifestGeneration(_) => "manifest_generation_error",
             Self::Serialization(_) => "serialization_error",
         }

@@ -1411,6 +1411,10 @@ pub(crate) async fn delete_app_before(
                     WHEN status = 'deleting'::app_status_enum THEN workload_teardown_required
                     ELSE $2
                 END,
+                workload_teardown_completed_at = CASE
+                    WHEN status = 'deleting'::app_status_enum THEN workload_teardown_completed_at
+                    ELSE NULL
+                END,
                 updated_at = clock_timestamp()
           WHERE id = $1",
     )
@@ -1577,16 +1581,32 @@ pub(crate) async fn delete_app_before(
                 Json(serde_json::json!({"error": "database error"})),
             )
         })?;
-    let app_backend =
-        crate::edge::backend_name_for(&org_slug, &deleting_app.name, crate::edge::BackendTag::App)
-            .map_err(|error| {
-                app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeBackend, error)
-            })?;
-    let tee_backend =
-        crate::edge::backend_name_for(&org_slug, &deleting_app.name, crate::edge::BackendTag::Tee)
-            .map_err(|error| {
-                app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeBackend, error)
-            })?;
+    let (app_backend, tee_backend) = match (
+        crate::edge::backend_name_for(&org_slug, &deleting_app.name, crate::edge::BackendTag::App),
+        crate::edge::backend_name_for(&org_slug, &deleting_app.name, crate::edge::BackendTag::Tee),
+    ) {
+        (Ok(app_backend), Ok(tee_backend)) => (app_backend, tee_backend),
+        (Err(error), _) | (_, Err(error)) => {
+            // Pure in-process name computation: no provider state was touched
+            // beyond the reconcile-idempotent KBS revocation enqueue, and
+            // teardown already completed (the marker lets the retry skip it).
+            // Release the shared fences in the held lane transaction instead
+            // of abandoning them through reclaim quarantine.
+            delete_mutation
+                .finish_in_tx(&mut delete_lane)
+                .await
+                .map_err(|_| internal_server_error())?;
+            delete_lane
+                .commit()
+                .await
+                .map_err(|_| internal_server_error())?;
+            return Err(app_delete_failure(
+                deleting_app.id,
+                AppDeleteFailure::EdgeBackend,
+                error,
+            ));
+        }
+    };
     let mut routes_to_remove: Vec<(String, String)> =
         vec![(app_backend.clone(), deleting_app.domain.clone())];
     if let Some(t) = deleting_app.tee_domain.as_deref() {

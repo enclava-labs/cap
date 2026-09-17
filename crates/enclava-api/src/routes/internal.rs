@@ -9181,6 +9181,9 @@ mod tests {
         state.tee_http_client = reqwest::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_millis(10))
+            // The per-request teardown timeout overrides the client timeout,
+            // so bound the connect/DNS phase explicitly against resolver stalls.
+            .connect_timeout(std::time::Duration::from_millis(500))
             .build()
             .unwrap();
         for table in ["kbs_owner_bindings", "kbs_tls_bindings"] {
@@ -9443,6 +9446,9 @@ mod tests {
         state.tee_http_client = reqwest::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_millis(10))
+            // The per-request teardown timeout overrides the client timeout,
+            // so bound the connect/DNS phase explicitly against resolver stalls.
+            .connect_timeout(std::time::Duration::from_millis(500))
             .build()
             .unwrap();
         for table in ["kbs_owner_bindings", "kbs_tls_bindings"] {

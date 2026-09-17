@@ -85,6 +85,9 @@ fn unreachable_tee_state() -> crate::state::AppState {
     state.tee_http_client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_millis(200))
+        // The per-request teardown timeout overrides the client timeout, so
+        // bound the connect/DNS phase explicitly against resolver stalls.
+        .connect_timeout(Duration::from_millis(500))
         .build()
         .unwrap();
     state
@@ -384,6 +387,9 @@ async fn unreachable_running_workload_teardown_blocks_deletion_and_diagnostics_a
     state.tee_http_client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_millis(200))
+        // The per-request teardown timeout overrides the client timeout, so
+        // bound the connect/DNS phase explicitly against resolver stalls.
+        .connect_timeout(Duration::from_millis(500))
         .build()
         .unwrap();
     let auth = crate::test_support::auth_context(Role::Admin, &["apps:write"]);

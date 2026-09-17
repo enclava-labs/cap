@@ -983,6 +983,10 @@ pub struct ApiErrorBody {
     pub message: Option<String>,
     pub detail: Option<String>,
     pub reason: Option<String>,
+    /// Fixed, CAP-authored deferral cause (e.g. a locked confidential
+    /// workload blocking app delete). Never tenant-controlled data.
+    #[serde(default)]
+    pub cause: Option<String>,
 }
 
 #[cfg(test)]
