@@ -1414,13 +1414,17 @@ async fn deliver_template_config_with_retry(
         owner_wait_budget: target.owner_wait_budget,
         delivery_started: Instant::now(),
         progress: target.progress,
+        owner_wait_announced: false,
+        post_lock_note_printed: false,
     };
     for (index, (key, value)) in pairs.iter().enumerate() {
         if let Err(error) = delivery.set_key(key, value).await {
+            let owner_blocked = delivery.owner_wait_engaged_now();
             return Err(undelivered_template_config_error(
                 target.instance_name,
                 &pairs[index..],
                 error.as_ref(),
+                owner_blocked,
             )
             .into());
         }
@@ -1432,20 +1436,34 @@ async fn deliver_template_config_with_retry(
 /// Name every key the terminal failure abandons, with the recovery path.
 /// The deployment itself keeps running on the previous config, so the
 /// operator must know exactly what did not land and how to re-deliver it.
+/// The unlock prescription is reserved for an owner-blocked (persistent
+/// password-mode lock) failure; other causes get the plain re-delivery path
+/// so the reported error stays the actionable signal.
 fn undelivered_template_config_error(
     instance_name: &str,
     undelivered: &[(&'static str, String)],
     source: &(dyn std::error::Error + '_),
+    owner_blocked: bool,
 ) -> String {
     let keys = undelivered
         .iter()
         .map(|(key, _)| *key)
         .collect::<Vec<_>>()
         .join(", ");
+    let recovery = if owner_blocked {
+        format!(
+            "Unlock the TEE (`enclava unlock --app {instance_name}`), then re-deliver with \
+             `enclava config set --app {instance_name} <KEY>=<VALUE>`."
+        )
+    } else {
+        format!(
+            "Once the reported cause is resolved, re-deliver with \
+             `enclava config set --app {instance_name} <KEY>=<VALUE>`."
+        )
+    };
     format!(
         "customer config NOT delivered: {keys}. The deployment continues with the previous \
-         config. Unlock the TEE (`enclava unlock --app {instance_name}`), then re-deliver with \
-         `enclava config set <KEY> <value>`. {CONFIG_APPLICATION_NOTE} Last error: {source}"
+         config. {recovery} {CONFIG_APPLICATION_NOTE} Last error: {source}"
     )
 }
 
@@ -1467,6 +1485,8 @@ struct TemplateConfigDeliveryState<'a> {
     owner_wait_budget: Duration,
     delivery_started: Instant,
     progress: &'a ProgressBar,
+    owner_wait_announced: bool,
+    post_lock_note_printed: bool,
 }
 
 impl TemplateConfigDeliveryState<'_> {
@@ -1501,6 +1521,10 @@ impl TemplateConfigDeliveryState<'_> {
         template_config_owner_wait_engaged(self.password_mode, self.locked_since, now)
     }
 
+    fn owner_wait_engaged_now(&self) -> bool {
+        self.owner_wait_engaged(Instant::now())
+    }
+
     /// The delivery keeps retrying through the default attempt budget, and
     /// beyond it only while the owner-wait is engaged and its budget lasts.
     fn delivery_continues(&self, attempt: usize) -> bool {
@@ -1514,23 +1538,50 @@ impl TemplateConfigDeliveryState<'_> {
     /// Track locked persistence, and while the owner-wait is engaged keep a
     /// clocked guidance message on the progress bar (the same elapsed/total
     /// format every other wait phase renders — a silent retry loop is
-    /// indistinguishable from an instant failure).
+    /// indistinguishable from an instant failure). Hidden bars (`--json`,
+    /// `--timings`) never render `set_message`, so the engagement is also
+    /// announced once on stderr: the operator action must stay visible in
+    /// non-interactive modes too.
     fn note_delivery_error(&mut self, error: &TeeError) {
         self.locked_since = template_config_next_locked_since(
             error,
             self.locked_since,
             self.owner_wait_engaged(Instant::now()),
         );
-        if self.owner_wait_engaged(Instant::now()) {
-            let label = format!(
-                "Customer config: TEE locked (password mode) — run `enclava unlock --app {}`",
-                self.instance_name
-            );
-            self.progress.set_message(timed_progress(
-                &label,
-                self.delivery_started.elapsed(),
-                self.owner_wait_budget,
-            ));
+        if !self.owner_wait_engaged(Instant::now()) {
+            return;
+        }
+        let label = format!(
+            "Customer config: TEE locked (password mode) — run `enclava unlock --app {}`",
+            self.instance_name
+        );
+        self.progress.set_message(timed_progress(
+            &label,
+            self.delivery_started.elapsed(),
+            self.owner_wait_budget,
+        ));
+        if !self.owner_wait_announced && self.progress.is_hidden() {
+            self.owner_wait_announced = true;
+            eprintln!("{label} — config delivery continues automatically.");
+        }
+    }
+
+    /// A write that succeeds after any `423 locked` observation may have
+    /// missed the workload's boot: the operator's unlock starts the
+    /// workload, and container creation races this delivery. The delivered
+    /// value is guaranteed only from the NEXT boot, so say so once on the
+    /// same channels as the guidance (hidden bars never render `println`).
+    fn report_post_lock_delivery(&mut self) {
+        if self.locked_since.is_none() || self.post_lock_note_printed {
+            return;
+        }
+        self.post_lock_note_printed = true;
+        let note =
+            format!("Config delivered while the TEE was unlocking: {CONFIG_APPLICATION_NOTE}");
+        if self.progress.is_hidden() {
+            eprintln!("{note}");
+        } else {
+            self.progress.println(note);
         }
     }
 
@@ -1539,7 +1590,10 @@ impl TemplateConfigDeliveryState<'_> {
         loop {
             attempt += 1;
             match self.tee.config_set(key, value, self.config_token).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.report_post_lock_delivery();
+                    return Ok(());
+                }
                 Err(error) if should_refresh_template_config_token(&error) => {
                     if !self.delivery_continues(attempt) {
                         return Err(error.into());
@@ -5660,16 +5714,27 @@ mod tests {
             message: "{\"error\":\"locked\"}".to_string(),
         };
 
-        let message = undelivered_template_config_error("shell", &pairs[..], &source);
+        // Owner-blocked failure: prescribe the unlock, then a re-delivery
+        // command that actually parses (`config set` takes KEY=VALUE pairs
+        // and must be pointed at the hosted app — there is no local
+        // enclava.toml to default from).
+        let message = undelivered_template_config_error("shell", &pairs[..], &source, true);
 
         assert!(message.contains("NOT delivered: DEBIAN_SSH_AUTHORIZED_KEYS, EXTRA_FLAG"));
         assert!(message.contains("enclava unlock --app shell"));
-        assert!(message.contains("enclava config set <KEY> <value>"));
+        assert!(message.contains("enclava config set --app shell <KEY>=<VALUE>"));
         assert!(message.contains(CONFIG_APPLICATION_NOTE));
         assert!(message.contains("Last error: TEE error (423)"));
         assert!(message.contains("continues with the previous config"));
 
-        let from_second_key = undelivered_template_config_error("shell", &pairs[1..], &source);
+        // Other failures keep the reported error as the actionable signal —
+        // no unlock prescription.
+        let generic = undelivered_template_config_error("shell", &pairs[..], &source, false);
+        assert!(generic.contains("enclava config set --app shell <KEY>=<VALUE>"));
+        assert!(!generic.contains("Unlock the TEE"));
+
+        let from_second_key =
+            undelivered_template_config_error("shell", &pairs[1..], &source, true);
         assert!(from_second_key.contains("EXTRA_FLAG"));
         assert!(!from_second_key.contains("DEBIAN_SSH_AUTHORIZED_KEYS"));
     }
@@ -5717,6 +5782,22 @@ mod tests {
             source.contains("enclava unlock --app {}"),
             "the guidance message must name the unlock command"
         );
+        let note_fn = source
+            .find("fn note_delivery_error")
+            .expect("note_delivery_error exists");
+        let note_body = &source[note_fn..note_fn + 2000];
+        assert!(
+            note_body.contains("is_hidden()"),
+            "hidden bars (--json/--timings) never render set_message: the \
+             operator action must also reach stderr"
+        );
+        let set_key_fn = source.find("async fn set_key").expect("set_key exists");
+        let set_key_body = &source[set_key_fn..set_key_fn + 4000];
+        assert!(
+            set_key_body.contains("report_post_lock_delivery"),
+            "a write that lands after an unlock may have missed the workload's \
+             boot and must say so"
+        );
         let deliver_fn = source
             .split_once("async fn deliver_template_config_with_retry")
             .unwrap()
@@ -5727,6 +5808,10 @@ mod tests {
         assert!(
             deliver_fn.contains("undelivered_template_config_error"),
             "a terminal delivery failure must name the abandoned keys"
+        );
+        assert!(
+            deliver_fn.contains("owner_wait_engaged_now()"),
+            "the unlock prescription must be reserved for owner-blocked failures"
         );
     }
 
@@ -6071,6 +6156,8 @@ mod tests {
             owner_wait_budget: Duration::from_secs(1800),
             delivery_started: Instant::now(),
             progress: &progress,
+            owner_wait_announced: false,
+            post_lock_note_printed: false,
         };
         state
             .set_key("SKEY", "value")
@@ -6152,6 +6239,8 @@ mod tests {
             owner_wait_budget: Duration::from_secs(1800),
             delivery_started: Instant::now(),
             progress: &progress,
+            owner_wait_announced: false,
+            post_lock_note_printed: false,
         };
         assert!(
             state.terminal_bootstrap_stop().await.is_none(),
