@@ -88,7 +88,9 @@ jobs:
           file: ./crates/enclava-init/Dockerfile
           push: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.enclava.build-profile=${{ steps.build_profile.outputs.profile }}
           build-args: |
             BUILD_PROFILE=${{ steps.build_profile.outputs.profile }}
           cache-from: type=gha

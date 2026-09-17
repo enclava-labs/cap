@@ -67,22 +67,33 @@ mod tests {
     }
 
     #[test]
-    fn cli_dockerfile_uses_locked_release_build() {
-        let dockerfile = include_str!("../../enclava-cli/Dockerfile").replace("\r\n", "\n");
-        let cargo_build_lines: Vec<&str> = dockerfile
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.contains("cargo build"))
-            .collect();
-        assert!(
-            !cargo_build_lines.is_empty(),
-            "CLI Dockerfile must contain cargo build lines"
-        );
-        for line in cargo_build_lines {
+    fn all_crates_dockerfiles_use_locked_builds() {
+        let dockerfiles = [
+            ("enclava-init", include_str!("../Dockerfile")),
+            ("enclava-cli", include_str!("../../enclava-cli/Dockerfile")),
+            ("enclava-api", include_str!("../../enclava-api/Dockerfile")),
+            (
+                "enclava-appraiser",
+                include_str!("../../enclava-appraiser/Dockerfile"),
+            ),
+        ];
+        for (name, raw) in dockerfiles {
+            let dockerfile = raw.replace("\r\n", "\n");
+            let cargo_build_lines: Vec<&str> = dockerfile
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.contains("cargo build"))
+                .collect();
             assert!(
-                line.contains("--locked"),
-                "cargo build in CLI Dockerfile must use --locked: {line}"
+                !cargo_build_lines.is_empty(),
+                "{name} Dockerfile must contain cargo build lines"
             );
+            for line in cargo_build_lines {
+                assert!(
+                    line.contains("--locked"),
+                    "cargo build in {name} Dockerfile must use --locked: {line}"
+                );
+            }
         }
     }
 
@@ -113,6 +124,24 @@ mod tests {
         );
     }
 
+    #[cfg(all(debug_assertions, not(feature = "prod-strict")))]
+    #[test]
+    fn dev_builds_honor_dev_no_luks_env() {
+        let previous = std::env::var("ENCLAVA_INIT_DEV_NO_LUKS").ok();
+        unsafe {
+            std::env::set_var("ENCLAVA_INIT_DEV_NO_LUKS", "1");
+        }
+        let skipped = super::dev_no_luks_override();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("ENCLAVA_INIT_DEV_NO_LUKS", value) },
+            None => unsafe { std::env::remove_var("ENCLAVA_INIT_DEV_NO_LUKS") },
+        }
+        assert!(
+            skipped,
+            "debug builds without prod-strict must honor ENCLAVA_INIT_DEV_NO_LUKS"
+        );
+    }
+
     #[test]
     fn init_image_workflow_never_pushes_debug_images() {
         let workflow =
@@ -139,5 +168,35 @@ mod tests {
                 "main branch pushes must not select debug BUILD_PROFILE"
             );
         }
+
+        // Pull-request (debug) builds must never be pushed or signed: the
+        // `push:` expression and every push-gated `if:` condition exclude
+        // pull_request events.
+        let push_expr = workflow
+            .split("push: ${{")
+            .nth(1)
+            .expect("Build and push step push expression")
+            .split("}}")
+            .next()
+            .expect("push expression end");
+        assert!(
+            !push_expr.contains("pull_request"),
+            "Build and push must never push pull_request builds: push: ${{{push_expr}}}"
+        );
+        for cond in workflow
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("if: ") && line.contains("workflow_dispatch"))
+        {
+            assert!(
+                !cond.contains("pull_request"),
+                "push/sign gating must exclude pull_request events: {cond}"
+            );
+        }
+
+        assert!(
+            workflow.contains("org.enclava.build-profile="),
+            "pushed images must carry an org.enclava.build-profile label so verifiers can reject debug digests"
+        );
     }
 }
