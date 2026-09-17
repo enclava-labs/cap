@@ -101,6 +101,10 @@ mod tests {
                     line.contains("--locked"),
                     "cargo build/run/install in {name} Dockerfile must use --locked: {line}"
                 );
+                assert!(
+                    line.matches("cargo build").count() <= line.matches("--locked").count(),
+                    "every cargo build on a chained RUN line needs its own --locked: {line}"
+                );
             }
         }
     }
@@ -115,6 +119,19 @@ mod tests {
         assert!(
             source.contains("std::env::var(\"ENCLAVA_INIT_DEV_NO_LUKS\")"),
             "dev_no_luks_override must read the ENCLAVA_INIT_DEV_NO_LUKS env var"
+        );
+        let wrapper_body = source
+            .split("pub fn dev_no_luks_override() -> bool {")
+            .nth(1)
+            .expect("dev_no_luks_override definition")
+            .split('}')
+            .next()
+            .expect("dev_no_luks_override body")
+            .trim();
+        assert_eq!(
+            wrapper_body,
+            "dev_no_luks_override_for(std::env::var(\"ENCLAVA_INIT_DEV_NO_LUKS\").ok().as_deref())",
+            "dev_no_luks_override must only delegate to dev_no_luks_override_for"
         );
     }
 
@@ -204,6 +221,10 @@ mod tests {
             workflow.match_indices("\n          push:").count(),
             1,
             "exactly one push property is allowed (expression or literal), and it must be the gated one"
+        );
+        assert!(
+            !workflow.contains("outputs:"),
+            "registry outputs bypass the push gate; only the gated push: property may publish"
         );
         assert!(
             workflow.contains("BUILD_PROFILE=${{ steps.build_profile.outputs.profile }}"),
