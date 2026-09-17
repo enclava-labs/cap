@@ -563,22 +563,13 @@ async fn deploy_with_timings(
     let tee_url = template_config_endpoint_url(tee_url)?;
     let mut tee_resolve_ip = token.tee_resolve_ip;
     let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
-    // Aggregate deadline for the initial attestation: the nominal delivery
-    // window (sleep budget plus one in-flight attempt). A silently
-    // unreachable endpoint whose connect attempts each burn the full TCP
-    // timeout must not outlive the phase's documented window just because
-    // every attempt is slow (the timeout variant is retryable, so without
-    // this cap the loop could stretch to ~24 minutes).
-    let attest_deadline = Instant::now()
-        + Duration::from_secs(
-            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS.saturating_sub(1) as u64
-                * TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS
-                + 10,
-        );
+    // No aggregate deadline here: the slow-connect attempt cap inside the
+    // retry loop bounds the unreachable-endpoint case without reducing the
+    // 121-attempt coverage fast-failure rollouts rely on.
     let mut tee = timings
         .run(
             DeployPhase::CustomerConfigAttestation,
-            attest_template_config_tee_with_retry(tee, Some(attest_deadline)),
+            attest_template_config_tee_with_retry(tee, None),
         )
         .await?;
     let mut tee_url = tee_url;
@@ -1805,6 +1796,7 @@ async fn attest_template_config_tee_with_retry(
     deadline: Option<Instant>,
 ) -> Result<TeeClient, Box<dyn std::error::Error>> {
     let mut attempt = 0usize;
+    let mut slow_connect_attempts = 0usize;
     loop {
         attempt += 1;
         // The deadline bounds the in-flight attestation too, not just
@@ -1819,7 +1811,10 @@ async fn attest_template_config_tee_with_retry(
             {
                 Ok(result) => result,
                 Err(_elapsed) => {
-                    return Err(OWNER_WAIT_DEADLINE_EXCEEDED.into());
+                    return Err(
+                        "customer-config attestation deadline reached with the request still in flight"
+                            .into(),
+                    );
                 }
             },
             None => attest.await,
@@ -1830,6 +1825,16 @@ async fn attest_template_config_tee_with_retry(
                 if should_retry_template_config_tee_error(&error)
                     && template_config_nested_retry_continues(attempt, deadline) =>
             {
+                // Slow connect attempts have their own, smaller budget so a
+                // silently unreachable endpoint cannot stretch the loop past
+                // the nominal window; fast-failure classes keep the full
+                // attempt budget.
+                if is_slow_template_config_attest_attempt(&error) {
+                    slow_connect_attempts += 1;
+                    if slow_connect_attempts >= TEMPLATE_CONFIG_SLOW_CONNECT_ATTEMPT_CAP {
+                        return Err(error.into());
+                    }
+                }
                 tokio::time::sleep(template_config_delivery_retry_delay()).await;
             }
             Err(error) => return Err(error.into()),
@@ -2064,6 +2069,22 @@ fn should_retry_template_config_tee_error(error: &TeeError) -> bool {
         TeeError::Attestation(message) => is_transient_template_config_attestation_error(message),
         TeeError::InvalidHeader(_) => false,
     }
+}
+
+/// Cap for attempts whose connect burns the full TCP timeout (10s each):
+/// 20 attempts x (10s + 2s sleep) spans the nominal delivery window, so the
+/// retryable timeout class cannot stretch an unreachable endpoint past the
+/// phase's documented budget. Fast-failure classes keep the full 121-attempt
+/// budget.
+const TEMPLATE_CONFIG_SLOW_CONNECT_ATTEMPT_CAP: usize = 20;
+
+/// The one slow class among the retryable attestation failures: an exact TCP
+/// connect timeout (its io-error sibling usually fails fast).
+fn is_slow_template_config_attest_attempt(error: &TeeError) -> bool {
+    matches!(
+        error,
+        TeeError::Attestation(message) if message == "TEE TCP connect timed out"
+    )
 }
 
 fn is_transient_template_config_attestation_error(message: &str) -> bool {
@@ -6140,6 +6161,35 @@ mod tests {
             "a sync failure after a successful TEE write is a distinct failure \
              class and must be distinguishable from an undelivered value"
         );
+    }
+
+    #[test]
+    fn template_config_slow_connect_class_and_cap() {
+        assert!(is_slow_template_config_attest_attempt(
+            &TeeError::Attestation("TEE TCP connect timed out".to_string())
+        ));
+        // Fast-failure classes are not slow attempts.
+        for message in [
+            "TEE TCP connect failed: Connection refused",
+            "TEE TLS handshake timed out",
+            "TEE did not present a certificate",
+        ] {
+            assert!(!is_slow_template_config_attest_attempt(
+                &TeeError::Attestation(message.to_string())
+            ));
+        }
+        assert!(!is_slow_template_config_attest_attempt(&TeeError::Tee {
+            status: 423,
+            message: "{\"error\":\"locked\"}".to_string(),
+        }));
+        // The slow cap spans, but does not exceed, the nominal delivery
+        // window (sleep budget plus one in-flight attempt).
+        let slow_worst_case = TEMPLATE_CONFIG_SLOW_CONNECT_ATTEMPT_CAP as u64
+            * (10 + TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS);
+        let nominal_window = TEMPLATE_CONFIG_DELIVERY_ATTEMPTS.saturating_sub(1) as u64
+            * TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS
+            + 10;
+        assert!(slow_worst_case <= nominal_window);
     }
 
     #[test]
