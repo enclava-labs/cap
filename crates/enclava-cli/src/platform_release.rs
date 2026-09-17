@@ -259,7 +259,17 @@ pub fn verify_envelope(
     #[cfg(not(test))]
     let configured_root = option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
         .ok_or(PlatformReleaseError::MissingRootPubkey)?;
-    let pinned = hex32("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX", configured_root)?;
+    verify_envelope_with_root(envelope, configured_root)
+}
+
+/// Root-pinning variant used by the release ceremony helper
+/// (`examples/platform-release.rs`), which takes the root as an argument
+/// instead of a compile-time `option_env!`.
+pub fn verify_envelope_with_root(
+    envelope: PlatformReleaseEnvelope,
+    root_hex: &str,
+) -> Result<PlatformRelease, PlatformReleaseError> {
+    let pinned = hex32("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX", root_hex)?;
     let signing = hex32("signing_pubkey", &envelope.signing_pubkey)?;
     if signing != pinned {
         return Err(PlatformReleaseError::RootMismatch);
@@ -369,6 +379,57 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             field: "schema_version",
             message: "expected v1".to_string(),
         });
+    }
+    // Match the API's payload validation exactly: a release the API would
+    // refuse at startup must never pass the CLI-side publish gates.
+    let signing_url = reqwest::Url::parse(&release.signing_service_url).map_err(|err| {
+        PlatformReleaseError::InvalidField {
+            field: "signing_service_url",
+            message: err.to_string(),
+        }
+    })?;
+    if !matches!(signing_url.scheme(), "http" | "https") {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "signing_service_url",
+            message: "scheme must be http or https".to_string(),
+        });
+    }
+    // The signing-service bearer token must not transit cleartext
+    // off-cluster; reject at release-validation time so the failure names the
+    // signed field.
+    if signing_url.scheme() == "http"
+        && !enclava_common::hostnames::plain_http_host_allowed(signing_url.host_str())
+    {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "signing_service_url",
+            message: "http scheme is only allowed for loopback/cluster-internal hosts".to_string(),
+        });
+    }
+    hex32(
+        "signing_service_pubkey_hex",
+        &release.signing_service_pubkey_hex,
+    )?;
+    hex32("policy_template_sha256", &release.policy_template_sha256)?;
+    hex32(
+        "expected_firmware_measurement",
+        &release.expected_firmware_measurement,
+    )?;
+    for (field, image) in [
+        ("attestation_proxy_image", &release.attestation_proxy_image),
+        ("caddy_ingress_image", &release.caddy_ingress_image),
+    ] {
+        let parsed = enclava_common::image::ImageRef::parse(image).map_err(|err| {
+            PlatformReleaseError::InvalidField {
+                field,
+                message: err.to_string(),
+            }
+        })?;
+        parsed
+            .require_digest()
+            .map_err(|err| PlatformReleaseError::InvalidField {
+                field,
+                message: err.to_string(),
+            })?;
     }
     let kbs_url = reqwest::Url::parse(&release.trustee_kbs_url).map_err(|err| {
         PlatformReleaseError::InvalidField {
@@ -607,6 +668,9 @@ mod tests {
         );
         assert!(dockerfile.contains("bash scripts/require-platform-release-root.sh"));
         assert!(dockerfile.contains("COPY scripts/require-platform-release-root.sh"));
+        // The Dockerfile itself must verify the envelope signature, not just
+        // compare pubkeys.
+        assert!(dockerfile.contains("--example platform-release -- verify"));
     }
 
     #[test]
@@ -649,6 +713,20 @@ mod tests {
                 .count(),
             4
         );
+        // The gate is satisfiable only by supplying a matching production
+        // envelope: the secret is materialized over the bundled envelope in
+        // the gate job and every build job, and the gate job verifies the
+        // full signature before anything builds.
+        assert!(workflow.contains(
+            "ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON }}"
+        ));
+        assert_eq!(
+            workflow
+                .matches("printf '%s' \"$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON\" > crates/enclava-cli/platform-release.json")
+                .count(),
+            4
+        );
+        assert!(workflow.contains("--example platform-release -- verify"));
     }
 
     #[test]
@@ -686,6 +764,23 @@ mod tests {
     }
 
     #[test]
+    fn verify_envelope_with_root_pins_the_supplied_root() {
+        // The ceremony helper passes the root at runtime; it must accept the
+        // bundled fixture envelope against the fixture root and reject any
+        // other root with RootMismatch, exactly like the compile-time pin.
+        let envelope: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        verify_envelope_with_root(envelope.clone(), TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX).unwrap();
+        assert!(matches!(
+            verify_envelope_with_root(
+                envelope,
+                "0000000000000000000000000000000000000000000000000000000000000001"
+            ),
+            Err(PlatformReleaseError::RootMismatch)
+        ));
+    }
+
+    #[test]
     fn tampering_breaks_signature() {
         let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
         let mut tampered = raw.clone();
@@ -717,6 +812,38 @@ mod tests {
         assert!(release_is_older(&divergent_version, &bundled.payload).unwrap());
 
         assert!(!release_is_older(&bundled.payload, &bundled.payload).unwrap());
+    }
+
+    #[test]
+    fn release_payload_rejects_tag_only_sidecar_image() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.attestation_proxy_image = "ghcr.io/enclava-labs/attestation-proxy:latest".into();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "attestation_proxy_image")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_off_cluster_http_signing_service_url() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.signing_service_url = "http://signing.example.test:8080".into();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "signing_service_url")
+        );
+        // The committed fixture uses a cluster-internal http URL and must
+        // keep validating.
+        validate_release_payload(
+            &serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
     }
 
     #[test]

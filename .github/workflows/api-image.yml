@@ -18,6 +18,8 @@ on:
       - "crates/enclava-api/**"
       - "crates/enclava-appraiser/**"
       - "crates/enclava-cli/platform-release.json"
+      - "crates/enclava-cli/src/platform_release.rs"
+      - "crates/enclava-cli/examples/**"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
       - "crates/enclava-verifier/**"
@@ -36,6 +38,8 @@ on:
       - "crates/enclava-api/**"
       - "crates/enclava-appraiser/**"
       - "crates/enclava-cli/platform-release.json"
+      - "crates/enclava-cli/src/platform_release.rs"
+      - "crates/enclava-cli/examples/**"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
       - "crates/enclava-verifier/**"
@@ -158,6 +162,14 @@ jobs:
             type=ref,event=tag
             type=sha,prefix=
             type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
+
+      - name: Materialize production platform-release envelope
+        env:
+          ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON }}
+        run: |
+          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
+            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
+          fi
 
       - name: Require platform-release root
         env:

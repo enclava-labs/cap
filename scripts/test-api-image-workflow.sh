@@ -132,6 +132,7 @@ for required in \
   "ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" \
   "COPY scripts/require-platform-release-root.sh scripts/require-platform-release-root.sh" \
   "bash scripts/require-platform-release-root.sh --allow-dev-fixture" \
+  "--example platform-release -- verify" \
   "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg"; do
   grep -Fq -- "$required" "$DOCKERFILE" \
     || fail "API image Dockerfile is missing: $required"
@@ -162,6 +163,8 @@ grep -Fq -- "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=5b9437adeaffbe8f41b13d96ed
   || fail "PR validation must pass the test-only fixture as an explicit build-arg"
 grep -Fq -- "secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" <<<"$publish_block" \
   || fail "publisher must pass secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX"
+grep -Fq -- "secrets.ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" <<<"$publish_block" \
+  || fail "publisher must materialize the production envelope from secrets.ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON"
 grep -Fq -- "scripts/require-platform-release-root.sh" <<<"$publish_block" \
   || fail "publisher must run the production platform-release root gate"
 # Every pushed image is a prod-strict release build; the fixture-tolerant
@@ -221,8 +224,8 @@ if env ENCLAVA_PLATFORM_RELEASE_ENVELOPE="$GATE_TMP/envelope.json" \
   >/tmp/platform-release-root-gate.out 2>/tmp/platform-release-root-gate.err; then
   fail "root gate must reject a root that does not match the bundled envelope signing_pubkey"
 fi
-grep -Fq -- "rotate the secret and the envelope together" /tmp/platform-release-root-gate.err \
-  || fail "root gate mismatch error must explain the rotation requirement"
+grep -Fq -- "ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON together" /tmp/platform-release-root-gate.err \
+  || fail "root gate mismatch error must explain the two-secret rotation requirement"
 
 # A matching root/envelope pair passes.
 write_envelope "$prod_key"
@@ -256,6 +259,8 @@ grep -Fq "id-token: write" <<<"$publish_block" \
   && grep -Fq "packages: write" <<<"$publish_block" \
   || fail "publisher must request package and keyless-signing permissions"
 
+assert_order "- name: Materialize production platform-release envelope" "- name: Require platform-release root"
+assert_order "- name: Require platform-release root" "- name: Build and push"
 assert_order "- name: Build and push" "- name: Render digest-pinned release artifact"
 assert_order "- name: Render digest-pinned release artifact" "- name: Install cosign"
 assert_order "- name: Install cosign" "- name: Sign pushed digest"

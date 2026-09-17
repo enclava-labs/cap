@@ -18,6 +18,11 @@ COPY scripts/require-platform-release-root.sh scripts/require-platform-release-r
 # envelope; the fixture root is rejected unconditionally here.
 RUN bash scripts/require-platform-release-root.sh
 
+# The shell gate only compares pubkeys; verify the full envelope signature
+# and payload invariants before the CLI binary is compiled.
+RUN cargo run --locked --release -p enclava-cli --example platform-release -- verify \
+    crates/enclava-cli/platform-release.json "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX"
+
 # Build for musl (static binary); prod-strict makes an invalid, missing, or
 # fixture root a compile error instead of a runtime one.
 RUN cargo build --locked --release --bin enclava --features prod-strict && \

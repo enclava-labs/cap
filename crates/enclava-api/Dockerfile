@@ -55,7 +55,9 @@ ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX
 ENV ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX}
 RUN test -n "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" || (echo "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg" >&2; exit 1)
 
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf bash jq
+# perl+make: the envelope verify step compiles enclava-cli, whose vendored
+# openssl build needs them.
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf bash jq perl make
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -66,6 +68,11 @@ COPY scripts/require-platform-release-root.sh scripts/require-platform-release-r
 # Released images must pin a production root that matches the bundled
 # envelope; the fixture root is rejected unconditionally here.
 RUN bash scripts/require-platform-release-root.sh
+
+# The shell gate only compares pubkeys; verify the full envelope signature
+# and payload invariants before the release binaries are compiled.
+RUN cargo run --locked --release -p enclava-cli --example platform-release -- verify \
+    crates/enclava-cli/platform-release.json "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX"
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
