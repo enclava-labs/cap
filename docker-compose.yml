@@ -19,6 +19,10 @@ services:
     build:
       context: .
       dockerfile: crates/enclava-api/Dockerfile
+      # Dev-only: the debug stage is the one stage allowed to pin the fixture
+      # root, and only while the bundled envelope is fixture-signed. The
+      # release stage runs the strict root gate inside the Dockerfile.
+      target: runtime-debug
       args:
         # Local-compose-only well-known fixture; must never be a Dockerfile default.
         ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd

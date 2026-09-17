@@ -159,36 +159,24 @@ jobs:
             type=sha,prefix=
             type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
 
-      - name: Select build profile
-        id: build_profile
-        env:
-          RELEASE_BUILD: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
-        run: |
-          if [[ "$RELEASE_BUILD" = "true" ]]; then
-            echo "profile=release" >> "$GITHUB_OUTPUT"
-            echo "target=runtime-release" >> "$GITHUB_OUTPUT"
-          else
-            echo "profile=debug" >> "$GITHUB_OUTPUT"
-            echo "target=runtime-debug" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Require platform-release root
         env:
           ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
         run: bash scripts/require-platform-release-root.sh
 
+      # Every pushed image is a prod-strict release build; the debug stage is
+      # reserved for PR validation and local compose.
       - name: Build and push
         id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: ./crates/enclava-api/Dockerfile
-          target: ${{ steps.build_profile.outputs.target }}
+          target: runtime-release
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BUILD_PROFILE=${{ steps.build_profile.outputs.profile }}
             ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

@@ -59,8 +59,8 @@ required_checks:
   - rustup run stable cargo audit --ignore RUSTSEC-2023-0071
   - rustup run stable cargo deny check advisories sources
   - rustup run stable cargo build --workspace
-  - ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=... rustup run stable cargo build --release --bin enclava-api
-  - ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=... rustup run stable cargo build --release --bin enclava
+  - ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=... rustup run stable cargo build --release --bin enclava-api --features prod-strict
+  - ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=... rustup run stable cargo build --release --bin enclava --features prod-strict
   - ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=... rustup run stable cargo build --release -p enclava-init --features prod-strict
   - sudo docker build -f crates/enclava-init/Dockerfile -t enclava-init:local .
   - sudo docker build -f crates/enclava-api/Dockerfile --build-arg ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=... -t enclava-api:local .

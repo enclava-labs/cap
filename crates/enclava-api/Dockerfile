@@ -7,13 +7,18 @@ ENV ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${ENCLAVA_PLATFORM_RELEASE_ROOT_PUB
 RUN test -n "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" || (echo "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg" >&2; exit 1)
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends pkg-config libssl-dev && \
+    apt-get install -y --no-install-recommends pkg-config libssl-dev jq && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY vendor/ vendor/
 COPY crates/ crates/
+COPY scripts/require-platform-release-root.sh scripts/require-platform-release-root.sh
+
+# Debug images may pin the dev fixture root only while the bundled envelope
+# is fixture-signed; the root must still match that envelope.
+RUN bash scripts/require-platform-release-root.sh --allow-dev-fixture
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -50,16 +55,21 @@ ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX
 ENV ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX}
 RUN test -n "$ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX" || (echo "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg" >&2; exit 1)
 
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf
+RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static pkgconf bash jq
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY vendor/ vendor/
 COPY crates/ crates/
+COPY scripts/require-platform-release-root.sh scripts/require-platform-release-root.sh
+
+# Released images must pin a production root that matches the bundled
+# envelope; the fixture root is rejected unconditionally here.
+RUN bash scripts/require-platform-release-root.sh
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    cargo build --locked --release --bin enclava-api --bin cap-migrate && \
+    cargo build --locked --release --bin enclava-api --bin cap-migrate --features prod-strict && \
     cp /build/target/release/enclava-api /usr/local/bin/enclava-api && \
     cp /build/target/release/cap-migrate /usr/local/bin/cap-migrate && \
     strip /usr/local/bin/enclava-api /usr/local/bin/cap-migrate

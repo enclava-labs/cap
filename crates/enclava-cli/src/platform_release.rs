@@ -23,6 +23,8 @@ const FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str =
 const TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str = FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX;
 
 #[cfg(any(test, feature = "prod-strict"))]
+// ponytail: manual compare, u8::eq_ignore_ascii_case is not const at MSRV 1.85
+#[allow(clippy::manual_ignore_case_cmp)]
 const fn eq_ignore_ascii_case(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
@@ -44,13 +46,34 @@ const fn is_forbidden_fixture_root(root: &str) -> bool {
     eq_ignore_ascii_case(root, FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX)
 }
 
+/// 64 ASCII hex characters (either case) = a 32-byte key.
+#[cfg(any(test, feature = "prod-strict"))]
+const fn is_hex32_root(root: &str) -> bool {
+    let bytes = root.as_bytes();
+    if bytes.len() != 64 {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i].to_ascii_lowercase();
+        if !(c.is_ascii_digit() || (c >= b'a' && c <= b'f')) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 #[cfg(all(not(test), feature = "prod-strict"))]
 const _: () = {
     match option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX") {
         Some(root) if is_forbidden_fixture_root(root) => {
             panic!("prod-strict builds must not pin the committed fixture platform-release root");
         }
-        _ => {}
+        Some(root) if is_hex32_root(root) => {}
+        _ => panic!(
+            "prod-strict builds require ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX to be set to a 32-byte hex pubkey"
+        ),
     }
 };
 
@@ -578,7 +601,12 @@ mod tests {
                 "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg"
             )
         );
-        assert!(dockerfile.contains("cargo build --locked --release --bin enclava"));
+        assert!(
+            dockerfile
+                .contains("cargo build --locked --release --bin enclava --features prod-strict")
+        );
+        assert!(dockerfile.contains("bash scripts/require-platform-release-root.sh"));
+        assert!(dockerfile.contains("COPY scripts/require-platform-release-root.sh"));
     }
 
     #[test]
@@ -606,6 +634,21 @@ mod tests {
                 .count(),
             1
         );
+        // Every published CLI binary is a prod-strict build, so an invalid,
+        // missing, or fixture root fails at compile time, and no job builds
+        // artifacts before the root gate has passed.
+        assert_eq!(
+            workflow
+                .matches("--bin enclava --features prod-strict")
+                .count(),
+            3
+        );
+        assert_eq!(
+            workflow
+                .matches("needs: require-platform-release-root")
+                .count(),
+            4
+        );
     }
 
     #[test]
@@ -622,11 +665,23 @@ mod tests {
     }
 
     #[test]
-    fn prod_strict_source_rejects_fixture_root_at_compile_time() {
-        let src = include_str!("platform_release.rs");
-        assert!(src.contains(r#"cfg(all(not(test), feature = "prod-strict"))"#));
-        assert!(src.contains(
-            "prod-strict builds must not pin the committed fixture platform-release root"
+    fn hex32_root_shape_is_validated() {
+        assert!(is_hex32_root(
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        ));
+        // Uppercase hex is still a valid key (hex::decode accepts it).
+        assert!(is_hex32_root(
+            "000000000000000000000000000000000000000000000000000000000000000A"
+        ));
+        assert!(!is_hex32_root(""));
+        assert!(!is_hex32_root(
+            "000000000000000000000000000000000000000000000000000000000000001"
+        ));
+        assert!(!is_hex32_root(
+            "00000000000000000000000000000000000000000000000000000000000000010"
+        ));
+        assert!(!is_hex32_root(
+            "zzzz000000000000000000000000000000000000000000000000000000000001"
         ));
     }
 

@@ -44,7 +44,7 @@ jobs:
 
       - name: Build binary
         run: |
-          cargo build --release --bin enclava --target ${{ matrix.target }}
+          cargo build --release --bin enclava --features prod-strict --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
@@ -71,7 +71,7 @@ jobs:
       # crt-static: link the MSVC runtime statically so the artifact runs on
       # machines without the Visual C++ redistributable.
       - name: Build binary
-        run: cargo build --release --bin enclava --target x86_64-pc-windows-msvc
+        run: cargo build --release --bin enclava --features prod-strict --target x86_64-pc-windows-msvc
         env:
           RUSTFLAGS: -C target-feature=+crt-static
 
@@ -109,7 +109,7 @@ jobs:
 
       - name: Build binary
         run: |
-          cargo build --release --bin enclava --target ${{ matrix.target }}
+          cargo build --release --bin enclava --features prod-strict --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
@@ -124,6 +124,7 @@ jobs:
 
   build-web-verifier:
     name: Build local HTML/WASM verifier
+    needs: require-platform-release-root
     runs-on: ubuntu-latest
 
     steps:
