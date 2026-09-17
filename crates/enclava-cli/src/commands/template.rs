@@ -51,8 +51,22 @@ const DEFAULT_SSH_TIMEOUT_SECONDS: u64 = 600;
 const TEMPLATE_CONFIG_DELIVERY_ATTEMPTS: usize = 121;
 const TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS: u64 = 2;
 /// Terminal marker when the owner-wait deadline cuts an in-flight request.
-const OWNER_WAIT_DEADLINE_EXCEEDED: &str =
+/// Typed (not string-boxed) so the undelivered-config report can classify
+/// it as owner-blocked — the exact scenario the unlock recovery targets —
+/// without pattern-matching message text.
+const OWNER_WAIT_DEADLINE_EXCEEDED_MESSAGE: &str =
     "owner-wait deadline reached with the TEE request still in flight";
+
+#[derive(Debug)]
+struct OwnerWaitDeadlineExceeded;
+
+impl std::fmt::Display for OwnerWaitDeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(OWNER_WAIT_DEADLINE_EXCEEDED_MESSAGE)
+    }
+}
+
+impl std::error::Error for OwnerWaitDeadlineExceeded {}
 /// How long a password-mode TEE must keep reporting `423 locked` before the
 /// delivery treats it as an owner-blocked relock (unlock guidance + extended
 /// wait) instead of rollout noise. Must exceed the claim/unlock window of a
@@ -1439,9 +1453,10 @@ async fn deliver_template_config_with_retry(
             // token refresh or an attestation failure is not repaired by
             // unlocking, and prescribing it would bury the real cause.
             let owner_blocked = delivery.password_mode
-                && error
+                && (error
                     .downcast_ref::<TeeError>()
-                    .is_some_and(is_locked_template_config_error);
+                    .is_some_and(is_locked_template_config_error)
+                    || error.downcast_ref::<OwnerWaitDeadlineExceeded>().is_some());
             return Err(undelivered_template_config_error(
                 target.instance_name,
                 &pairs[index..],
@@ -1728,7 +1743,7 @@ impl TemplateConfigDeliveryState<'_> {
                     Ok(result) => result,
                     Err(_elapsed) => {
                         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                            return Err(OWNER_WAIT_DEADLINE_EXCEEDED.into());
+                            return Err(OwnerWaitDeadlineExceeded.into());
                         }
                         // Threshold wake: surface the guidance, then re-issue
                         // the write (the stalled attempt is abandoned, not
