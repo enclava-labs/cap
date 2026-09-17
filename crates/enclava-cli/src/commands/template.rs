@@ -1456,7 +1456,8 @@ async fn deliver_template_config_with_retry(
                 && (error
                     .downcast_ref::<TeeError>()
                     .is_some_and(is_locked_template_config_error)
-                    || error.downcast_ref::<OwnerWaitDeadlineExceeded>().is_some());
+                    || (error.downcast_ref::<OwnerWaitDeadlineExceeded>().is_some()
+                        && delivery.owner_wait_ever_engaged()));
             return Err(undelivered_template_config_error(
                 target.instance_name,
                 &pairs[index..],
@@ -1582,6 +1583,13 @@ impl TemplateConfigDeliveryState<'_> {
     /// token-refresh blip must not retract the guidance or end the wait.
     fn owner_wait_engaged(&self, now: Instant) -> bool {
         template_config_owner_wait_engaged(self.password_mode, self.locked_since, now)
+    }
+
+    /// Whether the owner-wait ever engaged during this delivery (the
+    /// captured deadline is sticky). A candidate-only lock that never
+    /// crossed the persistence threshold must not select unlock recovery.
+    fn owner_wait_ever_engaged(&self) -> bool {
+        self.engaged_deadline.is_some()
     }
 
     /// The delivery keeps retrying through the default attempt budget, and
