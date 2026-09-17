@@ -129,6 +129,106 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         "kbs_attestation_token_url",
         crate::manifest::enclava_init_config::LOCAL_KBS_ATTESTATION_TOKEN_URL,
     );
+    push_toml_string(
+        &mut toml,
+        "mode",
+        crate::manifest::enclava_init_config::unlock_mode_claim(app.unlock_mode),
+    );
+    push_toml_string(&mut toml, "state_device", &app.storage.app_data.device_path);
+    push_toml_string(
+        &mut toml,
+        "state_mapping_name",
+        crate::manifest::enclava_init_config::STATE_MAPPING_NAME,
+    );
+    push_toml_string(
+        &mut toml,
+        "state_mount_path",
+        crate::manifest::enclava_init_config::STATE_MOUNT_PATH,
+    );
+    push_toml_string(
+        &mut toml,
+        "state_hkdf_info",
+        crate::manifest::enclava_init_config::STATE_HKDF_INFO,
+    );
+    push_toml_string(
+        &mut toml,
+        "tls_state_device",
+        &app.storage.tls_data.device_path,
+    );
+    push_toml_string(
+        &mut toml,
+        "tls_state_mapping_name",
+        crate::manifest::enclava_init_config::TLS_STATE_MAPPING_NAME,
+    );
+    push_toml_string(
+        &mut toml,
+        "tls_state_mount_path",
+        crate::manifest::enclava_init_config::TLS_STATE_MOUNT_PATH,
+    );
+    push_toml_string(
+        &mut toml,
+        "tls_state_hkdf_info",
+        crate::manifest::enclava_init_config::TLS_STATE_HKDF_INFO,
+    );
+    push_toml_string(
+        &mut toml,
+        "unlock_socket",
+        crate::manifest::enclava_init_config::UNLOCK_SOCKET,
+    );
+    push_toml_string(
+        &mut toml,
+        "attempts_path",
+        crate::manifest::enclava_init_config::ATTEMPTS_PATH,
+    );
+    push_toml_string(
+        &mut toml,
+        "state_root",
+        crate::manifest::enclava_init_config::STATE_ROOT,
+    );
+    push_toml_integer(
+        &mut toml,
+        "app_uid",
+        crate::manifest::enclava_init_config::primary_app_uid(app),
+    );
+    push_toml_integer(
+        &mut toml,
+        "app_gid",
+        crate::manifest::enclava_init_config::primary_app_gid(app),
+    );
+    push_toml_integer(
+        &mut toml,
+        "caddy_uid",
+        crate::manifest::enclava_init_config::CADDY_UID,
+    );
+    push_toml_integer(
+        &mut toml,
+        "caddy_gid",
+        crate::manifest::enclava_init_config::CADDY_GID,
+    );
+    if crate::manifest::enclava_init_config::primary_uses_root_workload_identity(app) {
+        push_toml_integer(
+            &mut toml,
+            "managed_config_gid",
+            crate::manifest::enclava_init_config::ROOT_GID,
+        );
+        push_toml_integer(
+            &mut toml,
+            "managed_config_dir_mode",
+            crate::manifest::enclava_init_config::ROOT_ONLY_MANAGED_CONFIG_DIR_MODE,
+        );
+    }
+    push_toml_string(
+        &mut toml,
+        "app_bind_mounts",
+        &crate::manifest::enclava_init_config::app_bind_mounts_json(app),
+    );
+    push_toml_string(
+        &mut toml,
+        "trustee_policy_read_available",
+        crate::manifest::enclava_init_config::trustee_policy_read_available_claim(
+            app.attestation.trustee_policy_read_available,
+        ),
+    );
     if app.attestation.trustee_policy_read_available {
         if let Some(url) = app
             .attestation
@@ -334,6 +434,13 @@ fn push_toml_string(toml: &mut String, key: &str, value: &str) {
     toml.push_str(key);
     toml.push_str(" = ");
     toml.push_str(&toml_string(value));
+    toml.push('\n');
+}
+
+fn push_toml_integer(toml: &mut String, key: &str, value: u32) {
+    toml.push_str(key);
+    toml.push_str(" = ");
+    toml.push_str(&value.to_string());
     toml.push('\n');
 }
 

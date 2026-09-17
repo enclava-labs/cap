@@ -4,7 +4,9 @@ use enclava_engine::manifest::cc_init_data::{
     encode_cc_init_data, resolve_runtime_class_with_env, sha256_hex,
 };
 use enclava_engine::testutil::sample_app;
-use enclava_engine::types::{GeneratedAgentPolicy, WorkloadArtifactBinding};
+use enclava_engine::types::{
+    GeneratedAgentPolicy, WorkloadArtifactBinding, WorkloadSecurityProfile,
+};
 use sha2::{Digest, Sha256};
 
 #[test]
@@ -116,7 +118,21 @@ fn data_claims_include_required_rego_descriptor_anchors() {
         "kbs_url",
         "kbs_resource_path",
         "kbs_attestation_token_url",
+        "mode",
         "runtime_class",
+        "state_device",
+        "state_mapping_name",
+        "state_mount_path",
+        "state_hkdf_info",
+        "tls_state_device",
+        "tls_state_mapping_name",
+        "tls_state_mount_path",
+        "tls_state_hkdf_info",
+        "unlock_socket",
+        "attempts_path",
+        "state_root",
+        "app_bind_mounts",
+        "trustee_policy_read_available",
     ] {
         let value = data.get(key).and_then(toml::Value::as_str).unwrap();
         assert!(!value.is_empty(), "{key} must be non-empty");
@@ -159,9 +175,50 @@ fn data_claims_include_required_rego_descriptor_anchors() {
         data["kbs_attestation_token_url"].as_str().unwrap(),
         "http://127.0.0.1:8006/aa/token?token_type=kbs"
     );
+    assert_eq!(data["mode"].as_str().unwrap(), "autounlock");
     assert_eq!(
         data["runtime_class"].as_str().unwrap(),
         DEFAULT_RUNTIME_CLASS
+    );
+    assert_eq!(data["state_device"].as_str().unwrap(), "/dev/csi0");
+    assert_eq!(data["state_mapping_name"].as_str().unwrap(), "cap-state");
+    assert_eq!(data["state_mount_path"].as_str().unwrap(), "/state");
+    assert_eq!(data["state_hkdf_info"].as_str().unwrap(), "state-luks-key");
+    assert_eq!(data["tls_state_device"].as_str().unwrap(), "/dev/csi1");
+    assert_eq!(
+        data["tls_state_mapping_name"].as_str().unwrap(),
+        "cap-tls-state"
+    );
+    assert_eq!(
+        data["tls_state_mount_path"].as_str().unwrap(),
+        "/state/tls-state"
+    );
+    assert_eq!(
+        data["tls_state_hkdf_info"].as_str().unwrap(),
+        "tls-state-luks-key"
+    );
+    assert_eq!(
+        data["unlock_socket"].as_str().unwrap(),
+        "/run/enclava-unlock/unlock.sock"
+    );
+    assert_eq!(
+        data["attempts_path"].as_str().unwrap(),
+        "/run/enclava-unlock/unlock-attempts"
+    );
+    assert_eq!(data["state_root"].as_str().unwrap(), "/state");
+    assert_eq!(data["app_uid"].as_integer(), Some(10001));
+    assert_eq!(data["app_gid"].as_integer(), Some(10001));
+    assert_eq!(data["caddy_uid"].as_integer(), Some(10002));
+    assert_eq!(data["caddy_gid"].as_integer(), Some(10002));
+    assert!(data.get("managed_config_gid").is_none());
+    assert!(data.get("managed_config_dir_mode").is_none());
+    assert_eq!(
+        data["app_bind_mounts"].as_str().unwrap(),
+        r#"[{"subdir":"app-data","mount_path":"/app/data"}]"#
+    );
+    assert_eq!(
+        data["trustee_policy_read_available"].as_str().unwrap(),
+        "false"
     );
 
     let sidecars: serde_json::Value = serde_json::from_str(
@@ -197,6 +254,30 @@ fn options_with_runtime_class(runtime_class: &str) -> CcInitDataOptions {
         kbs_ca_cert_pem: None,
         runtime_class: runtime_class.to_string(),
     }
+}
+
+#[test]
+fn data_claims_bind_root_workload_identity_and_trustee_flag() {
+    let mut app = sample_app();
+    app.containers[0].workload_security_profile = WorkloadSecurityProfile::PlatformManagedSshRelay;
+    app.attestation.trustee_policy_read_available = true;
+    app.attestation.workload_artifacts_url =
+        Some("http://cap-api.cap.svc.cluster.local/api/v1/workload/artifacts".to_string());
+    app.attestation.trustee_policy_url =
+        Some("http://kbs.trustee.svc/resource-policy/default/body".to_string());
+
+    let toml = build_toml(&app);
+    let value: toml::Value = toml::from_str(&toml).unwrap();
+    let data = value.get("data").and_then(toml::Value::as_table).unwrap();
+
+    assert_eq!(data["app_uid"].as_integer(), Some(0));
+    assert_eq!(data["app_gid"].as_integer(), Some(0));
+    assert_eq!(data["managed_config_gid"].as_integer(), Some(0));
+    assert_eq!(data["managed_config_dir_mode"].as_integer(), Some(448));
+    assert_eq!(
+        data["trustee_policy_read_available"].as_str().unwrap(),
+        "true"
+    );
 }
 
 #[test]

@@ -626,9 +626,7 @@ fn kbs_proxy_health_accepts_ready_statuses() {
     assert!(!kbs_proxy_health_status_is_ready(503));
 }
 
-fn config_with_signed_cc(dir: &Path, cc_body: &str) -> Config {
-    let cc_path = dir.join("cc-init-data.toml");
-    std::fs::write(&cc_path, cc_body).unwrap();
+fn unsigned_config() -> Config {
     Config {
         mode: Mode::Autounlock,
         state: VolumeConfig {
@@ -662,31 +660,127 @@ fn config_with_signed_cc(dir: &Path, cc_body: &str) -> Config {
         tls_certificate_hostnames: Vec::new(),
         trustee_policy_url: Some("file:///policy.json".to_string()),
         kbs_attestation_token_url: "http://127.0.0.1:8006/aa/token?token_type=kbs".to_string(),
-        cc_init_data_path: Some(cc_path.display().to_string()),
+        cc_init_data_path: None,
         platform_trustee_policy_pubkey_hex: None,
         signing_service_pubkey_hex: None,
     }
 }
 
-#[test]
-fn signed_cc_init_data_claims_bind_configmap_critical_values() {
-    let dir = tempdir().unwrap();
-    let cc_body = format!(
+fn signed_cc_claims_toml(cfg: &Config) -> String {
+    let mounts = serde_json::to_string(
+        &cfg.app_bind_mounts
+            .iter()
+            .map(|mount| {
+                serde_json::json!({
+                    "subdir": mount.subdir,
+                    "mount_path": mount.mount_path,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let mut out = format!(
         r#"
 version = "0.1.0"
 algorithm = "sha256"
 
 [data]
-argon2_salt_hex = "{}"
-kbs_url = "http://127.0.0.1:8006/cdh/resource"
-kbs_resource_path = "default/app-owner/seed-encrypted"
-kbs_attestation_token_url = "http://127.0.0.1:8006/aa/token?token_type=kbs"
-workload_artifacts_url = "file:///artifacts.json"
-trustee_policy_url = "file:///policy.json"
+argon2_salt_hex = "{argon2}"
+kbs_url = "{kbs_url}"
+kbs_resource_path = "{kbs_path}"
+kbs_attestation_token_url = "{token}"
+mode = "{mode}"
+state_device = "{state_device}"
+state_mapping_name = "{state_mapping}"
+state_mount_path = "{state_mount}"
+state_hkdf_info = "{state_hkdf}"
+tls_state_device = "{tls_device}"
+tls_state_mapping_name = "{tls_mapping}"
+tls_state_mount_path = "{tls_mount}"
+tls_state_hkdf_info = "{tls_hkdf}"
+unlock_socket = "{unlock}"
+attempts_path = "{attempts}"
+state_root = "{state_root}"
+app_uid = {app_uid}
+app_gid = {app_gid}
+caddy_uid = {caddy_uid}
+caddy_gid = {caddy_gid}
+app_bind_mounts = {mounts}
+trustee_policy_read_available = "{trustee}"
 "#,
-        "aa".repeat(32)
+        argon2 = cfg.argon2_salt_hex.as_deref().unwrap_or(""),
+        kbs_url = cfg.kbs_url.as_deref().unwrap_or(""),
+        kbs_path = cfg.kbs_resource_path.as_deref().unwrap_or(""),
+        token = cfg.kbs_attestation_token_url,
+        mode = match cfg.mode {
+            Mode::Autounlock => "autounlock",
+            Mode::Password => "password",
+        },
+        state_device = cfg.state.device,
+        state_mapping = cfg.state.mapping_name,
+        state_mount = cfg.state.mount_path,
+        state_hkdf = cfg.state.hkdf_info,
+        tls_device = cfg.tls_state.device,
+        tls_mapping = cfg.tls_state.mapping_name,
+        tls_mount = cfg.tls_state.mount_path,
+        tls_hkdf = cfg.tls_state.hkdf_info,
+        unlock = cfg.unlock_socket,
+        attempts = cfg.attempts_path,
+        state_root = cfg.state_root,
+        app_uid = cfg.app_uid,
+        app_gid = cfg.app_gid,
+        caddy_uid = cfg.caddy_uid,
+        caddy_gid = cfg.caddy_gid,
+        mounts = serde_json::to_string(&mounts).unwrap(),
+        trustee = if cfg.trustee_policy_read_available {
+            "true"
+        } else {
+            "false"
+        },
     );
-    let cfg = config_with_signed_cc(dir.path(), &cc_body);
+    if let Some(gid) = cfg.managed_config_gid {
+        out.push_str(&format!("managed_config_gid = {gid}\n"));
+    }
+    if let Some(mode) = cfg.managed_config_dir_mode {
+        out.push_str(&format!("managed_config_dir_mode = {mode}\n"));
+    }
+    if cfg.trustee_policy_read_available {
+        if let Some(url) = cfg.workload_artifacts_url.as_deref() {
+            out.push_str(&format!(
+                "workload_artifacts_url = {}\n",
+                serde_json::to_string(url).unwrap()
+            ));
+        }
+        if let Some(url) = cfg.trustee_policy_url.as_deref() {
+            out.push_str(&format!(
+                "trustee_policy_url = {}\n",
+                serde_json::to_string(url).unwrap()
+            ));
+        }
+    }
+    out
+}
+
+fn config_with_signed_cc(dir: &Path, cc_body: &str) -> Config {
+    let cc_path = dir.join("cc-init-data.toml");
+    std::fs::write(&cc_path, cc_body).unwrap();
+    let mut cfg = unsigned_config();
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    cfg
+}
+
+fn config_with_matching_signed_cc(dir: &Path) -> Config {
+    let mut cfg = unsigned_config();
+    let cc_path = dir.join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
+    cfg
+}
+
+#[test]
+fn signed_cc_init_data_claims_bind_configmap_critical_values() {
+    let dir = tempdir().unwrap();
+    let cfg = config_with_matching_signed_cc(dir.path());
 
     validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap();
 }
@@ -694,25 +788,140 @@ trustee_policy_url = "file:///policy.json"
 #[test]
 fn signed_cc_init_data_mismatch_rejects_configmap_transport() {
     let dir = tempdir().unwrap();
-    let cc_body = format!(
-        r#"
-version = "0.1.0"
-algorithm = "sha256"
-
-[data]
-argon2_salt_hex = "{}"
-kbs_url = "http://127.0.0.1:8006/cdh/resource"
-kbs_resource_path = "default/other-owner/seed-encrypted"
-kbs_attestation_token_url = "http://127.0.0.1:8006/aa/token?token_type=kbs"
-workload_artifacts_url = "file:///artifacts.json"
-trustee_policy_url = "file:///policy.json"
-"#,
-        "aa".repeat(32)
-    );
-    let cfg = config_with_signed_cc(dir.path(), &cc_body);
+    let mut cfg = config_with_matching_signed_cc(dir.path());
+    cfg.kbs_resource_path = Some("default/other-owner/seed-encrypted".to_string());
 
     let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
     assert!(err.to_string().contains("kbs-resource-path"));
+}
+
+#[test]
+fn signed_cc_init_data_mismatch_rejects_device_path() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config_with_matching_signed_cc(dir.path());
+    cfg.state.device = "/dev/evil".to_string();
+
+    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    assert!(err.to_string().contains("state.device"));
+}
+
+#[test]
+fn signed_cc_init_data_mismatch_rejects_changed_bind_mount() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config_with_matching_signed_cc(dir.path());
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: "app-data".to_string(),
+        mount_path: "/app/data".to_string(),
+    });
+
+    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    assert!(err.to_string().contains("app-bind-mounts"));
+}
+
+#[test]
+fn signed_cc_init_data_rejects_dotdot_bind_mount_path() {
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: "app-data".to_string(),
+        mount_path: "/app/../etc".to_string(),
+    });
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
+
+    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    assert!(err.to_string().contains(".."));
+}
+
+#[test]
+fn signed_cc_init_data_rejects_root_bind_mount_path() {
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: String::new(),
+        mount_path: "/".to_string(),
+    });
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
+
+    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    assert!(err.to_string().contains("below root"));
+}
+
+#[test]
+fn signed_cc_init_data_rejects_slash_only_bind_mount_path() {
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: String::new(),
+        mount_path: "//".to_string(),
+    });
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
+
+    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    assert!(err.to_string().contains("below root"));
+}
+
+#[test]
+fn signed_cc_init_data_mismatch_rejects_changed_mode() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config_with_matching_signed_cc(dir.path());
+    cfg.mode = Mode::Password;
+
+    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    assert!(err.to_string().contains("mode"));
+}
+
+#[test]
+fn password_mode_signed_cc_init_data_binds_mode_claim() {
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.mode = Mode::Password;
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
+
+    validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap();
+}
+
+#[test]
+fn trustee_policy_unavailable_skip_requires_missing_cc_init_data_path() {
+    let mut cfg = unsigned_config();
+    cfg.trustee_policy_read_available = false;
+    cfg.cc_init_data_path = None;
+
+    if cfg!(feature = "prod-strict") {
+        let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+        assert!(err.to_string().contains("prod-strict"));
+    } else {
+        validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap();
+    }
+}
+
+#[test]
+fn trustee_policy_unavailable_still_binds_host_fields_when_cc_init_data_present() {
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.trustee_policy_read_available = false;
+    cfg.workload_artifacts_url = None;
+    cfg.trustee_policy_url = None;
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
+
+    if cfg!(feature = "prod-strict") {
+        let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+        assert!(err.to_string().contains("prod-strict"));
+    } else {
+        validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap();
+        cfg.state.device = "/dev/evil".to_string();
+        let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+        assert!(err.to_string().contains("state.device"));
+    }
 }
 
 #[test]
