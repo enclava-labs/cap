@@ -345,11 +345,26 @@ pub(crate) async fn post_workload_teardown(
     };
 
     if response.status().is_success() {
-        // The wrap is erased on the TEE at this point. Failing here (or on the
-        // marker write) would make the retry re-POST the proxy's
-        // non-idempotent teardown and wedge the delete, so a marker write
-        // failure is logged and the delete proceeds.
-        if let Err(_error) = persist_workload_teardown_completed(&state.db, app.id).await {
+        // The wrap is erased on the TEE at this point. The marker is what lets
+        // a later-step retry skip the proxy's non-idempotent teardown re-POST,
+        // so ride out transient pool/database blips with a few bounded
+        // attempts. If it still fails, failing the delete here would guarantee
+        // that wedge on the retry, so log and proceed: the wrap is erased and
+        // the marker only matters if a later step fails and a retry runs.
+        let mut marker_persisted = false;
+        for attempt in 0..3u32 {
+            match persist_workload_teardown_completed(&state.db, app.id).await {
+                Ok(()) => {
+                    marker_persisted = true;
+                    break;
+                }
+                Err(_) if attempt < 2 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        if !marker_persisted {
             tracing::warn!(
                 app_id = %app.id,
                 code = "app_delete_teardown_marker_persist_failed",
