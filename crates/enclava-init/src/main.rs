@@ -441,6 +441,15 @@ fn validate_configmap_transport_against_signed_cc_init_data(cfg: &Config) -> Res
         Some(&cfg.kbs_attestation_token_url),
         "kbs-attestation-token-url",
     )?;
+    require_signed_config_match(
+        data,
+        "mode",
+        Some(match cfg.mode {
+            Mode::Autounlock => "autounlock",
+            Mode::Password => "password",
+        }),
+        "mode",
+    )?;
     if cfg.mode == Mode::Autounlock {
         require_signed_config_match(data, "kbs_url", cfg.kbs_url.as_deref(), "kbs-url")?;
         require_signed_config_match(
@@ -672,6 +681,9 @@ fn require_signed_app_bind_mounts_match(
 fn validate_app_bind_mount_path(path: &str) -> Result<()> {
     if !path.starts_with('/') {
         anyhow::bail!("app bind mount mount_path must be absolute: {path}");
+    }
+    if path.trim_matches('/').is_empty() {
+        anyhow::bail!("app bind mount mount_path must name a path below root: {path}");
     }
     if path.split('/').any(|segment| segment == "..") {
         anyhow::bail!("app bind mount mount_path must not contain '..' path segments: {path}");

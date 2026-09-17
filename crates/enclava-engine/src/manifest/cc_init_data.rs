@@ -129,6 +129,11 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         "kbs_attestation_token_url",
         crate::manifest::enclava_init_config::LOCAL_KBS_ATTESTATION_TOKEN_URL,
     );
+    push_toml_string(
+        &mut toml,
+        "mode",
+        crate::manifest::enclava_init_config::unlock_mode_claim(app.unlock_mode),
+    );
     push_toml_string(&mut toml, "state_device", &app.storage.app_data.device_path);
     push_toml_string(
         &mut toml,

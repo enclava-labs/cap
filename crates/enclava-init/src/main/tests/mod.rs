@@ -689,6 +689,7 @@ argon2_salt_hex = "{argon2}"
 kbs_url = "{kbs_url}"
 kbs_resource_path = "{kbs_path}"
 kbs_attestation_token_url = "{token}"
+mode = "{mode}"
 state_device = "{state_device}"
 state_mapping_name = "{state_mapping}"
 state_mount_path = "{state_mount}"
@@ -711,6 +712,10 @@ trustee_policy_read_available = "{trustee}"
         kbs_url = cfg.kbs_url.as_deref().unwrap_or(""),
         kbs_path = cfg.kbs_resource_path.as_deref().unwrap_or(""),
         token = cfg.kbs_attestation_token_url,
+        mode = match cfg.mode {
+            Mode::Autounlock => "autounlock",
+            Mode::Password => "password",
+        },
         state_device = cfg.state.device,
         state_mapping = cfg.state.mapping_name,
         state_mount = cfg.state.mount_path,
@@ -827,6 +832,60 @@ fn signed_cc_init_data_rejects_dotdot_bind_mount_path() {
 
     let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
     assert!(err.to_string().contains(".."));
+}
+
+#[test]
+fn signed_cc_init_data_rejects_root_bind_mount_path() {
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: String::new(),
+        mount_path: "/".to_string(),
+    });
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
+
+    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    assert!(err.to_string().contains("below root"));
+}
+
+#[test]
+fn signed_cc_init_data_rejects_slash_only_bind_mount_path() {
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.app_bind_mounts.push(AppBindMountConfig {
+        subdir: String::new(),
+        mount_path: "//".to_string(),
+    });
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
+
+    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    assert!(err.to_string().contains("below root"));
+}
+
+#[test]
+fn signed_cc_init_data_mismatch_rejects_changed_mode() {
+    let dir = tempdir().unwrap();
+    let mut cfg = config_with_matching_signed_cc(dir.path());
+    cfg.mode = Mode::Password;
+
+    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    assert!(err.to_string().contains("mode"));
+}
+
+#[test]
+fn password_mode_signed_cc_init_data_binds_mode_claim() {
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.mode = Mode::Password;
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
+
+    validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap();
 }
 
 #[test]

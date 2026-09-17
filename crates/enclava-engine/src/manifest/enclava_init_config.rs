@@ -82,10 +82,7 @@ pub fn generate_enclava_init_configmap(app: &ConfidentialApp) -> ConfigMap {
 }
 
 fn render_config_toml(app: &ConfidentialApp) -> String {
-    let mode = match app.unlock_mode {
-        UnlockMode::Auto => "autounlock",
-        UnlockMode::Password => "password",
-    };
+    let mode = unlock_mode_claim(app.unlock_mode);
     let mut out = String::new();
     out.push_str(&format!("mode = \"{mode}\"\n"));
     out.push_str(&format!("state-root = \"{STATE_ROOT}\"\n"));
@@ -259,6 +256,13 @@ pub(crate) fn app_bind_mounts_json(app: &ConfidentialApp) -> String {
 
 pub(crate) fn trustee_policy_read_available_claim(available: bool) -> &'static str {
     if available { "true" } else { "false" }
+}
+
+pub(crate) fn unlock_mode_claim(mode: UnlockMode) -> &'static str {
+    match mode {
+        UnlockMode::Auto => "autounlock",
+        UnlockMode::Password => "password",
+    }
 }
 
 pub(crate) fn argon2_salt_hex(app: &ConfidentialApp) -> String {

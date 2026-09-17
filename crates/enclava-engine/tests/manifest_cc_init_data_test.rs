@@ -118,6 +118,7 @@ fn data_claims_include_required_rego_descriptor_anchors() {
         "kbs_url",
         "kbs_resource_path",
         "kbs_attestation_token_url",
+        "mode",
         "runtime_class",
         "state_device",
         "state_mapping_name",
@@ -174,6 +175,7 @@ fn data_claims_include_required_rego_descriptor_anchors() {
         data["kbs_attestation_token_url"].as_str().unwrap(),
         "http://127.0.0.1:8006/aa/token?token_type=kbs"
     );
+    assert_eq!(data["mode"].as_str().unwrap(), "autounlock");
     assert_eq!(
         data["runtime_class"].as_str().unwrap(),
         DEFAULT_RUNTIME_CLASS
