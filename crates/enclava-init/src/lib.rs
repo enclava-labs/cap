@@ -14,8 +14,12 @@ compile_error!("prod-strict builds must not enable enclava-init/luks-integration
 
 /// Debug-only LUKS skip. Always false when `prod-strict` is enabled.
 pub fn dev_no_luks_override() -> bool {
+    dev_no_luks_override_for(std::env::var("ENCLAVA_INIT_DEV_NO_LUKS").ok().as_deref())
+}
+
+fn dev_no_luks_override_for(raw: Option<&str>) -> bool {
     cfg!(all(debug_assertions, not(feature = "prod-strict")))
-        && std::env::var("ENCLAVA_INIT_DEV_NO_LUKS")
+        && raw
             .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
             .unwrap_or(false)
 }
@@ -104,42 +108,29 @@ mod tests {
             source.contains("cfg!(all(debug_assertions, not(feature = \"prod-strict\")))"),
             "dev_no_luks_override must compile out when prod-strict is enabled"
         );
+        assert!(
+            source.contains("std::env::var(\"ENCLAVA_INIT_DEV_NO_LUKS\")"),
+            "dev_no_luks_override must read the ENCLAVA_INIT_DEV_NO_LUKS env var"
+        );
     }
 
     #[cfg(feature = "prod-strict")]
     #[test]
-    fn prod_strict_ignores_dev_no_luks_env() {
-        let previous = std::env::var("ENCLAVA_INIT_DEV_NO_LUKS").ok();
-        unsafe {
-            std::env::set_var("ENCLAVA_INIT_DEV_NO_LUKS", "1");
-        }
-        let skipped = super::dev_no_luks_override();
-        match previous {
-            Some(value) => unsafe { std::env::set_var("ENCLAVA_INIT_DEV_NO_LUKS", value) },
-            None => unsafe { std::env::remove_var("ENCLAVA_INIT_DEV_NO_LUKS") },
-        }
-        assert!(
-            !skipped,
-            "prod-strict builds must not skip LUKS via ENCLAVA_INIT_DEV_NO_LUKS"
-        );
+    fn prod_strict_ignores_dev_no_luks_value() {
+        assert!(!super::dev_no_luks_override_for(Some("true")));
+        assert!(!super::dev_no_luks_override_for(Some("1")));
+        assert!(!super::dev_no_luks_override_for(None));
     }
 
     #[cfg(all(debug_assertions, not(feature = "prod-strict")))]
     #[test]
-    fn dev_builds_honor_dev_no_luks_env() {
-        let previous = std::env::var("ENCLAVA_INIT_DEV_NO_LUKS").ok();
-        unsafe {
-            std::env::set_var("ENCLAVA_INIT_DEV_NO_LUKS", "1");
-        }
-        let skipped = super::dev_no_luks_override();
-        match previous {
-            Some(value) => unsafe { std::env::set_var("ENCLAVA_INIT_DEV_NO_LUKS", value) },
-            None => unsafe { std::env::remove_var("ENCLAVA_INIT_DEV_NO_LUKS") },
-        }
-        assert!(
-            skipped,
-            "debug builds without prod-strict must honor ENCLAVA_INIT_DEV_NO_LUKS"
-        );
+    fn dev_builds_honor_dev_no_luks_value() {
+        assert!(super::dev_no_luks_override_for(Some("true")));
+        assert!(super::dev_no_luks_override_for(Some("TRUE")));
+        assert!(super::dev_no_luks_override_for(Some("1")));
+        assert!(!super::dev_no_luks_override_for(Some("0")));
+        assert!(!super::dev_no_luks_override_for(Some("yes")));
+        assert!(!super::dev_no_luks_override_for(None));
     }
 
     #[test]
@@ -193,6 +184,16 @@ mod tests {
                 "{step} must be gated on the exact non-pull_request condition"
             );
         }
+
+        assert_eq!(
+            workflow.match_indices("push: $").count(),
+            1,
+            "exactly one push expression is allowed, and it must be the gated one"
+        );
+        assert!(
+            workflow.contains("BUILD_PROFILE=${{ steps.build_profile.outputs.profile }}"),
+            "build-args must consume the selected build profile, not a hardcoded one"
+        );
 
         assert!(
             workflow.contains("org.enclava.build-profile="),
