@@ -2572,7 +2572,29 @@ pub async fn destroy(args: DestroyArgs) -> Result<(), Box<dyn std::error::Error>
     spinner.set_message(format!("Destroying {app_name}..."));
     spinner.enable_steady_tick(Duration::from_millis(100));
 
-    api.delete_app(&app_name).await?;
+    let result = api.delete_app(&app_name).await;
+    // Teardown failures leave the app in 'deleting' and are retryable once the
+    // workload is reachable again; without this hint the raw API code is the
+    // only signal an operator gets.
+    if let Err(ApiError::Api {
+        code: Some(code), ..
+    }) = &result
+    {
+        let hint = match code.as_str() {
+            "app_delete_teardown_locked" => Some(
+                "the confidential workload is locked; unlock it with its storage password (`enclava app unlock`), then retry destroy",
+            ),
+            "app_delete_teardown_unavailable" => Some(
+                "the confidential workload teardown did not complete; the app stays in 'deleting' -- wait for the workload to become reachable and retry destroy",
+            ),
+            _ => None,
+        };
+        if let Some(hint) = hint {
+            spinner.finish_with_message(format!("Destroy of '{app_name}' did not complete."));
+            eprintln!("Hint: {hint}");
+        }
+    }
+    result?;
 
     spinner.finish_with_message(format!("App '{app_name}' destroyed."));
 

@@ -1665,12 +1665,20 @@ async fn complete_idempotent_result(
 
 /// Ordered app teardown is resumable even after partially applied provider work.
 /// Keep this exception local to DELETE; generic RetrySafe operations fail closed.
+/// A locked TEE (423 `app_delete_teardown_locked`) is recoverable — the owner
+/// can unlock the workload — so it defers like a 5xx instead of being cached
+/// as a terminal receipt that a same-key retry would replay forever.
 async fn complete_app_delete_result(
     lease: IdempotencyLease,
     result: Result<IdempotencyResponse, InternalRouteError>,
 ) -> Result<IdempotencyResponse, InternalRouteError> {
-    if matches!(&result, Err((status, _)) if status.is_server_error()) {
-        return Err(defer_idempotent_request(lease).await);
+    if let Err((status, body)) = &result {
+        let teardown_locked = *status == StatusCode::LOCKED
+            && body.get("error").and_then(serde_json::Value::as_str)
+                == Some("app_delete_teardown_locked");
+        if status.is_server_error() || teardown_locked {
+            return Err(defer_idempotent_request(lease).await);
+        }
     }
     complete_idempotent_result(lease, result).await
 }
@@ -8945,6 +8953,61 @@ mod tests {
         complete_app_delete_result(winners.pop().unwrap(), Ok((StatusCode::NO_CONTENT, body)))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_delete_locked_teardown_defers_and_same_key_reexecutes() {
+        let (state, auth, app_name, _) = app_delete_fixture().await;
+        let key = format!("locked-delete-{}", Uuid::new_v4());
+        let headers = idempotency_headers(&key);
+        let path = format!("/internal/paas/orgs/{}/apps/{app_name}", auth.org_id);
+        let body = serde_json::json!({});
+        let lease = expect_idempotency_execution(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap(),
+        );
+        let operation_id = lease.operation_id();
+        // A locked TEE is recoverable once the owner unlocks it: the 423 must
+        // defer (row stays incomplete) instead of caching a terminal receipt
+        // that every same-key retry would replay.
+        let failure = complete_app_delete_result(
+            lease,
+            Err(json_error(StatusCode::LOCKED, "app_delete_teardown_locked")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (failure.0, failure.1.0),
+            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+        );
+        let receipt: (bool, bool, bool, bool) = sqlx::query_as(
+            "SELECT completed_at IS NULL, response_status IS NULL,
+                    response_body IS NULL, known_not_applied
+               FROM cap_internal_idempotency WHERE idempotency_key = $1",
+        )
+        .bind(&key)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(receipt, (true, true, true, false));
+        expire_idempotency_lease(&state.db, &key).await;
+        let retry = expect_idempotency_execution(
+            begin_app_delete_request(&state, &headers, &path, &auth, &body, &app_name)
+                .await
+                .unwrap(),
+        );
+        assert!(retry.reclaimed());
+        assert_eq!(retry.operation_id(), operation_id);
+        complete_app_delete_result(
+            retry,
+            Ok((
+                StatusCode::NO_CONTENT,
+                serde_json::json!({"status": "deleted"}),
+            )),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

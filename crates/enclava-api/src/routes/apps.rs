@@ -310,16 +310,30 @@ async fn post_workload_teardown(
         .tee_http_client
         .post(url)
         .bearer_auth(token)
-        .timeout(std::time::Duration::from_secs(15))
+        // Out-wait the attestation-proxy teardown, which performs two KBS
+        // resource deletes with 20 s timeouts each plus attestation. A client
+        // timeout shorter than the proxy's own would report a slow success as
+        // a failure, and the retry would then hit the proxy's non-idempotent
+        // teardown (404 on the erased wrap -> 500) and wedge the delete.
+        .timeout(std::time::Duration::from_secs(45))
         .send()
         .await
     {
         Ok(response) => response,
-        Err(_) => {
+        Err(error) => {
+            // Coarse, content-free category: distinguishes "endpoint slow"
+            // from "endpoint gone" without leaking transport detail.
+            let category = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else {
+                "transport"
+            };
             return Err(app_delete_failure(
                 app.id,
                 AppDeleteFailure::TeardownEndpoint,
-                "unreachable",
+                category,
             ));
         }
     };
