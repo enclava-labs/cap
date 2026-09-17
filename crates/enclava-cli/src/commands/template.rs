@@ -50,6 +50,9 @@ const DEFAULT_TEMPLATE_DEPLOY_TIMEOUT_SECONDS: u64 = 1800;
 const DEFAULT_SSH_TIMEOUT_SECONDS: u64 = 600;
 const TEMPLATE_CONFIG_DELIVERY_ATTEMPTS: usize = 121;
 const TEMPLATE_CONFIG_DELIVERY_RETRY_SECONDS: u64 = 2;
+/// Terminal marker when the owner-wait deadline cuts an in-flight request.
+const OWNER_WAIT_DEADLINE_EXCEEDED: &str =
+    "owner-wait deadline reached with the TEE request still in flight";
 /// How long a password-mode TEE must keep reporting `423 locked` before the
 /// delivery treats it as an owner-blocked relock (unlock guidance + extended
 /// wait) instead of rollout noise. Must exceed the claim/unlock window of a
@@ -91,7 +94,8 @@ pub struct TemplateDeployArgs {
     /// Do not wait for stable SSH endpoint command readiness after config delivery.
     #[arg(long)]
     pub no_wait: bool,
-    /// Seconds to wait for each TEE boot, platform config, and stable SSH readiness phase.
+    /// Seconds to wait for each TEE boot, platform config (including the password-mode
+    /// config-delivery owner wait when a redeploy relocks the TEE), and stable SSH readiness phase.
     #[arg(long, default_value_t = DEFAULT_TEMPLATE_DEPLOY_TIMEOUT_SECONDS)]
     pub ssh_timeout_seconds: u64,
     /// File containing the initial storage password for non-interactive password-mode template deploys.
@@ -581,7 +585,6 @@ async fn deploy_with_timings(
                     password_mode: template.unlock_mode == "password",
                     owner_wait_budget: Duration::from_secs(args.ssh_timeout_seconds),
                     progress: &pb,
-                    json_mode: args.json,
                     timings_mode: args.timings,
                 },
                 &mut tee,
@@ -1391,12 +1394,9 @@ struct DeliverTemplateConfigTarget<'a> {
     password_mode: bool,
     owner_wait_budget: Duration,
     progress: &'a ProgressBar,
-    /// Output modes, so operator notices pick a channel that does not
-    /// corrupt a machine stream: with a hidden bar, `--json` frees stderr
-    /// (stdout holds the final JSON document), `--timings` frees stdout
-    /// (stderr carries the timing JSONL); with both, machine streams own
-    /// both channels and the notices stay silent.
-    json_mode: bool,
+    /// Output mode for operator notices: `--timings` owns stderr as a
+    /// JSONL stream, so notices ride it as structured events instead of
+    /// free-form text. Caller-supplied deploy metadata.
     timings_mode: bool,
 }
 
@@ -1425,7 +1425,6 @@ async fn deliver_template_config_with_retry(
         progress: target.progress,
         owner_wait_announced: false,
         post_lock_note_printed: false,
-        json_mode: target.json_mode,
         timings_mode: target.timings_mode,
     };
     for (index, (key, value)) in pairs.iter().enumerate() {
@@ -1439,7 +1438,18 @@ async fn deliver_template_config_with_retry(
             )
             .into());
         }
-        sync_template_config_key_with_retry(api, target.instance_name, key).await?;
+        if let Err(error) =
+            sync_template_config_key_with_retry(api, target.instance_name, key).await
+        {
+            // Distinct failure class from an undelivered value: the value is
+            // in the TEE store; only the platform's key metadata lags.
+            return Err(format!(
+                "config value delivered to the TEE store, but the platform key sync failed \\
+                 for {key}: {error}. The platform may not report this key as managed until a \\
+                 later sync succeeds."
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -1498,7 +1508,6 @@ struct TemplateConfigDeliveryState<'a> {
     progress: &'a ProgressBar,
     owner_wait_announced: bool,
     post_lock_note_printed: bool,
-    json_mode: bool,
     timings_mode: bool,
 }
 
@@ -1539,27 +1548,36 @@ impl TemplateConfigDeliveryState<'_> {
     }
 
     /// The delivery keeps retrying through the default attempt budget, and
-    /// beyond it only while the owner-wait is engaged and its budget lasts.
+    /// beyond it while the owner-wait is engaged and its budget lasts. A
+    /// password-mode lock candidate that appeared late in the default
+    /// window (e.g. transient rollout errors consumed most of it) gets
+    /// grace to reach the persistence threshold rather than dying with the
+    /// attempt budget mid-window.
     fn delivery_continues(&self, attempt: usize) -> bool {
+        let now = Instant::now();
+        let engaged = self.owner_wait_engaged(now);
         template_config_delivery_continues(
             attempt,
-            self.owner_wait_engaged(Instant::now()),
+            engaged,
             self.delivery_started.elapsed() < self.owner_wait_budget,
+            self.password_mode && self.locked_since.is_some() && !engaged,
         )
     }
 
     /// An operator notice on a channel that never corrupts a machine
-    /// stream: the bar when visible, stderr under `--json` (stdout holds
-    /// the final JSON document), stdout under `--timings` alone (stderr
-    /// carries the timing JSONL). With both machine modes the notice has
-    /// no free channel and is dropped.
+    /// stream: the bar when visible; under `--timings` stderr is the timing
+    /// JSONL stream, so the notice rides it as a distinct JSON event
+    /// (works for `--json --timings` too, where stdout holds the final
+    /// JSON document); with a hidden bar and no `--timings`, stderr is
+    /// free-form text.
     fn announce(&self, line: &str) {
         if !self.progress.is_hidden() {
             self.progress.println(line);
-        } else if !self.timings_mode {
+        } else if self.timings_mode {
+            let record = serde_json::json!({"event": "template_deploy_notice", "message": line});
+            eprintln!("{record}");
+        } else {
             eprintln!("{line}");
-        } else if !self.json_mode {
-            println!("{line}");
         }
     }
 
@@ -1628,9 +1646,28 @@ impl TemplateConfigDeliveryState<'_> {
         let mut attempt = 0usize;
         loop {
             attempt += 1;
-            match self.tee.config_set(key, value, self.config_token).await {
+            // While the owner-wait is engaged, the deadline bounds the
+            // in-flight request too: the API client's own 900s cap would
+            // otherwise let one stalled write run far past the phase budget.
+            let config_set = self.tee.config_set(key, value, self.config_token);
+            let result = match self.owner_wait_deadline() {
+                Some(deadline) => match tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    config_set,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => return Err(OWNER_WAIT_DEADLINE_EXCEEDED.into()),
+                },
+                None => config_set.await,
+            };
+            match result {
                 Ok(()) => {
                     self.report_post_lock_delivery();
+                    // A success is a non-locked outcome: the persistence
+                    // window must not leak into the next key's delivery.
+                    self.locked_since = None;
                     return Ok(());
                 }
                 Err(error) if should_refresh_template_config_token(&error) => {
@@ -1692,7 +1729,24 @@ async fn attest_template_config_tee_with_retry(
     let mut attempt = 0usize;
     loop {
         attempt += 1;
-        match tee.attest_receipt_key().await {
+        // The deadline bounds the in-flight attestation too, not just
+        // whether another iteration starts.
+        let attest = tee.attest_receipt_key();
+        let result = match deadline {
+            Some(deadline) => match tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                attest,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    return Err(OWNER_WAIT_DEADLINE_EXCEEDED.into());
+                }
+            },
+            None => attest.await,
+        };
+        match result {
             Ok((_attestation, attested_tee)) => return Ok(attested_tee),
             Err(error)
                 if should_retry_template_config_tee_error(&error)
@@ -1843,7 +1897,29 @@ async fn refresh_template_config_token_with_retry(
     let mut attempt = 0usize;
     loop {
         attempt += 1;
-        match api.get_config_token(instance_name).await {
+        // The deadline bounds the in-flight token request too, so a
+        // stalled response cannot run past the phase budget.
+        let token = api.get_config_token(instance_name);
+        let response = match deadline {
+            Some(deadline) => {
+                match tokio::time::timeout(
+                    deadline.saturating_duration_since(Instant::now()),
+                    token,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(_elapsed) => {
+                        return Err(format!(
+                            "owner-wait deadline reached while refreshing the config token for {key}"
+                        )
+                        .into());
+                    }
+                }
+            }
+            None => token.await,
+        };
+        match response {
             Ok(response) => return Ok(response),
             Err(error)
                 if should_retry_template_config_sync_error(&error)
@@ -1932,8 +2008,15 @@ fn template_config_delivery_continues(
     attempt: usize,
     owner_wait_engaged: bool,
     before_deadline: bool,
+    lock_pending: bool,
 ) -> bool {
-    attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS || (owner_wait_engaged && before_deadline)
+    attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS
+        || (owner_wait_engaged && before_deadline)
+        // A password-mode locked candidate that has not yet crossed the
+        // persistence threshold is inherently short-lived: it either
+        // crosses (then the deadline governs) or a non-locked outcome
+        // clears it. Auto-unlock apps never pass a pending candidate.
+        || lock_pending
 }
 
 /// Nested retry helpers (token refresh, re-attestation) keep their default
@@ -5706,29 +5789,54 @@ mod tests {
 
     #[test]
     fn template_config_delivery_continues_past_default_budget_only_when_engaged() {
-        assert!(template_config_delivery_continues(1, false, false));
+        let none = (false, false, false);
+        let engaged = (true, true, false);
+        assert!(template_config_delivery_continues(
+            1, none.0, none.1, none.2
+        ));
         assert!(template_config_delivery_continues(
             TEMPLATE_CONFIG_DELIVERY_ATTEMPTS - 1,
-            false,
-            false
+            none.0,
+            none.1,
+            none.2
         ));
         assert!(template_config_delivery_continues(
             TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
-            true,
-            true
+            engaged.0,
+            engaged.1,
+            engaged.2
         ));
         assert!(template_config_delivery_continues(
             TEMPLATE_CONFIG_DELIVERY_ATTEMPTS * 10,
-            true,
-            true
+            engaged.0,
+            engaged.1,
+            engaged.2
         ));
         assert!(!template_config_delivery_continues(
             TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
             false,
-            true
+            true,
+            false
         ));
         assert!(!template_config_delivery_continues(
             TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            true,
+            false,
+            false
+        ));
+        // A password-mode lock candidate that appeared late in the default
+        // window gets grace to cross the persistence threshold even though
+        // the attempt budget expired mid-window.
+        assert!(template_config_delivery_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            false,
+            false,
+            true
+        ));
+        // Auto-unlock apps never carry a pending candidate.
+        assert!(!template_config_delivery_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            false,
             true,
             false
         ));
@@ -5849,14 +5957,14 @@ mod tests {
             "hidden bars never render bar output; notices need a channel"
         );
         assert!(
-            announce_body.contains("timings_mode") && announce_body.contains("json_mode"),
-            "stderr is the timing JSONL stream under --timings and stdout is the \
-             final JSON document under --json: the channel choice must distinguish them"
+            announce_body.contains("timings_mode")
+                && announce_body.contains("template_deploy_notice"),
+            "stderr is the timing JSONL stream whenever --timings is set: notices \
+             must ride it as structured events, never free-form text"
         );
         assert!(
-            source.contains("json_mode: args.json")
-                && source.contains("timings_mode: args.timings"),
-            "output modes must be caller-supplied deploy metadata"
+            source.contains("timings_mode: args.timings"),
+            "output mode must be caller-supplied deploy metadata"
         );
         let set_key_fn = source.find("async fn set_key").expect("set_key exists");
         let set_key_body = &source[set_key_fn..set_key_fn + 4000];
@@ -5887,10 +5995,31 @@ mod tests {
         let refresh_arm_fn = source
             .find("async fn refresh_template_config_token_with_retry")
             .expect("refresh helper exists");
-        let refresh_body = &source[refresh_arm_fn..refresh_arm_fn + 1500];
+        let refresh_body = &source[refresh_arm_fn..refresh_arm_fn + 2000];
         assert!(
             refresh_body.contains("template_config_nested_retry_continues"),
             "the token-refresh retry loop must honor the owner-wait deadline"
+        );
+        assert!(
+            refresh_body.contains("tokio::time::timeout"),
+            "the deadline must also cut an in-flight token request, not only \
+             gate the next iteration"
+        );
+        let set_key_fn2 = source.find("async fn set_key").expect("set_key exists");
+        let set_key_body2 = &source[set_key_fn2..set_key_fn2 + 2000];
+        assert!(
+            set_key_body2.contains("tokio::time::timeout"),
+            "the deadline must also cut an in-flight config write"
+        );
+        assert!(
+            set_key_body2.contains("self.locked_since = None;"),
+            "a successful write is a non-locked outcome: the persistence window \
+             must not leak into the next key's delivery"
+        );
+        assert!(
+            deliver_fn.contains("platform key sync failed"),
+            "a sync failure after a successful TEE write is a distinct failure \
+             class and must be distinguishable from an undelivered value"
         );
     }
 
@@ -6260,7 +6389,6 @@ mod tests {
             progress: &progress,
             owner_wait_announced: false,
             post_lock_note_printed: false,
-            json_mode: false,
             timings_mode: false,
         };
         state
@@ -6345,7 +6473,6 @@ mod tests {
             progress: &progress,
             owner_wait_announced: false,
             post_lock_note_printed: false,
-            json_mode: false,
             timings_mode: false,
         };
         assert!(
