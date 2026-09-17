@@ -1426,10 +1426,17 @@ async fn deliver_template_config_with_retry(
         owner_wait_announced: false,
         post_lock_note_printed: false,
         timings_mode: target.timings_mode,
+        observed_lock: false,
     };
     for (index, (key, value)) in pairs.iter().enumerate() {
         if let Err(error) = delivery.set_key(key, value).await {
-            let owner_blocked = delivery.owner_wait_engaged_now();
+            // The unlock prescription follows the error that terminated the
+            // delivery, not the (sticky) wait history: a terminal 403 from a
+            // token refresh or an attestation failure is not repaired by
+            // unlocking, and prescribing it would bury the real cause.
+            let owner_blocked = error
+                .downcast_ref::<TeeError>()
+                .is_some_and(is_locked_template_config_error);
             return Err(undelivered_template_config_error(
                 target.instance_name,
                 &pairs[index..],
@@ -1438,8 +1445,13 @@ async fn deliver_template_config_with_retry(
             )
             .into());
         }
-        if let Err(error) =
-            sync_template_config_key_with_retry(api, target.instance_name, key).await
+        if let Err(error) = sync_template_config_key_with_retry(
+            api,
+            target.instance_name,
+            key,
+            delivery.owner_wait_deadline(),
+        )
+        .await
         {
             // Distinct failure class from an undelivered value: the value is
             // in the TEE store; only the platform's key metadata lags.
@@ -1509,6 +1521,10 @@ struct TemplateConfigDeliveryState<'a> {
     owner_wait_announced: bool,
     post_lock_note_printed: bool,
     timings_mode: bool,
+    /// Whether ANY locked response was observed this delivery, independent of
+    /// the consecutive-lock window: a success after a lock raced the
+    /// workload's boot regardless of intervening transient errors.
+    observed_lock: bool,
 }
 
 impl TemplateConfigDeliveryState<'_> {
@@ -1541,10 +1557,6 @@ impl TemplateConfigDeliveryState<'_> {
     /// token-refresh blip must not retract the guidance or end the wait.
     fn owner_wait_engaged(&self, now: Instant) -> bool {
         template_config_owner_wait_engaged(self.password_mode, self.locked_since, now)
-    }
-
-    fn owner_wait_engaged_now(&self) -> bool {
-        self.owner_wait_engaged(Instant::now())
     }
 
     /// The delivery keeps retrying through the default attempt budget, and
@@ -1589,6 +1601,7 @@ impl TemplateConfigDeliveryState<'_> {
     /// channel: the operator action must stay visible in non-interactive
     /// modes too.
     fn note_delivery_error(&mut self, error: &TeeError) {
+        self.observed_lock |= is_locked_template_config_error(error);
         self.locked_since = template_config_next_locked_since(
             error,
             self.locked_since,
@@ -1620,7 +1633,7 @@ impl TemplateConfigDeliveryState<'_> {
     /// value is guaranteed only from the NEXT boot, so say so once on a
     /// free channel.
     fn report_post_lock_delivery(&mut self) {
-        if self.locked_since.is_none() || self.post_lock_note_printed {
+        if !self.observed_lock || self.post_lock_note_printed {
             return;
         }
         self.post_lock_note_printed = true;
@@ -1763,20 +1776,42 @@ async fn sync_template_config_key_with_retry(
     api: &ApiClient,
     instance_name: &str,
     key: &str,
+    deadline: Option<Instant>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
-        match api.sync_config_key(instance_name, key, false).await {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        // The deadline bounds iteration and the in-flight request alike, so
+        // a stalled sync cannot hold the deploy open past the phase budget
+        // once the value is already stored.
+        let sync = api.sync_config_key(instance_name, key, false);
+        let result = match deadline {
+            Some(deadline) => {
+                match tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), sync)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        return Err(format!(
+                        "owner-wait deadline reached while syncing config key metadata for {key}"
+                    )
+                    .into());
+                    }
+                }
+            }
+            None => sync.await,
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(error)
                 if should_retry_template_config_sync_error(&error)
-                    && attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS =>
+                    && template_config_nested_retry_continues(attempt, deadline) =>
             {
                 tokio::time::sleep(template_config_delivery_retry_delay()).await;
             }
             Err(error) => return Err(error.into()),
         }
     }
-    Err(format!("TEE config metadata sync failed for {key}").into())
 }
 
 fn managed_config_progress_message(
@@ -2010,13 +2045,17 @@ fn template_config_delivery_continues(
     before_deadline: bool,
     lock_pending: bool,
 ) -> bool {
+    // A password-mode lock candidate or an engaged owner-wait is bounded by
+    // the owner-wait budget regardless of the attempt count — an expired
+    // budget terminates it even before the persistence threshold would
+    // engage (short --ssh-timeout-seconds). A candidate is inherently
+    // short-lived: it either crosses the threshold (still budget-bounded)
+    // or a non-locked outcome clears it. Without either, the ordinary
+    // attempt budget governs (rollout-coverage, unchanged).
+    if owner_wait_engaged || lock_pending {
+        return before_deadline;
+    }
     attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS
-        || (owner_wait_engaged && before_deadline)
-        // A password-mode locked candidate that has not yet crossed the
-        // persistence threshold is inherently short-lived: it either
-        // crosses (then the deadline governs) or a non-locked outcome
-        // clears it. Auto-unlock apps never pass a pending candidate.
-        || lock_pending
 }
 
 /// Nested retry helpers (token refresh, re-attestation) keep their default
@@ -5824,16 +5863,24 @@ mod tests {
             false,
             false
         ));
+        // An engaged wait is budget-bounded even inside the ordinary attempt
+        // count (a short --ssh-timeout-seconds must be honored), and so is a
+        // not-yet-engaged password-mode lock candidate.
+        assert!(!template_config_delivery_continues(1, true, false, false));
+        assert!(!template_config_delivery_continues(1, false, false, true));
         // A password-mode lock candidate that appeared late in the default
         // window gets grace to cross the persistence threshold even though
-        // the attempt budget expired mid-window.
+        // the attempt budget expired mid-window — while the budget lasts.
         assert!(template_config_delivery_continues(
             TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
             false,
-            false,
+            true,
             true
         ));
-        // Auto-unlock apps never carry a pending candidate.
+        // Without a candidate or engagement, the ordinary attempt budget
+        // governs regardless of the clock (rollout coverage is
+        // attempt-based).
+        assert!(template_config_delivery_continues(1, false, false, false));
         assert!(!template_config_delivery_continues(
             TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
             false,
@@ -5985,8 +6032,9 @@ mod tests {
             "a terminal delivery failure must name the abandoned keys"
         );
         assert!(
-            deliver_fn.contains("owner_wait_engaged_now()"),
-            "the unlock prescription must be reserved for owner-blocked failures"
+            deliver_fn.contains("downcast_ref::<TeeError>()"),
+            "the unlock prescription must follow the terminal error, not the \\
+             sticky wait history"
         );
         assert!(
             source.contains("fn owner_wait_deadline"),
@@ -6390,6 +6438,7 @@ mod tests {
             owner_wait_announced: false,
             post_lock_note_printed: false,
             timings_mode: false,
+            observed_lock: false,
         };
         state
             .set_key("SKEY", "value")
@@ -6474,6 +6523,7 @@ mod tests {
             owner_wait_announced: false,
             post_lock_note_printed: false,
             timings_mode: false,
+            observed_lock: false,
         };
         assert!(
             state.terminal_bootstrap_stop().await.is_none(),
