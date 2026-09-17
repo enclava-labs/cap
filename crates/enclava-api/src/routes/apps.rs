@@ -300,7 +300,7 @@ async fn request_workload_teardown(
     post_workload_teardown(state, app, &token, &workload_teardown_url(domain)).await
 }
 
-async fn post_workload_teardown(
+pub(crate) async fn post_workload_teardown(
     state: &AppState,
     app: &App,
     token: &str,
@@ -330,6 +330,12 @@ async fn post_workload_teardown(
             } else {
                 "transport"
             };
+            tracing::warn!(
+                app_id = %app.id,
+                category,
+                code = "app_delete_teardown_unavailable",
+                "workload teardown endpoint transport failure"
+            );
             return Err(app_delete_failure(
                 app.id,
                 AppDeleteFailure::TeardownEndpoint,
@@ -339,14 +345,24 @@ async fn post_workload_teardown(
     };
 
     if response.status().is_success() {
-        persist_workload_teardown_completed(&state.db, app.id).await?;
+        // The wrap is erased on the TEE at this point. Failing here (or on the
+        // marker write) would make the retry re-POST the proxy's
+        // non-idempotent teardown and wedge the delete, so a marker write
+        // failure is logged and the delete proceeds.
+        if let Err(_error) = persist_workload_teardown_completed(&state.db, app.id).await {
+            tracing::warn!(
+                app_id = %app.id,
+                code = "app_delete_teardown_marker_persist_failed",
+                "teardown completed on the TEE but the durable marker was not persisted"
+            );
+        }
         return Ok(());
     }
 
     Err(workload_teardown_http_failure(app.id, response.status()))
 }
 
-fn workload_teardown_http_failure(
+pub(crate) fn workload_teardown_http_failure(
     app_id: Uuid,
     status: StatusCode,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -355,14 +371,21 @@ fn workload_teardown_http_failure(
     } else {
         AppDeleteFailure::TeardownEndpoint
     };
+    tracing::warn!(
+        app_id = %app_id,
+        upstream_status = status.as_u16(),
+        code = failure.code(),
+        "workload teardown endpoint refused the request"
+    );
     app_delete_failure(app_id, failure, status.as_u16())
 }
 
 async fn persist_workload_teardown_completed(
     pool: &sqlx::PgPool,
     app_id: Uuid,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let mut tx = pool.begin().await.map_err(|_| internal_server_error())?;
+) -> Result<(), sqlx::Error> {
+    // Single statement: atomic on its own, and committed independently of the
+    // delete lane so a later step failure cannot roll back the marker.
     sqlx::query(
         "UPDATE apps
             SET workload_teardown_completed_at = COALESCE(workload_teardown_completed_at, clock_timestamp()),
@@ -370,10 +393,8 @@ async fn persist_workload_teardown_completed(
           WHERE id = $1",
     )
     .bind(app_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| internal_server_error())?;
-    tx.commit().await.map_err(|_| internal_server_error())?;
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

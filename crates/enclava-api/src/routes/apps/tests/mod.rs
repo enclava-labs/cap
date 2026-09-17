@@ -433,6 +433,10 @@ async fn unreachable_running_workload_teardown_blocks_deletion_and_diagnostics_a
     assert_eq!(body["error"], "app_delete_teardown_unavailable");
     assert!(diagnostics.contains(&app.id.to_string()));
     assert!(diagnostics.contains("app_delete_teardown_unavailable"));
+    assert!(
+        diagnostics.contains("category="),
+        "transport failures must log a coarse category"
+    );
     for secret in [SECRET_APP_NAME, SECRET_NAMESPACE, SECRET_DOMAIN] {
         assert!(
             !diagnostics.contains(secret),
@@ -650,6 +654,19 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
     assert!(
         teardown.contains("AppDeleteFailure::TeardownLocked"),
         "a locked TEE must fail destroy through a stable teardown error code"
+    );
+    assert!(
+        teardown.contains("Duration::from_secs(45)"),
+        "the teardown client timeout must out-wait the proxy's two 20 s KBS deletes"
+    );
+    let migration = include_str!("../../../../migrations/0048_app_workload_teardown_state.sql");
+    assert!(
+        migration.contains("WHERE status = 'running'"),
+        "the 0048 backfill must not mark legacy deleting rows teardown-required"
+    );
+    assert!(
+        !migration.contains("IN ('running', 'deleting')"),
+        "legacy in-flight deletes ran under best-effort semantics and must stay convergent"
     );
     for failure in [
         "app_delete_dns_failure",

@@ -1667,7 +1667,8 @@ async fn complete_idempotent_result(
 /// Keep this exception local to DELETE; generic RetrySafe operations fail closed.
 /// A locked TEE (423 `app_delete_teardown_locked`) is recoverable — the owner
 /// can unlock the workload — so it defers like a 5xx instead of being cached
-/// as a terminal receipt that a same-key retry would replay forever.
+/// as a terminal receipt that a same-key retry would replay forever. The
+/// deferred body carries a fixed `cause` so PaaS callers can see why.
 async fn complete_app_delete_result(
     lease: IdempotencyLease,
     result: Result<IdempotencyResponse, InternalRouteError>,
@@ -1677,7 +1678,11 @@ async fn complete_app_delete_result(
             && body.get("error").and_then(serde_json::Value::as_str)
                 == Some("app_delete_teardown_locked");
         if status.is_server_error() || teardown_locked {
-            return Err(defer_idempotent_request(lease).await);
+            let (deferred_status, Json(mut deferred_body)) = defer_idempotent_request(lease).await;
+            if teardown_locked {
+                deferred_body["cause"] = serde_json::json!("app_delete_teardown_locked");
+            }
+            return Err((deferred_status, Json(deferred_body)));
         }
     }
     complete_idempotent_result(lease, result).await
@@ -8970,16 +8975,27 @@ mod tests {
         let operation_id = lease.operation_id();
         // A locked TEE is recoverable once the owner unlocks it: the 423 must
         // defer (row stays incomplete) instead of caching a terminal receipt
-        // that every same-key retry would replay.
+        // that every same-key retry would replay. The body comes from the
+        // route's real helper so the error code cannot drift.
         let failure = complete_app_delete_result(
             lease,
-            Err(json_error(StatusCode::LOCKED, "app_delete_teardown_locked")),
+            Err(crate::routes::apps::workload_teardown_http_failure(
+                Uuid::new_v4(),
+                StatusCode::LOCKED,
+            )),
         )
         .await
         .unwrap_err();
+        assert_eq!(failure.0, StatusCode::CONFLICT);
         assert_eq!(
-            (failure.0, failure.1.0),
-            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+            failure.1.0.get("error"),
+            idempotency_in_progress_error().1.0.get("error"),
+            "locked teardown defers like a server error"
+        );
+        assert_eq!(
+            failure.1.0.get("cause"),
+            Some(&serde_json::json!("app_delete_teardown_locked")),
+            "deferred locked teardown must name its cause"
         );
         let receipt: (bool, bool, bool, bool) = sqlx::query_as(
             "SELECT completed_at IS NULL, response_status IS NULL,
@@ -9246,6 +9262,296 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(final_rows, (0, 1));
+    }
+
+    /// Route-level pin of the durable teardown decision and completion marker
+    /// (the #109 retry contract): a running app requires teardown, an
+    /// unreachable TEE blocks the first attempt before any other cleanup, and
+    /// once the completion marker exists the retry finishes with the TEE gone.
+    #[tokio::test]
+    async fn app_delete_retry_finishes_after_teardown_completion_marker() {
+        const CHILD: &str = "CAP_APP_DELETE_TEST_TEARDOWN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // KBS policy state and provider leases are global within a schema.
+            let pool = database_test_pool().await;
+            let schema = format!("app_delete_td_{}", Uuid::new_v4().simple());
+            sqlx::query(&format!("CREATE SCHEMA {schema}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            let mut database_url = reqwest::Url::parse(
+                &std::env::var("DATABASE_URL")
+                    .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".into()),
+            )
+            .unwrap();
+            database_url
+                .query_pairs_mut()
+                .append_pair("options", &format!("-csearch_path={schema}"));
+            // Isolate kube's process-wide configuration from other lib tests.
+            let mock_deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let resources = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+                String,
+                serde_json::Value,
+            >::new()));
+            let deleted = mock_deleted.clone();
+            let mock_resources = resources.clone();
+            let server = axum::Router::new().fallback(
+                move |request: axum::extract::Request| {
+                    let deleted = deleted.clone();
+                    let resources = mock_resources.clone();
+                    async move {
+                        let path = request.uri().path().to_string();
+                        let method = request.method().clone();
+                        if path.starts_with("/zones/") {
+                            return (StatusCode::OK, Json(serde_json::json!({"success":true, "result":[], "errors":[]})));
+                        }
+                        let name = path.rsplit('/').next().unwrap();
+                        let metadata = serde_json::json!({"name": name, "uid": "fixture", "resourceVersion": "1"});
+                        if path.starts_with("/api/v1/namespaces/cap-") {
+                            if method == axum::http::Method::DELETE {
+                                deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+                                return (StatusCode::OK, Json(serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Success", "code":200})));
+                            }
+                            if deleted.load(std::sync::atomic::Ordering::SeqCst) {
+                                return (StatusCode::NOT_FOUND, Json(serde_json::json!({"apiVersion":"v1", "kind":"Status", "status":"Failure", "reason":"NotFound", "message":"absent", "code":404})));
+                            }
+                            return (StatusCode::OK, Json(serde_json::json!({"apiVersion":"v1", "kind":"Namespace", "metadata":metadata})));
+                        }
+                        if method == axum::http::Method::PUT {
+                            let bytes = axum::body::to_bytes(request.into_body(), 1_048_576).await.unwrap();
+                            let resource: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                            resources.lock().unwrap().insert(path, resource.clone());
+                            return (StatusCode::OK, Json(resource));
+                        }
+                        if let Some(resource) = resources.lock().unwrap().get(&path).cloned() {
+                            return (StatusCode::OK, Json(resource));
+                        }
+                        let resource = if path.contains("/configmaps/") {
+                            serde_json::json!({"apiVersion":"v1", "kind":"ConfigMap", "metadata":metadata,
+                                "data":{"haproxy.cfg":"", "policy.rego":"package policy\nresource_bindings := {}\nowner_resource_bindings := {}\n"}})
+                        } else {
+                            assert!(path.contains("/daemonsets/") || path.contains("/deployments/"), "unexpected provider request {path}");
+                            serde_json::json!({"apiVersion":"apps/v1", "kind": if path.contains("/daemonsets/") {"DaemonSet"} else {"Deployment"},
+                                "metadata":metadata, "spec":{"replicas":1, "selector":{}, "template":{"metadata":{}, "spec":{"containers":[]}}},
+                                "status":{"readyReplicas":1, "availableReplicas":1, "updatedReplicas":1, "observedGeneration":1}})
+                        };
+                        (StatusCode::OK, Json(resource))
+                    }
+                },
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+            let config =
+                std::env::temp_dir().join(format!("cap-delete-td-{}.json", Uuid::new_v4()));
+            std::fs::write(
+                &config,
+                serde_json::to_vec(&serde_json::json!({
+                    "apiVersion":"v1", "kind":"Config", "current-context":"test",
+                    "clusters":[{"name":"test", "cluster":{"server":format!("http://{address}")}}],
+                    "contexts":[{"name":"test", "context":{"cluster":"test", "user":"test"}}],
+                    "users":[{"name":"test", "user":{}}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "routes::internal::tests::app_delete_retry_finishes_after_teardown_completion_marker",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("DATABASE_URL", database_url.as_str())
+                .env("KUBECONFIG", &config)
+                .env("CAP_APP_DELETE_TEST_PROVIDER_URL", format!("http://{address}"))
+                .env("TENANT_HAPROXY_NAMESPACE", "tenant-envoy")
+                .env("TENANT_HAPROXY_CONFIGMAP", "haproxy-tenant")
+                .env("TENANT_HAPROXY_DAEMONSET", "haproxy-tenant")
+                .kill_on_drop(true)
+                .output();
+            let output = tokio::time::timeout(std::time::Duration::from_secs(60), output).await;
+            task.abort();
+            std::fs::remove_file(config).unwrap();
+            sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+                .execute(&pool)
+                .await
+                .unwrap();
+            let output = output.expect("teardown retry must not deadlock").unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(
+                stdout.matches("app deletion step failed").count(),
+                1,
+                "exactly one failed teardown attempt before the marker"
+            );
+            assert_eq!(
+                stdout
+                    .matches("app_delete_teardown_already_completed")
+                    .count(),
+                1,
+                "the retry must skip teardown via the completion marker"
+            );
+            return;
+        }
+
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_test_writer()
+            .init();
+        let (mut state, auth, app_name, app_id) = app_delete_fixture().await;
+        // A running app holds confidential state: teardown is required and the
+        // pre-delete decision must survive the deleting transition.
+        sqlx::query("UPDATE apps SET status = 'running' WHERE id = $1")
+            .bind(app_id)
+            .execute(&state.db)
+            .await
+            .unwrap();
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.dns = Some(crate::dns::DnsConfig {
+            cloudflare_api_token: "test".into(),
+            cloudflare_api_base_url: std::env::var("CAP_APP_DELETE_TEST_PROVIDER_URL").unwrap(),
+            cloudflare_zone_id: Some("test".into()),
+            cloudflare_zone_name: "enclava.test".into(),
+            target: "192.0.2.1".into(),
+            required: true,
+        });
+        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
+            namespace: "kbs-test".into(),
+            configmap_name: "resource-policy".into(),
+            policy_key: "policy.rego".into(),
+            deployment_name: "trustee".into(),
+            required: true,
+            signed_policy_retention: 1,
+            signed_policy_max_bytes: 1_048_576,
+        });
+        // The TEE is unreachable for both attempts; only the durable marker
+        // can let the retry through.
+        state.tee_http_client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(10))
+            .build()
+            .unwrap();
+        for table in ["kbs_owner_bindings", "kbs_tls_bindings"] {
+            sqlx::query(&format!("INSERT INTO {table} (app_id, binding_key, namespace, service_account, tenant_instance_identity_hash)
+                SELECT id, id::text, namespace, service_account, tenant_instance_identity_hash FROM apps WHERE id = $1"))
+                .bind(app_id).execute(&state.db).await.unwrap();
+        }
+        let paas_id = auth.org_id.simple().to_string();
+        let key = format!("teardown-marker-{}", Uuid::new_v4());
+        let headers = config_token_actor_headers(&key, &paas_id);
+        let failed = delete_paas_app(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_id.clone(), app_name.clone())),
+            headers.clone(),
+            Json(serde_json::json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            (failed.0, failed.1.0),
+            (StatusCode::CONFLICT, idempotency_in_progress_error().1.0)
+        );
+        let after_first: (String, bool, bool, bool) = sqlx::query_as(
+            "SELECT status::text, workload_teardown_required,
+                    workload_teardown_completed_at IS NOT NULL,
+                    (SELECT deleted_at IS NULL FROM kbs_owner_bindings WHERE app_id = apps.id)
+               FROM apps WHERE id = $1",
+        )
+        .bind(app_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            after_first,
+            ("deleting".into(), true, false, true),
+            "unreachable teardown must block the delete before KBS revocation"
+        );
+        // Simulate the durable marker left by a previously successful teardown
+        // (or the documented operator recovery for an already-erased wrap).
+        sqlx::query(
+            "UPDATE apps SET workload_teardown_completed_at = clock_timestamp() WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&state.db)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE app_mutation_leases SET locked_until = clock_timestamp() - interval '2 seconds', reclaim_after = clock_timestamp() - interval '1 second' WHERE app_id = $1")
+            .bind(app_id).execute(&state.db).await.unwrap();
+        sqlx::query("UPDATE external_resource_mutation_leases SET locked_until = clock_timestamp() - interval '2 seconds', reclaim_after = clock_timestamp() - interval '1 second' WHERE operation_id = $1 AND reclaim_after <> 'infinity'::timestamptz")
+            .bind(app_id).execute(&state.db).await.unwrap();
+        expire_idempotency_lease(&state.db, &key).await;
+        let (status, _) = delete_paas_app(
+            internal_test_auth(),
+            State(state.clone()),
+            Path((paas_id.clone(), app_name.clone())),
+            headers.clone(),
+            Json(serde_json::json!({})),
+        )
+        .await
+        .expect("retry must complete via the completion marker");
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let final_rows: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM apps WHERE id = $1),
+                    (SELECT count(*) FROM audit_log WHERE org_id = $2 AND action = 'app.delete')",
+        )
+        .bind(app_id)
+        .bind(auth.org_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+        assert_eq!(final_rows, (0, 1));
+    }
+
+    #[tokio::test]
+    async fn successful_teardown_persists_completion_marker() {
+        let (state, _auth, _app_name, app_id) = app_delete_fixture().await;
+        let app: crate::models::App = sqlx::query_as("SELECT * FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = axum::Router::new().route(
+            "/.well-known/confidential/teardown",
+            axum::routing::post(|| async {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({"status": "teardown_complete"})),
+                )
+            }),
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+        let mut teardown_state = state.clone();
+        teardown_state.tee_http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("http://{address}/.well-known/confidential/teardown");
+        let result = crate::routes::apps::post_workload_teardown(
+            &teardown_state,
+            &app,
+            "teardown-token",
+            &url,
+        )
+        .await;
+        task.abort();
+        result.expect("successful teardown must not fail the delete");
+        let completed_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT workload_teardown_completed_at FROM apps WHERE id = $1")
+                .bind(app_id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert!(
+            completed_at.is_some(),
+            "a 2xx teardown must persist the durable completion marker"
+        );
     }
 
     #[tokio::test]
