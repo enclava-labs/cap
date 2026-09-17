@@ -112,6 +112,13 @@ jobs:
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test
 
+      - name: Run enclava-init prod-strict lib tests
+        # Runs prod_strict_ignores_dev_no_luks_env against a debug build
+        # (--release would disable debug_assertions and make the test vacuous):
+        # proves the ENCLAVA_INIT_DEV_NO_LUKS gate is compiled out, not just
+        # that the cfg string exists in source. Needs no DATABASE_URL.
+        run: cargo test --locked -p enclava-init --lib --features prod-strict -- --test-threads=1
+
       - name: Run doctests
         run: cargo test --doc
 
@@ -195,11 +202,6 @@ jobs:
           cargo build --release -p enclava-api --features prod-strict
           cargo build --release -p enclava-cli --features prod-strict
           cargo build --release -p enclava-init --features prod-strict
-          # Runs prod_strict_ignores_dev_no_luks_env against a debug build
-          # (--release would disable debug_assertions and make the test vacuous):
-          # proves the ENCLAVA_INIT_DEV_NO_LUKS gate is compiled out, not just
-          # that the cfg string exists in source.
-          cargo test --locked -p enclava-init --lib --features prod-strict -- --test-threads=1
         env:
           # CI-compile-only: this job does not publish images. Do not fall back
           # to the committed fixture; prod-strict rejects that root.

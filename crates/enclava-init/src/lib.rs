@@ -169,28 +169,28 @@ mod tests {
             );
         }
 
-        // Pull-request (debug) builds must never be pushed or signed: the
-        // `push:` expression and every push-gated `if:` condition exclude
-        // pull_request events.
-        let push_expr = workflow
-            .split("push: ${{")
-            .nth(1)
-            .expect("Build and push step push expression")
-            .split("}}")
-            .next()
-            .expect("push expression end");
+        // The exact gate that must guard every push/sign path: pull_request
+        // (debug) builds are never pushed or signed. Pinned by equality, not
+        // token absence, so `push: ${{ true }}` or `if: always()` fail the
+        // test instead of slipping through.
+        const PUSH_GATE: &str = "github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')";
+
+        let exact_push_gate = "push: ".to_string() + "${{ " + PUSH_GATE + " }}";
         assert!(
-            !push_expr.contains("pull_request"),
-            "Build and push must never push pull_request builds: push: ${{{push_expr}}}"
+            workflow.contains(&exact_push_gate),
+            "Build and push must use the exact non-pull_request push gate"
         );
-        for cond in workflow
-            .lines()
-            .map(str::trim)
-            .filter(|line| line.starts_with("if: ") && line.contains("workflow_dispatch"))
-        {
+        for step in ["Install cosign", "Sign and verify pushed digest"] {
+            let block = workflow
+                .split(&format!("- name: {step}"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{step} step"))
+                .split("\n      - name:")
+                .next()
+                .unwrap_or_else(|| panic!("{step} step body"));
             assert!(
-                !cond.contains("pull_request"),
-                "push/sign gating must exclude pull_request events: {cond}"
+                block.contains(&format!("if: {PUSH_GATE}")),
+                "{step} must be gated on the exact non-pull_request condition"
             );
         }
 
