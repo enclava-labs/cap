@@ -562,7 +562,7 @@ async fn deploy_with_timings(
     let mut tee = timings
         .run(
             DeployPhase::CustomerConfigAttestation,
-            attest_template_config_tee_with_retry(tee),
+            attest_template_config_tee_with_retry(tee, None),
         )
         .await?;
     let mut tee_url = tee_url;
@@ -581,6 +581,8 @@ async fn deploy_with_timings(
                     password_mode: template.unlock_mode == "password",
                     owner_wait_budget: Duration::from_secs(args.ssh_timeout_seconds),
                     progress: &pb,
+                    json_mode: args.json,
+                    timings_mode: args.timings,
                 },
                 &mut tee,
                 &mut config_token,
@@ -1389,6 +1391,13 @@ struct DeliverTemplateConfigTarget<'a> {
     password_mode: bool,
     owner_wait_budget: Duration,
     progress: &'a ProgressBar,
+    /// Output modes, so operator notices pick a channel that does not
+    /// corrupt a machine stream: with a hidden bar, `--json` frees stderr
+    /// (stdout holds the final JSON document), `--timings` frees stdout
+    /// (stderr carries the timing JSONL); with both, machine streams own
+    /// both channels and the notices stay silent.
+    json_mode: bool,
+    timings_mode: bool,
 }
 
 async fn deliver_template_config_with_retry(
@@ -1416,6 +1425,8 @@ async fn deliver_template_config_with_retry(
         progress: target.progress,
         owner_wait_announced: false,
         post_lock_note_printed: false,
+        json_mode: target.json_mode,
+        timings_mode: target.timings_mode,
     };
     for (index, (key, value)) in pairs.iter().enumerate() {
         if let Err(error) = delivery.set_key(key, value).await {
@@ -1487,6 +1498,8 @@ struct TemplateConfigDeliveryState<'a> {
     progress: &'a ProgressBar,
     owner_wait_announced: bool,
     post_lock_note_printed: bool,
+    json_mode: bool,
+    timings_mode: bool,
 }
 
 impl TemplateConfigDeliveryState<'_> {
@@ -1535,13 +1548,28 @@ impl TemplateConfigDeliveryState<'_> {
         )
     }
 
+    /// An operator notice on a channel that never corrupts a machine
+    /// stream: the bar when visible, stderr under `--json` (stdout holds
+    /// the final JSON document), stdout under `--timings` alone (stderr
+    /// carries the timing JSONL). With both machine modes the notice has
+    /// no free channel and is dropped.
+    fn announce(&self, line: &str) {
+        if !self.progress.is_hidden() {
+            self.progress.println(line);
+        } else if !self.timings_mode {
+            eprintln!("{line}");
+        } else if !self.json_mode {
+            println!("{line}");
+        }
+    }
+
     /// Track locked persistence, and while the owner-wait is engaged keep a
     /// clocked guidance message on the progress bar (the same elapsed/total
     /// format every other wait phase renders — a silent retry loop is
-    /// indistinguishable from an instant failure). Hidden bars (`--json`,
-    /// `--timings`) never render `set_message`, so the engagement is also
-    /// announced once on stderr: the operator action must stay visible in
-    /// non-interactive modes too.
+    /// indistinguishable from an instant failure). Hidden bars never render
+    /// `set_message`, so the engagement is also announced once on a free
+    /// channel: the operator action must stay visible in non-interactive
+    /// modes too.
     fn note_delivery_error(&mut self, error: &TeeError) {
         self.locked_since = template_config_next_locked_since(
             error,
@@ -1560,29 +1588,40 @@ impl TemplateConfigDeliveryState<'_> {
             self.delivery_started.elapsed(),
             self.owner_wait_budget,
         ));
-        if !self.owner_wait_announced && self.progress.is_hidden() {
+        if !self.owner_wait_announced {
             self.owner_wait_announced = true;
-            eprintln!("{label} — config delivery continues automatically.");
+            self.announce(&format!(
+                "{label} — config delivery continues automatically."
+            ));
         }
     }
 
     /// A write that succeeds after any `423 locked` observation may have
     /// missed the workload's boot: the operator's unlock starts the
     /// workload, and container creation races this delivery. The delivered
-    /// value is guaranteed only from the NEXT boot, so say so once on the
-    /// same channels as the guidance (hidden bars never render `println`).
+    /// value is guaranteed only from the NEXT boot, so say so once on a
+    /// free channel.
     fn report_post_lock_delivery(&mut self) {
         if self.locked_since.is_none() || self.post_lock_note_printed {
             return;
         }
         self.post_lock_note_printed = true;
-        let note =
-            format!("Config delivered while the TEE was unlocking: {CONFIG_APPLICATION_NOTE}");
-        if self.progress.is_hidden() {
-            eprintln!("{note}");
-        } else {
-            self.progress.println(note);
-        }
+        self.announce(&format!(
+            "Config delivered while the TEE was unlocking: {CONFIG_APPLICATION_NOTE}"
+        ));
+    }
+
+    /// The deadline nested retry helpers (token refresh, re-attestation)
+    /// must honor while the owner-wait is engaged: while waiting on the
+    /// owner they may run until the phase deadline instead of stopping at
+    /// their own default budgets, and never past it. Unengaged deliveries
+    /// pass `None` and keep today's exact behavior.
+    fn owner_wait_deadline(&self) -> Option<Instant> {
+        self.owner_wait_engaged(Instant::now()).then(|| {
+            self.delivery_started
+                .checked_add(self.owner_wait_budget)
+                .unwrap_or_else(Instant::now)
+        })
     }
 
     async fn set_key(&mut self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1599,9 +1638,14 @@ impl TemplateConfigDeliveryState<'_> {
                         return Err(error.into());
                     }
                     self.note_delivery_error(&error);
-                    let refreshed =
-                        refresh_template_config_token_with_retry(self.api, self.instance_name, key)
-                            .await?;
+                    let nested_deadline = self.owner_wait_deadline();
+                    let refreshed = refresh_template_config_token_with_retry(
+                        self.api,
+                        self.instance_name,
+                        key,
+                        nested_deadline,
+                    )
+                    .await?;
                     let refreshed_tee_url =
                         refreshed_template_config_endpoint_url(&refreshed, self.tee_url)?;
                     let refreshed_tee_resolve_ip =
@@ -1613,7 +1657,9 @@ impl TemplateConfigDeliveryState<'_> {
                             &refreshed_tee_url,
                             refreshed_tee_resolve_ip,
                         );
-                        *self.tee = attest_template_config_tee_with_retry(refreshed_tee).await?;
+                        *self.tee =
+                            attest_template_config_tee_with_retry(refreshed_tee, nested_deadline)
+                                .await?;
                         *self.tee_url = refreshed_tee_url;
                         *self.tee_resolve_ip = refreshed_tee_resolve_ip;
                     }
@@ -1641,20 +1687,22 @@ impl TemplateConfigDeliveryState<'_> {
 
 async fn attest_template_config_tee_with_retry(
     tee: TeeClient,
+    deadline: Option<Instant>,
 ) -> Result<TeeClient, Box<dyn std::error::Error>> {
-    for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
         match tee.attest_receipt_key().await {
             Ok((_attestation, attested_tee)) => return Ok(attested_tee),
             Err(error)
                 if should_retry_template_config_tee_error(&error)
-                    && attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS =>
+                    && template_config_nested_retry_continues(attempt, deadline) =>
             {
                 tokio::time::sleep(template_config_delivery_retry_delay()).await;
             }
             Err(error) => return Err(error.into()),
         }
     }
-    Err("TEE attestation failed before config delivery".into())
 }
 
 async fn sync_template_config_key_with_retry(
@@ -1790,13 +1838,16 @@ async fn refresh_template_config_token_with_retry(
     api: &ApiClient,
     instance_name: &str,
     key: &str,
+    deadline: Option<Instant>,
 ) -> Result<enclava_cli::api_types::ConfigTokenResponse, Box<dyn std::error::Error>> {
-    for attempt in 1..=TEMPLATE_CONFIG_DELIVERY_ATTEMPTS {
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
         match api.get_config_token(instance_name).await {
             Ok(response) => return Ok(response),
             Err(error)
                 if should_retry_template_config_sync_error(&error)
-                    && attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS =>
+                    && template_config_nested_retry_continues(attempt, deadline) =>
             {
                 tokio::time::sleep(template_config_delivery_retry_delay()).await;
             }
@@ -1808,7 +1859,6 @@ async fn refresh_template_config_token_with_retry(
             }
         }
     }
-    Err(format!("TEE config token refresh failed while writing {key}").into())
 }
 
 fn refreshed_template_config_endpoint_url(
@@ -1884,6 +1934,14 @@ fn template_config_delivery_continues(
     before_deadline: bool,
 ) -> bool {
     attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS || (owner_wait_engaged && before_deadline)
+}
+
+/// Nested retry helpers (token refresh, re-attestation) keep their default
+/// attempt budget, and while an owner-wait deadline is supplied they may
+/// keep retrying until it — never past it.
+fn template_config_nested_retry_continues(attempt: usize, deadline: Option<Instant>) -> bool {
+    attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS
+        || deadline.is_some_and(|deadline| Instant::now() < deadline)
 }
 
 /// Next value of the locked-persistence window: a locked response keeps or
@@ -5782,14 +5840,23 @@ mod tests {
             source.contains("enclava unlock --app {}"),
             "the guidance message must name the unlock command"
         );
-        let note_fn = source
-            .find("fn note_delivery_error")
-            .expect("note_delivery_error exists");
-        let note_body = &source[note_fn..note_fn + 2000];
+        let announce_fn = source
+            .find("fn announce")
+            .expect("operator notice channel selection exists");
+        let announce_body = &source[announce_fn..announce_fn + 1200];
         assert!(
-            note_body.contains("is_hidden()"),
-            "hidden bars (--json/--timings) never render set_message: the \
-             operator action must also reach stderr"
+            announce_body.contains("is_hidden()"),
+            "hidden bars never render bar output; notices need a channel"
+        );
+        assert!(
+            announce_body.contains("timings_mode") && announce_body.contains("json_mode"),
+            "stderr is the timing JSONL stream under --timings and stdout is the \
+             final JSON document under --json: the channel choice must distinguish them"
+        );
+        assert!(
+            source.contains("json_mode: args.json")
+                && source.contains("timings_mode: args.timings"),
+            "output modes must be caller-supplied deploy metadata"
         );
         let set_key_fn = source.find("async fn set_key").expect("set_key exists");
         let set_key_body = &source[set_key_fn..set_key_fn + 4000];
@@ -5813,6 +5880,41 @@ mod tests {
             deliver_fn.contains("owner_wait_engaged_now()"),
             "the unlock prescription must be reserved for owner-blocked failures"
         );
+        assert!(
+            source.contains("fn owner_wait_deadline"),
+            "nested retry helpers need the phase deadline while engaged"
+        );
+        let refresh_arm_fn = source
+            .find("async fn refresh_template_config_token_with_retry")
+            .expect("refresh helper exists");
+        let refresh_body = &source[refresh_arm_fn..refresh_arm_fn + 1500];
+        assert!(
+            refresh_body.contains("template_config_nested_retry_continues"),
+            "the token-refresh retry loop must honor the owner-wait deadline"
+        );
+    }
+
+    #[test]
+    fn template_config_nested_retry_continues_honors_deadline() {
+        // Default budget first, deadline-bounded extension only while one is
+        // supplied and unexpired.
+        assert!(template_config_nested_retry_continues(1, None));
+        assert!(template_config_nested_retry_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS - 1,
+            Some(Instant::now() - Duration::from_secs(1))
+        ));
+        assert!(template_config_nested_retry_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            Some(Instant::now() + Duration::from_secs(60))
+        ));
+        assert!(!template_config_nested_retry_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            None
+        ));
+        assert!(!template_config_nested_retry_continues(
+            TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            Some(Instant::now() - Duration::from_secs(1))
+        ));
     }
 
     #[test]
@@ -6158,6 +6260,8 @@ mod tests {
             progress: &progress,
             owner_wait_announced: false,
             post_lock_note_printed: false,
+            json_mode: false,
+            timings_mode: false,
         };
         state
             .set_key("SKEY", "value")
@@ -6241,6 +6345,8 @@ mod tests {
             progress: &progress,
             owner_wait_announced: false,
             post_lock_note_printed: false,
+            json_mode: false,
+            timings_mode: false,
         };
         assert!(
             state.terminal_bootstrap_stop().await.is_none(),
