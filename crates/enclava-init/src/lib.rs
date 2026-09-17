@@ -191,6 +191,16 @@ mod tests {
             else_branch.contains("profile=release") && !else_branch.contains("profile=debug"),
             "tags, workflow_dispatch, and main pushes must select BUILD_PROFILE=release"
         );
+        assert_eq!(
+            select.matches("profile=debug").count(),
+            1,
+            "profile=debug may be echoed exactly once, inside the pull_request branch"
+        );
+        assert_eq!(
+            select.matches("profile=release").count(),
+            1,
+            "profile=release may be echoed exactly once, inside the else branch"
+        );
 
         // The exact gate that must guard every push/sign path: pull_request
         // (debug) builds are never pushed or signed. Pinned by equality, not
@@ -199,9 +209,19 @@ mod tests {
         const PUSH_GATE: &str = "github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')";
 
         let exact_push_gate = "push: ".to_string() + "${{ " + PUSH_GATE + " }}";
-        assert!(
-            workflow.contains(&exact_push_gate),
-            "Build and push must use the exact non-pull_request push gate"
+        let push_lines: Vec<&str> = workflow
+            .lines()
+            .filter(|l| l.starts_with("   ") && l.trim_start().starts_with("push:"))
+            .collect();
+        assert_eq!(
+            push_lines.len(),
+            1,
+            "exactly one push property is allowed (expression or literal), and it must be the gated one"
+        );
+        assert_eq!(
+            push_lines[0].trim(),
+            exact_push_gate,
+            "the single push property must be the exact non-pull_request gate"
         );
         for step in ["Install cosign", "Sign and verify pushed digest"] {
             let block = workflow
@@ -212,16 +232,12 @@ mod tests {
                 .next()
                 .unwrap_or_else(|| panic!("{step} step body"));
             assert!(
-                block.contains(&format!("if: {PUSH_GATE}")),
+                block
+                    .lines()
+                    .any(|l| l.trim() == format!("if: {PUSH_GATE}")),
                 "{step} must be gated on the exact non-pull_request condition"
             );
         }
-
-        assert_eq!(
-            workflow.match_indices("\n          push:").count(),
-            1,
-            "exactly one push property is allowed (expression or literal), and it must be the gated one"
-        );
         assert!(
             !workflow.contains("outputs:"),
             "registry outputs bypass the push gate; only the gated push: property may publish"
