@@ -83,19 +83,23 @@ mod tests {
         ];
         for (name, raw) in dockerfiles {
             let dockerfile = raw.replace("\r\n", "\n");
-            let cargo_build_lines: Vec<&str> = dockerfile
+            let cargo_lines: Vec<&str> = dockerfile
                 .lines()
                 .map(str::trim)
-                .filter(|line| line.contains("cargo build"))
+                .filter(|line| {
+                    line.contains("cargo build")
+                        || line.contains("cargo run")
+                        || line.contains("cargo install")
+                })
                 .collect();
             assert!(
-                !cargo_build_lines.is_empty(),
+                !cargo_lines.is_empty(),
                 "{name} Dockerfile must contain cargo build lines"
             );
-            for line in cargo_build_lines {
+            for line in cargo_lines {
                 assert!(
                     line.contains("--locked"),
-                    "cargo build in {name} Dockerfile must use --locked: {line}"
+                    "cargo build/run/install in {name} Dockerfile must use --locked: {line}"
                 );
             }
         }
@@ -145,20 +149,31 @@ mod tests {
             .next()
             .expect("build profile step body");
 
+        // Pin the polarity of the profile selection, not just token
+        // presence: debug exactly in the pull_request branch, release
+        // exactly in the else branch. Swapping the branches must fail.
+        let pr_branch = select
+            .split("= \"pull_request\" ]; then")
+            .nth(1)
+            .expect("pull_request branch")
+            .split("else")
+            .next()
+            .expect("pull_request branch body");
+        let else_branch = select
+            .split("\n          else")
+            .nth(1)
+            .expect("else branch")
+            .split("\n          fi")
+            .next()
+            .expect("else branch body");
         assert!(
-            select.contains("profile=release"),
-            "tags, workflow_dispatch, and main pushes must use BUILD_PROFILE=release"
+            pr_branch.contains("profile=debug") && !pr_branch.contains("profile=release"),
+            "only pull_request builds may select BUILD_PROFILE=debug"
         );
-        if select.contains("profile=debug") {
-            assert!(
-                select.contains("pull_request"),
-                "debug BUILD_PROFILE is only allowed for pull_request builds"
-            );
-            assert!(
-                !select.contains("refs/heads/main"),
-                "main branch pushes must not select debug BUILD_PROFILE"
-            );
-        }
+        assert!(
+            else_branch.contains("profile=release") && !else_branch.contains("profile=debug"),
+            "tags, workflow_dispatch, and main pushes must select BUILD_PROFILE=release"
+        );
 
         // The exact gate that must guard every push/sign path: pull_request
         // (debug) builds are never pushed or signed. Pinned by equality, not
@@ -186,9 +201,9 @@ mod tests {
         }
 
         assert_eq!(
-            workflow.match_indices("push: $").count(),
+            workflow.match_indices("\n          push:").count(),
             1,
-            "exactly one push expression is allowed, and it must be the gated one"
+            "exactly one push property is allowed (expression or literal), and it must be the gated one"
         );
         assert!(
             workflow.contains("BUILD_PROFILE=${{ steps.build_profile.outputs.profile }}"),

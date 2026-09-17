@@ -71,6 +71,8 @@ jobs:
             exit 1
           fi
 
+      # Guard tests in crates/enclava-init/src/lib.rs pin this step's name,
+      # branch polarity, and build-args wiring — keep them in sync when editing.
       - name: Select build profile
         id: build_profile
         run: |
