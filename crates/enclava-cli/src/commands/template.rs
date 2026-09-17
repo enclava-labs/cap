@@ -2154,12 +2154,17 @@ fn template_config_delivery_continues(
     attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS
 }
 
-/// Nested retry helpers (token refresh, re-attestation) keep their default
-/// attempt budget, and while an owner-wait deadline is supplied they may
-/// keep retrying until it — never past it.
+/// Nested retry helpers (token refresh, re-attestation, key-metadata sync):
+/// without a deadline they keep their default attempt budget; a supplied
+/// deadline REPLACES that budget — retries continue until it, never past
+/// it, so fast-failing responses cannot sleep-loop to attempt 121 after
+/// the phase budget has elapsed (an in-flight timeout cannot cut a future
+/// that is already ready).
 fn template_config_nested_retry_continues(attempt: usize, deadline: Option<Instant>) -> bool {
-    attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS
-        || deadline.is_some_and(|deadline| Instant::now() < deadline)
+    match deadline {
+        Some(deadline) => Instant::now() < deadline,
+        None => attempt < TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+    }
 }
 
 /// Next value of the locked-persistence window: a locked response keeps or
@@ -6211,7 +6216,7 @@ mod tests {
         assert!(template_config_nested_retry_continues(1, None));
         assert!(template_config_nested_retry_continues(
             TEMPLATE_CONFIG_DELIVERY_ATTEMPTS - 1,
-            Some(Instant::now() - Duration::from_secs(1))
+            None
         ));
         assert!(template_config_nested_retry_continues(
             TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
@@ -6223,6 +6228,13 @@ mod tests {
         ));
         assert!(!template_config_nested_retry_continues(
             TEMPLATE_CONFIG_DELIVERY_ATTEMPTS,
+            Some(Instant::now() - Duration::from_secs(1))
+        ));
+        // A supplied deadline replaces the attempt budget: an expired
+        // deadline stops the loop even with attempts remaining, so
+        // fast-failing responses cannot outlive the phase budget.
+        assert!(!template_config_nested_retry_continues(
+            1,
             Some(Instant::now() - Duration::from_secs(1))
         ));
     }
