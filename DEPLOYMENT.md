@@ -182,9 +182,11 @@ together:
 1. Generate the production root offline:
    `openssl genpkey -algorithm ed25519 -out root.pem`
    (`openssl pkey -in root.pem -noout -text` shows the seed and pubkey hex.)
-2. Sign the payload with the repository's canonical encoding:
+2. Sign the payload with the repository's canonical encoding. Keep the seed
+   in a protected file and redirect it into the helper — it never appears in
+   argv or shell history:
    `cargo run --locked -p enclava-cli --example platform-release -- sign \
-   payload.json <root-seed-hex> > platform-release.json`
+   payload.json < root-seed.hex > platform-release.json`
 3. Sanity-check it: `cargo run --locked -p enclava-cli --example \
    platform-release -- verify platform-release.json <root-pubkey-hex>`
 4. Set both repository secrets in one sitting:

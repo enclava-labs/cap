@@ -10,9 +10,11 @@
 //! openssl genpkey -algorithm ed25519 -out root.pem
 //! openssl pkey -in root.pem -noout -text         # read seed + pubkey hex
 //!
-//! # produce a signed envelope from a payload document:
+//! # produce a signed envelope from a payload document. The root seed is
+//! # read from stdin — redirect it from a protected file so it never
+//! # appears in argv or shell history:
 //! cargo run --locked -p enclava-cli --example platform-release -- sign \
-//!     payload.json <root-seed-hex> > platform-release.json
+//!     payload.json < root-seed.hex > platform-release.json
 //!
 //! # verify the envelope a build would bundle, before setting secrets:
 //! cargo run --locked -p enclava-cli --example platform-release -- verify \
@@ -23,6 +25,7 @@
 //! `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX` (pubkey hex) and
 //! `ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON` (the envelope file contents).
 
+use std::io::Read;
 use std::process::ExitCode;
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -31,12 +34,15 @@ use enclava_cli::platform_release::{
     verify_envelope_with_root,
 };
 
-const USAGE: &str = "usage: platform-release sign <payload.json> <root-seed-hex>\n       platform-release verify <envelope.json> <root-pubkey-hex>";
+const USAGE: &str = "usage: platform-release sign <payload.json> <root-seed-hex-on-stdin>\n       platform-release verify <envelope.json> <root-pubkey-hex>";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
-        Some("sign") => sign(args.get(2), args.get(3)),
+        Some("sign") if args.len() > 3 => {
+            Err("the root seed must be piped on stdin, not passed as an argument".to_string())
+        }
+        Some("sign") => sign(args.get(2)),
         Some("verify") => verify(args.get(2), args.get(3)),
         _ => Err(USAGE.to_string()),
     };
@@ -49,13 +55,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn sign(payload_path: Option<&String>, seed_hex: Option<&String>) -> Result<(), String> {
+fn sign(payload_path: Option<&String>) -> Result<(), String> {
     let payload_path = payload_path.ok_or(USAGE)?;
-    let seed_hex = seed_hex.ok_or(USAGE)?;
-    let seed: [u8; 32] = hex::decode(seed_hex.trim())
-        .map_err(|err| format!("root seed: {err}"))?
-        .try_into()
-        .map_err(|bytes: Vec<u8>| format!("root seed must be 32 bytes, got {}", bytes.len()))?;
+    // The root seed is the platform trust anchor: it must never appear in
+    // argv (shell history, process listings). Read it from stdin and decode
+    // straight into a zeroized buffer so no intermediate copy survives.
+    let mut seed_hex = zeroize::Zeroizing::new(String::new());
+    std::io::stdin()
+        .read_to_string(&mut seed_hex)
+        .map_err(|err| format!("read root seed from stdin: {err}"))?;
+    let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(seed_hex.trim(), &mut *seed)
+        .map_err(|err| format!("root seed must be 32 bytes of hex: {err}"))?;
     let key = SigningKey::from_bytes(&seed);
 
     let raw = std::fs::read_to_string(payload_path)

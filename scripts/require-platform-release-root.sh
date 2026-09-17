@@ -7,8 +7,8 @@
 # artifact fails verification at startup (RootMismatch).
 #
 # Satisfying the gate in production: generate a root keypair outside the
-# repo, sign the payload with
-# `cargo run -p enclava-cli --example platform-release -- sign`, and set
+# repo, sign the payload with (root seed redirected from a protected file,
+# never argv: `-- sign payload.json < root-seed.hex`), and set
 # BOTH secrets together:
 #   ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX  (root pubkey hex)
 #   ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON    (signed envelope contents)

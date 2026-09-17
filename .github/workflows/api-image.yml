@@ -17,9 +17,9 @@ on:
       - "Cargo.lock"
       - "crates/enclava-api/**"
       - "crates/enclava-appraiser/**"
-      - "crates/enclava-cli/platform-release.json"
-      - "crates/enclava-cli/src/platform_release.rs"
-      - "crates/enclava-cli/examples/**"
+      # The release stage compiles the whole enclava-cli crate for the
+      # envelope verification step, so any CLI change must re-validate.
+      - "crates/enclava-cli/**"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
       - "crates/enclava-verifier/**"
@@ -37,9 +37,9 @@ on:
       - "Cargo.lock"
       - "crates/enclava-api/**"
       - "crates/enclava-appraiser/**"
-      - "crates/enclava-cli/platform-release.json"
-      - "crates/enclava-cli/src/platform_release.rs"
-      - "crates/enclava-cli/examples/**"
+      # The release stage compiles the whole enclava-cli crate for the
+      # envelope verification step, so any CLI change must re-validate.
+      - "crates/enclava-cli/**"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
       - "crates/enclava-verifier/**"
