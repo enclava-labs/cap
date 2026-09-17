@@ -14,9 +14,68 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const BUNDLED_PLATFORM_RELEASE: &str = include_str!("../platform-release.json");
-#[cfg(test)]
-const TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str =
+
+#[cfg(any(test, feature = "prod-strict"))]
+const FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str =
     "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd";
+
+#[cfg(test)]
+const TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str = FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX;
+
+#[cfg(any(test, feature = "prod-strict"))]
+// ponytail: manual compare, u8::eq_ignore_ascii_case is not const at MSRV 1.85
+#[allow(clippy::manual_ignore_case_cmp)]
+const fn eq_ignore_ascii_case(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(any(test, feature = "prod-strict"))]
+const fn is_forbidden_fixture_root(root: &str) -> bool {
+    eq_ignore_ascii_case(root, FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX)
+}
+
+/// 64 ASCII hex characters (either case) = a 32-byte key.
+#[cfg(any(test, feature = "prod-strict"))]
+const fn is_hex32_root(root: &str) -> bool {
+    let bytes = root.as_bytes();
+    if bytes.len() != 64 {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i].to_ascii_lowercase();
+        if !(c.is_ascii_digit() || (c >= b'a' && c <= b'f')) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(all(not(test), feature = "prod-strict"))]
+const _: () = {
+    match option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX") {
+        Some(root) if is_forbidden_fixture_root(root) => {
+            panic!("prod-strict builds must not pin the committed fixture platform-release root");
+        }
+        Some(root) if is_hex32_root(root) => {}
+        _ => panic!(
+            "prod-strict builds require ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX to be set to a 32-byte hex pubkey"
+        ),
+    }
+};
 
 #[derive(Debug, Error)]
 pub enum PlatformReleaseError {
@@ -200,7 +259,17 @@ pub fn verify_envelope(
     #[cfg(not(test))]
     let configured_root = option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
         .ok_or(PlatformReleaseError::MissingRootPubkey)?;
-    let pinned = hex32("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX", configured_root)?;
+    verify_envelope_with_root(envelope, configured_root)
+}
+
+/// Root-pinning variant used by the release ceremony helper
+/// (`examples/platform-release.rs`), which takes the root as an argument
+/// instead of a compile-time `option_env!`.
+pub fn verify_envelope_with_root(
+    envelope: PlatformReleaseEnvelope,
+    root_hex: &str,
+) -> Result<PlatformRelease, PlatformReleaseError> {
+    let pinned = hex32("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX", root_hex)?;
     let signing = hex32("signing_pubkey", &envelope.signing_pubkey)?;
     if signing != pinned {
         return Err(PlatformReleaseError::RootMismatch);
@@ -310,6 +379,57 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             field: "schema_version",
             message: "expected v1".to_string(),
         });
+    }
+    // Match the API's payload validation exactly: a release the API would
+    // refuse at startup must never pass the CLI-side publish gates.
+    let signing_url = reqwest::Url::parse(&release.signing_service_url).map_err(|err| {
+        PlatformReleaseError::InvalidField {
+            field: "signing_service_url",
+            message: err.to_string(),
+        }
+    })?;
+    if !matches!(signing_url.scheme(), "http" | "https") {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "signing_service_url",
+            message: "scheme must be http or https".to_string(),
+        });
+    }
+    // The signing-service bearer token must not transit cleartext
+    // off-cluster; reject at release-validation time so the failure names the
+    // signed field.
+    if signing_url.scheme() == "http"
+        && !enclava_common::hostnames::plain_http_host_allowed(signing_url.host_str())
+    {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "signing_service_url",
+            message: "http scheme is only allowed for loopback/cluster-internal hosts".to_string(),
+        });
+    }
+    hex32(
+        "signing_service_pubkey_hex",
+        &release.signing_service_pubkey_hex,
+    )?;
+    hex32("policy_template_sha256", &release.policy_template_sha256)?;
+    hex32(
+        "expected_firmware_measurement",
+        &release.expected_firmware_measurement,
+    )?;
+    for (field, image) in [
+        ("attestation_proxy_image", &release.attestation_proxy_image),
+        ("caddy_ingress_image", &release.caddy_ingress_image),
+    ] {
+        let parsed = enclava_common::image::ImageRef::parse(image).map_err(|err| {
+            PlatformReleaseError::InvalidField {
+                field,
+                message: err.to_string(),
+            }
+        })?;
+        parsed
+            .require_digest()
+            .map_err(|err| PlatformReleaseError::InvalidField {
+                field,
+                message: err.to_string(),
+            })?;
     }
     let kbs_url = reqwest::Url::parse(&release.trustee_kbs_url).map_err(|err| {
         PlatformReleaseError::InvalidField {
@@ -531,24 +651,133 @@ mod tests {
     }
 
     #[test]
-    fn tagged_cli_release_build_pins_bundled_release_root() {
-        let envelope: PlatformReleaseEnvelope =
-            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+    fn cli_dockerfile_requires_platform_release_root_build_arg() {
+        let dockerfile = include_str!("../Dockerfile").replace("\r\n", "\n");
+        assert!(
+            !dockerfile.contains("ARG ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX="),
+            "CLI Dockerfile must not default the platform-release root"
+        );
+        assert!(
+            dockerfile.contains(
+                "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX must be provided as a build-arg"
+            )
+        );
+        assert!(
+            dockerfile
+                .contains("cargo build --locked --release --bin enclava --features prod-strict")
+        );
+        assert!(dockerfile.contains("bash scripts/require-platform-release-root.sh"));
+        assert!(dockerfile.contains("COPY scripts/require-platform-release-root.sh"));
+        // The Dockerfile itself must verify the envelope signature, not just
+        // compare pubkeys.
+        assert!(dockerfile.contains("--example platform-release -- verify"));
+    }
+
+    #[test]
+    fn tagged_cli_release_build_requires_platform_release_root_secret() {
         let workflow = include_str!("../../../.github/workflows/release.yml");
         // Windows checkouts use CRLF (autocrlf); normalize before matching.
         let workflow = workflow.replace("\r\n", "\n");
-        let expected = format!(
-            "\nenv:\n  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: {}\n",
-            envelope.signing_pubkey
-        );
+        let expected = "\nenv:\n  ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}\n";
 
-        assert!(workflow.contains(&expected));
+        assert!(
+            workflow.contains(expected),
+            "release workflow must take the root from a required secret, not a committed fixture"
+        );
+        assert!(
+            workflow.contains("scripts/require-platform-release-root.sh"),
+            "release workflow must run the production platform-release root gate"
+        );
+        assert!(
+            !workflow.contains(TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX),
+            "release workflow must not hardcode the committed dev fixture pubkey"
+        );
         assert_eq!(
             workflow
                 .matches("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX:")
                 .count(),
             1
         );
+        // Every published CLI binary is a prod-strict build, so an invalid,
+        // missing, or fixture root fails at compile time, and no job builds
+        // artifacts before the root gate has passed.
+        assert_eq!(
+            workflow
+                .matches("--bin enclava --features prod-strict")
+                .count(),
+            3
+        );
+        assert_eq!(
+            workflow
+                .matches("needs: require-platform-release-root")
+                .count(),
+            4
+        );
+        // The gate is satisfiable only by supplying a matching production
+        // envelope: the secret is materialized over the bundled envelope in
+        // the gate job and every build job, and the gate job verifies the
+        // full signature before anything builds.
+        assert!(workflow.contains(
+            "ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON }}"
+        ));
+        assert_eq!(
+            workflow
+                .matches("printf '%s' \"$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON\" > crates/enclava-cli/platform-release.json")
+                .count(),
+            4
+        );
+        assert!(workflow.contains("--example platform-release -- verify"));
+    }
+
+    #[test]
+    fn fixture_root_is_detected_case_insensitively() {
+        assert!(is_forbidden_fixture_root(
+            TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX
+        ));
+        assert!(is_forbidden_fixture_root(
+            &TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX.to_ascii_uppercase()
+        ));
+        assert!(!is_forbidden_fixture_root(
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        ));
+    }
+
+    #[test]
+    fn hex32_root_shape_is_validated() {
+        assert!(is_hex32_root(
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        ));
+        // Uppercase hex is still a valid key (hex::decode accepts it).
+        assert!(is_hex32_root(
+            "000000000000000000000000000000000000000000000000000000000000000A"
+        ));
+        assert!(!is_hex32_root(""));
+        assert!(!is_hex32_root(
+            "000000000000000000000000000000000000000000000000000000000000001"
+        ));
+        assert!(!is_hex32_root(
+            "00000000000000000000000000000000000000000000000000000000000000010"
+        ));
+        assert!(!is_hex32_root(
+            "zzzz000000000000000000000000000000000000000000000000000000000001"
+        ));
+    }
+
+    #[test]
+    fn verify_envelope_with_root_pins_the_supplied_root() {
+        // The ceremony helper passes the root at runtime; it must accept the
+        // bundled fixture envelope against the fixture root and reject any
+        // other root with RootMismatch, exactly like the compile-time pin.
+        let envelope: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        verify_envelope_with_root(envelope.clone(), TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX).unwrap();
+        assert!(matches!(
+            verify_envelope_with_root(
+                envelope,
+                "0000000000000000000000000000000000000000000000000000000000000001"
+            ),
+            Err(PlatformReleaseError::RootMismatch)
+        ));
     }
 
     #[test]
@@ -583,6 +812,38 @@ mod tests {
         assert!(release_is_older(&divergent_version, &bundled.payload).unwrap());
 
         assert!(!release_is_older(&bundled.payload, &bundled.payload).unwrap());
+    }
+
+    #[test]
+    fn release_payload_rejects_tag_only_sidecar_image() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.attestation_proxy_image = "ghcr.io/enclava-labs/attestation-proxy:latest".into();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "attestation_proxy_image")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_off_cluster_http_signing_service_url() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.signing_service_url = "http://signing.example.test:8080".into();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "signing_service_url")
+        );
+        // The committed fixture uses a cluster-internal http URL and must
+        // keep validating.
+        validate_release_payload(
+            &serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
     }
 
     #[test]

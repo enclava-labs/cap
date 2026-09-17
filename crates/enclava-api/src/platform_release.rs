@@ -14,9 +14,67 @@ use thiserror::Error;
 
 const BUNDLED_PLATFORM_RELEASE: &str = include_str!("../../enclava-cli/platform-release.json");
 
-#[cfg(test)]
-const TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str =
+#[cfg(any(test, feature = "prod-strict"))]
+const FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str =
     "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd";
+
+#[cfg(test)]
+const TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str = FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX;
+
+#[cfg(any(test, feature = "prod-strict"))]
+// ponytail: manual compare, u8::eq_ignore_ascii_case is not const at MSRV 1.85
+#[allow(clippy::manual_ignore_case_cmp)]
+const fn eq_ignore_ascii_case(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i].to_ascii_lowercase() != b[i].to_ascii_lowercase() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(any(test, feature = "prod-strict"))]
+const fn is_forbidden_fixture_root(root: &str) -> bool {
+    eq_ignore_ascii_case(root, FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX)
+}
+
+/// 64 ASCII hex characters (either case) = a 32-byte key.
+#[cfg(any(test, feature = "prod-strict"))]
+const fn is_hex32_root(root: &str) -> bool {
+    let bytes = root.as_bytes();
+    if bytes.len() != 64 {
+        return false;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i].to_ascii_lowercase();
+        if !(c.is_ascii_digit() || (c >= b'a' && c <= b'f')) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[cfg(all(not(test), feature = "prod-strict"))]
+const _: () = {
+    match option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX") {
+        Some(root) if is_forbidden_fixture_root(root) => {
+            panic!("prod-strict builds must not pin the committed fixture platform-release root");
+        }
+        Some(root) if is_hex32_root(root) => {}
+        _ => panic!(
+            "prod-strict builds require ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX to be set to a 32-byte hex pubkey"
+        ),
+    }
+};
 
 #[derive(Debug, Error)]
 pub enum PlatformReleaseError {
@@ -326,6 +384,40 @@ fn hex32(field: &'static str, value: &str) -> Result<[u8; 32], PlatformReleaseEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixture_root_is_detected_case_insensitively() {
+        assert!(is_forbidden_fixture_root(
+            TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX
+        ));
+        assert!(is_forbidden_fixture_root(
+            &TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX.to_ascii_uppercase()
+        ));
+        assert!(!is_forbidden_fixture_root(
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        ));
+    }
+
+    #[test]
+    fn hex32_root_shape_is_validated() {
+        assert!(is_hex32_root(
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        ));
+        // Uppercase hex is still a valid key (hex::decode accepts it).
+        assert!(is_hex32_root(
+            "000000000000000000000000000000000000000000000000000000000000000A"
+        ));
+        assert!(!is_hex32_root(""));
+        assert!(!is_hex32_root(
+            "000000000000000000000000000000000000000000000000000000000000001"
+        ));
+        assert!(!is_hex32_root(
+            "00000000000000000000000000000000000000000000000000000000000000010"
+        ));
+        assert!(!is_hex32_root(
+            "zzzz000000000000000000000000000000000000000000000000000000000001"
+        ));
+    }
 
     #[test]
     fn bundled_release_verifies_and_hashes_template() {

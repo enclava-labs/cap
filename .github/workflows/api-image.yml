@@ -7,6 +7,7 @@ on:
     paths:
       - ".github/workflows/api-image.yml"
       - "scripts/render-api-release-manifest.sh"
+      - "scripts/require-platform-release-root.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
       - "scripts/verify-api-image-ref.bash"
@@ -16,7 +17,9 @@ on:
       - "Cargo.lock"
       - "crates/enclava-api/**"
       - "crates/enclava-appraiser/**"
-      - "crates/enclava-cli/platform-release.json"
+      # The release stage compiles the whole enclava-cli crate for the
+      # envelope verification step, so any CLI change must re-validate.
+      - "crates/enclava-cli/**"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
       - "crates/enclava-verifier/**"
@@ -24,6 +27,7 @@ on:
     paths:
       - ".github/workflows/api-image.yml"
       - "scripts/render-api-release-manifest.sh"
+      - "scripts/require-platform-release-root.sh"
       - "scripts/test-api-image-workflow.sh"
       - "scripts/test-verify-api-image-ref.sh"
       - "scripts/verify-api-image-ref.bash"
@@ -33,7 +37,9 @@ on:
       - "Cargo.lock"
       - "crates/enclava-api/**"
       - "crates/enclava-appraiser/**"
-      - "crates/enclava-cli/platform-release.json"
+      # The release stage compiles the whole enclava-cli crate for the
+      # envelope verification step, so any CLI change must re-validate.
+      - "crates/enclava-cli/**"
       - "crates/enclava-common/**"
       - "crates/enclava-engine/**"
       - "crates/enclava-verifier/**"
@@ -83,6 +89,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
+      # Test-only well-known fixture; never a Dockerfile default. PR validation only.
       - name: Build image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
@@ -91,6 +98,8 @@ jobs:
           target: runtime-debug
           push: false
           provenance: false
+          build-args: |
+            ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd
 
       - name: Build appraiser image
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -154,31 +163,33 @@ jobs:
             type=sha,prefix=
             type=raw,value=${{ github.event.inputs.version_tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.version_tag != '' }}
 
-      - name: Select build profile
-        id: build_profile
+      - name: Materialize production platform-release envelope
         env:
-          RELEASE_BUILD: ${{ github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' }}
+          ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON }}
         run: |
-          if [[ "$RELEASE_BUILD" = "true" ]]; then
-            echo "profile=release" >> "$GITHUB_OUTPUT"
-            echo "target=runtime-release" >> "$GITHUB_OUTPUT"
-          else
-            echo "profile=debug" >> "$GITHUB_OUTPUT"
-            echo "target=runtime-debug" >> "$GITHUB_OUTPUT"
+          if [[ -n "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" ]]; then
+            printf '%s' "$ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON" > crates/enclava-cli/platform-release.json
           fi
 
+      - name: Require platform-release root
+        env:
+          ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: ${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
+        run: bash scripts/require-platform-release-root.sh
+
+      # Every pushed image is a prod-strict release build; the debug stage is
+      # reserved for PR validation and local compose.
       - name: Build and push
         id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           file: ./crates/enclava-api/Dockerfile
-          target: ${{ steps.build_profile.outputs.target }}
+          target: runtime-release
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            BUILD_PROFILE=${{ steps.build_profile.outputs.profile }}
+            ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX=${{ secrets.ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: true

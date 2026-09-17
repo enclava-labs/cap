@@ -88,21 +88,9 @@ pub struct SigningServiceClient {
 }
 
 /// Plain-http is only acceptable for loopback or cluster-internal service
-/// hosts (`.svc`, `.svc.cluster.local`): the bearer token must not transit
-/// cleartext on any network an off-cluster attacker can observe.
+/// hosts: see `enclava_common::hostnames::plain_http_host_allowed`.
 pub(crate) fn plain_http_host_allowed(host: Option<&str>) -> bool {
-    let Some(host) = host else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return ip.is_loopback();
-    }
-    let host = host.to_ascii_lowercase();
-    host.ends_with(".svc") || host.ends_with(".svc.cluster.local")
+    enclava_common::hostnames::plain_http_host_allowed(host)
 }
 
 impl SigningServiceClient {
