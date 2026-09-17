@@ -195,6 +195,11 @@ jobs:
           cargo build --release -p enclava-api --features prod-strict
           cargo build --release -p enclava-cli --features prod-strict
           cargo build --release -p enclava-init --features prod-strict
+          # Runs prod_strict_ignores_dev_no_luks_env against a debug build
+          # (--release would disable debug_assertions and make the test vacuous):
+          # proves the ENCLAVA_INIT_DEV_NO_LUKS gate is compiled out, not just
+          # that the cfg string exists in source.
+          cargo test -p enclava-init --features prod-strict --lib
         env:
           # CI-compile-only: this job does not publish images. Do not fall back
           # to the committed fixture; prod-strict rejects that root.
