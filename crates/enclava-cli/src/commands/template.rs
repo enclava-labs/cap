@@ -1500,8 +1500,9 @@ fn undelivered_template_config_error(
         )
     };
     format!(
-        "customer config NOT delivered: {keys}. The deployment continues with the previous \
-         config. {recovery} {CONFIG_APPLICATION_NOTE} Last error: {source}"
+        "customer config NOT delivered: {keys}. The deployment continues without them \
+         (a redeploy keeps running its previous config; a first deploy stores no values \
+         at all). {recovery} {CONFIG_APPLICATION_NOTE} Last error: {source}"
     )
 }
 
@@ -1587,16 +1588,22 @@ impl TemplateConfigDeliveryState<'_> {
 
     /// An operator notice on a channel that never corrupts a machine
     /// stream: the bar when visible; under `--timings` stderr is the timing
-    /// JSONL stream, so the notice rides it as a categorical JSON event —
-    /// kind only, never the operator-facing text, which embeds the
-    /// deployment identifier the stream is designed to exclude (works for
-    /// `--json --timings` too, where stdout holds the final JSON document);
-    /// with a hidden bar and no `--timings`, stderr is free-form text.
-    fn announce(&self, kind: &str, line: &str) {
+    /// JSONL stream, so the notice rides it as a structured JSON event —
+    /// kind plus a static, identifier-free action string. The operator-
+    /// facing text embeds the deployment identifier the stream is designed
+    /// to exclude, so it stays off it; the action still tells the operator
+    /// how to unblock delivery (works for `--json --timings` too, where
+    /// stdout holds the final JSON document); with a hidden bar and no
+    /// `--timings`, stderr is free-form text.
+    fn announce(&self, kind: &str, action: &str, line: &str) {
         if !self.progress.is_hidden() {
             self.progress.println(line);
         } else if self.timings_mode {
-            let record = serde_json::json!({"event": "template_deploy_notice", "kind": kind});
+            let record = serde_json::json!({
+                "event": "template_deploy_notice",
+                "kind": kind,
+                "action": action,
+            });
             eprintln!("{record}");
         } else {
             eprintln!("{line}");
@@ -1644,6 +1651,7 @@ impl TemplateConfigDeliveryState<'_> {
             self.owner_wait_announced = true;
             self.announce(
                 "owner_wait_guidance",
+                "run `enclava unlock --app <app>`; config delivery continues automatically",
                 &format!("{label} — config delivery continues automatically."),
             );
         }
@@ -1673,6 +1681,7 @@ impl TemplateConfigDeliveryState<'_> {
         self.post_lock_note_printed = true;
         self.announce(
             "post_lock_boot_note",
+            "delivered values apply at the workload's next boot",
             &format!("Config delivered while the TEE was unlocking: {CONFIG_APPLICATION_NOTE}"),
         );
     }
@@ -6025,7 +6034,8 @@ mod tests {
         assert!(message.contains("enclava config set --app shell <KEY>=<VALUE>"));
         assert!(message.contains(CONFIG_APPLICATION_NOTE));
         assert!(message.contains("Last error: TEE error (423)"));
-        assert!(message.contains("continues with the previous config"));
+        assert!(message.contains("The deployment continues without them"));
+        assert!(message.contains("a first deploy stores no values"));
 
         // Other failures keep the reported error as the actionable signal —
         // no unlock prescription.
