@@ -1,6 +1,6 @@
 FROM rust:1.88-bookworm AS builder
 
-ARG BUILD_PROFILE=debug
+ARG BUILD_PROFILE=release
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -19,17 +19,17 @@ COPY vendor ./vendor
 COPY crates ./crates
 
 RUN if [ "${BUILD_PROFILE}" = "release" ]; then \
-      cargo build --release -p enclava-init --features prod-strict --bin enclava-init && \
-      cargo build --release -p enclava-init --features prod-strict --bin enclava-log-relay && \
-      cargo build --release -p enclava-wait-exec --target x86_64-unknown-linux-musl && \
+      cargo build --locked --release -p enclava-init --features prod-strict --bin enclava-init && \
+      cargo build --locked --release -p enclava-init --features prod-strict --bin enclava-log-relay && \
+      cargo build --locked --release -p enclava-wait-exec --target x86_64-unknown-linux-musl && \
       mkdir -p /out && \
       cp target/release/enclava-init /out/enclava-init && \
       cp target/release/enclava-log-relay /out/enclava-log-relay && \
       cp target/x86_64-unknown-linux-musl/release/enclava-wait-exec /out/enclava-wait-exec; \
     elif [ "${BUILD_PROFILE}" = "debug" ]; then \
-      cargo build -p enclava-init --bin enclava-init && \
-      cargo build -p enclava-init --bin enclava-log-relay && \
-      cargo build -p enclava-wait-exec --target x86_64-unknown-linux-musl && \
+      cargo build --locked -p enclava-init --bin enclava-init && \
+      cargo build --locked -p enclava-init --bin enclava-log-relay && \
+      cargo build --locked -p enclava-wait-exec --target x86_64-unknown-linux-musl && \
       mkdir -p /out && \
       cp target/debug/enclava-init /out/enclava-init && \
       cp target/debug/enclava-log-relay /out/enclava-log-relay && \

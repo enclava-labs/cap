@@ -112,6 +112,13 @@ jobs:
         env:
           DATABASE_URL: postgresql://test:test@localhost:5432/test
 
+      - name: Run enclava-init prod-strict lib tests
+        # Runs prod_strict_ignores_dev_no_luks_value against a debug build
+        # (--release would disable debug_assertions and make the test vacuous):
+        # proves the ENCLAVA_INIT_DEV_NO_LUKS gate is compiled out, not just
+        # that the cfg string exists in source. Needs no DATABASE_URL.
+        run: cargo test --locked -p enclava-init --lib --features prod-strict -- --test-threads=1
+
       - name: Run doctests
         run: cargo test --doc
 

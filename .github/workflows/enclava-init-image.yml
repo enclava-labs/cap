@@ -71,13 +71,15 @@ jobs:
             exit 1
           fi
 
+      # Guard tests in crates/enclava-init/src/lib.rs pin this step's name,
+      # branch polarity, and build-args wiring — keep them in sync when editing.
       - name: Select build profile
         id: build_profile
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            echo "profile=release" >> "$GITHUB_OUTPUT"
-          else
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
             echo "profile=debug" >> "$GITHUB_OUTPUT"
+          else
+            echo "profile=release" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build and push
@@ -88,7 +90,9 @@ jobs:
           file: ./crates/enclava-init/Dockerfile
           push: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.enclava.build-profile=${{ steps.build_profile.outputs.profile }}
           build-args: |
             BUILD_PROFILE=${{ steps.build_profile.outputs.profile }}
           cache-from: type=gha
