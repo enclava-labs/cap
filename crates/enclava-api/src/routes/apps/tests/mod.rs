@@ -667,12 +667,8 @@ fn app_delete_source_never_reads_or_formats_external_diagnostics() {
     );
     let migration = include_str!("../../../../migrations/0048_app_workload_teardown_state.sql");
     assert!(
-        migration.contains("WHERE status = 'running'"),
-        "the 0048 backfill must not mark legacy deleting rows teardown-required"
-    );
-    assert!(
-        !migration.contains("IN ('running', 'deleting')"),
-        "legacy in-flight deletes ran under best-effort semantics and must stay convergent"
+        !migration.to_lowercase().contains("update apps"),
+        "0048 must not backfill: the delete route records the requirement at delete time, and any backfill would only be read by a new replica retrying an old-replica delete whose workload may already be gone (mixed-rollout wedge)"
     );
     for failure in [
         "app_delete_dns_failure",
