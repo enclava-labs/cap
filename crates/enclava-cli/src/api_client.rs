@@ -119,6 +119,9 @@ impl ApiClient {
                     if let Some(reason) = body.reason {
                         message = format!("{message} ({reason})");
                     }
+                    if let Some(cause) = body.cause {
+                        message = format!("{message} (cause: {cause})");
+                    }
                     if message == label {
                         (code, message)
                     } else {

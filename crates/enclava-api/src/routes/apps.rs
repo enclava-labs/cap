@@ -41,6 +41,7 @@ fn internal_server_error() -> (StatusCode, Json<serde_json::Value>) {
 enum AppDeleteFailure {
     TeardownToken,
     TeardownEndpoint,
+    TeardownLocked,
     DnsNotConfigured,
     DnsOutsideManagedZone,
     DnsHostnameInUse,
@@ -58,6 +59,7 @@ impl AppDeleteFailure {
         match self {
             Self::TeardownToken => "app_delete_teardown_token_failed",
             Self::TeardownEndpoint => "app_delete_teardown_unavailable",
+            Self::TeardownLocked => "app_delete_teardown_locked",
             Self::DnsNotConfigured => "app_delete_dns_not_configured",
             Self::DnsOutsideManagedZone => "app_delete_dns_outside_managed_zone",
             Self::DnsHostnameInUse => "app_delete_dns_hostname_in_use",
@@ -78,6 +80,7 @@ impl AppDeleteFailure {
             }
             Self::DnsOutsideManagedZone => StatusCode::BAD_REQUEST,
             Self::DnsHostnameInUse => StatusCode::CONFLICT,
+            Self::TeardownLocked => StatusCode::LOCKED,
             Self::TeardownEndpoint
             | Self::DnsUnavailable
             | Self::EdgeRoute
@@ -244,20 +247,41 @@ fn workload_teardown_instance_id(app: &App) -> String {
 }
 
 fn requires_workload_teardown(status: AppStatus) -> bool {
-    matches!(status, AppStatus::Running | AppStatus::Deleting)
+    matches!(status, AppStatus::Running)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkloadTeardownDecision {
+    required: bool,
+    completed: bool,
+}
+
+fn workload_teardown_url(domain: &str) -> String {
+    format!(
+        "https://{}/.well-known/confidential/teardown",
+        domain.trim_end_matches('/')
+    )
 }
 
 async fn request_workload_teardown(
     state: &AppState,
     auth: &AuthContext,
     app: &App,
+    decision: WorkloadTeardownDecision,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if !requires_workload_teardown(app.status) {
+    if !decision.required {
         tracing::info!(
             app_id = %app.id,
-            status = ?app.status,
             code = "app_delete_teardown_not_required",
             "skipping workload teardown endpoint for non-running app"
+        );
+        return Ok(());
+    }
+    if decision.completed {
+        tracing::info!(
+            app_id = %app.id,
+            code = "app_delete_teardown_already_completed",
+            "skipping workload teardown endpoint after durable completion"
         );
         return Ok(());
     }
@@ -273,34 +297,119 @@ async fn request_workload_teardown(
     .map_err(|error| app_delete_failure(app.id, AppDeleteFailure::TeardownToken, error))?;
 
     let domain = app.tee_domain.as_deref().unwrap_or(&app.domain);
-    let url = format!(
-        "https://{}/.well-known/confidential/teardown",
-        domain.trim_end_matches('/')
-    );
+    post_workload_teardown(state, app, &token, &workload_teardown_url(domain)).await
+}
+
+pub(crate) async fn post_workload_teardown(
+    state: &AppState,
+    app: &App,
+    token: &str,
+    url: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let response = match state
         .tee_http_client
-        .post(&url)
+        .post(url)
         .bearer_auth(token)
-        .timeout(std::time::Duration::from_secs(15))
+        // Out-wait the attestation-proxy teardown, which performs two KBS
+        // resource deletes with 20 s timeouts each plus attestation. A client
+        // timeout shorter than the proxy's own would report a slow success as
+        // a failure, and the retry would then hit the proxy's non-idempotent
+        // teardown (404 on the erased wrap -> 500) and wedge the delete.
+        .timeout(std::time::Duration::from_secs(60))
         .send()
         .await
     {
         Ok(response) => response,
-        Err(_) => {
-            let _ = app_delete_failure(app.id, AppDeleteFailure::TeardownEndpoint, "unreachable");
-            return Ok(());
+        Err(error) => {
+            // Coarse, content-free category: distinguishes "endpoint slow"
+            // from "endpoint gone" without leaking transport detail.
+            let category = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else {
+                "transport"
+            };
+            tracing::warn!(
+                app_id = %app.id,
+                category,
+                code = "app_delete_teardown_unavailable",
+                "workload teardown endpoint transport failure"
+            );
+            return Err(app_delete_failure(
+                app.id,
+                AppDeleteFailure::TeardownEndpoint,
+                category,
+            ));
         }
     };
 
     if response.status().is_success() {
+        // The wrap is erased on the TEE at this point. The marker is what lets
+        // a later-step retry skip the proxy's non-idempotent teardown re-POST,
+        // so ride out transient pool/database blips with a few bounded
+        // attempts. If it still fails, failing the delete here would guarantee
+        // that wedge on the retry, so log and proceed: the wrap is erased and
+        // the marker only matters if a later step fails and a retry runs.
+        let mut marker_persisted = false;
+        for attempt in 0..3u32 {
+            match persist_workload_teardown_completed(&state.db, app.id).await {
+                Ok(()) => {
+                    marker_persisted = true;
+                    break;
+                }
+                Err(_) if attempt < 2 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        if !marker_persisted {
+            tracing::warn!(
+                app_id = %app.id,
+                code = "app_delete_teardown_marker_persist_failed",
+                "teardown completed on the TEE but the durable marker was not persisted"
+            );
+        }
         return Ok(());
     }
 
-    let _ = app_delete_failure(
-        app.id,
-        AppDeleteFailure::TeardownEndpoint,
-        response.status().as_u16(),
+    Err(workload_teardown_http_failure(app.id, response.status()))
+}
+
+pub(crate) fn workload_teardown_http_failure(
+    app_id: Uuid,
+    status: StatusCode,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let failure = if status == StatusCode::LOCKED {
+        AppDeleteFailure::TeardownLocked
+    } else {
+        AppDeleteFailure::TeardownEndpoint
+    };
+    tracing::warn!(
+        app_id = %app_id,
+        upstream_status = status.as_u16(),
+        code = failure.code(),
+        "workload teardown endpoint refused the request"
     );
+    app_delete_failure(app_id, failure, status.as_u16())
+}
+
+async fn persist_workload_teardown_completed(
+    pool: &sqlx::PgPool,
+    app_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    // Single statement: atomic on its own, and committed independently of the
+    // delete lane so a later step failure cannot roll back the marker.
+    sqlx::query(
+        "UPDATE apps
+            SET workload_teardown_completed_at = COALESCE(workload_teardown_completed_at, clock_timestamp()),
+                updated_at = clock_timestamp()
+          WHERE id = $1",
+    )
+    .bind(app_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1232,10 +1341,11 @@ pub(crate) async fn delete_app_before(
         ))
         .ok_or_else(internal_server_error)?;
 
-    // Persist the durable deleting phase before any external teardown. A retry
-    // therefore repeats the workload wipe even if token issuance or a later
-    // provider step failed. The same transaction terminalizes every queued or
-    // leased deployment generation before releasing the app lane.
+    // Persist the durable deleting phase and whether confidential teardown is
+    // required before any external call. Retries must reuse that decision
+    // instead of inferring it from status='deleting', which every in-flight
+    // delete shares. The same transaction terminalizes every queued or leased
+    // deployment generation before releasing the app lane.
     let mut phase_tx = state
         .db
         .begin()
@@ -1297,10 +1407,19 @@ pub(crate) async fn delete_app_before(
     sqlx::query(
         "UPDATE apps
             SET status = 'deleting'::app_status_enum,
+                workload_teardown_required = CASE
+                    WHEN status = 'deleting'::app_status_enum THEN workload_teardown_required
+                    ELSE $2
+                END,
+                workload_teardown_completed_at = CASE
+                    WHEN status = 'deleting'::app_status_enum THEN workload_teardown_completed_at
+                    ELSE NULL
+                END,
                 updated_at = clock_timestamp()
           WHERE id = $1",
     )
     .bind(phase_app.id)
+    .bind(requires_workload_teardown(phase_app.status))
     .execute(&mut *phase_tx)
     .await
     .map_err(|_| internal_server_error())?;
@@ -1363,16 +1482,65 @@ pub(crate) async fn delete_app_before(
         return Ok(StatusCode::NO_CONTENT);
     };
     if deleting_app.status != AppStatus::Deleting {
+        // Defensive: the phase transaction committed 'deleting' under this
+        // lane moments ago, so this is not expected to fire. Release in the
+        // held lane transaction all the same — dropping the lease here would
+        // abandon the shared fences through reclaim quarantine.
+        delete_mutation
+            .finish_in_tx(&mut delete_lane)
+            .await
+            .map_err(|_| internal_server_error())?;
+        delete_lane
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
         return Err((
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "app deletion phase is invalid"})),
         ));
     }
 
-    delete_mutation
-        .guard_provider(request_workload_teardown(&state, &auth, &deleting_app))
+    let (teardown_required, teardown_completed_at): (bool, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as(
+            "SELECT workload_teardown_required, workload_teardown_completed_at
+           FROM apps
+          WHERE id = $1",
+        )
+        .bind(deleting_app.id)
+        .fetch_one(&mut *delete_lane)
         .await
-        .map_err(|_| internal_server_error())??;
+        .map_err(|_| internal_server_error())?;
+
+    let teardown = delete_mutation
+        .guard_provider(request_workload_teardown(
+            &state,
+            &auth,
+            &deleting_app,
+            WorkloadTeardownDecision {
+                required: teardown_required,
+                completed: teardown_completed_at.is_some(),
+            },
+        ))
+        .await
+        .map_err(|_| internal_server_error())?;
+    if let Err(failure) = teardown {
+        // A failed teardown exits before any fenced resource is touched, but
+        // merely dropping the lease would hold the cluster-wide edge_config
+        // and kbs_policy fences through reclaim quarantine (~9 min), blocking
+        // every tenant's deploys until then. Nothing in this attempt wrote
+        // provider state yet, so release durably in the already-held lane
+        // transaction (finish() would re-take the advisory lane lock and
+        // deadlock) and surface the failure for a same-key retry.
+        delete_mutation
+            .finish_in_tx(&mut delete_lane)
+            .await
+            .map_err(|_| internal_server_error())?;
+        delete_lane
+            .commit()
+            .await
+            .map_err(|_| internal_server_error())?;
+        return Err(failure);
+    }
 
     // The running workload needs its current KBS authorization to erase the
     // owner seed. Revoke that authorization only after teardown has completed.
@@ -1413,16 +1581,32 @@ pub(crate) async fn delete_app_before(
                 Json(serde_json::json!({"error": "database error"})),
             )
         })?;
-    let app_backend =
-        crate::edge::backend_name_for(&org_slug, &deleting_app.name, crate::edge::BackendTag::App)
-            .map_err(|error| {
-                app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeBackend, error)
-            })?;
-    let tee_backend =
-        crate::edge::backend_name_for(&org_slug, &deleting_app.name, crate::edge::BackendTag::Tee)
-            .map_err(|error| {
-                app_delete_failure(deleting_app.id, AppDeleteFailure::EdgeBackend, error)
-            })?;
+    let (app_backend, tee_backend) = match (
+        crate::edge::backend_name_for(&org_slug, &deleting_app.name, crate::edge::BackendTag::App),
+        crate::edge::backend_name_for(&org_slug, &deleting_app.name, crate::edge::BackendTag::Tee),
+    ) {
+        (Ok(app_backend), Ok(tee_backend)) => (app_backend, tee_backend),
+        (Err(error), _) | (_, Err(error)) => {
+            // Pure in-process name computation: no provider state was touched
+            // beyond the reconcile-idempotent KBS revocation enqueue, and
+            // teardown already completed (the marker lets the retry skip it).
+            // Release the shared fences in the held lane transaction instead
+            // of abandoning them through reclaim quarantine.
+            delete_mutation
+                .finish_in_tx(&mut delete_lane)
+                .await
+                .map_err(|_| internal_server_error())?;
+            delete_lane
+                .commit()
+                .await
+                .map_err(|_| internal_server_error())?;
+            return Err(app_delete_failure(
+                deleting_app.id,
+                AppDeleteFailure::EdgeBackend,
+                error,
+            ));
+        }
+    };
     let mut routes_to_remove: Vec<(String, String)> =
         vec![(app_backend.clone(), deleting_app.domain.clone())];
     if let Some(t) = deleting_app.tee_domain.as_deref() {
