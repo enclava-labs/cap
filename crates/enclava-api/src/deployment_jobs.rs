@@ -583,6 +583,9 @@ pub async fn release_customer_config_hold(
     if updated.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
     }
+    // The hold hid this deployment from signed-policy selection. Publish it
+    // now that the roll is allowed to replace the running workload.
+    crate::kbs::enqueue_signed_policy_reconciliation(&mut tx).await?;
     tx.commit().await?;
     Ok(CustomerConfigHoldRelease::Released)
 }
@@ -678,7 +681,9 @@ async fn fail_unreleased_customer_config_hold_in_tx(
     if deployment.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
     }
-    crate::kbs::enqueue_signed_policy_revocation_if_active(tx).await?;
+    // Do not revoke signed policy. This deployment never became the running
+    // workload, and the unreleased job is excluded from policy selection so
+    // the previous authorization stays in place.
     Ok(true)
 }
 
