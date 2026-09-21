@@ -564,9 +564,18 @@ async fn app_has_incomplete_deployment_setup(
     sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
-             FROM deployments
-             WHERE app_id = $1
-               AND spec_snapshot ->> 'setup_state' IN ('dns_pending', 'cleanup_pending')
+               FROM deployments AS deployment
+              WHERE deployment.app_id = $1
+                AND deployment.spec_snapshot ->> 'setup_state'
+                    IN ('dns_pending', 'cleanup_pending')
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM deployment_apply_jobs AS job
+                     WHERE job.deployment_id = deployment.id
+                       AND job.customer_config_hold
+                       AND job.customer_config_released_at IS NULL
+                       AND job.state = 'setup_pending'
+                )
          )",
     )
     .bind(app_id)

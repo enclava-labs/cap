@@ -885,14 +885,19 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
 
 const CUSTOMER_CONFIG_ROLL_HOLD_MIN_SECONDS: u64 = 30;
 const CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS: u64 = 7_200;
+/// Work that happens after CAP arms the hold and before the release call:
+/// the PaaS config-token handoff (240s), untimed TEE attestation retries
+/// (121 attempts * 2s), and a release round trip. The two ssh-timeout waits
+/// cover managed-config delivery and the password-mode owner wait.
+const CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS: u64 = 240 + (121 * 2) + 60;
 
 /// Cover the managed-config wait and the customer-config delivery, each of
-/// which can consume the deploy's ssh timeout, plus a small release margin.
-/// CAP clamps the same window.
+/// which can consume the deploy's ssh timeout, plus the work that starts
+/// after CAP arms the hold. CAP clamps the same window.
 fn customer_config_roll_hold_seconds(ssh_timeout_seconds: u64) -> u32 {
     let budget = ssh_timeout_seconds
         .saturating_mul(2)
-        .saturating_add(120)
+        .saturating_add(CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS)
         .clamp(
             CUSTOMER_CONFIG_ROLL_HOLD_MIN_SECONDS,
             CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS,
@@ -4588,8 +4593,8 @@ mod tests {
 
     #[test]
     fn customer_config_roll_hold_covers_both_wait_budgets() {
-        assert_eq!(customer_config_roll_hold_seconds(1_800), 3_720);
-        assert_eq!(customer_config_roll_hold_seconds(10), 140);
+        assert_eq!(customer_config_roll_hold_seconds(1_800), 4_142);
+        assert_eq!(customer_config_roll_hold_seconds(10), 562);
         assert_eq!(customer_config_roll_hold_seconds(10_000), 7_200);
     }
 
