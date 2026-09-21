@@ -1460,11 +1460,11 @@ async fn deploy_app_candidate(
     let customer_config_hold_seconds =
         crate::deployment_jobs::normalize_customer_config_roll_hold_seconds(
             body.customer_config_roll_hold_seconds,
-            app_mutation != AppMutation::Insert
-                && app
-                    .tee_domain
-                    .as_deref()
-                    .is_some_and(|domain| !domain.trim().is_empty()),
+            crate::deployment_jobs::customer_config_roll_hold_applies(
+                app_mutation == AppMutation::Insert,
+                matches!(app.status, crate::models::AppStatus::Running),
+                app.tee_domain.as_deref(),
+            ),
         );
     let setup_job = crate::deployment_jobs::insert_setup_job(
         &mut tx,

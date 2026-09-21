@@ -36,6 +36,37 @@ pub const CUSTOMER_CONFIG_HOLD_EXPIRED: &str = "customer_config_hold_expired";
 pub const MIN_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS: i32 = 30;
 pub const MAX_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS: i32 = 7_200;
 
+/// A hostname allocated at app creation is not a running TEE. Hold only a
+/// replacement of a workload that is already running, so the CLI can write
+/// config to it before the roll.
+pub fn customer_config_roll_hold_applies(
+    is_new_app: bool,
+    app_is_running: bool,
+    tee_domain: Option<&str>,
+) -> bool {
+    !is_new_app && app_is_running && tee_domain.is_some_and(|domain| !domain.trim().is_empty())
+}
+
+/// True while this deployment's roll is still waiting for the handshake.
+pub async fn customer_config_hold_is_open(
+    pool: &PgPool,
+    deployment_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+               FROM deployment_apply_jobs
+              WHERE deployment_id = $1
+                AND customer_config_hold
+                AND customer_config_released_at IS NULL
+                AND state = 'setup_pending'
+         )",
+    )
+    .bind(deployment_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Clamp a caller-requested hold. `None` and zero mean the roll starts
 /// immediately. Values outside the window are clamped, not rejected, so a
 /// CLI and CAP release can disagree on the exact budget without failing
@@ -4436,6 +4467,23 @@ mod tests {
 
     #[test]
     fn customer_config_roll_hold_requires_a_live_tee_and_stays_bounded() {
+        assert!(!customer_config_roll_hold_applies(
+            true,
+            true,
+            Some("tee.example.test")
+        ));
+        assert!(!customer_config_roll_hold_applies(
+            false,
+            false,
+            Some("tee.example.test")
+        ));
+        assert!(!customer_config_roll_hold_applies(false, true, None));
+        assert!(!customer_config_roll_hold_applies(false, true, Some("  ")));
+        assert!(customer_config_roll_hold_applies(
+            false,
+            true,
+            Some("tee.example.test")
+        ));
         assert_eq!(
             normalize_customer_config_roll_hold_seconds(Some(120), false),
             None
@@ -4481,6 +4529,11 @@ mod tests {
             .await
             .expect("claim while held");
         assert!(claimed.is_none(), "an unreleased hold must not start setup");
+        assert!(
+            customer_config_hold_is_open(&pool, deployment_id)
+                .await
+                .expect("read open hold")
+        );
 
         let release = release_customer_config_hold(&pool, app.org_id, deployment_id)
             .await

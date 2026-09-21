@@ -262,17 +262,20 @@ pub async fn create_generic_deployment(
         && let Some((deployment, app)) =
             fetch_deployment_by_external_id(&state, auth.org_id, external_id).await?
     {
-        if super::deployment_setup_incomplete(&deployment) {
+        let customer_config_hold =
+            crate::deployment_jobs::customer_config_hold_is_open(&state.db, deployment.id)
+                .await
+                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+        if super::deployment_setup_incomplete(&deployment) && !customer_config_hold {
             return Err(json_error(
                 StatusCode::CONFLICT,
                 "external_id belongs to a deployment whose setup did not complete",
             ));
         }
         ensure_idempotent_retry_matches(&deployment, &app, &body)?;
-        return Ok((
-            StatusCode::OK,
-            Json(GenericDeploymentResponse::from_deployment(deployment, &app)),
-        ));
+        let mut response = GenericDeploymentResponse::from_deployment(deployment, &app);
+        response.customer_config_hold = customer_config_hold;
+        return Ok((StatusCode::OK, Json(response)));
     }
 
     let normalized_egress_allowlist =
@@ -341,18 +344,10 @@ pub async fn create_generic_deployment(
     let (deployment, app) = fetch_deployment_with_app(&state, org_id, deployed.deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-    let customer_config_hold: bool = sqlx::query_scalar(
-        "SELECT COALESCE(
-             bool_or(customer_config_hold AND customer_config_released_at IS NULL),
-             false
-         )
-           FROM deployment_apply_jobs
-          WHERE deployment_id = $1",
-    )
-    .bind(deployment.id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let customer_config_hold =
+        crate::deployment_jobs::customer_config_hold_is_open(&state.db, deployment.id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     let mut response = GenericDeploymentResponse::from_deployment(deployment, &app);
     response.customer_config_hold = customer_config_hold;
 
@@ -383,6 +378,10 @@ pub async fn get_generic_deployment(
         response.app_status = "failed".to_string();
         response.error_message = Some(runtime_failure);
     }
+    response.customer_config_hold =
+        crate::deployment_jobs::customer_config_hold_is_open(&state.db, deployment_id)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     Ok(Json(response))
 }
 
