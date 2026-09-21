@@ -287,6 +287,10 @@ fn internal_routes() -> Router<AppState> {
             axum::routing::post(routes::internal::issue_paas_generic_config_token),
         )
         .route(
+            "/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/customer-config-released",
+            axum::routing::post(routes::internal::release_paas_customer_config_roll),
+        )
+        .route(
             "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/status",
             axum::routing::get(routes::internal::get_paas_unlock_status),
         )

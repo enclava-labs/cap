@@ -11,6 +11,11 @@ pub struct GenericDeploymentRequest {
     pub signing: GenericDeploymentSigning,
     #[serde(default)]
     pub security: GenericDeploymentSecurity,
+    /// Forwarded by PaaS when the CLI is delivering customer config before
+    /// the workload roll. CAP honors it only for a redeploy that already has
+    /// a TEE domain.
+    #[serde(default)]
+    pub customer_config_roll_hold_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +92,10 @@ pub struct GenericDeploymentResponse {
     pub error_message: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// True when this deployment's roll is waiting for the customer-config
+    /// handshake. Absent when the roll was not held.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub customer_config_hold: bool,
     /// Explicit live evidence. The lifecycle fields above remain database
     /// projections; consumers must use this observation to decide whether a
     /// healthy/running projection is current.
@@ -140,6 +149,7 @@ impl GenericDeploymentResponse {
             error_message,
             created_at: deployment.created_at,
             completed_at: deployment.completed_at,
+            customer_config_hold: false,
             observation: LiveObservation::not_observed(),
         }
     }
@@ -148,6 +158,10 @@ impl GenericDeploymentResponse {
         self.observation = observation;
         self
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 pub(super) fn json_error(
@@ -319,6 +333,7 @@ pub async fn create_generic_deployment(
         signed_policy_artifact: body.security.signed_policy_artifact,
         workload_security_profile: body.security.workload_security_profile,
         log_encryption: body.security.log_encryption.clone(),
+        customer_config_roll_hold_seconds: body.customer_config_roll_hold_seconds,
     };
     let org_id = auth.org_id;
     let (status, Json(deployed)) =
@@ -326,11 +341,22 @@ pub async fn create_generic_deployment(
     let (deployment, app) = fetch_deployment_with_app(&state, org_id, deployed.deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let customer_config_hold: bool = sqlx::query_scalar(
+        "SELECT COALESCE(
+             bool_or(customer_config_hold AND customer_config_released_at IS NULL),
+             false
+         )
+           FROM deployment_apply_jobs
+          WHERE deployment_id = $1",
+    )
+    .bind(deployment.id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+    let mut response = GenericDeploymentResponse::from_deployment(deployment, &app);
+    response.customer_config_hold = customer_config_hold;
 
-    Ok((
-        status,
-        Json(GenericDeploymentResponse::from_deployment(deployment, &app)),
-    ))
+    Ok((status, Json(response)))
 }
 
 /// GET /deployments/{deployment_id} -- generic deployment status/details.

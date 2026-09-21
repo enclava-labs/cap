@@ -216,6 +216,7 @@ fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
                 issuer: "https://token.actions.githubusercontent.com".to_string(),
             },
             security: GenericDeploymentSecurity::default(),
+            customer_config_roll_hold_seconds: None,
         }
 }
 
@@ -694,6 +695,7 @@ async fn deploy_rejects_member_before_database_access() {
             signed_policy_artifact: None,
             workload_security_profile: None,
             log_encryption: None,
+            customer_config_roll_hold_seconds: None,
         }),
     )
     .await;

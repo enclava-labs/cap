@@ -379,6 +379,10 @@ pub struct CreateTemplateInstanceRequest {
     pub org_keyring_blob: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signed_policy_artifact: Option<String>,
+    /// Ask PaaS to hold the workload roll until customer config has been
+    /// written to the current TEE. Sent only for a redeploy of an existing app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_config_roll_hold_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,6 +392,9 @@ pub struct TemplateInstanceResponse {
     pub deployment: TemplateDeploymentResponse,
     pub config_token: Option<ConfigTokenResponse>,
     pub cap: serde_json::Value,
+    /// The workload roll is waiting until customer config is released.
+    #[serde(default)]
+    pub customer_config_hold: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]

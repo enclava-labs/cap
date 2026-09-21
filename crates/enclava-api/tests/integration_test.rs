@@ -3270,6 +3270,7 @@ async fn generic_deployment_external_id_is_idempotent_and_conflict_checked() {
         deployment_id,
         &payload,
         false,
+        None,
     )
     .await
     .expect("insert idempotency deployment durable job");

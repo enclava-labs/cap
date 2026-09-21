@@ -382,6 +382,10 @@ pub struct DeployRequest {
     pub workload_security_profile: Option<String>,
     #[serde(default)]
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// When set on a redeploy of an app that already has a TEE domain, DNS
+    /// setup and the workload roll wait until customer config is released.
+    #[serde(default)]
+    pub customer_config_roll_hold_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -487,7 +491,8 @@ const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 /// arbitrary backend, runtime, or workload-controlled plaintext.
 pub(crate) fn public_deployment_error_message(error_message: Option<&str>) -> Option<String> {
     error_message.map(|error_message| match error_message {
-        crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR => error_message.to_string(),
+        crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR
+        | crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED => error_message.to_string(),
         _ => PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string(),
     })
 }
@@ -1452,12 +1457,22 @@ async fn deploy_app_candidate(
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     }
 
+    let customer_config_hold_seconds =
+        crate::deployment_jobs::normalize_customer_config_roll_hold_seconds(
+            body.customer_config_roll_hold_seconds,
+            app_mutation != AppMutation::Insert
+                && app
+                    .tee_domain
+                    .as_deref()
+                    .is_some_and(|domain| !domain.trim().is_empty()),
+        );
     let setup_job = crate::deployment_jobs::insert_setup_job(
         &mut tx,
         deploy_id,
         deploy_id,
         &apply_payload,
         signed_required,
+        customer_config_hold_seconds,
     )
     .await
     .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
@@ -1488,22 +1503,26 @@ async fn deploy_app_candidate(
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
-    match crate::deployment_jobs::process_setup_job(&state, setup_job).await {
-        Ok(()) => {}
-        Err(crate::deployment_jobs::DeploymentJobError::Dns(error)) => {
-            return Err(dns_error_response(error));
-        }
-        Err(error) => {
-            tracing::error!(
-                app_id = %app.id,
-                deployment_id = %deploy_id,
-                error_code = error.code(),
-                "durable deployment setup did not complete"
-            );
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "database error",
-            ));
+    // A redeploy hold keeps the current TEE serving until the CLI releases
+    // the handshake. Starting setup here would race that write.
+    if customer_config_hold_seconds.is_none() {
+        match crate::deployment_jobs::process_setup_job(&state, setup_job).await {
+            Ok(()) => {}
+            Err(crate::deployment_jobs::DeploymentJobError::Dns(error)) => {
+                return Err(dns_error_response(error));
+            }
+            Err(error) => {
+                tracing::error!(
+                    app_id = %app.id,
+                    deployment_id = %deploy_id,
+                    error_code = error.code(),
+                    "durable deployment setup did not complete"
+                );
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "database error",
+                ));
+            }
         }
     }
 
@@ -2046,6 +2065,7 @@ mod tests {
             deployment_id,
             &payload,
             false,
+            None,
         )
         .await
         .expect("persist accepted setup job");

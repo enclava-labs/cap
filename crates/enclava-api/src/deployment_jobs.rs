@@ -30,6 +30,30 @@ pub const DEPLOYMENT_SETUP_CLEANUP_PENDING: &str = "cleanup_pending";
 pub const DEPLOYMENT_SETUP_ACCEPTED: &str = "accepted";
 pub const DEPLOYMENT_SETUP_FAILED: &str = "failed";
 pub const DEPLOYMENT_SETUP_FAILED_MESSAGE: &str = "deployment_setup_failed";
+/// The customer-config handshake did not arrive before the hold deadline.
+/// The deployment is failed without applying, so the previous workload stays.
+pub const CUSTOMER_CONFIG_HOLD_EXPIRED: &str = "customer_config_hold_expired";
+pub const MIN_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS: i32 = 30;
+pub const MAX_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS: i32 = 7_200;
+
+/// Clamp a caller-requested hold. `None` and zero mean the roll starts
+/// immediately. Values outside the window are clamped, not rejected, so a
+/// CLI and CAP release can disagree on the exact budget without failing
+/// the deployment request itself.
+pub fn normalize_customer_config_roll_hold_seconds(
+    requested: Option<u32>,
+    redeploy_with_live_tee: bool,
+) -> Option<i32> {
+    if !redeploy_with_live_tee {
+        return None;
+    }
+    let seconds = requested.filter(|seconds| *seconds > 0)?;
+    let seconds = i32::try_from(seconds).unwrap_or(i32::MAX);
+    Some(seconds.clamp(
+        MIN_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS,
+        MAX_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS,
+    ))
+}
 const DEPLOYMENT_APPLY_FAILED_MESSAGE: &str = "deployment_apply_failed";
 const JOB_PAYLOAD_VERSION: i32 = 1;
 const MIN_SUPPORTED_JOB_PAYLOAD_VERSION: i32 = 1;
@@ -371,6 +395,7 @@ pub async fn insert_setup_job(
     source_deployment_id: Uuid,
     payload: &DeploymentApplyJobPayload,
     signed_required: bool,
+    customer_config_hold_seconds: Option<i32>,
 ) -> Result<SetupJobLease, DeploymentJobError> {
     let (app_id, org_id) =
         sqlx::query_as::<_, (Uuid, Uuid)>("SELECT app_id, org_id FROM deployments WHERE id = $1")
@@ -386,17 +411,25 @@ pub async fn insert_setup_job(
         .map(serde_json::to_value)
         .transpose()
         .map_err(|_| DeploymentJobError::InvalidPayload)?;
+    let customer_config_hold = customer_config_hold_seconds.is_some();
+    let customer_config_hold_seconds = customer_config_hold_seconds.unwrap_or(0);
     sqlx::query(
         "INSERT INTO deployment_apply_jobs (
              deployment_id, app_id, org_id, source_deployment_id,
              payload_version, payload, payload_sha256,
              cleanup_app_on_setup_failure, signed_required,
              artifact_deployment_id, artifact_descriptor_core_hash,
-             log_encryption, state, next_attempt_at
+             log_encryption, state, next_attempt_at,
+             customer_config_hold, customer_config_hold_until
          )
          VALUES (
              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-             'setup_pending', clock_timestamp() + $13::interval
+             'setup_pending', clock_timestamp() + $13::interval,
+             $14,
+             CASE
+                 WHEN $14 THEN clock_timestamp() + make_interval(secs => $15)
+                 ELSE NULL
+             END
          )",
     )
     .bind(deployment_id)
@@ -416,9 +449,206 @@ pub async fn insert_setup_job(
     )
     .bind(log_encryption)
     .bind(SETUP_RECOVERY_DELAY_SQL)
+    .bind(customer_config_hold)
+    .bind(customer_config_hold_seconds)
     .execute(&mut **tx)
     .await?;
     Ok(SetupJobLease { deployment_id })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomerConfigHoldRelease {
+    Released,
+    AlreadyReleased,
+    /// This deployment was never held. The caller can continue; the roll was
+    /// not waiting on the handshake.
+    NotHeld,
+    NotFound,
+    /// The hold can no longer be released. The deployment must not roll.
+    Unavailable(&'static str),
+}
+
+/// Release a customer-config roll hold so DNS setup and apply may start.
+///
+/// A late release, after the deadline, fails the deployment instead of
+/// rolling. The previous workload is left in place.
+pub async fn release_customer_config_hold(
+    pool: &PgPool,
+    org_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<CustomerConfigHoldRelease, DeploymentJobError> {
+    let app_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT app_id
+           FROM deployment_apply_jobs
+          WHERE deployment_id = $1
+            AND org_id = $2",
+    )
+    .bind(deployment_id)
+    .bind(org_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(app_id) = app_id else {
+        return Ok(CustomerConfigHoldRelease::NotFound);
+    };
+
+    let mut tx = pool.begin().await?;
+    crate::deploy::lock_app_deployment_lane(&mut tx, app_id).await?;
+    let row: Option<(String, bool, bool, bool)> = sqlx::query_as(
+        "SELECT state,
+                customer_config_hold,
+                customer_config_released_at IS NOT NULL,
+                COALESCE(customer_config_hold_until <= clock_timestamp(), false)
+           FROM deployment_apply_jobs
+          WHERE deployment_id = $1
+            AND org_id = $2
+          FOR UPDATE",
+    )
+    .bind(deployment_id)
+    .bind(org_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((state, hold, released, expired)) = row else {
+        tx.rollback().await?;
+        return Ok(CustomerConfigHoldRelease::NotFound);
+    };
+    if !hold {
+        tx.commit().await?;
+        return Ok(CustomerConfigHoldRelease::NotHeld);
+    }
+    if released {
+        tx.commit().await?;
+        return Ok(CustomerConfigHoldRelease::AlreadyReleased);
+    }
+    if expired || state != "setup_pending" {
+        if state == "setup_pending" {
+            fail_unreleased_customer_config_hold_in_tx(&mut tx, deployment_id, app_id, org_id)
+                .await?;
+            tx.commit().await?;
+            return Ok(CustomerConfigHoldRelease::Unavailable(
+                "customer config roll hold expired before release; the running workload was left unchanged",
+            ));
+        }
+        tx.commit().await?;
+        return Ok(CustomerConfigHoldRelease::Unavailable(
+            "deployment is no longer waiting for customer config; the running workload was left unchanged",
+        ));
+    }
+    let updated = sqlx::query(
+        "UPDATE deployment_apply_jobs
+            SET customer_config_released_at = clock_timestamp(),
+                next_attempt_at = clock_timestamp(),
+                updated_at = clock_timestamp()
+          WHERE deployment_id = $1
+            AND org_id = $2
+            AND state = 'setup_pending'
+            AND customer_config_hold
+            AND customer_config_released_at IS NULL
+            AND customer_config_hold_until > clock_timestamp()",
+    )
+    .bind(deployment_id)
+    .bind(org_id)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(DeploymentJobError::LeaseLost);
+    }
+    tx.commit().await?;
+    Ok(CustomerConfigHoldRelease::Released)
+}
+
+/// Fail held deployments whose handshake deadline passed. Does not apply
+/// the workload and does not change the app's current status.
+pub async fn expire_customer_config_holds(pool: &PgPool) -> Result<u64, DeploymentJobError> {
+    let due: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
+        "SELECT deployment_id, app_id, org_id
+           FROM deployment_apply_jobs
+          WHERE customer_config_hold
+            AND customer_config_released_at IS NULL
+            AND state = 'setup_pending'
+            AND lock_token IS NULL
+            AND customer_config_hold_until <= clock_timestamp()
+          ORDER BY customer_config_hold_until, deployment_id
+          LIMIT 32",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut expired = 0u64;
+    for (deployment_id, app_id, org_id) in due {
+        let mut tx = pool.begin().await?;
+        crate::deploy::lock_app_deployment_lane(&mut tx, app_id).await?;
+        let failed =
+            fail_unreleased_customer_config_hold_in_tx(&mut tx, deployment_id, app_id, org_id)
+                .await?;
+        tx.commit().await?;
+        if failed {
+            expired += 1;
+        }
+    }
+    Ok(expired)
+}
+
+async fn fail_unreleased_customer_config_hold_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment_id: Uuid,
+    app_id: Uuid,
+    org_id: Uuid,
+) -> Result<bool, DeploymentJobError> {
+    let job = sqlx::query(
+        "UPDATE deployment_apply_jobs
+            SET state = 'failed',
+                lock_token = NULL,
+                locked_until = NULL,
+                last_error_code = $4,
+                updated_at = clock_timestamp()
+          WHERE deployment_id = $1
+            AND app_id = $2
+            AND org_id = $3
+            AND state = 'setup_pending'
+            AND lock_token IS NULL
+            AND customer_config_hold
+            AND customer_config_released_at IS NULL",
+    )
+    .bind(deployment_id)
+    .bind(app_id)
+    .bind(org_id)
+    .bind(CUSTOMER_CONFIG_HOLD_EXPIRED)
+    .execute(&mut **tx)
+    .await?;
+    if job.rows_affected() != 1 {
+        return Ok(false);
+    }
+    let deployment = sqlx::query(
+        "UPDATE deployments
+            SET status = 'failed'::deploy_status_enum,
+                spec_snapshot = jsonb_set(
+                    spec_snapshot,
+                    '{setup_state}',
+                    to_jsonb($4::text),
+                    true
+                ),
+                error_message = $5,
+                completed_at = clock_timestamp()
+          WHERE id = $1
+            AND app_id = $2
+            AND org_id = $3
+            AND status IN (
+                'pending'::deploy_status_enum,
+                'applying'::deploy_status_enum,
+                'watching'::deploy_status_enum
+            )",
+    )
+    .bind(deployment_id)
+    .bind(app_id)
+    .bind(org_id)
+    .bind(DEPLOYMENT_SETUP_FAILED)
+    .bind(CUSTOMER_CONFIG_HOLD_EXPIRED)
+    .execute(&mut **tx)
+    .await?;
+    if deployment.rows_affected() != 1 {
+        return Err(DeploymentJobError::LeaseLost);
+    }
+    crate::kbs::enqueue_signed_policy_revocation_if_active(tx).await?;
+    Ok(true)
 }
 
 /// Insert a job whose setup was already satisfied (for example rollback).
@@ -1245,6 +1475,17 @@ pub fn spawn_deployment_dispatcher(state: AppState) {
                     "failed to repair orphaned deployment namespace mutation leases"
                 ),
             }
+            match expire_customer_config_holds(&repair_state.db).await {
+                Ok(expired) if expired > 0 => tracing::warn!(
+                    expired,
+                    "expired customer-config roll holds without applying"
+                ),
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    error_code = "customer_config_hold_expiry_failed",
+                    "failed to expire customer-config roll holds"
+                ),
+            }
             tokio::time::sleep(TERMINAL_LEASE_REPAIR_INTERVAL).await;
         }
     });
@@ -1384,6 +1625,10 @@ async fn claim_job_candidate(
                     OR (state = $2 AND locked_until < clock_timestamp())
                 )
                 AND ($7::uuid IS NULL OR deployment_id = $7)
+                AND (
+                    NOT customer_config_hold
+                    OR customer_config_released_at IS NOT NULL
+                )
               ORDER BY created_at, deployment_id
               FOR UPDATE SKIP LOCKED
               LIMIT 1
@@ -3012,7 +3257,7 @@ mod tests {
         .execute(&mut *tx)
         .await
         .expect("insert deployment job deployment");
-        let lease = insert_setup_job(&mut tx, deployment_id, deployment_id, &payload, false)
+        let lease = insert_setup_job(&mut tx, deployment_id, deployment_id, &payload, false, None)
             .await
             .expect("insert setup job");
         tx.commit().await.expect("commit deployment job fixture");
@@ -3536,7 +3781,7 @@ mod tests {
         )
         .await
         .expect("persist valid signed fixture");
-        insert_setup_job(&mut tx, deployment_id, deployment_id, &payload, true)
+        insert_setup_job(&mut tx, deployment_id, deployment_id, &payload, true, None)
             .await
             .expect("insert valid signed durable job");
         tx.commit()
@@ -4187,6 +4432,115 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete malformed payload fixture");
+    }
+
+    #[test]
+    fn customer_config_roll_hold_requires_a_live_tee_and_stays_bounded() {
+        assert_eq!(
+            normalize_customer_config_roll_hold_seconds(Some(120), false),
+            None
+        );
+        assert_eq!(
+            normalize_customer_config_roll_hold_seconds(None, true),
+            None
+        );
+        assert_eq!(
+            normalize_customer_config_roll_hold_seconds(Some(0), true),
+            None
+        );
+        assert_eq!(
+            normalize_customer_config_roll_hold_seconds(Some(10), true),
+            Some(MIN_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS)
+        );
+        assert_eq!(
+            normalize_customer_config_roll_hold_seconds(Some(90), true),
+            Some(90)
+        );
+        assert_eq!(
+            normalize_customer_config_roll_hold_seconds(Some(u32::MAX), true),
+            Some(MAX_CUSTOMER_CONFIG_ROLL_HOLD_SECONDS)
+        );
+    }
+
+    #[tokio::test]
+    async fn customer_config_hold_blocks_setup_until_release_and_expiry_does_not_roll() {
+        let pool = database_test_pool().await;
+        let (app, deployment_id, _setup, _payload) = insert_job_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() + interval '1 hour'
+              WHERE deployment_id = $1",
+        )
+        .bind(deployment_id)
+        .execute(&pool)
+        .await
+        .expect("arm customer-config hold");
+
+        let claimed = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim while held");
+        assert!(claimed.is_none(), "an unreleased hold must not start setup");
+
+        let release = release_customer_config_hold(&pool, app.org_id, deployment_id)
+            .await
+            .expect("release hold");
+        assert_eq!(release, CustomerConfigHoldRelease::Released);
+        let again = release_customer_config_hold(&pool, app.org_id, deployment_id)
+            .await
+            .expect("repeat release");
+        assert_eq!(again, CustomerConfigHoldRelease::AlreadyReleased);
+        let claimed = claim_job(&pool, "setup_pending", "setting_up", Some(deployment_id))
+            .await
+            .expect("claim after release");
+        assert!(claimed.is_some(), "release must allow setup to start");
+
+        let (expired_app, expired_deployment, _setup, _payload) = insert_job_fixture(&pool).await;
+        sqlx::query(
+            "UPDATE deployment_apply_jobs
+                SET customer_config_hold = true,
+                    customer_config_hold_until = clock_timestamp() - interval '1 second'
+              WHERE deployment_id = $1",
+        )
+        .bind(expired_deployment)
+        .execute(&pool)
+        .await
+        .expect("expire customer-config hold");
+        let expired = expire_customer_config_holds(&pool)
+            .await
+            .expect("sweep expired holds");
+        assert!(expired >= 1);
+        let (job_state, deploy_status, app_status, error_code): (String, String, String, String) =
+            sqlx::query_as(
+                "SELECT job.state, deployment.status::text, app.status::text, job.last_error_code
+                   FROM deployment_apply_jobs job
+                   JOIN deployments deployment ON deployment.id = job.deployment_id
+                   JOIN apps app ON app.id = job.app_id
+                  WHERE job.deployment_id = $1",
+            )
+            .bind(expired_deployment)
+            .fetch_one(&pool)
+            .await
+            .expect("load expired hold");
+        assert_eq!(job_state, "failed");
+        assert_eq!(deploy_status, "failed");
+        assert_eq!(app_status, "creating");
+        assert_eq!(error_code, CUSTOMER_CONFIG_HOLD_EXPIRED);
+        let late = release_customer_config_hold(&pool, expired_app.org_id, expired_deployment)
+            .await
+            .expect("late release");
+        assert!(matches!(late, CustomerConfigHoldRelease::Unavailable(_)));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete released hold fixture");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(expired_app.org_id)
+            .execute(&pool)
+            .await
+            .expect("delete expired hold fixture");
     }
 
     #[tokio::test]

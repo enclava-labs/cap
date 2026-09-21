@@ -421,7 +421,7 @@ async fn deploy_with_timings(
 
     let bootstrap_pubkey_hash =
         template_bootstrap_pubkey_hash(api, &ctx.paths, template, &instance_name).await?;
-    let app = ensure_template_app(
+    let (app, app_already_existed) = ensure_template_app(
         api,
         template,
         &instance_name,
@@ -476,6 +476,8 @@ async fn deploy_with_timings(
                 customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
                 org_keyring_blob: Some(signed_blobs.org_keyring_blob),
                 signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
+                customer_config_roll_hold_seconds: app_already_existed
+                    .then(|| customer_config_roll_hold_seconds(args.ssh_timeout_seconds)),
             }),
         )
         .await
@@ -487,12 +489,16 @@ async fn deploy_with_timings(
         &response,
         explicit_stable_endpoint.as_deref(),
     )?;
+    let customer_config_hold = response.customer_config_hold;
     let deployment_id = response
         .deployment
         .cap_deployment_id
         .as_deref()
         .unwrap_or("pending")
         .to_string();
+    if customer_config_hold && deployment_id == "pending" {
+        return Err("PaaS held the workload roll but did not return a deployment id".into());
+    }
     pb.set_position(3);
     // The PaaS forwards the signed descriptor unchanged and preserves the
     // returned CAP deployment id, so the trusted expectation is valid only
@@ -611,7 +617,27 @@ async fn deploy_with_timings(
                 &config_pairs,
             ),
         )
-        .await?;
+        .await
+        .map_err(|error| -> Box<dyn std::error::Error> {
+            if customer_config_hold {
+                format!(
+                    "{error}\nThe workload roll was not released, so this deployment will not replace the running workload."
+                )
+                .into()
+            } else {
+                error
+            }
+        })?;
+    if customer_config_hold {
+        pb.set_message("Customer config stored; releasing workload roll...");
+        api.release_template_customer_config_roll(&instance_name, &deployment_id)
+            .await
+            .map_err(|error| {
+                format!(
+                    "customer config was stored, but the workload roll was not released: {error}. The running workload was left unchanged."
+                )
+            })?;
+    }
     pb.set_message(counted_progress(
         "Customer config",
         config_pairs.len(),
@@ -857,14 +883,31 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+const CUSTOMER_CONFIG_ROLL_HOLD_MIN_SECONDS: u64 = 30;
+const CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS: u64 = 7_200;
+
+/// Cover the managed-config wait and the customer-config delivery, each of
+/// which can consume the deploy's ssh timeout, plus a small release margin.
+/// CAP clamps the same window.
+fn customer_config_roll_hold_seconds(ssh_timeout_seconds: u64) -> u32 {
+    let budget = ssh_timeout_seconds
+        .saturating_mul(2)
+        .saturating_add(120)
+        .clamp(
+            CUSTOMER_CONFIG_ROLL_HOLD_MIN_SECONDS,
+            CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS,
+        );
+    u32::try_from(budget).unwrap_or(u32::MAX)
+}
+
 async fn ensure_template_app(
     api: &ApiClient,
     template: &HostedTemplate,
     instance_name: &str,
     bootstrap_pubkey_hash: Option<&str>,
-) -> Result<AppResponse, Box<dyn std::error::Error>> {
+) -> Result<(AppResponse, bool), Box<dyn std::error::Error>> {
     match api.get_app(instance_name).await {
-        Ok(app) => return Ok(app),
+        Ok(app) => return Ok((app, true)),
         Err(ApiError::Api { status: 404, .. }) => {}
         Err(error) => return Err(error.into()),
     }
@@ -877,8 +920,10 @@ async fn ensure_template_app(
         )?)
         .await
     {
-        Ok(app) => Ok(app),
-        Err(ApiError::Api { status: 409, .. }) => Ok(api.get_app(instance_name).await?),
+        Ok(app) => Ok((app, false)),
+        // A concurrent create won. The app already exists, so a following
+        // deploy is a redeploy and may hold the roll.
+        Err(ApiError::Api { status: 409, .. }) => Ok((api.get_app(instance_name).await?, true)),
         Err(error) => Err(error.into()),
     }
 }
@@ -4409,6 +4454,7 @@ mod tests {
             cap: serde_json::json!({
                 "app_domain": "shell.enclava.dev"
             }),
+            customer_config_hold: false,
         }
     }
 
@@ -4513,6 +4559,12 @@ mod tests {
         let config = body
             .find("deliver_template_config_with_retry")
             .expect("template deploy writes customer config");
+        let release = body
+            .find("release_template_customer_config_roll")
+            .expect("template redeploy releases the workload roll after customer config");
+        let ssh_wait = body
+            .find("wait_for_paas_ssh_command")
+            .expect("template deploy waits for the stable SSH command");
 
         assert!(
             !body.contains("enable_steady_tick"),
@@ -4527,9 +4579,18 @@ mod tests {
                 && wait_claim < claim
                 && claim < managed_config
                 && managed_config < wait_managed_config
-                && wait_managed_config < config,
-            "template deploy must prepare tenant log encryption before deployment, then make the config store writable before writing customer config"
+                && wait_managed_config < config
+                && config < release
+                && release < ssh_wait,
+            "template deploy must prepare tenant log encryption before deployment, write customer config before releasing a held roll, and only then wait for SSH"
         );
+    }
+
+    #[test]
+    fn customer_config_roll_hold_covers_both_wait_budgets() {
+        assert_eq!(customer_config_roll_hold_seconds(1_800), 3_720);
+        assert_eq!(customer_config_roll_hold_seconds(10), 140);
+        assert_eq!(customer_config_roll_hold_seconds(10_000), 7_200);
     }
 
     #[test]
