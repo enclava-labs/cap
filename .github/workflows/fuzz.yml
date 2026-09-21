@@ -17,6 +17,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - run: cargo fuzz run parse_proof_bundle -- -max_total_time=20
-      - run: cargo fuzz run ce_v1_decode -- -max_total_time=20
-      - run: cargo fuzz run verify_rsa_pss_sha384 -- -max_total_time=20
+      # cargo-binstall ships a musl cargo-fuzz. That binary defaults fuzz
+      # builds to x86_64-unknown-linux-musl, and AddressSanitizer cannot use
+      # a statically linked musl libc (rust-fuzz/cargo-fuzz#355).
+      - name: Resolve rustc host triple
+        run: echo "FUZZ_HOST=$(rustc -vV | awk '/^host:/{print $2}')" >> "$GITHUB_ENV"
+      - run: cargo fuzz run --target "$FUZZ_HOST" parse_proof_bundle -- -max_total_time=20
+      - run: cargo fuzz run --target "$FUZZ_HOST" ce_v1_decode -- -max_total_time=20
+      - run: cargo fuzz run --target "$FUZZ_HOST" verify_rsa_pss_sha384 -- -max_total_time=20
