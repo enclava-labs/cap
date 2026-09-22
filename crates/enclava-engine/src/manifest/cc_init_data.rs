@@ -273,15 +273,16 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     // enclava-init re-publishes this claim as the trusted in-guest handoff for
     // enclava-wait-exec, so a tampered host cannot swap the recipient key (and
     // thereby capture workload log plaintext) through pod env or ConfigMap.
+    // The claim deliberately carries ONLY key material: per-deployment frame
+    // labels (org/app/deployment) stay out of it so the cc_init_data hash of a
+    // rollback — which builds an app_spec with a fresh deployment UUID but
+    // reuses the target's signed artifact and expected hash — stays identical.
     if let Some(log_encryption) = &app.log_encryption {
         let handoff = serde_json::json!({
             "algorithm": log_encryption.algorithm,
             "key_id": log_encryption.key_id,
             "public_key_base64url": log_encryption.public_key_base64url,
             "public_key_sha256": log_encryption.public_key_sha256,
-            "org_id": app.tenant_id,
-            "app_name": app.name,
-            "deployment_id": app.deployment_id.to_string(),
         });
         push_toml_string(&mut toml, "log_encryption_json", &handoff.to_string());
     }

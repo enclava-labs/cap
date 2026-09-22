@@ -682,9 +682,23 @@ fn signed_log_encryption_handoff(
         .and_then(toml::Value::as_str);
     match (signed, cfg.log_encryption.as_ref()) {
         (None, None) => Ok(None),
-        (None, Some(_)) => anyhow::bail!(
-            "ConfigMap has a [log-encryption] section but signed cc_init_data has no log_encryption_json claim"
-        ),
+        // Init-first rollout compatibility: during the transition window where
+        // the new init binary is live but the old API still renders manifests,
+        // the ConfigMap may have [log-encryption] while cc_init_data lacks the
+        // new log_encryption_json claim. We tolerate this but the trust binding
+        // is DOWNGRADED: encrypted logs are disabled because we cannot verify
+        // the key material came from a trusted manifest source (it's purely
+        // host-controlled ConfigMap at this point). Once the API rolls out and
+        // begins emitting log_encryption_json, this branch is no longer taken
+        // and full trust binding is restored.
+        (None, Some(_)) => {
+            tracing::warn!(
+                "ConfigMap has [log-encryption] but signed cc_init_data lacks \
+                 log_encryption_json claim: legacy API manifest in transition window? \
+                 Encrypted logs are DISABLED for this workload until API rollout completes."
+            );
+            Ok(None)
+        }
         (Some(signed), section) => {
             let handoff: LogEncryptionHandoff = serde_json::from_str(signed)
                 .with_context(|| "parsing signed log_encryption_json claim")?;

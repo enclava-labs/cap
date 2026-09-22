@@ -569,10 +569,15 @@ fn log_encryption_claim_is_bound_to_cc_init_data() {
         handoff["public_key_sha256"],
         "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU"
     );
-    // Frame context rides the signed claim, not the pod env.
-    assert_eq!(handoff["org_id"], app.tenant_id);
-    assert_eq!(handoff["app_name"], app.name);
-    assert_eq!(handoff["deployment_id"], app.deployment_id.to_string());
+    // Per-deployment frame labels stay OUT of the measured claim so signed
+    // rollback hash reuse (fresh deployment UUID, reused artifact) is not
+    // broken by this field.
+    for label in ["org_id", "app_name", "deployment_id"] {
+        assert!(
+            handoff.get(label).is_none(),
+            "{label} must not be part of the measured log_encryption_json claim"
+        );
+    }
 
     // Absent when log encryption is not configured.
     let plain = build_toml(&sample_app());

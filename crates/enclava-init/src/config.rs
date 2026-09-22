@@ -33,11 +33,14 @@ pub struct AppBindMountConfig {
     pub mount_path: String,
 }
 
-/// Encrypted-log recipient metadata from the signed `log_encryption_json`
-/// cc_init_data claim. This is the authoritative form: enclava-init
-/// re-publishes it as the trusted in-guest handoff for enclava-wait-exec,
-/// so a tampered host cannot swap the recipient key (and thereby capture
-/// workload log plaintext) through pod env or ConfigMap.
+/// Encrypted-log recipient key material from the signed `log_encryption_json`
+/// cc_init_data claim. This is the authoritative form: enclava-init extracts
+/// it from the hash-verified cc_init_data buffer and re-publishes it as the
+/// trusted in-guest handoff for enclava-wait-exec, so a tampered host cannot
+/// swap the recipient key (and thereby capture workload log plaintext)
+/// through pod env or ConfigMap. Per-deployment frame labels
+/// (org/app/deployment) deliberately stay OUT: they are not key material and
+/// putting them in the measured claim would break signed rollback hash reuse.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct LogEncryptionHandoff {
@@ -45,9 +48,6 @@ pub struct LogEncryptionHandoff {
     pub key_id: String,
     pub public_key_base64url: String,
     pub public_key_sha256: String,
-    pub org_id: String,
-    pub app_name: String,
-    pub deployment_id: String,
 }
 
 /// The `[log-encryption]` ConfigMap section. Host-controlled transport copy

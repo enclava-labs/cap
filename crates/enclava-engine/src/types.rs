@@ -100,6 +100,15 @@ pub struct WorkloadArtifactBinding {
     pub descriptor_signing_pubkey: [u8; 32],
     #[serde(with = "hex_bytes32")]
     pub org_keyring_fingerprint: [u8; 32],
+    /// Deployment UUID the stored signed artifact was created for. Rollback
+    /// (and any later operation reusing a signed artifact) renders cc_init_data
+    /// under a fresh operation UUID while validating against the artifact's
+    /// expected hash, so any deployment-coupled claim (today:
+    /// `log_encryption_json.deployment_id`) must pin this value — not
+    /// `ConfidentialApp::deployment_id` — to keep the rendered bytes stable.
+    /// `None` for unsigned/dev renders, which fall back to the app value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_deploy_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
