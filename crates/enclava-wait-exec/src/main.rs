@@ -305,13 +305,20 @@ where
     let mut dropped_frames: u64 = 0;
     loop {
         buf.clear();
-        let n = read_capped_record(&mut reader, &mut buf)
+        let record = read_capped_record(&mut reader, &mut buf)
             .map_err(|err| format!("failed to read child {stream}: {err}"))?;
-        if n == 0 {
+        if record.len == 0 {
             return Ok(());
         }
-        while buf.ends_with(b"\n") || buf.ends_with(b"\r") {
-            buf.pop();
+        // Strip CR/LF line terminators only from records that actually ended
+        // at a newline (or at EOF, preserving the historical cleanup): an
+        // artificially capped chunk that happens to end in `\r` carries
+        // record content, not a terminator — stripping it would corrupt the
+        // encrypted plaintext of the reassembled record.
+        if !record.capped {
+            while buf.ends_with(b"\n") || buf.ends_with(b"\r") {
+                buf.pop();
+            }
         }
         let frame = encrypt_log_frame(
             &logs.recipient,
@@ -349,10 +356,22 @@ where
         // if it fails, neither is, so the log stream stays valid NDJSON.
         let mut frame_with_newline = line;
         frame_with_newline.push(b'\n');
+        // A single write_all is not transactional: a short write followed by
+        // an error (e.g. ENOSPC) can leave a frame prefix on disk. Snapshot
+        // the pre-write file length from the inode (NOT stream_position():
+        // the spool is O_APPEND and rotation reopens the handle, so the fd's
+        // cached offset can be stale relative to end-of-file) and truncate
+        // back to it on any write/flush failure, so the spool never carries
+        // a partial NDJSON line that the next successful append would extend
+        // into a permanently malformed record.
+        let pre_write_len = spool.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         if let Err(err) = spool
             .write_all(&frame_with_newline)
             .and_then(|_| spool.flush())
         {
+            if spool.set_len(pre_write_len).is_ok() {
+                let _ = spool.seek(SeekFrom::Start(pre_write_len));
+            }
             dropped_frames += 1;
             if dropped_frames == 1 || dropped_frames % 1000 == 0 {
                 eprintln!(
@@ -364,6 +383,17 @@ where
     }
 }
 
+/// One input record (or capped chunk of one) returned by `read_capped_record`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CappedRecord {
+    /// Bytes buffered into `buf` for this record/chunk.
+    len: usize,
+    /// True when the chunk was cut at `MAX_LOG_RECORD_BYTES` before any
+    /// newline was seen — the record continues in the next chunk, so its
+    /// final byte is record content, not a line terminator.
+    capped: bool,
+}
+
 /// Read one input record from the child, capped at
 /// `MAX_LOG_RECORD_BYTES`: a longer line is returned as consecutive
 /// chunks (each without a trailing newline except the final chunk), which
@@ -372,12 +402,18 @@ where
 /// wrapper's memory and the largest frame the spool can ever see.
 /// Implemented via fill_buf/consume rather than `Take::read_until` so the
 /// cap boundary is exact (no byte duplication or loss at the limit).
-fn read_capped_record<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+fn read_capped_record<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<CappedRecord> {
     buf.clear();
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
-            return Ok(buf.len());
+            return Ok(CappedRecord {
+                len: buf.len(),
+                capped: false,
+            });
         }
         let remaining = MAX_LOG_RECORD_BYTES - buf.len();
         let search = &available[..available.len().min(remaining)];
@@ -385,14 +421,20 @@ fn read_capped_record<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io:
             Some(i) => {
                 buf.extend_from_slice(&search[..=i]);
                 reader.consume(i + 1);
-                return Ok(buf.len());
+                return Ok(CappedRecord {
+                    len: buf.len(),
+                    capped: false,
+                });
             }
             None => {
                 buf.extend_from_slice(search);
                 let n = search.len();
                 reader.consume(n);
                 if buf.len() == MAX_LOG_RECORD_BYTES {
-                    return Ok(buf.len());
+                    return Ok(CappedRecord {
+                        len: buf.len(),
+                        capped: true,
+                    });
                 }
             }
         }
@@ -864,26 +906,30 @@ mod tests {
         let mut reader = std::io::BufReader::new(input.as_bytes());
 
         let mut first = Vec::new();
-        let n1 = read_capped_record(&mut reader, &mut first).unwrap();
-        assert_eq!(n1, MAX_LOG_RECORD_BYTES);
+        let r1 = read_capped_record(&mut reader, &mut first).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
         assert_eq!(first.len(), MAX_LOG_RECORD_BYTES);
         assert!(!first.ends_with(b"\n"), "capped chunk has no newline yet");
+        assert!(r1.capped, "chunk hit the cap before any newline");
 
         // The remainder of the same line (up to its newline) is the next
         // record — content is preserved across the split, nothing dropped.
         let mut second = Vec::new();
-        let n2 = read_capped_record(&mut reader, &mut second).unwrap();
+        let r2 = read_capped_record(&mut reader, &mut second).unwrap();
         let expected_remainder = format!("{}BCDEFGHIJKLMNOPQRSTUVWXYZ\n", "a".repeat(8));
         assert_eq!(second, expected_remainder.as_bytes());
-        assert!(n2 > 0);
+        assert!(r2.len > 0);
+        assert!(!r2.capped);
 
         let mut third = Vec::new();
-        let n3 = read_capped_record(&mut reader, &mut third).unwrap();
+        let r3 = read_capped_record(&mut reader, &mut third).unwrap();
         assert_eq!(third, b"second line\n");
-        assert!(n3 > 0);
+        assert!(r3.len > 0);
+        assert!(!r3.capped);
 
         let mut fourth = Vec::new();
-        assert_eq!(read_capped_record(&mut reader, &mut fourth).unwrap(), 0);
+        let r4 = read_capped_record(&mut reader, &mut fourth).unwrap();
+        assert_eq!(r4.len, 0);
         assert!(fourth.is_empty());
 
         // Reassembled content equals the input minus the record split.
@@ -891,5 +937,58 @@ mod tests {
         reassembled.extend_from_slice(&second);
         reassembled.extend_from_slice(&third);
         assert_eq!(reassembled, input.as_bytes());
+    }
+
+    /// Round-5 review finding: a `\r` that happens to sit exactly at an
+    /// artificial chunk boundary is record content, not a line terminator.
+    /// `read_capped_record` must report the chunk as capped so the caller
+    /// does not strip that byte (previously the trailing-CR cleanup
+    /// corrupted the encrypted plaintext of the reassembled record).
+    #[test]
+    fn read_capped_record_marks_cr_at_chunk_boundary_as_content() {
+        // 262,143 ordinary bytes followed by `\rX\n`: byte at index
+        // MAX_LOG_RECORD_BYTES - 1 (the chunk's last byte) is the `\r`.
+        let prefix = "a".repeat(MAX_LOG_RECORD_BYTES - 1);
+        let input = format!("{prefix}\rX\nsecond line\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert!(r1.capped, "chunk must be marked capped so CR survives");
+        assert_eq!(first.last(), Some(&b'\r'), "boundary CR is record content");
+
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second).unwrap();
+        assert_eq!(second, b"X\n");
+        assert!(!r2.capped);
+
+        let mut third = Vec::new();
+        read_capped_record(&mut reader, &mut third).unwrap();
+        assert_eq!(third, b"second line\n");
+
+        // Full record reassembly preserves the CR byte.
+        let mut reassembled = first.clone();
+        reassembled.extend_from_slice(&second);
+        reassembled.extend_from_slice(&third);
+        assert_eq!(reassembled, input.as_bytes());
+    }
+
+    /// CR/LF terminators are still stripped from records that ended at a
+    /// real newline (or EOF) — the historical cleanup behavior.
+    #[test]
+    fn read_capped_record_strips_terminators_on_complete_records() {
+        let input = "line-one\nline-two\r\nline-three\r\n";
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut buf = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut buf).unwrap();
+        assert_eq!(buf, b"line-one\n");
+        assert!(!r1.capped);
+        let r2 = read_capped_record(&mut reader, &mut buf).unwrap();
+        assert_eq!(buf, b"line-two\r\n");
+        assert!(!r2.capped);
+        let r3 = read_capped_record(&mut reader, &mut buf).unwrap();
+        assert_eq!(buf, b"line-three\r\n");
+        assert!(!r3.capped);
     }
 }
