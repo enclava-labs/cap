@@ -39,6 +39,26 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
+    build_router_inner_with_trace(state, enable_rate_limits, TraceLayer::new_for_http())
+}
+
+/// Build the production router with a configurable request-tracing layer.
+/// Production always passes `TraceLayer::new_for_http()`; tests inject a
+/// recording trace layer to assert that governor 429 rejections and gate
+/// short-circuits pass through the (outermost) tracing layer.
+#[allow(clippy::type_complexity)]
+fn build_router_inner_with_trace<T>(
+    state: AppState,
+    enable_rate_limits: bool,
+    trace_layer: T,
+) -> Router
+where
+    T: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+    T::Service: tower::Service<Request> + Clone + Send + Sync + 'static,
+    <T::Service as tower::Service<Request>>::Response: IntoResponse + 'static,
+    <T::Service as tower::Service<Request>>::Error: Into<std::convert::Infallible> + 'static,
+    <T::Service as tower::Service<Request>>::Future: Send + 'static,
+{
     let key_extractor = TrustedProxyKeyExtractor::from_env();
     let api_routes = build_api_routes(enable_rate_limits, key_extractor.clone());
     let api_routes = if enable_rate_limits {
@@ -54,7 +74,10 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         api_routes
     };
 
-    let mut router = Router::new().merge(with_tracing(with_operational_gates(&state, api_routes)));
+    let mut router = Router::new().merge(with_tracing(
+        with_operational_gates(&state, api_routes),
+        &trace_layer,
+    ));
 
     // Health and internal PaaS governors are layered OUTSIDE the operational
     // gates (startup gate, dispatch freeze): requests short-circuited by
@@ -90,7 +113,7 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
     } else {
         health_routes
     };
-    router = router.merge(with_tracing(health_routes));
+    router = router.merge(with_tracing(health_routes, &trace_layer));
 
     if state.management_mode.internal_paas_routes_enabled() {
         let internal_routes = with_operational_gates(&state, internal_routes());
@@ -119,7 +142,7 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         } else {
             internal_routes
         };
-        router = router.merge(with_tracing(internal_routes));
+        router = router.merge(with_tracing(internal_routes, &trace_layer));
     }
 
     router.layer(build_cors_layer()).with_state(state)
@@ -129,8 +152,15 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
 /// (above the group governors and operational gates) so that governor 429
 /// rejections and gate short-circuits are still recorded in HTTP traces —
 /// without this, the traffic that trips a rate limit is invisible.
-fn with_tracing(routes: Router<AppState>) -> Router<AppState> {
-    routes.layer(TraceLayer::new_for_http())
+fn with_tracing<T>(routes: Router<AppState>, trace_layer: &T) -> Router<AppState>
+where
+    T: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+    T::Service: tower::Service<Request> + Clone + Send + Sync + 'static,
+    <T::Service as tower::Service<Request>>::Response: IntoResponse + 'static,
+    <T::Service as tower::Service<Request>>::Error: Into<std::convert::Infallible> + 'static,
+    <T::Service as tower::Service<Request>>::Future: Send + 'static,
+{
+    routes.layer(trace_layer.clone())
 }
 
 /// Wrap a route group in the operational middleware shared by every group:
@@ -683,7 +713,10 @@ pub fn test_router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod runtime_gate_tests {
-    use super::{build_router_inner, is_workload_authority_mutation, test_router};
+    use super::{
+        build_router_inner, build_router_inner_with_trace, is_workload_authority_mutation,
+        test_router,
+    };
     use axum::{
         body::Body,
         extract::ConnectInfo,
@@ -927,41 +960,30 @@ mod runtime_gate_tests {
         // and internal governors sit outside the operational gates, so a
         // 429 rejection must not bypass request tracing — otherwise the
         // traffic that trips a rate limit is invisible in traces. This test
-        // captures tower_http trace output and asserts the 429 responses are
-        // recorded.
-        use tracing::level_filters::LevelFilter;
-        use tracing_subscriber::fmt::MakeWriter;
+        // injects a recording trace layer through the real router assembly
+        // (no global tracing subscriber, so it is robust under parallel test
+        // execution) and asserts 429 responses pass through it.
+        use std::sync::Arc;
+        use tower_http::trace::{OnResponse, TraceLayer};
 
-        #[derive(Clone)]
-        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        #[derive(Clone, Default)]
+        struct RecordStatuses(Arc<std::sync::Mutex<Vec<u16>>>);
 
-        impl std::io::Write for CaptureWriter {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl MakeWriter<'_> for CaptureWriter {
-            type Writer = CaptureWriter;
-            fn make_writer(&self) -> Self::Writer {
-                self.clone()
+        impl<B> OnResponse<B> for RecordStatuses {
+            fn on_response(
+                self,
+                response: &axum::http::Response<B>,
+                _latency: std::time::Duration,
+                _span: &tracing::Span,
+            ) {
+                self.0.lock().unwrap().push(response.status().as_u16());
             }
         }
 
-        let captured = CaptureWriter(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(LevelFilter::DEBUG)
-            .with_target(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-
+        let recorder = RecordStatuses::default();
+        let trace_layer = TraceLayer::new_for_http().on_response(recorder.clone());
         let state = crate::test_support::lazy_state();
-        let app = build_router_inner(state, true);
+        let app = build_router_inner_with_trace(state, true, trace_layer);
 
         // Drain the health bucket until the governor rejects with 429s.
         let mut saw_limit = false;
@@ -978,10 +1000,10 @@ mod runtime_gate_tests {
         }
         assert!(saw_limit, "governor must reject the probe loop with 429");
 
-        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let statuses = recorder.0.lock().unwrap().clone();
         assert!(
-            logs.contains("429"),
-            "governor 429 rejections must appear in HTTP traces; captured: {logs}"
+            statuses.contains(&429),
+            "governor 429 rejections must pass through the tracing layer; saw {statuses:?}"
         );
     }
 
