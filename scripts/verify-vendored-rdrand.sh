@@ -40,6 +40,17 @@ if [[ ! -d "$VENDOR_DIR" ]]; then
     exit 1
 fi
 
+# No file may exist in the vendor dir that is absent from the pristine
+# tarball (e.g. a smuggled build.rs) — the vendored tree must be exactly
+# the tarball contents plus the reviewed patch.
+while IFS= read -r -d '' f; do
+    rel="${f#"$VENDOR_DIR"/}"
+    if [[ ! -e "$work/rdrand-0.8.3/$rel" ]]; then
+        echo "verify-vendored-rdrand: extra file not in pristine tarball: $rel" >&2
+        exit 1
+    fi
+done < <(find "$VENDOR_DIR" -type f -print0)
+
 # The reviewed delta covers only Cargo.toml and src/lib.rs; every other
 # vendored file must be byte-identical to the tarball.
 for f in src/errors.rs src/changelog.rs LICENSE; do

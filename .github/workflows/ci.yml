@@ -63,7 +63,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -148,10 +148,10 @@ jobs:
           tool: cargo-audit,cargo-deny
 
       - name: Run cargo audit
-        # RUSTSEC-2023-0071 is transitive through sigstore/openidconnect and has
-        # no fixed upstream path. cargo-deny records the same exception with
-        # rationale in deny.toml.
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        # Ignore list is kept in lockstep with deny.toml [advisories]:
+        # every id there must appear here (and vice versa) so the two
+        # gates can never diverge on which advisories are accepted.
+        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2026-0173 --ignore RUSTSEC-2026-0221
 
       - name: Run cargo deny
         run: cargo deny check advisories sources

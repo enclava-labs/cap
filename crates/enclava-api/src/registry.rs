@@ -29,36 +29,6 @@ pub async fn resolve_tag_to_digest(
 ) -> Result<String, RegistryError> {
     let base_url = registry_base_url(registry)?;
 
-    // HEAD request for the manifest, accepting OCI and Docker media types
-    let url = format!("{base_url}/v2/{repository}/manifests/{tag}");
-    client.check_url(&url)?;
-
-    let response = client
-        .inner()
-        .head(&url)
-        .header(
-            "Accept",
-            "application/vnd.oci.image.index.v1+json, \
-             application/vnd.oci.image.manifest.v1+json, \
-             application/vnd.docker.distribution.manifest.v2+json, \
-             application/vnd.docker.distribution.manifest.list.v2+json",
-        )
-        .send()
-        .await?;
-
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(RegistryError::NotFound(format!(
-            "{registry}/{repository}:{tag}"
-        )));
-    }
-
-    if !response.status().is_success() {
-        return Err(RegistryError::ResolveFailed(format!(
-            "registry returned status {}",
-            response.status()
-        )));
-    }
-
     // Resolve by GET and hash the returned manifest bytes ourselves instead
     // of trusting the Docker-Content-Digest header: a compromised or
     // MITM-positioned registry could serve one manifest body while claiming
@@ -67,6 +37,9 @@ pub async fn resolve_tag_to_digest(
     // also still carries Docker-Content-Digest, so a mismatch between the
     // self-computed and advertised digests additionally proves the registry
     // is dishonest and is rejected outright (defense in depth, issue #140).
+    let url = format!("{base_url}/v2/{repository}/manifests/{tag}");
+    client.check_url(&url)?;
+
     let response = client
         .inner()
         .get(&url)
@@ -105,7 +78,24 @@ pub async fn resolve_tag_to_digest(
             RegistryError::ResolveFailed("no Docker-Content-Digest header in response".to_string())
         })?;
 
+    // Cap the manifest read like every other registry body: an allowlisted
+    // but hostile registry must not be able to OOM the API pod with an
+    // oversized "manifest".
+    let limit = client.body_limit();
+    if let Some(len) = response.content_length()
+        && len > limit
+    {
+        return Err(RegistryError::ResolveFailed(format!(
+            "manifest body length {len} exceeds client body limit {limit}"
+        )));
+    }
     let manifest = response.bytes().await?;
+    if manifest.len() as u64 > limit {
+        return Err(RegistryError::ResolveFailed(format!(
+            "manifest body length {} exceeds client body limit {limit}",
+            manifest.len()
+        )));
+    }
     verify_advertised_digest(&advertised_digest, &manifest, registry, repository, tag)
 }
 

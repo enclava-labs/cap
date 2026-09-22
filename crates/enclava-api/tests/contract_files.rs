@@ -66,21 +66,61 @@ fn dockerfiles_pin_base_images_by_digest() {
                 continue;
             };
             let image = rest.split_whitespace().next().unwrap_or("");
-            // BUILD stages can use the implicit latest; scratch has no bytes.
-            if image == "SCRATCH" || image == "scratch" {
-                continue;
-            }
-            assert!(
-                image.contains("@sha256:"),
-                "{}: FROM `{image}` must be pinned by digest",
-                dockerfile.display()
-            );
+            assert_is_digest_pinned(&dockerfile, image);
             checked += 1;
         }
     }
     assert!(
         checked > 0,
         "expected to check at least one Dockerfile FROM line"
+    );
+}
+
+#[test]
+fn ci_and_compose_service_images_are_digest_pinned() {
+    // Dev/CI service images are not production artifacts, but they are part
+    // of the reproducible-build story: pin them the same way (issue #140).
+    for (path, needle) in [
+        (
+            ".github/workflows/ci.yml",
+            "postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+        ),
+        (
+            "docker-compose.yml",
+            "postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+        ),
+    ] {
+        let content = fs::read_to_string(workspace_root().join(path))
+            .unwrap_or_else(|e| panic!("read {path}: {e}"));
+        assert!(
+            content.contains(needle),
+            "{path} must pin the postgres service image by the reviewed digest"
+        );
+        assert!(
+            !content.contains("postgres:16-alpine\n"),
+            "{path} must not reference the mutable postgres:16-alpine tag"
+        );
+    }
+}
+
+fn assert_is_digest_pinned(dockerfile: &std::path::Path, image: &str) {
+    // scratch has no bytes to pin; anything else needs a well-formed
+    // sha256 digest: exactly 64 lowercase hex characters.
+    if image == "scratch" {
+        return;
+    }
+    let digest = image
+        .rsplit_once("@sha256:")
+        .map(|(_, hex)| hex)
+        .unwrap_or_default();
+    let valid = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    assert!(
+        valid,
+        "{}: FROM `{image}` must be pinned by a sha256 digest (64 lowercase hex chars)",
+        dockerfile.display()
     );
 }
 
