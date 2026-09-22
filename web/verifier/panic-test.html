@@ -4,40 +4,4 @@
       content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; style-src 'unsafe-inline'">
 <title>Verifier panic-isolation harness</title>
 <pre id="result">RUNNING</pre>
-<script type="module">
-  // Panic isolation on the real browser target (cap#141 review): a panic
-  // inside the wasm module (built for wasm32-unknown-unknown, whose panic
-  // strategy is abort) must surface as a *catchable* JS exception, and the
-  // instance must stay usable afterwards. This page is only built and run
-  // in CI with the debug-panic-probe feature; the shipped release module
-  // exports no probe.
-  import init, { debug_panic_probe } from './pkg/enclava_verifier_wasm.js';
-
-  const fail = (reason) => {
-    document.querySelector('#result').textContent = `FAIL ${reason}`;
-  };
-
-  try {
-    await init();
-    let trapped = null;
-    try {
-      debug_panic_probe();
-    } catch (error) {
-      trapped = error;
-    }
-    if (!trapped) throw new Error('probe did not trap');
-    if (!(trapped instanceof Error)) throw new Error('trap is not an Error');
-    // The instance must still serve calls after the trap — a poisoned
-    // module would throw again or return garbage.
-    let second = null;
-    try {
-      debug_panic_probe();
-    } catch (error) {
-      second = error;
-    }
-    if (!second) throw new Error('second probe did not trap');
-    document.querySelector('#result').textContent = 'PASS panic-isolated';
-  } catch (error) {
-    fail(error);
-  }
-</script>
+<script type="module" src="panic-test-harness.js"></script>
