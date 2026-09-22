@@ -1101,10 +1101,14 @@ async fn deploy_app_candidate(
             })?;
 
     // Fetch provenance attestation and SBOM if available (non-fatal if missing).
-    let (provenance, sbom) =
-        crate::cosign::fetch_attestations(&state.http_client, &body.image, &image_digest)
-            .await
-            .unwrap_or((None, None));
+    let (provenance, sbom) = crate::cosign::fetch_attestations(
+        &state.http_client,
+        &body.image,
+        &image_digest,
+        state.outbound_body_limit,
+    )
+    .await
+    .unwrap_or((None, None));
 
     let source_provider = body.source_provider.map(SourceProvider::as_str);
     let spec_snapshot = serde_json::json!({

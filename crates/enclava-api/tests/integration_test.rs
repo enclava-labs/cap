@@ -185,6 +185,7 @@ async fn setup_test_state_with_mode(management_mode: CapManagementMode) -> (AppS
         platform_domain: "enclava.dev".to_string(),
         tee_domain_suffix: "tee.enclava.dev".to_string(),
         http_client: reqwest::Client::new(),
+        outbound_body_limit: enclava_api::clients::ClientConfig::from_env().body_limit_bytes,
         registry_client: enclava_api::clients::RegistryClient::new(
             enclava_api::clients::ClientConfig::from_env(),
             enclava_api::clients::AllowList::from_env_or_default(None),

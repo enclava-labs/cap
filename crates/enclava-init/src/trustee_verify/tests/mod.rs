@@ -642,3 +642,195 @@ fn parse_kbs_attestation_token_payload_accepts_token() {
         .unwrap();
     assert_eq!(token, "abc.def.ghi");
 }
+
+/// Regression tests for issue #125: trustee artifact fetches must cap
+/// response/file bodies instead of buffering unbounded content.
+#[test]
+fn fetch_json_rejects_oversized_file_body() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("huge.json");
+    std::fs::write(&path, "x".repeat(TRUSTEE_FETCH_BODY_LIMIT_BYTES + 1)).unwrap();
+    let client = reqwest::blocking::Client::new();
+    let err = fetch_json::<serde_json::Value>(
+        &client,
+        &format!("file://{}", path.display()),
+        "token",
+        "fetch artifacts",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, InitError::Kbs(msg) if msg.contains("byte limit")),
+        "expected body-limit error, got: {err:?}"
+    );
+}
+
+#[test]
+fn fetch_json_rejects_oversized_http_body() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = "x".repeat(TRUSTEE_FETCH_BODY_LIMIT_BYTES + 1);
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body.as_bytes()).unwrap();
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let err = fetch_json::<serde_json::Value>(
+        &client,
+        &format!("http://127.0.0.1:{port}/artifacts"),
+        "token",
+        "fetch artifacts",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, InitError::Kbs(msg) if msg.contains("byte limit")),
+        "expected body-limit error, got: {err:?}"
+    );
+}
+
+#[test]
+fn fetch_json_accepts_small_http_body() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = r#"{"token":"abc"}"#;
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body.as_bytes()).unwrap();
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let value: serde_json::Value = fetch_json(
+        &client,
+        &format!("http://127.0.0.1:{port}/artifacts"),
+        "token",
+        "fetch artifacts",
+    )
+    .unwrap();
+    assert_eq!(value["token"], "abc");
+}
+
+/// Regression test for issue #125 (chunked-transfer variant): the original
+/// `Response::json()` path buffered chunked bodies with no content-length;
+/// the capped reader must reject mid-stream, not only via Content-Length.
+#[test]
+fn fetch_json_rejects_oversized_chunked_http_body() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    // No Content-Length: HTTP/1.1 chunked transfer encoding, body larger
+    // than the cap, streamed in small chunks.
+    let total = TRUSTEE_FETCH_BODY_LIMIT_BYTES + 64 * 1024;
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut sent = 0usize;
+        while sent < total {
+            let remaining = total - sent;
+            let chunk = remaining.min(64 * 1024);
+            stream
+                .write_all(format!("{chunk:x}\r\n").as_bytes())
+                .unwrap();
+            stream.write_all(&vec![b'x'; chunk]).unwrap();
+            stream.write_all(b"\r\n").unwrap();
+            sent += chunk;
+        }
+        stream.write_all(b"0\r\n\r\n").unwrap();
+    });
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let err = fetch_json::<serde_json::Value>(
+        &client,
+        &format!("http://127.0.0.1:{port}/artifacts"),
+        "token",
+        "fetch artifacts",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, InitError::Kbs(msg) if msg.contains("byte limit")),
+        "expected body-limit error, got: {err:?}"
+    );
+}
+
+/// Regression test for issue #125 (file-swap variant): the `Read::take`
+/// backstop must reject a body that exceeds the cap on the actual bytes
+/// read, even when the pre-read `metadata` check passed — a fifo reports
+/// length 0 at stat time, so only the read-loop cap stops an unbounded
+/// writer (the same protection covers a file grown between stat and read).
+#[test]
+fn fetch_json_rejects_oversized_body_when_file_grows_after_metadata() {
+    let dir = tempdir().unwrap();
+    let fifo = dir.path().join("huge.fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("spawn mkfifo")
+            .success(),
+        "mkfifo {fifo:?}"
+    );
+    let writer = std::thread::spawn({
+        let fifo = fifo.clone();
+        move || {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            // metadata on a fifo reports 0 bytes, so the stat check passes.
+            let chunk = vec![b'x'; 64 * 1024];
+            for _ in 0..(TRUSTEE_FETCH_BODY_LIMIT_BYTES / (64 * 1024) + 2) {
+                if f.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let client = reqwest::blocking::Client::new();
+    let err = fetch_json::<serde_json::Value>(
+        &client,
+        &format!("file://{}", fifo.display()),
+        "token",
+        "fetch artifacts",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, InitError::Kbs(msg) if msg.contains("byte limit")),
+        "expected body-limit error, got: {err:?}"
+    );
+    let _ = writer.join();
+}

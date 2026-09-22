@@ -873,6 +873,7 @@ async fn main() {
     let outbound_config = enclava_api::clients::ClientConfig::from_env();
     let http_client = enclava_api::clients::build_guarded_client(&outbound_config)
         .expect("failed to build SSRF-defended outbound HTTP client");
+    let outbound_body_limit = outbound_config.body_limit_bytes;
     let registry_client =
         enclava_api::clients::RegistryClient::from_env().expect("failed to build registry client");
     let trustee_http_client =
@@ -891,6 +892,7 @@ async fn main() {
         platform_domain,
         tee_domain_suffix,
         http_client,
+        outbound_body_limit,
         registry_client,
         trustee_http_client,
         tee_http_client,

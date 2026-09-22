@@ -23,6 +23,7 @@ use enclava_common::descriptor::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -311,22 +312,81 @@ fn fetch_json<T: DeserializeOwned>(
     attestation_token: &str,
     context: &str,
 ) -> Result<T> {
+    let bytes = fetch_body_capped(client, url, attestation_token, context)?;
+    serde_json::from_slice(&bytes).map_err(|e| InitError::Kbs(format!("{context} {url} json: {e}")))
+}
+
+/// Read an artifact body into memory with a hard size cap so a compromised
+/// KBS/Trustee endpoint cannot OOM the init sidecar before seed release.
+/// Applies to both the `file://` dev/test transport and real HTTP fetches
+/// (declared `content-length` is checked before reading; streamed chunks
+/// are re-checked as they arrive).
+const TRUSTEE_FETCH_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+
+fn fetch_body_capped(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    attestation_token: &str,
+    context: &str,
+) -> Result<Vec<u8>> {
     if let Some(path) = url.strip_prefix("file://") {
-        let bytes = std::fs::read(path)
+        let metadata = std::fs::metadata(path)
             .map_err(|e| InitError::Kbs(format!("{context} file {path}: {e}")))?;
-        return serde_json::from_slice(&bytes)
-            .map_err(|e| InitError::Kbs(format!("{context} file {path} json: {e}")));
+        let len = metadata.len() as usize;
+        if len > TRUSTEE_FETCH_BODY_LIMIT_BYTES {
+            return Err(InitError::Kbs(format!(
+                "{context} file {path}: body exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+            )));
+        }
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| InitError::Kbs(format!("{context} file {path}: {e}")))?;
+        let mut bytes = Vec::new();
+        // Cap enforced on actual bytes read, not just the declared length,
+        // so the file cannot grow (or be swapped for a fifo) between the
+        // metadata check and the read.
+        (&mut file)
+            .take(TRUSTEE_FETCH_BODY_LIMIT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| InitError::Kbs(format!("{context} file {path}: {e}")))?;
+        if bytes.len() > TRUSTEE_FETCH_BODY_LIMIT_BYTES {
+            return Err(InitError::Kbs(format!(
+                "{context} file {path}: body exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+            )));
+        }
+        return Ok(bytes);
     }
 
-    client
+    let mut response = client
         .get(url)
         .header("Authorization", format!("Attestation {attestation_token}"))
         .send()
         .map_err(|e| request_error(&format!("{context} send"), url, e))?
         .error_for_status()
-        .map_err(|e| request_error(&format!("{context} status"), url, e))?
-        .json()
-        .map_err(|e| request_error(&format!("{context} json"), url, e))
+        .map_err(|e| request_error(&format!("{context} status"), url, e))?;
+    if let Some(len) = response.content_length()
+        && len as usize > TRUSTEE_FETCH_BODY_LIMIT_BYTES
+    {
+        return Err(InitError::Kbs(format!(
+            "{context} {url}: body exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+        )));
+    }
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = response
+            .read(&mut chunk)
+            .map_err(|e| InitError::Kbs(format!("{context} {url} body: {e}")))?;
+        if read == 0 {
+            break;
+        }
+        if body.len() + read > TRUSTEE_FETCH_BODY_LIMIT_BYTES {
+            return Err(InitError::Kbs(format!(
+                "{context} {url}: body exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+            )));
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    Ok(body)
 }
 
 fn request_error(context: &str, url: &str, err: reqwest::Error) -> InitError {
@@ -346,12 +406,36 @@ pub fn resolve_kbs_attestation_token(
         .timeout(timeout)
         .build()
         .map_err(|e| InitError::Kbs(format!("token client build: {e}")))?;
-    let payload: serde_json::Value = client
+    let mut response = client
         .get(token_url)
         .send()
         .and_then(|r| r.error_for_status())
-        .and_then(|r| r.json())
         .map_err(|e| InitError::Kbs(format!("fetch KBS attestation token: {e}")))?;
+    if let Some(len) = response.content_length()
+        && len as usize > TRUSTEE_FETCH_BODY_LIMIT_BYTES
+    {
+        return Err(InitError::Kbs(format!(
+            "KBS attestation token response exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+        )));
+    }
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = response
+            .read(&mut chunk)
+            .map_err(|e| InitError::Kbs(format!("read KBS attestation token body: {e}")))?;
+        if read == 0 {
+            break;
+        }
+        if body.len() + read > TRUSTEE_FETCH_BODY_LIMIT_BYTES {
+            return Err(InitError::Kbs(format!(
+                "KBS attestation token response exceeds {TRUSTEE_FETCH_BODY_LIMIT_BYTES} byte limit"
+            )));
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    let payload: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| InitError::Kbs(format!("parse KBS attestation token response: {e}")))?;
     parse_kbs_attestation_token_payload(&payload)
 }
 
