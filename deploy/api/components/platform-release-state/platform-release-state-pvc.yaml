@@ -10,8 +10,9 @@ spec:
   # STATE) must survive pod replacement, so an emptyDir would silently reset
   # the anti-rollback floor. ReadWriteMany because the base deployment runs
   # 2 replicas that serialize on the same mark + flock; single-replica
-  # overlays may relax this to ReadWriteOnce. Overlays without a default
-  # StorageClass must set spec.storageClassName explicitly.
+  # deployments may relax this to ReadWriteOnce. Environments without a
+  # default RWX-capable StorageClass must set spec.storageClassName
+  # explicitly.
   accessModes:
     - ReadWriteMany
   resources:

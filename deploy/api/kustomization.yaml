@@ -5,7 +5,6 @@ resources:
 - namespace.yaml
 - rbac.yaml
 - deployment.yaml
-- platform-release-state-pvc.yaml
 - service.yaml
 - ingress.yaml
 - network-policy.yaml

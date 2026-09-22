@@ -45,8 +45,6 @@ spec:
         volumeMounts:
         - name: tmp
           mountPath: /tmp
-        - name: platform-release-state
-          mountPath: /var/lib/enclava
         env:
         # Rate-limit keying behind the ingress: the peer address seen by
         # the API pod is the ingress-nginx controller's pod/node IP, not the
@@ -83,15 +81,14 @@ spec:
               key: database-url
         - name: DATABASE_MIGRATION_MODE
           value: verify
-        # Durable, pod-replacement-surviving home for the platform-release
-        # override high-water mark. The override envelope itself is a
-        # read-only configmap mount, so the anti-rollback mark must live on
-        # a writable volume — otherwise a pod replacement resets it and
-        # re-admits a stale (T0 < T1 < T2) signed release. Point this at
-        # separately-protected storage if the override lane is used in
-        # anger; an attacker who can delete this file can reset the floor.
-        - name: ENCLAVA_PLATFORM_RELEASE_STATE
-          value: /var/lib/enclava/platform-release.accepted
+        # The platform-release override lane (ENCLAVA_PLATFORM_RELEASE_PATH)
+        # is NOT active in this base deployment, so it wires no durable
+        # high-water-mark state: a mandatory RWX PVC would leave pods
+        # unschedulable on clusters whose default StorageClass is
+        # ReadWriteOnce. Environments that activate the override lane add
+        # deploy/api/components/platform-release-state (or replicate its
+        # wiring) to mount writable state for ENCLAVA_PLATFORM_RELEASE_
+        # STATE.
         # Keep false through migration, clean-cut proof, provider convergence,
         # and smoke tests. Enable only in a later activation rollout.
         - name: CAP_DEPLOYMENT_DISPATCH_ENABLED
@@ -153,10 +150,3 @@ spec:
       volumes:
       - name: tmp
         emptyDir: {}
-      # Durable high-water-mark storage for the ENCLAVA_PLATFORM_RELEASE_PATH
-      # override lane (see ENCLAVA_PLATFORM_RELEASE_STATE above). ReadWriteMany
-      # because the base runs 2 replicas that must serialize on the same
-      # mark + flock; scale-to-one overlays can relax this to RWO.
-      - name: platform-release-state
-        persistentVolumeClaim:
-          claimName: cap-api-platform-release-state

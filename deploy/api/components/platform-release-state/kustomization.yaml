@@ -1,0 +1,25 @@
+# Opt-in kustomize component: durable storage for the platform-release
+# override lane's high-water mark (anti-rollback gate, enclava-labs/cap#165).
+#
+# The base deployment does NOT mount this state: the override lane
+# (ENCLAVA_PLATFORM_RELEASE_PATH) is inactive in the base, and a mandatory
+# RWX claim would leave API pods unschedulable on clusters whose default
+# StorageClass is ReadWriteOnce. Environments that activate the override
+# lane add this component (or replicate its wiring in their own overlay)
+# so the accepted-release mark survives pod replacement:
+#
+#   components:
+#     - ../../deploy/api/components/platform-release-state   # local
+#     # or, from another repo:
+#     - github.com/enclava-labs/cap/deploy/api/components/platform-release-state?ref=<tag>
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+- platform-release-state-pvc.yaml
+
+patches:
+- path: deployment-state-volume.yaml
+  target:
+    kind: Deployment
+    name: enclava-api

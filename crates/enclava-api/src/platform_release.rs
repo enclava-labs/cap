@@ -244,6 +244,11 @@ fn override_high_water_mark_state_path(override_path: &Path) -> PathBuf {
 struct AcceptedOverrideMark {
     platform_release_version: String,
     created_at: String,
+    /// Empty for marks persisted by the pre-digest version (serde default):
+    /// such a legacy mark still floors timestamp-downgrades but can never
+    /// equal a freshly computed digest, so any equal-timestamp candidate
+    /// fails closed against it.
+    #[serde(default)]
     payload_sha256: String,
 }
 
@@ -388,12 +393,48 @@ fn enforce_override_not_older_than_last_accepted_locked(
     }
     let mark = AcceptedOverrideMark::of(release)?;
     if floor.as_ref() != Some(&mark) {
-        std::fs::write(state_path, serde_json::to_vec_pretty(&mark)?).map_err(|error| {
+        // Durable atomic persist: write a sibling temp file, fsync it, then
+        // rename over the mark. A bare truncate-in-place write could tear on
+        // crash (next boot fails closed) or silently lose the mark on power
+        // loss — resetting the anti-rollback floor to the bundle, which is
+        // exactly the downgrade this gate exists to refuse.
+        let mut tmp = state_path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let bytes = serde_json::to_vec_pretty(&mark)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .map_err(|error| PlatformReleaseError::HighWaterMarkPersistFailed {
+                state_path: state_path.display().to_string(),
+                source: error,
+            })?;
+        std::io::Write::write_all(&mut file, &bytes).map_err(|error| {
             PlatformReleaseError::HighWaterMarkPersistFailed {
                 state_path: state_path.display().to_string(),
                 source: error,
             }
         })?;
+        file.sync_all()
+            .map_err(|error| PlatformReleaseError::HighWaterMarkPersistFailed {
+                state_path: state_path.display().to_string(),
+                source: error,
+            })?;
+        drop(file);
+        std::fs::rename(&tmp, state_path).map_err(|error| {
+            PlatformReleaseError::HighWaterMarkPersistFailed {
+                state_path: state_path.display().to_string(),
+                source: error,
+            }
+        })?;
+        // fsync the directory so the rename itself survives power loss.
+        if let Some(parent) = state_path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
     }
     Ok(())
 }
