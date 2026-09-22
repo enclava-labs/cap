@@ -137,6 +137,10 @@ impl ApiClient {
                     }
                     Err(_) => (None, format!("HTTP {status_code}")),
                 },
+                Err(ApiError::ResponseTooLarge(cap)) => (
+                    None,
+                    format!("HTTP {status_code} (error body exceeded {cap}-byte cap)"),
+                ),
                 Err(_) => (None, format!("HTTP {status_code}")),
             };
             Err(ApiError::Api {
@@ -870,7 +874,7 @@ const API_REQUEST_TIMEOUT_SECONDS: u64 = 900;
 /// hostile or compromised API from streaming an unbounded body into CLI
 /// memory. Checked against `content-length` and again per chunk, so streaming
 /// bodies without a declared length cannot bypass the limit.
-const MAX_API_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_API_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Error bodies carry a short code/message envelope; anything larger is not
 /// a legitimate error payload.
@@ -889,7 +893,7 @@ fn http_client_for(url: &str) -> reqwest::Client {
 /// Bounded body read shared by every JSON decode: the declared
 /// `content-length` is checked first and each streamed chunk is checked
 /// again, so a body without a declared length cannot bypass the cap.
-async fn read_bounded_body(
+pub async fn read_bounded_body(
     mut resp: reqwest::Response,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ApiError> {
@@ -901,7 +905,7 @@ async fn read_bounded_body(
     }
     let mut body = Vec::new();
     while let Some(chunk) = resp.chunk().await? {
-        if chunk.len() > max_bytes - body.len() {
+        if chunk.len() > max_bytes.saturating_sub(body.len()) {
             return Err(ApiError::ResponseTooLarge(max_bytes));
         }
         body.extend_from_slice(&chunk);
