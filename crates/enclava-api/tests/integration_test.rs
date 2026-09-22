@@ -978,6 +978,14 @@ async fn purge_expired_device_login_sessions_removes_only_long_expired_rows() {
             .expect("kept lookup");
     // SELECT 1 returns i64=1 when present.
     assert_eq!(kept, Some(1), "recent session survives the purge");
+
+    // Clean up test rows to avoid polluting other tests' purge assertions.
+    sqlx::query("DELETE FROM device_login_sessions WHERE device_code_hash IN ($1, $2)")
+        .bind(device_code_hash(&kept_code))
+        .bind(device_code_hash(&purged_code))
+        .execute(&pool)
+        .await
+        .expect("test cleanup");
 }
 
 #[tokio::test]
