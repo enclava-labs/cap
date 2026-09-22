@@ -69,7 +69,7 @@ pub enum KbsPolicyError {
     #[error("signed KBS policy compare-and-swap retries were exhausted")]
     PolicyCasExhausted,
     #[error(
-        "resource-policy.rego managed marker is malformed: {0} (markers must be line-anchored and unique)"
+        "resource-policy.rego splice anchor is malformed: {0} (markers/assignments must be line-anchored, outside strings, and unique)"
     )]
     MalformedManagedMarkers(String),
     #[error("Trustee deployment rollout timed out")]

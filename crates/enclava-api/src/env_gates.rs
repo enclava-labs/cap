@@ -55,9 +55,12 @@ fn validate_acme_directory_url(
 ) -> Result<(), EnvGateError> {
     // Cleartext ACME directory URLs would leak ACME account credentials and
     // challenge traffic; same rule as the signed-release field and
-    // TRUSTEE_KBS_URL. Parsing makes the scheme check case-insensitive
-    // (`HTTP://` must not slip a prefix check).
-    if http_scheme(value) {
+    // TRUSTEE_KBS_URL. The parsed scheme must be exactly https — same
+    // strictness as the signed-release validator (`ws://`, `file://`, or
+    // schemeless values are not acceptable ACME directories) — and parsing
+    // makes the check case-insensitive (`HTTP://` must not slip a prefix
+    // check).
+    if !https_scheme(value) {
         return Err(EnvGateError::CleartextAcmeUrl(source_name));
     }
     if is_letsencrypt_production_acme_url(value) && !production_acme_allowed {
@@ -158,6 +161,12 @@ fn enforce_with(
     }
 
     Ok(())
+}
+
+/// True when `value` parses as an https:// URL. Parsing makes the scheme
+/// check case-insensitive (`HTTPS://` normalizes to `https`).
+fn https_scheme(value: &str) -> bool {
+    reqwest::Url::parse(value.trim()).is_ok_and(|url| url.scheme() == "https")
 }
 
 /// True when `value` parses as an http:// URL (any host). Parsing makes the

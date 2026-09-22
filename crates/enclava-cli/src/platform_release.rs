@@ -202,10 +202,9 @@ impl PlatformReleaseEnvelope {
 pub fn enforce_release_not_older_than_bundled(
     release: &PlatformRelease,
 ) -> Result<(), PlatformReleaseError> {
-    let Ok(bundled) = serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
-    else {
-        return Ok(());
-    };
+    // Parity with the API twin: a malformed bundled baseline fails closed
+    // (Json error) rather than silently disabling the downgrade gate.
+    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
     if release_is_older(release, &bundled.payload)? {
         return Err(PlatformReleaseError::DowngradeRefused {
             override_version: release.platform_release_version.clone(),
