@@ -1384,6 +1384,9 @@ async fn wait_for_template_bootstrap_endpoint(
 fn should_retry_template_bootstrap_endpoint_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(error) => should_retry_api_transport_error(error),
+        // A body that fails to decode or breaches the size cap will not
+        // improve on retry: the API response itself is bad.
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => false,
         ApiError::Api { status, code, .. } => match (*status, code.as_deref()) {
             (409, Some("cap_app_sync_pending")) => true,
             (
@@ -2222,6 +2225,8 @@ fn template_config_next_locked_since(
 fn should_retry_template_config_sync_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
+        // A malformed or oversized body will not improve on retry.
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => false,
         ApiError::Api { status, .. } => matches!(*status, 408 | 409 | 425 | 429) || *status >= 500,
         ApiError::NotAuthenticated => false,
     }
@@ -2897,6 +2902,8 @@ fn template_deployment_failure_message(
 fn should_retry_template_deployment_status_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(error) => should_retry_api_transport_error(error),
+        // A malformed or oversized body will not improve on retry.
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => false,
         ApiError::Api { status, code, .. } => {
             if matches!(
                 code.as_deref(),
@@ -3237,6 +3244,8 @@ fn normalize_paas_ssh_command_app_url(app_url: &str) -> Result<String, Box<dyn s
 fn should_retry_paas_ssh_command_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
+        // A malformed or oversized body will not improve on retry.
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => false,
         ApiError::Api { status, code, .. } => {
             if matches!(
                 code.as_deref(),
@@ -4642,7 +4651,10 @@ mod tests {
             .get_unlock_endpoint("shell")
             .await
             .unwrap_err();
-        assert!(matches!(&error, ApiError::Http(error) if error.is_decode()));
+        // Decode failures surface as the dedicated ApiError::Decode variant
+        // (bounded-body read + serde decode) rather than a raw reqwest
+        // transport error.
+        assert!(matches!(&error, ApiError::Decode(_)));
         assert!(!should_retry_template_bootstrap_endpoint_error(&error));
         assert!(!should_retry_template_deployment_status_error(&error));
     }

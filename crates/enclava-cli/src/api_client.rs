@@ -21,6 +21,10 @@ pub enum ApiError {
         code: Option<String>,
         message: String,
     },
+    #[error("response body decode failed: {0}")]
+    Decode(#[from] serde_json::Error),
+    #[error("API response body exceeds the {0}-byte safety cap")]
+    ResponseTooLarge(usize),
     #[error("not authenticated -- run `enclava login` first")]
     NotAuthenticated,
 }
@@ -106,28 +110,33 @@ impl ApiClient {
             Ok(resp)
         } else {
             let status_code = status.as_u16();
-            let (code, message) = match resp.json::<ApiErrorBody>().await {
-                Ok(body) => {
-                    let code = body.code.or_else(|| body.error.clone());
-                    let label = code
-                        .clone()
-                        .unwrap_or_else(|| format!("HTTP {status_code}"));
-                    let mut message = body
-                        .message
-                        .or(body.detail)
-                        .unwrap_or_else(|| label.clone());
-                    if let Some(reason) = body.reason {
-                        message = format!("{message} ({reason})");
+            // Bound the error-body read too: a hostile API must not be able
+            // to stream an unbounded "error" body into CLI memory either.
+            let (code, message) = match read_bounded_body(resp, MAX_API_ERROR_BODY_BYTES).await {
+                Ok(bytes) => match serde_json::from_slice::<ApiErrorBody>(&bytes) {
+                    Ok(body) => {
+                        let code = body.code.or_else(|| body.error.clone());
+                        let label = code
+                            .clone()
+                            .unwrap_or_else(|| format!("HTTP {status_code}"));
+                        let mut message = body
+                            .message
+                            .or(body.detail)
+                            .unwrap_or_else(|| label.clone());
+                        if let Some(reason) = body.reason {
+                            message = format!("{message} ({reason})");
+                        }
+                        if let Some(cause) = body.cause {
+                            message = format!("{message} (cause: {cause})");
+                        }
+                        if message == label {
+                            (code, message)
+                        } else {
+                            (code, format!("{label}: {message}"))
+                        }
                     }
-                    if let Some(cause) = body.cause {
-                        message = format!("{message} (cause: {cause})");
-                    }
-                    if message == label {
-                        (code, message)
-                    } else {
-                        (code, format!("{label}: {message}"))
-                    }
-                }
+                    Err(_) => (None, format!("HTTP {status_code}")),
+                },
                 Err(_) => (None, format!("HTTP {status_code}")),
             };
             Err(ApiError::Api {
@@ -148,7 +157,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn login(&self, req: &LoginRequest) -> Result<AuthResponse, ApiError> {
@@ -159,7 +168,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub fn auth_login_url(&self) -> String {
@@ -173,7 +182,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn start_device_login(
@@ -197,7 +206,7 @@ impl ApiClient {
         };
         let resp = http.post(endpoint_url).json(req).send().await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn poll_device_login(
@@ -221,7 +230,7 @@ impl ApiClient {
         };
         let resp = http.post(endpoint_url).json(req).send().await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn get_current_user(&self) -> Result<CurrentUserResponse, ApiError> {
@@ -232,7 +241,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     // --- Apps ---
@@ -246,7 +255,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn list_apps(&self) -> Result<Vec<AppResponse>, ApiError> {
@@ -257,7 +266,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn get_app(&self, name: &str) -> Result<AppResponse, ApiError> {
@@ -268,7 +277,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn set_signer(
@@ -284,7 +293,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn issue_signer_rotation_token(
@@ -300,7 +309,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn delete_app(&self, name: &str) -> Result<(), ApiError> {
@@ -329,7 +338,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn list_deployments(&self, app_name: &str) -> Result<Vec<DeploymentEntry>, ApiError> {
@@ -340,7 +349,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn rollback(
@@ -356,7 +365,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn generate_agent_policy(
@@ -372,7 +381,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn deployment_context(&self) -> Result<DeploymentContextResponse, ApiError> {
@@ -383,7 +392,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     // --- Hosted Templates ---
@@ -396,7 +405,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn create_template_instance(
@@ -413,7 +422,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn get_template_ssh_command(
@@ -428,7 +437,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn deliver_managed_template_config(
@@ -443,7 +452,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     // --- Status ---
@@ -456,7 +465,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn get_logs(
@@ -487,7 +496,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn register_log_key(
@@ -504,7 +513,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn select_log_key(
@@ -521,7 +530,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn revoke_log_key(
@@ -538,7 +547,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn list_org_log_keys(&self) -> Result<OrgLogEncryptionKeyList, ApiError> {
@@ -549,7 +558,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn revoke_org_log_key(
@@ -564,7 +573,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     // --- Config ---
@@ -577,7 +586,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn list_config_keys(&self, app_name: &str) -> Result<ConfigKeysResponse, ApiError> {
@@ -588,7 +597,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn sync_config_key(
@@ -638,7 +647,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn verify_domain(
@@ -653,7 +662,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn get_domain(&self, app_name: &str) -> Result<DomainResponse, ApiError> {
@@ -664,7 +673,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn delete_custom_domain(&self, app_name: &str, domain: &str) -> Result<(), ApiError> {
@@ -691,7 +700,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn get_unlock_status(
@@ -705,7 +714,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn update_unlock_mode(
@@ -721,7 +730,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     // --- Orgs ---
@@ -735,7 +744,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn list_orgs(&self) -> Result<Vec<OrgResponse>, ApiError> {
@@ -746,7 +755,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn invite_member(&self, org_name: &str, req: &InviteRequest) -> Result<(), ApiError> {
@@ -769,7 +778,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn register_public_key(
@@ -784,7 +793,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn put_org_keyring(
@@ -800,7 +809,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn get_org_keyring(&self, org_name: &str) -> Result<OrgKeyringResponse, ApiError> {
@@ -811,7 +820,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn bootstrap_signing_service_owner(
@@ -829,7 +838,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 
     pub async fn rotate_org_owner(
@@ -845,7 +854,7 @@ impl ApiClient {
             .send()
             .await?;
         let resp = self.check_response(resp).await?;
-        Ok(resp.json().await?)
+        read_bounded_json(resp).await
     }
 }
 
@@ -856,13 +865,56 @@ impl ApiClient {
 /// already budgeted; this bounds the surrounding wait-loop API calls too).
 const API_REQUEST_TIMEOUT_SECONDS: u64 = 900;
 
+/// Upper bound for a single JSON response body read from the CAP API. Real
+/// responses are a few KiB; 16 MiB is a generous ceiling that still stops a
+/// hostile or compromised API from streaming an unbounded body into CLI
+/// memory. Checked against `content-length` and again per chunk, so streaming
+/// bodies without a declared length cannot bypass the limit.
+const MAX_API_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Error bodies carry a short code/message envelope; anything larger is not
+/// a legitimate error payload.
+const MAX_API_ERROR_BODY_BYTES: usize = 64 * 1024;
+
 fn http_client_for(url: &str) -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(format!("enclava-cli/{}", env!("CARGO_PKG_VERSION")))
         .https_only(!loopback_http_url(url))
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(API_REQUEST_TIMEOUT_SECONDS))
         .build()
         .expect("failed to build HTTP client")
+}
+
+/// Bounded body read shared by every JSON decode: the declared
+/// `content-length` is checked first and each streamed chunk is checked
+/// again, so a body without a declared length cannot bypass the cap.
+async fn read_bounded_body(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ApiError> {
+    if resp
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(ApiError::ResponseTooLarge(max_bytes));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if chunk.len() > max_bytes - body.len() {
+            return Err(ApiError::ResponseTooLarge(max_bytes));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Read one API JSON response, bounded by `MAX_API_RESPONSE_BODY_BYTES`.
+async fn read_bounded_json<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, ApiError> {
+    let bytes = read_bounded_body(resp, MAX_API_RESPONSE_BODY_BYTES).await?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn path_segment(value: &str) -> String {

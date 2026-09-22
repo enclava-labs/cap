@@ -418,7 +418,7 @@ async fn auth_discovery_rejects_malformed_success() {
 
     let request = handle.join().unwrap();
     assert!(request.starts_with("GET /.well-known/enclava "));
-    assert!(err.to_string().contains("error decoding response body"));
+    assert!(err.to_string().contains("response body decode failed"));
 }
 
 #[tokio::test]
@@ -448,7 +448,7 @@ async fn auth_discovery_rejects_success_without_auth_methods() {
 
     let request = handle.join().unwrap();
     assert!(request.starts_with("GET /.well-known/enclava "));
-    assert!(err.to_string().contains("error decoding response body"));
+    assert!(err.to_string().contains("response body decode failed"));
 }
 
 #[tokio::test]
@@ -545,4 +545,59 @@ async fn discovered_device_endpoint_rejects_remote_plain_http() {
         .unwrap_err();
 
     assert!(err.to_string().contains("HTTPS"));
+}
+
+#[tokio::test]
+async fn api_client_refuses_to_follow_redirects() {
+    // A hostile or compromised API must not be able to redirect the CLI's
+    // authenticated request to an attacker-chosen origin: the redirect must
+    // surface as an error (3xx is not a success status), never be followed.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/steal\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n]).to_string()
+    });
+
+    let client = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+    let err = client.get_current_user().await.unwrap_err();
+
+    // The request itself was served by the loopback listener (no second
+    // connection to the redirect target exists), and the 3xx surfaces as an
+    // API error rather than being followed.
+    assert!(matches!(err, ApiError::Api { status: 302, .. }));
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn api_client_rejects_oversized_error_body() {
+    // The error-body read is bounded: an "error" response whose declared
+    // content-length exceeds the cap fails fast instead of buffering it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 4294967296\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+    });
+
+    let client = ApiClient::new(&format!("http://{addr}"), None);
+    // Use an endpoint that needs no auth header so the error path is the
+    // oversized body, not a missing token.
+    let err = client.auth_discovery().await.unwrap_err();
+    // The oversized error body is not buffered: the request surfaces as a
+    // plain HTTP 400 with no decoded code/message payload.
+    assert!(matches!(err, ApiError::Api { status: 400, .. }));
 }
