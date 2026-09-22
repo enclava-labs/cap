@@ -936,6 +936,7 @@ async fn main() {
         enclava_api::edge::spawn_haproxy_reconciler(state.clone());
     }
     enclava_api::kbs::spawn_signed_policy_reconciler(state.clone());
+    enclava_api::routes::auth::spawn_device_login_reaper(state.db.clone());
     if deployment_dispatch_enabled {
         enclava_api::deployment_jobs::spawn_deployment_dispatcher(state.clone());
     } else {

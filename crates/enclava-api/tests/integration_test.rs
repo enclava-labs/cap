@@ -593,7 +593,9 @@ fn signed_test_artifact_blobs(
 }
 
 fn device_code_hash(code: &str) -> Vec<u8> {
-    Sha256::digest(code.as_bytes()).to_vec()
+    // Must mirror the test state's session HMAC key ([0u8; 32], see
+    // setup_test_state_with_mode) and the server's keyed hash.
+    enclava_api::routes::auth::device_code_hash(code, &[0u8; 32])
 }
 
 #[tokio::test]
@@ -782,6 +784,138 @@ async fn device_login_approved_code_is_single_use_and_still_expires() {
     let expired_body: Value = expired_poll.json();
     assert_eq!(expired_body["status"], "expired");
     assert_eq!(expired_body["auth"], Value::Null);
+}
+
+#[tokio::test]
+async fn device_login_codes_are_stored_with_keyed_hash_and_uri_hides_user_code() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state.clone());
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    let start = server
+        .post("/auth/device/start")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({}))
+        .await;
+    start.assert_status_ok();
+    let start_body: Value = start.json();
+    let device_code = start_body["device_code"].as_str().expect("device_code");
+    let user_code = start_body["user_code"].as_str().expect("user_code");
+
+    // The test state's session HMAC key is [0u8; 32]; the helper mirrors it.
+    let expected_device_hash = enclava_api::routes::auth::device_code_hash(device_code, &[0u8; 32]);
+    let plain_hash: Vec<u8> = Sha256::digest(device_code.as_bytes()).to_vec();
+
+    let stored: (Vec<u8>, String) = sqlx::query_as(
+        "SELECT device_code_hash, verification_uri_complete FROM device_login_sessions WHERE device_code_hash = $1",
+    )
+    .bind(&expected_device_hash)
+    .fetch_one(&pool)
+    .await
+    .expect("session stored under keyed device code hash");
+
+    assert_ne!(
+        stored.0, plain_hash,
+        "device code must not be stored as unsalted SHA-256"
+    );
+    assert!(
+        !stored.1.contains(user_code),
+        "persisted verification_uri_complete must not carry the plaintext user code: {}",
+        stored.1
+    );
+
+    let normalized_user_code: String = user_code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let expected_user_hash =
+        enclava_api::routes::auth::user_code_hash(&normalized_user_code, &[0u8; 32]);
+    let user_row: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT user_code_hash FROM device_login_sessions WHERE user_code_hash = $1",
+    )
+    .bind(&expected_user_hash)
+    .fetch_optional(&pool)
+    .await
+    .expect("user code hash lookup");
+    assert!(
+        user_row.is_some(),
+        "user code must be stored under keyed hash"
+    );
+}
+
+#[tokio::test]
+async fn device_login_start_is_rate_limited_per_ip() {
+    let (state, _pool) = setup_test_state().await;
+    // build_router (unlike test_router) enables the governor layers. The
+    // governor keys on the peer IP, so the app must carry ConnectInfo the
+    // same way main.rs serves it.
+    let app = enclava_api::build_router(state)
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    let mut saw_too_many_requests = false;
+    for _ in 0..15 {
+        let response = server
+            .post("/auth/device/start")
+            .add_header("x-forwarded-for", "127.0.0.1")
+            .json(&serde_json::json!({}))
+            .await;
+        if response.status_code() == StatusCode::TOO_MANY_REQUESTS {
+            saw_too_many_requests = true;
+            break;
+        }
+    }
+    assert!(
+        saw_too_many_requests,
+        "burst of /auth/device/start requests must eventually be rate limited"
+    );
+}
+
+#[tokio::test]
+async fn purge_expired_device_login_sessions_removes_only_long_expired_rows() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    let mut kept_code = String::new();
+    let mut purged_code = String::new();
+    for slot in 0..2 {
+        let start = server
+            .post("/auth/device/start")
+            .add_header("x-forwarded-for", "127.0.0.1")
+            .json(&serde_json::json!({}))
+            .await;
+        start.assert_status_ok();
+        let code: String = start.json::<Value>()["device_code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        if slot == 0 {
+            kept_code = code;
+        } else {
+            purged_code = code;
+        }
+    }
+
+    sqlx::query("UPDATE device_login_sessions SET expires_at = now() - interval '25 hours' WHERE device_code_hash = $1")
+        .bind(device_code_hash(&purged_code))
+        .execute(&pool)
+        .await
+        .expect("age out purge candidate");
+
+    let purged = enclava_api::routes::auth::purge_expired_device_login_sessions(&pool)
+        .await
+        .expect("purge runs");
+    assert_eq!(purged, 1, "only the long-expired session is deleted");
+
+    let kept: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM device_login_sessions WHERE device_code_hash = $1")
+            .bind(device_code_hash(&kept_code))
+            .fetch_optional(&pool)
+            .await
+            .expect("kept lookup");
+    // SELECT 1 returns i64=1 when present.
+    assert_eq!(kept, Some(1), "recent session survives the purge");
 }
 
 #[tokio::test]

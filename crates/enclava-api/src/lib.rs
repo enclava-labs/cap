@@ -305,7 +305,7 @@ fn build_api_routes(
     key_extractor: TrustedProxyKeyExtractor,
 ) -> Router<AppState> {
     Router::new()
-        .merge(auth_routes())
+        .merge(auth_routes(enable_rate_limits, key_extractor.clone()))
         .merge(user_routes())
         .merge(platform_routes())
         .merge(org_routes())
@@ -318,10 +318,29 @@ fn build_api_routes(
         .merge(workload_routes())
 }
 
-fn auth_routes() -> Router<AppState> {
+fn auth_routes(
+    enable_rate_limits: bool,
+    key_extractor: TrustedProxyKeyExtractor,
+) -> Router<AppState> {
     Router::new()
         .route("/auth/signup", axum::routing::post(routes::auth::signup))
         .route("/auth/login", axum::routing::post(routes::auth::login))
+        .route(
+            "/auth/api-keys",
+            axum::routing::post(routes::auth::create_api_key_route),
+        )
+        .route(
+            "/auth/api-keys/{id}",
+            axum::routing::delete(routes::auth::revoke_api_key_route),
+        )
+        .merge(device_auth_routes(enable_rate_limits, key_extractor))
+}
+
+fn device_auth_routes(
+    enable_rate_limits: bool,
+    key_extractor: TrustedProxyKeyExtractor,
+) -> Router<AppState> {
+    let routes = Router::new()
         .route(
             "/auth/device/start",
             axum::routing::post(routes::auth::start_device_login),
@@ -333,15 +352,25 @@ fn auth_routes() -> Router<AppState> {
         .route(
             "/auth/device/approve",
             axum::routing::post(routes::auth::approve_device_login),
-        )
-        .route(
-            "/auth/api-keys",
-            axum::routing::post(routes::auth::create_api_key_route),
-        )
-        .route(
-            "/auth/api-keys/{id}",
-            axum::routing::delete(routes::auth::revoke_api_key_route),
-        )
+        );
+
+    if !enable_rate_limits {
+        return routes;
+    }
+
+    // The device-login surface is reachable before authentication, and
+    // /auth/device/start inserts a session row per call, so it gets a much
+    // tighter per-IP budget than the generic API governor. Compliant clients
+    // are unaffected: a CLI issues one start, then polls at the advertised
+    // 5-second interval.
+    routes.layer(GovernorLayer::new(
+        GovernorConfigBuilder::default()
+            .per_second(1)
+            .burst_size(10)
+            .key_extractor(key_extractor)
+            .finish()
+            .expect("device auth governor config"),
+    ))
 }
 
 fn user_routes() -> Router<AppState> {
