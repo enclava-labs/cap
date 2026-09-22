@@ -421,17 +421,19 @@ fn enforce_override_gate(
     persist: bool,
 ) -> Result<(), PlatformReleaseError> {
     parse_release_timestamp(&release.created_at)?;
-    let _guard = acquire_state_lock(state_path)?;
-    enforce_override_not_older_than_last_accepted_locked(state_path, release, persist)
+    with_state_lock(state_path, || {
+        enforce_override_not_older_than_last_accepted_locked(state_path, release, persist)
+    })
 }
 
-/// Open `<state>.lock` and take an exclusive flock, serializing every
-/// read-compare-persist sequence (override lane AND bundled-lane removal
-/// guard) across concurrent API replicas sharing the state volume. The
-/// lock is auto-released on process death.
-fn acquire_state_lock(
+/// Open `<state>.lock` and run `body` under an exclusive flock, serializing
+/// every read-compare-persist sequence (override lane AND bundled-lane
+/// removal guard) across concurrent API replicas sharing the state volume.
+/// The lock is auto-released on process death.
+fn with_state_lock<T>(
     state_path: &Path,
-) -> Result<fd_lock::RwLockGuard<'_, std::fs::File>, PlatformReleaseError> {
+    body: impl FnOnce() -> Result<T, PlatformReleaseError>,
+) -> Result<T, PlatformReleaseError> {
     let mut lock_path = state_path.as_os_str().to_os_string();
     lock_path.push(".lock");
     let lock_path = PathBuf::from(lock_path);
@@ -453,7 +455,7 @@ fn acquire_state_lock(
             source: error,
         })?;
     let mut lock = fd_lock::RwLock::new(lock_file);
-    let guard = lock
+    let _guard = lock
         .write()
         .map_err(|err| PlatformReleaseError::HighWaterMarkPersistFailed {
             state_path: state_path.display().to_string(),
@@ -462,7 +464,7 @@ fn acquire_state_lock(
                 format!("acquire {}: {err}", lock_path.display()),
             ),
         })?;
-    Ok(guard)
+    body()
 }
 
 fn enforce_override_not_older_than_last_accepted_locked(
@@ -584,9 +586,8 @@ fn enforce_bundle_not_older_than_persisted_mark(
     // lane so a replica whose override env was just removed cannot read a
     // mark that a concurrent commit is about to replace — the read side of
     // the removal guard must be serialized against commits too.
-    let _guard = acquire_state_lock(state_path)?;
-    let persisted =
-        match std::fs::read_to_string(state_path) {
+    with_state_lock(state_path, || {
+        let persisted = match std::fs::read_to_string(state_path) {
             Ok(raw) => Some(serde_json::from_str::<AcceptedOverrideMark>(&raw).map_err(
                 |error| PlatformReleaseError::HighWaterMarkPersistFailed {
                     state_path: state_path.display().to_string(),
@@ -605,21 +606,22 @@ fn enforce_bundle_not_older_than_persisted_mark(
                 });
             }
         };
-    let Some(mark) = newest_mark(persisted)? else {
-        return Ok(());
-    };
-    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
-    let bundled_mark = AcceptedOverrideMark::of(&bundled.payload)?;
-    if mark_is_older(&bundled_mark, &mark)? {
-        return Err(PlatformReleaseError::OverrideDowngradeRefused {
-            override_version: bundled_mark.platform_release_version,
-            override_created: bundled_mark.created_at,
-            accepted_version: mark.platform_release_version,
-            accepted_created: mark.created_at,
-            state_path: state_path.display().to_string(),
-        });
-    }
-    Ok(())
+        let Some(mark) = newest_mark(persisted)? else {
+            return Ok(());
+        };
+        let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
+        let bundled_mark = AcceptedOverrideMark::of(&bundled.payload)?;
+        if mark_is_older(&bundled_mark, &mark)? {
+            return Err(PlatformReleaseError::OverrideDowngradeRefused {
+                override_version: bundled_mark.platform_release_version,
+                override_created: bundled_mark.created_at,
+                accepted_version: mark.platform_release_version,
+                accepted_created: mark.created_at,
+                state_path: state_path.display().to_string(),
+            });
+        }
+        Ok(())
+    })
 }
 
 /// Reject `release` when it is older than the release compiled into this

@@ -680,10 +680,9 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let platform_release_envelope = match platform_release_loaded {
-        Some(ref loaded) => Some(loaded.envelope.clone()),
-        None => None,
-    };
+    let platform_release_envelope = platform_release_loaded
+        .as_ref()
+        .map(|loaded| loaded.envelope.clone());
     let pending_high_water = match platform_release_loaded {
         Some(loaded) => loaded.pending_high_water,
         None => None,
