@@ -82,3 +82,46 @@ def test_release_generator_rejects_hostless_https_acme_ca():
 
         with pytest.raises(ValueError, match="tenant_caddy_acme_ca must be https"):
             generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_malformed_port_kbs_url():
+    # `https://kbs.example:bad/` and out-of-range ports parse fine in
+    # urlparse (scheme https, host set), but the Rust consumers reject them
+    # at reqwest::Url::parse — the generator must not sign such an envelope.
+    for value in ("https://kbs.example.test:bad/", "https://kbs.example.test:99999"):
+        payload = base_payload()
+        payload["trustee_kbs_url"] = value
+
+        with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
+            generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_malformed_port_acme_ca():
+    for value in (
+        "https://acme.example.test:bad/directory",
+        "https://acme.example.test:99999/directory",
+    ):
+        payload = base_payload()
+        payload["tenant_caddy_acme_ca"] = value
+
+        with pytest.raises(ValueError, match="tenant_caddy_acme_ca must be https"):
+            generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_invalid_host_characters():
+    # Space / percent in the host are forbidden domain code points in the
+    # WHATWG URL parser (what reqwest::Url uses), so reject at sign time.
+    for value in ("https://kbs.example.test /", "https://kbs%.example.test/"):
+        payload = base_payload()
+        payload["trustee_kbs_url"] = value
+
+        with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
+            generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_accepts_valid_boundary_ports():
+    payload = base_payload()
+    payload["trustee_kbs_url"] = "https://kbs.example.test:65535"
+    payload["tenant_caddy_acme_ca"] = "https://acme.example.test:1/directory"
+
+    generate_platform_release.validate_payload(payload)

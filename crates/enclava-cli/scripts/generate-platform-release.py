@@ -129,15 +129,27 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
 
 def _is_https(value: str) -> bool:
     # urlparse lowercases the scheme, so `HTTPS://` is accepted exactly as
-    # the Rust validators (parsed-URL scheme) accept it. A non-empty host is
-    # required too: the Rust consumers parse with the url crate, which
-    # rejects hostless values like `https://` or `https:` (EmptyHost), so
-    # signing one would produce an envelope the API/CLI refuse to load.
+    # the Rust validators (parsed-URL scheme) accept it. The authority is
+    # checked with the same semantics the Rust consumers (url crate)
+    # enforce, so a release ceremony cannot sign metadata the API/CLI would
+    # refuse to load:
+    #   * a non-empty host is required (url crate rejects hostless values
+    #     like `https://` or `https:` with EmptyHost),
+    #   * reading `.port` raises ValueError for non-numeric or
+    #     out-of-range ports (`https://kbs.example:bad/`, `:99999`),
+    #   * space, control, or NUL characters and percent signs in the host
+    #     are forbidden domain code points in the WHATWG URL parser.
     try:
         parsed = urlparse(value)
+        parsed.port  # noqa: B018 — property access raises for malformed ports
+        host = parsed.hostname
     except ValueError:
         return False
-    return parsed.scheme == "https" and parsed.hostname is not None
+    if parsed.scheme != "https" or not host:
+        return False
+    return not any(
+        ord(ch) < 0x20 or ord(ch) == 0x7F or ch in (" ", "%") for ch in host
+    )
 
 
 def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = False) -> None:
