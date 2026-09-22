@@ -54,13 +54,17 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         api_routes
     };
 
-    let mut router = Router::new().merge(with_operational_gates(&state, api_routes));
+    let mut router = Router::new().merge(with_tracing(with_operational_gates(&state, api_routes)));
 
     // Health and internal PaaS governors are layered OUTSIDE the operational
     // gates (startup gate, dispatch freeze): requests short-circuited by
     // those gates must still consume rate-limit tokens, otherwise the very
     // surfaces this router bounds stay unbounded exactly while a gate is
     // tripped (review feedback on enclava-labs/cap#170).
+    //
+    // TraceLayer conversely sits OUTERMOST in every group (see
+    // `with_tracing`) so governor rejections and gate short-circuits remain
+    // observable in HTTP traces.
     let health_routes = with_operational_gates(&state, health_routes());
     let health_routes = if enable_rate_limits {
         health_routes.layer(GovernorLayer::new(
@@ -86,7 +90,7 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
     } else {
         health_routes
     };
-    router = router.merge(health_routes);
+    router = router.merge(with_tracing(health_routes));
 
     if state.management_mode.internal_paas_routes_enabled() {
         let internal_routes = with_operational_gates(&state, internal_routes());
@@ -115,19 +119,26 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         } else {
             internal_routes
         };
-        router = router.merge(internal_routes);
+        router = router.merge(with_tracing(internal_routes));
     }
 
     router.layer(build_cors_layer()).with_state(state)
 }
 
+/// Wrap a route group in request tracing. Applied OUTERMOST in every group
+/// (above the group governors and operational gates) so that governor 429
+/// rejections and gate short-circuits are still recorded in HTTP traces —
+/// without this, the traffic that trips a rate limit is invisible.
+fn with_tracing(routes: Router<AppState>) -> Router<AppState> {
+    routes.layer(TraceLayer::new_for_http())
+}
+
 /// Wrap a route group in the operational middleware shared by every group:
-/// request tracing plus the dispatch-freeze and startup gates. Applied per
-/// group (rather than once on the merged router) so group-level governors
-/// can be layered above these short-circuiting middlewares.
+/// the dispatch-freeze and startup gates. Applied per group (rather than
+/// once on the merged router) so group-level governors can be layered above
+/// these short-circuiting middlewares.
 fn with_operational_gates(state: &AppState, routes: Router<AppState>) -> Router<AppState> {
     routes
-        .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             freeze_workload_authority_mutations,
@@ -876,6 +887,101 @@ mod runtime_gate_tests {
             saw_limit,
             Some(StatusCode::TOO_MANY_REQUESTS),
             "gate-rejected internal requests must still consume governor tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregistered_writes_still_hit_dispatch_gate_with_rate_limits_on() {
+        // Review feedback on enclava-labs/cap#170 (Codex): merging
+        // individually wrapped route groups could fall back to an ungated
+        // 404 for unregistered workload-authority writes instead of the
+        // freeze gate's fail-closed 503. In axum, layers applied with
+        // `.layer()` wrap each group's fallback, so merged groups keep the
+        // api group's gated fallback. This test pins that behavior on the
+        // production router (rate limits enabled, three-way merge).
+        let mut state = crate::test_support::lazy_state();
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.deployment_dispatch_enabled = false;
+        let app = build_router_inner(state, true);
+
+        for uri in [
+            "/future-workload-authority",
+            "/internal/paas/future-workload-authority",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request_with_peer("203.0.113.99", Method::POST, uri))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unregistered write to {uri} must be fail-closed by the dispatch gate, not 404"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limit_rejections_are_recorded_in_http_traces() {
+        // Review feedback on enclava-labs/cap#170 (Devin + Codex): the health
+        // and internal governors sit outside the operational gates, so a
+        // 429 rejection must not bypass request tracing — otherwise the
+        // traffic that trips a rate limit is invisible in traces. This test
+        // captures tower_http trace output and asserts the 429 responses are
+        // recorded.
+        use tracing::level_filters::LevelFilter;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl MakeWriter<'_> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = CaptureWriter(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(LevelFilter::DEBUG)
+            .with_target(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let state = crate::test_support::lazy_state();
+        let app = build_router_inner(state, true);
+
+        // Drain the health bucket until the governor rejects with 429s.
+        let mut saw_limit = false;
+        for _ in 0..250 {
+            let response = app
+                .clone()
+                .oneshot(request_with_peer("203.0.113.77", Method::GET, "/readyz"))
+                .await
+                .unwrap();
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                saw_limit = true;
+                break;
+            }
+        }
+        assert!(saw_limit, "governor must reject the probe loop with 429");
+
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("429"),
+            "governor 429 rejections must appear in HTTP traces; captured: {logs}"
         );
     }
 
