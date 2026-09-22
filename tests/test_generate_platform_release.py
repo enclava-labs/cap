@@ -61,3 +61,24 @@ def test_release_generator_rejects_http_acme_ca():
 
     with pytest.raises(ValueError, match="tenant_caddy_acme_ca must be https"):
         generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_hostless_https_kbs_url():
+    # `https://` and `https:` parse with scheme https but no host; the Rust
+    # consumers (url crate) reject them (EmptyHost), so the generator must
+    # not sign such an envelope.
+    for value in ("https://", "https:", "HTTPS://"):
+        payload = base_payload()
+        payload["trustee_kbs_url"] = value
+
+        with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
+            generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_hostless_https_acme_ca():
+    for value in ("https://", "https:"):
+        payload = base_payload()
+        payload["tenant_caddy_acme_ca"] = value
+
+        with pytest.raises(ValueError, match="tenant_caddy_acme_ca must be https"):
+            generate_platform_release.validate_payload(payload)

@@ -129,11 +129,15 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
 
 def _is_https(value: str) -> bool:
     # urlparse lowercases the scheme, so `HTTPS://` is accepted exactly as
-    # the Rust validators (parsed-URL scheme) accept it.
+    # the Rust validators (parsed-URL scheme) accept it. A non-empty host is
+    # required too: the Rust consumers parse with the url crate, which
+    # rejects hostless values like `https://` or `https:` (EmptyHost), so
+    # signing one would produce an envelope the API/CLI refuse to load.
     try:
-        return urlparse(value).scheme == "https"
+        parsed = urlparse(value)
     except ValueError:
         return False
+    return parsed.scheme == "https" and parsed.hostname is not None
 
 
 def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = False) -> None:

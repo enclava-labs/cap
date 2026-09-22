@@ -52,6 +52,7 @@ fn validate_acme_directory_url(
     source_name: &'static str,
     value: &str,
     production_acme_allowed: bool,
+    debug_assertions: bool,
 ) -> Result<(), EnvGateError> {
     // Cleartext ACME directory URLs would leak ACME account credentials and
     // challenge traffic; same rule as the signed-release field and
@@ -59,8 +60,10 @@ fn validate_acme_directory_url(
     // strictness as the signed-release validator (`ws://`, `file://`, or
     // schemeless values are not acceptable ACME directories) — and parsing
     // makes the check case-insensitive (`HTTP://` must not slip a prefix
-    // check).
-    if !https_scheme(value) {
+    // check). Debug builds are exempt so developers can run against a local
+    // cleartext ACME directory (e.g. pebble), matching how the other
+    // dangerous settings below are debug-permitted.
+    if !debug_assertions && !https_scheme(value) {
         return Err(EnvGateError::CleartextAcmeUrl(source_name));
     }
     if is_letsencrypt_production_acme_url(value) && !production_acme_allowed {
@@ -78,7 +81,16 @@ pub fn ensure_acme_directory_allowed(
     let production_acme_allowed = std::env::var(CAP_ALLOW_PRODUCTION_ACME)
         .ok()
         .is_some_and(|value| flag_is_truthy(&value));
-    validate_acme_directory_url(source_name, value, production_acme_allowed)
+    // Debug builds may point the ACME client at a local cleartext directory
+    // (e.g. pebble); the https-only rule is enforced in release builds by
+    // `enforce_production_env_gates`, like every other debug-permitted
+    // dangerous setting.
+    validate_acme_directory_url(
+        source_name,
+        value,
+        production_acme_allowed,
+        debug_assertions_on(),
+    )
 }
 
 /// Apply Phase-0 production gates. Should be called early in `main`, before
@@ -118,7 +130,12 @@ fn enforce_with(
             lookup(CAP_ALLOW_PRODUCTION_ACME).is_some_and(|value| flag_is_truthy(&value));
         for acme_source_name in ["ACME_DIRECTORY_URL", "TENANT_CADDY_ACME_CA"] {
             if let Some(value) = lookup(acme_source_name) {
-                validate_acme_directory_url(acme_source_name, &value, production_acme_allowed)?;
+                validate_acme_directory_url(
+                    acme_source_name,
+                    &value,
+                    production_acme_allowed,
+                    false,
+                )?;
             }
         }
 
@@ -478,5 +495,26 @@ mod tests {
                 EnvGateError::CleartextAcmeUrl(_)
             ));
         }
+    }
+
+    #[test]
+    fn debug_builds_allow_cleartext_acme_directory() {
+        // `load_acme_config` calls `ensure_acme_directory_allowed` in every
+        // build; under `cargo test` (debug profile) a local cleartext ACME
+        // directory (e.g. pebble) must pass so dev setups keep working. The
+        // release behavior is pinned by
+        // `release_rejects_cleartext_acme_directory_urls` above.
+        ensure_acme_directory_allowed("ACME_DIRECTORY_URL", "http://127.0.0.1:14000/dir")
+            .expect("debug builds must allow cleartext ACME directories");
+        // The Let's Encrypt production gate still applies in debug builds.
+        let err = ensure_acme_directory_allowed(
+            "ACME_DIRECTORY_URL",
+            "https://acme-v02.api.letsencrypt.org/directory",
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::ProductionAcmeWithoutExplicitAllow(_)
+        ));
     }
 }
