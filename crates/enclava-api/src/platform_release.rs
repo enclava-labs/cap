@@ -421,6 +421,17 @@ fn enforce_override_gate(
     persist: bool,
 ) -> Result<(), PlatformReleaseError> {
     parse_release_timestamp(&release.created_at)?;
+    let _guard = acquire_state_lock(state_path)?;
+    enforce_override_not_older_than_last_accepted_locked(state_path, release, persist)
+}
+
+/// Open `<state>.lock` and take an exclusive flock, serializing every
+/// read-compare-persist sequence (override lane AND bundled-lane removal
+/// guard) across concurrent API replicas sharing the state volume. The
+/// lock is auto-released on process death.
+fn acquire_state_lock(
+    state_path: &Path,
+) -> Result<fd_lock::RwLockGuard<'_, std::fs::File>, PlatformReleaseError> {
     let mut lock_path = state_path.as_os_str().to_os_string();
     lock_path.push(".lock");
     let lock_path = PathBuf::from(lock_path);
@@ -442,7 +453,7 @@ fn enforce_override_gate(
             source: error,
         })?;
     let mut lock = fd_lock::RwLock::new(lock_file);
-    let _guard = lock
+    let guard = lock
         .write()
         .map_err(|err| PlatformReleaseError::HighWaterMarkPersistFailed {
             state_path: state_path.display().to_string(),
@@ -451,7 +462,7 @@ fn enforce_override_gate(
                 format!("acquire {}: {err}", lock_path.display()),
             ),
         })?;
-    enforce_override_not_older_than_last_accepted_locked(state_path, release, persist)
+    Ok(guard)
 }
 
 fn enforce_override_not_older_than_last_accepted_locked(
@@ -569,6 +580,11 @@ fn enforce_override_not_older_than_last_accepted_locked(
 fn enforce_bundle_not_older_than_persisted_mark(
     state_path: &Path,
 ) -> Result<(), PlatformReleaseError> {
+    // Reviewer P2 (cap#165 self-check): take the same flock as the override
+    // lane so a replica whose override env was just removed cannot read a
+    // mark that a concurrent commit is about to replace — the read side of
+    // the removal guard must be serialized against commits too.
+    let _guard = acquire_state_lock(state_path)?;
     let persisted =
         match std::fs::read_to_string(state_path) {
             Ok(raw) => Some(serde_json::from_str::<AcceptedOverrideMark>(&raw).map_err(
@@ -591,7 +607,8 @@ fn enforce_bundle_not_older_than_persisted_mark(
         };
     let Some(mark) = newest_mark(persisted)? else {
         return Ok(());
-    };    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
+    };
+    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
     let bundled_mark = AcceptedOverrideMark::of(&bundled.payload)?;
     if mark_is_older(&bundled_mark, &mark)? {
         return Err(PlatformReleaseError::OverrideDowngradeRefused {
@@ -1462,6 +1479,55 @@ mod tests {
                 false,
                 Some(&state)
             ),
+            Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bundled_lane_removal_guard_is_serialized_by_flock() {
+        // Reviewer P2 (cap#165 self-check): the removal guard's mark read
+        // must take the same flock as commits — an externally held lock must
+        // block it, exactly like the override-lane gate.
+        let dir = std::env::temp_dir().join(format!("pr-hwm-bundlelock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+
+        // Accept T2 via the override lane (persists a mark above bundle).
+        let t2 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        assert!(load_and_maybe_commit(t2, &state, true).is_ok());
+
+        // Hold the state lock externally: the bundled-lane guard (override
+        // env removed) must block on it instead of reading unlocked.
+        let mut lock_path = state.clone().into_os_string();
+        lock_path.push(".lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let mut lock = fd_lock::RwLock::new(lock_file);
+        let guard = lock.write().unwrap();
+
+        let state_clone = state.clone();
+        let gate = std::thread::spawn(move || {
+            PlatformReleaseEnvelope::load_verified_from_raw(
+                BUNDLED_PLATFORM_RELEASE.to_string(),
+                false,
+                Some(&state_clone),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !gate.is_finished(),
+            "bundled-lane removal guard must block on the flock"
+        );
+        drop(guard);
+
+        // Once released it completes with the expected refusal.
+        assert!(matches!(
+            gate.join().unwrap(),
             Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
         ));
         std::fs::remove_dir_all(&dir).ok();

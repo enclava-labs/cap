@@ -197,8 +197,17 @@ environments that activate the override lane compose the opt-in component
 or replicate that wiring in their own overlay (single-replica deployments may
 relax the claim to ReadWriteOnce; the mark advances only after startup
 validation accepts the release, so a signed-but-incompatible override cannot
-strand the deployment). An operator who can delete the state file
-can reset the floor: for the full threat model, point the state path at
+strand the deployment). Multi-replica deployments: the gate serializes on an
+flock over the state volume — this is only real if the StorageClass provides
+cross-node flock and directory fsync; several RWX CSI drivers (NFS with
+local_lock, some FUSE drivers) silently no-op node-local locks, which would
+reopen the two-replica race. Do not treat "an RWX PVC exists" as the control:
+verify the provisioner's lock semantics, or run this lane single-replica (RWO)
+until verified. An operator who can delete the state file
+can reset the floor; the mark itself is unsigned, so an operator who can
+*write* the state file can equally lower the floor to any timestamp at or
+above the bundled release — "file still present" does not mean the floor is
+intact. For the full threat model, point the state path at
 separately-protected storage. Intentional rollbacks require clearing the
 state file (after operator verification), which the refusal message names.
 Removing `ENCLAVA_PLATFORM_RELEASE_PATH` while `ENCLAVA_PLATFORM_RELEASE_STATE`

@@ -680,9 +680,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let (platform_release_envelope, pending_high_water) = match platform_release_loaded {
-        Some(loaded) => (Some(loaded.envelope), loaded.pending_high_water),
-        None => (None, None),
+    let platform_release_envelope = match platform_release_loaded {
+        Some(ref loaded) => Some(loaded.envelope.clone()),
+        None => None,
+    };
+    let pending_high_water = match platform_release_loaded {
+        Some(loaded) => loaded.pending_high_water,
+        None => None,
     };
     if let Some(envelope) = &platform_release_envelope {
         let release = &envelope.payload;
@@ -770,21 +774,17 @@ async fn main() {
         }
     };
 
-    // The platform release has now cleared every startup validation derived
-    // from it (runtime class, env-match, sidecar pins): advance the
-    // persisted high-water mark. Deferring the persist to this point means
-    // a signed-but-incompatible override can pass the load-time checks and
-    // still fail startup WITHOUT raising the floor — restoring the last
-    // working override stays possible (Devin review, cap#165). The commit
-    // re-runs the comparison under the flock, so a concurrent replica that
-    // accepted something newer in the meantime still wins.
-    if let (Some(state_path), Some(envelope)) = (&pending_high_water, &platform_release_envelope)
-        && let Err(e) =
-            enclava_api::platform_release::commit_override_acceptance(state_path, &envelope.payload)
-    {
-        eprintln!("startup refused: {e}");
-        std::process::exit(1);
-    }
+    // The platform release's sidecar pins have cleared startup validation;
+    // the persisted high-water mark is NOT advanced yet — further fallible
+    // release-derived configuration follows below (attestation config with
+    // its pubkey and env-match checks, ACME, the platform signing-service
+    // URL/client), and a release that fails any of them must not raise the
+    // floor (Codex P1, cap#165). Deferring the persist past all of them
+    // means a signed-but-incompatible override can pass the load-time
+    // checks and still fail startup WITHOUT raising the floor — restoring
+    // the last working override stays possible (Devin review, cap#165).
+    // The commit re-runs the comparison under the flock, so a concurrent
+    // replica that accepted something newer in the meantime still wins.
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
@@ -851,6 +851,26 @@ async fn main() {
         )
         .expect("failed to configure platform signing service client")
     });
+
+    // The platform release has now cleared EVERY fallible startup
+    // validation derived from it — runtime class, env-match on the early
+    // lane, sidecar pins, attestation config (image refs, ACME CA, TLS
+    // mode, policy/signing pubkeys), ACME broker config, and the platform
+    // signing-service URL/client: advance the persisted high-water mark.
+    // A signed-but-incompatible override (e.g. a T2 that changes
+    // `signing_service_url` while the deployment env still names the T1
+    // value) can pass the earlier checks and still fail startup WITHOUT
+    // raising the floor — restoring the last working override stays
+    // possible (Devin review + Codex P1, cap#165). The commit re-runs the
+    // comparison under the flock, so a concurrent replica that accepted
+    // something newer in the meantime still wins.
+    if let (Some(state_path), Some(envelope)) = (&pending_high_water, &platform_release_envelope)
+        && let Err(e) =
+            enclava_api::platform_release::commit_override_acceptance(state_path, &envelope.payload)
+    {
+        eprintln!("startup refused: {e}");
+        std::process::exit(1);
+    }
     let require_customer_signed_policy_artifact =
         env_flag("REQUIRE_CUSTOMER_SIGNED_POLICY_ARTIFACT");
     let max_concurrent_applies = std::env::var("CAP_MAX_CONCURRENT_APPLIES")
