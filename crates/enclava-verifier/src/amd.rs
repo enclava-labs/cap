@@ -113,23 +113,29 @@ pub fn verify_amd_revocation(
     // does not currently revoke individual VCEKs by serial — TCB
     // requirements supersede a chip's previous certificates, and shipped
     // VCEKs share serial 0 — and go-sev-guest therefore compares only the
-    // ASK.
+    // ASK. If AMD ever does list a VCEK serial here, this check rejects it
+    // instead of silently accepting a revoked endorsement key.
     //
-    // NOTE: X.509 serial numbers are issuer-scoped. This CRL is issued by the
-    // ARK, so its entries can only revoke ARK-issued certificates (like the
-    // ASK). Comparing VCEK serials (issued by ASK) against this ARK CRL would
-    // incorrectly revoke valid VCEKs if an unrelated ARK-issued certificate
-    // happens to share the same serial number. VCEK revocation must be checked
-    // against a CRL issued by the ASK (or an indirect CRL with proper
-    // certificateIssuer extensions).
+    // Design note (issuer scoping): X.509 serial numbers are issuer-scoped,
+    // and this CRL is ARK-issued, so strictly its entries revoke ARK-issued
+    // certificates (like the ASK); a VCEK (ASK-issued) serial match could
+    // in principle collide with an unrelated ARK-issued certificate. We
+    // still fail closed (#126): the CRL reaching this walk is policy-pinned
+    // to a trusted ARK and RSA-PSS signature-verified, i.e. AMD-authored
+    // content either way, and shipped VCEKs share serial 0 — so a false
+    // positive requires AMD deliberately listing serial 0 on a product CRL,
+    // self-breakage the same trust could equally inflict by revoking the
+    // ASK outright. Behavior on all current AMD CRL contents is identical
+    // to go-sev-guest; this arm only fires if AMD ever publishes a VCEK
+    // serial, and rejecting then is the safe reading.
     if let Some(revoked) = crl.tbs_cert_list.revoked_certificates.as_ref() {
         for entry in revoked {
             if entry.serial_number == ask.tbs_certificate.serial_number {
                 return Err(AmdVerificationError::AskRevoked);
             }
-            // VCEK serials are NOT checked against this ARK-issued CRL — see
-            // note above. A VCEK-specific CRL (issued by ASK) would be needed
-            // to validly revoke VCEKs by serial.
+            if entry.serial_number == vcek.tbs_certificate.serial_number {
+                return Err(AmdVerificationError::VcekRevoked);
+            }
         }
     }
     Ok(())
@@ -534,12 +540,12 @@ mod tests {
             Err(AmdVerificationError::AskRevoked)
         );
 
-        // #126 FIXED: The VCEK serial is NOT checked against the ARK-signed CRL.
-        // X.509 serials are issuer-scoped: this CRL is issued by ARK, so it can
-        // only revoke ARK-issued certificates (like the ASK). A VCEK is issued by
-        // ASK, so matching its serial against this CRL would incorrectly reject
-        // valid VCEKs. The test confirms the fix: the VCEK with a CRL-matching
-        // serial is now accepted (the correct behavior).
+        // #126: the serial walk must also reject a VCEK whose serial appears
+        // on the ARK-signed CRL. Issuer-scoping counterargument considered
+        // and documented in verify_amd_revocation; decision is fail-closed.
+        // The unmodified ASK serial stays off the CRL, so an ASK-only check
+        // would return Ok — exactly the gap #126 reports. This fixture is
+        // not a chain-valid certificate: only the serial is under test.
         let mut revoked_vcek = Certificate::from_der(&vcek).unwrap();
         revoked_vcek.tbs_certificate.serial_number = parsed_crl
             .tbs_cert_list
@@ -558,7 +564,7 @@ mod tests {
                 30 * 86_400,
                 trusted,
             ),
-            Ok(()) // VCEK serial is NOT checked against ARK CRL - this is correct
+            Err(AmdVerificationError::VcekRevoked)
         );
     }
 
