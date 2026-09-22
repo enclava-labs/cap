@@ -84,6 +84,15 @@ fn validate_sentinel_name(name: &str) -> Result<(), String> {
     if name.as_bytes().contains(&b'/') || name.as_bytes().contains(&0) {
         return Err("ENCLAVA_CONTAINER_NAME must be a single path component".to_string());
     }
+    // The name lands in the sentinel's key=value record (`container=<name>`)
+    // and in file paths: newlines would inject extra record lines and `=`
+    // would corrupt the key; reject both along with all other control
+    // characters (#137).
+    if name.bytes().any(|b| b.is_ascii_control() || b == b'=') {
+        return Err(
+            "ENCLAVA_CONTAINER_NAME must not contain control characters or '='".to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -328,11 +337,15 @@ fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
         ));
     }
     let body = sentinel_record(name)?;
+    // 0o600 (#137): the started dir is group-writable (0o2770) so sibling
+    // containers can create their own sentinels; the sentinel itself must
+    // stay owner-writable only, or a same-group process could overwrite
+    // another container's record.
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .mode(0o640)
+        .mode(0o600)
         .custom_flags(O_NOFOLLOW)
         .open(&sentinel)
         .map_err(|err| format!("failed to write sentinel {}: {err}", sentinel.display()))?;
@@ -482,6 +495,37 @@ mod tests {
             assert!(validate_sentinel_name(name).is_err(), "{name:?}");
         }
         assert!(validate_sentinel_name("tenant-ingress").is_ok());
+    }
+
+    #[test]
+    fn rejects_record_injection_sentinel_names() {
+        // Names land in the sentinel key=value record: newlines inject
+        // lines, '=' corrupts keys, and other control characters have no
+        // legitimate use (#137).
+        for name in [
+            "web\npid=1",
+            "web\n",
+            "con=tainer",
+            "web\r",
+            "web\ttab",
+            "web\0nul",
+        ] {
+            assert!(validate_sentinel_name(name).is_err(), "{name:?}");
+        }
+        assert!(validate_sentinel_name("tenant-ingress").is_ok());
+    }
+
+    #[test]
+    fn signal_started_writes_owner_only_sentinel() {
+        let dir = unique_dir();
+        signal_started(&dir, "web").unwrap();
+        let mode = fs::metadata(dir.join("web")).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "sentinel must be owner-writable only (group writes would let a same-group process overwrite it)"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
