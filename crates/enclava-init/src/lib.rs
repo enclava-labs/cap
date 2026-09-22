@@ -194,9 +194,12 @@ mod tests {
     #[test]
     fn prod_strict_gates_host_mutable_env_overrides() {
         let main_source = include_str!("main.rs").replace("\r\n", "\n");
-        // Every host-controlled operational env var read in main.rs must go
-        // through env_override (compiled out under prod-strict), never a
-        // bare std::env::var that a tampered host could redirect.
+        // The path-like env vars below redirect init output surfaces and must
+        // resolve through env_override (compiled out under prod-strict).
+        // Deliberately NOT gated (platform-set in prod manifests or
+        // timing-only knobs, see PR #136): ENCLAVA_INIT_CONFIG,
+        // ENCLAVA_INIT_STAY_ALIVE, ENCLAVA_INIT_UNLOCK_SOCKET_GID,
+        // ENCLAVA_INIT_WAIT_FOR_CONTAINERS*, KBS_FETCH_*/KBS_PROXY_HEALTH_*.
         for var in [
             "ENCLAVA_INIT_READY_FILE",
             "ENCLAVA_INIT_ERROR_FILE",

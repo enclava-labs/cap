@@ -69,6 +69,8 @@ fn main() -> ExitCode {
             // Prod-strict fails fast: an indefinitely-alive failed sidecar
             // masks the failure from orchestration (no restart, no backoff).
             // Dev builds keep the diagnostics-readable stay-alive.
+            // NOTE: the exact condition string below is load-bearing —
+            // lib.rs::prod_strict_gates_host_mutable_env_overrides pins it.
             if stay_alive_enabled() && !cfg!(feature = "prod-strict") {
                 tracing::error!(
                     "enclava-init failed; keeping sidecar alive so diagnostics remain readable"
@@ -109,9 +111,12 @@ fn run() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/enclava-init/config.toml"));
     let cfg = Config::load(&cfg_path).with_context(|| format!("loading {}", cfg_path.display()))?;
-    let _log_relay = start_log_relay_if_configured().context("starting encrypted log relay")?;
     record_stage("validating signed config").ok();
     validate_configmap_transport_against_signed_cc_init_data(&cfg)?;
+    // The relay starts only after the signed-config check passes: it serves
+    // an unauthenticated log-tail endpoint keyed off host-visible env, so
+    // it must not come up while the transport is still unverified.
+    let _log_relay = start_log_relay_if_configured().context("starting encrypted log relay")?;
     let stay_alive = stay_alive_enabled();
     let ready_file = ready_file_path();
     if stay_alive {
