@@ -8,7 +8,7 @@ use x509_cert::{
     Certificate,
     crl::CertificateList,
     der::{
-        Decode, Encode, Reader,
+        Decode, Encode, Reader, Tagged,
         asn1::{ContextSpecific, ObjectIdentifier},
     },
     spki::{AlgorithmIdentifierOwned, AlgorithmIdentifierRef},
@@ -317,6 +317,19 @@ fn verifying_key(certificate: &Certificate) -> Result<VerifyingKey, AmdVerificat
 /// so a signature actually made with a different salt length is rejected
 /// even when the declaration itself is well-formed — the declaration and
 /// the encoded signature must agree (enclava-labs/cap#141 review).
+/// RFC 4055 § 2.1 / RFC 8017 Appendix B: the digest AlgorithmIdentifiers
+/// inside a RSASSA-PSS declaration (hashAlgorithm and the MGF1 hash) take
+/// no parameters, so they must be absent or ASN.1 NULL. Checking only that
+/// the encoded value is empty would accept any other zero-length tag (an
+/// empty OCTET STRING, SEQUENCE, ...), so the tag itself is enforced
+/// (cap#168 review).
+fn hash_parameters_are_absent_or_null(algorithm: &AlgorithmIdentifierRef<'_>) -> bool {
+    algorithm
+        .parameters
+        .as_ref()
+        .is_none_or(|parameters| parameters.tag() == x509_cert::der::Tag::Null)
+}
+
 fn pss_parameters_match(algorithm: &AlgorithmIdentifierOwned) -> bool {
     let Some(parameters) = algorithm.parameters.as_ref() else {
         return false;
@@ -353,12 +366,15 @@ fn pss_parameters_match(algorithm: &AlgorithmIdentifierOwned) -> bool {
             Ok((hash, mgf, salt, trailer))
         })
         .is_ok_and(|(hash, mgf, salt, trailer)| {
+            // RFC 8017 / RFC 4055 § 2.1: the hash AlgorithmIdentifier's
+            // parameters must be absent or NULL — and per RFC 5280 § 4.1.1.2
+            // an AlgorithmIdentifier with no defined parameters encodes them
+            // as NULL, so "absent" is tolerated. Any other ASN.1 type (an
+            // empty OCTET STRING, SEQUENCE, etc.) with the right OID is a
+            // malformed declaration and rejected by checking the tag, not
+            // just the encoded length (cap#168 review).
             let hash_ok = hash.is_some_and(|hash| {
-                hash.value.oid == PSS_SHA384
-                    && hash
-                        .value
-                        .parameters
-                        .is_none_or(|parameters| parameters.value().is_empty())
+                hash.value.oid == PSS_SHA384 && hash_parameters_are_absent_or_null(&hash.value)
             });
             // MGF1 params are AlgorithmIdentifier { algorithm id-sha384,
             // parameters NULL } — a plain SEQUENCE, not context-tagged.
@@ -371,10 +387,7 @@ fn pss_parameters_match(algorithm: &AlgorithmIdentifierOwned) -> bool {
                             parameters.decode_as::<AlgorithmIdentifierRef>().ok()
                         })
                         .is_some_and(|hash| {
-                            hash.oid == PSS_SHA384
-                                && hash
-                                    .parameters
-                                    .is_none_or(|parameters| parameters.value().is_empty())
+                            hash.oid == PSS_SHA384 && hash_parameters_are_absent_or_null(&hash)
                         })
             });
             hash_ok
@@ -631,6 +644,59 @@ mod tests {
         AlgorithmIdentifierOwned::from_der(&full).unwrap()
     }
 
+    /// Like [`pss_algorithm_identifier`] but with the message-hash
+    /// AlgorithmIdentifier parameters set to an arbitrary TLV instead of
+    /// NULL — used to prove non-NULL parameter tags fail closed.
+    fn pss_algorithm_identifier_with_hash_params(
+        tag: u8,
+        value: &[u8],
+    ) -> AlgorithmIdentifierOwned {
+        pss_algorithm_identifier_with_params(tag, value, None)
+    }
+
+    /// Like [`pss_algorithm_identifier`] but with the MGF1 hash
+    /// AlgorithmIdentifier parameters set to an arbitrary TLV instead of
+    /// NULL.
+    fn pss_algorithm_identifier_with_mgf_hash_params(
+        tag: u8,
+        value: &[u8],
+    ) -> AlgorithmIdentifierOwned {
+        pss_algorithm_identifier_with_params(tag, value, Some(()))
+    }
+
+    fn pss_algorithm_identifier_with_params(
+        tag: u8,
+        value: &[u8],
+        mgf: Option<()>,
+    ) -> AlgorithmIdentifierOwned {
+        let null = der_tlv(0x05, &[]);
+        let non_null = der_tlv(tag, value);
+        let (hash_params, mgf_hash_params) = match mgf {
+            None => (non_null.clone(), null),
+            Some(()) => (null, non_null),
+        };
+        let hash_alg = der_tlv(
+            0x30,
+            &[oid_bytes("2.16.840.1.101.3.4.2.2"), hash_params].concat(),
+        );
+        let mgf_hash_alg = der_tlv(
+            0x30,
+            &[oid_bytes("2.16.840.1.101.3.4.2.2"), mgf_hash_params].concat(),
+        );
+        let mgf_alg = der_tlv(
+            0x30,
+            &[oid_bytes("1.2.840.113549.1.1.8"), mgf_hash_alg].concat(),
+        );
+        let mut params_body = Vec::new();
+        params_body.extend(der_tlv(0xA0, &hash_alg));
+        params_body.extend(der_tlv(0xA1, &mgf_alg));
+        params_body.extend(der_tlv(0xA2, &der_tlv(0x02, &minimal_der_integer(48))));
+        params_body.extend(der_tlv(0xA3, &der_tlv(0x02, &minimal_der_integer(1))));
+        let params = der_tlv(0x30, &params_body);
+        let full = der_tlv(0x30, &[oid_bytes(OID_RSASSA_PSS), params].concat());
+        AlgorithmIdentifierOwned::from_der(&full).unwrap()
+    }
+
     #[test]
     fn pss_declared_parameters_are_enforced() {
         let sha384 = "2.16.840.1.101.3.4.2.2";
@@ -684,6 +750,25 @@ mod tests {
             Some(1),
             true
         )));
+        // Non-NULL zero-length hash parameters (empty OCTET STRING /
+        // SEQUENCE / BOOLEAN) must be rejected even though they encode to
+        // zero bytes — only absent-or-NULL is a valid SHA-384 declaration
+        // (cap#168 review).
+        for tag in [0x04u8, 0x30, 0x01] {
+            let alg = pss_algorithm_identifier_with_hash_params(tag, &[]);
+            assert!(
+                !pss_parameters_match(&alg),
+                "empty non-NULL hash parameters (tag {tag:#04x}) must be rejected"
+            );
+        }
+        // Same for the MGF1 hash parameters.
+        for tag in [0x04u8, 0x30, 0x01] {
+            let alg = pss_algorithm_identifier_with_mgf_hash_params(tag, &[]);
+            assert!(
+                !pss_parameters_match(&alg),
+                "empty non-NULL MGF1 hash parameters (tag {tag:#04x}) must be rejected"
+            );
+        }
         // DEFAULT-omitted hash/MGF/salt (i.e. sha1/mgf1-SHA1/20): rejected.
         let params = der_tlv(0x30, &[]);
         let full = der_tlv(0x30, &[oid_bytes(OID_RSASSA_PSS), params].concat());

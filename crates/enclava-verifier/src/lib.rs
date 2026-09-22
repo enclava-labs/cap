@@ -37,6 +37,8 @@ pub use result::{
     canonical_result_sha256,
 };
 use sha2::{Digest, Sha256};
+#[cfg(feature = "fuzzing")]
+pub use sigstore::verify_inclusion_proof_for_fuzzing;
 pub use sigstore::{SigstoreError, verify_sigstore_and_provenance};
 pub use snp::{SNP_REPORT_BYTES, SnpReport, SnpReportError, parse_snp_report};
 pub use supply_chain::{SupplyChainError, verify_portable_material};
