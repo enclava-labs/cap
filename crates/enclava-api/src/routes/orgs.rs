@@ -644,6 +644,14 @@ pub async fn put_keyring(
         .execute(&mut *tx)
         .await
         .map_err(|_| db_error())?;
+        // A new keyring generation can remove the signer of retained signed
+        // policy artifacts still inside the KBS retention window (#130).
+        // Bump the signed-policy generation so the reconciler withdraws them
+        // from Trustee instead of treating the changed candidate set at an
+        // unchanged generation as a conflict.
+        crate::kbs::enqueue_signed_policy_reconciliation_if_active(&mut tx)
+            .await
+            .map_err(|_| db_error())?;
     }
 
     tx.commit().await.map_err(|_| db_error())?;
@@ -1528,6 +1536,13 @@ pub async fn rotate_org_owner(
         return Err(bad_request(
             "rotation signer does not match the current pinned owner",
         ));
+        // Owner rotation can remove the signer of retained signed policy
+        // artifacts still inside the KBS retention window (#130). Bump the
+        // signed-policy generation so those artifacts are withdrawn from
+        // Trustee instead of surviving at an unchanged generation.
+        crate::kbs::enqueue_signed_policy_reconciliation_if_active(&mut tx)
+            .await
+            .map_err(|_| db_error())?;
     }
 
     let owner_status = read_live_service_owner(signing_service, org_id).await?;
