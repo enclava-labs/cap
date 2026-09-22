@@ -1169,6 +1169,35 @@ mod tests {
         assert_eq!(reassembled, input.as_bytes());
     }
 
+    /// Cross-restart sequence monotonicity (round-8 review finding): the
+    /// spool on the shared `logs` emptyDir survives a container restart,
+    /// so a restarted wrapper must resume ABOVE the highest sequence the
+    /// previous process wrote — the relay's rotation dedup keeps the max
+    /// delivered sequence as its frontier and would silently drop every
+    /// post-restart frame whose reset counter lands at or below it.
+    #[test]
+    fn initial_spool_sequence_resumes_above_surviving_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        // A surviving spool whose highest frame is 417 (rotation retains
+        // only a tail, so the lowest present sequence is not 1).
+        let body: String = (400..=417).map(|s| format!("{}\n", frame(s))).collect();
+        std::fs::write(&path, body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 418);
+
+        // An empty spool resumes at 1.
+        std::fs::write(&path, "").unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 1);
+
+        // A spool with no parseable frames resumes at 1.
+        std::fs::write(&path, "not-json\nalso not json\n").unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 1);
+    }
+
     /// CR/LF terminators are still stripped from records that ended at a
     /// real newline (or EOF) — the historical cleanup behavior.
     #[test]
