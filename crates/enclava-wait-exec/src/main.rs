@@ -585,6 +585,15 @@ mod tests {
                 })
                 .unwrap_or(primary_gid);
             let strong_case = dir_gid != primary_gid;
+            if !strong_case {
+                eprintln!(
+                    "NOTE: no supplemental group available; setgid-inherit gid \
+                     normalization tested only in the weak form (dir gid == \
+                     primary gid, so inheritance alone cannot detect a \
+                     missing fchown). Run the suite with a supplemental \
+                     group or as root for full coverage."
+                );
+            }
             let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
             let rc = unsafe { nix::libc::chown(c_path.as_ptr(), uid, dir_gid) };
             assert_eq!(rc, 0, "failed to set up test dir group");

@@ -368,27 +368,35 @@ fn sentinel_with_wrong_owner_gid_is_rejected() {
     let dir = tempdir().unwrap();
     write_fake_proc(dir.path(), 789, "web", 10001, 10001, 555);
     let sentinel = dir.path().join("web");
+    std::fs::write(&sentinel, "").unwrap();
+    // The record mirrors the real inode gid so the only mismatch is the
+    // expected gid; this exercises the inode-owner-gid rejection on every
+    // host (the tempdir file inherits the runner's gid, whatever it is).
+    let inode_gid = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&sentinel).unwrap());
     std::fs::write(
         &sentinel,
-        "version=1\ncontainer=web\npid=789\nuid=10001\ngid=10001\nstart_time_ticks=555\n",
+        format!(
+            "version=1\ncontainer=web\npid=789\nuid=10001\ngid={inode_gid}\nstart_time_ticks=555\n"
+        ),
     )
     .unwrap();
-    let meta = std::fs::metadata(&sentinel).unwrap();
-    let uid = std::os::unix::fs::MetadataExt::uid(&meta);
-    let inode_gid = std::os::unix::fs::MetadataExt::gid(&meta);
-    // Derive a guaranteed-mismatching expected gid from the inode's real
-    // gid: 0 is never a valid test-process group here (we created the
-    // file), so the inode-gid rejection path is exercised on every host.
-    assert_ne!(inode_gid, 0, "sentinel inode unexpectedly owned by gid 0");
+    let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&sentinel).unwrap());
+    // expected gid differs from the inode gid by construction.
+    let expected_gid = inode_gid.wrapping_add(1);
     let err = read_sentinel_pid(
         &sentinel,
         dir.path(),
         "web",
-        ExpectedIdentity { uid, gid: 0 },
+        ExpectedIdentity {
+            uid,
+            gid: expected_gid,
+        },
     )
     .unwrap_err();
+    // "owner gid" pins the inode-gid rejection specifically; the record-gid
+    // mismatch message says "sentinel gid ..." instead.
     assert!(
-        err.to_string().contains("does not match expected gid"),
+        err.to_string().contains("owner gid"),
         "unexpected error: {err}"
     );
 }
