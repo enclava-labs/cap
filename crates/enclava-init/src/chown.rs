@@ -92,6 +92,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    #[ignore = "requires /etc/passwd with functioning NSS"]
     fn resolve_numeric_uid_only() {
         let id = resolve_exec_identity("10001").unwrap();
         assert_eq!(id.uid, 10001);
@@ -100,6 +101,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires /etc/passwd with functioning NSS"]
     fn resolve_numeric_uid_gid() {
         let id = resolve_exec_identity("10001:20002").unwrap();
         assert_eq!(id.uid, 10001);
