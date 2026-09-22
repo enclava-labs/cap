@@ -970,7 +970,16 @@ async fn deploy_app_candidate(
     if let Some(artifacts) = signing_artifacts.as_ref() {
         let api_signing_pubkey = crate::auth::jwt::public_key_base64(&state.signing_key);
         artifacts
-            .validate_deployment_inputs(&app, &image_digest, &api_signing_pubkey)
+            .validate_deployment_inputs(
+                &app,
+                &image_digest,
+                &api_signing_pubkey,
+                &crate::signing_service::descriptor_platform_binding_for(
+                    &state,
+                    &candidate_resources.memory_limit,
+                )
+                .map_err(signing_error_response)?,
+            )
             .map_err(signing_error_response)?;
         let attestation = state.attestation.as_ref().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
