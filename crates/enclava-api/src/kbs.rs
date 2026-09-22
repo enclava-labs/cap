@@ -1467,10 +1467,12 @@ fn replace_tls_resource_bindings_block(
     let marker = "resource_bindings := {";
     let cap_begin = "# BEGIN CAP MANAGED TLS RESOURCE BINDINGS";
     let cap_end = "# END CAP MANAGED TLS RESOURCE BINDINGS";
-    let start = find_binding_assignment(policy, marker)
+    let states = lex_rego_states(policy);
+    let start = find_binding_assignment(policy, &states, marker)?
         .ok_or(KbsPolicyError::MissingResourceBindingsBlock)?;
     replace_bindings_block(
         policy,
+        &states,
         marker,
         start,
         cap_begin,
@@ -1486,10 +1488,12 @@ fn replace_owner_bindings_block(
     let marker = "owner_resource_bindings := {";
     let cap_begin = "# BEGIN CAP MANAGED OWNER BINDINGS";
     let cap_end = "# END CAP MANAGED OWNER BINDINGS";
-    let start =
-        find_binding_assignment(policy, marker).ok_or(KbsPolicyError::MissingOwnerBindingsBlock)?;
+    let states = lex_rego_states(policy);
+    let start = find_binding_assignment(policy, &states, marker)?
+        .ok_or(KbsPolicyError::MissingOwnerBindingsBlock)?;
     replace_bindings_block(
         policy,
+        &states,
         marker,
         start,
         cap_begin,
@@ -1498,31 +1502,123 @@ fn replace_owner_bindings_block(
     )
 }
 
+/// Lexical state of a byte in a Rego policy. Rego has line comments
+/// (`# ...`), quoted strings (`"..."` with `\` escapes) and multi-line raw
+/// strings (`` `...` ``). Line-anchored substring search alone is not
+/// enough: a marker or assignment sitting on its own line *inside a raw
+/// string* satisfies any whitespace-prefix check, so splice points must be
+/// validated against the lexical state, not just the line shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegoLexState {
+    Code,
+    LineComment,
+    QuotedString,
+    RawString,
+}
+
+/// Classify every byte of `policy`. Delimiter bytes (`#`, `"`, `` ` ``)
+/// belong to the comment/string they open, and a newline inside a line
+/// comment is Code again. An unterminated string or raw string leaves the
+/// remainder classified as string content, which makes every lookup in it
+/// invisible — malformed input fails closed downstream.
+fn lex_rego_states(policy: &str) -> Vec<RegoLexState> {
+    let bytes = policy.as_bytes();
+    let mut states = Vec::with_capacity(bytes.len());
+    let mut current = RegoLexState::Code;
+    let mut escaped = false;
+    for &byte in bytes {
+        let mut state = current;
+        match current {
+            RegoLexState::Code => {
+                if byte == b'#' {
+                    current = RegoLexState::LineComment;
+                    state = RegoLexState::LineComment;
+                } else if byte == b'"' {
+                    current = RegoLexState::QuotedString;
+                    state = RegoLexState::QuotedString;
+                    escaped = false;
+                } else if byte == b'`' {
+                    current = RegoLexState::RawString;
+                    state = RegoLexState::RawString;
+                }
+            }
+            RegoLexState::LineComment => {
+                if byte == b'\n' {
+                    current = RegoLexState::Code;
+                    state = RegoLexState::Code;
+                }
+            }
+            RegoLexState::QuotedString => {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    current = RegoLexState::Code;
+                }
+            }
+            RegoLexState::RawString => {
+                if byte == b'`' {
+                    current = RegoLexState::Code;
+                }
+            }
+        }
+        states.push(state);
+    }
+    states
+}
+
 /// Locate `marker` only where it is the line's leading token (nothing but
-/// whitespace between the previous newline and the marker). A binding
-/// assignment quoted inside a string or trailing a comment no longer
-/// hijacks the splice, and `resource_bindings := {` no longer matches the
-/// tail of an `owner_resource_bindings := {` line.
-fn find_binding_assignment(policy: &str, marker: &str) -> Option<usize> {
+/// whitespace between the previous newline and the marker) AND every byte
+/// of the match is lexical code — not inside a comment, quoted string, or
+/// raw string. A binding assignment quoted inside a string, trailing a
+/// comment, or embedded in a multi-line raw string no longer hijacks the
+/// splice, and `resource_bindings := {` no longer matches the tail of an
+/// `owner_resource_bindings := {` line. More than one real assignment is
+/// an ambiguous splice target and fails closed instead of first-match.
+fn find_binding_assignment(
+    policy: &str,
+    states: &[RegoLexState],
+    marker: &str,
+) -> Result<Option<usize>, KbsPolicyError> {
+    let mut hits: Vec<usize> = Vec::new();
     let mut from = 0;
     while let Some(relative) = policy[from..].find(marker) {
         let at = from + relative;
-        let line_start = policy[..at].rfind('\n').map(|index| index + 1).unwrap_or(0);
-        if policy[line_start..at].chars().all(char::is_whitespace) {
-            return Some(at);
-        }
         from = at + marker.len();
+        let line_start = policy[..at].rfind('\n').map(|index| index + 1).unwrap_or(0);
+        if !policy[line_start..at].chars().all(char::is_whitespace) {
+            continue;
+        }
+        if !states[at..at + marker.len()]
+            .iter()
+            .all(|state| *state == RegoLexState::Code)
+        {
+            continue;
+        }
+        hits.push(at);
     }
-    None
+    match hits.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(*only)),
+        _ => Err(KbsPolicyError::MalformedManagedMarkers(format!(
+            "binding assignment `{marker}` appears {} times outside comments and strings",
+            hits.len()
+        ))),
+    }
 }
 
 /// Locate `marker` only where it occupies a whole line (optional leading
-/// indentation, nothing but whitespace after it). Returns the byte offset of
+/// indentation, nothing but whitespace after it) outside a string literal.
+/// The markers themselves are Rego comment lines (`# ...`), so comments are
+/// fine; what must be rejected is marker text sitting on its own line
+/// inside a quoted or multi-line raw string. Returns the byte offset of
 /// the marker itself, `None` when absent, and errors when the marker line
 /// appears more than once — an ambiguous splice target must fail closed
 /// instead of silently replacing the wrong span.
 fn find_managed_marker_unique(
     haystack: &str,
+    states: &[RegoLexState],
     marker: &str,
     label: &str,
 ) -> Result<Option<usize>, KbsPolicyError> {
@@ -1530,6 +1626,7 @@ fn find_managed_marker_unique(
     let mut from = 0;
     while let Some(relative) = haystack[from..].find(marker) {
         let at = from + relative;
+        from = at + marker.len();
         let line_start = haystack[..at]
             .rfind('\n')
             .map(|index| index + 1)
@@ -1542,10 +1639,12 @@ fn find_managed_marker_unique(
             && haystack[at + marker.len()..line_end]
                 .chars()
                 .all(char::is_whitespace);
-        if occupies_whole_line {
+        let inside_string = states[at..at + marker.len()]
+            .iter()
+            .any(|state| matches!(state, RegoLexState::QuotedString | RegoLexState::RawString));
+        if occupies_whole_line && !inside_string {
             hits.push(at);
         }
-        from = at + marker.len();
     }
     match hits.as_slice() {
         [] => Ok(None),
@@ -1559,6 +1658,7 @@ fn find_managed_marker_unique(
 
 fn replace_bindings_block(
     policy: &str,
+    states: &[RegoLexState],
     marker: &str,
     start: usize,
     cap_begin: &str,
@@ -1569,7 +1669,12 @@ fn replace_bindings_block(
     let mut depth = 0i32;
     let mut end = None;
 
+    // Braces inside comments, quoted strings, and raw strings do not open
+    // or close the binding map; counting them yields the wrong block.
     for (offset, ch) in policy[open_brace..].char_indices() {
+        if states[open_brace + offset] != RegoLexState::Code {
+            continue;
+        }
         match ch {
             '{' => depth += 1,
             '}' => {
@@ -1595,13 +1700,20 @@ fn replace_bindings_block(
     let block_body_end = end - 1;
     let block_body = &policy[block_body_start..block_body_end];
 
-    // Markers must sit on their own line and appear at most once inside the
-    // block; a marker string embedded mid-line in a policy value or comment
-    // is not a splice point, and a half-present or inverted marker pair is a
-    // corrupted block that must fail closed rather than be mis-spliced.
-    let begin_hit =
-        find_managed_marker_unique(block_body, cap_begin, "managed-block BEGIN marker")?;
-    let end_hit = find_managed_marker_unique(block_body, cap_end, "managed-block END marker")?;
+    // Markers must sit on their own line in lexical code and appear at most
+    // once inside the block; a marker string embedded mid-line in a policy
+    // value, comment, or raw string is not a splice point, and a
+    // half-present or inverted marker pair is a corrupted block that must
+    // fail closed rather than be mis-spliced.
+    let body_states = &states[block_body_start..block_body_end];
+    let begin_hit = find_managed_marker_unique(
+        block_body,
+        body_states,
+        cap_begin,
+        "managed-block BEGIN marker",
+    )?;
+    let end_hit =
+        find_managed_marker_unique(block_body, body_states, cap_end, "managed-block END marker")?;
 
     match (begin_hit, end_hit) {
         (None, None) => {}
@@ -1930,20 +2042,120 @@ resource_bindings := {
 "#;
 
         let next = replace_tls_resource_bindings_block(policy, &[tls_binding("cap-tls")]).unwrap();
-        // The owner block survives untouched...
-        assert!(next.contains("\"owner\""));
+        // The owner block survives verbatim...
+        assert!(
+            next.contains(
+                "owner_resource_bindings := {\n  \"owner\": {\"repository\": \"default\"}\n}"
+            ),
+            "owner block must survive the splice verbatim"
+        );
         assert!(!next.contains("BEGIN CAP MANAGED OWNER BINDINGS"));
-        // ...and the CAP TLS section lands inside resource_bindings.
-        let tls_pos = next
-            .find("BEGIN CAP MANAGED TLS RESOURCE BINDINGS")
-            .unwrap();
-        let rb_pos = next.find("resource_bindings := {").unwrap();
+        // ...and nothing is spliced between the owner assignment and the
+        // real `resource_bindings := {` line (the old unanchored find()
+        // spliced into the owner block and still satisfied bare
+        // substring-order assertions).
         let owner_pos = next.find("owner_resource_bindings := {").unwrap();
+        let rb_pos = next
+            .find("\nresource_bindings := {")
+            .map(|index| index + 1)
+            .unwrap();
         assert!(
             owner_pos < rb_pos,
             "owner block must come first for the suffix trap"
         );
+        assert!(
+            !next[owner_pos..rb_pos].contains("BEGIN CAP MANAGED"),
+            "no CAP-managed section may land between the owner assignment and the real resource_bindings map"
+        );
+        // ...and the CAP TLS section lands inside resource_bindings.
+        let tls_pos = next
+            .find("BEGIN CAP MANAGED TLS RESOURCE BINDINGS")
+            .unwrap();
         assert!(rb_pos < tls_pos);
+    }
+
+    #[test]
+    fn binding_assignment_inside_raw_string_is_ignored() {
+        // Rego raw strings (backticks) span lines; a line-start
+        // `resource_bindings := {` inside one must not seed the brace
+        // matcher. The splice targets the real map, and the raw string
+        // content survives untouched.
+        let policy = "package policy\n\ndocumentation := `example\nresource_bindings := {\n}`\n\nresource_bindings := {\n  \"legacy\": {\"repository\": \"default\"}\n}\n";
+
+        let next = replace_tls_resource_bindings_block(policy, &[tls_binding("cap-tls")]).unwrap();
+        assert!(
+            next.contains("documentation := `example\nresource_bindings := {\n}`"),
+            "raw string must survive verbatim"
+        );
+        assert!(next.contains("\"legacy\""));
+        assert!(next.contains("\"cap-tls\""));
+        let doc_pos = next.find("documentation := ").unwrap();
+        let tls_pos = next
+            .find("BEGIN CAP MANAGED TLS RESOURCE BINDINGS")
+            .unwrap();
+        let real_rb_pos = next.rfind("\nresource_bindings := {").unwrap();
+        assert!(
+            real_rb_pos < tls_pos,
+            "CAP section must land inside the real map, not the raw string"
+        );
+        assert!(doc_pos < real_rb_pos);
+        // The generated binding key appears exactly once: inside the real
+        // map, never spliced into the raw string.
+        assert_eq!(next.matches("\"cap-tls\"").count(), 1);
+    }
+
+    #[test]
+    fn managed_marker_inside_raw_string_is_not_a_splice_point() {
+        // Whole-line BEGIN/END markers inside a multi-line raw string value
+        // in the block body are string content, not splice points; the
+        // existing real managed section is what gets replaced.
+        let policy = "owner_resource_bindings := {\n  \"legacy\": {\"repository\": \"default\"},\n  \"doc\": `see\n# BEGIN CAP MANAGED OWNER BINDINGS\n# END CAP MANAGED OWNER BINDINGS\nhere`,\n  # BEGIN CAP MANAGED OWNER BINDINGS\n  \"old-cap\": {\"repository\": \"default\"}\n  # END CAP MANAGED OWNER BINDINGS\n}\n";
+
+        let next = replace_owner_bindings_block(policy, &[binding("new-owner")]).unwrap();
+        // The real managed section is replaced...
+        assert!(next.contains("\"new-owner\""));
+        assert!(!next.contains("\"old-cap\""));
+        // ...and the raw-string documentation survives verbatim (its
+        // marker-shaped lines are string content and stay as text).
+        assert!(next.contains("\"doc\": `see"));
+        assert!(next.contains("here`"));
+        // Exactly one splice happened: the fresh section's END marker is
+        // followed by the map's real closing content, not the old section.
+        let fresh_end = next.find("here`").unwrap();
+        let old_section_probe = "\"repository\": \"default\"\n  }".to_string();
+        assert!(
+            !next[fresh_end..].contains(&old_section_probe),
+            "the old managed section after the raw string must be gone"
+        );
+    }
+
+    #[test]
+    fn braces_inside_raw_string_do_not_close_the_block() {
+        // A `}` inside a raw string value must not terminate the map; the
+        // splice keeps the entry and the block boundary is the real brace.
+        let policy = "resource_bindings := {\n  \"legacy\": {\"repository\": \"default\"},\n  \"doc\": `template with } and { inside`\n}\n";
+
+        let next = replace_tls_resource_bindings_block(policy, &[tls_binding("cap-tls")]).unwrap();
+        assert!(next.contains("\"doc\": `template with } and { inside`"));
+        assert!(next.contains("\"legacy\""));
+        assert!(next.contains("BEGIN CAP MANAGED TLS RESOURCE BINDINGS"));
+        // The closing brace of the map is the real one, after the raw string.
+        let doc_pos = next.find("\"doc\"").unwrap();
+        let tls_pos = next
+            .find("BEGIN CAP MANAGED TLS RESOURCE BINDINGS")
+            .unwrap();
+        assert!(doc_pos < tls_pos);
+    }
+
+    #[test]
+    fn duplicate_real_assignments_fail_closed() {
+        // Two real (line-start, code) `resource_bindings := {` assignments
+        // are an ambiguous splice target; first-match must not silently win.
+        let policy = "package policy\n\nresource_bindings := {\n  \"first\": {\"repository\": \"default\"}\n}\n\nresource_bindings := {\n  \"second\": {\"repository\": \"default\"}\n}\n";
+
+        let err =
+            replace_tls_resource_bindings_block(policy, &[tls_binding("cap-tls")]).unwrap_err();
+        assert!(matches!(err, KbsPolicyError::MalformedManagedMarkers(_)));
     }
 
     #[test]

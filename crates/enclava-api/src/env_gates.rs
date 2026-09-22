@@ -13,6 +13,10 @@ pub enum EnvGateError {
         "ACME directory `{0}` points at production Let's Encrypt; set CAP_ALLOW_PRODUCTION_ACME=true only for production CAP"
     )]
     ProductionAcmeWithoutExplicitAllow(&'static str),
+    #[error(
+        "env var `{0}` must use https; cleartext ACME would leak account credentials and challenge traffic"
+    )]
+    CleartextAcmeUrl(&'static str),
 }
 
 const CAP_ALLOW_PRODUCTION_ACME: &str = "CAP_ALLOW_PRODUCTION_ACME";
@@ -54,7 +58,7 @@ fn validate_acme_directory_url(
     // TRUSTEE_KBS_URL. Parsing makes the scheme check case-insensitive
     // (`HTTP://` must not slip a prefix check).
     if http_scheme(value) {
-        return Err(EnvGateError::DebugOnlyFlagInRelease(source_name));
+        return Err(EnvGateError::CleartextAcmeUrl(source_name));
     }
     if is_letsencrypt_production_acme_url(value) && !production_acme_allowed {
         return Err(EnvGateError::ProductionAcmeWithoutExplicitAllow(
@@ -449,7 +453,7 @@ mod tests {
             );
             let err = run(env, false).unwrap_err();
             assert!(
-                matches!(err, EnvGateError::DebugOnlyFlagInRelease(rejected) if rejected == name),
+                matches!(err, EnvGateError::CleartextAcmeUrl(rejected) if rejected == name),
                 "{name} http URL must be rejected in release builds"
             );
 
@@ -462,7 +466,7 @@ mod tests {
             );
             assert!(matches!(
                 run(env, false).unwrap_err(),
-                EnvGateError::DebugOnlyFlagInRelease(_)
+                EnvGateError::CleartextAcmeUrl(_)
             ));
         }
     }

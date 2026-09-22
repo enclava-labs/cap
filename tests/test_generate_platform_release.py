@@ -43,3 +43,21 @@ def test_release_generator_allows_internal_tls_with_dev_fixture_key():
     payload["tenant_caddy_tls_mode"] = "internal"
 
     generate_platform_release.validate_payload(payload, allow_dev_internal_tls=True)
+
+
+def test_release_generator_scheme_check_is_case_insensitive():
+    # Parity with the Rust validators (parsed-URL scheme): HTTPS:// is a
+    # valid scheme, not a rejected prefix.
+    payload = base_payload()
+    payload["trustee_kbs_url"] = "HTTPS://kbs.example.test:8080"
+    payload["tenant_caddy_acme_ca"] = "HTTPS://acme.example.test/directory"
+
+    generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_http_acme_ca():
+    payload = base_payload()
+    payload["tenant_caddy_acme_ca"] = "http://acme.example.test/directory"
+
+    with pytest.raises(ValueError, match="tenant_caddy_acme_ca must be https"):
+        generate_platform_release.validate_payload(payload)

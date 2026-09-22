@@ -173,10 +173,12 @@ impl PlatformRelease {
 
 impl PlatformReleaseEnvelope {
     pub fn load_verified() -> Result<Self, PlatformReleaseError> {
-        let override_active = matches!(std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH"), Ok(path) if !path.trim().is_empty());
-        let raw = match std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH") {
-            Ok(path) if !path.trim().is_empty() => std::fs::read_to_string(Path::new(&path))?,
-            _ => BUNDLED_PLATFORM_RELEASE.to_string(),
+        let override_path = std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH")
+            .ok()
+            .filter(|path| !path.trim().is_empty());
+        let raw = match &override_path {
+            Some(path) => std::fs::read_to_string(Path::new(path))?,
+            None => BUNDLED_PLATFORM_RELEASE.to_string(),
         };
         let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
         verify_envelope(envelope.clone())?;
@@ -184,7 +186,7 @@ impl PlatformReleaseEnvelope {
         // the release compiled into this binary. A validly-signed stale
         // release (pinned to old measurements/sidecar digests) is exactly
         // what a file-swap or env-var attack serves.
-        if override_active {
+        if override_path.is_some() {
             enforce_release_not_older_than_bundled(&envelope.payload)?;
         }
         Ok(envelope)

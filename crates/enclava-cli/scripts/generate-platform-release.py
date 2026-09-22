@@ -15,6 +15,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -126,13 +127,22 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
     return out
 
 
+def _is_https(value: str) -> bool:
+    # urlparse lowercases the scheme, so `HTTPS://` is accepted exactly as
+    # the Rust validators (parsed-URL scheme) accept it.
+    try:
+        return urlparse(value).scheme == "https"
+    except ValueError:
+        return False
+
+
 def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = False) -> None:
     if payload["schema_version"] != "v1":
         raise ValueError("schema_version must be v1")
     for field in ["attestation_proxy_image", "caddy_ingress_image"]:
         if not GHCR_DIGEST_RE.fullmatch(payload[field]):
             raise ValueError(f"{field} must be a ghcr.io/enclava-labs digest-pinned ref")
-    if not payload["trustee_kbs_url"].startswith("https://"):
+    if not _is_https(payload["trustee_kbs_url"]):
         raise ValueError("trustee_kbs_url must be https")
     if payload["tenant_caddy_tls_mode"] not in ("acme", "dns01-broker", "internal"):
         raise ValueError("tenant_caddy_tls_mode must be acme, dns01-broker, or internal")
@@ -140,7 +150,7 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
         raise ValueError(
             "tenant_caddy_tls_mode=internal is only allowed with --dev-fixture-key"
         )
-    if not payload["tenant_caddy_acme_ca"].startswith("https://"):
+    if not _is_https(payload["tenant_caddy_acme_ca"]):
         raise ValueError("tenant_caddy_acme_ca must be https")
     hex32_bytes("signing_service_pubkey_hex", payload["signing_service_pubkey_hex"])
     hex32_bytes("policy_template_sha256", payload["policy_template_sha256"])

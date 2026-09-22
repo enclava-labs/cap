@@ -162,12 +162,14 @@ impl PlatformRelease {
 
 impl PlatformReleaseEnvelope {
     pub fn load_verified() -> Result<Self, PlatformReleaseError> {
-        let override_active = matches!(std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH"), Ok(path) if !path.trim().is_empty());
-        let raw = match std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH") {
-            Ok(path) if !path.trim().is_empty() => std::fs::read_to_string(Path::new(&path))?,
-            _ => BUNDLED_PLATFORM_RELEASE.to_string(),
+        let override_path = std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH")
+            .ok()
+            .filter(|path| !path.trim().is_empty());
+        let raw = match &override_path {
+            Some(path) => std::fs::read_to_string(Path::new(path))?,
+            None => BUNDLED_PLATFORM_RELEASE.to_string(),
         };
-        Self::load_verified_from_raw(raw, override_active)
+        Self::load_verified_from_raw(raw, override_path.is_some())
     }
 
     fn load_verified_from_raw(
