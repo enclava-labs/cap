@@ -1622,6 +1622,367 @@ mod tests {
         assert_eq!(list_orgs_api_key_org_filter(&auth), Some(org_id));
     }
 
+    async fn keyring_enqueue_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await
+    }
+
+    /// Route-level keyring tests assert exact values on the global
+    /// `kbs_signed_policy_reconciliation` singleton.  The shared test
+    /// database is mutated concurrently by hundreds of other tests (and by
+    /// sibling pipeline worktrees), any of which can bump the generation
+    /// mid-assertion.  A dedicated database makes these tests deterministic.
+    async fn isolated_database_test_pool(name: &str) -> sqlx::PgPool {
+        let base_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:***@localhost:5432/test".to_string());
+        let options = base_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("parse isolated keyring database URL");
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options.clone())
+            .await
+            .expect("connect isolated keyring database admin");
+        let create = sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+            .execute(&admin)
+            .await;
+        admin.close().await;
+        match create {
+            Ok(_) => {}
+            Err(err) if err.as_database_error().is_some_and(|d| d.code().as_deref() == Some("42P04")) => {}
+            Err(err) => panic!("create isolated keyring database {name}: {err}"),
+        }
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options.database(name))
+            .await
+            .expect("connect isolated keyring database");
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate isolated keyring database");
+        pool
+    }
+
+    #[tokio::test]
+    async fn put_keyring_route_enqueues_signed_policy_reconciliation_in_transaction() {
+        let _singleton = keyring_enqueue_guard().await;
+        let pool = isolated_database_test_pool("cap130_keyring_enqueue_put").await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-enqueue-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert keyring enqueue org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Enqueuer')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring enqueue user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring enqueue membership");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert keyring enqueue signing key");
+
+        // Route-level regression for #130: a signed-policy generation must be
+        // enqueued inside the put_keyring transaction itself. A regression
+        // that drops the enqueue call silently reintroduces #130 while the
+        // kbs helper test stays green.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed signed-policy generation");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth,
+            State(state),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+        )
+        .await
+        .expect("put keyring enqueues reconciliation");
+
+        let desired: i64 = sqlx::query_scalar(
+            "SELECT desired_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read desired generation after put");
+        assert_eq!(
+            desired, 6,
+            "PUT /orgs/:name/keyring must bump the signed-policy generation"
+        );
+
+        // Idempotent replay must not churn the generation.
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth,
+            State(state),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+        )
+        .await
+        .expect("idempotent replay succeeds");
+        let desired: i64 = sqlx::query_scalar(
+            "SELECT desired_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read desired generation after replay");
+        assert_eq!(desired, 6, "idempotent replay must not bump again");
+
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring enqueue audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring enqueue org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete keyring enqueue user");
+    }
+
+    #[tokio::test]
+    async fn rotate_owner_route_enqueues_signed_policy_reconciliation_in_transaction() {
+        let _singleton = keyring_enqueue_guard().await;
+        let pool = isolated_database_test_pool("cap130_keyring_enqueue_rotate").await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-rotate-enqueue-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert rotate enqueue org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Rotate Enqueuer')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert rotate enqueue user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert rotate enqueue membership");
+        let key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        // Both the current and the replacement owner keys must be registered
+        // for the rotating user: the handler resolves signing_key_id from
+        // user_signing_keys inside the lane-locked transaction.
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert rotate enqueue signing keys");
+
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 5,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed signed-policy generation");
+
+        // Publish v1 as the current owner.
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
+        )
+        .await
+        .expect("seed keyring v1");
+
+        // The signing service owner already matches the replacement key, so
+        // the handler takes the no-remote-rotation branch and commits the
+        // keyring v2 insert plus the generation bump locally.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind signing service mock");
+        let address = listener.local_addr().expect("mock signing service address");
+        let replacement_hex = hex::encode(replacement_key.verifying_key().to_bytes());
+        let org_id_for_mock = org_id;
+        let mock = tokio::spawn(async move {
+            use axum::{Json, routing::get};
+            let app = axum::Router::new().route(
+                "/orgs/{org_id}/owner",
+                get(move || async move {
+                    Json(serde_json::json!({
+                        "org_id": org_id_for_mock,
+                        "state": "ready",
+                        "version": 2,
+                        "owner_pubkey_hex": replacement_hex,
+                        "last_changed_at": null,
+                    }))
+                }),
+            );
+            axum::serve(listener, app).await.expect("serve mock");
+        });
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(format!("http://{address}"), None)
+                .expect("mock signing service client"),
+        );
+
+        let added_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let updated_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+        let replacement_pubkey = replacement_key.verifying_key().to_bytes();
+        let keyring = SignedOrgKeyring {
+            org_id,
+            version: 2,
+            members: vec![SignedOrgKeyringMember {
+                user_id,
+                pubkey: replacement_pubkey,
+                role: SignedOrgKeyringRole::Owner,
+                added_at,
+            }],
+            updated_at,
+        };
+        let keyring_payload = serde_json::json!({
+            "org_id": org_id,
+            "version": 2,
+            "members": [{
+                "user_id": user_id,
+                "pubkey": hex::encode(replacement_pubkey),
+                "role": "owner",
+                "added_at": added_at,
+            }],
+            "updated_at": updated_at,
+        });
+        let keyring_signature = replacement_key.sign(&canonical_keyring_bytes(&keyring));
+        let signed_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 45).unwrap();
+        let reason = "owner key compromised";
+        let directive = owner_rotation_directive_bytes(
+            org_id,
+            &key.verifying_key().to_bytes(),
+            &replacement_pubkey,
+            signed_at,
+            reason,
+        );
+        let rotation_signature = key.sign(&directive);
+        let rotated = rotate_org_owner(
+            auth,
+            State(state),
+            Path(org_name.clone()),
+            Json(RotateOrgOwnerRequest {
+                version: 2,
+                keyring_payload,
+                signature: hex::encode(keyring_signature.to_bytes()),
+                replacement_signing_pubkey: hex::encode(replacement_pubkey),
+                current_signing_pubkey: hex::encode(key.verifying_key().to_bytes()),
+                signed_at,
+                reason: reason.to_string(),
+                rotation_signature: hex::encode(rotation_signature.to_bytes()),
+            }),
+        )
+        .await
+        .expect("rotate owner enqueues reconciliation");
+
+        let desired: i64 = sqlx::query_scalar(
+            "SELECT desired_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read desired generation after rotation");
+        assert_eq!(
+            desired, 7,
+            "owner rotation must bump the signed-policy generation \
+             (v1 put: 5->6, rotation: 6->7)"
+        );
+        let latest_version: i64 =
+            sqlx::query_scalar("SELECT max(version) FROM org_keyrings WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .expect("read latest keyring version");
+        assert_eq!(latest_version, 2);
+        assert_eq!(rotated.0.state, "ready");
+
+        mock.abort();
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete rotate enqueue audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete rotate enqueue org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete rotate enqueue user");
+    }
+
     #[tokio::test]
     async fn keyring_acceptance_waits_for_membership_removal_and_rejects() {
         let pool = database_test_pool().await;
@@ -1746,6 +2107,10 @@ mod tests {
 
     #[tokio::test]
     async fn keyring_rotation_preserves_pinned_owner_and_one_immutable_v2_winner() {
+        // Holds the singleton lock: this test's committed put_keyring calls
+        // bump the shared signed-policy generation whenever it is nonzero,
+        // which would corrupt concurrent tests asserting exact values.
+        let _singleton = keyring_enqueue_guard().await;
         let pool = database_test_pool().await;
         let org_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();

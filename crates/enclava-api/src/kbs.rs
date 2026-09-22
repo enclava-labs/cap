@@ -570,9 +570,13 @@ async fn load_signed_policy_candidates(
              AND deployment.org_id = job.org_id
             JOIN apps AS app ON app.id = job.app_id
         ),
-        -- The cast is safe: org_keyrings rows are written only by the put/
-        -- rotate handlers, which serialize validated JSON, so a committed
-        -- payload is always well-formed UTF-8 JSON with a members array.
+        -- The cast is safe at two levels: org_keyrings rows are written only
+        -- by the put/rotate handlers, which serialize validated JSON, and the
+        -- org_keyrings_payload_wellformed CHECK constraint (migration 0049)
+        -- rejects any non-JSON or non-object payload or a non-array members
+        -- entry at INSERT time, so a malformed row from a backfill script or
+        -- manual psql fix can never take down candidate loading for every
+        -- org at once.
         current_keyring_members AS (
             SELECT latest.org_id, member.value->>'pubkey' AS pubkey
               FROM (
@@ -627,6 +631,13 @@ async fn load_signed_policy_candidates(
              AND artifact.deploy_id = historical.artifact_deployment_id
              AND artifact.descriptor_core_hash
                  = historical.artifact_descriptor_core_hash
+            -- Membership is compared case-insensitively on purpose: the
+            -- keyring payload is stored verbatim from the request and
+            -- `hex_bytes32` deserialization is case-insensitive, so an
+            -- uppercase member pubkey hex survives validation and is
+            -- stored as-is.  Artifact pubkeys, by contrast, are enforced
+            -- lowercase at verification.  Do not "simplify" the lower()
+            -- away or uppercase keyrings would silently lose authority.
             JOIN current_keyring_members AS member
               ON member.org_id = current.org_id
              AND lower(member.pubkey) = lower(
@@ -687,6 +698,8 @@ async fn load_signed_policy_candidates(
               ON artifact.app_id = legacy.app_id
              AND artifact.deploy_id = legacy.deployment_id
             JOIN current_keyring_members AS member
+              -- Case-insensitive membership join: see the comment at the
+              -- job_artifact_candidates join above.
               ON member.org_id = legacy.org_id
              AND lower(member.pubkey) = lower(
                  artifact.signed_policy_artifact
@@ -2710,6 +2723,9 @@ owner_resource_bindings := {}
 
     #[tokio::test]
     async fn keyring_rotation_enqueues_signed_policy_reconciliation_only_when_active() {
+        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
+            .lock()
+            .await;
         let pool = database_test_pool().await;
 
         // Unsigned-only installs must not enter signed-policy mode.

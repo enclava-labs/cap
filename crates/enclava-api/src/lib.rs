@@ -1989,6 +1989,13 @@ mod runtime_gate_tests {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    /// Serializes tests that mutate or assert on the global
+    /// `kbs_signed_policy_reconciliation` singleton row: cargo runs lib
+    /// tests in parallel against one shared database, so unsynchronized
+    /// generation bumps from one test would corrupt another's assertions.
+    pub(crate) static SIGNED_POLICY_SINGLETON_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
     use crate::auth::api_key::ValidatedApiKey;
     use crate::auth::middleware::{AuthContext, ManagementOrigin};
     use crate::clients::{AllowList, ClientConfig, RegistryClient};
