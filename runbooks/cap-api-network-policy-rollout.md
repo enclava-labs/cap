@@ -191,33 +191,35 @@ only on the ingress→CAP leg), and there is no debug endpoint exposing
 request headers. Verify behaviorally instead, with a POSITIVE control:
 
 ```sh
-# Two clients on DIFFERENT public source IPs (e.g. two networks, a VPN
-# hop, or a second cloud instance). Run BOTH loops CONCURRENTLY (not sequentially)
-# to prevent the burst from refilling between tests — CAP's bucket refills at
-# 1 r/s, so sequential tests could give a false pass even with broken secret wiring:
-
-# Run both loops in parallel and capture outputs separately:
+# Run BOTH loops CONCURRENTLY (not sequentially) to prevent the burst
+# from refilling between tests — CAP's bucket refills at 1 r/s, so sequential
+# tests could give a false pass even with broken secret wiring.
+#
+# IMPORTANT — different egress is mandatory: both snippets below must run
+# on TWO SEPARATE MACHINES with different public source IPs (e.g. laptop +
+# cloud instance, or two instances in different networks). Pasting both
+# loops into one shell on one host does NOT work: they would share the
+# host's single public IP, land in one bucket either way, and the check
+# below cannot distinguish per-client keying from shared keying.
+#
+# --- MACHINE A (public IP A) — start this first, then IMMEDIATELY: ---
 ( for i in $(seq 1 15); do
     curl -s -o /dev/null -w '%{http_code}\n' -X POST \
       https://api.<cluster>/auth/device/start \
       -H 'Content-Type: application/json' -d '{}'
-  done ) > /tmp/ip1.out &
-PID1=$!
+  done ) > /tmp/ip1.out
+sort /tmp/ip1.out | uniq -c; rm /tmp/ip1.out
 
+# --- MACHINE B (public IP B) — run WHILE machine A's loop is still firing: ---
 ( for i in $(seq 1 15); do
     curl -s -o /dev/null -w '%{http_code}\n' -X POST \
       https://api.<cluster>/auth/device/start \
       -H 'Content-Type: application/json' -d '{}'
-  done ) > /tmp/ip2.out &
-PID2=$!
+  done ) > /tmp/ip2.out
+sort /tmp/ip2.out | uniq -c; rm /tmp/ip2.out
 
-wait $PID1 $PID2
-
-echo "=== IP1 results ==="
-sort /tmp/ip1.out | uniq -c
-echo "=== IP2 results ==="
-sort /tmp/ip2.out | uniq -c
-rm /tmp/ip1.out /tmp/ip2.out
+# Compare the two summaries side by side (the two machines cannot write to
+# a shared /tmp, so collect each machine's `sort | uniq -c` output by hand).
 #
 # NOTE: Running these sequentially (first loop, then second loop) can give a
 # false pass because CAP's bucket refills at 1 r/s. If there's any delay >~10s
