@@ -36,9 +36,15 @@ metadata:
   namespace: enclava-platform
   annotations:
     nginx.ingress.kubernetes.io/limit-rps: "1"
-    # This is per ingress controller replica; with N replicas the effective
-    # limit is N r/s. Size accordingly or use a cluster-wide store if the
-    # target cluster runs multiple ingress-nginx controllers.
+    # ingress-nginx computes the effective burst as limit-rps ×
+    # limit-burst-multiplier (documented default 5). Without this annotation
+    # the ingress would allow only burst 5 and reject the 6th+ concurrent CLI
+    # login behind one NAT (503) before it reaches CAP's intended burst-10
+    # governor; 1 × 10 keeps the ingress aligned with the in-process budget.
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "10"
+    # Both annotations are per ingress controller replica; with N replicas
+    # the effective limit is N r/s. Size accordingly or use a cluster-wide
+    # store if the target cluster runs multiple ingress-nginx controllers.
 spec:
   ingressClassName: nginx
   tls:

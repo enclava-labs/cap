@@ -41,6 +41,10 @@ wget -qO- --header="Authorization: Bearer <token>" \
 
 A timeout here means the tenant ingress rule (namespace label
 `enclava.dev/tenant: Exists`) is not matching — workload unlock will hang.
+Note `wget -qO-` writes any fetched document to stdout; if the endpoint
+ever returns a body, prefer `-qO /dev/null` so the output cannot be
+mistaken for command success. An exit status of 4 (network failure)
+also fails the check — do not judge this step by output presence alone.
 
 ## 3. Ingress controller forwarded-header behavior (rate-limit keying)
 
@@ -75,7 +79,9 @@ for i in $(seq 1 15); do
     -H 'Content-Type: application/json' -d '{}' \
     -H "X-Real-IP: 198.51.100.$i" -H "X-Forwarded-For: 198.51.100.$i"
 done | sort | uniq -c
-# Expect a handful of 200/4xx (before the budget drains) and then 429s.
+# Expect a handful of 200/4xx (before the budget drains) and then 429s
+# (or 503s — the device-start Ingress's own limit-rps may fire first;
+# see the disambiguation note in §3c).
 # If all 15 succeed, the spoofed headers are being honored as distinct
 # rate-limit keys — STOP the rollout and re-check the controller config.
 # Then repeat the loop WITHOUT the spoofed headers: the 429 threshold must
@@ -101,9 +107,32 @@ kubectl get nodes -o wide                   # map pod IPs to the node+pod CIDR i
 ```
 
 Set `TRUSTED_PROXY_CIDRS` in the live overlay to the smallest CIDR (or
-explicit IP list) covering ONLY the ingress-nginx controller pods, and re-run
-the §3-style spoofed-header check from a tenant pod directly against the
-ClusterIP:
+explicit IP list) covering ONLY the ingress-nginx controller pods.
+
+How to verify the narrowing depends on whether the proxy secret (§3c) is
+already wired:
+
+- **With `TRUSTED_PROXY_SECRET` configured (the mandatory end state):** a
+  direct tenant-pod connection carries no proxy secret, so the extractor
+  ignores its forwarding headers and keys by the pod IP whether that pod
+  sits inside `10.0.0.0/8` or outside the narrowed CIDR — a spoofed-header
+  loop hits 429 either way and CANNOT distinguish wide from narrow trust.
+  The secret gate is what actually defeats tenant-pod spoofing; the CIDR
+  narrowing is defense-in-depth (it limits blast radius if the secret
+  leaks or the injection is misconfigured). Verify the narrowing itself
+  by inspecting the live value against the controller pod IPs:
+
+```sh
+kubectl -n enclava-platform get deploy enclava-api -o jsonpath=\
+  '{.spec.template.spec.containers[0].env[?(@.name=="TRUSTED_PROXY_CIDRS")].value}'
+kubectl get pods -n ingress-nginx -o wide   # every controller IP must fall
+                                            # inside the printed CIDR(s), and
+                                            # tenant pod CIDRs must NOT
+```
+
+- **Without the secret (e.g. a staging cluster before §3c):** re-run the
+  §3-style spoofed-header check from a tenant pod directly against the
+  ClusterIP, where the CIDR IS the only gate:
 
 ```sh
 # from a tenant pod — spoofed headers must NOT buy extra /auth/device/start
@@ -118,6 +147,9 @@ done | sort | uniq -c
 # 429s within ~10 requests = good (keyed by the pod's own address).
 # All 15 succeeding = the tenant pod's headers are still trusted = the CIDR
 # is too wide — do not enable the policy until it is narrowed.
+# EMPTY output = wget failed before issuing the request (DNS/service
+# unreachable); treat that as a FAILED check, not a pass — the pipeline
+# has no pipefail, so do not rely on the loop's exit status.
 ```
 
 If the cluster cannot pin controller addresses (fully dynamic pools), split
@@ -153,25 +185,46 @@ kubectl -n ingress-nginx get cm ingress-nginx-controller -o yaml
 
 3. **Verify the secret actually reaches CAP** (critical sanity check):
 
+Directly reading the header CAP receives is not possible via `curl -v`
+(that shows the request as *curl sent it* — the injected header exists
+only on the ingress→CAP leg), and there is no debug endpoint exposing
+request headers. Verify behaviorally instead, with a POSITIVE control:
+
 ```sh
-# Make a request through the ingress and check that CAP sees the header:
-curl -s https://api.<cluster>/.well-known/enclava -v 2>&1 | grep -i x-enclava
-# The header should appear in the request logs or be traceable via
-# CAP's debug/profiling endpoint.
+# Two clients on DIFFERENT public source IPs (e.g. two networks, a VPN
+# hop, or a second cloud instance). Each drives the same rapid loop:
+for i in $(seq 1 15); do
+  curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+    https://api.<cluster>/auth/device/start \
+    -H 'Content-Type: application/json' -d '{}'
+done | sort | uniq -c
 #
-# Alternatively, exhaust the rate limit from one source IP and confirm a
-# second source retains its own budget — this verifies that the secret
-# (present only in ingress-proxied traffic) gates the per-client keying:
-#
-# First IP:
-for i in $(seq 1 15); do curl -s -o /dev/null https://api.<cluster>/auth/device/start -H 'Content-Type: application/json' -d '{}'; done
-# Second IP (from a different network):
-for i in $(seq 1 15); do curl -s -o /dev/null --interface <different-ip> https://api.<cluster>/auth/device/start -H 'Content-Type: application/json' -d '{}'; done
-#
-# If both IPs hit 429 around the same request number (~10), the secret is
-# NOT being honored — traffic is keyed by the ingress pod IP. Do NOT enable
-# the policy until this passes.
+# PASS (secret honored, per-client keying):
+#   - first IP: 200/4xx for ~10 requests, then 429s
+#   - second IP starts FRESH: ~10 non-429 responses of its own
+#     (its own bucket), NOT immediate 429s.
+# FAIL (secret missing/mismatched — every public request is keyed by
+#   the ingress controller pod IP, one shared bucket for all clients):
+#   - the second IP gets 429 IMMEDIATELY (its requests land in the
+#     same drained bucket the first IP just exhausted).
+# DISAMBIGUATION: the device-start Ingress has its own limit-rps
+#   annotation, so the ingress limiter can fire BEFORE CAP's governor
+#   and mask CAP's answer. ingress-nginx throttling returns 503, CAP's
+#   governor returns 429 — distinguish the tiers by status code, and
+#   count only 429s as evidence about the secret wiring.
+# Do NOT enable the policy on a FAIL.
 ```
+
+The direction of the signal matters: if the second IP retains its own
+budget, the secret is being honored; if it is throttled instantly, it is
+not. (A second-IP FAIL here is also the observable signature of the §3
+spoofing regression.)
+
+Optionally, to distinguish "secret honored" from "ingress not injecting
+but CIDR trusts it anyway", repeat one loop WITH a spoofed
+`X-Real-IP` per request (§3 style): with the secret honored the outcome
+must be identical to the unspoofed loop, because ingress-nginx
+overwrites `X-Real-IP` with the true client address either way.
 
 Verifying the wiring is the FIRST thing to do if per-client rate limiting
 regresses: if the controller does not inject the header (or the values
