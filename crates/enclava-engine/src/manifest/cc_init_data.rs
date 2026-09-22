@@ -292,7 +292,6 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     toml.push('\n');
 
     // policy.rego
-    toml.push_str("\"policy.rego\" = '''\n");
     if let Some(agent_policy) = &app.generated_agent_policy {
         let actual_hash: [u8; 32] = Sha256::digest(agent_policy.policy_text.as_bytes()).into();
         assert_eq!(
@@ -303,47 +302,45 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
             "generated_agent_policy.genpolicy_version_pin",
             &agent_policy.genpolicy_version_pin,
         );
-        toml.push_str(&agent_policy.policy_text);
-        if !agent_policy.policy_text.ends_with('\n') {
-            toml.push('\n');
-        }
+        push_toml_multiline_string(&mut toml, "\"policy.rego\"", &agent_policy.policy_text);
     } else {
-        toml.push_str(&build_agent_policy(
-            &image_digest,
-            &app.namespace,
-            &app.service_account,
-            &app.name,
-        ));
+        push_toml_multiline_string(
+            &mut toml,
+            "\"policy.rego\"",
+            &build_agent_policy(
+                &image_digest,
+                &app.namespace,
+                &app.service_account,
+                &app.name,
+            ),
+        );
     }
-    toml.push_str("'''\n");
     toml.push('\n');
 
     // aa.toml
-    toml.push_str("\"aa.toml\" = '''\n");
-    toml.push_str("[token_configs]\n");
-    toml.push_str("[token_configs.kbs]\n");
-    push_toml_string(&mut toml, "url", &kbs_url);
+    let mut aa_toml = String::new();
+    aa_toml.push_str("[token_configs]\n");
+    aa_toml.push_str("[token_configs.kbs]\n");
+    push_toml_string(&mut aa_toml, "url", &kbs_url);
     if let Some(cert) = &kbs_ca_cert_pem {
-        push_toml_string(&mut toml, "cert", cert.trim());
+        push_toml_string(&mut aa_toml, "cert", cert.trim());
     }
-    toml.push_str("'''\n");
+    push_toml_multiline_string(&mut toml, "\"aa.toml\"", &aa_toml);
     toml.push('\n');
 
     // cdh.toml
-    toml.push_str("\"cdh.toml\" = '''\n");
-    toml.push_str("[kbc]\n");
-    toml.push_str("name = \"cc_kbc\"\n");
-    push_toml_string(&mut toml, "url", &kbs_url);
+    let mut cdh_toml = String::new();
+    cdh_toml.push_str("[kbc]\n");
+    cdh_toml.push_str("name = \"cc_kbc\"\n");
+    push_toml_string(&mut cdh_toml, "url", &kbs_url);
     if let Some(cert) = &kbs_ca_cert_pem {
-        push_toml_string(&mut toml, "kbs_cert", cert.trim());
+        push_toml_string(&mut cdh_toml, "kbs_cert", cert.trim());
     }
-    toml.push_str("'''\n");
+    push_toml_multiline_string(&mut toml, "\"cdh.toml\"", &cdh_toml);
 
     // identity.toml (always present per OID-1)
     toml.push('\n');
-    toml.push_str("\"identity.toml\" = '''\n");
-    toml.push_str(&identity_toml);
-    toml.push_str("'''\n");
+    push_toml_multiline_string(&mut toml, "\"identity.toml\"", &identity_toml);
 
     let sidecar_digests = serde_json::json!({
         "attestation_proxy": app.attestation.proxy_image.digest(),
@@ -552,6 +549,31 @@ fn build_agent_policy(
 
 fn rego_string(value: &str) -> String {
     serde_json::to_string(value).expect("string serialization is infallible")
+}
+
+/// Append `key = '''…'''` with `body` embedded as a TOML multi-line literal
+/// string.
+///
+/// The signed `generated_agent_policy.policy_text` flows in here, so the
+/// embedding must not be breakable by file content: if the body contains a
+/// `'''` terminator sequence, fall back to a single-line basic string (JSON
+/// encoding is a valid TOML basic string body) instead of a literal block the
+/// content could escape from. Benign bodies keep the historical byte layout
+/// because descriptor signatures commit to the SHA256 of the exact TOML.
+fn push_toml_multiline_string(toml: &mut String, key: &str, body: &str) {
+    toml.push_str(key);
+    toml.push_str(" = ");
+    if body.contains("'''") {
+        toml.push_str(&toml_string(body));
+        toml.push('\n');
+    } else {
+        toml.push_str("'''\n");
+        toml.push_str(body);
+        if !body.ends_with('\n') {
+            toml.push('\n');
+        }
+        toml.push_str("'''\n");
+    }
 }
 
 /// Build the identity.toml content.

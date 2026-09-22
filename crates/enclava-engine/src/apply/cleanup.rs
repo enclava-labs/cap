@@ -211,7 +211,12 @@ pub async fn delete_statefulset(
     }
 }
 
-/// Delete all PVCs in a namespace and wait for PV cleanup.
+/// Delete CAP-owned PVCs in a namespace and wait for PV cleanup.
+///
+/// Only PVCs carrying the platform `app.kubernetes.io/managed-by`
+/// label are selected (#138): a namespace-colocated PVC created by another
+/// actor must not be swept by tenant teardown. PVCs created before the label
+/// existed are reclaimed by the namespace deletion that follows teardown.
 pub async fn delete_pvcs_and_wait(
     engine: &ApplyEngine,
     namespace: &str,
@@ -220,8 +225,13 @@ pub async fn delete_pvcs_and_wait(
 ) -> Result<(), ApplyError> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(engine.client().clone(), namespace);
 
-    // List all PVCs in the namespace
-    let pvcs = api.list(&ListParams::default()).await?;
+    let selector = format!(
+        "{}={}",
+        crate::manifest::volumes::MANAGED_BY_LABEL.0,
+        crate::manifest::volumes::MANAGED_BY_LABEL.1
+    );
+    // List only CAP-managed PVCs in the namespace
+    let pvcs = api.list(&ListParams::default().labels(&selector)).await?;
 
     if pvcs.items.is_empty() {
         tracing::info!(namespace = %namespace, "no PVCs to delete");
@@ -252,7 +262,7 @@ pub async fn delete_pvcs_and_wait(
     let start = Instant::now();
     loop {
         if start.elapsed() >= timeout_duration {
-            let remaining = api.list(&ListParams::default()).await?;
+            let remaining = api.list(&ListParams::default().labels(&selector)).await?;
             if !remaining.items.is_empty() {
                 let names: Vec<_> = remaining
                     .items
@@ -274,7 +284,7 @@ pub async fn delete_pvcs_and_wait(
             break;
         }
 
-        let remaining = api.list(&ListParams::default()).await?;
+        let remaining = api.list(&ListParams::default().labels(&selector)).await?;
         if remaining.items.is_empty() {
             tracing::info!(namespace = %namespace, "all PVCs deleted");
             return Ok(());

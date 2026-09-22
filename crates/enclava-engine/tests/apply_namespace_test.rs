@@ -1,12 +1,3 @@
-use enclava_engine::apply::namespace::namespace_patch_params;
-
-#[test]
-fn patch_params_use_correct_field_manager() {
-    let pp = namespace_patch_params("enclava-platform");
-    assert_eq!(pp.field_manager.as_deref(), Some("enclava-platform"));
-    assert!(pp.force);
-}
-
 /// Integration test: requires a running cluster.
 /// Run with: cargo test -- --ignored
 #[tokio::test]

@@ -115,12 +115,14 @@ fn volumes_decrypted_mountpoints_use_memory_medium_and_1mi_limit() {
 }
 
 #[test]
-fn volumes_logs_emptydir_uses_default_disk_medium() {
+fn volumes_logs_emptydir_is_disk_backed_and_bounded() {
     let vols = build_volumes(&memory_app());
     let v = vols.iter().find(|v| v.name == "logs").unwrap();
     let ed = v.empty_dir.as_ref().unwrap();
+    // #138: disk medium with an explicit node-side bound (relay tails at most
+    // 2 MiB per container; 64 MiB bounds runaway writers).
     assert!(ed.medium.is_none());
-    assert!(ed.size_limit.is_none());
+    assert_eq!(ed.size_limit.as_ref().map(|q| q.0.as_str()), Some("64Mi"));
 }
 
 #[test]
@@ -145,7 +147,11 @@ fn historical_policy_replay_preserves_bootstrap_volume_layout() {
             replayed_spec.containers.last().unwrap().name,
             "enclava-init"
         );
-        for name in ["enclava-tools", "state-mount", "tls-state-mount"] {
+        for (name, disk_limit) in [
+            ("enclava-tools", "16Mi"),
+            ("state-mount", "1Mi"),
+            ("tls-state-mount", "1Mi"),
+        ] {
             let ed = replayed_spec
                 .volumes
                 .as_ref()
@@ -158,7 +164,12 @@ fn historical_policy_replay_preserves_bootstrap_volume_layout() {
                 .unwrap();
             assert_eq!(ed.medium.as_deref(), expected_memory.then_some("Memory"));
             if !expected_memory {
-                assert!(ed.size_limit.is_none());
+                // #138: disk-backed bootstrap emptyDirs keep an explicit
+                // node-side size bound instead of unbounded disk usage.
+                assert_eq!(
+                    ed.size_limit.as_ref().map(|q| q.0.as_str()),
+                    Some(disk_limit)
+                );
             }
         }
     }
@@ -178,9 +189,19 @@ fn only_exact_first_line_policy_marker_selects_memory() {
         let app = app_with_policy(format!("{prefix}package agent_policy\n"));
         let sts = enclava_engine::manifest::statefulset::generate_statefulset(&app);
         for volume in sts.spec.unwrap().template.spec.unwrap().volumes.unwrap() {
-            if ["enclava-tools", "state-mount", "tls-state-mount"].contains(&volume.name.as_str()) {
-                assert_eq!(volume.empty_dir.unwrap(), Default::default());
-            }
+            let expected_limit = match volume.name.as_str() {
+                "enclava-tools" => "16Mi",
+                "state-mount" | "tls-state-mount" => "1Mi",
+                _ => continue,
+            };
+            let ed = volume.empty_dir.unwrap();
+            // Unmarked policies keep disk medium, now with an explicit
+            // node-side bound (#138) instead of an unbounded default.
+            assert!(ed.medium.is_none());
+            assert_eq!(
+                ed.size_limit.as_ref().map(|q| q.0.as_str()),
+                Some(expected_limit)
+            );
         }
     }
 }

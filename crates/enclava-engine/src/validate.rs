@@ -1,3 +1,6 @@
+use enclava_common::log_encryption;
+use enclava_common::validate::{ValidateError, validate_fqdn};
+
 use crate::types::ConfidentialApp;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +31,18 @@ pub enum ValidationError {
     SidecarImageNotPinned { name: String, detail: String },
     #[error("verification material exceeds 716800 bytes")]
     VerificationMaterialTooLarge,
+    #[error("resource quantity is invalid: {field} ({detail})")]
+    InvalidResourceQuantity { field: &'static str, detail: String },
+    #[error("storage size is invalid: {field} ({detail})")]
+    InvalidStorageSize { field: &'static str, detail: String },
+    #[error("domain is invalid: {field} ({detail})")]
+    InvalidDomain { field: &'static str, detail: String },
+    #[error("egress_allowlist entry {index} is invalid: {detail}")]
+    InvalidEgressAllowlist { index: usize, detail: String },
+    #[error("attestation pubkey is invalid: {field} ({detail})")]
+    InvalidAttestationPubkey { field: &'static str, detail: String },
+    #[error("log_encryption config is invalid: {0}")]
+    InvalidLogEncryption(String),
 }
 
 /// Validates that a ConfidentialApp spec is well-formed.
@@ -112,7 +127,167 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
         return Err(ValidationError::VerificationMaterialTooLarge);
     }
 
+    // The engine interpolates resources, storage sizes, domains, egress
+    // rules, and attestation/log-encryption material into Kubernetes
+    // manifests and cc_init_data. The API validates these on admission;
+    // the engine re-validates as defense in depth so a DB write that
+    // bypassed the API (or a future admission gap) cannot reach manifest
+    // generation with malformed values (#138).
+    validate_resource_quantity("cpu", &app.resources.cpu).map_err(|detail| {
+        ValidationError::InvalidResourceQuantity {
+            field: "cpu",
+            detail,
+        }
+    })?;
+    // Memory limits use the same binary Mi/Gi/Ti grammar as storage sizes
+    // (the API's parse_binary_mib), not the CPU millicore grammar.
+    validate_storage_size("memory", &app.resources.memory).map_err(|detail| {
+        ValidationError::InvalidResourceQuantity {
+            field: "memory",
+            detail,
+        }
+    })?;
+    validate_storage_size("storage.app_data.size", &app.storage.app_data.size).map_err(
+        |detail| ValidationError::InvalidStorageSize {
+            field: "storage.app_data.size",
+            detail,
+        },
+    )?;
+    validate_storage_size("storage.tls_data.size", &app.storage.tls_data.size).map_err(
+        |detail| ValidationError::InvalidStorageSize {
+            field: "storage.tls_data.size",
+            detail,
+        },
+    )?;
+
+    validate_domain("domain.platform_domain", &app.domain.platform_domain)?;
+    if let Some(custom) = app.domain.custom_domain.as_deref() {
+        validate_domain("domain.custom_domain", custom)?;
+    }
+
+    for (index, rule) in app.egress_allowlist.iter().enumerate() {
+        validate_egress_rule(rule)
+            .map_err(|detail| ValidationError::InvalidEgressAllowlist { index, detail })?;
+    }
+
+    validate_attestation_pubkey(
+        "attestation.platform_trustee_policy_pubkey_hex",
+        app.attestation
+            .platform_trustee_policy_pubkey_hex
+            .as_deref(),
+    )?;
+    validate_attestation_pubkey(
+        "attestation.signing_service_pubkey_hex",
+        app.attestation.signing_service_pubkey_hex.as_deref(),
+    )?;
+
+    if let Some(config) = app.log_encryption.as_ref() {
+        log_encryption::validate_public_key(
+            config.key_id.clone(),
+            config.public_key_base64url.clone(),
+            config.public_key_sha256.clone(),
+        )
+        .map_err(|e| ValidationError::InvalidLogEncryption(e.to_string()))?;
+        if config.algorithm != log_encryption::LOG_ENCRYPTION_ALGORITHM {
+            return Err(ValidationError::InvalidLogEncryption(format!(
+                "unsupported algorithm {:?}; expected {:?}",
+                config.algorithm,
+                log_encryption::LOG_ENCRYPTION_ALGORITHM
+            )));
+        }
+    }
+
     Ok(())
+}
+
+/// CPU quantity: millicore (`250m`) or whole cores (`1`, `1.5`), matching the
+/// API's `parse_cpu_cores` admission grammar.
+fn validate_resource_quantity(field: &'static str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value {
+        return Err(format!("{field} must be a non-empty CPU quantity"));
+    }
+    let numeric = trimmed.strip_suffix('m').unwrap_or(trimmed);
+    let parsed: f64 = numeric
+        .parse()
+        .map_err(|_| format!("{field} must be a positive number or millicpu quantity"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(format!(
+            "{field} must be a positive number or millicpu quantity"
+        ));
+    }
+    Ok(())
+}
+
+/// Storage/memory binary quantity with an explicit Mi/Gi/Ti (or MiB/GiB/TiB)
+/// suffix, matching the API's `parse_binary_mib` admission grammar. The value
+/// must be a positive number; a bare number without a unit is rejected so the
+/// quota/summing code never silently treats bytes as MiB.
+fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed != value {
+        return Err(format!("{field} must be a non-empty binary quantity"));
+    }
+    let units = ["TiB", "Ti", "GiB", "Gi", "MiB", "Mi"];
+    let Some((number, _)) = units
+        .iter()
+        .find_map(|suffix| trimmed.strip_suffix(suffix).map(|n| (n, *suffix)))
+    else {
+        return Err(format!("{field} must use Mi, Gi, or Ti binary units"));
+    };
+    let parsed: f64 = number
+        .parse()
+        .map_err(|_| format!("{field} must be a positive binary quantity"))?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(format!("{field} must be a positive binary quantity"));
+    }
+    Ok(())
+}
+
+fn validate_domain(field: &'static str, value: &str) -> Result<(), ValidationError> {
+    validate_fqdn(value).map_err(|e| ValidationError::InvalidDomain {
+        field,
+        detail: fqdn_error_detail(e),
+    })
+}
+
+fn validate_egress_rule(rule: &crate::types::EgressRule) -> Result<(), String> {
+    if rule.host.parse::<std::net::IpAddr>().is_ok() {
+        return Err("host must be a DNS hostname, not an IP address".to_string());
+    }
+    validate_fqdn(&rule.host).map_err(|e| format!("invalid host: {}", fqdn_error_detail(e)))?;
+    if rule.ports.is_empty() {
+        return Err("ports must not be empty".to_string());
+    }
+    Ok(())
+}
+
+/// Optional Ed25519 public key, hex encoded (64 hex chars) when present.
+fn validate_attestation_pubkey(
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<(), ValidationError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.len() != 64
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(ValidationError::InvalidAttestationPubkey {
+            field,
+            detail: "must be 64 lowercase hex characters (Ed25519 public key)".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn fqdn_error_detail(error: ValidateError) -> String {
+    match error {
+        ValidateError::InvalidFqdn(detail) => detail.to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Validates that a name is DNS-safe: lowercase alphanumeric + hyphens, starts with letter/digit.
