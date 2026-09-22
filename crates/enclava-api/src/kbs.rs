@@ -1009,9 +1009,13 @@ async fn load_signed_policy_candidates(
               ) AS latest,
               jsonb_array_elements(latest.keyring->'members') AS member
         ),
-        -- The cast is safe: org_keyrings rows are written only by the put/
-        -- rotate handlers, which serialize validated JSON, so a committed
-        -- payload is always well-formed UTF-8 JSON with a members array.
+        -- The cast is safe at two levels: org_keyrings rows are written only
+        -- by the put/rotate handlers, which serialize validated JSON, and the
+        -- org_keyrings_payload_wellformed CHECK constraint (migration 0049)
+        -- rejects any non-JSON or non-object payload or a non-array members
+        -- entry at INSERT time, so a malformed row from a backfill script or
+        -- manual psql fix can never take down candidate loading for every
+        -- org at once.
         current_keyring_members AS (
             SELECT latest.org_id, member.value->>'pubkey' AS pubkey
               FROM (
@@ -1298,6 +1302,8 @@ async fn load_signed_policy_candidates(
               ON artifact.app_id = legacy.app_id
              AND artifact.deploy_id = legacy.deployment_id
             JOIN current_keyring_members AS member
+              -- Case-insensitive membership join: see the comment at the
+              -- job_artifact_candidates join above.
               ON member.org_id = legacy.org_id
              AND lower(member.pubkey) = lower(
                  artifact.signed_policy_artifact
