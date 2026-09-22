@@ -6,6 +6,14 @@
 -- while at most one API revision is serving; a failed CONCURRENTLY build
 -- leaves an INVALID index that must be dropped before retrying.
 --
+-- Recovery from failed CONCURRENTLY:
+--   1. Drop the invalid index if it exists:
+--      DROP INDEX IF EXISTS device_login_sessions_expires_purge;
+--   2. Clean up the dirty SQLx ledger entry (the migration runner records
+--      the attempt before executing, so a failure leaves it marked failed):
+--      DELETE FROM _sqlx_migrations WHERE version = 49;
+--   3. Retry the migration: cap_migrate will re-execute from a clean slate.
+--
 -- The device-login reaper purges with `WHERE expires_at < now() - interval
 -- '24 hours'`, which cannot use the existing (status, expires_at) index
 -- because it does not constrain the leading `status` column. Under the

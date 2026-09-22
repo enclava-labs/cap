@@ -109,7 +109,7 @@ ClusterIP:
 # from a tenant pod — spoofed headers must NOT buy extra /auth/device/start
 # budget once the pod's own IP is the rate-limit key:
 for i in $(seq 1 15); do
-  wget -qO- /dev/null --server-response \
+  wget -qO /dev/null --server-response \
     --header="X-Real-IP: 198.51.100.$i" \
     --post-data='{}' \
     http://enclava-api.enclava-platform.svc.cluster.local:80/auth/device/start 2>&1 \
@@ -149,6 +149,28 @@ kubectl -n ingress-nginx get cm ingress-nginx-controller -o yaml
 # ensure `data["proxy-set-headers"]` points at a ConfigMap containing:
 #   data:
 #     x-enclava-proxy-secret: "<same value as trusted-proxy-secret>"
+```
+
+3. **Verify the secret actually reaches CAP** (critical sanity check):
+
+```sh
+# Make a request through the ingress and check that CAP sees the header:
+curl -s https://api.<cluster>/.well-known/enclava -v 2>&1 | grep -i x-enclava
+# The header should appear in the request logs or be traceable via
+# CAP's debug/profiling endpoint.
+#
+# Alternatively, exhaust the rate limit from one source IP and confirm a
+# second source retains its own budget — this verifies that the secret
+# (present only in ingress-proxied traffic) gates the per-client keying:
+#
+# First IP:
+for i in $(seq 1 15); do curl -s -o /dev/null https://api.<cluster>/auth/device/start -H 'Content-Type: application/json' -d '{}'; done
+# Second IP (from a different network):
+for i in $(seq 1 15); do curl -s -o /dev/null --interface <different-ip> https://api.<cluster>/auth/device/start -H 'Content-Type: application/json' -d '{}'; done
+#
+# If both IPs hit 429 around the same request number (~10), the secret is
+# NOT being honored — traffic is keyed by the ingress pod IP. Do NOT enable
+# the policy until this passes.
 ```
 
 Verifying the wiring is the FIRST thing to do if per-client rate limiting
