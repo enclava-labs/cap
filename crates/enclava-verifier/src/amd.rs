@@ -8,7 +8,7 @@ use x509_cert::{
     Certificate,
     crl::CertificateList,
     der::{
-        Decode, Encode, Reader, Tagged,
+        Decode, Encode, Reader,
         asn1::{ContextSpecific, ObjectIdentifier},
     },
     spki::{AlgorithmIdentifierOwned, AlgorithmIdentifierRef},
@@ -319,15 +319,15 @@ fn verifying_key(certificate: &Certificate) -> Result<VerifyingKey, AmdVerificat
 /// the encoded signature must agree (enclava-labs/cap#141 review).
 /// RFC 4055 § 2.1 / RFC 8017 Appendix B: the digest AlgorithmIdentifiers
 /// inside a RSASSA-PSS declaration (hashAlgorithm and the MGF1 hash) take
-/// no parameters, so they must be absent or ASN.1 NULL. Checking only that
-/// the encoded value is empty would accept any other zero-length tag (an
-/// empty OCTET STRING, SEQUENCE, ...), so the tag itself is enforced
-/// (cap#168 review).
+/// no parameters, so they must be absent or ASN.1 NULL. The parameters are
+/// decoded as ASN.1 NULL rather than inspected by tag alone: a malformed
+/// NULL that carries content bytes (e.g. `05 01 00`) has the right tag but
+/// is not a valid NULL encoding and must fail closed (cap#168 review).
 fn hash_parameters_are_absent_or_null(algorithm: &AlgorithmIdentifierRef<'_>) -> bool {
     algorithm
         .parameters
         .as_ref()
-        .is_none_or(|parameters| parameters.tag() == x509_cert::der::Tag::Null)
+        .is_none_or(|parameters| parameters.decode_as::<x509_cert::der::asn1::Null>().is_ok())
 }
 
 fn pss_parameters_match(algorithm: &AlgorithmIdentifierOwned) -> bool {
@@ -767,6 +767,22 @@ mod tests {
             assert!(
                 !pss_parameters_match(&alg),
                 "empty non-NULL MGF1 hash parameters (tag {tag:#04x}) must be rejected"
+            );
+        }
+        // A NULL-tagged value that carries content bytes (e.g. `05 01 00`)
+        // is not a valid ASN.1 NULL encoding and must be rejected on both
+        // the message-hash and MGF1-hash paths, even though the tag alone
+        // is correct (cap#168 review).
+        for value in [&[0x00u8][..], &[0x00, 0x00][..]] {
+            let alg = pss_algorithm_identifier_with_hash_params(0x05, value);
+            assert!(
+                !pss_parameters_match(&alg),
+                "NULL with content bytes {value:?} must be rejected on the hash path"
+            );
+            let alg = pss_algorithm_identifier_with_mgf_hash_params(0x05, value);
+            assert!(
+                !pss_parameters_match(&alg),
+                "NULL with content bytes {value:?} must be rejected on the MGF1 hash path"
             );
         }
         // DEFAULT-omitted hash/MGF/salt (i.e. sha1/mgf1-SHA1/20): rejected.

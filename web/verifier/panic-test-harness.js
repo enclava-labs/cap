@@ -9,7 +9,7 @@
 // 'self' only (matching the production verifier pages), which would block
 // an inline module before it ever runs — exactly the failure mode the first
 // version of this harness hit in CI (result stuck at RUNNING).
-import init, { debug_panic_probe } from './pkg/enclava_verifier_wasm.js';
+import init, { debug_panic_probe, debug_ping_probe } from './pkg/enclava_verifier_wasm.js';
 
 const fail = (reason) => {
   document.querySelector('#result').textContent = `FAIL ${reason}`;
@@ -25,8 +25,13 @@ try {
   }
   if (!trapped) throw new Error('probe did not trap');
   if (!(trapped instanceof Error)) throw new Error('trap is not an Error');
-  // The instance must still serve calls after the trap — a poisoned
-  // module would throw again or return garbage.
+  // The instance must still serve *normal* calls after the trap. Calling
+  // the panicking probe again would prove nothing — it throws on a healthy
+  // instance too — so a non-panicking export must return successfully;
+  // a poisoned module would trap or return garbage (cap#168 review).
+  const pong = debug_ping_probe(41);
+  if (pong !== 42) throw new Error(`post-trap call returned ${pong}, expected 42`);
+  // And the panic path itself must remain reproducible afterwards.
   let second = null;
   try {
     debug_panic_probe();

@@ -188,6 +188,16 @@ pub fn debug_panic_probe() {
     panic!("debug-panic-probe: intentional panic for the browser panic-isolation test");
 }
 
+/// Test-only non-panicking counterpart to `debug_panic_probe`: a normal
+/// export that must return successfully *after* the probe has trapped. A
+/// poisoned instance traps on every call, so a successful round-trip here
+/// is what actually substantiates post-panic usability (cap#168 review).
+#[cfg(feature = "debug-panic-probe")]
+#[wasm_bindgen]
+pub fn debug_ping_probe(value: u32) -> u32 {
+    value.wrapping_add(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
