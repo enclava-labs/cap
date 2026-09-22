@@ -18,14 +18,17 @@ if [[ ! -f "$CI_YML" ]]; then
     exit 1
 fi
 
-# Every `cargo audit ... --ignore RUSTSEC-xxxx-xxxx` line in ci.yml. If the
-# audit step derives its ignores from cargo-audit-args.sh (deny.toml is the
-# single source of truth), the lists cannot diverge and the check passes;
-# otherwise any hardcoded list must match deny.toml exactly.
-if grep -q 'cargo audit .*scripts/cargo-audit-args.sh' "$CI_YML"; then
-    echo "check-audit-lockstep: ci.yml cargo audit ignores are generated from deny.toml"
-    exit 0
-fi
+# Every `cargo audit ... --ignore RUSTSEC-xxxx-xxxx` occurrence in ci.yml.
+# If the audit step derives its ignores from cargo-audit-args.sh (deny.toml
+# is the single source of truth), the generated step cannot diverge — but a
+# stray hardcoded --ignore ANYWHERE in ci.yml (e.g. appended to the
+# generated line, or hiding in another job) is still collected and rejected
+# below, so the generator fast-path cannot be used to smuggle extra ignores.
+generated_step="$(grep -nE '^ *run: cargo audit \$\(bash scripts/cargo-audit-args\.sh\)$' "$CI_YML" || true)"
+
+# Hardcoded ignores are collected from the WHOLE file regardless of the
+# generator step, so appending e.g. `--ignore RUSTSEC-XXXX-YYYY` to the
+# generated line still fails this check.
 
 expected="$(bash "$SCRIPT_DIR/cargo-audit-args.sh" | sort)"
 if [[ -z "$expected" ]]; then
@@ -33,14 +36,19 @@ if [[ -z "$expected" ]]; then
     exit 1
 fi
 
-actual="$(grep -o 'cargo audit .*--ignore RUSTSEC-[0-9]\{4\}-[0-9]\{4\}' "$CI_YML" \
-    | grep -o -- '--ignore RUSTSEC-[0-9]\{4\}-[0-9]\{4\}' | sort)"
+actual="$(grep -o -- '--ignore RUSTSEC-[0-9]\{4\}-[0-9]\{4\}' "$CI_YML" | sort || true)"
 
-if [[ "$expected" != "$actual" ]]; then
-    echo "check-audit-lockstep: cargo audit ignores in .github/workflows/ci.yml diverge from deny.toml [advisories]:" >&2
+if [[ -n "$actual" ]]; then
+    echo "check-audit-lockstep: hardcoded --ignore flags in .github/workflows/ci.yml diverge from the deny.toml-generated policy:" >&2
     diff -u <(echo "$expected") <(echo "$actual") >&2 || true
-    echo "Fix: update the ci.yml cargo audit step to 'run: cargo audit \$(bash scripts/cargo-audit-args.sh)' or align both lists." >&2
+    echo "Fix: remove the hardcoded --ignore flags (the audit step derives them from deny.toml via scripts/cargo-audit-args.sh)." >&2
     exit 1
 fi
 
-echo "check-audit-lockstep: ci.yml cargo audit ignores match deny.toml [advisories]"
+if [[ -z "$generated_step" ]]; then
+    echo "check-audit-lockstep: ci.yml has no 'run: cargo audit \$(bash scripts/cargo-audit-args.sh)' step" >&2
+    echo "Fix: update the ci.yml cargo audit step to 'run: cargo audit \$(bash scripts/cargo-audit-args.sh)'." >&2
+    exit 1
+fi
+
+echo "check-audit-lockstep: ci.yml cargo audit ignores are generated from deny.toml (no hardcoded divergences)"
