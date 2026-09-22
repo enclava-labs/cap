@@ -166,9 +166,21 @@ fn run_with_encrypted_logs(
     logs: EncryptedLogConfig,
 ) -> Result<i32, String> {
     install_signal_forwarding()?;
-    let spool = open_log_spool(&logs.spool_path)?;
+    let mut spool = open_log_spool(&logs.spool_path)?;
+    // The spool lives on the shared `logs` emptyDir, which SURVIVES a
+    // container restart without replacing the Pod — and so do the frames
+    // the previous wrapper process wrote. Sequence numbers must therefore
+    // stay monotonic across the restart, not restart at 1: the relay's
+    // rotation dedup keeps the highest delivered sequence as its frontier
+    // and would silently drop every post-restart frame whose reset
+    // sequence lands at or below it. Scan the surviving spool tail (the
+    // rotation-retained window is the only part that matters for the
+    // frontier a connected relay can hold) for the highest frame sequence
+    // and resume from it. Non-frame lines are skipped; a spool with no
+    // parseable frame sequences resumes at 1.
+    let sequence_start = initial_spool_sequence(&mut spool)?;
     let spool = Arc::new(Mutex::new(spool));
-    let sequence = Arc::new(AtomicU64::new(1));
+    let sequence = Arc::new(AtomicU64::new(sequence_start));
     let mut child = Command::new(&program)
         .args(&args)
         .stdin(Stdio::inherit())
@@ -275,6 +287,32 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
                 path.display()
             )
         })
+}
+
+/// Highest frame sequence present in the surviving spool, plus one. Called
+/// once at wrapper startup so a restarted process resumes sequence numbers
+/// ABOVE everything the previous process wrote (the `logs` emptyDir and its
+/// spool survive container restarts; the relay's rotation dedup would drop
+/// post-restart frames whose reset sequences land at or below its retained
+/// frontier). The spool is bounded by the rotation threshold, so one
+/// startup scan is cheap; lines that do not parse as frames are skipped.
+fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
+    spool
+        .seek(SeekFrom::Start(0))
+        .map_err(|err| format!("failed to seek log spool for sequence scan: {err}"))?;
+    let mut max_sequence = 0u64;
+    for line in BufReader::new(spool).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        if let Ok(frame) = serde_json::from_str::<serde_json::Value>(&line)
+            && let Some(sequence) = frame.get("sequence").and_then(|s| s.as_u64())
+            && sequence > max_sequence
+        {
+            max_sequence = sequence;
+        }
+    }
+    Ok(max_sequence + 1)
 }
 
 fn spawn_log_forwarder<R>(
@@ -447,6 +485,28 @@ fn read_capped_record<R: BufRead>(
                 let n = search.len();
                 reader.consume(n);
                 if buf.len() == MAX_LOG_RECORD_BYTES {
+                    // If the record's newline lands EXACTLY at the cap
+                    // boundary, consume it here instead of letting the
+                    // next call return it as a lone-newline record: the
+                    // caller's terminator strip would leave an empty
+                    // plaintext that still gets encrypted and appended,
+                    // fabricating an empty log frame after every record
+                    // whose length is an exact multiple of the cap.
+                    // Consuming the boundary newline reports the record as
+                    // terminated (`capped: false`) so the caller strips a
+                    // trailing CR/LF exactly as for a short record. At EOF
+                    // there is no terminator to consume; the chunk stays
+                    // `capped` so its final byte (possible CR content)
+                    // survives verbatim.
+                    let boundary_newline =
+                        reader.fill_buf()?.first() == Some(&b'\n');
+                    if boundary_newline {
+                        reader.consume(1);
+                        return Ok(CappedRecord {
+                            len: buf.len(),
+                            capped: false,
+                        });
+                    }
                     return Ok(CappedRecord {
                         len: buf.len(),
                         capped: true,

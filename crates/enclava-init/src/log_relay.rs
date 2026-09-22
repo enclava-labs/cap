@@ -13,6 +13,13 @@ const DEFAULT_TAIL_LINES: usize = 100;
 const MAX_TAIL_LINES: usize = 1_000;
 const MAX_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Hard ceiling on one blocking socket write/read during a follow stream.
+/// A stalled or dead client must not pin the relay thread (and the rotated
+/// spool inode it holds open) forever: on expiry the connection errors out,
+/// the follower handle is dropped, and the unlinked old inode is finally
+/// released. Generous enough that a slow-but-alive client on a cold
+/// connection is never cut off mid-stream.
+const FOLLOW_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug)]
 pub struct LogRelayConfig {
@@ -64,7 +71,9 @@ fn serve(listener: TcpListener, config: LogRelayConfig) {
                 let spool_path = config.spool_path.clone();
                 let container = config.container.clone();
                 thread::spawn(move || {
-                    if let Err(err) = handle_connection(stream, &spool_path, &container) {
+                    if let Err(err) =
+                        handle_connection(stream, &spool_path, &container, FOLLOW_IO_TIMEOUT)
+                    {
                         eprintln!("enclava-log-relay: request failed: {err}");
                     }
                 });
@@ -74,7 +83,25 @@ fn serve(listener: TcpListener, config: LogRelayConfig) {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, spool_path: &Path, container: &str) -> io::Result<()> {
+fn handle_connection(
+    mut stream: TcpStream,
+    spool_path: &Path,
+    container: &str,
+    io_timeout: Duration,
+) -> io::Result<()> {
+    // Bound every blocking socket operation on this connection. Follow
+    // streams are long-lived, and the follower KEEPS the adopted spool
+    // handle open across rotation resyncs: a client that stops reading
+    // would otherwise block `write_all` forever while pinning unlinked
+    // rotated inodes (~32 MiB each, retained by the rotation design).
+    // SO_SNDTIMEO turns that indefinite block into a WouldBlock/TimedOut
+    // error that unwinds the handler, drops the held inode, and frees the
+    // thread. The read timeout bounds `read_request_head`: a client that
+    // connects and never sends its request would otherwise pin the thread
+    // forever. Follow polling is strictly write-driven once the head
+    // arrives, so neither timeout fires for a healthy client.
+    stream.set_write_timeout(Some(io_timeout))?;
+    stream.set_read_timeout(Some(io_timeout))?;
     let request = read_request_head(&mut stream)?;
     let Some((method, uri)) = request_line(&request) else {
         return write_json_error(&mut stream, 400, "bad_request");
@@ -291,19 +318,14 @@ fn follow_spool(
             *offset = 0;
             let mut adopted = file;
             adopted.seek(SeekFrom::Start(0))?;
-            let (bytes, _delivered) = drain_from(&mut adopted, 0)?;
-            // Resume at the END OF THE LAST COMPLETE LINE, not the drain
-            // cursor: a trailing incomplete fragment (writer mid-append into
-            // the fresh inode) must be re-read next poll and delivered as a
-            // whole line once completed. Advancing past its prefix would
-            // emit only the suffix as a bogus NDJSON line; and if the writer
-            // then rolls the partial write back (set_len), an offset inside
-            // the retracted range would trip the truncation fallback below.
-            let mut delivered_end = 0usize;
-            while let Some(idx) = bytes[delivered_end..].iter().position(|&b| b == b'\n') {
-                delivered_end += idx + 1;
-            }
-            *offset = delivered_end as u64;
+            let (bytes, delivered) = drain_from(&mut adopted, 0)?;
+            // Use the ACTUAL cursor position as the offset: the writer is a
+            // separate process and can append during the read. Those bytes are
+            // delivered in this response, so the next poll must resume past them.
+            // A trailing incomplete fragment (writer mid-append) sits at the end
+            // of the delivered range; the next poll will read from this offset,
+            // see the now-complete line, and deliver it.
+            *offset = delivered;
             // Write to the client BEFORE holding the fd: a stalled client would keep
             // this fd open, pinning the old inode's ~32 MiB against deletion.
             // The inode identity is already captured in `current_identity` for
@@ -661,5 +683,90 @@ mod tests {
         // but pinned) — no data race between the two handles.
         drop(file);
         drop(held_file);
+    }
+
+    /// Round-7 review finding (P1): a follow client that stops reading
+    /// must not pin the relay thread (and the rotated spool inode it
+    /// holds) forever. The connection must carry socket timeouts: a short
+    /// one in tests (FOLLOW_IO_TIMEOUT in production), so a stalled
+    /// write_all/strandead head read errors out and unwinds the handler.
+    #[test]
+    fn stalled_follow_client_times_out_and_releases_thread() {
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.jsonl");
+        std::fs::write(&spool_path, "{\"sequence\":1}\n").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let spool = spool_path.clone();
+        let server = thread::spawn(move || {
+            // Reuse the server loop's per-connection setup: accept one
+            // connection and run handle_connection with a short timeout.
+            let (stream, _peer) = listener.accept().unwrap();
+            handle_connection(stream, &spool, "app", Duration::from_millis(200))
+        });
+
+        // Stalled client: connect, send a valid follow request, then never
+        // read another byte. A filler writer keeps appending spool lines so
+        // the relay has data to send every poll: the kernel socket buffer
+        // fills, write_all blocks, and the write timeout must fire.
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .write_all(
+                b"GET /.well-known/confidential/logs?follow=true&container=app HTTP/1.1\r\n\
+                  Host: x\r\n\r\n",
+            )
+            .unwrap();
+        // Do NOT read: leave the request in flight and the socket open.
+
+        let filler_path = spool_path.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let filler_stop = std::sync::Arc::clone(&stop);
+        let filler = thread::spawn(move || {
+            use std::io::Write as _;
+            let mut spool = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&filler_path)
+                .unwrap();
+            // One 4 KiB line per write, in a tight loop: the relay drains
+            // the spool each 500 ms poll, so the kernel socket buffer (a
+            // few MB on loopback, with autotuning) fills within a second
+            // or two and write_all starts blocking.
+            let line = format!("{}\n", "x".repeat(4096));
+            let mut written: u64 = 0;
+            while !filler_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = spool.write_all(line.as_bytes());
+                let _ = spool.flush();
+                written += 1;
+                if written % 64 == 0 {
+                    thread::yield_now();
+                }
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = server.join();
+        let elapsed = started.elapsed();
+        // The handler must have terminated via the timeout, not blocked
+        // forever (join returning at all is the assertion; the elapsed
+        // bound guards against a future regression to a poll loop that
+        // never writes and thus never times out).
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "handler must terminate via IO timeout, took {elapsed:?}"
+        );
+        assert!(
+            outcome.is_ok(),
+            "handler must return (Err is fine — a hang is not): {outcome:?}"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        filler.join().unwrap();
+        // Best-effort drain so the test client does not RST.
+        let _ = client.set_read_timeout(Some(Duration::from_millis(100)));
+        let mut sink = Vec::new();
+        let _ = client.read_to_end(&mut sink);
     }
 }
