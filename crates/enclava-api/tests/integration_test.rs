@@ -853,6 +853,17 @@ async fn device_login_start_is_rate_limited_per_ip() {
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
     let server = axum_test::TestServer::builder().http_transport().build(app);
 
+    // The first request must succeed (compliant single CLI start), then a
+    // sustained burst from the same IP must hit the tighter device-auth
+    // budget. Exact burst boundaries are not asserted: the governor refills
+    // at 1 r/s, so the cut-off point depends on elapsed test time.
+    let first = server
+        .post("/auth/device/start")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({}))
+        .await;
+    first.assert_status_ok();
+
     let mut saw_too_many_requests = false;
     for _ in 0..15 {
         let response = server
