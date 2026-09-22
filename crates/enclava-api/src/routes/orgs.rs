@@ -1633,29 +1633,42 @@ mod tests {
     /// database is mutated concurrently by hundreds of other tests (and by
     /// sibling pipeline worktrees), any of which can bump the generation
     /// mid-assertion.  A dedicated database makes these tests deterministic.
+    ///
+    /// The database name is suffixed with the current process id: sibling CI
+    /// worktrees share one PostgreSQL server, and a fixed name would let two
+    /// processes mutate the same singleton row concurrently.  The database is
+    /// created fresh (a stale leftover from a crashed run is dropped first)
+    /// and dropped at the end of the test.
     async fn isolated_database_test_pool(name: &str) -> sqlx::PgPool {
         let base_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:***@localhost:5432/test".to_string());
-        let options = base_url
-            .parse::<sqlx::postgres::PgConnectOptions>()
-            .expect("parse isolated keyring database URL");
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let db_name = format!("{name}_{}", std::process::id());
         let admin = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
-            .connect_with(options.clone())
+            .connect(&base_url)
             .await
             .expect("connect isolated keyring database admin");
-        let create = sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+        // A leftover database from a crashed run would carry a stale
+        // singleton generation; drop it so every run starts from scratch.
+        sqlx::query(&format!(
+            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+        ))
+        .execute(&admin)
+        .await
+        .expect("drop stale isolated keyring database");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
             .execute(&admin)
-            .await;
+            .await
+            .expect("create isolated keyring database");
         admin.close().await;
-        match create {
-            Ok(_) => {}
-            Err(err) if err.as_database_error().is_some_and(|d| d.code().as_deref() == Some("42P04")) => {}
-            Err(err) => panic!("create isolated keyring database {name}: {err}"),
-        }
+        // Same URL with only the database path replaced.
+        let path_start = base_url
+            .rfind('/')
+            .expect("database URL has a path component");
+        let isolated_url = format!("{}/{}", &base_url[..path_start], db_name);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
-            .connect_with(options.database(name))
+            .connect(&isolated_url)
             .await
             .expect("connect isolated keyring database");
         crate::db::pool::run_migrations(&pool)
