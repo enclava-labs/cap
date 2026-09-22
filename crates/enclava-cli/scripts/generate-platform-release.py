@@ -135,11 +135,71 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
 _FORBIDDEN_HOST_CHARS = set(" #%<>@[\\]^|`{}")
 
 
+def _label_looks_numeric(label: str) -> bool:
+    # WHATWG treats a host whose last label is a (decimal or 0x-hex) number
+    # as an IPv4 address and runs the full IPv4 parser on it; Python's
+    # urlparse happily leaves `1.2.3.4.5` or `999.1.1.1` in .hostname.
+    if label.isdigit():
+        return True
+    return len(label) > 2 and label.lower().startswith("0x") and all(
+        ch in "0123456789abcdef" for ch in label[2:].lower()
+    )
+
+
+def _idna_ok(host: str) -> bool:
+    # Non-ASCII hosts go through the same UTS46/IDNA2008 processing the url
+    # crate performs (stdlib .encode("idna") is IDNA2003 and accepts inputs
+    # like a non-breaking space that the url crate rejects, so it cannot be
+    # used here). If the `idna` package is unavailable, fail closed: reject
+    # every non-ASCII host rather than risk signing an unloadable envelope.
+    if host.isascii():
+        return True
+    try:
+        import idna  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+    try:
+        idna.encode(host, uts46=True)
+    except (idna.IDNAError, UnicodeError, ValueError):
+        return False
+    return True
+
+
 def _host_ok(host: str) -> bool:
-    return not any(
+    if any(
         ord(ch) < 0x20 or ord(ch) == 0x7F or ch in _FORBIDDEN_HOST_CHARS
         for ch in host
-    )
+    ):
+        return False
+    if not _idna_ok(host):
+        return False
+    # WHATWG IPv4 ending rule (see _label_looks_numeric): when the last
+    # label is numeric the whole host must be a valid IPv4 address or the
+    # url crate rejects it. IPv4Address is stricter than WHATWG for exotic
+    # forms (pure-integer `12345`, hex/octal octets) — rejecting those is
+    # generator-stricter, which is the safe direction.
+    bare = host.rstrip(".")
+    if bare:
+        last_label = bare.rsplit(".", 1)[-1]
+        if _label_looks_numeric(last_label):
+            try:
+                ipaddress.IPv4Address(bare)
+            except ValueError:
+                return False
+    return True
+
+
+def _authority_ok(netloc: str) -> bool:
+    # Python's urlparse and the WHATWG parser disagree on netloc structure:
+    # urlparse splits userinfo at the LAST "@" and treats "\" as an ordinary
+    # character, while WHATWG ends the authority at the first "\" (special
+    # schemes) and first "@". A URL like
+    #   http://evil.example\@signing.release.svc
+    # therefore has hostname `signing.release.svc` in Python but host
+    # `evil.example` in the url crate — the cleartext-host gate would check
+    # the wrong host. No legitimate release URL carries userinfo or a
+    # backslash, so reject both outright in the authority.
+    return "@" not in netloc and "\\" not in netloc
 
 
 def _is_https(value: str) -> bool:
@@ -161,6 +221,8 @@ def _is_https(value: str) -> bool:
     except ValueError:
         return False
     if parsed.scheme != "https" or not host:
+        return False
+    if not _authority_ok(parsed.netloc):
         return False
     return _host_ok(host)
 
@@ -189,6 +251,8 @@ def _is_valid_signing_service_url(value: str) -> bool:
     except ValueError:
         return False
     if parsed.scheme not in ("http", "https") or not host:
+        return False
+    if not _authority_ok(parsed.netloc):
         return False
     if not _host_ok(host):
         return False

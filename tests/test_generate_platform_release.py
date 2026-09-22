@@ -162,3 +162,68 @@ def test_release_generator_accepts_loopback_and_cluster_http_signing_url():
     payload = base_payload()
     payload["signing_service_url"] = "http://127.0.0.1:8123/"
     generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_backslash_userinfo_signing_url_bypass():
+    # Devin: Python urlparse splits userinfo at the LAST "@", WHATWG at the
+    # first — so `http://evil.example\@signing.release.svc` has hostname
+    # `signing.release.svc` in Python but host `evil.example` in reqwest.
+    # The cleartext-host gate must not check the wrong host.
+    for value in (
+        "http://evil.example\\@signing.release.svc",
+        "http://user:pass@signing.release.svc",
+        "https://kbs.example.test\\@evil.example/",
+    ):
+        payload = base_payload()
+        payload["signing_service_url"] = value
+
+        with pytest.raises(ValueError, match="signing_service_url"):
+            generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_idna_invalid_unicode_hosts():
+    # Codex: a non-breaking space (or other code point the WHATWG/UTS46
+    # pipeline rejects) passes Python's urlparse and the ASCII denylist but
+    # makes reqwest::Url::parse fail with "invalid international domain
+    # name" — signing it would produce an unloadable envelope.
+    # U+FF1C (fullwidth less-than) is a confirmed double rejection: UTS46
+    # maps it to forbidden "<" and the url crate fails IDNA on it too.
+    for value in (
+        "https://kbs .example.test/",
+        "https://kbs＜.example.test/",
+    ):
+        payload = base_payload()
+        payload["trustee_kbs_url"] = value
+
+        with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
+            generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_accepts_valid_unicode_idna_host():
+    # Positive control: a genuinely valid IDN that reqwest::Url::parse
+    # accepts (münchen.example.test -> xn--mnchen-3ya.example.test) must
+    # still be signable — the IDNA gate is not a blanket Unicode ban.
+    payload = base_payload()
+    payload["trustee_kbs_url"] = "https://münchen.example.test/"
+    generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_whatwg_ipv4_ending_host_shapes():
+    # WHATWG runs the IPv4 parser when the last label is numeric; Python
+    # urlparse leaves `1.2.3.4.5` / `999.1.1.1` untouched in .hostname but
+    # reqwest rejects them ("invalid IPv4 address").
+    for value in (
+        "https://1.2.3.4.5/",
+        "https://999.1.1.1/",
+    ):
+        payload = base_payload()
+        payload["trustee_kbs_url"] = value
+
+        with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
+            generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_accepts_valid_ipv4_host():
+    payload = base_payload()
+    payload["trustee_kbs_url"] = "https://192.168.0.1/"
+    generate_platform_release.validate_payload(payload)

@@ -4,7 +4,7 @@
 //! uses the same signed anchors to reject drift in platform-controlled release
 //! values before it can mint cc_init_data or verify signed policy artifacts.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::ce_v1_bytes;
@@ -106,6 +106,28 @@ pub enum PlatformReleaseError {
         bundled_version: String,
         bundled_created: String,
     },
+    #[error(
+        "platform release override downgrade refused: override is {override_version} ({override_created}) but this API previously accepted {accepted_version} ({accepted_created}) from the same override lane; \
+         if the rollback is intentional, clear the high-water-mark state at {state_path} after verifying with the operator. \
+         Refusing to silently revert measurements, policy, and sidecar digests"
+    )]
+    OverrideDowngradeRefused {
+        override_version: String,
+        override_created: String,
+        accepted_version: String,
+        accepted_created: String,
+        state_path: String,
+    },
+    #[error(
+        "cannot persist the platform-release override high-water mark at {state_path}: {source}. \
+         Refusing to start without it: if the mark were skipped, a later file swap to an older \
+         validly-signed release would be accepted. Point ENCLAVA_PLATFORM_RELEASE_STATE at a \
+         writable path (the override file itself is typically a read-only configmap mount)"
+    )]
+    HighWaterMarkPersistFailed {
+        state_path: String,
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,12 +191,17 @@ impl PlatformReleaseEnvelope {
             Some(path) => std::fs::read_to_string(Path::new(path))?,
             None => BUNDLED_PLATFORM_RELEASE.to_string(),
         };
-        Self::load_verified_from_raw(raw, override_path.is_some())
+        let mut high_water = None;
+        if let Some(path) = &override_path {
+            high_water = Some(override_high_water_mark_state_path(Path::new(path)));
+        }
+        Self::load_verified_from_raw(raw, override_path.is_some(), high_water.as_deref())
     }
 
     fn load_verified_from_raw(
         raw: String,
         override_active: bool,
+        high_water_state: Option<&Path>,
     ) -> Result<Self, PlatformReleaseError> {
         let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
         verify_envelope(envelope.clone())?;
@@ -185,9 +212,134 @@ impl PlatformReleaseEnvelope {
         // `enforce_release_not_older_than_bundled` gate.
         if override_active {
             enforce_release_not_older_than_bundled(&envelope.payload)?;
+            if let Some(state_path) = high_water_state {
+                enforce_override_not_older_than_last_accepted(state_path, &envelope.payload)?;
+            }
         }
         Ok(envelope)
     }
+}
+
+/// Where the override lane's high-water mark lives: next to the override
+/// file by default, or `$ENCLAVA_PLATFORM_RELEASE_STATE` when set. The
+/// override file itself is typically a read-only configmap mount, so
+/// operators point the state var at a writable path.
+fn override_high_water_mark_state_path(override_path: &Path) -> PathBuf {
+    if let Some(state) = std::env::var("ENCLAVA_PLATFORM_RELEASE_STATE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        return PathBuf::from(state);
+    }
+    let mut s = override_path.as_os_str().to_os_string();
+    s.push(".accepted");
+    PathBuf::from(s)
+}
+
+/// Persisted newest-accepted override (`{version, created_at}` JSON).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct AcceptedOverrideMark {
+    platform_release_version: String,
+    created_at: String,
+}
+
+impl From<&PlatformRelease> for AcceptedOverrideMark {
+    fn from(release: &PlatformRelease) -> Self {
+        Self {
+            platform_release_version: release.platform_release_version.clone(),
+            created_at: release.created_at.clone(),
+        }
+    }
+}
+
+/// The downgrade baseline must never regress below the bundle: a newer API
+/// image can bundle a release newer than a previously accepted override,
+/// and the effective floor is whichever is newer.
+fn newest_mark(
+    persisted: Option<AcceptedOverrideMark>,
+) -> Result<Option<AcceptedOverrideMark>, PlatformReleaseError> {
+    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
+    let bundled_mark = AcceptedOverrideMark::from(&bundled.payload);
+    Ok(match persisted {
+        Some(p)
+            if !release_pair_is_older(
+                (&p.platform_release_version, &p.created_at),
+                (
+                    &bundled_mark.platform_release_version,
+                    &bundled_mark.created_at,
+                ),
+            )? =>
+        {
+            Some(p)
+        }
+        _ => Some(bundled_mark),
+    })
+}
+
+/// Second downgrade gate for the env-path override lane: compare against the
+/// newest release this host has ever accepted, not just the bundle. Without
+/// it, a file swap from an accepted T2 release to a validly-signed T1
+/// release (T0 < T1 < T2) sails through `enforce_release_not_older_than_
+/// bundled`. Corrupt state fails closed (an attacker must not be able to
+/// disable the gate by scribbling on the state file), and a failed persist
+/// fails closed too (accepting without recording would reset the mark).
+fn enforce_override_not_older_than_last_accepted(
+    state_path: &Path,
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    parse_release_timestamp(&release.created_at)?;
+    let persisted =
+        match std::fs::read_to_string(state_path) {
+            Ok(raw) => Some(serde_json::from_str::<AcceptedOverrideMark>(&raw).map_err(
+                |error| PlatformReleaseError::HighWaterMarkPersistFailed {
+                    state_path: state_path.display().to_string(),
+                    source: std::io::Error::other(format!(
+                        "corrupt high-water-mark state ({error}); \
+                         if the corruption is benign, remove the file after verifying \
+                         with the operator"
+                    )),
+                },
+            )?),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(PlatformReleaseError::HighWaterMarkPersistFailed {
+                    state_path: state_path.display().to_string(),
+                    source: err,
+                });
+            }
+        };
+    let floor = newest_mark(persisted)?;
+    if let Some(mark) = &floor
+        && release_pair_is_older(
+            (&release.platform_release_version, &release.created_at),
+            (&mark.platform_release_version, &mark.created_at),
+        )?
+    {
+        return Err(PlatformReleaseError::OverrideDowngradeRefused {
+            override_version: release.platform_release_version.clone(),
+            override_created: release.created_at.clone(),
+            accepted_version: mark.platform_release_version.clone(),
+            accepted_created: mark.created_at.clone(),
+            state_path: state_path.display().to_string(),
+        });
+    }
+    let mark = AcceptedOverrideMark::from(release);
+    if floor.as_ref() != Some(&mark) {
+        let parent = state_path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|error| {
+            PlatformReleaseError::HighWaterMarkPersistFailed {
+                state_path: state_path.display().to_string(),
+                source: error,
+            }
+        })?;
+        std::fs::write(state_path, serde_json::to_vec_pretty(&mark)?).map_err(|error| {
+            PlatformReleaseError::HighWaterMarkPersistFailed {
+                state_path: state_path.display().to_string(),
+                source: error,
+            }
+        })?;
+    }
+    Ok(())
 }
 
 /// Reject `release` when it is older than the release compiled into this
@@ -225,6 +377,17 @@ fn parse_release_timestamp(
             message: format!("must be RFC3339: {error}"),
         }
     })
+}
+
+/// `candidate` predates `baseline` (strictly older timestamp, or equal
+/// timestamp with a divergent opaque version — unorderable, fail closed).
+fn release_pair_is_older(
+    candidate: (&str, &str),
+    baseline: (&str, &str),
+) -> Result<bool, PlatformReleaseError> {
+    let candidate_ts = parse_release_timestamp(candidate.1)?;
+    let baseline_ts = parse_release_timestamp(baseline.1)?;
+    Ok(candidate_ts < baseline_ts || (candidate_ts == baseline_ts && candidate.0 != baseline.0))
 }
 
 pub fn verify_envelope(
@@ -657,7 +820,7 @@ mod tests {
         assert!(verify_envelope(parsed).is_ok());
         // ...but the override lane refuses the downgrade.
         assert!(matches!(
-            PlatformReleaseEnvelope::load_verified_from_raw(stale_raw, true),
+            PlatformReleaseEnvelope::load_verified_from_raw(stale_raw, true, None),
             Err(PlatformReleaseError::DowngradeRefused { .. })
         ));
     }
@@ -665,7 +828,7 @@ mod tests {
     #[test]
     fn env_override_path_accepts_validly_signed_newer_release() {
         let newer_raw = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
-        assert!(PlatformReleaseEnvelope::load_verified_from_raw(newer_raw, true).is_ok());
+        assert!(PlatformReleaseEnvelope::load_verified_from_raw(newer_raw, true, None).is_ok());
     }
 
     #[test]
@@ -675,9 +838,125 @@ mod tests {
         assert!(
             PlatformReleaseEnvelope::load_verified_from_raw(
                 BUNDLED_PLATFORM_RELEASE.to_string(),
-                false
+                false,
+                None
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn override_high_water_mark_blocks_file_swap_to_older_release() {
+        // Codex review scenario: bundle T0, accepted override T2; a later
+        // file swap to a validly-signed T1 (T0 < T1 < T2) must be refused —
+        // the persisted high-water mark, not the bundle, is the baseline.
+        let dir = std::env::temp_dir().join(format!("pr-hwm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+
+        let t1 = resigned_envelope_with_created_at("2998-01-01T00:00:00Z");
+        let t2 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+
+        // First boot with override T2: accepted, mark persisted.
+        assert!(
+            PlatformReleaseEnvelope::load_verified_from_raw(t2.clone(), true, Some(&state)).is_ok()
+        );
+        let mark: AcceptedOverrideMark =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        assert_eq!(mark.created_at, "2999-01-01T00:00:00Z");
+
+        // File swap to T1 (still newer than the bundle): refused.
+        assert!(matches!(
+            PlatformReleaseEnvelope::load_verified_from_raw(t1, true, Some(&state)),
+            Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
+        ));
+
+        // Steady state: same T2 reload writes nothing new and passes.
+        let before = std::fs::metadata(&state).unwrap().modified().unwrap();
+        assert!(
+            PlatformReleaseEnvelope::load_verified_from_raw(t2.clone(), true, Some(&state)).is_ok()
+        );
+        let after = std::fs::metadata(&state).unwrap().modified().unwrap();
+        assert_eq!(before, after);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn override_high_water_mark_corrupt_state_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("pr-hwm-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+        std::fs::write(&state, "{ not json").unwrap();
+
+        let newer = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        assert!(matches!(
+            PlatformReleaseEnvelope::load_verified_from_raw(newer, true, Some(&state)),
+            Err(PlatformReleaseError::HighWaterMarkPersistFailed { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn override_high_water_mark_never_regresses_below_bundle() {
+        // A persisted mark older than the current bundle (e.g. left over
+        // from an older API image) must not LOWER the floor: the effective
+        // baseline is max(bundled, persisted).
+        let dir = std::env::temp_dir().join(format!("pr-hwm-floor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+        let bundled: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let stale_mark = AcceptedOverrideMark {
+            platform_release_version: "ancient".to_string(),
+            created_at: "2020-01-01T00:00:00Z".to_string(),
+        };
+        std::fs::write(&state, serde_json::to_vec(&stale_mark).unwrap()).unwrap();
+
+        // Something strictly older than the bundle is refused even though
+        // the persisted mark would have allowed it.
+        let stale_release = resigned_envelope_with_created_at("2021-01-01T00:00:00Z");
+        assert!(matches!(
+            PlatformReleaseEnvelope::load_verified_from_raw(stale_release, true, Some(&state)),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
+        ));
+
+        // Something newer than both is accepted and RAISES the persisted
+        // mark above the bundle.
+        let newer = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        assert!(PlatformReleaseEnvelope::load_verified_from_raw(newer, true, Some(&state)).is_ok());
+        let mark: AcceptedOverrideMark =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        assert_eq!(mark.created_at, "2999-01-01T00:00:00Z");
+        assert_ne!(
+            mark.platform_release_version,
+            bundled.payload.platform_release_version
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn override_high_water_mark_unwritable_state_fails_closed() {
+        // Persisting the mark is part of accepting the release: a read-only
+        // state location must fail startup with the actionable error, not
+        // silently skip the mark.
+        let dir = std::env::temp_dir().join(format!("pr-hwm-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("subdir").join("release.accepted");
+        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        let mut perms = std::fs::metadata(dir.join("subdir")).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o500);
+        std::fs::set_permissions(dir.join("subdir"), perms).unwrap();
+
+        let newer = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        let result = PlatformReleaseEnvelope::load_verified_from_raw(newer, true, Some(&state));
+        let mut perms = std::fs::metadata(dir.join("subdir")).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(dir.join("subdir"), perms).unwrap();
+        assert!(matches!(
+            result,
+            Err(PlatformReleaseError::HighWaterMarkPersistFailed { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
