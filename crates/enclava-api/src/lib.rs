@@ -2119,6 +2119,215 @@ pub(crate) mod test_support {
     /// per-process database forever.  The guard drops the database during
     /// unwind as well; its final `DROP IF EXISTS` is idempotent with the
     /// explicit drop.
+    pub(crate) async fn database_test_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect test database");
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate test database");
+        pool
+    }
+
+    pub(crate) struct KbsPolicyProvider {
+        pub(crate) healthy: bool,
+        pub(crate) configmap: serde_json::Value,
+        pub(crate) deployment: serde_json::Value,
+        pub(crate) configmap_replaces: usize,
+        pub(crate) deployment_replaces: usize,
+        pub(crate) deployment_put_failures: usize,
+        pub(crate) deployment_gets_before_failure: Option<usize>,
+        pub(crate) replace_configmap_on_next_deployment_get: Option<serde_json::Value>,
+        pub(crate) configmap_put_hold: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    }
+
+impl KbsPolicyProvider {
+        pub(crate) fn new(healthy: bool) -> Self {
+            Self {
+                healthy,
+                configmap: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "resource-policy",
+                        "namespace": "kbs-test",
+                        "resourceVersion": "1",
+                    },
+                    "data": {
+                        "policy.rego": "package policy\nresource_bindings := {}\nowner_resource_bindings := {}\n",
+                    },
+                }),
+                deployment: serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "trustee",
+                        "namespace": "kbs-test",
+                        "resourceVersion": "1",
+                        "generation": 1,
+                    },
+                    "spec": {
+                        "replicas": 1,
+                        "template": {
+                            "metadata": {},
+                            "spec": {
+                                "containers": [{"name": "trustee", "image": "trustee"}],
+                            },
+                        },
+                    },
+                    "status": {
+                        "observedGeneration": 1_000_000,
+                        "replicas": 1,
+                        "updatedReplicas": 1,
+                        "readyReplicas": 1,
+                        "availableReplicas": 1,
+                    },
+                }),
+                configmap_replaces: 0,
+                deployment_replaces: 0,
+                deployment_put_failures: 0,
+                deployment_gets_before_failure: None,
+                replace_configmap_on_next_deployment_get: None,
+                configmap_put_hold: None,
+            }
+        }
+
+        pub(crate) fn published_generation(&self) -> Option<i64> {
+            self.configmap["metadata"]["annotations"]
+                .as_object()?
+                .get("enclava.dev/cap-policy-generation")?
+                .as_str()?
+                .parse()
+                .ok()
+        }
+    }
+
+
+    pub(crate) fn kbs_policy_kube_client(
+        provider: std::sync::Arc<tokio::sync::Mutex<KbsPolicyProvider>>,
+    ) -> kube::Client {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+
+        fn respond(
+            status: u16,
+            value: &serde_json::Value,
+        ) -> Result<Response<Body>, std::io::Error> {
+            Ok(Response::builder()
+                .status(status)
+                .body(Body::from(
+                    serde_json::to_vec(value).expect("serialize kube double response"),
+                ))
+                .expect("build kube double response"))
+        }
+
+        kube::Client::new(
+            service_fn(move |request: Request<Body>| {
+                let provider = provider.clone();
+                async move {
+                    let method = request.method().as_str().to_string();
+                    let path = request.uri().path().to_string();
+                    let body = request
+                        .into_body()
+                        .collect()
+                        .await
+                        .expect("read Kubernetes request body")
+                        .to_bytes();
+                    let mut provider = provider.lock().await;
+                    let mut object: serde_json::Value = if method == "PUT" {
+                        serde_json::from_slice(&body)
+                            .expect("kube double PUT requests carry a JSON body")
+                    } else {
+                        serde_json::json!({})
+                    };
+                    if !provider.healthy
+                        || (method != "GET" && method != "PUT")
+                        || (!path.contains("/configmaps/") && !path.contains("/deployments/"))
+                    {
+                        return respond(
+                            404,
+                            &serde_json::json!({
+                                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                "reason": "NotFound", "message": "unavailable", "code": 404,
+                            }),
+                        );
+                    }
+                    if path.contains("/configmaps/") {
+                        if method == "PUT" {
+                            if let Some((reached, release)) = provider.configmap_put_hold.take() {
+                                // Deterministic handshake: park this PUT,
+                                // and the provider mutex it holds, until the
+                                // test releases it, so a rotation can commit
+                                // while a publication is mid-flight.
+                                let _ = reached.send(());
+                                let _ = release.await;
+                            }
+                            provider.configmap_replaces += 1;
+                            if let Some(metadata) =
+                                object.get_mut("metadata").and_then(|m| m.as_object_mut())
+                            {
+                                metadata.insert(
+                                    "resourceVersion".to_string(),
+                                    serde_json::json!(
+                                        (provider.configmap_replaces + 1).to_string()
+                                    ),
+                                );
+                            }
+                            provider.configmap = object;
+                        }
+                        return respond(200, &provider.configmap);
+                    }
+                    if method == "PUT" {
+                        if provider.deployment_put_failures > 0 {
+                            provider.deployment_put_failures -= 1;
+                            return respond(
+                                500,
+                                &serde_json::json!({
+                                    "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                    "reason": "InternalError",
+                                    "message": "injected deployment write failure",
+                                    "code": 500,
+                                }),
+                            );
+                        }
+                        provider.deployment_replaces += 1;
+                        provider.deployment = object;
+                    } else {
+                        if let Some(configmap) =
+                            provider.replace_configmap_on_next_deployment_get.take()
+                        {
+                            provider.configmap = configmap;
+                        }
+                        if let Some(remaining) = provider.deployment_gets_before_failure {
+                            if remaining == 0 {
+                                provider.deployment_gets_before_failure = None;
+                                return respond(
+                                    500,
+                                    &serde_json::json!({
+                                        "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                        "reason": "InternalError",
+                                        "message": "injected deployment readiness failure",
+                                        "code": 500,
+                                    }),
+                                );
+                            }
+                            provider.deployment_gets_before_failure = Some(remaining - 1);
+                        }
+                    }
+                    respond(200, &provider.deployment)
+                }
+            }),
+            "default",
+        )
+    }
+
     pub(crate) async fn isolated_database_test_pool(
         name: &str,
     ) -> (IsolatedDatabaseCleanup, sqlx::PgPool) {
