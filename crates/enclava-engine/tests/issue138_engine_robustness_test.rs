@@ -215,18 +215,44 @@ fn validate_accepts_valid_log_encryption() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn volume_claim_templates_are_labeled_for_cleanup_selector() {
-    use enclava_engine::manifest::volumes::{MANAGED_BY_LABEL, build_volume_claim_templates};
+fn cap_vct_names_match_statefulset_pvc_pattern() {
+    // PVCs created from the StatefulSet volumeClaimTemplates are named
+    // `<vct>-<statefulset>-<ordinal>`. VCT metadata (labels) is immutable in
+    // Kubernetes, so cleanup matches by name shape instead.
+    use enclava_engine::manifest::volumes::{CAP_VCT_NAMES, build_volume_claim_templates};
 
     let vcts = build_volume_claim_templates(&sample_app());
-    assert!(!vcts.is_empty());
+    let vct_names: Vec<&str> = vcts
+        .iter()
+        .filter_map(|vct| vct.metadata.name.as_deref())
+        .collect();
+    assert_eq!(vct_names.as_slice(), CAP_VCT_NAMES);
+    // VCTs must stay unlabeled: adding labels would 422 every redeploy of an
+    // existing StatefulSet (spec.volumeClaimTemplates immutability).
     for vct in &vcts {
-        let labels = vct.metadata.labels.as_ref().expect("VCT must be labeled");
-        assert_eq!(
-            labels.get(MANAGED_BY_LABEL.0).map(String::as_str),
-            Some(MANAGED_BY_LABEL.1),
-            "VCT {} must carry the managed-by label",
+        assert!(
+            vct.metadata.labels.is_none(),
+            "VCT {} must not carry labels",
             vct.metadata.name.as_deref().unwrap_or("<unnamed>")
         );
     }
+}
+
+#[test]
+fn validate_rejects_cpu_forms_the_api_never_writes() {
+    let mut app = sample_app();
+    for bad in ["1e2", "+5", "5.", ".5", "-1", "0"] {
+        app.resources.cpu = bad.to_string();
+        assert!(
+            matches!(
+                validate_app(&app),
+                Err(ValidationError::InvalidResourceQuantity { field, .. }) if field == "cpu"
+            ),
+            "cpu={bad:?} must be rejected"
+        );
+    }
+    app.resources.cpu = "250m".to_string();
+    assert!(validate_app(&app).is_ok());
+    app.resources.cpu = "1.5".to_string();
+    assert!(validate_app(&app).is_ok());
 }

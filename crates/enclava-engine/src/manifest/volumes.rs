@@ -20,10 +20,11 @@ use crate::types::ConfidentialApp;
 
 const GUEST_MEMORY_LAYOUT_MARKER: &str = "# enclava-cap-volume-layout: guest-memory-v1\n";
 
-/// Platform ownership label shared by every CAP-created object in the tenant
-/// namespace; cleanup deletes PVCs by this selector instead of sweeping the
-/// whole namespace (#138).
-pub const MANAGED_BY_LABEL: (&str, &str) = ("app.kubernetes.io/managed-by", "enclava-platform");
+/// Names of the StatefulSet volumeClaimTemplates CAP renders. PVCs created
+/// from them are named `<vct>-<statefulset>-<ordinal>`; cleanup identifies
+/// CAP-owned PVCs by these name shapes because VCT metadata is immutable in
+/// Kubernetes (labels cannot be added to an existing StatefulSet's VCTs).
+pub const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
 
 /// Disk-backed bound for the workload log spool emptyDir. The relay tails at
 /// most MAX_TAIL_BYTES per container (2 MiB today), so 64 MiB leaves generous
@@ -189,16 +190,16 @@ pub fn build_volume_claim_templates(app: &ConfidentialApp) -> Vec<PersistentVolu
 fn build_vct(name: &str, size: &str) -> PersistentVolumeClaim {
     let mut requests = BTreeMap::new();
     requests.insert("storage".to_string(), Quantity(size.to_string()));
-    let mut labels = BTreeMap::new();
-    labels.insert(
-        MANAGED_BY_LABEL.0.to_string(),
-        MANAGED_BY_LABEL.1.to_string(),
-    );
+
+    // NOTE: no labels here. spec.volumeClaimTemplates is immutable in
+    // Kubernetes (KEP-4650 only makes it mutable-alpha in 1.35+): adding or
+    // changing VCT metadata makes every redeploy of an existing StatefulSet
+    // fail with 422. Cleanup therefore identifies CAP-owned PVCs by the VCT
+    // name shape (CAP_VCT_NAMES) instead of labels.
 
     PersistentVolumeClaim {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
-            labels: Some(labels),
             ..Default::default()
         },
         spec: Some(PersistentVolumeClaimSpec {

@@ -140,11 +140,13 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
         }
     })?;
     // Memory limits use the same binary Mi/Gi/Ti grammar as storage sizes
-    // (the API's parse_binary_mib), not the CPU millicore grammar.
+    // (the API's parse_binary_mib), not the CPU millicore grammar, so the
+    // shared binary-quantity validator is reused here; the error is filed
+    // as a resource-quantity error with field "memory" for caller clarity.
     validate_storage_size("memory", &app.resources.memory).map_err(|detail| {
         ValidationError::InvalidResourceQuantity {
             field: "memory",
-            detail,
+            detail: format!("memory uses binary Mi/Gi/Ti units: {detail}"),
         }
     })?;
     validate_storage_size("storage.app_data.size", &app.storage.app_data.size).map_err(
@@ -208,6 +210,26 @@ fn validate_resource_quantity(field: &'static str, value: &str) -> Result<(), St
         return Err(format!("{field} must be a non-empty CPU quantity"));
     }
     let numeric = trimmed.strip_suffix('m').unwrap_or(trimmed);
+    // Match the API's ScaledDecimal grammar: plain decimal digits with an
+    // optional single `.` separator. f64 parsing would also admit `1e2`,
+    // `+5`, `5.`, and `inf`-adjacent forms the API never writes.
+    let mut seen_dot = false;
+    let valid = !numeric.is_empty()
+        && numeric.chars().all(|c| match c {
+            '0'..='9' => true,
+            '.' if !seen_dot => {
+                seen_dot = true;
+                true
+            }
+            _ => false,
+        })
+        && !numeric.starts_with('.')
+        && !numeric.ends_with('.');
+    if !valid {
+        return Err(format!(
+            "{field} must be a positive number or millicpu quantity"
+        ));
+    }
     let parsed: f64 = numeric
         .parse()
         .map_err(|_| format!("{field} must be a positive number or millicpu quantity"))?;
@@ -251,6 +273,11 @@ fn validate_domain(field: &'static str, value: &str) -> Result<(), ValidationErr
     })
 }
 
+/// Structural egress-rule validation only. The API additionally enforces the
+/// internal-host denylist (localhost, metadata, *.svc, rebinding helpers)
+/// with an operator opt-in env (`enforce_egress_allowlist_host`); that policy
+/// decision stays API-side so the engine does not second-guess operator
+/// opt-outs on rows the API already admitted.
 fn validate_egress_rule(rule: &crate::types::EgressRule) -> Result<(), String> {
     if rule.host.parse::<std::net::IpAddr>().is_ok() {
         return Err("host must be a DNS hostname, not an IP address".to_string());

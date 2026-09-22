@@ -564,7 +564,20 @@ fn push_toml_multiline_string(toml: &mut String, key: &str, body: &str) {
     toml.push_str(key);
     toml.push_str(" = ");
     if body.contains("'''") {
-        toml.push_str(&toml_string(body));
+        // Basic-string fallback. Emit a TOML basic string with full control
+        // character escaping: JSON escaping (serde_json) leaves raw DEL
+        // (0x7F) unescaped, which TOML basic strings forbid, so escape
+        // explicitly via toml::Value (which serializes bare strings when
+        // given a table containing the value).
+        let mut table = toml::map::Map::new();
+        table.insert("v".to_string(), toml::Value::from(body));
+        let encoded = toml::to_string(&table).expect("TOML string serialization is infallible");
+        // to_string yields `v = "<escaped>"\n`; keep only the value part.
+        let value = encoded
+            .strip_prefix("v = ")
+            .and_then(|rest| rest.strip_suffix('\n'))
+            .expect("serialized table has the expected shape");
+        toml.push_str(value);
         toml.push('\n');
     } else {
         toml.push_str("'''\n");
