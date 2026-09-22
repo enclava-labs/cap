@@ -257,6 +257,12 @@ fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String>
     else {
         return Err(format!("{field} must use Mi, Gi, or Ti binary units"));
     };
+    // Match the API's ScaledDecimal grammar (plain digits with an optional
+    // single `.`); f64 parsing would admit `+5`, `1e3`, and other forms the
+    // API never writes.
+    if !is_plain_decimal(number) {
+        return Err(format!("{field} must be a positive binary quantity"));
+    }
     let parsed: f64 = number
         .parse()
         .map_err(|_| format!("{field} must be a positive binary quantity"))?;
@@ -264,6 +270,23 @@ fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String>
         return Err(format!("{field} must be a positive binary quantity"));
     }
     Ok(())
+}
+
+/// True for plain decimal digits with at most one interior `.` — the grammar
+/// the API's `ScaledDecimal::parse` accepts.
+fn is_plain_decimal(s: &str) -> bool {
+    let mut seen_dot = false;
+    !s.is_empty()
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && s.chars().all(|c| match c {
+            '0'..='9' => true,
+            '.' if !seen_dot => {
+                seen_dot = true;
+                true
+            }
+            _ => false,
+        })
 }
 
 fn validate_domain(field: &'static str, value: &str) -> Result<(), ValidationError> {
@@ -285,6 +308,9 @@ fn validate_egress_rule(rule: &crate::types::EgressRule) -> Result<(), String> {
     validate_fqdn(&rule.host).map_err(|e| format!("invalid host: {}", fqdn_error_detail(e)))?;
     if rule.ports.is_empty() {
         return Err("ports must not be empty".to_string());
+    }
+    if rule.ports.contains(&0) {
+        return Err("ports must be non-zero".to_string());
     }
     Ok(())
 }

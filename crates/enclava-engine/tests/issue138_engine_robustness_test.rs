@@ -256,3 +256,56 @@ fn validate_rejects_cpu_forms_the_api_never_writes() {
     app.resources.cpu = "1.5".to_string();
     assert!(validate_app(&app).is_ok());
 }
+
+#[test]
+fn policy_text_with_control_characters_produces_valid_toml() {
+    // Round 2 review: TOML literal strings forbid raw DEL (0x7F) and C0
+    // controls other than tab/LF/CR — a body free of `'''` but containing
+    // such bytes must still take the escaped basic-string fallback.
+    let body = "package agent_policy\n\x07\x1FDEL:\x7F\n";
+    let app = app_with_policy(body.to_string());
+    let toml = build_toml(&app);
+
+    let parsed: toml::Value =
+        toml::from_str(&toml).expect("TOML must survive control-character policy");
+    let data = parsed.get("data").and_then(toml::Value::as_table).unwrap();
+    assert_eq!(
+        data.get("policy.rego").and_then(toml::Value::as_str),
+        Some(body)
+    );
+}
+
+#[test]
+fn validate_rejects_memory_and_storage_forms_the_api_never_writes() {
+    // Round 2 review: the binary-quantity validator must use the API's
+    // ScaledDecimal digit grammar, not f64 parsing.
+    let mut app = sample_app();
+    for bad in [
+        "512Mi ", "+512Mi", "512e3Mi", "5.12e2Mi", ".5Gi", "5.Gi", "1e3Mi",
+    ] {
+        app.resources.memory = bad.to_string();
+        assert!(
+            matches!(
+                validate_app(&app),
+                Err(ValidationError::InvalidResourceQuantity { field, .. }) if field == "memory"
+            ),
+            "memory={bad:?} must be rejected"
+        );
+    }
+    app.resources.memory = "512Mi".to_string();
+    app.storage.app_data.size = "1.5Gi".to_string();
+    assert!(validate_app(&app).is_ok());
+}
+
+#[test]
+fn validate_rejects_egress_port_zero() {
+    let mut app = sample_app();
+    app.egress_allowlist = vec![EgressRule {
+        host: "api.example.com".to_string(),
+        ports: vec![0],
+    }];
+    assert!(
+        validate_app(&app).is_err(),
+        "egress port 0 must be rejected"
+    );
+}

@@ -563,7 +563,14 @@ fn rego_string(value: &str) -> String {
 fn push_toml_multiline_string(toml: &mut String, key: &str, body: &str) {
     toml.push_str(key);
     toml.push_str(" = ");
-    if body.contains("'''") {
+    // Literal blocks forbid raw control characters (C0 except tab/CR/LF) and
+    // DEL (0x7F), and ''' would terminate the block early; any of these
+    // forces the escaped basic-string fallback.
+    let needs_escaping = body.contains("'''")
+        || body
+            .bytes()
+            .any(|b| b == 0x7F || (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r'));
+    if needs_escaping {
         // Basic-string fallback. Emit a TOML basic string with full control
         // character escaping: JSON escaping (serde_json) leaves raw DEL
         // (0x7F) unescaped, which TOML basic strings forbid, so escape
