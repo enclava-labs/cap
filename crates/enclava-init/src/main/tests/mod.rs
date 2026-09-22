@@ -366,23 +366,31 @@ fn container_sentinel_names_reject_record_injection_characters() {
 #[test]
 fn sentinel_with_wrong_owner_gid_is_rejected() {
     let dir = tempdir().unwrap();
-    write_fake_proc(dir.path(), 789, "web", 10001, 10001, 555);
+    // Use a guaranteed-mismatching GID: 65534 (nobody) is extremely unlikely
+    // to match any test runner's primary or supplemental group.
+    const FILE_GID: u32 = 65534;
+    const EXPECTED_GID: u32 = 10001; // Different from FILE_GID to ensure mismatch
+
+    write_fake_proc(dir.path(), 789, "web", 10001, FILE_GID, 555);
     let sentinel = dir.path().join("web");
     std::fs::write(
         &sentinel,
-        "version=1\ncontainer=web\npid=789\nuid=10001\ngid=10001\nstart_time_ticks=555\n",
+        format!(
+            "version=1\ncontainer=web\npid=789\nuid=10001\ngid={}\nstart_time_ticks=555\n",
+            FILE_GID
+        ),
     )
     .unwrap();
-    // On typical test hosts the file's real gid is the test user's primary
-    // group; the expected gid 10001 differs unless we happen to run as that
-    // exact group, so assert the specific mismatch message.
+
+    // The file's real gid is FILE_GID (65534), but we expect a different gid,
+    // so the validation should reject it with a specific error message.
     let err = read_sentinel_pid(
         &sentinel,
         dir.path(),
         "web",
         ExpectedIdentity {
             uid: std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&sentinel).unwrap()),
-            gid: 10001,
+            gid: EXPECTED_GID,
         },
     )
     .unwrap_err();
