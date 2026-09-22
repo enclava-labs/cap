@@ -355,8 +355,9 @@ fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
     // reader (enclava-init) validates the sentinel's owner gid against the
     // container's expected identity, and this fchown is what makes that
     // hold for every writer. fd-based, so it cannot be redirected by a
-    // path race, and chowning to the process's own ids is always
-    // permitted.
+    // path race. Note: chowning to the process's own ids is permitted for
+    // a fresh or self-owned inode; a pre-created inode owned by another
+    // uid fails with EPERM here, which is the safe outcome (#175 review).
     let (uid, gid) = current_uid_gid()?;
     // SAFETY: plain libc wrappers around the process's own ids and an
     // owned fd; no path traversal is involved.
@@ -369,6 +370,17 @@ fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
         {
             return Err(format!(
                 "failed to own sentinel {}: {}",
+                sentinel.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        // `.mode(0o600)` above only applies when the file is created; a
+        // reused inode (container restart with the dir still present)
+        // keeps its previous mode. fchmod the fd so the owner-only
+        // invariant holds on reopen too (#175 review).
+        if nix::libc::fchmod(file.as_raw_fd(), 0o600) != 0 {
+            return Err(format!(
+                "failed to set sentinel {} mode: {}",
                 sentinel.display(),
                 std::io::Error::last_os_error()
             ));
@@ -549,6 +561,29 @@ mod tests {
             mode & 0o777,
             0o600,
             "sentinel must be owner-writable only (group writes would let a same-group process overwrite it)"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_started_renormalizes_reused_sentinel_mode() {
+        // A reused inode (container restart, started dir still populated)
+        // can carry a group-writable mode; `.mode(0o600)` only applies at
+        // creation, so signal_started must fchmod the fd back to 0o600
+        // (#175 review).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let sentinel = dir.join("web");
+        fs::write(&sentinel, "stale").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o664)).unwrap();
+        signal_started(&dir, "web").unwrap();
+        let mode = fs::metadata(&sentinel).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "reused sentinel must be re-chmodded to owner-only"
         );
         fs::remove_dir_all(dir).unwrap();
     }

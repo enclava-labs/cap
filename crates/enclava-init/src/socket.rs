@@ -40,6 +40,10 @@ pub fn bind_with_peer_gid(socket_path: &Path, peer_gid: Option<u32>) -> Result<U
     // link itself (not follow it) — sound, but the bound socket would then
     // sit at a path we no longer own. Accepted risk: this runs early in
     // boot inside a root-owned directory before any untrusted code executes.
+    // The chmod below must stay path-based: fchmod() on a bound unix-socket
+    // fd succeeds but is silently a no-op on Linux (the socket inode keeps
+    // its umask-derived mode), verified on 6.17 — so fd-based chmod is not
+    // an option here (#175 review).
     use std::os::unix::fs::PermissionsExt;
     if let Some(gid) = peer_gid {
         // lchown semantics (#137): the freshly bound socket is re-owned
