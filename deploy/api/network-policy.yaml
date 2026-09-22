@@ -1,0 +1,42 @@
+# Restricts inbound traffic to the API pods to the ingress-nginx controllers
+# (plus kubelet probes). This matters for the rate-limiter's trusted-proxy
+# model: TRUSTED_PROXY_CIDRS grants X-Forwarded-For trust to the pod network,
+# so only the ingress controllers — the proxies that actually set that
+# header — must be able to reach the API. Any other cluster workload
+# connecting directly is untrusted at the network layer and can neither
+# spoof a client IP nor consume a public client's bucket.
+#
+# If the target cluster runs its ingress controllers somewhere other than
+# the `ingress-nginx` namespace, adjust the namespaceSelector to match.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cap-api-ingress-only
+  namespace: enclava-platform
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cap-api
+  policyTypes:
+  - Ingress
+  ingress:
+  # Public traffic via the ingress-nginx controllers.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 3000
+  # kubelet health probes originate from the node; allow them so the pod is
+  # not marked Unready on clusters enforcing NetworkPolicy by default.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: enclava-platform
+    ports:
+    - protocol: TCP
+      port: 3000

@@ -348,6 +348,12 @@ fn device_auth_routes(
     // users behind one public IP, and an unauthenticated start flood must
     // not be able to starve authenticated approvals. Both remain covered
     // by the generic per-IP API governor.
+    //
+    // Same-NAT note: keying by IP means users sharing one public egress IP
+    // (corporate NAT, CI runners) share the 1 start/s burst-10 budget.
+    // `start` is rare per user (once per login), so even ~10 concurrent
+    // logins behind one NAT fit inside the burst; if a hosted-tenant NAT
+    // ever trips this, key by IP + requested org instead.
     let start = Router::new().route(
         "/auth/device/start",
         axum::routing::post(routes::auth::start_device_login),

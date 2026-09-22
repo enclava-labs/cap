@@ -50,9 +50,12 @@ spec:
         # API pod is the ingress-nginx controller's pod/node IP, not the
         # client. Without a trusted CIDR the extractor falls back to that
         # shared address and every public client lands in one rate-limit
-        # bucket. 10.0.0.0/8 covers the cluster pod network; narrow it to
-        # the ingress-nginx controller's subnet for the target cluster
-        # where that is known.
+        # bucket. 10.0.0.0/8 covers the cluster pod network; XFF trust is
+        # made safe in combination with deploy/api/network-policy.yaml,
+        # which restricts API ingress to the ingress-nginx controllers only,
+        # and the extractor's rightmost-untrusted XFF walk, which ignores
+        # client-spoofed leftmost entries. Narrow to the ingress-nginx
+        # controller's subnet per target cluster where that is known.
         - name: TRUSTED_PROXY_CIDRS
           value: "10.0.0.0/8"
         - name: DATABASE_URL

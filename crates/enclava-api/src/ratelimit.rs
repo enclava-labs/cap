@@ -3,6 +3,10 @@
 //!
 //! Untrusted peers fall back to the direct TCP peer address; spoofed XFF
 //! headers from the open internet cannot move another tenant's bucket.
+//! Within a trusted proxy chain the client IP is resolved with the standard
+//! rightmost-untrusted walk: the public client may append arbitrary leftmost
+//! entries, but it cannot forge the rightmost entries appended by proxies
+//! we trust, so it cannot choose its own rate-limit key.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -107,28 +111,47 @@ impl TrustedProxyKeyExtractor {
             .map(|ConnectInfo(s)| s.ip())
     }
 
-    fn first_forwarded_ip<B>(&self, req: &Request<B>) -> Option<IpAddr> {
-        if let Some(value) = req.headers().get("x-forwarded-for")
-            && let Ok(s) = value.to_str()
-            && let Some(first) = s.split(',').next()
-            && let Ok(ip) = first.trim().parse::<IpAddr>()
-        {
-            return Some(ip);
+    /// Parse the comma-separated `X-Forwarded-For` list, right to left.
+    fn forwarded_list<B>(&self, req: &Request<B>) -> Vec<IpAddr> {
+        let Some(value) = req.headers().get("x-forwarded-for") else {
+            return Vec::new();
+        };
+        let Ok(s) = value.to_str() else {
+            return Vec::new();
+        };
+        s.split(',')
+            .filter_map(|entry| entry.trim().parse::<IpAddr>().ok())
+            .collect()
+    }
+
+    /// Rightmost-untrusted walk over `X-Forwarded-For`.
+    ///
+    /// Only called when the direct peer is a trusted proxy. Each trusted
+    /// proxy appends the address it received the request from, so the
+    /// rightmost entries were written by proxies closest to us and can be
+    /// consumed while they are trusted; the rightmost address that is NOT a
+    /// trusted proxy is the originating client. Spoofed leftmost entries
+    /// appended by the public client are skipped like any other untrusted
+    /// hop. If every entry is trusted (e.g. an internal probe through two
+    /// layers of proxy), fall back to the leftmost entry.
+    fn client_ip_from_forwarded<B>(&self, req: &Request<B>) -> Option<IpAddr> {
+        let chain = self.forwarded_list(req);
+        if chain.is_empty() {
+            return None;
         }
-        if let Some(value) = req.headers().get("x-real-ip")
-            && let Ok(s) = value.to_str()
-            && let Ok(ip) = s.trim().parse::<IpAddr>()
-        {
-            return Some(ip);
-        }
-        None
+        let client = chain
+            .iter()
+            .rev()
+            .find(|ip| !self.trusted.is_trusted(**ip))
+            .copied();
+        client.or_else(|| chain.first().copied())
     }
 
     pub fn extract_ip<B>(&self, req: &Request<B>) -> Option<IpAddr> {
         let peer = self.peer_addr(req);
         if let Some(peer_ip) = peer
             && self.trusted.is_trusted(peer_ip)
-            && let Some(client) = self.first_forwarded_ip(req)
+            && let Some(client) = self.client_ip_from_forwarded(req)
         {
             return Some(client);
         }
@@ -208,5 +231,46 @@ mod tests {
         let extractor = TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.0.0.5"));
         assert!(extractor.trusted.is_trusted("10.0.0.5".parse().unwrap()));
         assert!(!extractor.trusted.is_trusted("10.0.0.6".parse().unwrap()));
+    }
+
+    #[test]
+    fn spoofed_leftmost_xff_cannot_choose_bucket() {
+        // A public client sends its own XFF header; the ingress appends the
+        // client's real address. The leftmost spoofed entry must be ignored
+        // and the real client IP (rightmost untrusted) used as the key.
+        let extractor =
+            TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.10.0.0/16"));
+        let req = req_with("10.10.5.5", Some("1.2.3.4, 5.6.7.8, 198.51.100.7"));
+        let ip = extractor.extract_ip(&req).unwrap();
+        assert_eq!(ip.to_string(), "198.51.100.7");
+    }
+
+    #[test]
+    fn spoofed_trusted_range_leftmost_xff_is_skipped() {
+        // Spoofing a trusted-range address as the leftmost entry must not
+        // let the client impersonate an internal caller either.
+        let extractor =
+            TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.10.0.0/16"));
+        let req = req_with("10.10.5.5", Some("10.10.9.9, 198.51.100.7"));
+        let ip = extractor.extract_ip(&req).unwrap();
+        assert_eq!(ip.to_string(), "198.51.100.7");
+    }
+
+    #[test]
+    fn all_trusted_chain_falls_back_to_leftmost() {
+        let extractor =
+            TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.10.0.0/16"));
+        let req = req_with("10.10.5.5", Some("10.10.1.1, 10.10.2.2"));
+        let ip = extractor.extract_ip(&req).unwrap();
+        assert_eq!(ip.to_string(), "10.10.1.1");
+    }
+
+    #[test]
+    fn unparseable_xff_entries_are_skipped() {
+        let extractor =
+            TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.10.0.0/16"));
+        let req = req_with("10.10.5.5", Some("garbage, 198.51.100.7"));
+        let ip = extractor.extract_ip(&req).unwrap();
+        assert_eq!(ip.to_string(), "198.51.100.7");
     }
 }

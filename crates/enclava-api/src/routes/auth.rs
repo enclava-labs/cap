@@ -36,6 +36,12 @@ pub struct AuthResponse {
 }
 
 const DEVICE_LOGIN_TTL_MINUTES: i64 = 10;
+
+/// Post-expiry retention for the purge reaper. Sessions become unusable at
+/// `DEVICE_LOGIN_TTL_MINUTES`; this window keeps the rows around for
+/// audit/debug visibility before the reaper deletes them. Keep the two
+/// horizons discoverable together.
+const DEVICE_LOGIN_PURGE_RETENTION_HOURS: i64 = 24;
 const DEVICE_LOGIN_POLL_INTERVAL_SECONDS: i64 = 5;
 type DeviceLoginPollRow = (
     String,
@@ -273,13 +279,34 @@ pub fn user_code_hash(code: &str, hmac_key: &[u8; 32]) -> Vec<u8> {
 /// expire after 10 minutes, so a 24-hour retention window preserves ample
 /// audit/debug visibility while bounding table growth on hosts that get
 /// unauthenticated `/auth/device/start` traffic.
+///
+/// Deletes in bounded batches (see `PURGE_BATCH`) so a large backlog after
+/// an outage or a flood cannot turn into one huge DELETE transaction; the
+/// reaper loop picks up remaining batches on subsequent ticks, and each
+/// batch uses the `device_login_sessions_expires_purge` index.
 pub async fn purge_expired_device_login_sessions(db: &PgPool) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "DELETE FROM device_login_sessions WHERE expires_at < now() - interval '24 hours'",
-    )
-    .execute(db)
-    .await?;
-    Ok(result.rows_affected())
+    const PURGE_BATCH: i64 = 5_000;
+    let mut total = 0u64;
+    loop {
+        let result = sqlx::query(
+            "DELETE FROM device_login_sessions
+             WHERE id IN (
+                 SELECT id FROM device_login_sessions
+                 WHERE expires_at < now() - make_interval(hours => $2::int)
+                 LIMIT $1
+             )",
+        )
+        .bind(PURGE_BATCH)
+        .bind(DEVICE_LOGIN_PURGE_RETENTION_HOURS)
+        .execute(db)
+        .await?;
+        let affected = result.rows_affected();
+        total += affected;
+        if (affected as i64) < PURGE_BATCH {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 /// Hourly reaper for expired device-login sessions (see
