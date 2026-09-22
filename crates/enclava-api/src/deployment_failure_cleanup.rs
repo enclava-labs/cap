@@ -11,25 +11,34 @@
 //!   StatefulSet). Deleting the namespace is sufficient cleanup: every object
 //!   the apply creates is namespaced and dies with it.
 //!
-//! Cleanup is strictly conservative. It runs only when durable evidence says
-//! this failed generation itself published provider state (`manifest_hash`)
-//! and no OTHER generation of the app ever did — a superseded `watching`
-//! predecessor that already applied manifests keeps its namespace (and its
-//! PVCs, whose StatefulSet retention the namespace cascade would bypass) and
-//! its shared generation-independent routes. Namespace deletion additionally
-//! requires the live namespace to carry this exact generation's
-//! mutation-generation annotation, so a namespace created or last written by
-//! any other generation is never touched.
+//! Cleanup is strictly conservative and gated on live provider evidence, not
+//! on deployment-row status alone:
 //!
-//! Cleanup runs while the failing worker still owns the durable mutation
-//! fences (`edge_config`, `kubernetes_namespace/<ns>`), under
+//! * the live namespace must carry this exact generation's mutation-generation
+//!   annotation — proof this generation itself ran `apply_namespace` and
+//!   currently owns the namespace (the deployment row's `manifest_hash` is
+//!   written at `applying`, before any provider call, so it is not evidence
+//!   of publication);
+//! * no OTHER deployment of the app may carry any provider-state evidence
+//!   (`manifest_hash`, `observing_since`, or a non-failed status including
+//!   `rolled_back`) — a superseded `watching`/`applying` predecessor
+//!   terminalized to `failed` keeps its namespace (and its PVCs, whose
+//!   StatefulSet retention the namespace cascade would bypass) and its shared
+//!   generation-independent routes;
+//! * the app must not be `deleting` (the delete path owns teardown).
+//!
+//! Both provider steps run while the failing worker still owns the durable
+//! mutation fences (`edge_config`, `kubernetes_namespace/<ns>`), under
 //! `guard_provider`, so a concurrently accepted redeploy cannot mutate the
 //! same providers until this worker releases them, and a lost lease heartbeat
-//! cancels the provider calls the same way apply does. Every step is bounded
-//! and best-effort: a failure or timeout is logged and the caller's bounded
-//! reclaim quarantine retains the fences; the periodic reconcilers converge
-//! the remainder. A crash before cleanup simply leaves the pre-existing
-//! (slower) convergence behavior — never a worse one.
+//! cancels the provider calls the same way apply does. Route removal is
+//! best-effort (idempotent; the periodic edge reconciler converges the rest).
+//! Namespace deletion fails closed: if a delete was issued but 404 was not
+//! observed within the bounded wait, the pre-armed namespace fence is
+//! retained (not converted to the bounded reclaim quarantine), so a retry
+//! cannot claim the fence while the namespace is still Terminating. A crash
+//! before cleanup simply leaves the pre-existing (slower) convergence
+//! behavior — never a worse one.
 
 use uuid::Uuid;
 
@@ -37,33 +46,61 @@ use crate::models::App;
 use crate::mutation_leases::{AppMutationLease, ResourceFence};
 use crate::state::AppState;
 
-/// Mirrors the app-delete namespace teardown envelope so the two loops cannot
-/// drift: bounded convergence wait inside a hard bound over the whole
-/// provider operation (inspect + delete + wait), fail-closed on timeout.
+/// Mirrors the app-delete namespace teardown envelope: bounded convergence
+/// wait once the delete has been accepted. `delete_resource`'s internal
+/// conflict retries are short-lived (409 backoff only), so this wait starts
+/// after the delete is accepted and is not nested inside a second budget.
 const NAMESPACE_CONVERGENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-const CLEANUP_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// Outcome of the bounded namespace teardown.
+#[derive(Debug, PartialEq, Eq)]
+enum NamespaceTeardown {
+    /// The namespace is confirmed gone (404 observed, or absent throughout).
+    ConfirmedAbsent,
+    /// Nothing this generation owns: the live namespace carries another
+    /// generation's (or no) mutation annotation, or it could not even be
+    /// inspected. No delete was issued through this path.
+    NotOurs,
+    /// A delete was issued but 404 was not confirmed, or the step failed or
+    /// lost its lease after deciding to delete. The caller must retain the
+    /// pre-armed namespace fence for reconciliation instead of quarantining
+    /// it, so a retry cannot claim the fence while the namespace may still be
+    /// Terminating.
+    DeleteIncomplete,
+}
+
+/// How the caller should release the mutation fences after cleanup.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CleanupFenceOutcome {
+    /// Fences may be released through the normal bounded reclaim quarantine.
+    ReleaseNormally,
+    /// The `kubernetes_namespace` fence must stay armed until reconciliation;
+    /// the other fences may be released.
+    RetainNamespaceFence,
+}
 
 /// Best-effort compensating cleanup for a deployment whose apply failed
 /// terminally. `app` is the immutable payload snapshot of the failed
-/// generation; `mutation` still owns that generation's provider fences and is
-/// released by the caller (through bounded reclaim quarantine) afterwards.
+/// generation; `mutation` still owns that generation's provider fences.
 pub(crate) async fn cleanup_after_terminal_apply_failure(
     state: &AppState,
     app: &App,
     failed_deployment_id: Uuid,
     mutation: &AppMutationLease,
-) {
-    // Evidence gate: this generation must itself have published provider
-    // state, and no other generation of this app may ever have. The failed
-    // deployment's own row is excluded from the "other" check.
-    match app_lifecycle_allows_cleanup(&state.db, app.id, failed_deployment_id).await {
+) -> CleanupFenceOutcome {
+    // Row-level gate: no other generation of this app may carry ANY
+    // provider-state evidence, and the app must not be deleting. Whether THIS
+    // generation published anything is proven separately against the live
+    // namespace annotation, because the deployment row's manifest_hash is
+    // written before any provider call.
+    match no_other_generation_owns_provider_state(&state.db, app.id, failed_deployment_id).await {
         Ok(false) => {
             tracing::info!(
                 app_id = %app.id,
                 deployment_id = %failed_deployment_id,
                 "skipping failed-apply compensating cleanup: another generation owns or previously owned the provider state"
             );
-            return;
+            return CleanupFenceOutcome::ReleaseNormally;
         }
         Ok(true) => {}
         Err(error) => {
@@ -75,10 +112,75 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
                 error = %error,
                 "failed-apply cleanup precondition check failed; leaving provider cleanup to reconciliation"
             );
-            return;
+            return CleanupFenceOutcome::ReleaseNormally;
         }
     }
 
+    let namespace_generation = match mutation
+        .resource_generation(&ResourceFence::new("kubernetes_namespace", &app.namespace))
+    {
+        Some(raw) => match enclava_engine::apply::generation::MutationGeneration::new(raw) {
+            Ok(generation) => generation,
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    error = %error,
+                    "failed-apply cleanup cannot validate kubernetes_namespace generation; skipping provider cleanup"
+                );
+                return CleanupFenceOutcome::ReleaseNormally;
+            }
+        },
+        None => {
+            tracing::info!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                "failed-apply cleanup holds no kubernetes_namespace generation; skipping provider cleanup"
+            );
+            return CleanupFenceOutcome::ReleaseNormally;
+        }
+    };
+
+    // Namespace teardown first: the live annotation check is the proof that
+    // this generation published provider state at all. Only when it owns the
+    // namespace does route removal make sense — `ensure_haproxy_routes` runs
+    // strictly after `apply_namespace` inside the same provider phase, so a
+    // generation that never owned the namespace never published routes.
+    let teardown = match mutation
+        .guard_provider(delete_failed_generation_namespace(
+            app,
+            namespace_generation,
+        ))
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // Lease heartbeat lost with the provider state uncertain: fail
+            // closed on the namespace fence.
+            tracing::warn!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                error = %error,
+                "failed-apply namespace cleanup lost its mutation lease; retaining the namespace fence for reconciliation"
+            );
+            return CleanupFenceOutcome::RetainNamespaceFence;
+        }
+    };
+
+    if teardown == NamespaceTeardown::NotOurs {
+        tracing::info!(
+            app_id = %app.id,
+            namespace = %app.namespace,
+            "failed apply never owned the live namespace; skipping route removal"
+        );
+        return CleanupFenceOutcome::ReleaseNormally;
+    }
+
+    // The namespace was this generation's, so its SNI routes are this
+    // generation's publication. Remove them while still holding the
+    // edge_config fence generation. Route removal is idempotent and covered
+    // by the periodic edge reconciler, so a Lost/failed removal does not
+    // retain any fence.
     if let Some(edge_config_generation) =
         mutation.resource_generation(&ResourceFence::edge_config())
     {
@@ -103,91 +205,44 @@ pub(crate) async fn cleanup_after_terminal_apply_failure(
         );
     }
 
-    if let Some(namespace_generation) =
-        mutation.resource_generation(&ResourceFence::new("kubernetes_namespace", &app.namespace))
-    {
-        // `resource_generation` returns the raw durable i64; the provider
-        // calls require a validated MutationGeneration.
-        let namespace_generation = match enclava_engine::apply::generation::MutationGeneration::new(
-            namespace_generation,
-        ) {
-            Ok(generation) => generation,
-            Err(error) => {
-                tracing::warn!(
-                    app_id = %app.id,
-                    namespace = %app.namespace,
-                    error = %error,
-                    "failed-apply cleanup cannot validate kubernetes_namespace generation; skipping namespace deletion"
-                );
-                return;
-            }
-        };
-        let deleted = mutation
-            .guard_provider(delete_failed_generation_namespace(
-                app,
-                namespace_generation,
-            ))
-            .await;
-        if let Err(error) = deleted {
+    match teardown {
+        NamespaceTeardown::ConfirmedAbsent => CleanupFenceOutcome::ReleaseNormally,
+        NamespaceTeardown::DeleteIncomplete => {
             tracing::warn!(
                 app_id = %app.id,
                 namespace = %app.namespace,
-                error = %error,
-                "failed-apply namespace cleanup did not complete under the mutation lease; the caller's bounded reclaim quarantine retains the fence for reconciliation"
+                "failed-apply namespace deletion is not confirmed complete; retaining the pre-armed namespace fence for reconciliation"
             );
+            CleanupFenceOutcome::RetainNamespaceFence
         }
-    } else {
-        tracing::info!(
-            app_id = %app.id,
-            namespace = %app.namespace,
-            "failed-apply cleanup holds no kubernetes_namespace generation; skipping namespace deletion"
-        );
+        NamespaceTeardown::NotOurs => unreachable!("handled above"),
     }
 }
 
-/// Cleanup may only run when BOTH hold:
-///
-/// * the failed deployment itself reached provider publication
-///   (`manifest_hash` IS NOT NULL) — otherwise it created nothing and there
-///   is nothing of its own to clean;
-/// * no OTHER deployment of this app ever published provider state
-///   (`manifest_hash` or `observing_since` set, or any non-failed status
-///   including `rolled_back`), and the app is not being deleted.
-///
-/// The second condition deliberately treats a superseded `watching`/
-/// `applying` predecessor — terminalized to `failed` by
-/// `supersede_incomplete_deployments` — as still owning its namespace, PVCs,
-/// and shared routes: its evidence columns remain set even though its status
-/// flipped to `failed`, so this failed row cannot destroy another
-/// generation's live data.
-async fn app_lifecycle_allows_cleanup(
+/// No OTHER deployment of this app may carry ANY provider-state evidence:
+/// `manifest_hash` or `observing_since` set (both survive
+/// `supersede_incomplete_deployments` terminalizing a watching/applying row
+/// to `failed`), or any non-failed status including `rolled_back`. The app
+/// must not be `deleting`.
+async fn no_other_generation_owns_provider_state(
     pool: &sqlx::PgPool,
     app_id: Uuid,
     failed_deployment_id: Uuid,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar::<_, bool>(
-        "SELECT
-             -- this generation itself reached provider publication
-             EXISTS (
-                 SELECT 1 FROM deployments
-                  WHERE id = $2 AND app_id = $1 AND manifest_hash IS NOT NULL
-             )
-             -- no other generation ever published provider state
-             AND NOT EXISTS (
-                 SELECT 1 FROM deployments
-                  WHERE app_id = $1
-                    AND id <> $2
-                    AND (
-                        manifest_hash IS NOT NULL
-                        OR observing_since IS NOT NULL
-                        OR status::text IN ('pending', 'applying', 'watching', 'healthy', 'rolled_back')
-                    )
-             )
-             -- the app delete path owns teardown while deleting
-             AND NOT EXISTS (
-                 SELECT 1 FROM apps
-                  WHERE id = $1 AND status = 'deleting'::app_status_enum
-             )",
+        "SELECT NOT EXISTS (
+             SELECT 1 FROM deployments
+              WHERE app_id = $1
+                AND id <> $2
+                AND (
+                    manifest_hash IS NOT NULL
+                    OR observing_since IS NOT NULL
+                    OR status::text IN ('pending', 'applying', 'watching', 'healthy', 'rolled_back')
+                )
+         ) AND NOT EXISTS (
+             SELECT 1 FROM apps
+              WHERE id = $1 AND status = 'deleting'::app_status_enum
+         )",
     )
     .bind(app_id)
     .bind(failed_deployment_id)
@@ -195,36 +250,12 @@ async fn app_lifecycle_allows_cleanup(
     .await
 }
 
-/// The SNI hostnames this generation's apply published, mirroring
-/// `apply_deployment_manifests` exactly (including the TEE fallback to the
-/// platform domain when `tee_domain` is null/empty, and the empty-custom-
-/// domain skip) so cleanup can never diverge from what was published.
-fn failed_generation_route_hosts(app: &App) -> Vec<(crate::edge::BackendTag, String)> {
-    let mut hosts = vec![
-        (crate::edge::BackendTag::App, app.domain.clone()),
-        (
-            crate::edge::BackendTag::Tee,
-            match app.tee_domain.as_deref() {
-                Some(tee_domain) if !tee_domain.is_empty() => tee_domain.to_string(),
-                // build_confidential_app_from_rows falls back to the platform
-                // domain when tee_domain is null, and apply publishes that
-                // route unconditionally.
-                _ => app.domain.clone(),
-            },
-        ),
-    ];
-    if let Some(custom_domain) = app.custom_domain.as_deref()
-        && !custom_domain.is_empty()
-    {
-        hosts.push((crate::edge::BackendTag::App, custom_domain.to_string()));
-    }
-    hosts
-}
-
 /// Remove the SNI routes this failed generation's domains route through.
 /// Backend names are generation-independent (derived from org/app slug), so
-/// removal is only safe once the lifecycle precondition confirmed no other
-/// generation ever published routes.
+/// removal is only safe once the gates confirmed no other generation ever
+/// published routes. The host list comes from the same
+/// [`crate::deploy::app_route_hosts`] helper apply uses, so it cannot diverge
+/// from what was published.
 async fn remove_failed_generation_edge_routes(
     state: &AppState,
     app: &App,
@@ -248,7 +279,7 @@ async fn remove_failed_generation_edge_routes(
     };
 
     let mut routes_to_remove = Vec::new();
-    for (tag, host) in failed_generation_route_hosts(app) {
+    for (tag, host) in crate::deploy::app_route_hosts(app) {
         match crate::edge::backend_name_for(&org_slug, &app.name, tag) {
             Ok(backend) => routes_to_remove.push((backend, host)),
             Err(error) => {
@@ -284,12 +315,19 @@ async fn remove_failed_generation_edge_routes(
 /// mutation-generation annotation. `delete_resource` alone would accept any
 /// live generation <= ours (a missing annotation counts as 0), which could
 /// destroy a namespace another generation created; the exact-annotation check
-/// closes that. Absence (404) is success. The whole operation is bounded and
-/// fails closed, mirroring the app-delete teardown envelope.
+/// closes that, and it doubles as the proof this generation itself ran
+/// `apply_namespace` (the deployment row's `manifest_hash` is written before
+/// any provider call and proves nothing).
+///
+/// Absence (404) is success. Once a delete is issued, the bounded convergence
+/// wait must observe 404; otherwise the outcome is `DeleteIncomplete` and the
+/// caller retains the pre-armed fence (fail closed, mirroring app delete)
+/// rather than converting it to the bounded reclaim quarantine while the
+/// namespace may still be Terminating.
 async fn delete_failed_generation_namespace(
     app: &App,
     generation: enclava_engine::apply::generation::MutationGeneration,
-) {
+) -> NamespaceTeardown {
     let client = match kube::Client::try_default().await {
         Ok(client) => client,
         Err(error) => {
@@ -299,111 +337,106 @@ async fn delete_failed_generation_namespace(
                 error = %error,
                 "failed-apply cleanup cannot reach Kubernetes; skipping namespace deletion"
             );
-            return;
+            // No delete was issued through this path.
+            return NamespaceTeardown::NotOurs;
         }
     };
     let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(client);
 
-    let delete_and_wait = async {
-        match api.get(&app.namespace).await {
-            Ok(namespace) => {
-                let live = namespace
-                    .metadata
-                    .annotations
-                    .as_ref()
-                    .and_then(|annotations| {
-                        annotations
-                            .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
-                    })
-                    .and_then(|raw| raw.parse::<i64>().ok());
-                if live != Some(generation.get()) {
-                    // The namespace was created or last written by another
-                    // generation (or predates generation annotations): it is
-                    // not this apply's partial state. Leave it alone.
-                    tracing::info!(
+    match api.get(&app.namespace).await {
+        Ok(namespace) => {
+            let live = namespace
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| {
+                    annotations
+                        .get(enclava_engine::apply::generation::MUTATION_GENERATION_ANNOTATION)
+                })
+                .and_then(|raw| raw.parse::<i64>().ok());
+            if live != Some(generation.get()) {
+                // The namespace was created or last written by another
+                // generation (or predates generation annotations): it is not
+                // this apply's partial state. Leave it alone.
+                tracing::info!(
+                    app_id = %app.id,
+                    namespace = %app.namespace,
+                    expected_generation = generation.get(),
+                    live_generation = ?live,
+                    "failed-apply cleanup skips namespace: it does not carry this generation's mutation annotation"
+                );
+                return NamespaceTeardown::NotOurs;
+            }
+            let deleted = match enclava_engine::apply::generation::delete_resource(
+                &api,
+                &app.namespace,
+                generation,
+                kube::api::DeleteParams::default(),
+            )
+            .await
+            {
+                Ok(deleted) => deleted,
+                Err(error) => {
+                    tracing::warn!(
                         app_id = %app.id,
                         namespace = %app.namespace,
-                        expected_generation = generation.get(),
-                        live_generation = ?live,
-                        "failed-apply cleanup skips namespace: it does not carry this generation's mutation annotation"
+                        error = %error,
+                        "failed-apply namespace deletion failed; retaining the namespace fence for reconciliation"
                     );
-                    return;
+                    // The delete request may have reached the API server
+                    // before the error surfaced: treat as incomplete.
+                    return NamespaceTeardown::DeleteIncomplete;
                 }
-                let deleted = match enclava_engine::apply::generation::delete_resource(
-                    &api,
-                    &app.namespace,
-                    generation,
-                    kube::api::DeleteParams::default(),
-                )
-                .await
-                {
-                    Ok(deleted) => deleted,
+            };
+            if !deleted {
+                // Vanished between get and delete: complete.
+                return NamespaceTeardown::ConfirmedAbsent;
+            }
+            // The delete was accepted. Bound the convergence wait; if it
+            // elapses without a 404 the caller must retain the fence.
+            let deadline = tokio::time::Instant::now() + NAMESPACE_CONVERGENCE_TIMEOUT;
+            loop {
+                match api.get(&app.namespace).await {
+                    Err(kube::Error::Api(error)) if error.code == 404 => {
+                        return NamespaceTeardown::ConfirmedAbsent;
+                    }
+                    Ok(_) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            app_id = %app.id,
+                            namespace = %app.namespace,
+                            "failed-apply namespace deletion did not converge within the bounded wait; retaining the namespace fence for reconciliation"
+                        );
+                        return NamespaceTeardown::DeleteIncomplete;
+                    }
                     Err(error) => {
                         tracing::warn!(
                             app_id = %app.id,
                             namespace = %app.namespace,
                             error = %error,
-                            "failed-apply namespace deletion failed; reconciliation will converge"
+                            "failed-apply namespace deletion wait failed; retaining the namespace fence for reconciliation"
                         );
-                        return;
-                    }
-                };
-                if !deleted {
-                    return;
-                }
-                let deadline = tokio::time::Instant::now() + NAMESPACE_CONVERGENCE_TIMEOUT;
-                loop {
-                    match api.get(&app.namespace).await {
-                        Err(kube::Error::Api(error)) if error.code == 404 => return,
-                        Ok(_) if tokio::time::Instant::now() < deadline => {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        }
-                        Ok(_) => {
-                            tracing::warn!(
-                                app_id = %app.id,
-                                namespace = %app.namespace,
-                                "failed-apply namespace deletion did not converge within the bounded wait; reconciliation will finish it"
-                            );
-                            return;
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                app_id = %app.id,
-                                namespace = %app.namespace,
-                                error = %error,
-                                "failed-apply namespace deletion wait failed; reconciliation will finish it"
-                            );
-                            return;
-                        }
+                        return NamespaceTeardown::DeleteIncomplete;
                     }
                 }
-            }
-            Err(kube::Error::Api(error)) if error.code == 404 => {
-                // Already absent: nothing this apply left behind.
-            }
-            Err(error) => {
-                tracing::warn!(
-                    app_id = %app.id,
-                    namespace = %app.namespace,
-                    error = %error,
-                    "failed-apply cleanup cannot inspect the namespace; skipping deletion"
-                );
             }
         }
-    };
-
-    // Bound the entire provider operation so this path fails closed (the
-    // caller's bounded reclaim quarantine then retains the namespace fence)
-    // instead of pinning the worker and its fences indefinitely.
-    if tokio::time::timeout(CLEANUP_OPERATION_TIMEOUT, delete_and_wait)
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            app_id = %app.id,
-            namespace = %app.namespace,
-            "failed-apply namespace cleanup exceeded its operation budget; the caller's bounded reclaim quarantine retains the fence for reconciliation"
-        );
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            // Already absent: nothing this apply left behind.
+            NamespaceTeardown::ConfirmedAbsent
+        }
+        Err(error) => {
+            tracing::warn!(
+                app_id = %app.id,
+                namespace = %app.namespace,
+                error = %error,
+                "failed-apply cleanup cannot inspect the namespace; skipping deletion"
+            );
+            // No delete issued through this path.
+            NamespaceTeardown::NotOurs
+        }
     }
 }
 
@@ -541,38 +574,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn published_failed_apply_allows_cleanup_when_no_other_generation_exists() {
+    async fn sole_generation_allows_cleanup() {
         let pool = cleanup_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
         let failed_id = Uuid::new_v4();
         insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), false).await;
 
-        let allowed = app_lifecycle_allows_cleanup(&pool, app_id, failed_id)
+        let allowed = no_other_generation_owns_provider_state(&pool, app_id, failed_id)
             .await
             .expect("check cleanup precondition");
         assert!(
             allowed,
-            "a failed apply that published manifests, with no other generation, must allow compensating cleanup"
-        );
-
-        delete_cleanup_fixture(&pool, app_id).await;
-    }
-
-    #[tokio::test]
-    async fn unpublished_failed_apply_skips_cleanup() {
-        let pool = cleanup_test_pool().await;
-        let app_id = insert_cleanup_app_fixture(&pool).await;
-        // Failed before any manifest hash was recorded (e.g. validation or
-        // KBS failure before apply_namespace): it created nothing.
-        let failed_id = Uuid::new_v4();
-        insert_cleanup_deployment(&pool, app_id, failed_id, "failed", None, false).await;
-
-        let allowed = app_lifecycle_allows_cleanup(&pool, app_id, failed_id)
-            .await
-            .expect("check cleanup precondition");
-        assert!(
-            !allowed,
-            "a failed apply that never published must not run provider cleanup"
+            "with no other generation, the row gate must allow provider cleanup"
         );
 
         delete_cleanup_fixture(&pool, app_id).await;
@@ -587,7 +600,7 @@ mod tests {
         insert_cleanup_deployment(&pool, app_id, Uuid::new_v4(), "healthy", Some("old"), false)
             .await;
 
-        let allowed = app_lifecycle_allows_cleanup(&pool, app_id, failed_id)
+        let allowed = no_other_generation_owns_provider_state(&pool, app_id, failed_id)
             .await
             .expect("check cleanup precondition");
         assert!(
@@ -606,7 +619,7 @@ mod tests {
         insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), false).await;
         insert_cleanup_deployment(&pool, app_id, Uuid::new_v4(), "watching", None, false).await;
 
-        let allowed = app_lifecycle_allows_cleanup(&pool, app_id, failed_id)
+        let allowed = no_other_generation_owns_provider_state(&pool, app_id, failed_id)
             .await
             .expect("check cleanup precondition");
         assert!(
@@ -617,35 +630,48 @@ mod tests {
         delete_cleanup_fixture(&pool, app_id).await;
     }
 
+    /// The round-1 data-loss regression: a predecessor that reached
+    /// `applying` (manifest_hash written, namespace possibly applied) or
+    /// `watching` and was then terminalized to `failed` by
+    /// `supersede_incomplete_deployments`. The newer generation under test
+    /// HAS published (hash set), so only the other-row evidence clause can
+    /// block cleanup.
     #[tokio::test]
-    async fn superseded_watching_predecessor_blocks_cleanup() {
+    async fn superseded_predecessor_with_evidence_blocks_published_failure_cleanup() {
         let pool = cleanup_test_pool().await;
         let app_id = insert_cleanup_app_fixture(&pool).await;
-        // The critical regression from review: a predecessor that reached
-        // `watching` (namespace, PVCs, and routes published) and was then
-        // terminalized to `failed` by supersede_incomplete_deployments when a
-        // newer generation was accepted. Its status is `failed` but its
-        // manifest_hash/observing_since evidence remains.
-        let predecessor_id = Uuid::new_v4();
+
+        // Case A: superseded `applying` predecessor — failed with hash.
+        let failed_a = Uuid::new_v4();
+        insert_cleanup_deployment(&pool, app_id, failed_a, "failed", Some("new-gen"), false).await;
+        let predecessor_a = Uuid::new_v4();
         insert_cleanup_deployment(
             &pool,
             app_id,
-            predecessor_id,
+            predecessor_a,
             "failed",
             Some("old-gen"),
-            true,
+            false,
         )
         .await;
-        // The newer generation fails before publishing anything.
-        let failed_id = Uuid::new_v4();
-        insert_cleanup_deployment(&pool, app_id, failed_id, "failed", None, false).await;
-
-        let allowed = app_lifecycle_allows_cleanup(&pool, app_id, failed_id)
-            .await
-            .expect("check cleanup precondition");
         assert!(
-            !allowed,
-            "a superseded watching predecessor (failed but published) keeps its namespace, PVCs, and routes"
+            !no_other_generation_owns_provider_state(&pool, app_id, failed_a)
+                .await
+                .expect("check case A precondition"),
+            "a superseded applying predecessor (failed with manifest_hash) blocks cleanup of a published failure"
+        );
+
+        // Case B: superseded `watching` predecessor — failed, hash already
+        // cleared, but observing_since evidence remains.
+        let failed_b = Uuid::new_v4();
+        insert_cleanup_deployment(&pool, app_id, failed_b, "failed", Some("new-gen"), false).await;
+        let predecessor_b = Uuid::new_v4();
+        insert_cleanup_deployment(&pool, app_id, predecessor_b, "failed", None, true).await;
+        assert!(
+            !no_other_generation_owns_provider_state(&pool, app_id, failed_b)
+                .await
+                .expect("check case B precondition"),
+            "a superseded watching predecessor (failed with observing_since) blocks cleanup of a published failure"
         );
 
         delete_cleanup_fixture(&pool, app_id).await;
@@ -659,7 +685,7 @@ mod tests {
         insert_cleanup_deployment(&pool, app_id, failed_id, "failed", Some("abc123"), false).await;
         insert_cleanup_deployment(&pool, app_id, Uuid::new_v4(), "rolled_back", None, false).await;
 
-        let allowed = app_lifecycle_allows_cleanup(&pool, app_id, failed_id)
+        let allowed = no_other_generation_owns_provider_state(&pool, app_id, failed_id)
             .await
             .expect("check cleanup precondition");
         assert!(
@@ -682,7 +708,7 @@ mod tests {
             .await
             .expect("mark cleanup app deleting");
 
-        let allowed = app_lifecycle_allows_cleanup(&pool, app_id, failed_id)
+        let allowed = no_other_generation_owns_provider_state(&pool, app_id, failed_id)
             .await
             .expect("check cleanup precondition");
         assert!(
@@ -725,7 +751,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
 
-        let hosts = failed_generation_route_hosts(&app);
+        let hosts = crate::deploy::app_route_hosts(&app);
         assert_eq!(
             hosts,
             vec![

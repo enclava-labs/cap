@@ -367,6 +367,34 @@ async fn apply_all_with_tenant_image_pull_secret(
     Ok(())
 }
 
+/// The SNI (backend-tag, host) pairs a deployment of this app publishes,
+/// derived from the authoritative app row exactly as
+/// `build_confidential_app_from_rows` derives its `DomainSpec`: the TEE host
+/// falls back to the platform domain when `tee_domain` is null, and an empty
+/// custom domain is skipped. Apply and failed-apply cleanup both build their
+/// route lists from this helper so they can never diverge.
+pub(crate) fn app_route_hosts(app: &App) -> Vec<(crate::edge::BackendTag, String)> {
+    let mut hosts = vec![
+        (crate::edge::BackendTag::App, app.domain.clone()),
+        (
+            crate::edge::BackendTag::Tee,
+            match app.tee_domain.as_deref() {
+                Some(tee_domain) if !tee_domain.is_empty() => tee_domain.to_string(),
+                // build_confidential_app_from_rows falls back to the platform
+                // domain when tee_domain is null, and apply publishes that
+                // route unconditionally.
+                _ => app.domain.clone(),
+            },
+        ),
+    ];
+    if let Some(custom_domain) = app.custom_domain.as_deref()
+        && !custom_domain.is_empty()
+    {
+        hosts.push((crate::edge::BackendTag::App, custom_domain.to_string()));
+    }
+    hosts
+}
+
 pub struct ApplyDeploymentManifestsRequest {
     pub pool: PgPool,
     pub app: App,
@@ -2248,26 +2276,21 @@ pub async fn apply_deployment_manifests(
         .bind(app.org_id)
         .fetch_one(&pool)
         .await?;
+    // Host list shared with failed-apply cleanup
+    // (`crate::deployment_failure_cleanup`) so publication and removal can
+    // never diverge.
     let app_target =
         crate::edge::resolve_backend_target(&app_spec.name, &app_spec.namespace, 443).await?;
     let tee_target =
         crate::edge::resolve_backend_target(&app_spec.name, &app_spec.namespace, 8081).await?;
-    let app_backend =
-        crate::edge::backend_name_for(&org_slug, &app_spec.name, crate::edge::BackendTag::App)?;
-    let tee_backend =
-        crate::edge::backend_name_for(&org_slug, &app_spec.name, crate::edge::BackendTag::Tee)?;
-    let mut routes = vec![
-        crate::edge::SniRoute::new(&app_spec.domain.platform_domain, &app_backend, &app_target)?,
-        crate::edge::SniRoute::new(&app_spec.domain.tee_domain, &tee_backend, &tee_target)?,
-    ];
-    if let Some(custom) = app_spec.domain.custom_domain.as_deref()
-        && !custom.is_empty()
-    {
-        routes.push(crate::edge::SniRoute::new(
-            custom,
-            &app_backend,
-            &app_target,
-        )?);
+    let mut routes = Vec::with_capacity(3);
+    for (tag, host) in crate::deploy::app_route_hosts(&app) {
+        let backend = crate::edge::backend_name_for(&org_slug, &app_spec.name, tag)?;
+        let target = match tag {
+            crate::edge::BackendTag::App => &app_target,
+            crate::edge::BackendTag::Tee => &tee_target,
+        };
+        routes.push(crate::edge::SniRoute::new(&host, &backend, target)?);
     }
     crate::edge::ensure_haproxy_routes(&pool, &edge_config, Some(edge_config_generation), &routes)
         .await?;

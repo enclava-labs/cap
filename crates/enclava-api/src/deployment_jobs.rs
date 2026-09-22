@@ -2414,16 +2414,22 @@ async fn fail_apply_job_with_mutation(
     // Compensating provider cleanup for the partial state this apply may have
     // published (HAProxy routes, namespace objects). Runs while the mutation
     // lease still owns the edge/namespace fences, before any fence release.
-    // Best-effort by design: failures keep the fences quarantined for
-    // operator/periodic reconciliation.
-    if published && let (Some(mutation), Some(app)) = (mutation.as_ref(), failed_app) {
-        crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
+    // When the namespace delete is not confirmed complete, cleanup asks us to
+    // retain the pre-armed namespace fence (fail closed, like app delete)
+    // instead of converting it to the bounded reclaim quarantine.
+    let mut retain_namespace_fence = false;
+    if published
+        && let (Some(mutation), Some(app)) = (mutation.as_ref(), failed_app)
+        && crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
             state,
             app,
             job.deployment_id,
             mutation,
         )
-        .await;
+        .await
+            == crate::deployment_failure_cleanup::CleanupFenceOutcome::RetainNamespaceFence
+    {
+        retain_namespace_fence = true;
     }
     if published && let Some(mutation) = mutation.as_mut() {
         if reconcile_pending_kbs_with_mutation(state, mutation)
@@ -2445,15 +2451,37 @@ async fn fail_apply_job_with_mutation(
             );
         }
     }
-    if published
-        && let Some(mutation) = mutation
-        && let Err(release_error) = mutation.release_after_provider_quarantine().await
-    {
-        tracing::error!(
-            deployment_id = %job.deployment_id,
-            error_code = DeploymentJobError::from(release_error).code(),
-            "failed to bound failed deployment mutation leases"
-        );
+    if published && let Some(mut mutation) = mutation {
+        if retain_namespace_fence {
+            // The namespace may still be Terminating. Convert every other
+            // scope to the bounded reclaim quarantine but leave the
+            // kubernetes_namespace scope armed until reconciliation confirms
+            // the namespace is gone — mirroring the app-delete fail-closed
+            // teardown contract.
+            if let Err(retain_error) = mutation
+                .retain_resource_scope_until_reconciled("kubernetes_namespace")
+                .await
+            {
+                tracing::error!(
+                    deployment_id = %job.deployment_id,
+                    error_code = DeploymentJobError::from(retain_error).code(),
+                    "failed to retain the namespace fence after incomplete teardown; falling back to bounded quarantine"
+                );
+                if let Err(release_error) = mutation.release_after_provider_quarantine().await {
+                    tracing::error!(
+                        deployment_id = %job.deployment_id,
+                        error_code = DeploymentJobError::from(release_error).code(),
+                        "failed to bound failed deployment mutation leases"
+                    );
+                }
+            }
+        } else if let Err(release_error) = mutation.release_after_provider_quarantine().await {
+            tracing::error!(
+                deployment_id = %job.deployment_id,
+                error_code = DeploymentJobError::from(release_error).code(),
+                "failed to bound failed deployment mutation leases"
+            );
+        }
     }
     tracing::error!(
         app_id = %job.app_id,
