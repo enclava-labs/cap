@@ -183,9 +183,13 @@ The high-water mark lives at `ENCLAVA_PLATFORM_RELEASE_STATE` (default:
 `<override-path>.accepted`). It must point at durable writable storage — the
 override envelope itself is typically a read-only configmap mount, and an
 `emptyDir` would reset the anti-rollback floor on every pod replacement. The
-base deployment wires it to a small ReadWriteMany PVC
-(`deploy/api/platform-release-state-pvc.yaml`); overlays that run a single
-replica may relax the access mode. An operator who can delete the state file
+base deployment does not wire this state (the override lane is inactive there
+and a mandatory RWX claim would block scheduling on RWO-only clusters);
+environments that activate the override lane compose the opt-in component
+`deploy/api/components/platform-release-state` (a ReadWriteMany PVC plus the
+volume/mount/env wiring) onto the base, or replicate its wiring in their own
+overlay — single-replica deployments may relax the access mode to
+ReadWriteOnce. An operator who can delete the state file
 can reset the floor: for the full threat model, point the state path at
 separately-protected storage. Intentional rollbacks require clearing the
 state file (after operator verification), which the refusal message names.
