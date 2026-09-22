@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -349,6 +350,30 @@ fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
         .custom_flags(O_NOFOLLOW)
         .open(&sentinel)
         .map_err(|err| format!("failed to write sentinel {}: {err}", sentinel.display()))?;
+    // Normalize ownership to the writer's own uid:gid (#137). The started
+    // dir is setgid, so a fresh file inherits the directory's group; the
+    // reader (enclava-init) validates the sentinel's owner gid against the
+    // container's expected identity, and this fchown is what makes that
+    // hold for every writer. fd-based, so it cannot be redirected by a
+    // path race, and chowning to the process's own ids is always
+    // permitted.
+    let (uid, gid) = current_uid_gid()?;
+    // SAFETY: plain libc wrappers around the process's own ids and an
+    // owned fd; no path traversal is involved.
+    unsafe {
+        if nix::libc::fchown(
+            file.as_raw_fd(),
+            uid as nix::libc::uid_t,
+            gid as nix::libc::gid_t,
+        ) != 0
+        {
+            return Err(format!(
+                "failed to own sentinel {}: {}",
+                sentinel.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
     use std::io::Write;
     file.write_all(body.as_bytes())
         .map_err(|err| format!("failed to write sentinel {}: {err}", sentinel.display()))?;
@@ -526,6 +551,54 @@ mod tests {
             "sentinel must be owner-writable only (group writes would let a same-group process overwrite it)"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn signal_started_normalizes_sentinel_gid_under_setgid_dir() {
+        // Model the deployed started dir: setgid (0o2770) with a group the
+        // writer is a member of. A freshly created file inherits the dir's
+        // gid; the sentinel must still end up owned by the writer's own
+        // uid:gid because enclava-init validates the owner gid (#137).
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let supplemental = supplemental_gid()
+            .expect("test process needs a supplemental group to model the setgid started dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+            let rc =
+                unsafe { nix::libc::chown(c_path.as_ptr(), nix::libc::getuid(), supplemental) };
+            assert_eq!(rc, 0, "failed to set up test dir group");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o2770)).unwrap();
+        }
+
+        signal_started(&dir, "web").unwrap();
+
+        let meta = fs::metadata(dir.join("web")).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o600);
+        assert_eq!(
+            (meta.uid(), meta.gid()),
+            (
+                unsafe { nix::libc::getuid() } as u32,
+                unsafe { nix::libc::getgid() } as u32
+            ),
+            "sentinel must be re-owned to the writer's uid:gid despite the setgid dir"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn supplemental_gid() -> Option<u32> {
+        // Supplemental groups of the test process; one distinct from the
+        // primary gid models the deployed started dir's group.
+        let path = std::path::Path::new("/proc/self/status");
+        let status = fs::read_to_string(path).ok()?;
+        let line = status.lines().find(|l| l.starts_with("Groups:"))?;
+        line.split_whitespace()
+            .skip(1)
+            .filter_map(|g| g.parse::<u32>().ok())
+            .find(|g| *g != unsafe { nix::libc::getgid() } as u32)
     }
 
     #[test]

@@ -35,6 +35,11 @@ pub fn bind_with_peer_gid(socket_path: &Path, peer_gid: Option<u32>) -> Result<U
         std::fs::remove_file(socket_path)?;
     }
     let listener = UnixListener::bind(socket_path)?;
+    // NOTE (#137, TOCTOU window): if a symlink were raced in at this path
+    // between bind() and the fchownat below, the fchownat would chown the
+    // link itself (not follow it) — sound, but the bound socket would then
+    // sit at a path we no longer own. Accepted risk: this runs early in
+    // boot inside a root-owned directory before any untrusted code executes.
     use std::os::unix::fs::PermissionsExt;
     if let Some(gid) = peer_gid {
         // lchown semantics (#137): the freshly bound socket is re-owned

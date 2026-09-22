@@ -386,10 +386,9 @@ fn sentinel_with_wrong_owner_gid_is_rejected() {
         },
     )
     .unwrap_err();
-    let msg = err.to_string();
     assert!(
-        msg.contains("does not match expected gid") || msg.contains("group- or world-writable"),
-        "unexpected error: {msg}"
+        err.to_string().contains("does not match expected gid"),
+        "unexpected error: {err}"
     );
 }
 
