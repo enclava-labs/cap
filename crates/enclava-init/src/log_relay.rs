@@ -209,7 +209,16 @@ fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64, File)>
     file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    let text = String::from_utf8_lossy(&bytes);
+    // A trailing segment without a newline is an in-flight frame (writer
+    // mid-append): never emit it as a line. Drop it from the tail and point
+    // the follow offset at its first byte so the follow loop completes it
+    // once the writer finishes the append.
+    let complete_len = match bytes.iter().rposition(|&b| b == b'\n') {
+        Some(idx) => idx + 1,
+        None => 0,
+    };
+    let follow_from = start + complete_len as u64;
+    let text = String::from_utf8_lossy(&bytes[..complete_len]);
     let text = if start > 0 {
         text.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
     } else {
@@ -225,7 +234,21 @@ fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64, File)>
     // The File handle is returned so the follower can HOLD it open: while
     // the old inode stays open the filesystem cannot recycle its number
     // into a rotation temp file, making identity comparison sound.
-    Ok((lines, len, file))
+    Ok((lines, follow_from, file))
+}
+
+/// Read from the file's current cursor to end-of-file, returning the bytes
+/// read together with the ACTUAL cursor position after the read. The writer
+/// is a separate process, so the file can grow during the read; callers must
+/// adopt the returned position (not a pre-read metadata length) as the
+/// delivered boundary, or frames appended mid-read get replayed on the next
+/// poll.
+fn drain_from(file: &mut File, expected_start: u64) -> io::Result<(Vec<u8>, u64)> {
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let delivered = file.stream_position()?;
+    debug_assert_eq!(delivered, expected_start + bytes.len() as u64);
+    Ok((bytes, delivered))
 }
 
 fn follow_spool(
@@ -243,6 +266,13 @@ fn follow_spool(
     // frontier instead of replaying them. Unparseable lines are passed
     // through unchanged (historical behavior for anything not a frame).
     let mut last_seq: Option<u64> = initial_last_seq;
+    // Buffer for an incomplete trailing line (writer mid-append): bytes are
+    // held back from the client until the writer's newline completes the
+    // frame. Never emit a partial NDJSON line — if the spool rotates while a
+    // fragment is pending, the new inode's retained window re-contains the
+    // completed frame and the rotation resync delivers it whole, so the
+    // fragment is simply dropped.
+    let mut remainder: Vec<u8> = Vec::new();
     loop {
         thread::sleep(FOLLOW_POLL_INTERVAL);
         let Ok(mut file) = File::open(path) else {
@@ -265,12 +295,28 @@ fn follow_spool(
             // already-delivered frames by sequence. Never seek a stale byte
             // offset into the rewritten tail. Adopt the new file as the
             // held handle (drop the old fd only after adopting the new one).
+            // A pending incomplete-line fragment from the OLD inode is
+            // dropped: the completed frame lives in the new inode's
+            // retained window and is deduped or delivered there as a whole
+            // line. The NEW inode's own trailing fragment (if the writer
+            // is mid-append into the fresh file) becomes the carried
+            // remainder so its completion is joined to its prefix.
+            remainder.clear();
             *offset = 0;
             let mut adopted = file;
             adopted.seek(SeekFrom::Start(0))?;
-            let mut bytes = Vec::new();
-            adopted.read_to_end(&mut bytes)?;
-            *offset = len;
+            let (bytes, delivered) = drain_from(&mut adopted, 0)?;
+            // `delivered` is the ACTUAL file cursor after the read, not the
+            // pre-read metadata length: the writer is a different process,
+            // so a concurrent append can extend the spool during the read.
+            // Those extra bytes ARE delivered in this response; keeping a
+            // stale length would re-send them on the next poll.
+            *offset = delivered;
+            let mut complete_end = 0usize;
+            while let Some(idx) = bytes[complete_end..].iter().position(|&b| b == b'\n') {
+                complete_end += idx + 1;
+            }
+            remainder.extend_from_slice(&bytes[complete_end..]);
             *held = Some(adopted);
             write_deduped_after_rotation(stream, &bytes, &mut last_seq)?;
             stream.flush()?;
@@ -280,38 +326,53 @@ fn follow_spool(
             // Fallback for same-inode truncation (not the rotation path,
             // but cheap insurance if the rotation mechanism ever changes).
             *offset = 0;
+            remainder.clear();
         }
         if len == *offset {
             continue;
         }
         file.seek(SeekFrom::Start(*offset))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        *offset = len;
-        advance_last_sequence(&bytes, &mut last_seq);
-        stream.write_all(&bytes)?;
+        let (bytes, delivered) = drain_from(&mut file, *offset)?;
+        // Same as the rotation branch: adopt the file cursor as the
+        // delivered boundary so a concurrent append landing mid-read is
+        // not replayed on the next poll.
+        *offset = delivered;
+        // Line-buffered delivery: emit only newline-terminated lines, hold
+        // any trailing fragment back until it completes. The fragment was
+        // already accounted for in `*offset` (it was read), so it is never
+        // re-read — it lives only in `remainder` until its newline arrives.
+        remainder.extend_from_slice(&bytes);
+        let mut complete_end = 0usize;
+        while let Some(idx) = remainder[complete_end..].iter().position(|&b| b == b'\n') {
+            complete_end += idx + 1;
+        }
+        if complete_end > 0 {
+            let complete = remainder[..complete_end].to_vec();
+            advance_last_sequence(&complete, &mut last_seq);
+            stream.write_all(&complete)?;
+        }
+        remainder.drain(..complete_end);
         stream.flush()?;
     }
 }
 
 /// Re-send spool bytes after a rotation resync, dropping complete frames
 /// whose sequence number was already delivered (`<= last_seq`). A trailing
-/// segment without a newline is an incomplete frame (writer mid-append):
-/// forward its bytes but NOT a terminating newline, so the rest of that
-/// frame arrives as a raw continuation in the next poll rather than as a
-/// prematurely terminated line. Lines that do not parse as frames are
-/// forwarded unchanged (historical pass-through behavior).
+/// segment without a newline is an in-flight frame (writer mid-append) and
+/// is NOT forwarded: emitting a fragment risks the client concatenating it
+/// with the next complete frame into one invalid NDJSON line, and the
+/// completed frame will be re-read whole from the new inode on the next
+/// poll (it sits at the end of the file past `*offset`). Lines that do not
+/// parse as frames are forwarded unchanged (historical pass-through).
 fn write_deduped_after_rotation<W: Write>(
     stream: &mut W,
     bytes: &[u8],
     last_seq: &mut Option<u64>,
 ) -> io::Result<()> {
     let mut start = 0usize;
-    let mut complete_end = 0usize;
     while let Some(idx) = bytes[start..].iter().position(|&b| b == b'\n') {
         let line = &bytes[start..start + idx];
         start += idx + 1;
-        complete_end = start;
         if line.is_empty() {
             continue;
         }
@@ -326,10 +387,6 @@ fn write_deduped_after_rotation<W: Write>(
         }
         stream.write_all(line)?;
         stream.write_all(b"\n")?;
-    }
-    let tail = &bytes[complete_end..];
-    if !tail.is_empty() {
-        stream.write_all(tail)?;
     }
     Ok(())
 }
@@ -431,10 +488,12 @@ mod tests {
         assert_eq!(last_seq, Some(6));
     }
 
-    /// An incomplete trailing frame during resync must be forwarded without
-    /// a terminating newline so the client reassembles it across polls.
+    /// An in-flight trailing fragment (writer mid-append) must NOT be
+    /// forwarded during a rotation resync: emitting a partial NDJSON line
+    /// risks the client concatenating it with the next complete frame.
+    /// The completed frame is re-delivered whole from the new inode.
     #[test]
-    fn rotation_resync_forwards_incomplete_tail_without_newline() {
+    fn rotation_resync_drops_incomplete_tail() {
         let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
         let mut bytes = format!("{}\n", frame(7)).into_bytes();
         bytes.extend_from_slice(b"{\"version\":\"enclava-log-fra"); // partial
@@ -442,10 +501,7 @@ mod tests {
         let mut sink = Vec::new();
         write_deduped_after_rotation(&mut sink, &bytes, &mut last_seq).unwrap();
         let sent = String::from_utf8(sink).unwrap();
-        assert_eq!(
-            sent,
-            format!("{}\n{{\"version\":\"enclava-log-fra", frame(7))
-        );
+        assert_eq!(sent, format!("{}\n", frame(7)));
         // The partial tail carries no parseable sequence: the frontier
         // reflects only the complete frame 7 forwarded above it.
         assert_eq!(last_seq, Some(7));
@@ -476,6 +532,43 @@ mod tests {
         // The returned handle is open and pins the spool inode: while it is
         // held the filesystem cannot recycle that inode number.
         assert!(spool_identity(&file).is_ok());
+    }
+
+    /// Round-6 review finding: the delivered boundary after a drain must be
+    /// the file's actual cursor, not a pre-read metadata length — the writer
+    /// is a separate process and can append mid-read; those bytes are
+    /// delivered in the same response and must not be replayed next poll.
+    #[test]
+    fn drain_from_reports_cursor_position_not_preread_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        use std::io::Write;
+        file.write_all(b"frame-1\n").unwrap();
+        file.flush().unwrap();
+        drop(file);
+
+        // Simulate a mid-read append: seed the spool with the pre-read
+        // state, then grow it BEFORE draining, as an interleaved writer
+        // process would. The pre-read length (7) is stale by drain time.
+        let mut reader = std::fs::File::open(&path).unwrap();
+        reader.seek(std::io::SeekFrom::Start(0)).unwrap();
+        {
+            let mut writer = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writer.write_all(b"frame-2\n").unwrap();
+        }
+        let (bytes, delivered) = drain_from(&mut reader, 0).unwrap();
+        assert_eq!(bytes, b"frame-1\nframe-2\n");
+        // The cursor (14), not the stale pre-read length (7), is the
+        // delivered boundary — frame-2 is not replayed on the next poll.
+        assert_eq!(delivered, "frame-1\nframe-2\n".len() as u64);
     }
 
     /// A rename-based rotation swaps the inode: the follower must detect the

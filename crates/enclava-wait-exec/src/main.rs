@@ -320,6 +320,17 @@ where
                 buf.pop();
             }
         }
+        // Allocate the sequence number while HOLDING the spool mutex and
+        // only after acquiring it: encrypt_log_frame runs here, inside the
+        // lock, so a faster forwarder cannot reserve a higher sequence,
+        // lose the CPU to its peer, and let the lower sequence reach the
+        // spool second. File order therefore always equals sequence order,
+        // which is the invariant the relay's rotation dedup relies on
+        // (last_seq is a contiguous delivery frontier, only sound when
+        // spool position is monotonic in sequence).
+        let mut spool = spool
+            .lock()
+            .map_err(|_| "encrypted log spool lock poisoned".to_string())?;
         let frame = encrypt_log_frame(
             &logs.recipient,
             &logs.context,
@@ -332,9 +343,6 @@ where
         .map_err(|err| format!("failed to encrypt child {stream} log frame: {err}"))?;
         let line = serde_json::to_vec(&frame)
             .map_err(|err| format!("failed to encode encrypted log frame: {err}"))?;
-        let mut spool = spool
-            .lock()
-            .map_err(|_| "encrypted log spool lock poisoned".to_string())?;
         // Rotate BEFORE writing, projected against the encoded frame length:
         // records are capped (see MAX_LOG_RECORD_BYTES), so the spool never
         // grows past the rotate threshold between checks and a single frame
@@ -857,6 +865,81 @@ mod tests {
         rotate_spool_if_needed(&mut spool, 0, &path).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), len_before);
         assert_eq!(fs::metadata(&path).unwrap().ino(), inode_before);
+    }
+
+    /// Round-6 review finding: the relay's rotation dedup treats the max
+    /// delivered sequence as a contiguous frontier, which is only sound when
+    /// spool file order is monotonic in sequence order. The sequence must
+    /// therefore be allocated (and the frame encrypted) while HOLDING the
+    /// spool mutex — previously `fetch_add` ran before the lock, so a
+    /// forwarder could reserve a higher sequence, lose the CPU, and let its
+    /// peer's lower sequence reach the file first; a later rotation resync
+    /// would then drop that unseen lower frame as "already delivered".
+    /// This test drives both forwarder threads concurrently and pins that
+    /// the spool's sequence numbers are strictly increasing in file order.
+    #[test]
+    fn concurrent_forwarders_keep_spool_order_monotonic_in_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let spool = Arc::new(Mutex::new(open_log_spool(&path).unwrap()));
+
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        let recipient = validate_public_key(
+            "logs-prod",
+            &keypair.public_key_base64url,
+            &keypair.public_key_sha256,
+        )
+        .unwrap();
+        let logs = EncryptedLogConfig {
+            recipient,
+            context: enclava_common::log_encryption::LogFrameContext {
+                org_id: "org-123".to_string(),
+                app_name: "secure-app".to_string(),
+                deployment_id: "deploy-123".to_string(),
+            },
+            spool_path: path.clone(),
+            container: "web".to_string(),
+        };
+
+        let sequence = Arc::new(AtomicU64::new(1));
+        let handles: Vec<_> = ["stdout", "stderr"]
+            .iter()
+            .map(|stream| {
+                let input = (0..400)
+                    .map(|i| format!("{stream} record {i} {}\n", "x".repeat(i % 97)))
+                    .collect::<String>();
+                let reader = std::io::Cursor::new(input);
+                let spool = Arc::clone(&spool);
+                let sequence = Arc::clone(&sequence);
+                let logs = logs.clone();
+                let stream: &'static str = match *stream {
+                    "stdout" => "stdout",
+                    _ => "stderr",
+                };
+                thread::spawn(move || {
+                    forward_encrypted_logs(reader, stream, &logs, &spool, &sequence).unwrap()
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("forwarder panicked");
+        }
+
+        let content = fs::read_to_string(&path).unwrap();
+        let mut prev = 0u64;
+        let mut count = 0u64;
+        for line in content.lines() {
+            let frame: serde_json::Value =
+                serde_json::from_str(line).expect("spool must contain valid NDJSON frames");
+            let seq = frame["sequence"].as_u64().expect("sequence is plaintext");
+            assert!(
+                seq > prev,
+                "spool order must be monotonic in sequence: {seq} followed {prev}"
+            );
+            prev = seq;
+            count += 1;
+        }
+        assert_eq!(count, 800, "both streams' 400 frames must be on disk");
     }
 
     /// Rotation is projected against the incoming frame: the spool never
