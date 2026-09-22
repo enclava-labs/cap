@@ -19,6 +19,9 @@ COPY scripts/require-platform-release-root.sh scripts/require-platform-release-r
 # Debug images may pin the dev fixture root only while the bundled envelope
 # is fixture-signed; the root must still match that envelope.
 RUN bash scripts/require-platform-release-root.sh --allow-dev-fixture
+RUN printf "%s  crates/enclava-api/trust-roots/sigstore-public-good-1.root.json\n" \
+      6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66 \
+      | sha256sum -c >/dev/null
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -68,6 +71,9 @@ COPY scripts/require-platform-release-root.sh scripts/require-platform-release-r
 # Released images must pin a production root that matches the bundled
 # envelope; the fixture root is rejected unconditionally here.
 RUN bash scripts/require-platform-release-root.sh
+RUN printf "%s  crates/enclava-api/trust-roots/sigstore-public-good-1.root.json\n" \
+      6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66 \
+      | sha256sum -c >/dev/null
 
 # The shell gate only compares pubkeys; verify the full envelope signature
 # and payload invariants before the release binaries are compiled.
@@ -87,8 +93,15 @@ RUN apk add --no-cache ca-certificates tzdata wget && \
     addgroup -g 1000 enclava && \
     adduser -D -u 1000 -G enclava enclava
 
+# The pinned sigstore public-good trust root (TUF-verified target, see
+# scripts/verify-sigstore-trust-root.sh). The release API refuses to verify
+# cosign signatures without it: cosign.rs only honors a file-backed
+# SIGSTORE_TUF_ROOT_PATH in release builds and never bootstraps trust from
+# the network at runtime.
 COPY --from=release-builder /usr/local/bin/enclava-api /usr/local/bin/enclava-api
 COPY --from=release-builder /usr/local/bin/cap-migrate /usr/local/bin/cap-migrate
+COPY crates/enclava-api/trust-roots/sigstore-public-good-1.root.json /etc/enclava/sigstore/trusted_root.json
+ENV SIGSTORE_TUF_ROOT_PATH=/etc/enclava/sigstore/trusted_root.json
 RUN chown enclava:enclava /usr/local/bin/enclava-api /usr/local/bin/cap-migrate
 
 USER enclava

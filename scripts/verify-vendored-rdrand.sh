@@ -50,24 +50,37 @@ fi
 
 # No file may exist in the vendor dir that is absent from the pristine
 # tarball (e.g. a smuggled build.rs) — the vendored tree must be exactly
-# the tarball contents plus the reviewed patch.
+# the tarball contents plus the reviewed patch. Symlinks and every other
+# non-regular entry are rejected outright: a tracked symlink such as
+# build.rs -> ../../elsewhere/build.rs is invisible to a regular-files-only
+# scan, yet cargo follows it and executes the target as a build script.
 while IFS= read -r -d '' f; do
     rel="${f#"$VENDOR_DIR"/}"
+    if [[ -L "$f" || ! -f "$f" ]]; then
+        echo "verify-vendored-rdrand: non-regular entry (symlink?) not allowed: $rel" >&2
+        exit 1
+    fi
     if [[ ! -e "$work/rdrand-0.8.3/$rel" ]]; then
         echo "verify-vendored-rdrand: extra file not in pristine tarball: $rel" >&2
         exit 1
     fi
-done < <(find "$VENDOR_DIR" -type f -print0)
+done < <(find "$VENDOR_DIR" -mindepth 1 ! -type d -print0)
 
-# The reviewed delta covers only Cargo.toml and src/lib.rs; every other
-# vendored file must be byte-identical to the tarball.
-for f in src/errors.rs src/changelog.rs LICENSE; do
-    if ! diff -q "$work/rdrand-0.8.3/$f" "$VENDOR_DIR/$f" >/dev/null; then
-        echo "verify-vendored-rdrand: unexpected delta in $f (must be pristine)" >&2
-        diff -u "$work/rdrand-0.8.3/$f" "$VENDOR_DIR/$f" || true
+# Every vendored file except the two the reviewed patch touches
+# (Cargo.toml, src/lib.rs) must be byte-identical to the pristine tarball;
+# previously only src/errors.rs, src/changelog.rs and LICENSE were covered,
+# leaving every other pristine file unverified.
+while IFS= read -r -d '' f; do
+    rel="${f#"$VENDOR_DIR"/}"
+    if [[ "$rel" == "Cargo.toml" || "$rel" == "src/lib.rs" ]]; then
+        continue
+    fi
+    if ! diff -q "$work/rdrand-0.8.3/$rel" "$f" >/dev/null; then
+        echo "verify-vendored-rdrand: unexpected delta in $rel (must be pristine)" >&2
+        diff -u "$work/rdrand-0.8.3/$rel" "$f" || true
         exit 1
     fi
-done
+done < <(find "$VENDOR_DIR" -type f -print0)
 
 {
     diff -u --label a/Cargo.toml --label b/Cargo.toml \

@@ -77,6 +77,12 @@ spec:
             secretKeyRef:
               name: api-secrets
               key: tenant-dns-target
+        # Release images ship the pinned sigstore public-good TUF root at
+        # /etc/enclava/sigstore/trusted_root.json (see the API Dockerfile);
+        # restating the path here makes the deployment contract explicit.
+        # The API fails cosign verification — by design — without it.
+        - name: SIGSTORE_TUF_ROOT_PATH
+          value: /etc/enclava/sigstore/trusted_root.json
         resources:
           requests:
             cpu: 100m
