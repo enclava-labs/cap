@@ -164,9 +164,12 @@ Release verification checks:
 - envelope signature against `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`;
 - digest pins for platform sidecar images;
 - HTTPS Trustee KBS URL;
+- HTTPS tenant Caddy ACME CA URL;
 - genpolicy version;
 - policy template hash;
-- runtime class expected by the engine.
+- runtime class expected by the engine;
+- when `ENCLAVA_PLATFORM_RELEASE_PATH` overrides the bundle: the override
+  is not older than the bundled release (downgrade refused).
 
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.

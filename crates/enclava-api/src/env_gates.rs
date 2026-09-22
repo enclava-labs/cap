@@ -49,6 +49,13 @@ fn validate_acme_directory_url(
     value: &str,
     production_acme_allowed: bool,
 ) -> Result<(), EnvGateError> {
+    // Cleartext ACME directory URLs would leak ACME account credentials and
+    // challenge traffic; same rule as the signed-release field and
+    // TRUSTEE_KBS_URL. Parsing makes the scheme check case-insensitive
+    // (`HTTP://` must not slip a prefix check).
+    if http_scheme(value) {
+        return Err(EnvGateError::DebugOnlyFlagInRelease(source_name));
+    }
     if is_letsencrypt_production_acme_url(value) && !production_acme_allowed {
         return Err(EnvGateError::ProductionAcmeWithoutExplicitAllow(
             source_name,
@@ -430,5 +437,33 @@ mod tests {
             "https://acme-v02.api.letsencrypt.org/directory",
         );
         run(env, false).expect("explicit production ACME override should be allowed");
+    }
+
+    #[test]
+    fn release_rejects_cleartext_acme_directory_urls() {
+        for name in ["ACME_DIRECTORY_URL", "TENANT_CADDY_ACME_CA"] {
+            let mut env = ok_required();
+            env.insert(
+                name,
+                "http://acme-staging-v02.api.letsencrypt.org/directory",
+            );
+            let err = run(env, false).unwrap_err();
+            assert!(
+                matches!(err, EnvGateError::DebugOnlyFlagInRelease(rejected) if rejected == name),
+                "{name} http URL must be rejected in release builds"
+            );
+
+            // Scheme parsing is case-insensitive: HTTP:// must not slip a
+            // prefix-shaped check.
+            let mut env = ok_required();
+            env.insert(
+                name,
+                "HTTP://acme-staging-v02.api.letsencrypt.org/directory",
+            );
+            assert!(matches!(
+                run(env, false).unwrap_err(),
+                EnvGateError::DebugOnlyFlagInRelease(_)
+            ));
+        }
     }
 }

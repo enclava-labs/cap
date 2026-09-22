@@ -456,12 +456,20 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: "internal mode is only allowed for dev fixtures/local tests".to_string(),
         });
     }
-    reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
+    let acme_url = reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
         PlatformReleaseError::InvalidField {
             field: "tenant_caddy_acme_ca",
             message: err.to_string(),
         }
     })?;
+    // Cleartext ACME directory URLs would leak ACME account credentials;
+    // same rule as the KBS URL.
+    if acme_url.scheme() != "https" {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_acme_ca",
+            message: "scheme must be https".to_string(),
+        });
+    }
     if release.genpolicy_version.trim().is_empty()
         || release.genpolicy_version.contains("unconfigured")
         || release.genpolicy_version.contains("unpinned")
@@ -669,6 +677,19 @@ mod tests {
             assert!(image.contains("@sha256:"));
             assert!(!image.contains("ttl.sh/"));
         }
+    }
+
+    #[test]
+    fn release_payload_rejects_http_acme_ca() {
+        let mut payload = serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+            .unwrap()
+            .payload;
+        payload.tenant_caddy_acme_ca =
+            "http://acme-staging-v02.api.letsencrypt.org/directory".into();
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca")
+        );
     }
 
     #[test]

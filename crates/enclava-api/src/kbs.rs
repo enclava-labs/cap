@@ -68,6 +68,10 @@ pub enum KbsPolicyError {
     ArtifactNotCurrent,
     #[error("signed KBS policy compare-and-swap retries were exhausted")]
     PolicyCasExhausted,
+    #[error(
+        "resource-policy.rego managed marker is malformed: {0} (markers must be line-anchored and unique)"
+    )]
+    MalformedManagedMarkers(String),
     #[error("Trustee deployment rollout timed out")]
     RolloutTimedOut,
 }
@@ -1463,8 +1467,7 @@ fn replace_tls_resource_bindings_block(
     let marker = "resource_bindings := {";
     let cap_begin = "# BEGIN CAP MANAGED TLS RESOURCE BINDINGS";
     let cap_end = "# END CAP MANAGED TLS RESOURCE BINDINGS";
-    let start = policy
-        .find(marker)
+    let start = find_binding_assignment(policy, marker)
         .ok_or(KbsPolicyError::MissingResourceBindingsBlock)?;
     replace_bindings_block(
         policy,
@@ -1483,9 +1486,8 @@ fn replace_owner_bindings_block(
     let marker = "owner_resource_bindings := {";
     let cap_begin = "# BEGIN CAP MANAGED OWNER BINDINGS";
     let cap_end = "# END CAP MANAGED OWNER BINDINGS";
-    let start = policy
-        .find(marker)
-        .ok_or(KbsPolicyError::MissingOwnerBindingsBlock)?;
+    let start =
+        find_binding_assignment(policy, marker).ok_or(KbsPolicyError::MissingOwnerBindingsBlock)?;
     replace_bindings_block(
         policy,
         marker,
@@ -1494,6 +1496,65 @@ fn replace_owner_bindings_block(
         cap_end,
         &render_cap_owner_bindings_section(bindings),
     )
+}
+
+/// Locate `marker` only where it is the line's leading token (nothing but
+/// whitespace between the previous newline and the marker). A binding
+/// assignment quoted inside a string or trailing a comment no longer
+/// hijacks the splice, and `resource_bindings := {` no longer matches the
+/// tail of an `owner_resource_bindings := {` line.
+fn find_binding_assignment(policy: &str, marker: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(relative) = policy[from..].find(marker) {
+        let at = from + relative;
+        let line_start = policy[..at].rfind('\n').map(|index| index + 1).unwrap_or(0);
+        if policy[line_start..at].chars().all(char::is_whitespace) {
+            return Some(at);
+        }
+        from = at + marker.len();
+    }
+    None
+}
+
+/// Locate `marker` only where it occupies a whole line (optional leading
+/// indentation, nothing but whitespace after it). Returns the byte offset of
+/// the marker itself, `None` when absent, and errors when the marker line
+/// appears more than once — an ambiguous splice target must fail closed
+/// instead of silently replacing the wrong span.
+fn find_managed_marker_unique(
+    haystack: &str,
+    marker: &str,
+    label: &str,
+) -> Result<Option<usize>, KbsPolicyError> {
+    let mut hits: Vec<usize> = Vec::new();
+    let mut from = 0;
+    while let Some(relative) = haystack[from..].find(marker) {
+        let at = from + relative;
+        let line_start = haystack[..at]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let line_end = haystack[at..]
+            .find('\n')
+            .map(|offset| at + offset)
+            .unwrap_or(haystack.len());
+        let occupies_whole_line = haystack[line_start..at].chars().all(char::is_whitespace)
+            && haystack[at + marker.len()..line_end]
+                .chars()
+                .all(char::is_whitespace);
+        if occupies_whole_line {
+            hits.push(at);
+        }
+        from = at + marker.len();
+    }
+    match hits.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(*only)),
+        _ => Err(KbsPolicyError::MalformedManagedMarkers(format!(
+            "{label} appears {} times",
+            hits.len()
+        ))),
+    }
 }
 
 fn replace_bindings_block(
@@ -1534,20 +1595,35 @@ fn replace_bindings_block(
     let block_body_end = end - 1;
     let block_body = &policy[block_body_start..block_body_end];
 
-    if let (Some(begin_rel), Some(end_rel)) = (block_body.find(cap_begin), block_body.find(cap_end))
-    {
-        let begin = block_body_start + begin_rel;
-        let end_marker_end = block_body_start + end_rel + cap_end.len();
-        let line_end = policy[end_marker_end..]
-            .find('\n')
-            .map(|offset| end_marker_end + offset)
-            .unwrap_or(end_marker_end);
+    // Markers must sit on their own line and appear at most once inside the
+    // block; a marker string embedded mid-line in a policy value or comment
+    // is not a splice point, and a half-present or inverted marker pair is a
+    // corrupted block that must fail closed rather than be mis-spliced.
+    let begin_hit =
+        find_managed_marker_unique(block_body, cap_begin, "managed-block BEGIN marker")?;
+    let end_hit = find_managed_marker_unique(block_body, cap_end, "managed-block END marker")?;
 
-        let mut next = String::with_capacity(policy.len() + cap_section.len());
-        next.push_str(&policy[..begin]);
-        next.push_str(cap_section.trim_start_matches(','));
-        next.push_str(&policy[line_end..]);
-        return Ok(next);
+    match (begin_hit, end_hit) {
+        (None, None) => {}
+        (Some(begin_rel), Some(end_rel)) if begin_rel < end_rel => {
+            let begin = block_body_start + begin_rel;
+            let end_marker_end = block_body_start + end_rel + cap_end.len();
+            let line_end = policy[end_marker_end..]
+                .find('\n')
+                .map(|offset| end_marker_end + offset)
+                .unwrap_or(end_marker_end);
+
+            let mut next = String::with_capacity(policy.len() + cap_section.len());
+            next.push_str(&policy[..begin]);
+            next.push_str(cap_section.trim_start_matches(','));
+            next.push_str(&policy[line_end..]);
+            return Ok(next);
+        }
+        _ => {
+            return Err(KbsPolicyError::MalformedManagedMarkers(
+                "BEGIN present without a following END marker".to_string(),
+            ));
+        }
     }
 
     let section = if block_body.trim().is_empty() {
@@ -1835,6 +1911,116 @@ owner_resource_bindings := {}
         ));
         assert!(next.contains("BEGIN CAP MANAGED TLS RESOURCE BINDINGS"));
         assert!(next.contains("owner_resource_bindings := {}"));
+    }
+
+    #[test]
+    fn tls_splice_targets_the_resource_bindings_line_not_the_owner_suffix() {
+        // `resource_bindings := {` is a suffix of
+        // `owner_resource_bindings := {`; an unanchored find() splices the
+        // owner block (or the wrong span) when the owner map comes first.
+        let policy = r#"package policy
+
+owner_resource_bindings := {
+  "owner": {"repository": "default"}
+}
+
+resource_bindings := {
+  "legacy": {"repository": "default"}
+}
+"#;
+
+        let next = replace_tls_resource_bindings_block(policy, &[tls_binding("cap-tls")]).unwrap();
+        // The owner block survives untouched...
+        assert!(next.contains("\"owner\""));
+        assert!(!next.contains("BEGIN CAP MANAGED OWNER BINDINGS"));
+        // ...and the CAP TLS section lands inside resource_bindings.
+        let tls_pos = next
+            .find("BEGIN CAP MANAGED TLS RESOURCE BINDINGS")
+            .unwrap();
+        let rb_pos = next.find("resource_bindings := {").unwrap();
+        let owner_pos = next.find("owner_resource_bindings := {").unwrap();
+        assert!(
+            owner_pos < rb_pos,
+            "owner block must come first for the suffix trap"
+        );
+        assert!(rb_pos < tls_pos);
+    }
+
+    #[test]
+    fn marker_embedded_mid_line_is_not_a_splice_point() {
+        // A marker string quoted inside a policy value or trailing a comment
+        // must not be treated as the managed block; only whole-line markers
+        // are splice points.
+        let policy = r#"package policy
+
+owner_resource_bindings := {
+  "legacy": {"repository": "default"},
+  # note: see also # BEGIN CAP MANAGED OWNER BINDINGS elsewhere
+  "doc": "the string # END CAP MANAGED OWNER BINDINGS is documented"
+}
+"#;
+
+        let next = replace_owner_bindings_block(policy, &[binding("new-owner")]).unwrap();
+        // The legacy entries and embedded marker texts survive; the fresh CAP
+        // section is inserted (no whole-line markers existed to replace).
+        assert!(next.contains("\"legacy\""));
+        assert!(next.contains("\"doc\""));
+        assert!(next.contains("see also # BEGIN CAP MANAGED OWNER BINDINGS elsewhere"));
+        assert!(next.contains("\"new-owner\""));
+    }
+
+    #[test]
+    fn duplicate_whole_line_markers_fail_closed() {
+        let policy = r#"owner_resource_bindings := {
+  # BEGIN CAP MANAGED OWNER BINDINGS
+  "first": {"repository": "default"}
+  # END CAP MANAGED OWNER BINDINGS
+  # BEGIN CAP MANAGED OWNER BINDINGS
+  "second": {"repository": "default"}
+  # END CAP MANAGED OWNER BINDINGS
+}
+"#;
+
+        let err = replace_owner_bindings_block(policy, &[binding("new-owner")]).unwrap_err();
+        assert!(matches!(err, KbsPolicyError::MalformedManagedMarkers(_)));
+    }
+
+    #[test]
+    fn end_marker_without_begin_fails_closed() {
+        let policy = r#"owner_resource_bindings := {
+  "legacy": {"repository": "default"},
+  # END CAP MANAGED OWNER BINDINGS
+}
+"#;
+
+        let err = replace_owner_bindings_block(policy, &[binding("new-owner")]).unwrap_err();
+        assert!(matches!(err, KbsPolicyError::MalformedManagedMarkers(_)));
+    }
+
+    #[test]
+    fn binding_assignment_embedded_in_string_is_ignored() {
+        // The assignment marker quoted inside a value must not seed the
+        // brace matcher; the real line-start assignment is the splice target.
+        let policy = r#"package policy
+
+owner_resource_bindings := {
+  "doc": "resource_bindings := { is documented"
+}
+
+resource_bindings := {
+  "legacy": {"repository": "default"}
+}
+"#;
+
+        let next = replace_tls_resource_bindings_block(policy, &[tls_binding("cap-tls")]).unwrap();
+        assert!(next.contains("\"doc\""));
+        assert!(next.contains("\"legacy\""));
+        assert!(next.contains("\"cap-tls\""));
+        // Exactly one real assignment line each, still intact (the third
+        // substring match is the doc string, the owner line doubles as a
+        // resource_bindings substring match).
+        assert_eq!(next.matches("resource_bindings := {").count(), 3);
+        assert_eq!(next.matches("owner_resource_bindings := {").count(), 1);
     }
 
     fn test_signed_policy_artifact(

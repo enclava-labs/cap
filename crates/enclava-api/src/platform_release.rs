@@ -97,6 +97,15 @@ pub enum PlatformReleaseError {
     BadSignature(String),
     #[error("policy_template_sha256 does not match policy_template_text")]
     TemplateHashMismatch,
+    #[error(
+        "platform release downgrade refused: override is {override_version} ({override_created}) but the API bundles {bundled_version} ({bundled_created}); refusing a validly-signed stale release"
+    )]
+    DowngradeRefused {
+        override_version: String,
+        override_created: String,
+        bundled_version: String,
+        bundled_created: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,14 +162,67 @@ impl PlatformRelease {
 
 impl PlatformReleaseEnvelope {
     pub fn load_verified() -> Result<Self, PlatformReleaseError> {
+        let override_active = matches!(std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH"), Ok(path) if !path.trim().is_empty());
         let raw = match std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH") {
             Ok(path) if !path.trim().is_empty() => std::fs::read_to_string(Path::new(&path))?,
             _ => BUNDLED_PLATFORM_RELEASE.to_string(),
         };
+        Self::load_verified_from_raw(raw, override_active)
+    }
+
+    fn load_verified_from_raw(
+        raw: String,
+        override_active: bool,
+    ) -> Result<Self, PlatformReleaseError> {
         let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
         verify_envelope(envelope.clone())?;
+        // Downgrade protection: an env-path override may never be older than
+        // the release compiled into this binary. A validly-signed stale
+        // release (pinned to old measurements/sidecar digests) is exactly
+        // what a file-swap or env-var attack serves. Parity with the CLI's
+        // `enforce_release_not_older_than_bundled` gate.
+        if override_active {
+            enforce_release_not_older_than_bundled(&envelope.payload)?;
+        }
         Ok(envelope)
     }
+}
+
+/// Reject `release` when it is older than the release compiled into this
+/// binary. Ordering by the signed creation timestamp;
+/// `platform_release_version` is opaque, so distinct releases at the same
+/// timestamp are unorderable and fail closed rather than using the
+/// identifier as a tiebreak. A malformed bundled baseline also fails closed
+/// rather than silently disabling the check.
+pub fn enforce_release_not_older_than_bundled(
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
+    let candidate_ts = parse_release_timestamp(&release.created_at)?;
+    let bundled_ts = parse_release_timestamp(&bundled.payload.created_at)?;
+    if candidate_ts < bundled_ts
+        || (candidate_ts == bundled_ts
+            && release.platform_release_version != bundled.payload.platform_release_version)
+    {
+        return Err(PlatformReleaseError::DowngradeRefused {
+            override_version: release.platform_release_version.clone(),
+            override_created: release.created_at.clone(),
+            bundled_version: bundled.payload.platform_release_version.clone(),
+            bundled_created: bundled.payload.created_at.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_release_timestamp(
+    value: &str,
+) -> Result<chrono::DateTime<chrono::FixedOffset>, PlatformReleaseError> {
+    chrono::DateTime::parse_from_rfc3339(value).map_err(|error| {
+        PlatformReleaseError::InvalidField {
+            field: "created_at",
+            message: format!("must be RFC3339: {error}"),
+        }
+    })
 }
 
 pub fn verify_envelope(
@@ -347,12 +409,21 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: "internal mode is only allowed for dev fixtures/local tests".to_string(),
         });
     }
-    reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
+    let acme_url = reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
         PlatformReleaseError::InvalidField {
             field: "tenant_caddy_acme_ca",
             message: err.to_string(),
         }
     })?;
+    // The tenant Caddyfile is rendered from this value; a cleartext ACME
+    // directory URL would leak ACME account credentials and challenge
+    // traffic. Mirror of the KBS URL rule.
+    if acme_url.scheme() != "https" {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_acme_ca",
+            message: "scheme must be https".to_string(),
+        });
+    }
     if release.genpolicy_version.trim().is_empty()
         || release.genpolicy_version.contains("unconfigured")
         || release.genpolicy_version.contains("unpinned")
@@ -475,6 +546,136 @@ mod tests {
         let err = validate_release_payload(&payload).unwrap_err();
         assert!(
             matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "created_at")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_http_acme_ca() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.tenant_caddy_acme_ca =
+            "http://acme-staging-v02.api.letsencrypt.org/directory".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_non_http_acme_ca() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.tenant_caddy_acme_ca = "ftp://acme.example.test/directory".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca")
+        );
+    }
+
+    fn bundled_payload() -> PlatformRelease {
+        serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+            .unwrap()
+            .payload
+    }
+
+    #[test]
+    fn bundled_not_older_than_itself_and_newer_passes() {
+        let bundled = bundled_payload();
+        assert!(enforce_release_not_older_than_bundled(&bundled).is_ok());
+
+        let mut newer = bundled.clone();
+        newer.created_at = "2999-01-01T00:00:00Z".to_string();
+        newer.platform_release_version = "dev-2999.01.01-x".to_string();
+        assert!(enforce_release_not_older_than_bundled(&newer).is_ok());
+    }
+
+    #[test]
+    fn older_than_bundle_is_refused_regardless_of_version_suffix() {
+        let mut stale = bundled_payload();
+        stale.created_at = "2020-01-01T00:00:00Z".to_string();
+        stale.platform_release_version = "zzz-newer-suffix".to_string();
+        assert!(matches!(
+            enforce_release_not_older_than_bundled(&stale),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn equal_timestamp_divergent_version_fails_closed() {
+        let mut divergent = bundled_payload();
+        divergent.platform_release_version =
+            format!("{}-divergent", divergent.platform_release_version);
+        assert!(matches!(
+            enforce_release_not_older_than_bundled(&divergent),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn unparseable_override_timestamp_is_rejected_not_ignored() {
+        let mut broken = bundled_payload();
+        broken.created_at = "not-a-timestamp".to_string();
+        assert!(matches!(
+            enforce_release_not_older_than_bundled(&broken),
+            Err(PlatformReleaseError::InvalidField {
+                field: "created_at",
+                ..
+            })
+        ));
+    }
+
+    fn resigned_envelope_with_created_at(created_at: &str) -> String {
+        use ed25519_dalek::{Signer, SigningKey};
+        // The committed fixture key (DEV_FIXTURE_SIGNING_KEY_HEX in
+        // crates/enclava-cli/scripts/generate-platform-release.py) matches
+        // the test root pinned below, so the re-signed envelope is
+        // "validly signed" for verify_envelope.
+        let key = SigningKey::from_bytes(&[0xc0; 32]);
+        let mut envelope =
+            serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE).unwrap();
+        envelope.payload.created_at = created_at.to_string();
+        envelope.payload.platform_release_version =
+            format!("dev-stale-{}", created_at).replace(':', "");
+        let canonical = canonical_platform_release_bytes(&envelope.payload).unwrap();
+        envelope.signature = hex::encode(key.sign(&canonical).to_bytes());
+        envelope.signing_pubkey = hex::encode(key.verifying_key().as_bytes());
+        serde_json::to_string(&envelope).unwrap()
+    }
+
+    #[test]
+    fn env_override_path_rejects_validly_signed_stale_release() {
+        // A stale envelope that PASSES signature verification must still be
+        // refused when it arrives via the ENCLAVA_PLATFORM_RELEASE_PATH
+        // override lane.
+        let stale_raw = resigned_envelope_with_created_at("2020-06-01T00:00:00Z");
+        // Signature/root verification alone accepts it...
+        let parsed: PlatformReleaseEnvelope = serde_json::from_str(&stale_raw).unwrap();
+        assert!(verify_envelope(parsed).is_ok());
+        // ...but the override lane refuses the downgrade.
+        assert!(matches!(
+            PlatformReleaseEnvelope::load_verified_from_raw(stale_raw, true),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn env_override_path_accepts_validly_signed_newer_release() {
+        let newer_raw = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        assert!(PlatformReleaseEnvelope::load_verified_from_raw(newer_raw, true).is_ok());
+    }
+
+    #[test]
+    fn bundled_lane_skips_the_downgrade_gate() {
+        // The bundled release passes even though it is "the same age" as
+        // itself; the gate only applies to the override lane.
+        assert!(
+            PlatformReleaseEnvelope::load_verified_from_raw(
+                BUNDLED_PLATFORM_RELEASE.to_string(),
+                false
+            )
+            .is_ok()
         );
     }
 }

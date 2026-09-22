@@ -140,8 +140,8 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
         raise ValueError(
             "tenant_caddy_tls_mode=internal is only allowed with --dev-fixture-key"
         )
-    if not payload["tenant_caddy_acme_ca"].startswith(("http://", "https://")):
-        raise ValueError("tenant_caddy_acme_ca must be http or https")
+    if not payload["tenant_caddy_acme_ca"].startswith("https://"):
+        raise ValueError("tenant_caddy_acme_ca must be https")
     hex32_bytes("signing_service_pubkey_hex", payload["signing_service_pubkey_hex"])
     hex32_bytes("policy_template_sha256", payload["policy_template_sha256"])
     hex32_bytes(
