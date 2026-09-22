@@ -27,7 +27,7 @@ fn open_spool_nofollow(path: &Path) -> io::Result<File> {
 
 #[derive(Clone, Debug)]
 pub struct LogRelayConfig {
-    pub bind: String,
+    pub bind: std::net::SocketAddr,
     pub spool_path: PathBuf,
     pub container: String,
 }
@@ -59,7 +59,13 @@ impl LogRelayConfig {
 /// bind is ever allowed. A host-controlled `ENCLAVA_LOG_RELAY_BIND` pointing
 /// off-loopback (including wildcard 0.0.0.0/::) must fail closed instead of
 /// exposing the relay pod-wide.
-fn require_loopback_bind(bind: &str) -> io::Result<String> {
+///
+/// Resolves the bind string once and returns the validated `SocketAddr`:
+/// callers bind that exact address. Returning the original string (and
+/// letting `TcpListener::bind` resolve it again) would let a host
+/// controlling DNS answer validation with a loopback address and binding
+/// with a pod-reachable one (TOCTOU re-resolution).
+fn require_loopback_bind(bind: &str) -> io::Result<std::net::SocketAddr> {
     use std::net::ToSocketAddrs;
     let invalid = || {
         io::Error::new(
@@ -73,8 +79,8 @@ fn require_loopback_bind(bind: &str) -> io::Result<String> {
         .next()
         .ok_or_else(invalid)?;
     match addr.ip() {
-        std::net::IpAddr::V4(ip) if ip.is_loopback() => Ok(bind.to_string()),
-        std::net::IpAddr::V6(ip) if ip.is_loopback() => Ok(bind.to_string()),
+        std::net::IpAddr::V4(ip) if ip.is_loopback() => Ok(addr),
+        std::net::IpAddr::V6(ip) if ip.is_loopback() => Ok(addr),
         _ => Err(invalid()),
     }
 }
@@ -84,13 +90,13 @@ pub fn run_from_env() -> io::Result<()> {
 }
 
 pub fn spawn(config: LogRelayConfig) -> io::Result<thread::JoinHandle<()>> {
-    let listener = TcpListener::bind(&config.bind)?;
+    let listener = TcpListener::bind(config.bind)?;
     eprintln!("enclava-log-relay: listening on {}", config.bind);
     Ok(thread::spawn(move || serve(listener, config)))
 }
 
 pub fn run(config: LogRelayConfig) -> io::Result<()> {
-    let listener = TcpListener::bind(&config.bind)?;
+    let listener = TcpListener::bind(config.bind)?;
     eprintln!("enclava-log-relay: listening on {}", config.bind);
     serve(listener, config);
     Ok(())
@@ -299,7 +305,11 @@ mod tests {
     #[test]
     fn loopback_binds_are_accepted() {
         for bind in ["127.0.0.1:8082", "localhost:8082", "[::1]:9000"] {
-            assert_eq!(require_loopback_bind(bind).unwrap(), bind);
+            let addr = require_loopback_bind(bind).unwrap();
+            assert!(addr.ip().is_loopback(), "{bind}: {addr}");
+            // The validated address is what gets bound: no string
+            // re-resolution at TcpListener::bind time.
+            assert_eq!(addr.port().to_string(), bind.rsplit(':').next().unwrap());
         }
     }
 

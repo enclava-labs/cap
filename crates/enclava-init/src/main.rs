@@ -210,33 +210,90 @@ fn start_log_relay_if_configured() -> Result<Option<std::thread::JoinHandle<()>>
 }
 
 fn ready_file_path() -> PathBuf {
-    env_override("ENCLAVA_INIT_READY_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_READY_FILE))
+    init_surface_path("ENCLAVA_INIT_READY_FILE", DEFAULT_READY_FILE)
 }
 
 fn error_file_path() -> PathBuf {
-    env_override("ENCLAVA_INIT_ERROR_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_ERROR_FILE))
+    init_surface_path("ENCLAVA_INIT_ERROR_FILE", DEFAULT_ERROR_FILE)
 }
 
 fn acme_cooldown_file_path() -> PathBuf {
-    env_override("ENCLAVA_INIT_ACME_COOLDOWN_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_ACME_COOLDOWN_FILE))
+    init_surface_path(
+        "ENCLAVA_INIT_ACME_COOLDOWN_FILE",
+        DEFAULT_ACME_COOLDOWN_FILE,
+    )
 }
 
 fn stage_file_path() -> PathBuf {
-    env_override("ENCLAVA_INIT_STAGE_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_STAGE_FILE))
+    init_surface_path("ENCLAVA_INIT_STAGE_FILE", DEFAULT_STAGE_FILE)
 }
 
 fn started_dir_path() -> PathBuf {
-    env_override("ENCLAVA_INIT_STARTED_DIR")
+    init_surface_path("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers")
+}
+
+/// Resolve the path of an init output surface (ready/error/stage/started/
+/// termination/cooldown files).
+///
+/// Prod-strict builds bind these surfaces to the compiled defaults only:
+/// [`env_override`] returns `None`, so the host-controlled pod environment
+/// can never redirect them. Test builds (cfg(test) — compiled exclusively
+/// for the test harness, never into release binaries) additionally consult
+/// an in-process override map so the failure-path tests can redirect the
+/// surfaces into a temp directory even under `--features prod-strict`,
+/// without reopening the env bypass those tests would otherwise need.
+fn init_surface_path(name: &str, default: &str) -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = test_surface_paths::get(name) {
+        return path;
+    }
+    env_override(name)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/run/enclava/containers"))
+        .unwrap_or_else(|| PathBuf::from(default))
+}
+
+#[cfg(test)]
+mod test_surface_paths {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    static OVERRIDES: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
+
+    fn lock() -> MutexGuard<'static, Option<HashMap<String, PathBuf>>> {
+        // A poisoned lock only means some earlier test panicked while
+        // holding it; the map itself is still structurally valid.
+        OVERRIDES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn get(name: &str) -> Option<PathBuf> {
+        lock().as_ref().and_then(|map| map.get(name).cloned())
+    }
+
+    /// Install path overrides for the named init surfaces, returning a
+    /// guard that restores the previous state on drop. Installed values
+    /// take precedence over the environment in test builds only. The
+    /// snapshot/restore semantics keep an inner guard's drop from
+    /// un-redirecting an outer guard's surfaces.
+    pub fn install(entries: &[(&'static str, PathBuf)]) -> Guard {
+        let mut slot = lock();
+        let previous = slot.take();
+        let map = slot.get_or_insert_with(HashMap::new);
+        for (name, path) in entries {
+            map.insert((*name).to_string(), path.clone());
+        }
+        Guard { previous }
+    }
+
+    pub struct Guard {
+        previous: Option<HashMap<String, PathBuf>>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *lock() = self.previous.take();
+        }
+    }
 }
 
 #[path = "main/init_stats.rs"]
@@ -281,9 +338,8 @@ fn record_failure_file(safe_json: &str) {
     if let Err(err) = writes::atomic_write(&path, body.as_bytes(), 0o644) {
         eprintln!("enclava-init: failed to write init error file: {err}");
     }
-    let termination_path = env_override("ENCLAVA_INIT_TERMINATION_LOG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/dev/termination-log"));
+    let termination_path =
+        init_surface_path("ENCLAVA_INIT_TERMINATION_LOG", "/dev/termination-log");
     if let Err(err) = write_termination_log_in_place(&termination_path, body.as_bytes()) {
         eprintln!("enclava-init: failed to write termination log: {err}");
     }

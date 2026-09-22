@@ -34,6 +34,27 @@ const TERMINATION_SIGNALS: [Signal; 4] = [
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
+/// Read a host-mutable env override for a wait-exec operational parameter
+/// (ready-file and started-dir paths).
+///
+/// Prod-strict builds bind operational behavior to the compiled defaults
+/// only: the pod environment is host-controlled and unbound to the signed
+/// cc_init_data, so honoring it there would let a tampered host point this
+/// process at a planted "ready" file (starting the workload before init
+/// verifies policy and releases seeds) or desync the started-dir sentinel
+/// handshake with enclava-init. Overrides are honored exclusively in
+/// non-prod-strict (dev/CI debug) builds; mirrors enclava_init::env_override.
+fn env_override(name: &str) -> Option<OsString> {
+    env_override_for(env::var_os(name))
+}
+
+fn env_override_for(raw: Option<OsString>) -> Option<OsString> {
+    if cfg!(feature = "prod-strict") {
+        return None;
+    }
+    raw
+}
+
 fn main() {
     if let Err(err) = run(env::args_os().skip(1).collect()) {
         eprintln!("enclava-wait-exec: {err}");
@@ -45,10 +66,10 @@ fn run(argv: Vec<OsString>) -> Result<(), String> {
     let name = env::var("ENCLAVA_CONTAINER_NAME").unwrap_or_else(|_| "unknown".to_string());
     validate_sentinel_name(&name)?;
 
-    let started_dir = env::var_os("ENCLAVA_STARTED_DIR")
+    let started_dir = env_override("ENCLAVA_STARTED_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STARTED_DIR));
-    let ready_file = env::var_os("ENCLAVA_INIT_READY_FILE")
+    let ready_file = env_override("ENCLAVA_INIT_READY_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_READY_FILE));
 
@@ -513,6 +534,38 @@ mod tests {
         assert!(ready_file_is_ready(&ready));
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "prod-strict")]
+    #[test]
+    fn prod_strict_ignores_env_overrides() {
+        assert!(env_override_for(Some(OsString::from("/tmp/planted"))).is_none());
+        assert!(env_override_for(None).is_none());
+    }
+
+    #[cfg(not(feature = "prod-strict"))]
+    #[test]
+    fn dev_builds_honor_env_overrides() {
+        assert_eq!(
+            env_override_for(Some(OsString::from("/tmp/override"))),
+            Some(OsString::from("/tmp/override"))
+        );
+        assert!(env_override_for(None).is_none());
+    }
+
+    #[test]
+    fn prod_strict_pins_readiness_paths_to_compiled_defaults() {
+        let source = include_str!("main.rs").replace("\r\n", "\n");
+        for var in ["ENCLAVA_INIT_READY_FILE", "ENCLAVA_STARTED_DIR"] {
+            assert!(
+                !source.contains(&format!("env::var_os(\"{var}\")")),
+                "{var} must be read via env_override, not env::var_os"
+            );
+            assert!(
+                source.contains(&format!("env_override(\"{var}\")")),
+                "{var} must resolve through env_override"
+            );
+        }
     }
 
     #[test]

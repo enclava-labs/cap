@@ -42,6 +42,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedMaker {
 
 struct FailureEnvGuard {
     _dir: tempfile::TempDir,
+    _surface_overrides: test_surface_paths::Guard,
     error: PathBuf,
     termination: PathBuf,
     stage: PathBuf,
@@ -50,27 +51,23 @@ struct FailureEnvGuard {
 impl FailureEnvGuard {
     fn install() -> Self {
         let dir = tempdir().unwrap();
-        let guard = Self {
-            error: dir.path().join("init-error"),
-            termination: dir.path().join("termination-log"),
-            stage: dir.path().join("init-stage"),
+        let error = dir.path().join("init-error");
+        let termination = dir.path().join("termination-log");
+        let stage = dir.path().join("init-stage");
+        // Test-only in-process path overrides: unlike env vars, these work
+        // under --features prod-strict (where env_override is compiled out),
+        // so the failure-path binary suite stays exercisable there.
+        let _surface_overrides = test_surface_paths::install(&[
+            ("ENCLAVA_INIT_ERROR_FILE", error.clone()),
+            ("ENCLAVA_INIT_TERMINATION_LOG", termination.clone()),
+            ("ENCLAVA_INIT_STAGE_FILE", stage.clone()),
+        ]);
+        Self {
             _dir: dir,
-        };
-        unsafe {
-            std::env::set_var("ENCLAVA_INIT_ERROR_FILE", &guard.error);
-            std::env::set_var("ENCLAVA_INIT_TERMINATION_LOG", &guard.termination);
-            std::env::set_var("ENCLAVA_INIT_STAGE_FILE", &guard.stage);
-        }
-        guard
-    }
-}
-
-impl Drop for FailureEnvGuard {
-    fn drop(&mut self) {
-        unsafe {
-            std::env::remove_var("ENCLAVA_INIT_ERROR_FILE");
-            std::env::remove_var("ENCLAVA_INIT_TERMINATION_LOG");
-            std::env::remove_var("ENCLAVA_INIT_STAGE_FILE");
+            _surface_overrides,
+            error,
+            termination,
+            stage,
         }
     }
 }

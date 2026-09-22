@@ -194,6 +194,9 @@ mod tests {
     #[test]
     fn prod_strict_gates_host_mutable_env_overrides() {
         let main_source = include_str!("main.rs").replace("\r\n", "\n");
+        // Whitespace-squashed view: the tripwire matches call sites even
+        // when rustfmt wraps long argument lists across lines.
+        let normalized: String = main_source.chars().filter(|c| !c.is_whitespace()).collect();
         // The path-like env vars below redirect init output surfaces and must
         // resolve through env_override (compiled out under prod-strict).
         // Deliberately NOT gated (platform-set in prod manifests or
@@ -213,10 +216,19 @@ mod tests {
                 "{var} must be read via env_override, not std::env::var"
             );
         }
-        assert!(
-            main_source.contains("env_override(\"ENCLAVA_INIT_READY_FILE\")"),
-            "ready file path must resolve through env_override"
-        );
+        for var in [
+            "ENCLAVA_INIT_READY_FILE",
+            "ENCLAVA_INIT_ERROR_FILE",
+            "ENCLAVA_INIT_STAGE_FILE",
+            "ENCLAVA_INIT_STARTED_DIR",
+            "ENCLAVA_INIT_ACME_COOLDOWN_FILE",
+            "ENCLAVA_INIT_TERMINATION_LOG",
+        ] {
+            assert!(
+                normalized.contains(&format!("init_surface_path(\"{var}\"")),
+                "{var} must resolve through init_surface_path (env_override + compiled default)"
+            );
+        }
         // The failure-path keep-alive masks failed boots from orchestration;
         // prod-strict must fail fast instead.
         assert!(
