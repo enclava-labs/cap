@@ -129,7 +129,11 @@ fn enforce_with(
         let production_acme_allowed =
             lookup(CAP_ALLOW_PRODUCTION_ACME).is_some_and(|value| flag_is_truthy(&value));
         for acme_source_name in ["ACME_DIRECTORY_URL", "TENANT_CADDY_ACME_CA"] {
-            if let Some(value) = lookup(acme_source_name) {
+            // Empty/whitespace-only values are treated as unset, matching
+            // the runtime config path (env_nonempty): a manifest that
+            // defines the var empty selects the signed-release value or
+            // default CA and must not trip the https gate.
+            if let Some(value) = lookup(acme_source_name).filter(|v| !v.trim().is_empty()) {
                 validate_acme_directory_url(
                     acme_source_name,
                     &value,
@@ -259,6 +263,24 @@ mod tests {
     fn release_rejects_insecure_tee_tls_mode() {
         let mut env = ok_required();
         env.insert("TENANT_TEE_TLS_MODE", "insecure");
+        assert!(run(env, false).is_err());
+    }
+
+    #[test]
+    fn release_treats_empty_optional_acme_overrides_as_unset() {
+        // Codex P2: an empty/whitespace-only optional ACME var must not
+        // trip the https gate — the runtime path (env_nonempty) treats it
+        // as unset and would select the signed-release value / default.
+        for value in ["", "  \t"] {
+            for name in ["ACME_DIRECTORY_URL", "TENANT_CADDY_ACME_CA"] {
+                let mut env = ok_required();
+                env.insert(name, value);
+                run(env, false).expect("empty optional ACME value must pass the release gate");
+            }
+        }
+        // But a real cleartext value is still rejected.
+        let mut env = ok_required();
+        env.insert("ACME_DIRECTORY_URL", "http://pebble.example:14000/dir");
         assert!(run(env, false).is_err());
     }
 

@@ -182,8 +182,28 @@ impl PlatformRelease {
     }
 }
 
+/// A verified platform release plus the deferred high-water-mark commit
+/// obligation that comes with it. The load itself only CHECKS the override
+/// against the persisted mark; the mark is advanced by
+/// `enforce_override_not_older_than_last_accepted` only after startup
+/// validation has accepted the release (runtime class, env-match, sidecar
+/// pins). Otherwise a signed-but-incompatible override would raise the
+/// floor and then fail startup, locking the deployment out of its last
+/// working release (Devin review, cap#165).
+pub struct LoadedPlatformRelease {
+    pub envelope: PlatformReleaseEnvelope,
+    /// State path to commit once startup validation accepts the release.
+    /// `None` when no high-water lane is active.
+    pub pending_high_water: Option<PathBuf>,
+}
+
 impl PlatformReleaseEnvelope {
     pub fn load_verified() -> Result<Self, PlatformReleaseError> {
+        Ok(Self::load_verified_with_pending_state()?.envelope)
+    }
+
+    pub fn load_verified_with_pending_state() -> Result<LoadedPlatformRelease, PlatformReleaseError>
+    {
         let override_path = std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH")
             .ok()
             .filter(|path| !path.trim().is_empty());
@@ -210,7 +230,7 @@ impl PlatformReleaseEnvelope {
         raw: String,
         override_active: bool,
         high_water_state: Option<&Path>,
-    ) -> Result<Self, PlatformReleaseError> {
+    ) -> Result<LoadedPlatformRelease, PlatformReleaseError> {
         let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
         verify_envelope(envelope.clone())?;
         // Downgrade protection: an env-path override may never be older than
@@ -218,10 +238,17 @@ impl PlatformReleaseEnvelope {
         // release (pinned to old measurements/sidecar digests) is exactly
         // what a file-swap or env-var attack serves. Parity with the CLI's
         // `enforce_release_not_older_than_bundled` gate.
+        //
+        // This is the CHECK pass only: the high-water mark is not persisted
+        // here. Callers advance it via
+        // `enforce_override_not_older_than_last_accepted` once the rest of
+        // startup validation has accepted the release, so a release that
+        // fails a later check cannot strand the deployment above its last
+        // working override.
         if override_active {
             enforce_release_not_older_than_bundled(&envelope.payload)?;
             if let Some(state_path) = high_water_state {
-                enforce_override_not_older_than_last_accepted(state_path, &envelope.payload)?;
+                check_override_not_older_than_last_accepted(state_path, &envelope.payload)?;
             }
         } else if let Some(state_path) = high_water_state {
             // The override lane is inactive, but persisted accepted-release
@@ -231,7 +258,18 @@ impl PlatformReleaseEnvelope {
             // installs (no state file) start untouched.
             enforce_bundle_not_older_than_persisted_mark(state_path)?;
         }
-        Ok(envelope)
+        // The pending-commit obligation exists only on the override lane:
+        // the bundled lane must never persist a mark (a bundle roll-forward
+        // cannot raise the override lane's floor).
+        let pending_high_water = if override_active {
+            high_water_state.map(Path::to_path_buf)
+        } else {
+            None
+        };
+        Ok(LoadedPlatformRelease {
+            envelope,
+            pending_high_water,
+        })
     }
 }
 
@@ -332,9 +370,43 @@ fn mark_is_older(
 /// either persists, and the T1 replica could overwrite the T2 mark and start
 /// with the stale release. The lock makes the sequence atomic across
 /// processes; it is auto-released on process death.
+#[cfg_attr(not(test), allow(dead_code))]
 fn enforce_override_not_older_than_last_accepted(
     state_path: &Path,
     release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    enforce_override_gate(state_path, release, true)
+}
+
+/// Advance the persisted high-water mark for an override that startup
+/// validation has fully accepted (runtime class, env-match, sidecar pins).
+/// Split from the load-time check so a release failing a later startup
+/// check cannot raise the floor and strand the deployment above its last
+/// working override. Re-runs the comparison under the flock: if a
+/// concurrent replica already accepted something newer, this refuses
+/// instead of lowering the mark.
+pub fn commit_override_acceptance(
+    state_path: &Path,
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    enforce_override_gate(state_path, release, true)
+}
+
+/// Check-only twin of `enforce_override_not_older_than_last_accepted`: same
+/// corrupt-state and comparison semantics, but never persists the mark. Used
+/// during load so a release that later fails startup validation cannot
+/// advance the floor; the full gate runs once startup has accepted it.
+fn check_override_not_older_than_last_accepted(
+    state_path: &Path,
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    enforce_override_gate(state_path, release, false)
+}
+
+fn enforce_override_gate(
+    state_path: &Path,
+    release: &PlatformRelease,
+    persist: bool,
 ) -> Result<(), PlatformReleaseError> {
     parse_release_timestamp(&release.created_at)?;
     let mut lock_path = state_path.as_os_str().to_os_string();
@@ -367,12 +439,13 @@ fn enforce_override_not_older_than_last_accepted(
                 format!("acquire {}: {err}", lock_path.display()),
             ),
         })?;
-    enforce_override_not_older_than_last_accepted_locked(state_path, release)
+    enforce_override_not_older_than_last_accepted_locked(state_path, release, persist)
 }
 
 fn enforce_override_not_older_than_last_accepted_locked(
     state_path: &Path,
     release: &PlatformRelease,
+    persist: bool,
 ) -> Result<(), PlatformReleaseError> {
     let persisted =
         match std::fs::read_to_string(state_path) {
@@ -407,7 +480,7 @@ fn enforce_override_not_older_than_last_accepted_locked(
         });
     }
     let mark = AcceptedOverrideMark::of(release)?;
-    if floor.as_ref() != Some(&mark) {
+    if floor.as_ref() != Some(&mark) && persist {
         // Durable atomic persist: write a sibling temp file, fsync it, then
         // rename over the mark. A bare truncate-in-place write could tear on
         // crash (next boot fails closed) or silently lose the mark on power
@@ -447,8 +520,15 @@ fn enforce_override_not_older_than_last_accepted_locked(
         // fsync the directory so the rename itself survives power loss.
         // Failure to make the rename durable is a failed persist, not a
         // warning: after a crash the old mark could resurface and re-admit
-        // a release the gate already refused.
-        if let Some(parent) = state_path.parent() {
+        // a release the gate already refused. An empty parent (relative
+        // means the working directory — resolve it to `.` so the sync
+        // target can actually be opened (and the rename made durable)
+        // instead of skipping the directory fsync entirely.
+        let parent = state_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        {
             let dir = std::fs::File::open(parent).map_err(|error| {
                 PlatformReleaseError::HighWaterMarkPersistFailed {
                     state_path: state_path.display().to_string(),
@@ -897,6 +977,20 @@ mod tests {
         );
     }
 
+    /// Mirrors main.rs: load is check-only; the mark advances only when
+    /// startup validation accepts, via commit_override_acceptance.
+    fn load_and_maybe_commit(
+        raw: String,
+        state: &std::path::Path,
+        commit: bool,
+    ) -> Result<(), PlatformReleaseError> {
+        let loaded = PlatformReleaseEnvelope::load_verified_from_raw(raw, true, Some(state))?;
+        if commit && let Some(path) = loaded.pending_high_water.as_ref() {
+            commit_override_acceptance(path, &loaded.envelope.payload)?;
+        }
+        Ok(())
+    }
+
     fn bundled_payload() -> PlatformRelease {
         serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
             .unwrap()
@@ -1029,10 +1123,9 @@ mod tests {
         let t1 = resigned_envelope_with_created_at("2998-01-01T00:00:00Z");
         let t2 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
 
-        // First boot with override T2: accepted, mark persisted.
-        assert!(
-            PlatformReleaseEnvelope::load_verified_from_raw(t2.clone(), true, Some(&state)).is_ok()
-        );
+        // First boot with override T2: accepted, mark persisted (the
+        // commit happens after startup validation, mirroring main.rs).
+        assert!(load_and_maybe_commit(t2.clone(), &state, true).is_ok());
         let mark: AcceptedOverrideMark =
             serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
         assert_eq!(mark.created_at, "2999-01-01T00:00:00Z");
@@ -1043,11 +1136,9 @@ mod tests {
             Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
         ));
 
-        // Steady state: same T2 reload writes nothing new and passes.
+        // Steady state: same T2 reload-and-commit writes nothing new.
         let before = std::fs::metadata(&state).unwrap().modified().unwrap();
-        assert!(
-            PlatformReleaseEnvelope::load_verified_from_raw(t2.clone(), true, Some(&state)).is_ok()
-        );
+        assert!(load_and_maybe_commit(t2.clone(), &state, true).is_ok());
         let after = std::fs::metadata(&state).unwrap().modified().unwrap();
         assert_eq!(before, after);
         std::fs::remove_dir_all(&dir).ok();
@@ -1096,7 +1187,7 @@ mod tests {
         // Something newer than both is accepted and RAISES the persisted
         // mark above the bundle.
         let newer = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
-        assert!(PlatformReleaseEnvelope::load_verified_from_raw(newer, true, Some(&state)).is_ok());
+        assert!(load_and_maybe_commit(newer, &state, true).is_ok());
         let mark: AcceptedOverrideMark =
             serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
         assert_eq!(mark.created_at, "2999-01-01T00:00:00Z");
@@ -1161,7 +1252,7 @@ mod tests {
         }
 
         // First accepted; the divergent same-pair envelope is then refused.
-        assert!(PlatformReleaseEnvelope::load_verified_from_raw(first, true, Some(&state)).is_ok());
+        assert!(load_and_maybe_commit(first, &state, true).is_ok());
         assert!(matches!(
             PlatformReleaseEnvelope::load_verified_from_raw(divergent, true, Some(&state)),
             Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
@@ -1173,7 +1264,91 @@ mod tests {
             "dev-same-pair",
             Some("https://kbs-first.example.test"),
         );
-        assert!(PlatformReleaseEnvelope::load_verified_from_raw(again, true, Some(&state)).is_ok());
+        assert!(load_and_maybe_commit(again, &state, true).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bundled_lane_does_not_persist_or_commit_a_mark() {
+        // main.rs commits the pending high-water mark after startup
+        // validation; the bundled lane must never carry that obligation
+        // (pending_high_water is None), or a bundle roll-forward could
+        // raise the override lane's floor.
+        let dir = std::env::temp_dir().join(format!("pr-hwm-bundled-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+
+        let bundled = BUNDLED_PLATFORM_RELEASE.to_string();
+        let loaded =
+            PlatformReleaseEnvelope::load_verified_from_raw(bundled, false, Some(&state)).unwrap();
+        assert!(
+            loaded.pending_high_water.is_none(),
+            "bundled lane must not carry a pending high-water commit"
+        );
+        assert!(!state.exists(), "bundled lane must not persist a mark");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_startup_does_not_advance_the_high_water_mark() {
+        // Devin P1 (cap#165): a signed-but-incompatible override that fails
+        // a LATER startup check (runtime class, env match, sidecar pins)
+        // must not raise the floor. Load is check-only; only
+        // commit_override_acceptance (called after startup validation in
+        // main.rs) persists. Scenario: load T2 without committing, then
+        // restoring T1 must still be accepted — the deployment is not
+        // stranded above its last working release.
+        let dir = std::env::temp_dir().join(format!("pr-hwm-nocommit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+
+        let t1 = resigned_envelope_with_created_at("2998-01-01T00:00:00Z");
+        let t2 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+
+        // Load T2 (check passes) but startup fails before the commit.
+        assert!(load_and_maybe_commit(t2, &state, false).is_ok());
+        assert!(!state.exists(), "check-only load must not persist a mark");
+
+        // Restoring T1 is still accepted: the floor was never raised.
+        assert!(load_and_maybe_commit(t1.clone(), &state, true).is_ok());
+        let mark: AcceptedOverrideMark =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        assert_eq!(mark.created_at, "2998-01-01T00:00:00Z");
+
+        // Once T2 IS committed (startup accepted it), T1 is refused.
+        let t2 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        assert!(load_and_maybe_commit(t2, &state, true).is_ok());
+        assert!(matches!(
+            load_and_maybe_commit(t1, &state, true),
+            Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Devin P2 (cap#165): a relative `ENCLAVA_PLATFORM_RELEASE_STATE`
+    /// (empty `.parent()`) must resolve the dir-sync target to `.` — first
+    /// acceptance previously failed with HighWaterMarkPersistFailed despite
+    /// having written the mark.
+    #[test]
+    fn relative_state_path_persists_and_syncs_cwd() {
+        let dir = std::env::temp_dir().join(format!("pr-hwm-relpath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let state = std::path::PathBuf::from("release.accepted"); // relative — no parent
+        let t2 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        let result = load_and_maybe_commit(t2, &state, true);
+
+        std::env::set_current_dir(prev_cwd).unwrap();
+        assert!(
+            result.is_ok(),
+            "relative state path must not fail persist: {result:?}"
+        );
+        let mark: AcceptedOverrideMark =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("release.accepted")).unwrap())
+                .unwrap();
+        assert_eq!(mark.created_at, "2999-01-01T00:00:00Z");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1237,7 +1412,7 @@ mod tests {
 
         // Accept T2 via the override lane (persists the mark).
         let t2 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
-        assert!(PlatformReleaseEnvelope::load_verified_from_raw(t2, true, Some(&state)).is_ok());
+        assert!(load_and_maybe_commit(t2, &state, true).is_ok());
 
         // Override env var removed: the bundled lane now compares against
         // the persisted mark and refuses (bundle < T2).

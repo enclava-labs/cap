@@ -373,18 +373,18 @@ fn validate_platform_release_runtime_class(
 fn load_platform_release(
     enabled: bool,
     effective_runtime_class: &str,
-) -> anyhow::Result<Option<PlatformReleaseEnvelope>> {
+) -> anyhow::Result<Option<enclava_api::platform_release::LoadedPlatformRelease>> {
     if !enabled {
         return Ok(None);
     }
-    let envelope = PlatformReleaseEnvelope::load_verified()
+    let loaded = PlatformReleaseEnvelope::load_verified_with_pending_state()
         .map_err(|e| anyhow::anyhow!("failed to load signed platform release: {e}"))?;
-    let release = &envelope.payload;
+    let release = &loaded.envelope.payload;
     validate_platform_release_runtime_class(
         &release.expected_runtime_class,
         effective_runtime_class,
     )?;
-    Ok(Some(envelope))
+    Ok(Some(loaded))
 }
 
 fn release_env_value(
@@ -670,7 +670,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let platform_release_envelope = match load_platform_release(
+    let platform_release_loaded = match load_platform_release(
         platform_release_enabled(trustee_policy_read_available),
         &effective_runtime_class,
     ) {
@@ -679,6 +679,10 @@ async fn main() {
             eprintln!("startup refused: {e}");
             std::process::exit(1);
         }
+    };
+    let (platform_release_envelope, pending_high_water) = match platform_release_loaded {
+        Some(loaded) => (Some(loaded.envelope), loaded.pending_high_water),
+        None => (None, None),
     };
     if let Some(envelope) = &platform_release_envelope {
         let release = &envelope.payload;
@@ -764,6 +768,22 @@ async fn main() {
             eprintln!("startup refused: invalid sidecar pin configuration: {e}");
             std::process::exit(1);
         }
+    };
+
+    // The platform release has now cleared every startup validation derived
+    // from it (runtime class, env-match, sidecar pins): advance the
+    // persisted high-water mark. Deferring the persist to this point means
+    // a signed-but-incompatible override can pass the load-time checks and
+    // still fail startup WITHOUT raising the floor — restoring the last
+    // working override stays possible (Devin review, cap#165). The commit
+    // re-runs the comparison under the flock, so a concurrent replica that
+    // accepted something newer in the meantime still wins.
+    if let (Some(state_path), Some(envelope)) = (&pending_high_water, &platform_release_envelope)
+        && let Err(e) =
+            enclava_api::platform_release::commit_override_acceptance(state_path, &envelope.payload)
+    {
+        eprintln!("startup refused: {e}");
+        std::process::exit(1);
     }
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
