@@ -192,12 +192,37 @@ request headers. Verify behaviorally instead, with a POSITIVE control:
 
 ```sh
 # Two clients on DIFFERENT public source IPs (e.g. two networks, a VPN
-# hop, or a second cloud instance). Each drives the same rapid loop:
-for i in $(seq 1 15); do
-  curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-    https://api.<cluster>/auth/device/start \
-    -H 'Content-Type: application/json' -d '{}'
-done | sort | uniq -c
+# hop, or a second cloud instance). Run BOTH loops CONCURRENTLY (not sequentially)
+# to prevent the burst from refilling between tests — CAP's bucket refills at
+# 1 r/s, so sequential tests could give a false pass even with broken secret wiring:
+
+# Run both loops in parallel and capture outputs separately:
+( for i in $(seq 1 15); do
+    curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+      https://api.<cluster>/auth/device/start \
+      -H 'Content-Type: application/json' -d '{}'
+  done ) > /tmp/ip1.out &
+PID1=$!
+
+( for i in $(seq 1 15); do
+    curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+      https://api.<cluster>/auth/device/start \
+      -H 'Content-Type: application/json' -d '{}'
+  done ) > /tmp/ip2.out &
+PID2=$!
+
+wait $PID1 $PID2
+
+echo "=== IP1 results ==="
+sort /tmp/ip1.out | uniq -c
+echo "=== IP2 results ==="
+sort /tmp/ip2.out | uniq -c
+rm /tmp/ip1.out /tmp/ip2.out
+#
+# NOTE: Running these sequentially (first loop, then second loop) can give a
+# false pass because CAP's bucket refills at 1 r/s. If there's any delay >~10s
+# between loops, the burst refills and the second IP gets ~10 fresh responses
+# even when the secret is NOT wired. The parallel version above is required.
 #
 # PASS (secret honored, per-client keying):
 #   - first IP: 200/4xx for ~10 requests, then 429s
