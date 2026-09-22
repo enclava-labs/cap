@@ -125,17 +125,18 @@ async fn freeze_workload_authority_mutations(
 /// splits on literal `/` and compares raw segments: `%2F` inside a segment
 /// is NOT a separator here, because it is not one to the router either.
 ///
-/// These matcher semantics were verified empirically against the locked
-/// matchit version (probe: insert the route table into a fresh
-/// `matchit::Router` and feed it the raw variants) — not assumed from the
-/// changelog. The invariant itself is enforced by
+/// The invariant is enforced by
 /// `workload_gate_classification_agrees_with_matchit_dispatch`, which
-/// mirrors the route table into a `matchit::Router` and asserts gate
-/// classification ↔ router dispatch agreement over generated poisoned raw
-/// paths: if a matchit upgrade (0.x or 1.x) ever changes raw-path semantics
-/// (e.g. adds trailing-slash tolerance or percent-decodes before matching),
-/// that test fails instead of the alignment breaking silently. Re-run the
-/// same probe when bumping matchit majors.
+/// mirrors this file's route table into a `matchit::Router` pinned to the
+/// locked version and asserts gate classification ↔ dispatch agreement on
+/// every pattern instantiated with poisoned parameter values (empty, dot
+/// segments, %2F encodings), plus explicit match/miss pins for the raw
+/// variants below: a matchit update that changes raw-path semantics
+/// (decoding %2F, resolving dot segments, tolerating trailing slashes)
+/// fails that test instead of silently breaking alignment. Because a
+/// patch-level matchit release can change matching behavior, the pin must
+/// be bumped deliberately — re-verify the semantics on ANY matchit bump,
+/// not only majors.
 ///
 /// A path that matches no allow pattern below is a mutation (deny-by-default),
 /// so raw variants such as `/apps%2Fdemo/deploy`, `//apps//demo//deploy`,
@@ -687,24 +688,36 @@ mod runtime_gate_tests {
 
     #[test]
     fn workload_gate_classification_agrees_with_matchit_dispatch() {
-        // Property: whenever the router (matchit — the exact crate/version
-        // axum resolves in Cargo.lock) would dispatch a raw (method, path)
-        // to a handler, the freeze gate's classification must equal the
-        // handler's mutation-ness. This pins the gate/router alignment
-        // invariant beyond the enumerated cases above: if a matchit upgrade
-        // ever changes raw-path semantics (e.g. starts percent-decoding,
-        // collapsing interior empty segments, or tolerating trailing
-        // slashes), a generated poisoned path will dispatch to a handler
-        // the gate misclassifies and this test fails instead of the
-        // alignment breaking silently.
+        // Locks the gate/router alignment invariant to the exact matchit
+        // in the lockfile, from four angles:
         //
-        // The mirror below must list every route pattern from
-        // build_router_inner (public routes plus the PaasManaged internal
-        // routes — the union of what can ever be mounted) with the methods
-        // each pattern serves and whether that (pattern, method) is an
-        // allow-listed control-plane write (true) or a tenant
-        // workload-authority mutation (false). GETs are always allows: the
-        // gate passes all GET/HEAD/OPTIONS through.
+        // 1. Mirror freshness: the annotated pattern set below must equal
+        //    the route declarations in this file (scanned from the source
+        //    at compile time), so adding a route without updating the
+        //    table fails here instead of drifting silently.
+        // 2. Single matcher: Cargo.lock must contain exactly one matchit
+        //    package, pinned via the `=0.8.4` dev-dependency. If axum and
+        //    this mirror ever resolve to different matchit copies, the
+        //    mirror would test the wrong crate — fail instead.
+        // 3. Exhaustive dispatch agreement: every pattern is instantiated
+        //    with every poison value (empty, dot segments, %2F encodings)
+        //    in every parameter, and the mirror must dispatch it to the
+        //    same pattern (pinning that matchit never decodes %2F,
+        //    resolves dot segments, or treats an interior empty segment as
+        //    a separator) with the gate classification equal to the
+        //    annotation. A trailing empty parameter produces a trailing
+        //    '/', which matchit must NOT match (pinning the absence of
+        //    trailing-slash tolerance); the gate's own trailing-slash
+        //    trim stays fail-closed because no handler serves those
+        //    shapes.
+        // 4. Enumerated raw variants from the tests below are fed through
+        //    the mirror with explicit match/miss pins.
+        //
+        // A matcher semantics change (percent-decoding, %2F/empty as
+        // separators, dot resolution, trailing-slash tolerance) breaks 3
+        // or 4 and fails CI instead of silently breaking alignment.
+        // HEAD is dispatched by axum's method router to the GET handler
+        // and always allowed by the gate, so GET annotations cover it.
         const ALLOW: bool = true;
         const MUTATION: bool = false;
         let route_table: &[(&str, &[(&str, bool)])] = &[
@@ -921,9 +934,67 @@ mod runtime_gate_tests {
             ),
         ];
 
-        // Inserting must succeed: axum inserts this exact pattern set into
-        // its own matchit tree at router construction, so a conflict here
-        // means the mirror has drifted from the real route table.
+        // (1) The route declarations of this file, scanned at compile
+        // time, must match the annotated table exactly (as a set: the
+        // same path may be declared twice with different methods). Only
+        // the router-construction section is scanned — everything from
+        // the test module onward (including this scanner's own source)
+        // is excluded.
+        let source = include_str!("lib.rs");
+        let source = &source[..source
+            .find("mod runtime_gate_tests")
+            .expect("test module must exist; the route scanner depends on its position")];
+        let mut declared: Vec<&str> = Vec::new();
+        let mut rest_scan = source;
+        while let Some(pos) = rest_scan.find(".route(") {
+            rest_scan = &rest_scan[pos + ".route(".len()..];
+            if let Some(literal) = rest_scan.trim_start().strip_prefix('"') {
+                // route paths are plain literals without escapes
+                if let Some(end) = literal.find('"') {
+                    declared.push(&literal[..end]);
+                }
+            }
+        }
+        let mut declared_set = declared.clone();
+        declared_set.sort_unstable();
+        declared_set.dedup();
+        let mut table_set: Vec<&str> = route_table.iter().map(|(p, _)| *p).collect();
+        table_set.sort_unstable();
+        table_set.dedup();
+        assert_eq!(
+            declared_set, table_set,
+            "route table mirror drifted from the route declarations in this file"
+        );
+
+        // (2) Exactly one matchit in the lockfile, and it is the pinned
+        // version this test compiles against.
+        let lock = include_str!("../../../Cargo.lock");
+        let mut lock_lines = lock.lines().filter(|l| l.starts_with("name = \"matchit\""));
+        let name_line = lock_lines
+            .next()
+            .expect("Cargo.lock must contain a matchit package");
+        assert!(
+            lock_lines.next().is_none(),
+            "Cargo.lock contains more than one matchit package: the mirror would \
+             test a different matcher than the router"
+        );
+        let _ = name_line;
+        let pin_index = lock.find("name = \"matchit\"").unwrap();
+        let version_line = lock[pin_index..]
+            .lines()
+            .find(|l| l.starts_with("version = "))
+            .expect("matchit package must have a version");
+        const PINNED_MATCHIT: &str = "0.8.4";
+        assert_eq!(
+            version_line,
+            format!("version = \"{PINNED_MATCHIT}\""),
+            "the matchit dev-dependency pin (=0.8.4) and Cargo.lock disagree; \
+             re-verify matcher semantics (see the classifier invariant comment) \
+             when bumping matchit — any bump, not only majors"
+        );
+
+        // Inserting must succeed: conflicting patterns would mean the
+        // table itself is malformed.
         let mut mirror = matchit::Router::new();
         for (index, (pattern, _)) in route_table.iter().enumerate() {
             mirror
@@ -931,37 +1002,22 @@ mod runtime_gate_tests {
                 .unwrap_or_else(|e| panic!("mirror insert failed for {pattern}: {e}"));
         }
 
-        // Deterministic generator (xorshift64*): no external proptest
-        // dependency, fully reproducible failures from the printed seed.
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = || {
-            let mut x = state;
-            x ^= x >> 12;
-            x ^= x << 25;
-            x ^= x >> 27;
-            state = x;
-            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        };
+        // Replace every {param} in a pattern with the given raw value.
+        fn instantiate(pattern: &str, value: &str) -> String {
+            let mut out = String::new();
+            let mut rest = pattern;
+            while let Some(open) = rest.find('{') {
+                out.push_str(&rest[..open]);
+                let close = rest[open..].find('}').expect("unclosed param") + open;
+                out.push_str(value);
+                rest = &rest[close + 1..];
+            }
+            out.push_str(rest);
+            out
+        }
 
-        // Poisoned segment pool: route-table literals, dot segments,
-        // percent-encoded slashes/dots (case variants), and the empty
-        // segment (interior `//`), which matchit treats as a parameter
-        // value.
-        let pool: [&str; 26] = [
-            "apps",
-            "orgs",
-            "internal",
-            "paas",
-            "auth",
-            "deploy",
-            "members",
-            "entitlements",
-            "keyring",
-            "invite",
-            "config",
-            "domains",
-            "deployments",
-            "unlock",
+        // (3) Exhaustive per-pattern poison instantiation.
+        let poison_values = [
             "demo",
             "org-1",
             "",
@@ -969,59 +1025,131 @@ mod runtime_gate_tests {
             "..",
             "%2e%2e",
             "%2F",
+            "%2f",
             "x%2F..%2F..%2Fauth%2Flogin",
-            "x%2f..%2f..%2fauth",
             "org%2F1",
-            "user%2F1",
-            "api-keys",
         ];
-        let methods = [
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::PATCH,
-            Method::DELETE,
-        ];
-
-        for case in 0..50_000u32 {
-            let segment_count = 1 + next() % 7;
-            let segments = (0..segment_count)
-                .map(|_| pool[(next() % pool.len() as u64) as usize])
-                .collect::<Vec<_>>();
-            // The router always sees an absolute path; optionally poison
-            // the shape with a trailing slash (matchit has no tolerance —
-            // if that ever changes, this property must catch it).
-            let mut path = format!("/{}", segments.join("/"));
-            if next() % 4 == 0 {
-                path.push('/');
-            }
-            let method = methods[(next() % methods.len() as u64) as usize].clone();
-
-            let gate_mutation = is_workload_authority_mutation(&method, &path);
-            if let Ok(matched) = mirror.at(&path) {
-                let (pattern, served_methods) = route_table[*matched.value];
-                if let Some(&(_, handler_is_allow)) = served_methods
-                    .iter()
-                    .find(|(served, _)| *served == method.as_str())
-                {
-                    // The router dispatches this (method, path) to a real
-                    // handler: the gate must agree with the handler's
-                    // mutation-ness in both directions.
-                    assert_eq!(
-                        gate_mutation,
-                        !handler_is_allow,
-                        "gate/router disagreement (seed case {case}): {method} {path} \
-                         dispatches to {pattern} but the gate classifies it as \
-                         {}",
-                        if gate_mutation { "mutation" } else { "allowed" },
-                    );
+        let patterns_needing_non_get = route_table
+            .iter()
+            .filter(|(_, served)| served.iter().any(|(m, _)| *m != "GET"))
+            .count();
+        let mut non_get_covered = std::collections::HashSet::new();
+        for (index, (pattern, served)) in route_table.iter().enumerate() {
+            for value in poison_values {
+                let path = instantiate(pattern, value);
+                // A trailing empty parameter yields a trailing '/', which
+                // no pattern contains: matchit must not match it. All
+                // other instantiations must dispatch to their own pattern
+                // — pinning that %2F, dots, and interior empties are
+                // ordinary parameter bytes to the matcher.
+                let trailing_empty = value.is_empty() && pattern.ends_with('}');
+                match mirror.at(&path) {
+                    Ok(matched) => {
+                        assert!(
+                            !trailing_empty,
+                            "{path}: matchit must not match a trailing '/' \
+                             (no pattern serves it; pattern {pattern})"
+                        );
+                        assert_eq!(
+                            *matched.value, index,
+                            "{path} instantiated from {pattern} dispatched to {}",
+                            route_table[*matched.value].0
+                        );
+                        for (method_name, is_allow) in served.iter() {
+                            let method = Method::from_bytes(method_name.as_bytes()).unwrap();
+                            let gate = is_workload_authority_mutation(&method, &path);
+                            assert_eq!(
+                                gate,
+                                !*is_allow,
+                                "{method} {path} (from {pattern}): gate says {}, \
+                                 annotation says {}",
+                                if gate { "mutation" } else { "allowed" },
+                                if *is_allow { "allow" } else { "mutation" },
+                            );
+                            if method != Method::GET {
+                                non_get_covered.insert(index);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        assert!(
+                            trailing_empty,
+                            "{path} instantiated from {pattern} must dispatch"
+                        );
+                    }
                 }
-                // Method not served on the matched pattern -> 405 at the
-                // router; the gate's deny-by-default classification is
-                // safe either way.
             }
-            // No route matched -> 404; unconstrained (the gate may allow or
-            // block shapes no handler serves).
+        }
+        assert_eq!(
+            non_get_covered.len(),
+            patterns_needing_non_get,
+            "every pattern with a non-GET method must be asserted against \
+             the mirror with at least one non-GET method"
+        );
+
+        // (4) Enumerated raw variants: explicit dispatch pins for the
+        // shapes the other tests reason about.
+        let dispatch_pins: &[(Method, &str)] = &[
+            // Interior empty segment is a parameter value: dispatched to
+            // the keyring handler (a mutation), never collapsed onto the
+            // org-upsert allow rule.
+            (Method::PUT, "/internal/paas/orgs//keyring"),
+            // The issue's central case: %2F/.. poisoned parameter is
+            // dispatched to the deploy handler (mutation) — a decoding
+            // matcher would retarget it and fail this pin.
+            (Method::POST, "/apps/x%2F..%2F..%2Fauth%2Flogin/deploy"),
+            (Method::POST, "/apps/demo/deploy"),
+            // Encoded bytes inside a parameter of an allow-listed route.
+            (Method::PUT, "/internal/paas/orgs/org%2F1/entitlements"),
+            (Method::PUT, "/internal/paas/orgs//members/u"),
+            (Method::PUT, "/internal/paas/orgs//entitlements"),
+            (Method::DELETE, "/internal/paas/orgs//apps/demo"),
+            (Method::POST, "/orgs//invite"),
+            (Method::DELETE, "/orgs//members/user-1"),
+        ];
+        for (method, path) in dispatch_pins {
+            let matched = mirror.at(path).unwrap_or_else(|_| {
+                panic!(
+                    "{method} {path} must dispatch under \
+                                          current matchit semantics"
+                )
+            });
+            let (pattern, served) = route_table[*matched.value];
+            let (_, is_allow) = served
+                .iter()
+                .find(|(m, _)| *m == method.as_str())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{method} {path} dispatched to {pattern} \
+                                          which does not serve that method"
+                    )
+                });
+            assert_eq!(
+                is_workload_authority_mutation(method, path),
+                !*is_allow,
+                "{method} {path} dispatched to {pattern}: gate and annotation \
+                 disagree"
+            );
+        }
+        let miss_pins = [
+            "/apps%2Fdemo/deploy",
+            "/apps%2fdemo/deploy",
+            "/apps/demo/deploy/",
+            "/apps/./demo/deploy",
+            "/apps/x/../demo/deploy",
+            "//apps//demo//deploy",
+            "/auth/%2e%2e/apps/demo/deploy",
+            "/internal/paas/orgs/",
+            "/internal%2Fpaas/orgs/org-1/deployments",
+            "/auth%2Flogin",
+        ];
+        for path in miss_pins {
+            assert!(
+                mirror.at(path).is_err(),
+                "{path} must NOT dispatch under current matchit semantics \
+                 (raw bytes are not decoded, dot segments are not resolved, \
+                 trailing slashes and leading empties do not match)"
+            );
         }
     }
 
