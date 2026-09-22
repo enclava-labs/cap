@@ -883,6 +883,57 @@ async fn device_login_start_is_rate_limited_per_ip() {
 }
 
 #[tokio::test]
+async fn device_login_poll_and_approve_are_not_in_start_rate_limit_bucket() {
+    let (state, _pool) = setup_test_state().await;
+    let app = enclava_api::build_router(state)
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    // Exhaust the tight /auth/device/start budget for this peer IP, then
+    // prove poll (and approve's route check, which requires a session
+    // token) still answer from the generic governor budget rather than
+    // sharing the exhausted device-start bucket. Approve without a token
+    // must yield 401, never 429.
+    let mut start_throttled = false;
+    for _ in 0..15 {
+        let response = server
+            .post("/auth/device/start")
+            .add_header("x-forwarded-for", "127.0.0.1")
+            .json(&serde_json::json!({}))
+            .await;
+        if response.status_code() == StatusCode::TOO_MANY_REQUESTS {
+            start_throttled = true;
+            break;
+        }
+    }
+    assert!(start_throttled, "start burst must exhaust the start bucket");
+
+    for _ in 0..12 {
+        let poll = server
+            .post("/auth/device/poll")
+            .add_header("x-forwarded-for", "127.0.0.1")
+            .json(&serde_json::json!({ "device_code": "nonexistent" }))
+            .await;
+        assert_eq!(
+            poll.status_code(),
+            StatusCode::BAD_REQUEST,
+            "poll must stay out of the exhausted start bucket (any 429 here means the routes share a governor)"
+        );
+    }
+
+    let approve = server
+        .post("/auth/device/approve")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(
+        approve.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "approve must be auth-gated (401), not starved by the start bucket (429)"
+    );
+}
+
+#[tokio::test]
 async fn purge_expired_device_login_sessions_removes_only_long_expired_rows() {
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);

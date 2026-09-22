@@ -340,11 +340,33 @@ fn device_auth_routes(
     enable_rate_limits: bool,
     key_extractor: TrustedProxyKeyExtractor,
 ) -> Router<AppState> {
-    let routes = Router::new()
-        .route(
-            "/auth/device/start",
-            axum::routing::post(routes::auth::start_device_login),
-        )
+    // The device-login surface is reachable before authentication, and
+    // /auth/device/start inserts a session row per call, so only the start
+    // route gets the tight per-IP budget. Poll and approve deliberately
+    // stay out of this bucket: CLIs poll at the advertised 5-second
+    // interval, so a shared 1 r/s budget would throttle any group of
+    // users behind one public IP, and an unauthenticated start flood must
+    // not be able to starve authenticated approvals. Both remain covered
+    // by the generic per-IP API governor.
+    let start = Router::new().route(
+        "/auth/device/start",
+        axum::routing::post(routes::auth::start_device_login),
+    );
+
+    let start = if enable_rate_limits {
+        start.layer(GovernorLayer::new(
+            GovernorConfigBuilder::default()
+                .per_second(1)
+                .burst_size(10)
+                .key_extractor(key_extractor)
+                .finish()
+                .expect("device auth governor config"),
+        ))
+    } else {
+        start
+    };
+
+    Router::new()
         .route(
             "/auth/device/poll",
             axum::routing::post(routes::auth::poll_device_login),
@@ -352,25 +374,8 @@ fn device_auth_routes(
         .route(
             "/auth/device/approve",
             axum::routing::post(routes::auth::approve_device_login),
-        );
-
-    if !enable_rate_limits {
-        return routes;
-    }
-
-    // The device-login surface is reachable before authentication, and
-    // /auth/device/start inserts a session row per call, so it gets a much
-    // tighter per-IP budget than the generic API governor. Compliant clients
-    // are unaffected: a CLI issues one start, then polls at the advertised
-    // 5-second interval.
-    routes.layer(GovernorLayer::new(
-        GovernorConfigBuilder::default()
-            .per_second(1)
-            .burst_size(10)
-            .key_extractor(key_extractor)
-            .finish()
-            .expect("device auth governor config"),
-    ))
+        )
+        .merge(start)
 }
 
 fn user_routes() -> Router<AppState> {
