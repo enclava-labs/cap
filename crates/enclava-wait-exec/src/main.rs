@@ -320,6 +320,14 @@ where
                 buf.pop();
             }
         }
+        // Skip records that are empty after newline handling: these arise when a
+        // capped chunk boundary coincides with a newline — the first call returns
+        // capped bytes up to but not including the newline, the second call
+        // returns only that newline. Writing an empty frame would produce a spurious
+        // empty log entry in the encrypted stream.
+        if buf.is_empty() {
+            continue;
+        }
         // Allocate the sequence number while HOLDING the spool mutex and
         // only after acquiring it: encrypt_log_frame runs here, inside the
         // lock, so a faster forwarder cannot reserve a higher sequence,

@@ -266,13 +266,6 @@ fn follow_spool(
     // frontier instead of replaying them. Unparseable lines are passed
     // through unchanged (historical behavior for anything not a frame).
     let mut last_seq: Option<u64> = initial_last_seq;
-    // Buffer for an incomplete trailing line (writer mid-append): bytes are
-    // held back from the client until the writer's newline completes the
-    // frame. Never emit a partial NDJSON line — if the spool rotates while a
-    // fragment is pending, the new inode's retained window re-contains the
-    // completed frame and the rotation resync delivers it whole, so the
-    // fragment is simply dropped.
-    let mut remainder: Vec<u8> = Vec::new();
     loop {
         thread::sleep(FOLLOW_POLL_INTERVAL);
         let Ok(mut file) = File::open(path) else {
@@ -295,63 +288,56 @@ fn follow_spool(
             // already-delivered frames by sequence. Never seek a stale byte
             // offset into the rewritten tail. Adopt the new file as the
             // held handle (drop the old fd only after adopting the new one).
-            // A pending incomplete-line fragment from the OLD inode is
-            // dropped: the completed frame lives in the new inode's
-            // retained window and is deduped or delivered there as a whole
-            // line. The NEW inode's own trailing fragment (if the writer
-            // is mid-append into the fresh file) becomes the carried
-            // remainder so its completion is joined to its prefix.
-            remainder.clear();
             *offset = 0;
             let mut adopted = file;
             adopted.seek(SeekFrom::Start(0))?;
             let (bytes, delivered) = drain_from(&mut adopted, 0)?;
-            // `delivered` is the ACTUAL file cursor after the read, not the
-            // pre-read metadata length: the writer is a different process,
-            // so a concurrent append can extend the spool during the read.
-            // Those extra bytes ARE delivered in this response; keeping a
-            // stale length would re-send them on the next poll.
+            // Use the ACTUAL cursor position as the offset: the writer is a
+            // separate process and can append during the read. Those bytes are
+            // delivered in this response, so the next poll must resume past them.
+            // A trailing incomplete fragment (writer mid-append) sits at the end
+            // of the delivered range; the next poll will read from this offset,
+            // see the now-complete line, and deliver it.
             *offset = delivered;
-            let mut complete_end = 0usize;
-            while let Some(idx) = bytes[complete_end..].iter().position(|&b| b == b'\n') {
-                complete_end += idx + 1;
-            }
-            remainder.extend_from_slice(&bytes[complete_end..]);
-            *held = Some(adopted);
+            // Write to the client BEFORE holding the fd: a stalled client would keep
+            // this fd open, pinning the old inode's ~32 MiB against deletion.
+            // The inode identity is already captured in `current_identity` for
+            // rotation detection, so we reopen on the next poll if needed.
             write_deduped_after_rotation(stream, &bytes, &mut last_seq)?;
             stream.flush()?;
+            *held = Some(adopted);
             continue;
         }
         if len < *offset {
             // Fallback for same-inode truncation (not the rotation path,
             // but cheap insurance if the rotation mechanism ever changes).
             *offset = 0;
-            remainder.clear();
         }
         if len == *offset {
             continue;
         }
         file.seek(SeekFrom::Start(*offset))?;
-        let (bytes, delivered) = drain_from(&mut file, *offset)?;
-        // Same as the rotation branch: adopt the file cursor as the
-        // delivered boundary so a concurrent append landing mid-read is
-        // not replayed on the next poll.
-        *offset = delivered;
-        // Line-buffered delivery: emit only newline-terminated lines, hold
-        // any trailing fragment back until it completes. The fragment was
-        // already accounted for in `*offset` (it was read), so it is never
-        // re-read — it lives only in `remainder` until its newline arrives.
-        remainder.extend_from_slice(&bytes);
+        let (bytes, _delivered) = drain_from(&mut file, *offset)?;
+        // Line-buffered delivery: emit only newline-terminated lines and
+        // leave `*offset` at the first byte of any trailing fragment (it is
+        // NOT counted as delivered). The fragment is re-read on the next
+        // poll and joined with its completion. This is also what makes the
+        // follower robust against the writer's rollback path: on a partial
+        // write the writer truncates back to its pre-write length, and a
+        // follower that had buffered the retracted prefix would emit a
+        // corrupted line once the file regrew past its stale offset. By
+        // never advancing past an uncommitted fragment, the follower always
+        // re-reads whatever bytes actually exist at that offset now.
         let mut complete_end = 0usize;
-        while let Some(idx) = remainder[complete_end..].iter().position(|&b| b == b'\n') {
+        while let Some(idx) = bytes[complete_end..].iter().position(|&b| b == b'\n') {
             complete_end += idx + 1;
         }
         if complete_end > 0 {
-            let complete = remainder[..complete_end].to_vec();
-            advance_last_sequence(&complete, &mut last_seq);
-            stream.write_all(&complete)?;
+            let complete = &bytes[..complete_end];
+            advance_last_sequence(complete, &mut last_seq);
+            stream.write_all(complete)?;
+            *offset += complete_end as u64;
         }
-        remainder.drain(..complete_end);
         stream.flush()?;
     }
 }
