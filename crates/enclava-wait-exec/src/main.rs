@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,16 @@ const DEFAULT_STARTUP: &str = "/startup/startup.sh";
 const DEFAULT_LOG_SPOOL_DIR: &str = "/run/enclava-logs";
 const STARTED_DIR_MODE: u32 = 0o2770;
 const O_NOFOLLOW: i32 = 0o400000;
+/// Soft cap on the encrypted log spool before rotation. The `logs` emptyDir
+/// is capped at 64 MiB by the engine manifest (see
+/// `LOGS_EMPTY_DIR_SIZE_LIMIT`); rotating well below that (aligned to the
+/// relay's 2 MiB MAX_TAIL_BYTES tail window, with ample margin) keeps the
+/// volume from ever hitting ENOSPC, which would otherwise kill the forwarding
+/// thread and expose the child to SIGPIPE on its next stdout/stderr write.
+const LOG_SPOOL_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
+/// After rotation, keep this prefix of the pre-rotation spool so the relay's
+/// tail reads still span the rotation boundary.
+const LOG_SPOOL_KEEP_BYTES: u64 = 8 * 1024 * 1024;
 const TERMINATION_SIGNALS: [Signal; 4] = [
     Signal::SIGHUP,
     Signal::SIGINT,
@@ -243,9 +253,12 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create log spool dir {}: {err}", parent.display()))?;
     }
+    // read+append: appends position writes at end-of-file, while the read
+    // side lets the rotation path retain the newest frames in place.
     OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .mode(0o640)
         .custom_flags(O_NOFOLLOW)
         .open(path)
@@ -313,7 +326,54 @@ where
             .and_then(|_| spool.write_all(b"\n"))
             .and_then(|_| spool.flush())
             .map_err(|err| format!("failed to write encrypted log spool: {err}"))?;
+        // Bounded rotation; best-effort by design — a rotation failure must
+        // not terminate the forwarding thread (that would close the child's
+        // pipe and expose it to SIGPIPE), so it is logged and skipped.
+        if let Err(err) = rotate_spool_if_needed(&mut spool) {
+            eprintln!("enclava-wait-exec: log spool rotation failed: {err}");
+        }
     }
+}
+
+/// Bound the encrypted log spool: once it exceeds `LOG_SPOOL_ROTATE_BYTES`,
+/// retain only the last `LOG_SPOOL_KEEP_BYTES` of frames. Rotation is a
+/// prefix truncation on the same inode: the relay's `follow_spool` detects
+/// `len < offset` and resumes from 0, and `tail_lines` reads the last
+/// MAX_TAIL_BYTES regardless, so readers stay correct across rotation.
+/// Callers hold the spool mutex, so the check-then-truncate is race-free.
+/// Rotation is best-effort: failures are logged by the caller and never
+/// terminate the forwarding threads, which keep draining the child pipes.
+fn rotate_spool_if_needed(spool: &mut File) -> std::io::Result<()> {
+    let len = spool.metadata()?.len();
+    if len < LOG_SPOOL_ROTATE_BYTES {
+        return Ok(());
+    }
+    // Copy the retained tail to a scratch buffer, then rewrite the file
+    // in place. The file was opened with O_APPEND; ftruncate + rewind via
+    // seek works because writes are positioned at end-of-file by the flag,
+    // so we only need to shrink it and re-write the retained prefix.
+    let keep_from = len.saturating_sub(LOG_SPOOL_KEEP_BYTES);
+    let mut retain_buf = Vec::new();
+    spool.seek(SeekFrom::Start(keep_from))?;
+    spool.read_to_end(&mut retain_buf)?;
+    // Align the retained window to the next frame boundary: rotation can
+    // start mid-line, and the relay's tail_lines only discards a partial
+    // first line when its read offset is nonzero.
+    if keep_from > 0 {
+        if let Some(nl) = retain_buf.iter().position(|b| *b == b'\n') {
+            retain_buf.drain(..=nl);
+        } else {
+            // No newline in the retained window (one gigantic frame);
+            // dropping it entirely is the only safe truncation point.
+            retain_buf.clear();
+        }
+    }
+    spool.set_len(0)?;
+    spool.seek(SeekFrom::Start(0))?;
+    // With O_APPEND the write lands at the current end (0) regardless of
+    // the read cursor; flush keeps ordering with the subsequent appends.
+    spool.write_all(&retain_buf)?;
+    spool.flush()
 }
 
 fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
@@ -597,5 +657,65 @@ mod tests {
         assert_eq!(config.context.app_name, "secure-app");
         assert_eq!(config.context.deployment_id, "deploy-123");
         assert_eq!(config.container, "web");
+    }
+
+    // ---- spool rotation (round-3 review) ----
+
+    /// Rotation must bound the spool: once past the rotate threshold the
+    /// file shrinks to roughly the retained window, the retained content is
+    /// the newest frames (line-aligned), and subsequent appends still land
+    /// at end-of-file. Regression test for the round-3 review SIGPIPE/ENOSPC
+    /// finding: without rotation a full `logs` emptyDir killed the forwarder
+    /// thread and exposed the child to SIGPIPE.
+    #[test]
+    fn spool_rotation_bounds_file_and_keeps_newest_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let mut spool = open_log_spool(&path).unwrap();
+
+        // Write just past the rotate threshold using complete frames.
+        let line: String = "x".repeat(63);
+        let frame = format!("{line}\n");
+        let frame_len = frame.len() as u64;
+        let total = (LOG_SPOOL_ROTATE_BYTES + 1024 * 1024) / frame_len;
+        for i in 0..total {
+            write!(spool, "{i:06}{frame}").unwrap();
+        }
+        spool.flush().unwrap();
+
+        rotate_spool_if_needed(&mut spool).unwrap();
+
+        let len = fs::metadata(&path).unwrap().len();
+        assert!(
+            len <= LOG_SPOOL_KEEP_BYTES + frame_len,
+            "spool must shrink to ~KEEP_BYTES, got {len}"
+        );
+        // Appends still land at end-of-file after rotation.
+        let before = fs::metadata(&path).unwrap().len();
+        writeln!(spool, "tail-marker").unwrap();
+        spool.flush().unwrap();
+        let after = fs::metadata(&path).unwrap().len();
+        assert_eq!(after, before + b"tail-marker\n".len() as u64);
+        // The retained window starts at a frame boundary: the first line is
+        // a complete 6-digit-prefixed frame.
+        let content = fs::read_to_string(&path).unwrap();
+        let first_line = content.lines().next().unwrap();
+        assert!(
+            first_line.len() == 69 && first_line.starts_with(|c: char| c.is_ascii_digit()),
+            "first retained line must be a complete frame, got {first_line:?}"
+        );
+    }
+
+    /// No rotation below the threshold: the benign-layout invariant.
+    #[test]
+    fn spool_rotation_is_noop_below_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let mut spool = open_log_spool(&path).unwrap();
+        writeln!(spool, "small").unwrap();
+        spool.flush().unwrap();
+        let len_before = fs::metadata(&path).unwrap().len();
+        rotate_spool_if_needed(&mut spool).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), len_before);
     }
 }

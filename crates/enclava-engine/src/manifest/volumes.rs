@@ -29,6 +29,9 @@ pub const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
 /// Disk-backed bound for the workload log spool emptyDir. The relay tails at
 /// most MAX_TAIL_BYTES per container (2 MiB today), so 64 MiB leaves generous
 /// headroom while bounding node-disk exhaustion from a runaway writer.
+/// enclava-wait-exec additionally rotates its spool at 32 MiB (retaining the
+/// newest 8 MiB), so a chatty workload cannot hit the volume cap and die by
+/// ENOSPC/SIGPIPE — the sizeLimit is the outer fence, rotation the inner one.
 const LOGS_EMPTY_DIR_SIZE_LIMIT: &str = "64Mi";
 
 pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {

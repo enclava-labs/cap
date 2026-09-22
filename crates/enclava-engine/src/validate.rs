@@ -1,5 +1,5 @@
 use enclava_common::log_encryption;
-use enclava_common::validate::{ValidateError, validate_fqdn};
+use enclava_common::validate::validate_fqdn;
 
 use crate::types::ConfidentialApp;
 
@@ -163,6 +163,10 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
     )?;
 
     validate_domain("domain.platform_domain", &app.domain.platform_domain)?;
+    // tee_domain flows into the attestation container's TEE_DOMAIN env and
+    // the TEE TLSRoute hostname, so it gets the same FQDN gate as the other
+    // domains (defense in depth for rows that bypassed API admission).
+    validate_domain("domain.tee_domain", &app.domain.tee_domain)?;
     if let Some(custom) = app.domain.custom_domain.as_deref() {
         validate_domain("domain.custom_domain", custom)?;
     }
@@ -203,72 +207,71 @@ pub fn validate_app(app: &ConfidentialApp) -> Result<(), ValidationError> {
 }
 
 /// CPU quantity: millicore (`250m`) or whole cores (`1`, `1.5`), matching the
-/// API's `parse_cpu_cores` admission grammar.
+/// API's `parse_cpu_cores` admission grammar — including the
+/// `ScaledDecimal::parse` digit/scale bounds (≤38 total digits, ≤24
+/// fractional digits, non-zero, no u128 overflow) so values the API would
+/// never persist are rejected here too.
 fn validate_resource_quantity(field: &'static str, value: &str) -> Result<(), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed != value {
         return Err(format!("{field} must be a non-empty CPU quantity"));
     }
     let numeric = trimmed.strip_suffix('m').unwrap_or(trimmed);
-    // Match the API's ScaledDecimal grammar: plain decimal digits with an
-    // optional single `.` separator. f64 parsing would also admit `1e2`,
-    // `+5`, `5.`, and `inf`-adjacent forms the API never writes.
-    let mut seen_dot = false;
-    let valid = !numeric.is_empty()
-        && numeric.chars().all(|c| match c {
-            '0'..='9' => true,
-            '.' if !seen_dot => {
-                seen_dot = true;
-                true
-            }
-            _ => false,
-        })
-        && !numeric.starts_with('.')
-        && !numeric.ends_with('.');
-    if !valid {
-        return Err(format!(
-            "{field} must be a positive number or millicpu quantity"
-        ));
-    }
-    let parsed: f64 = numeric
-        .parse()
-        .map_err(|_| format!("{field} must be a positive number or millicpu quantity"))?;
-    if !parsed.is_finite() || parsed <= 0.0 {
-        return Err(format!(
-            "{field} must be a positive number or millicpu quantity"
-        ));
-    }
-    Ok(())
+    validate_scaled_decimal(numeric, 1)
+        .map_err(|_| format!("{field} must be a positive number or millicpu quantity"))
 }
 
 /// Storage/memory binary quantity with an explicit Mi/Gi/Ti (or MiB/GiB/TiB)
 /// suffix, matching the API's `parse_binary_mib` admission grammar. The value
 /// must be a positive number; a bare number without a unit is rejected so the
-/// quota/summing code never silently treats bytes as MiB.
+/// quota/summing code never silently treats bytes as MiB. The exact-Mi
+/// conversion must not overflow, exactly as the API's `checked_mul` requires.
 fn validate_storage_size(field: &'static str, value: &str) -> Result<(), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed != value {
         return Err(format!("{field} must be a non-empty binary quantity"));
     }
-    let units = ["TiB", "Ti", "GiB", "Gi", "MiB", "Mi"];
-    let Some((number, _)) = units
+    // (suffix, multiplier-in-Mi) pairs mirroring the API's parse_binary_mib.
+    const BINARY_UNITS: [(&str, u128); 6] = [
+        ("TiB", 1024 * 1024),
+        ("Ti", 1024 * 1024),
+        ("GiB", 1024),
+        ("Gi", 1024),
+        ("MiB", 1),
+        ("Mi", 1),
+    ];
+    let Some((number, multiplier)) = BINARY_UNITS
         .iter()
-        .find_map(|suffix| trimmed.strip_suffix(suffix).map(|n| (n, *suffix)))
+        .find_map(|(suffix, multiplier)| trimmed.strip_suffix(*suffix).map(|n| (n, *multiplier)))
     else {
         return Err(format!("{field} must use Mi, Gi, or Ti binary units"));
     };
-    // Match the API's ScaledDecimal grammar (plain digits with an optional
-    // single `.`); f64 parsing would admit `+5`, `1e3`, and other forms the
-    // API never writes.
+    validate_scaled_decimal(number, multiplier)
+        .map_err(|_| format!("{field} must be a positive binary quantity"))
+}
+
+/// Digit, scale, and overflow bounds mirroring the API's
+/// `ScaledDecimal::parse` + `checked_mul` (entitlements.rs): plain decimal
+/// grammar, at most 38 total digits, at most 24 fractional digits, non-zero
+/// coefficient, and an exact-Mi conversion (`multiplier`) that must not
+/// overflow u128. f64 parsing would silently admit all of those.
+fn validate_scaled_decimal(number: &str, multiplier: u128) -> Result<(), String> {
     if !is_plain_decimal(number) {
-        return Err(format!("{field} must be a positive binary quantity"));
+        return Err("must be a positive decimal quantity".to_string());
     }
-    let parsed: f64 = number
+    let (integer, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if integer.len() + fraction.len() > 38 || fraction.len() > 24 {
+        return Err("has too much precision".to_string());
+    }
+    let coefficient: u128 = format!("{integer}{fraction}")
         .parse()
-        .map_err(|_| format!("{field} must be a positive binary quantity"))?;
-    if !parsed.is_finite() || parsed <= 0.0 {
-        return Err(format!("{field} must be a positive binary quantity"));
+        .map_err(|_| "is too large".to_string())?;
+    if coefficient == 0 {
+        return Err("must be positive".to_string());
     }
+    coefficient
+        .checked_mul(multiplier)
+        .ok_or_else(|| "is too large".to_string())?;
     Ok(())
 }
 
@@ -292,7 +295,7 @@ fn is_plain_decimal(s: &str) -> bool {
 fn validate_domain(field: &'static str, value: &str) -> Result<(), ValidationError> {
     validate_fqdn(value).map_err(|e| ValidationError::InvalidDomain {
         field,
-        detail: fqdn_error_detail(e),
+        detail: e.to_string(),
     })
 }
 
@@ -305,7 +308,7 @@ fn validate_egress_rule(rule: &crate::types::EgressRule) -> Result<(), String> {
     if rule.host.parse::<std::net::IpAddr>().is_ok() {
         return Err("host must be a DNS hostname, not an IP address".to_string());
     }
-    validate_fqdn(&rule.host).map_err(|e| format!("invalid host: {}", fqdn_error_detail(e)))?;
+    validate_fqdn(&rule.host).map_err(|e| format!("invalid host: {e}"))?;
     if rule.ports.is_empty() {
         return Err("ports must not be empty".to_string());
     }
@@ -334,13 +337,6 @@ fn validate_attestation_pubkey(
         });
     }
     Ok(())
-}
-
-fn fqdn_error_detail(error: ValidateError) -> String {
-    match error {
-        ValidateError::InvalidFqdn(detail) => detail.to_string(),
-        other => other.to_string(),
-    }
 }
 
 /// Validates that a name is DNS-safe: lowercase alphanumeric + hyphens, starts with letter/digit.

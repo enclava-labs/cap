@@ -309,3 +309,95 @@ fn validate_rejects_egress_port_zero() {
         "egress port 0 must be rejected"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 6. round-3 review follow-ups
+// ---------------------------------------------------------------------------
+
+/// Round 3 review (Devin 🟡 + Codex P2): a signed policy containing CR —
+/// either CRLF line endings or a lone CR — must take the escaped
+/// basic-string fallback. TOML multi-line literals normalize CRLF to LF, so
+/// the literal path cannot round-trip CR-bearing bytes to the signed policy,
+/// and a lone CR is invalid TOML outright.
+#[test]
+fn policy_text_with_carriage_returns_round_trips_via_basic_string() {
+    for body in [
+        "package agent_policy\r\nallow := true\r\n",
+        "package agent_policy\nallow\r:= true\n",
+    ] {
+        let app = app_with_policy(body.to_string());
+        let toml = build_toml(&app);
+        let parsed: toml::Value =
+            toml::from_str(&toml).expect("TOML must survive CR-bearing policy");
+        assert_eq!(
+            parsed
+                .get("data")
+                .and_then(toml::Value::as_table)
+                .and_then(|data| data.get("policy.rego"))
+                .and_then(toml::Value::as_str),
+            Some(body),
+            "CR-bearing policy must round-trip exactly"
+        );
+    }
+}
+
+/// Round 3 review (Devin 🟨 + Codex P2): quantities exceeding the API's
+/// ScaledDecimal precision bounds (≤38 total digits, ≤24 fractional digits,
+/// u128/checked-mul overflow) must be rejected by the engine gate too.
+#[test]
+fn validate_rejects_quantities_exceeding_api_precision_bounds() {
+    let mut app = sample_app();
+    // 39 total digits: parses fine as f64, rejected by ScaledDecimal::parse.
+    app.resources.cpu = format!("{}2", "1".repeat(38));
+    assert!(
+        matches!(
+            validate_app(&app),
+            Err(ValidationError::InvalidResourceQuantity { field, .. }) if field == "cpu"
+        ),
+        "39-digit CPU quantity must be rejected"
+    );
+    // 25 fractional digits.
+    app.resources.cpu = format!("1.{}1", "0".repeat(24));
+    assert!(
+        matches!(
+            validate_app(&app),
+            Err(ValidationError::InvalidResourceQuantity { field, .. }) if field == "cpu"
+        ),
+        "25-fractional-digit CPU quantity must be rejected"
+    );
+    // In-bounds values still pass (38 digits total, 24 fractional).
+    app.resources.cpu = format!("{}2", "1".repeat(37));
+    assert!(validate_app(&app).is_ok());
+    app.resources.cpu = format!("1.{}1", "0".repeat(22));
+    assert!(validate_app(&app).is_ok());
+    // Storage: 39-digit coefficient with Ti suffix overflows u128 when
+    // multiplied out, exactly as the API's checked_mul requires.
+    app.storage.app_data.size = format!("{}2Ti", "1".repeat(38));
+    assert!(
+        matches!(
+            validate_app(&app),
+            Err(ValidationError::InvalidStorageSize { field, .. }) if field == "storage.app_data.size"
+        ),
+        "overflowing Ti quantity must be rejected"
+    );
+    app.storage.app_data.size = "10Gi".to_string();
+    assert!(validate_app(&app).is_ok());
+}
+
+/// Round 3 review (Codex P2): tee_domain flows into the attestation
+/// container's TEE_DOMAIN env and the TEE TLSRoute hostname, so a malformed
+/// value must fail deploy validation like the other domains.
+#[test]
+fn validate_rejects_invalid_tee_domain() {
+    let mut app = sample_app();
+    app.domain.tee_domain = "not_a_domain".to_string();
+    assert!(
+        matches!(
+            validate_app(&app),
+            Err(ValidationError::InvalidDomain { field, .. }) if field == "domain.tee_domain"
+        ),
+        "malformed tee_domain must be rejected"
+    );
+    app.domain.tee_domain = "tee.enclava.dev".to_string();
+    assert!(validate_app(&app).is_ok());
+}

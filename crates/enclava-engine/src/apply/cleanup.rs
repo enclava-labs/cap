@@ -9,6 +9,7 @@ use tokio::time::Instant;
 use super::engine::{ApplyEngine, ApplyError};
 use super::generation::{MutationGeneration, apply_existing_partial, delete_resource};
 use crate::manifest::volumes::CAP_VCT_NAMES;
+use enclava_common::validate::validate_dns_label;
 
 /// Result of a single cleanup step.
 #[derive(Debug, Clone)]
@@ -321,7 +322,11 @@ pub async fn delete_pvcs_and_wait(
 /// `<vct>-<statefulset>-<ordinal>` where `<vct>` is one of the CAP-rendered
 /// volumeClaimTemplate names and the trailing segment is the pod ordinal.
 /// The StatefulSet (app) name may itself contain hyphens, so the VCT is
-/// matched as a prefix, not by splitting on the last-but-one hyphen.
+/// matched as a prefix, not by splitting on the last-but-one hyphen. The
+/// statefulset segment must be a valid DNS label (names come from
+/// `validate_name`, which enforces `[a-z0-9-]` with no leading/trailing
+/// hyphen): a namespace actor naming a foreign PVC `state--0` or
+/// `state-evil.example-0` must not get it swept by tenant teardown.
 fn is_cap_owned_pvc_name(name: &str) -> bool {
     let Some((stem, ordinal)) = name.rsplit_once('-') else {
         return false;
@@ -331,7 +336,8 @@ fn is_cap_owned_pvc_name(name: &str) -> bool {
     }
     CAP_VCT_NAMES.iter().any(|vct| {
         stem.strip_prefix(vct)
-            .is_some_and(|rest| rest.starts_with('-') && rest.len() > 1)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|app| validate_dns_label(app).is_ok())
     })
 }
 
@@ -442,6 +448,13 @@ mod tests {
             "tls-state",
             "state-app-",
             "state--",
+            // Round 3 review: a namespace actor naming a foreign PVC with the
+            // VCT shape but a non-DNS-label statefulset segment must not match.
+            "state-my.app-0",
+            "state-MyApp-0",
+            "state-my_app-0",
+            "state-app..x-0",
+            "tls-state-evil.example-1",
         ] {
             assert!(!is_cap_owned_pvc_name(name), "{name} must not match");
         }

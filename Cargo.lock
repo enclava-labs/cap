@@ -1703,6 +1703,7 @@ dependencies = [
  "enclava-common",
  "nix",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
