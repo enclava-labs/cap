@@ -40,13 +40,13 @@ pub fn build_router(state: AppState) -> Router {
 
 fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
     let key_extractor = TrustedProxyKeyExtractor::from_env();
-    let api_routes = build_api_routes(enable_rate_limits, key_extractor);
+    let api_routes = build_api_routes(enable_rate_limits, key_extractor.clone());
     let api_routes = if enable_rate_limits {
         api_routes.layer(GovernorLayer::new(
             GovernorConfigBuilder::default()
                 .per_second(1)
                 .burst_size(100)
-                .key_extractor(TrustedProxyKeyExtractor::from_env())
+                .key_extractor(key_extractor.clone())
                 .finish()
                 .expect("api governor config"),
         ))
@@ -54,9 +54,9 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         api_routes
     };
 
-    let mut router = Router::new().merge(health_routes());
+    let mut router = Router::new().merge(health_routes(enable_rate_limits, key_extractor.clone()));
     if state.management_mode.internal_paas_routes_enabled() {
-        router = router.merge(internal_routes());
+        router = router.merge(internal_routes(enable_rate_limits, key_extractor));
     }
 
     router
@@ -149,8 +149,11 @@ fn is_workload_authority_mutation(method: &Method, path: &str) -> bool {
     !control_plane_write
 }
 
-fn internal_routes() -> Router<AppState> {
-    Router::new()
+fn internal_routes(
+    enable_rate_limits: bool,
+    key_extractor: TrustedProxyKeyExtractor,
+) -> Router<AppState> {
+    let routes = Router::new()
         .route(
             "/internal/paas/status",
             axum::routing::get(routes::internal::list_paas_cluster_status),
@@ -297,7 +300,26 @@ fn internal_routes() -> Router<AppState> {
         .route(
             "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/mode",
             axum::routing::put(routes::internal::update_paas_unlock_mode),
-        )
+        );
+
+    if enable_rate_limits {
+        routes.layer(GovernorLayer::new(
+            GovernorConfigBuilder::default()
+                // The PaaS control plane is the only consumer of this surface
+                // and egresses from a single IP: 100 req/s with a burst of
+                // 1000 leaves headroom for proxied end-user traffic while
+                // bounding call rates (issue #135). enclava-paas treats 429
+                // as retryable, so bursts degrade gracefully. If the PaaS
+                // ever scales to multiple egress IPs, revisit the keying.
+                .per_second(100)
+                .burst_size(1000)
+                .key_extractor(key_extractor)
+                .finish()
+                .expect("internal paas governor config"),
+        ))
+    } else {
+        routes
+    }
 }
 
 fn build_api_routes(
@@ -545,11 +567,34 @@ fn workload_routes() -> Router<AppState> {
         )
 }
 
-fn health_routes() -> Router<AppState> {
-    Router::new()
+fn health_routes(
+    enable_rate_limits: bool,
+    key_extractor: TrustedProxyKeyExtractor,
+) -> Router<AppState> {
+    let routes = Router::new()
         .route("/livez", axum::routing::get(|| async { "ok" }))
         .route("/readyz", axum::routing::get(|| async { "ok" }))
-        .route("/health", axum::routing::get(|| async { "ok" }))
+        .route("/health", axum::routing::get(|| async { "ok" }));
+
+    if enable_rate_limits {
+        routes.layer(GovernorLayer::new(
+            GovernorConfigBuilder::default()
+                // Kubelet probes run at ~1/s per node. Probes from many nodes
+                // can arrive without a per-node X-Forwarded-For (only trusted
+                // proxies are honoured), so buckets key on the observed probe
+                // source; 5 req/s with a burst of 100 bounds amplification
+                // (issue #135) while leaving headroom for shared probe
+                // sources. If probes ever exceed this, raise the budget or
+                // widen TRUSTED_PROXY_CIDRS so probes key per node.
+                .per_second(5)
+                .burst_size(100)
+                .key_extractor(key_extractor)
+                .finish()
+                .expect("health governor config"),
+        ))
+    } else {
+        routes
+    }
 }
 
 /// Build the CORS layer from `CORS_ALLOWED_ORIGINS` (comma-separated).
@@ -608,13 +653,106 @@ pub fn test_router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod runtime_gate_tests {
-    use super::{is_workload_authority_mutation, test_router};
+    use super::{build_router_inner, is_workload_authority_mutation, test_router};
     use axum::{
         body::Body,
+        extract::ConnectInfo,
         http::{Method, Request, StatusCode, header},
     };
     use http_body_util::BodyExt;
+    use std::net::SocketAddr;
     use tower::ServiceExt;
+
+    fn request_with_peer(peer: &str, method: Method, uri: &str) -> Request<Body> {
+        let peer: SocketAddr = format!("{peer}:42000").parse().unwrap();
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .extension(ConnectInfo(peer))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_routes_are_rate_limited_on_the_production_router() {
+        // Regression test for enclava-labs/cap#135: `/livez`, `/readyz` and
+        // `/health` used to be merged without a GovernorLayer, so a single
+        // peer could request them at an unbounded rate. Each path is probed
+        // from its own peer address so the three loops do not drain one
+        // another's bucket before the 429 assertion.
+        let state = crate::test_support::lazy_state();
+        let app = build_router_inner(state, true);
+
+        for (i, uri) in ["/livez", "/readyz", "/health"].into_iter().enumerate() {
+            let peer = format!("198.51.{}.7", i + 1);
+            let mut saw_ok = false;
+            let mut saw_limit = None;
+            for _ in 0..250 {
+                let response = app
+                    .clone()
+                    .oneshot(request_with_peer(&peer, Method::GET, uri))
+                    .await
+                    .unwrap();
+                if response.status() == StatusCode::OK {
+                    saw_ok = true;
+                } else {
+                    saw_limit = Some(response.status());
+                }
+            }
+            assert!(saw_ok, "{uri} probe must succeed below the burst budget");
+            assert_eq!(
+                saw_limit,
+                Some(StatusCode::TOO_MANY_REQUESTS),
+                "{uri} must share a per-peer request bucket"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_paas_routes_are_rate_limited_on_the_production_router() {
+        // Regression test for enclava-labs/cap#135: the internal PaaS surface
+        // used to be merged without a GovernorLayer, so internal-route call
+        // rates were unbounded. The request below is rejected by InternalAuth
+        // long before the database is touched; the governor still counts it.
+        let mut state = crate::test_support::lazy_state();
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        let app = build_router_inner(state, true);
+
+        let mut saw_reachable = false;
+        let mut saw_limit = None;
+        for _ in 0..1500 {
+            let response = app
+                .clone()
+                .oneshot(request_with_peer(
+                    "198.51.100.7",
+                    Method::GET,
+                    "/internal/paas/status",
+                ))
+                .await
+                .unwrap();
+            match response.status() {
+                // 401 = InternalAuth rejected the request, 503 = internal
+                // auth is not configured (lazy_state sets internal_auth to
+                // None and startup_ready to true, so no other middleware
+                // can produce a 503 for this GET); either way the route
+                // itself was reached and the governor counted the request.
+                StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE => {
+                    saw_reachable = true;
+                }
+                StatusCode::TOO_MANY_REQUESTS => saw_limit = Some(response.status()),
+                other => panic!("unexpected status from internal route: {other}"),
+            }
+        }
+        assert!(
+            saw_reachable,
+            "internal routes must still be reachable behind InternalAuth"
+        );
+        assert_eq!(
+            saw_limit,
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            "internal PaaS routes must share a per-peer request bucket"
+        );
+    }
 
     #[test]
     fn workload_gate_is_fail_closed_for_current_and_future_writes() {
