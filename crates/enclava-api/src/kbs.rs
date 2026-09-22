@@ -473,6 +473,28 @@ pub async fn enqueue_signed_policy_revocation_if_active(
     Ok(generation)
 }
 
+/// Enqueue a signed-policy recomputation only when CAP has already entered
+/// signed-policy mode.  Keyring rotation changes which retained artifacts are
+/// still authorized (#130); without a generation bump the reconciler would
+/// treat the changed candidate set at an unchanged generation as a conflict
+/// and keep the stale policy body live in Trustee.  Unsigned-only installs
+/// stay untouched.
+pub async fn enqueue_signed_policy_reconciliation_if_active(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<Option<i64>, KbsPolicyError> {
+    let generation = sqlx::query_scalar(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = desired_generation + 1,
+                updated_at = clock_timestamp()
+          WHERE singleton
+            AND desired_generation > 0
+        RETURNING desired_generation",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(generation)
+}
+
 async fn enqueue_signed_policy_bootstrap_if_idle(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<bool, KbsPolicyError> {
@@ -515,6 +537,11 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
 /// its exact source artifact required.  The active operation is authoritative
 /// even while the app row still projects the preceding failed/stopped state.
 /// Failed, unsigned, or deleting latest operations contribute no authorization.
+/// Every candidate must still be signed by a key that is a member of the
+/// org's *current* keyring generation (#130): a retained historical artifact
+/// whose signer was removed by keyring rotation must not keep authorizing KBS
+/// policy while its immutable row survives the retention window.  Candidates
+/// fail closed when the org has no keyring row at all.
 async fn load_signed_policy_candidates(
     db: &PgPool,
     retention: i64,
@@ -525,6 +552,7 @@ async fn load_signed_policy_candidates(
             SELECT
                 job.deployment_id,
                 job.app_id,
+                job.org_id,
                 job.generation,
                 job.artifact_deployment_id,
                 job.artifact_descriptor_core_hash,
@@ -541,6 +569,20 @@ async fn load_signed_policy_candidates(
              AND deployment.app_id = job.app_id
              AND deployment.org_id = job.org_id
             JOIN apps AS app ON app.id = job.app_id
+        ),
+        -- The cast is safe: org_keyrings rows are written only by the put/
+        -- rotate handlers, which serialize validated JSON, so a committed
+        -- payload is always well-formed UTF-8 JSON with a members array.
+        current_keyring_members AS (
+            SELECT latest.org_id, member.value->>'pubkey' AS pubkey
+              FROM (
+                  SELECT DISTINCT ON (org_id)
+                      org_id,
+                      convert_from(keyring_payload, 'UTF8')::jsonb AS keyring
+                    FROM org_keyrings
+                   ORDER BY org_id, version DESC
+              ) AS latest,
+              jsonb_array_elements(latest.keyring->'members') AS member
         ),
         eligible_current_job_operations AS (
             SELECT *
@@ -585,6 +627,12 @@ async fn load_signed_policy_candidates(
              AND artifact.deploy_id = historical.artifact_deployment_id
              AND artifact.descriptor_core_hash
                  = historical.artifact_descriptor_core_hash
+            JOIN current_keyring_members AS member
+              ON member.org_id = current.org_id
+             AND lower(member.pubkey) = lower(
+                 artifact.signed_policy_artifact
+                     ->'metadata'->>'descriptor_signing_pubkey'
+             )
             ORDER BY
                 current.app_id,
                 artifact.descriptor_core_hash,
@@ -610,6 +658,7 @@ async fn load_signed_policy_candidates(
             SELECT
                 deployment.id AS deployment_id,
                 deployment.app_id,
+                deployment.org_id,
                 deployment.status::text AS deployment_status,
                 app.status::text AS app_status,
                 deployment.created_at,
@@ -637,6 +686,12 @@ async fn load_signed_policy_candidates(
             JOIN workload_artifacts AS artifact
               ON artifact.app_id = legacy.app_id
              AND artifact.deploy_id = legacy.deployment_id
+            JOIN current_keyring_members AS member
+              ON member.org_id = legacy.org_id
+             AND lower(member.pubkey) = lower(
+                 artifact.signed_policy_artifact
+                     ->'metadata'->>'descriptor_signing_pubkey'
+             )
             WHERE legacy.current_operation_rank = 1
               AND legacy.app_status IN ('creating', 'running')
               AND legacy.deployment_status = 'healthy'
@@ -2268,9 +2323,23 @@ owner_resource_bindings := {}
         deployment_id: Uuid,
         hash_byte: &str,
     ) -> crate::signing_service::SignedPolicyArtifact {
+        insert_test_artifact_signed_by(pool, app_id, deployment_id, hash_byte, "bb").await
+    }
+
+    /// Like insert_test_artifact, but lets each fixture pick its descriptor
+    /// signer so keyring-rotation tests can distinguish removed and remaining
+    /// members.
+    async fn insert_test_artifact_signed_by(
+        pool: &PgPool,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        hash_byte: &str,
+        signer_hex: &str,
+    ) -> crate::signing_service::SignedPolicyArtifact {
         let mut artifact = test_signed_policy_artifact(hash_byte, 16);
         artifact.metadata.app_id = app_id.to_string();
         artifact.metadata.deploy_id = deployment_id.to_string();
+        artifact.metadata.descriptor_signing_pubkey = signer_hex.repeat(32);
         let descriptor_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
         sqlx::query(
             "INSERT INTO workload_artifacts (
@@ -2330,14 +2399,76 @@ owner_resource_bindings := {}
         .expect("insert KBS test apply job");
     }
 
+    /// Insert one append-only org keyring version. The first member is the
+    /// owner; the raw signature bytes are irrelevant to candidate selection.
+    /// Returns the ids of the user and signing key rows it created so callers
+    /// can clean them up without touching other tests' fixtures.
+    async fn insert_test_keyring_version(
+        pool: &PgPool,
+        org_id: Uuid,
+        version: i64,
+        member_pubkeys: &[&str],
+    ) -> (Uuid, Uuid) {
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'kbs keyring member')")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("insert KBS keyring user");
+        let signing_key_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO user_signing_keys (id, user_id, pubkey) VALUES ($1, $2, $3)")
+            .bind(signing_key_id)
+            .bind(user_id)
+            .bind(hex::decode(member_pubkeys[0]).expect("decode owner keyring pubkey"))
+            .execute(pool)
+            .await
+            .expect("insert KBS keyring signing key");
+        let members: Vec<serde_json::Value> = member_pubkeys
+            .iter()
+            .enumerate()
+            .map(|(index, pubkey)| {
+                serde_json::json!({
+                    "user_id": user_id,
+                    "pubkey": pubkey,
+                    "role": if index == 0 { "owner" } else { "deployer" },
+                    "added_at": "2026-01-01T00:00:00Z",
+                })
+            })
+            .collect();
+        let keyring = serde_json::json!({
+            "org_id": org_id,
+            "version": version,
+            "members": members,
+            "updated_at": "2026-01-01T00:00:00Z",
+        });
+        sqlx::query(
+            "INSERT INTO org_keyrings (
+                 org_id, version, keyring_payload, signature, signing_key_id
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(version)
+        .bind(serde_json::to_vec(&keyring).expect("serialize test keyring"))
+        .bind(vec![9u8; 64])
+        .bind(signing_key_id)
+        .execute(pool)
+        .await
+        .expect("insert KBS test keyring version");
+        (user_id, signing_key_id)
+    }
+
     #[tokio::test]
     async fn selector_uses_current_operation_binding_and_legacy_fallback() {
         let pool = database_test_pool().await;
         let now = Utc::now();
+        // test_signed_policy_artifact signs every fixture with this pubkey.
+        let signer = "bb".repeat(32);
 
         // A rollback operation points to an older exact artifact. It must rank
         // ahead of a newer historical artifact for the same app.
         let (rollback_org, rollback_app) = insert_test_app(&pool, "running").await;
+        let mut fixture_users = Vec::new();
+        fixture_users.push(insert_test_keyring_version(&pool, rollback_org, 1, &[&signer]).await);
         let source = Uuid::new_v4();
         insert_test_deployment(&pool, rollback_org, rollback_app, source, "healthy", now).await;
         let source_artifact = insert_test_artifact(&pool, rollback_app, source, "aa").await;
@@ -2392,6 +2523,7 @@ owner_resource_bindings := {}
 
         // A pre-0038 healthy signed deployment has no job but remains current.
         let (legacy_org, legacy_app) = insert_test_app(&pool, "running").await;
+        fixture_users.push(insert_test_keyring_version(&pool, legacy_org, 1, &[&signer]).await);
         let legacy = Uuid::new_v4();
         insert_test_deployment(&pool, legacy_org, legacy_app, legacy, "healthy", now).await;
         let legacy_artifact = insert_test_artifact(&pool, legacy_app, legacy, "cc").await;
@@ -2399,6 +2531,7 @@ owner_resource_bindings := {}
         // A retry is current authority even before its stale failed app
         // projection advances to creating.
         let (retry_org, retry_app) = insert_test_app(&pool, "failed").await;
+        fixture_users.push(insert_test_keyring_version(&pool, retry_org, 1, &[&signer]).await);
         let retry = Uuid::new_v4();
         insert_test_deployment(&pool, retry_org, retry_app, retry, "healthy", now).await;
         let retry_artifact = insert_test_artifact(&pool, retry_app, retry, "34").await;
@@ -2560,6 +2693,236 @@ owner_resource_bindings := {}
                 .execute(&pool)
                 .await
                 .expect("delete KBS selector fixture");
+        }
+        for (user_id, signing_key_id) in fixture_users {
+            sqlx::query("DELETE FROM user_signing_keys WHERE id = $1")
+                .bind(signing_key_id)
+                .execute(&pool)
+                .await
+                .expect("delete KBS selector fixture signing key");
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("delete KBS selector fixture user");
+        }
+    }
+
+    #[tokio::test]
+    async fn keyring_rotation_enqueues_signed_policy_reconciliation_only_when_active() {
+        let pool = database_test_pool().await;
+
+        // Unsigned-only installs must not enter signed-policy mode.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        assert!(
+            enqueue_signed_policy_reconciliation_if_active(&mut tx)
+                .await
+                .unwrap()
+                .is_none(),
+            "idle installation must not enqueue a signed-policy generation"
+        );
+        tx.rollback().await.unwrap();
+
+        // Once signed mode is active, every keyring rotation must bump the
+        // generation so the reconciler withdraws rotated-out artifacts
+        // (#130): the changed candidate set at an unchanged generation would
+        // otherwise be rejected as a content conflict.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 1
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let bumped = enqueue_signed_policy_reconciliation_if_active(&mut tx)
+            .await
+            .unwrap()
+            .expect("active installation enqueues a new generation");
+        assert_eq!(bumped, 2);
+        tx.commit().await.unwrap();
+        let desired: i64 = sqlx::query_scalar(
+            "SELECT desired_generation
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(desired, 2);
+
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    /// Regression for #130: a retained historical artifact must stop
+    /// authorizing KBS policy as soon as its signer is no longer a member of
+    /// the org's current keyring generation, even though the immutable
+    /// workload_artifacts row survives the retention window.
+    #[tokio::test]
+    async fn selector_drops_artifacts_whose_signer_left_the_current_keyring() {
+        let pool = database_test_pool().await;
+        let now = Utc::now();
+        let signer = "bb".repeat(32);
+        let remaining = "cd".repeat(32);
+        let rotated_owner = "ab".repeat(32);
+
+        // Job-backed app: the current operation binds an artifact signed by a
+        // remaining member, while an older historical artifact (still inside
+        // the retention window) was signed by the since-removed signer.
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let mut fixture_users = Vec::new();
+        fixture_users
+            .push(insert_test_keyring_version(&pool, org_id, 1, &[&remaining, &signer]).await);
+        let historical = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, historical, "healthy", now).await;
+        let stale_artifact =
+            insert_test_artifact_signed_by(&pool, app_id, historical, "9a", "bb").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            historical,
+            historical,
+            Some((historical, &stale_artifact)),
+        )
+        .await;
+        let deployment = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            deployment,
+            "healthy",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let artifact = insert_test_artifact_signed_by(&pool, app_id, deployment, "9b", "cd").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            deployment,
+            deployment,
+            Some((deployment, &artifact)),
+        )
+        .await;
+
+        let selected = |candidates: &Vec<SignedPolicyArtifactCandidate>| {
+            candidates.iter().any(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == artifact.metadata.descriptor_core_hash
+            })
+        };
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select pre-rotation candidates");
+        assert!(
+            selected(&candidates),
+            "artifact signed by a current keyring member must be a candidate"
+        );
+
+        // Keyring rotation removes the signer while the remaining member's
+        // artifact stays live: the stale historical artifact must no longer be
+        // re-admitted into the KBS policy authority set, and the remaining
+        // member's artifact must survive the rotation.
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.artifact.metadata.descriptor_core_hash
+                    == stale_artifact.metadata.descriptor_core_hash),
+            "pre-rotation, the historical artifact inside the retention window is a candidate"
+        );
+        fixture_users.push(
+            insert_test_keyring_version(&pool, org_id, 2, &[&remaining, &rotated_owner]).await,
+        );
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select post-rotation candidates");
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.artifact.metadata.descriptor_core_hash
+                    == stale_artifact.metadata.descriptor_core_hash),
+            "historical artifact whose signer was removed by keyring rotation must not be re-admitted"
+        );
+        assert!(
+            selected(&candidates),
+            "current artifact signed by a remaining member must survive the rotation"
+        );
+
+        // The same fence applies to pre-0038 legacy deployments without jobs.
+        let (legacy_org, legacy_app) = insert_test_app(&pool, "running").await;
+        fixture_users.push(insert_test_keyring_version(&pool, legacy_org, 1, &[&signer]).await);
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, legacy_org, legacy_app, legacy, "healthy", now).await;
+        let legacy_artifact = insert_test_artifact(&pool, legacy_app, legacy, "9c").await;
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select pre-rotation legacy candidates");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.artifact.metadata.descriptor_core_hash
+                    == legacy_artifact.metadata.descriptor_core_hash),
+            "legacy artifact signed by a current keyring member must be a candidate"
+        );
+        fixture_users
+            .push(insert_test_keyring_version(&pool, legacy_org, 2, &[&rotated_owner]).await);
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select post-rotation legacy candidates");
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.artifact.metadata.descriptor_core_hash
+                    == legacy_artifact.metadata.descriptor_core_hash),
+            "legacy artifact whose signer was removed must not be re-admitted"
+        );
+
+        for cleanup_org in [org_id, legacy_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(cleanup_org)
+                .execute(&pool)
+                .await
+                .expect("delete keyring rotation fixture");
+        }
+        for (user_id, signing_key_id) in fixture_users {
+            sqlx::query("DELETE FROM user_signing_keys WHERE id = $1")
+                .bind(signing_key_id)
+                .execute(&pool)
+                .await
+                .expect("delete keyring rotation fixture signing key");
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("delete keyring rotation fixture user");
         }
     }
 
