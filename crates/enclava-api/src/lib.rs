@@ -54,13 +54,79 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
         api_routes
     };
 
-    let mut router = Router::new().merge(health_routes(enable_rate_limits, key_extractor.clone()));
+    let mut router = Router::new().merge(with_operational_gates(&state, api_routes));
+
+    // Health and internal PaaS governors are layered OUTSIDE the operational
+    // gates (startup gate, dispatch freeze): requests short-circuited by
+    // those gates must still consume rate-limit tokens, otherwise the very
+    // surfaces this router bounds stay unbounded exactly while a gate is
+    // tripped (review feedback on enclava-labs/cap#170).
+    let health_routes = with_operational_gates(&state, health_routes());
+    let health_routes = if enable_rate_limits {
+        health_routes.layer(GovernorLayer::new(
+            GovernorConfigBuilder::default()
+                // Kubelet probes run at ~1/s per node. Probes from many nodes
+                // can arrive without a per-node X-Forwarded-For (only trusted
+                // proxies are honoured), so buckets key on the observed probe
+                // source; 5 req/s with a burst of 100 bounds amplification
+                // (issue #135) while leaving headroom for shared probe
+                // sources. If probes ever exceed this, raise the budget or
+                // widen TRUSTED_PROXY_CIDRS so probes key per node.
+                //
+                // NOTE: tower_governor's `per_second(n)` sets the token
+                // replenishment *period* to n seconds (one token per n
+                // seconds), not n requests per second. The intended rate is
+                // therefore expressed as a period: 200ms/token = 5 req/s.
+                .per_millisecond(200)
+                .burst_size(100)
+                .key_extractor(key_extractor.clone())
+                .finish()
+                .expect("health governor config"),
+        ))
+    } else {
+        health_routes
+    };
+    router = router.merge(health_routes);
+
     if state.management_mode.internal_paas_routes_enabled() {
-        router = router.merge(internal_routes(enable_rate_limits, key_extractor));
+        let internal_routes = with_operational_gates(&state, internal_routes());
+        let internal_routes = if enable_rate_limits {
+            internal_routes.layer(GovernorLayer::new(
+                GovernorConfigBuilder::default()
+                    // The PaaS control plane is the only consumer of this
+                    // surface and egresses from a single IP: 100 req/s with a
+                    // burst of 1000 leaves headroom for proxied end-user
+                    // traffic while bounding call rates (issue #135).
+                    // enclava-paas treats 429 as retryable, so bursts degrade
+                    // gracefully. If the PaaS ever scales to multiple egress
+                    // IPs, revisit the keying.
+                    //
+                    // NOTE: tower_governor's `per_second(n)` sets the token
+                    // replenishment *period* to n seconds (one token per n
+                    // seconds), not n requests per second. The intended rate
+                    // is therefore expressed as a period: 10ms/token =
+                    // 100 req/s.
+                    .per_millisecond(10)
+                    .burst_size(1000)
+                    .key_extractor(key_extractor)
+                    .finish()
+                    .expect("internal paas governor config"),
+            ))
+        } else {
+            internal_routes
+        };
+        router = router.merge(internal_routes);
     }
 
-    router
-        .merge(api_routes)
+    router.layer(build_cors_layer()).with_state(state)
+}
+
+/// Wrap a route group in the operational middleware shared by every group:
+/// request tracing plus the dispatch-freeze and startup gates. Applied per
+/// group (rather than once on the merged router) so group-level governors
+/// can be layered above these short-circuiting middlewares.
+fn with_operational_gates(state: &AppState, routes: Router<AppState>) -> Router<AppState> {
+    routes
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -70,8 +136,6 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
             state.clone(),
             require_startup_ready,
         ))
-        .layer(build_cors_layer())
-        .with_state(state)
 }
 
 async fn require_startup_ready(
@@ -149,11 +213,8 @@ fn is_workload_authority_mutation(method: &Method, path: &str) -> bool {
     !control_plane_write
 }
 
-fn internal_routes(
-    enable_rate_limits: bool,
-    key_extractor: TrustedProxyKeyExtractor,
-) -> Router<AppState> {
-    let routes = Router::new()
+fn internal_routes() -> Router<AppState> {
+    Router::new()
         .route(
             "/internal/paas/status",
             axum::routing::get(routes::internal::list_paas_cluster_status),
@@ -300,26 +361,7 @@ fn internal_routes(
         .route(
             "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/mode",
             axum::routing::put(routes::internal::update_paas_unlock_mode),
-        );
-
-    if enable_rate_limits {
-        routes.layer(GovernorLayer::new(
-            GovernorConfigBuilder::default()
-                // The PaaS control plane is the only consumer of this surface
-                // and egresses from a single IP: 100 req/s with a burst of
-                // 1000 leaves headroom for proxied end-user traffic while
-                // bounding call rates (issue #135). enclava-paas treats 429
-                // as retryable, so bursts degrade gracefully. If the PaaS
-                // ever scales to multiple egress IPs, revisit the keying.
-                .per_second(100)
-                .burst_size(1000)
-                .key_extractor(key_extractor)
-                .finish()
-                .expect("internal paas governor config"),
-        ))
-    } else {
-        routes
-    }
+        )
 }
 
 fn build_api_routes(
@@ -567,34 +609,11 @@ fn workload_routes() -> Router<AppState> {
         )
 }
 
-fn health_routes(
-    enable_rate_limits: bool,
-    key_extractor: TrustedProxyKeyExtractor,
-) -> Router<AppState> {
-    let routes = Router::new()
+fn health_routes() -> Router<AppState> {
+    Router::new()
         .route("/livez", axum::routing::get(|| async { "ok" }))
         .route("/readyz", axum::routing::get(|| async { "ok" }))
-        .route("/health", axum::routing::get(|| async { "ok" }));
-
-    if enable_rate_limits {
-        routes.layer(GovernorLayer::new(
-            GovernorConfigBuilder::default()
-                // Kubelet probes run at ~1/s per node. Probes from many nodes
-                // can arrive without a per-node X-Forwarded-For (only trusted
-                // proxies are honoured), so buckets key on the observed probe
-                // source; 5 req/s with a burst of 100 bounds amplification
-                // (issue #135) while leaving headroom for shared probe
-                // sources. If probes ever exceed this, raise the budget or
-                // widen TRUSTED_PROXY_CIDRS so probes key per node.
-                .per_second(5)
-                .burst_size(100)
-                .key_extractor(key_extractor)
-                .finish()
-                .expect("health governor config"),
-        ))
-    } else {
-        routes
-    }
+        .route("/health", axum::routing::get(|| async { "ok" }))
 }
 
 /// Build the CORS layer from `CORS_ALLOWED_ORIGINS` (comma-separated).
@@ -709,6 +728,44 @@ mod runtime_gate_tests {
     }
 
     #[tokio::test]
+    async fn gate_rejected_health_probes_still_consume_rate_limit_tokens() {
+        // Review feedback on enclava-labs/cap#170: while startup
+        // reconciliation is in progress, /readyz is short-circuited by
+        // require_startup_ready with a 503. Those rejected probes must still
+        // pass through (and drain) the health governor, otherwise the health
+        // surface is unbounded exactly when the service is not ready.
+        let state = crate::test_support::lazy_state();
+        state
+            .startup_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        let app = build_router_inner(state, true);
+
+        let mut saw_gate_rejection = false;
+        let mut saw_limit = None;
+        for _ in 0..250 {
+            let response = app
+                .clone()
+                .oneshot(request_with_peer("203.0.113.7", Method::GET, "/readyz"))
+                .await
+                .unwrap();
+            match response.status() {
+                StatusCode::SERVICE_UNAVAILABLE => saw_gate_rejection = true,
+                StatusCode::TOO_MANY_REQUESTS => saw_limit = Some(response.status()),
+                other => panic!("unexpected status while not ready: {other}"),
+            }
+        }
+        assert!(
+            saw_gate_rejection,
+            "startup gate must still reject /readyz while not ready"
+        );
+        assert_eq!(
+            saw_limit,
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            "gate-rejected probes must still consume governor tokens"
+        );
+    }
+
+    #[tokio::test]
     async fn internal_paas_routes_are_rate_limited_on_the_production_router() {
         // Regression test for enclava-labs/cap#135: the internal PaaS surface
         // used to be merged without a GovernorLayer, so internal-route call
@@ -777,6 +834,49 @@ mod runtime_gate_tests {
         ] {
             assert!(!is_workload_authority_mutation(&method, path));
         }
+    }
+
+    #[tokio::test]
+    async fn internal_routes_rate_limited_while_dispatch_gate_is_frozen() {
+        // Review feedback on enclava-labs/cap#170: with
+        // CAP_DEPLOYMENT_DISPATCH_ENABLED=false, POSTs to internal PaaS
+        // workload-authority routes are short-circuited by
+        // freeze_workload_authority_mutations with a 503 before any handler
+        // (or auth) runs. Those gate-rejected requests must still drain the
+        // internal governor, otherwise the internal surface is unbounded
+        // exactly while the dispatch gate is tripped.
+        let mut state = crate::test_support::lazy_state();
+        state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        state.deployment_dispatch_enabled = false;
+        let app = build_router_inner(state, true);
+
+        let mut saw_gate_rejection = false;
+        let mut saw_limit = None;
+        for _ in 0..1500 {
+            let response = app
+                .clone()
+                .oneshot(request_with_peer(
+                    "203.0.113.9",
+                    Method::POST,
+                    "/internal/paas/orgs/org-1/apps",
+                ))
+                .await
+                .unwrap();
+            match response.status() {
+                StatusCode::SERVICE_UNAVAILABLE => saw_gate_rejection = true,
+                StatusCode::TOO_MANY_REQUESTS => saw_limit = Some(response.status()),
+                other => panic!("unexpected status while dispatch frozen: {other}"),
+            }
+        }
+        assert!(
+            saw_gate_rejection,
+            "dispatch freeze must still reject internal workload mutations"
+        );
+        assert_eq!(
+            saw_limit,
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            "gate-rejected internal requests must still consume governor tokens"
+        );
     }
 
     #[tokio::test]
