@@ -1468,11 +1468,15 @@ async fn deploy_app_candidate(
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     }
 
+    // The requested seconds are the idempotency identity. The accepted
+    // duration depends on the status read in this transaction, and apply
+    // changes that status before a lost-response retry arrives.
+    let customer_config_roll_hold_request = honor_customer_config_roll_hold
+        .then_some(body.customer_config_roll_hold_seconds)
+        .flatten();
     let customer_config_hold_seconds =
         crate::deployment_jobs::normalize_customer_config_roll_hold_seconds(
-            honor_customer_config_roll_hold
-                .then_some(body.customer_config_roll_hold_seconds)
-                .flatten(),
+            customer_config_roll_hold_request,
             crate::deployment_jobs::customer_config_roll_hold_applies(
                 app_mutation == AppMutation::Insert,
                 matches!(live_app_status, crate::models::AppStatus::Running),
@@ -1482,15 +1486,21 @@ async fn deploy_app_candidate(
     sqlx::query(
         "UPDATE deployments
             SET spec_snapshot = jsonb_set(
-                  spec_snapshot,
-                  '{customer_config_roll_hold_seconds}',
-                  $2::jsonb,
+                  jsonb_set(
+                    spec_snapshot,
+                    '{customer_config_roll_hold_seconds}',
+                    COALESCE($2::jsonb, 'null'::jsonb),
+                    true
+                  ),
+                  '{customer_config_roll_hold_requested_seconds}',
+                  COALESCE($3::jsonb, 'null'::jsonb),
                   true
                 )
           WHERE id = $1",
     )
     .bind(deploy_id)
     .bind(serde_json::json!(customer_config_hold_seconds))
+    .bind(serde_json::json!(customer_config_roll_hold_request))
     .execute(&mut *tx)
     .await
     .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;

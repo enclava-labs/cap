@@ -629,25 +629,45 @@ pub(super) fn ensure_idempotent_retry_matches(
     if existing_log_encryption != requested_log_encryption {
         return Err(idempotency_conflict("security.log_encryption"));
     }
-    let stored_hold = deployment
-        .spec_snapshot
-        .get("customer_config_roll_hold_seconds")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let requested_hold = serde_json::json!(
-        crate::deployment_jobs::normalize_customer_config_roll_hold_seconds(
-            body.customer_config_roll_hold_seconds,
-            crate::deployment_jobs::customer_config_roll_hold_applies(
-                false,
-                matches!(app.status, crate::models::AppStatus::Running),
-                app.tee_domain.as_deref(),
-            ),
-        )
-    );
-    if stored_hold != requested_hold {
+    if !customer_config_roll_hold_idempotency_matches(
+        &deployment.spec_snapshot,
+        body.customer_config_roll_hold_seconds,
+    ) {
         return Err(idempotency_conflict("customer_config_roll_hold_seconds"));
     }
     Ok(())
+}
+
+/// Compare the caller's requested hold, not a duration recomputed from the
+/// app's current status. Apply moves a running app to `creating` before a
+/// lost response is retried, and that later status would turn the same
+/// request into a conflict.
+fn customer_config_roll_hold_idempotency_matches(
+    spec_snapshot: &serde_json::Value,
+    requested_seconds: Option<u32>,
+) -> bool {
+    let requested = serde_json::json!(requested_seconds);
+    if let Some(stored_requested) = spec_snapshot.get("customer_config_roll_hold_requested_seconds")
+    {
+        return stored_requested == &requested;
+    }
+    // Rows accepted before the requested seconds were stored. A recorded
+    // duration means the hold applied, so clamp without reading app status.
+    // A missing duration only matches a retry that does not ask for a hold.
+    let stored_hold = spec_snapshot
+        .get("customer_config_roll_hold_seconds")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if stored_hold.is_number() {
+        let requested_hold = serde_json::json!(
+            crate::deployment_jobs::normalize_customer_config_roll_hold_seconds(
+                requested_seconds,
+                true,
+            )
+        );
+        return stored_hold == requested_hold;
+    }
+    requested_seconds.is_none_or(|seconds| seconds == 0)
 }
 
 fn idempotency_conflict(field: &'static str) -> (StatusCode, Json<serde_json::Value>) {
