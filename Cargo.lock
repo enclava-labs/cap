@@ -1702,6 +1702,7 @@ dependencies = [
  "chrono",
  "enclava-common",
  "nix",
+ "serde",
  "serde_json",
 ]
 

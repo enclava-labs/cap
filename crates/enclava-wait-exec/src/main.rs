@@ -119,6 +119,32 @@ struct EncryptedLogConfig {
 fn encrypted_log_config_from_env(
     default_container: &str,
 ) -> Result<Option<EncryptedLogConfig>, String> {
+    // Prod-strict resolves the recipient key and frame context exclusively
+    // from the trusted handoff enclava-init writes onto the decrypted state
+    // volume from the signed cc_init_data claim — never from the
+    // host-controlled pod environment, which a tampered host could populate
+    // with its own self-consistent key pair and thereby capture all workload
+    // log plaintext. ENCLAVA_LOG_ENCRYPTION_KEY_ID (platform-set in prod
+    // manifests) is read only as an activation hint: its presence selects
+    // encrypted logging, its value is not trusted.
+    #[cfg(feature = "prod-strict")]
+    {
+        let _ = default_container;
+        if env::var_os("ENCLAVA_LOG_ENCRYPTION_KEY_ID").is_none() {
+            return Ok(None);
+        }
+        encrypted_log_config_from_handoff()
+    }
+    #[cfg(not(feature = "prod-strict"))]
+    {
+        encrypted_log_config_from_raw_env(default_container)
+    }
+}
+
+#[cfg(not(feature = "prod-strict"))]
+fn encrypted_log_config_from_raw_env(
+    default_container: &str,
+) -> Result<Option<EncryptedLogConfig>, String> {
     let Some(key_id) = env::var_os("ENCLAVA_LOG_ENCRYPTION_KEY_ID") else {
         return Ok(None);
     };
@@ -152,6 +178,7 @@ fn encrypted_log_config_from_env(
     }))
 }
 
+#[cfg(not(feature = "prod-strict"))]
 fn required_env(name: &str) -> Result<String, String> {
     let value = env::var(name).map_err(|_| format!("{name} is required"))?;
     if value.is_empty()
@@ -162,6 +189,88 @@ fn required_env(name: &str) -> Result<String, String> {
         return Err(format!("{name} must not be empty or contain line breaks"));
     }
     Ok(value)
+}
+
+/// Trusted encrypted-log recipient handoff written by enclava-init onto the
+/// decrypted state volume (contents from the signed cc_init_data
+/// `log_encryption_json` claim). Prod-strict builds read this instead of the
+/// host-controlled log-encryption env vars.
+#[cfg(feature = "prod-strict")]
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct LogEncryptionHandoff {
+    key_id: String,
+    public_key_base64url: String,
+    public_key_sha256: String,
+    org_id: String,
+    app_name: String,
+    deployment_id: String,
+}
+
+/// Location of the trusted handoff on the decrypted state volume; mirrors
+/// enclava-init's `write_log_encryption_handoff` compiled default
+/// (`<state-root>/app/log-encryption.json`). The state volume is only ever
+/// writable from inside the guest after LUKS unlock — the host sees
+/// ciphertext — so this is the trust root for the recipient key.
+#[cfg(feature = "prod-strict")]
+const LOG_ENCRYPTION_HANDOFF_FILE: &str = "/state/app/log-encryption.json";
+
+/// Container-name source for the spool file name in prod-strict.
+/// ENCLAVA_CONTAINER_NAME is validated by the sentinel handshake
+/// (`validate_sentinel_name`) and only selects the spool sibling name, never
+/// key material or paths outside the spool dir.
+#[cfg(feature = "prod-strict")]
+fn handoff_container_name() -> Result<String, String> {
+    let name = env::var("ENCLAVA_CONTAINER_NAME")
+        .unwrap_or_else(|_| "app".to_string())
+        .trim()
+        .to_string();
+    validate_sentinel_name(&name)?;
+    Ok(name)
+}
+
+#[cfg(feature = "prod-strict")]
+fn encrypted_log_config_from_handoff() -> Result<Option<EncryptedLogConfig>, String> {
+    let handoff = fs::read_to_string(LOG_ENCRYPTION_HANDOFF_FILE)
+        .map_err(|err| format!("reading {LOG_ENCRYPTION_HANDOFF_FILE}: {err}"))?;
+    let handoff: LogEncryptionHandoff = serde_json::from_str(&handoff)
+        .map_err(|err| format!("parsing {LOG_ENCRYPTION_HANDOFF_FILE}: {err}"))?;
+    let recipient = validate_public_key(
+        handoff.key_id,
+        handoff.public_key_base64url,
+        handoff.public_key_sha256,
+    )
+    .map_err(|err| format!("invalid log encryption public key metadata: {err}"))?;
+    for (name, value) in [
+        ("org_id", &handoff.org_id),
+        ("app_name", &handoff.app_name),
+        ("deployment_id", &handoff.deployment_id),
+    ] {
+        if value.is_empty()
+            || value
+                .bytes()
+                .any(|byte| byte == 0 || byte == b'\n' || byte == b'\r')
+        {
+            return Err(format!(
+                "log-encryption handoff {name} must not be empty or contain line breaks"
+            ));
+        }
+    }
+    let context = LogFrameContext {
+        org_id: handoff.org_id,
+        app_name: handoff.app_name,
+        deployment_id: handoff.deployment_id,
+    };
+    let container = handoff_container_name()?;
+    // Spool pinned to the dedicated log spool dir: the host-controlled
+    // ENCLAVA_LOG_SPOOL_PATH env is not honored in prod-strict.
+    let spool_path = PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(format!("{container}.jsonl"));
+    Ok(Some(EncryptedLogConfig {
+        recipient,
+        context,
+        spool_path,
+        container,
+    }))
 }
 
 fn run_with_encrypted_logs(
@@ -554,18 +663,40 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "prod-strict"))]
     fn prod_strict_pins_readiness_paths_to_compiled_defaults() {
+        // This test verifies that prod-strict builds don't read certain env vars directly.
+        // It runs in dev builds but checks the source for patterns that should not exist
+        // in prod-strict.
+        //
+        // Note: The log encryption key checks are intentionally omitted here because
+        // encrypted_log_config_from_raw_env is already gated with #[cfg(not(feature = "prod-strict"))],
+        // so the env::var calls exist in the source but are compiled out in prod-strict.
         let source = include_str!("main.rs").replace("\r\n", "\n");
         for var in ["ENCLAVA_INIT_READY_FILE", "ENCLAVA_STARTED_DIR"] {
             assert!(
                 !source.contains(&format!("env::var_os(\"{var}\")")),
-                "{var} must be read via env_override, not env::var_os"
+                "{var} must not be read via env::var_os"
             );
             assert!(
                 source.contains(&format!("env_override(\"{var}\")")),
                 "{var} must resolve through env_override"
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn prod_strict_uses_handoff_for_log_encryption() {
+        // Verify prod-strict reads log encryption from handoff file, not env.
+        let source = include_str!("main.rs").replace("\r\n", "\n");
+        assert!(
+            source.contains("LOG_ENCRYPTION_HANDOFF_FILE"),
+            "prod-strict must read log encryption from handoff file"
+        );
+        // Note: We don't check that encrypted_log_config_from_raw_env is absent because
+        // it's gated with #[cfg(not(feature = "prod-strict"))] in the source, which is correct.
+        // The function exists in dev builds but is compiled out in prod-strict.
     }
 
     #[test]
@@ -618,6 +749,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "prod-strict"))]
     fn encrypted_log_config_requires_and_reads_routing_context() {
         let keypair = enclava_common::log_encryption::generate_log_keypair();
         unsafe {

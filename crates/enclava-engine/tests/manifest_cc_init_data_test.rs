@@ -540,3 +540,43 @@ fn runtime_class_rejects_unknown_values() {
         RuntimeClassConfigError::Unsupported("kata-qemu-tdx".to_string())
     );
 }
+
+#[test]
+fn log_encryption_claim_is_bound_to_cc_init_data() {
+    let mut app = sample_app();
+    app.log_encryption = Some(enclava_engine::types::LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+    });
+    let toml = build_toml(&app);
+    let value: toml::Value = toml::from_str(&toml).unwrap();
+    let data = value.get("data").and_then(toml::Value::as_table).unwrap();
+    let handoff: serde_json::Value = serde_json::from_str(
+        data.get("log_encryption_json")
+            .and_then(toml::Value::as_str)
+            .expect("log_encryption_json claim"),
+    )
+    .unwrap();
+    assert_eq!(handoff["algorithm"], "x25519-hpke-v1");
+    assert_eq!(handoff["key_id"], "logs-prod");
+    assert_eq!(
+        handoff["public_key_base64url"],
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    );
+    assert_eq!(
+        handoff["public_key_sha256"],
+        "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU"
+    );
+    // Frame context rides the signed claim, not the pod env.
+    assert_eq!(handoff["org_id"], app.tenant_id);
+    assert_eq!(handoff["app_name"], app.name);
+    assert_eq!(handoff["deployment_id"], app.deployment_id.to_string());
+
+    // Absent when log encryption is not configured.
+    let plain = build_toml(&sample_app());
+    let value: toml::Value = toml::from_str(&plain).unwrap();
+    let data = value.get("data").and_then(toml::Value::as_table).unwrap();
+    assert!(data.get("log_encryption_json").is_none());
+}

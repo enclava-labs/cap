@@ -660,6 +660,7 @@ fn unsigned_config() -> Config {
         cc_init_data_path: None,
         platform_trustee_policy_pubkey_hex: None,
         signing_service_pubkey_hex: None,
+        log_encryption: None,
     }
 }
 

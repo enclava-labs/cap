@@ -33,6 +33,37 @@ pub struct AppBindMountConfig {
     pub mount_path: String,
 }
 
+/// Encrypted-log recipient metadata from the signed `log_encryption_json`
+/// cc_init_data claim. This is the authoritative form: enclava-init
+/// re-publishes it as the trusted in-guest handoff for enclava-wait-exec,
+/// so a tampered host cannot swap the recipient key (and thereby capture
+/// workload log plaintext) through pod env or ConfigMap.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct LogEncryptionHandoff {
+    pub algorithm: String,
+    pub key_id: String,
+    pub public_key_base64url: String,
+    pub public_key_sha256: String,
+    pub org_id: String,
+    pub app_name: String,
+    pub deployment_id: String,
+}
+
+/// The `[log-encryption]` ConfigMap section. Host-controlled transport copy
+/// of a subset of the handoff fields; never trusted on its own — when the
+/// signed claim exists, any field present here must match it. All fields are
+/// optional so legacy ConfigMap sections (rendered without the newer fields)
+/// still parse.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct LogEncryptionSection {
+    pub algorithm: Option<String>,
+    pub key_id: Option<String>,
+    pub public_key_base64url: Option<String>,
+    pub public_key_sha256: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
@@ -105,6 +136,11 @@ pub struct Config {
 
     #[serde(default)]
     pub signing_service_pubkey_hex: Option<String>,
+
+    /// `[log-encryption]` ConfigMap section (host-controlled transport copy;
+    /// cross-checked against the signed claim, never trusted alone).
+    #[serde(default)]
+    pub log_encryption: Option<LogEncryptionSection>,
 }
 
 fn default_unlock_socket() -> String {

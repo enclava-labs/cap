@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
-use enclava_init::config::{Config, Mode, VolumeConfig};
+use enclava_init::config::{Config, LogEncryptionHandoff, Mode, VolumeConfig};
 use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
@@ -112,7 +112,7 @@ fn run() -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from("/etc/enclava-init/config.toml"));
     let cfg = Config::load(&cfg_path).with_context(|| format!("loading {}", cfg_path.display()))?;
     record_stage("validating signed config").ok();
-    validate_configmap_transport_against_signed_cc_init_data(&cfg)?;
+    let log_encryption_handoff = validate_configmap_transport_against_signed_cc_init_data(&cfg)?;
     // The relay starts only after the signed-config check passes: it serves
     // an unauthenticated log-tail endpoint keyed off host-visible env, so
     // it must not come up while the transport is still unverified.
@@ -150,6 +150,7 @@ fn run() -> Result<()> {
     record_stage("writing component seeds").ok();
     let phase = stats.elapsed_ms();
     write_per_component_seeds(&cfg, &owner)?;
+    write_log_encryption_handoff(&cfg, log_encryption_handoff.as_ref())?;
     stats.record_component_seeds(phase);
 
     if stay_alive {
@@ -473,7 +474,9 @@ fn acquire_owner_seed_password(cfg: &Config) -> Result<OwnerSeed> {
     }
 }
 
-fn validate_configmap_transport_against_signed_cc_init_data(cfg: &Config) -> Result<()> {
+fn validate_configmap_transport_against_signed_cc_init_data(
+    cfg: &Config,
+) -> Result<Option<LogEncryptionHandoff>> {
     if !cfg.trustee_policy_read_available {
         if cfg!(feature = "prod-strict") {
             anyhow::bail!(
@@ -481,7 +484,7 @@ fn validate_configmap_transport_against_signed_cc_init_data(cfg: &Config) -> Res
             );
         }
         if cfg.cc_init_data_path.is_none() {
-            return Ok(());
+            return Ok(None);
         }
     }
     let cc_path = cfg
@@ -652,8 +655,69 @@ fn validate_configmap_transport_against_signed_cc_init_data(cfg: &Config) -> Res
             "signing-service-pubkey-hex",
         )?;
     }
+    let handoff = signed_log_encryption_handoff(data, cfg)?;
 
-    Ok(())
+    Ok(handoff)
+}
+
+/// Bind the `[log-encryption]` ConfigMap section to the signed
+/// `log_encryption_json` cc_init_data claim and return the authoritative
+/// handoff for re-publication.
+///
+/// The recipient public key decides who can decrypt workload log plaintext,
+/// so the signed claim is authoritative and the host-controlled ConfigMap
+/// copy is only a cross-check: every field present in the section must match
+/// the claim, and any mismatch fails closed. A section with no signed claim
+/// is likewise rejected (the host must not be able to introduce log
+/// encryption where the signed data has none). A claim without a section is
+/// tolerated in dev builds but refused in prod-strict, where the section is
+/// expected to ride along; the handoff itself is written from the claim
+/// either way, so a tampered section can never redirect it.
+fn signed_log_encryption_handoff(
+    data: &toml::map::Map<String, toml::Value>,
+    cfg: &Config,
+) -> Result<Option<LogEncryptionHandoff>> {
+    let signed = data
+        .get("log_encryption_json")
+        .and_then(toml::Value::as_str);
+    match (signed, cfg.log_encryption.as_ref()) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => anyhow::bail!(
+            "ConfigMap has a [log-encryption] section but signed cc_init_data has no log_encryption_json claim"
+        ),
+        (Some(signed), section) => {
+            let handoff: LogEncryptionHandoff = serde_json::from_str(signed)
+                .with_context(|| "parsing signed log_encryption_json claim")?;
+            if let Some(section) = section {
+                let mismatches = [
+                    ("algorithm", (&section.algorithm, &handoff.algorithm)),
+                    ("key-id", (&section.key_id, &handoff.key_id)),
+                    (
+                        "public-key-base64url",
+                        (&section.public_key_base64url, &handoff.public_key_base64url),
+                    ),
+                    (
+                        "public-key-sha256",
+                        (&section.public_key_sha256, &handoff.public_key_sha256),
+                    ),
+                ];
+                for (field, (section_value, claim_value)) in mismatches {
+                    if let Some(section_value) = section_value
+                        && section_value != claim_value
+                    {
+                        anyhow::bail!(
+                            "ConfigMap log-encryption {field} does not match signed cc_init_data claim log_encryption_json"
+                        );
+                    }
+                }
+            } else if cfg!(feature = "prod-strict") {
+                anyhow::bail!(
+                    "signed cc_init_data carries log_encryption_json but the ConfigMap has no [log-encryption] section"
+                );
+            }
+            Ok(Some(handoff))
+        }
+    }
 }
 
 fn require_signed_u32_match(
@@ -1440,6 +1504,34 @@ fn write_per_component_seeds(cfg: &Config, owner: &OwnerSeed) -> Result<()> {
     chown::chown(&app_path, numeric_identity(cfg.app_uid, cfg.app_gid))
         .with_context(|| format!("chown {}", app_path.display()))?;
 
+    Ok(())
+}
+
+/// Publish the trusted encrypted-log recipient handoff for wait-exec.
+///
+/// The recipient metadata comes from the signed `log_encryption_json`
+/// cc_init_data claim, extracted during
+/// [`validate_configmap_transport_against_signed_cc_init_data`] (which also
+/// cross-checks the host-controlled ConfigMap section against it). It is
+/// published onto the decrypted state volume — the only path the host
+/// cannot write (it only ever sees LUKS ciphertext) — so prod-strict
+/// enclava-wait-exec resolves the recipient (and the log frame context)
+/// from this file instead of the host-controlled pod environment. The file
+/// carries only public key material; it is written after unlock and before
+/// the ready file flips, so consumers never see readiness without it.
+fn write_log_encryption_handoff(
+    cfg: &Config,
+    handoff: Option<&LogEncryptionHandoff>,
+) -> Result<()> {
+    let Some(handoff) = handoff else {
+        return Ok(());
+    };
+    let path = Path::new(&cfg.state_root).join("app/log-encryption.json");
+    let body = serde_json::to_vec_pretty(handoff).context("serializing log-encryption handoff")?;
+    writes::atomic_write(&path, &body, 0o640)
+        .with_context(|| format!("writing log-encryption handoff {}", path.display()))?;
+    chown::chown(&path, numeric_identity(cfg.app_uid, cfg.app_gid))
+        .with_context(|| format!("chown {}", path.display()))?;
     Ok(())
 }
 

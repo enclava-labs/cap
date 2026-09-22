@@ -269,6 +269,22 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
         "identity_hash",
         &app.tenant_instance_identity_hash,
     );
+    // The encrypted-log recipient must be bound to the measured cc_init_data:
+    // enclava-init re-publishes this claim as the trusted in-guest handoff for
+    // enclava-wait-exec, so a tampered host cannot swap the recipient key (and
+    // thereby capture workload log plaintext) through pod env or ConfigMap.
+    if let Some(log_encryption) = &app.log_encryption {
+        let handoff = serde_json::json!({
+            "algorithm": log_encryption.algorithm,
+            "key_id": log_encryption.key_id,
+            "public_key_base64url": log_encryption.public_key_base64url,
+            "public_key_sha256": log_encryption.public_key_sha256,
+            "org_id": app.tenant_id,
+            "app_name": app.name,
+            "deployment_id": app.deployment_id.to_string(),
+        });
+        push_toml_string(&mut toml, "log_encryption_json", &handoff.to_string());
+    }
     push_toml_string(
         &mut toml,
         "signer_identity_subject",

@@ -7,6 +7,7 @@ use std::time::Duration;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8082";
 const DEFAULT_SPOOL_PATH: &str = "/run/enclava-logs/app.jsonl";
+const SPOOL_DIR: &str = "/run/enclava-logs";
 const DEFAULT_CONTAINER: &str = "app";
 const DEFAULT_TAIL_LINES: usize = 100;
 const MAX_TAIL_LINES: usize = 1_000;
@@ -39,9 +40,11 @@ impl LogRelayConfig {
                 &std::env::var("ENCLAVA_LOG_RELAY_BIND")
                     .unwrap_or_else(|_| DEFAULT_BIND.to_string()),
             )?,
-            spool_path: std::env::var_os("ENCLAVA_LOG_RELAY_SPOOL_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_SPOOL_PATH)),
+            spool_path: require_spool_under_log_dir(
+                &std::env::var_os("ENCLAVA_LOG_RELAY_SPOOL_PATH")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_SPOOL_PATH)),
+            )?,
             container: std::env::var("ENCLAVA_LOG_RELAY_CONTAINER")
                 .unwrap_or_else(|_| DEFAULT_CONTAINER.to_string()),
         })
@@ -83,6 +86,40 @@ fn require_loopback_bind(bind: &str) -> io::Result<std::net::SocketAddr> {
         std::net::IpAddr::V6(ip) if ip.is_loopback() => Ok(addr),
         _ => Err(invalid()),
     }
+}
+
+/// The relay spool must live directly under the dedicated log spool
+/// directory (`/run/enclava-logs`, a k8s volume mount that is a real
+/// directory in the guest). `O_NOFOLLOW` only rejects a symlinked final
+/// component; a host-controlled `ENCLAVA_LOG_RELAY_SPOOL_PATH` pointing
+/// directly at some other regular sensitive file (for example a mounted
+/// TLS key) would otherwise be streamed through the unauthenticated
+/// relay endpoint. Fail closed on any path that is not an absolute
+/// `<log-spool-dir>/<single-component>` path.
+fn require_spool_under_log_dir(path: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+    let spool_dir = Path::new(SPOOL_DIR);
+    let invalid = |reason: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("log relay spool {path:?} must live directly under {SPOOL_DIR}: {reason}"),
+        )
+    };
+    if !path.is_absolute() {
+        return Err(invalid("must be an absolute path"));
+    }
+    if path
+        .components()
+        .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(invalid(
+            "must not contain traversal or CurDir/ParentDir components",
+        ));
+    }
+    if path.parent() != Some(spool_dir) {
+        return Err(invalid("parent directory must be the log spool dir"));
+    }
+    Ok(path.to_path_buf())
 }
 
 pub fn run_from_env() -> io::Result<()> {
@@ -352,5 +389,30 @@ mod tests {
         let (lines, offset) = tail_lines(&spool, 10).unwrap();
         assert_eq!(lines.len(), 1);
         assert!(offset > 0);
+    }
+    #[test]
+    fn spool_paths_outside_the_log_dir_are_rejected() {
+        for spool in [
+            "/state/tls-state/tenant-ingress/certificates/tls.key",
+            "/run/enclava-logs/nested/app.jsonl",
+            "/run/enclava-logs/../app.jsonl",
+            "run/enclava-logs/app.jsonl",
+            "/etc/passwd",
+            "/run/enclava-logs",
+        ] {
+            let err = require_spool_under_log_dir(Path::new(spool))
+                .expect_err("off-spool-dir spool path must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{spool}: {err}");
+        }
+    }
+
+    #[test]
+    fn spool_paths_directly_under_the_log_dir_are_accepted() {
+        for spool in ["/run/enclava-logs/app.jsonl", "/run/enclava-logs/web.jsonl"] {
+            assert_eq!(
+                require_spool_under_log_dir(Path::new(spool)).unwrap(),
+                PathBuf::from(spool)
+            );
+        }
     }
 }
