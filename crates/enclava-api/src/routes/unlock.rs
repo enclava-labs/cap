@@ -372,9 +372,12 @@ async fn commit_unlock_mode_transition(
     crate::signing_service::lock_org_signing_authority_lane(&mut tx, request.org_id)
         .await
         .map_err(|_| unlock_database_error())?;
-    let current_role =
-        crate::auth::scopes::active_membership_role_in_tx(&mut tx, request.org_id, request.user_id)
-            .await?;
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut tx,
+        request.org_id,
+        request.user_id,
+    )
+    .await?;
     crate::auth::scopes::require_owner_role(current_role)?;
     crate::deploy::lock_app_deployment_lane(&mut tx, request.observed_authority.app_id())
         .await

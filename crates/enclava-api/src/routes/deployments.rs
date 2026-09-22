@@ -1140,9 +1140,12 @@ async fn deploy_app_candidate(
             .await
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     }
-    let current_role =
-        crate::auth::scopes::active_membership_role_in_tx(&mut tx, auth.org_id, auth.user_id)
-            .await?;
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut tx,
+        auth.org_id,
+        auth.user_id,
+    )
+    .await?;
     crate::auth::scopes::require_admin_role(current_role)?;
     crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
         .await
@@ -1834,10 +1837,11 @@ mod tests {
             crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
                 .await
                 .expect("lock acceptance signing lane");
-            let authority =
-                crate::auth::scopes::active_membership_role_in_tx(&mut tx, org_id, user_id)
-                    .await
-                    .and_then(crate::auth::scopes::require_admin_role);
+            let authority = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+                &mut tx, org_id, user_id,
+            )
+            .await
+            .and_then(crate::auth::scopes::require_admin_role);
             if authority.is_ok() {
                 crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
                     .await

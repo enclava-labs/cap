@@ -402,9 +402,12 @@ pub async fn verify_challenge(
     crate::entitlements::lock_org_entitlement_lane(&mut app_lane, auth.org_id)
         .await
         .map_err(|_| internal_error())?;
-    let current_role =
-        crate::auth::scopes::active_membership_role_in_tx(&mut app_lane, auth.org_id, auth.user_id)
-            .await?;
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut app_lane,
+        auth.org_id,
+        auth.user_id,
+    )
+    .await?;
     crate::auth::scopes::require_admin_role(current_role)?;
     crate::deploy::lock_app_deployment_lane(&mut app_lane, app.id)
         .await
@@ -667,9 +670,12 @@ pub async fn remove_custom_domain(
     crate::deploy::lock_app_deployment_lane(&mut app_lane, app.id)
         .await
         .map_err(|_| internal_error())?;
-    let current_role =
-        crate::auth::scopes::active_membership_role_in_tx(&mut app_lane, auth.org_id, auth.user_id)
-            .await?;
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut app_lane,
+        auth.org_id,
+        auth.user_id,
+    )
+    .await?;
     crate::auth::scopes::require_admin_role(current_role)?;
     let current: bool = sqlx::query_scalar(
         "SELECT EXISTS(

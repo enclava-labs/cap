@@ -95,12 +95,19 @@ pub fn require_owner_role(role: Role) -> AuthzResult {
 /// The memberships row is locked with `FOR UPDATE` so the read role is held
 /// stable until the caller's transaction commits: a concurrent demotion or
 /// removal blocks on the row lock instead of committing between this read and
-/// the caller's commit. Deadlock safety relies on lane discipline rather than
-/// on this function: every caller must already hold the organization
-/// entitlement or signing authority lane, and every memberships writer must
-/// acquire those lanes before touching the row, so the row lock can only
-/// queue behind a lane-ordered mutation, never cycle with it.
-pub async fn active_membership_role_in_tx(
+/// the caller's commit.
+///
+/// # Precondition (deadlock safety)
+///
+/// Deadlock safety relies on lane discipline rather than on this function.
+/// PRECONDITION: every caller must already hold the organization entitlement
+/// lane or the signing authority lane before calling this function, and every
+/// memberships writer must acquire those lanes before touching the row, so
+/// the row lock can only queue behind a lane-ordered mutation, never cycle
+/// with it. A call site that skips the lane silently reintroduces cycle risk
+/// (see review of #174): if you see `lock_and_read_` on a path that does not
+/// hold a lane, that is a bug.
+pub async fn lock_and_read_active_membership_role_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: Uuid,
     user_id: Uuid,
@@ -344,7 +351,7 @@ mod tests {
 
         // The mutating route's transaction: read (and lock) the actor's role.
         let mut reader = pool.begin().await.expect("begin role lock reader");
-        let role = active_membership_role_in_tx(&mut reader, org_id, user_id)
+        let role = lock_and_read_active_membership_role_in_tx(&mut reader, org_id, user_id)
             .await
             .expect("read active membership role under row lock");
         assert_eq!(role, Role::Admin);
@@ -380,7 +387,7 @@ mod tests {
         });
 
         // The demotion's UPDATE must be waiting on the reader's row lock.
-        // Without FOR UPDATE in active_membership_role_in_tx the UPDATE would
+        // Without FOR UPDATE in lock_and_read_active_membership_role_in_tx the UPDATE would
         // commit immediately and this backend would never sit in Lock wait.
         let demoter_pid = pid_receiver.await.expect("receive demoter pid");
         tokio::time::timeout(std::time::Duration::from_secs(5), async {

@@ -469,7 +469,8 @@ pub async fn put_keyring(
         .await
         .map_err(|_| db_error())?;
 
-    let current_role = scopes::active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
+    let current_role =
+        scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_owner_role(current_role)?;
 
     // Re-read key registration and latest keyring only after acquiring the
@@ -927,7 +928,8 @@ pub async fn rotate_org_owner(
     crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
         .await
         .map_err(|_| db_error())?;
-    let current_role = scopes::active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
+    let current_role =
+        scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_owner_role(current_role)?;
 
     type AuthorityRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
@@ -1155,7 +1157,7 @@ pub async fn invite_member(
         .await
         .map_err(|_| db_error())?;
     let current_caller_role =
-        scopes::active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
+        scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_admin_role(current_caller_role)?;
 
     let existing_role: Option<Role> = sqlx::query_scalar(
@@ -1290,7 +1292,7 @@ pub async fn remove_member(
         .await
         .map_err(|_| db_error())?;
     let current_caller_role =
-        scopes::active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
+        scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_admin_role(current_caller_role)?;
     let target_role: Option<Role> = sqlx::query_scalar(
         "SELECT role as \"role: _\"
