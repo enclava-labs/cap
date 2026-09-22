@@ -91,6 +91,15 @@ pub fn require_owner_role(role: Role) -> AuthzResult {
 /// Request authentication happens before potentially slow deployment and
 /// signing validation. This check prevents a membership removal or demotion
 /// that wins the authority lane from being overwritten by a stale request.
+///
+/// The memberships row is locked with `FOR UPDATE` so the read role is held
+/// stable until the caller's transaction commits: a concurrent demotion or
+/// removal blocks on the row lock instead of committing between this read and
+/// the caller's commit. Deadlock safety relies on lane discipline rather than
+/// on this function: every caller must already hold the organization
+/// entitlement or signing authority lane, and every memberships writer must
+/// acquire those lanes before touching the row, so the row lock can only
+/// queue behind a lane-ordered mutation, never cycle with it.
 pub async fn active_membership_role_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     org_id: Uuid,
@@ -101,7 +110,8 @@ pub async fn active_membership_role_in_tx(
            FROM memberships
           WHERE org_id = $1
             AND user_id = $2
-            AND removed_at IS NULL",
+            AND removed_at IS NULL
+          FOR UPDATE",
     )
     .bind(org_id)
     .bind(user_id)
@@ -290,5 +300,133 @@ mod tests {
         assert!(require_config_metadata_write(&auth(Role::Admin, &["apps:write"])).is_err());
         assert!(require_config_metadata_write(&auth(Role::Admin, &["config:write"])).is_ok());
         assert!(require_config_metadata_write(&auth(Role::Owner, &[])).is_ok());
+    }
+
+    async fn scopes_test_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect membership role lock regression database");
+        crate::db::pool::run_migrations(&pool)
+            .await
+            .expect("migrate membership role lock regression database");
+        pool
+    }
+
+    /// Regression test for #131: the in-transaction membership role read must
+    /// hold a row lock, so a concurrent demotion cannot commit between the
+    /// role check and the caller's commit.
+    #[tokio::test]
+    async fn active_membership_role_read_blocks_concurrent_demotion() {
+        let pool = scopes_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+            .bind(org_id)
+            .bind(format!("role-lock-{suffix}"))
+            .bind(&suffix[..8])
+            .execute(&pool)
+            .await
+            .expect("insert role lock test organization");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Role Lock Admin')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert role lock test user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'admin')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert role lock test membership");
+
+        // The mutating route's transaction: read (and lock) the actor's role.
+        let mut reader = pool.begin().await.expect("begin role lock reader");
+        let role = active_membership_role_in_tx(&mut reader, org_id, user_id)
+            .await
+            .expect("read active membership role under row lock");
+        assert_eq!(role, Role::Admin);
+
+        // A concurrent demotion of the same member must block on the row
+        // lock instead of committing while the reader still sees admin.
+        // The demoter publishes its backend pid so the lock-wait check below
+        // cannot false-positive on an unrelated backend in the shared test
+        // database.
+        let demoter_pool = pool.clone();
+        let (pid_sender, pid_receiver) = tokio::sync::oneshot::channel();
+        let demotion = tokio::spawn(async move {
+            let mut tx = demoter_pool
+                .begin()
+                .await
+                .expect("begin concurrent demotion");
+            let demoter_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("concurrent demotion backend pid");
+            pid_sender.send(demoter_pid).expect("send demoter pid");
+            sqlx::query(
+                "UPDATE memberships
+                    SET role = 'member'
+                  WHERE org_id = $1 AND user_id = $2 AND removed_at IS NULL",
+            )
+            .bind(org_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .expect("stage concurrent demotion");
+            tx.commit().await.expect("commit concurrent demotion");
+        });
+
+        // The demotion's UPDATE must be waiting on the reader's row lock.
+        // Without FOR UPDATE in active_membership_role_in_tx the UPDATE would
+        // commit immediately and this backend would never sit in Lock wait.
+        let demoter_pid = pid_receiver.await.expect("receive demoter pid");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let demotion_blocked: bool = sqlx::query_scalar(
+                    "SELECT COALESCE((
+                         SELECT wait_event_type = 'Lock'
+                           FROM pg_stat_activity
+                          WHERE pid = $1), false)",
+                )
+                .bind(demoter_pid)
+                .fetch_one(&pool)
+                .await
+                .expect("inspect concurrent demotion lock state");
+                if demotion_blocked {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("concurrent demotion must block on the locked membership row");
+
+        // Releasing the reader lets the demotion finish.
+        reader.rollback().await.expect("roll back role lock reader");
+        demotion.await.expect("join concurrent demotion");
+
+        let final_role: Option<String> = sqlx::query_scalar(
+            "SELECT role::text FROM memberships WHERE org_id = $1 AND user_id = $2",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read final membership role");
+        assert_eq!(final_role.as_deref(), Some("member"));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete role lock test organization");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete role lock test user");
     }
 }
