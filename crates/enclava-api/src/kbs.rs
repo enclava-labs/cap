@@ -1009,6 +1009,20 @@ async fn load_signed_policy_candidates(
               ) AS latest,
               jsonb_array_elements(latest.keyring->'members') AS member
         ),
+        -- The cast is safe: org_keyrings rows are written only by the put/
+        -- rotate handlers, which serialize validated JSON, so a committed
+        -- payload is always well-formed UTF-8 JSON with a members array.
+        current_keyring_members AS (
+            SELECT latest.org_id, member.value->>'pubkey' AS pubkey
+              FROM (
+                  SELECT DISTINCT ON (org_id)
+                      org_id,
+                      convert_from(keyring_payload, 'UTF8')::jsonb AS keyring
+                    FROM org_keyrings
+                   ORDER BY org_id, version DESC
+              ) AS latest,
+              jsonb_array_elements(latest.keyring->'members') AS member
+        ),
         eligible_current_job_operations AS (
             SELECT *
               FROM ranked_job_operations
@@ -1283,6 +1297,12 @@ async fn load_signed_policy_candidates(
             JOIN workload_artifacts AS artifact
               ON artifact.app_id = legacy.app_id
              AND artifact.deploy_id = legacy.deployment_id
+            JOIN current_keyring_members AS member
+              ON member.org_id = legacy.org_id
+             AND lower(member.pubkey) = lower(
+                 artifact.signed_policy_artifact
+                     ->'metadata'->>'descriptor_signing_pubkey'
+             )
             WHERE legacy.current_operation_rank = 1
               -- App failure alone does not retire the last healthy workload.
               AND (
