@@ -705,6 +705,28 @@ pub async fn enqueue_signed_policy_revocation_if_active(
     Ok(generation)
 }
 
+/// Enqueue a signed-policy recomputation only when CAP has already entered
+/// signed-policy mode.  Keyring rotation changes which retained artifacts are
+/// still authorized (#130); without a generation bump the reconciler would
+/// treat the changed candidate set at an unchanged generation as a conflict
+/// and keep the stale policy body live in Trustee.  Unsigned-only installs
+/// stay untouched.
+pub async fn enqueue_signed_policy_reconciliation_if_active(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<Option<i64>, KbsPolicyError> {
+    let generation = sqlx::query_scalar(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = desired_generation + 1,
+                updated_at = clock_timestamp()
+          WHERE singleton
+            AND desired_generation > 0
+        RETURNING desired_generation",
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(generation)
+}
+
 async fn enqueue_signed_policy_bootstrap_if_idle(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<bool, KbsPolicyError> {
@@ -968,6 +990,20 @@ async fn load_signed_policy_candidates(
             -- verification would reject its artifacts -- fail closed if a
             -- non-deploy role is ever added to keyring payloads.
             WHERE (member.value->>'role') IN ('owner', 'admin', 'deployer')
+        ),
+        -- The cast is safe: org_keyrings rows are written only by the put/
+        -- rotate handlers, which serialize validated JSON, so a committed
+        -- payload is always well-formed UTF-8 JSON with a members array.
+        current_keyring_members AS (
+            SELECT latest.org_id, member.value->>'pubkey' AS pubkey
+              FROM (
+                  SELECT DISTINCT ON (org_id)
+                      org_id,
+                      convert_from(keyring_payload, 'UTF8')::jsonb AS keyring
+                    FROM org_keyrings
+                   ORDER BY org_id, version DESC
+              ) AS latest,
+              jsonb_array_elements(latest.keyring->'members') AS member
         ),
         eligible_current_job_operations AS (
             SELECT *
@@ -1243,6 +1279,12 @@ async fn load_signed_policy_candidates(
             JOIN workload_artifacts AS artifact
               ON artifact.app_id = legacy.app_id
              AND artifact.deploy_id = legacy.deployment_id
+            JOIN current_keyring_members AS member
+              ON member.org_id = legacy.org_id
+             AND lower(member.pubkey) = lower(
+                 artifact.signed_policy_artifact
+                     ->'metadata'->>'descriptor_signing_pubkey'
+             )
             WHERE legacy.current_operation_rank = 1
               -- App failure alone does not retire the last healthy workload.
               AND (
