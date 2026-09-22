@@ -203,6 +203,11 @@ def test_release_generator_accepts_valid_unicode_idna_host():
     # Positive control: a genuinely valid IDN that reqwest::Url::parse
     # accepts (münchen.example.test -> xn--mnchen-3ya.example.test) must
     # still be signable — the IDNA gate is not a blanket Unicode ban.
+    # The idna package is a declared dependency (scripts/requirements.txt);
+    # if the environment lacks it the generator fail-closed rejects all
+    # non-ASCII hosts, so skip the positive control there rather than
+    # depend on an incidental package.
+    pytest.importorskip("idna")
     payload = base_payload()
     payload["trustee_kbs_url"] = "https://münchen.example.test/"
     generate_platform_release.validate_payload(payload)

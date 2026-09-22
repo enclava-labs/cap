@@ -4,6 +4,9 @@
 Production releases must pass ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX as a
 32-byte Ed25519 seed. The --dev-fixture-key option is only for the checked-in
 development artifact verified by enclava-cli's fallback fixture root.
+
+Python dependencies (cryptography, idna) are declared in requirements.txt
+next to this script: pip install -r requirements.txt
 """
 
 

@@ -200,7 +200,12 @@ state file (after operator verification), which the refusal message names.
 Removing `ENCLAVA_PLATFORM_RELEASE_PATH` while `ENCLAVA_PLATFORM_RELEASE_STATE`
 stays wired does not bypass the gate: the bundled release is then compared
 against the persisted mark as well (no state file yet → fresh install,
-untouched).
+untouched). Note this removal guard only covers deployments that set the
+explicit state var: with the default `<override-path>.accepted` location the
+mark's path is derived from the override path itself, so once the override
+var is removed the mark is undiscoverable — deployments that want the
+removal guard should set `ENCLAVA_PLATFORM_RELEASE_STATE` explicitly (as the
+kustomize component does).
 
 ### Rotating the production root
 
