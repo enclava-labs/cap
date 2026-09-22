@@ -1,12 +1,21 @@
-//! Rate-limiter key extractor that only honours `X-Forwarded-For` /
-//! `Forwarded` headers from configured trusted proxy CIDRs.
+//! Rate-limiter key extractor that only honours client-address headers
+//! from configured trusted proxy CIDRs.
 //!
 //! Untrusted peers fall back to the direct TCP peer address; spoofed XFF
 //! headers from the open internet cannot move another tenant's bucket.
-//! Within a trusted proxy chain the client IP is resolved with the standard
-//! rightmost-untrusted walk: the public client may append arbitrary leftmost
-//! entries, but it cannot forge the rightmost entries appended by proxies
-//! we trust, so it cannot choose its own rate-limit key.
+//! For a trusted peer the key is derived, in order of preference, from:
+//!
+//! 1. `X-Real-IP` — ingress-nginx rewrites this with the address that
+//!    actually connected to it (default `use-forwarded-headers=false`), so
+//!    no client — public or on the trusted pod network — can seed it.
+//!    This is the verified-proxy-metadata source and takes precedence.
+//! 2. A rightmost-untrusted walk over `X-Forwarded-For` — for proxies that
+//!    only append to XFF. The public client may put arbitrary leftmost
+//!    entries in the header, but the rightmost entries are appended by
+//!    proxies we trust. If every entry is trusted, the rightmost entry
+//!    (written by the proxy closest to us) is used — the leftmost entry is
+//!    fully client-controlled and must never become a key.
+//! 3. The direct TCP peer address.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -141,7 +150,9 @@ impl TrustedProxyKeyExtractor {
     /// trusted proxy is the originating client. Spoofed leftmost entries
     /// appended by the public client are skipped like any other untrusted
     /// hop. If every entry is trusted (e.g. an internal probe through two
-    /// layers of proxy), fall back to the leftmost entry.
+    /// layers of proxy), fall back to the rightmost entry: it was written
+    /// by the proxy closest to us, whereas the leftmost entry is fully
+    /// client-controlled and must never become a rate-limit key.
     fn client_ip_from_forwarded<B>(&self, req: &Request<B>) -> Option<IpAddr> {
         let chain = self.forwarded_list(req);
         if chain.is_empty() {
@@ -152,23 +163,25 @@ impl TrustedProxyKeyExtractor {
             .rev()
             .find(|ip| !self.trusted.is_trusted(**ip))
             .copied();
-        client.or_else(|| chain.first().copied())
+        client.or_else(|| chain.last().copied())
     }
 
     pub fn extract_ip<B>(&self, req: &Request<B>) -> Option<IpAddr> {
         let peer = self.peer_addr(req);
-        if let Some(peer_ip) = peer
-            && self.trusted.is_trusted(peer_ip)
-            && let Some(client) = self.client_ip_from_forwarded(req)
-        {
-            return Some(client);
-        }
-        // Fall back to X-Real-IP if peer is trusted but X-Forwarded-For is absent/unusable.
-        if let Some(peer_ip) = peer
-            && self.trusted.is_trusted(peer_ip)
-            && let Some(real_ip) = self.real_ip(req)
-        {
-            return Some(real_ip);
+        let peer_is_trusted = peer.map(|ip| self.trusted.is_trusted(ip)).unwrap_or(false);
+        if peer_is_trusted {
+            // Preferred source: X-Real-IP as rewritten by ingress-nginx with
+            // the address that actually connected to it. Unlike XFF (which
+            // proxies append to), this header is overwritten, so a client
+            // on the trusted pod network cannot seed it via the ingress to
+            // rotate rate-limit keys.
+            if let Some(real_ip) = self.real_ip(req) {
+                return Some(real_ip);
+            }
+            // Fallback for trusted proxies that only set XFF.
+            if let Some(client) = self.client_ip_from_forwarded(req) {
+                return Some(client);
+            }
         }
         peer
     }
@@ -272,12 +285,12 @@ mod tests {
     }
 
     #[test]
-    fn all_trusted_chain_falls_back_to_leftmost() {
+    fn all_trusted_chain_falls_back_to_rightmost() {
         let extractor =
             TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.10.0.0/16"));
         let req = req_with("10.10.5.5", Some("10.10.1.1, 10.10.2.2"));
         let ip = extractor.extract_ip(&req).unwrap();
-        assert_eq!(ip.to_string(), "10.10.1.1");
+        assert_eq!(ip.to_string(), "10.10.2.2");
     }
 
     #[test]
@@ -305,19 +318,26 @@ mod tests {
     }
 
     #[test]
-    fn xff_preferred_over_x_real_ip() {
-        // When both XFF and X-Real-IP are present, XFF takes precedence.
-        let extractor =
-            TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.10.0.0/16"));
+    fn x_real_ip_preferred_and_unspoofable_through_ingress() {
+        // Codex PR #172 finding: a pod on the trusted pod network (10/8)
+        // calls the public ingress with a spoofed XFF; ingress-nginx
+        // appends the pod's (trusted) address to XFF but OVERWRITES
+        // X-Real-IP with the address that actually connected to it. Since
+        // the key comes from X-Real-IP, the spoofed XFF entries are
+        // ignored and the pod cannot rotate rate-limit keys.
+        let extractor = TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.0.0.0/8"));
         let mut req = Request::builder().uri("/").body(()).unwrap();
-        let socket: SocketAddr = "10.10.5.5:54321".parse().unwrap();
+        let socket: SocketAddr = "10.10.5.5:54321".parse().unwrap(); // ingress controller
         req.extensions_mut().insert(ConnectInfo(socket));
+        req.headers_mut().insert(
+            "x-forwarded-for",
+            "1.2.3.4, 5.6.7.8, 10.20.30.40".parse().unwrap(),
+        );
+        // ingress-nginx rewrote X-Real-IP to the pod's true address
         req.headers_mut()
-            .insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
-        req.headers_mut()
-            .insert("x-real-ip", "203.0.113.99".parse().unwrap());
+            .insert("x-real-ip", "10.20.30.40".parse().unwrap());
         let ip = extractor.extract_ip(&req).unwrap();
-        assert_eq!(ip.to_string(), "198.51.100.7");
+        assert_eq!(ip.to_string(), "10.20.30.40");
     }
 
     #[test]

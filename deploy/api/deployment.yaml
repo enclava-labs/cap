@@ -52,8 +52,11 @@ spec:
         # shared address and every public client lands in one rate-limit
         # bucket. 10.0.0.0/8 covers the cluster pod network; XFF trust is
         # made safe in combination with deploy/api/network-policy.yaml,
-        # which restricts API ingress to the ingress-nginx controllers only,
-        # and the extractor's rightmost-untrusted XFF walk, which ignores
+        # which restricts API ingress to the ingress-nginx controllers and
+        # the enclava-paas internal caller only, and the extractor, which
+        # prefers the X-Real-IP header that ingress-nginx overwrites with
+        # the connecting address (unspoofable even by pod-network clients)
+        # and falls back to a rightmost-untrusted XFF walk that ignores
         # client-spoofed leftmost entries. Narrow to the ingress-nginx
         # controller's subnet per target cluster where that is known.
         - name: TRUSTED_PROXY_CIDRS

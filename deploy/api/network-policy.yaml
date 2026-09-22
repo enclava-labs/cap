@@ -1,15 +1,24 @@
 # Restricts inbound traffic to the API pods to the ingress-nginx controllers
-# (plus kubelet probes). This matters for the rate-limiter's trusted-proxy
-# model: TRUSTED_PROXY_CIDRS grants X-Forwarded-For trust to the pod network,
-# so only the ingress controllers — the proxies that actually set that
-# header — must be able to reach the API. Any other cluster workload
-# connecting directly is untrusted at the network layer and can neither
-# spoof a client IP nor consume a public client's bucket.
+# plus the enclava-paas internal caller. This matters for the rate-limiter's
+# trusted-proxy model: TRUSTED_PROXY_CIDRS grants X-Forwarded-For trust to
+# the pod network, so only the ingress controllers — the proxies that
+# actually set that header — must be able to reach the API from outside the
+# namespace. Any other cluster workload connecting directly is untrusted at
+# the network layer and can neither spoof a client IP nor consume a public
+# client's bucket.
 #
 # If the target cluster runs its ingress controllers somewhere other than
 # the `ingress-nginx` namespace, adjust the namespaceSelector to match.
-# Note: kubelet health probes use the node's host IP (not a pod in the
+# Note: kubelet probes use the node's host IP (not a pod in the
 # namespace), so they bypass NetworkPolicy and don't need an explicit rule.
+#
+# The enclava-paas rule exists because /internal/paas/* requires the
+# caller's mTLS client identity (see cap-paas-internal-logs.contract.yaml);
+# TLS-terminating ingress would discard the client certificate, so the PaaS
+# service must call the API ClusterIP directly. Those routes authenticate
+# with a service token + mTLS and are not part of the unauthenticated
+# rate-limit surface this policy protects. Adjust the namespace name if the
+# PaaS runs elsewhere; verify against the live cluster before rollout.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -30,6 +39,14 @@ spec:
       podSelector:
         matchLabels:
           app.kubernetes.io/name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 3000
+  # Internal enclava-paas caller (service token + mTLS on /internal/paas/*).
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: enclava-paas
     ports:
     - protocol: TCP
       port: 3000
