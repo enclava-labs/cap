@@ -356,12 +356,14 @@ fn platform_release_enabled(trustee_policy_read_available: bool) -> bool {
     trustee_policy_read_available
         || env_flag("ENCLAVA_USE_PLATFORM_RELEASE")
         || env_nonempty("ENCLAVA_PLATFORM_RELEASE_PATH").is_some()
-        // Codex P2 (cap#165): a wired state path alone must keep the gate
-        // active — otherwise removing the override env var in a deployment
-        // where trustee reads are disabled skips the bundled-lane removal
-        // guard entirely and silently re-enables the T2→T0 rollback it
-        // exists to refuse.
-        || env_nonempty("ENCLAVA_PLATFORM_RELEASE_STATE").is_some()
+    // NOTE: ENCLAVA_PLATFORM_RELEASE_STATE alone must NOT enable the release
+    // lane (Codex P2, cap#165): loading the bundled release imposes
+    // release-derived env requirements (TRUSTEE_KBS_URL, TENANT_CADDY_*,
+    // bundled CA) on fresh debug installs that merely pre-wire the state
+    // var with no mark yet. The anti-rollback protection a state-only
+    // wiring needs — a previously accepted override flooring the bundled
+    // release — runs via enforce_state_only_removal_guard below, without
+    // adopting the release as a configuration source.
 }
 
 fn validate_platform_release_runtime_class(
@@ -686,6 +688,16 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // State-only lane (Codex P2, cap#165): when no release lane is active
+    // but ENCLAVA_PLATFORM_RELEASE_STATE is wired, a previously accepted
+    // override must still floor the bundled release (removal guard) —
+    // without adopting the release as a configuration source.
+    if platform_release_loaded.is_none()
+        && let Err(e) = enclava_api::platform_release::enforce_state_only_removal_guard()
+    {
+        eprintln!("startup refused: {e}");
+        std::process::exit(1);
+    }
     let platform_release_envelope = platform_release_loaded
         .as_ref()
         .map(|loaded| loaded.envelope.clone());
@@ -1204,6 +1216,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn management_mode_resolves_documented_values_and_rejects_typos() {
         assert_eq!(
             load_management_mode_with_env(|name| match name {
@@ -1254,6 +1267,54 @@ mod tests {
                 .unwrap(),
                 CapManagementMode::Standalone
             );
+        }
+    }
+
+    #[test]
+    fn state_env_alone_does_not_enable_the_release_lane() {
+        // Codex P2 (cap#165 round 5): ENCLAVA_PLATFORM_RELEASE_STATE alone
+        // must not load the bundled release as a configuration source
+        // (which would impose TRUSTEE_KBS_URL / TENANT_CADDY_* env
+        // requirements on fresh debug installs); the anti-rollback removal
+        // guard runs separately via enforce_state_only_removal_guard.
+        let vars = [
+            "TRUSTEE_POLICY_READ_AVAILABLE",
+            "ENCLAVA_USE_PLATFORM_RELEASE",
+            "ENCLAVA_PLATFORM_RELEASE_PATH",
+            "ENCLAVA_PLATFORM_RELEASE_STATE",
+        ];
+        let saved: Vec<(String, Option<std::ffi::OsString>)> = vars
+            .iter()
+            .map(|name| (name.to_string(), std::env::var_os(name)))
+            .collect();
+        // Env mutation is test-only single-threaded here; no other test in
+        // this binary reads these four vars concurrently.
+        unsafe {
+            for name in vars {
+                std::env::remove_var(name);
+            }
+            // Nothing set: disabled.
+            assert!(!platform_release_enabled(false));
+            // State alone: still disabled (the removal guard runs
+            // separately and does not adopt the release).
+            std::env::set_var("ENCLAVA_PLATFORM_RELEASE_STATE", "/var/lib/enclava/x");
+            assert!(!platform_release_enabled(false));
+            // Each real release-lane trigger enables it (with STATE still
+            // set, matching a fully-wired deployment).
+            std::env::set_var("TRUSTEE_POLICY_READ_AVAILABLE", "true");
+            assert!(platform_release_enabled(false));
+            std::env::remove_var("TRUSTEE_POLICY_READ_AVAILABLE");
+            std::env::set_var("ENCLAVA_USE_PLATFORM_RELEASE", "true");
+            assert!(platform_release_enabled(false));
+            std::env::remove_var("ENCLAVA_USE_PLATFORM_RELEASE");
+            std::env::set_var("ENCLAVA_PLATFORM_RELEASE_PATH", "/etc/release.json");
+            assert!(platform_release_enabled(false));
+            for (name, value) in saved {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
         }
     }
 }

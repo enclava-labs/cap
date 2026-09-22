@@ -549,7 +549,9 @@ fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
     } else {
         path
     };
-    // Collect the missing suffix, shallowest-last.
+    // Collect the missing suffix, shallowest-last. A relative path walks up
+    // to an empty parent ("a" → ""), which is the working directory —
+    // resolve it to "." instead of failing (Codex P2, cap#165).
     let mut missing: Vec<PathBuf> = Vec::new();
     let mut current = target.to_path_buf();
     loop {
@@ -563,12 +565,16 @@ fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 missing.push(current.clone());
-                let Some(parent) = current.parent() else {
+                let parent = current
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                if parent == current {
                     return Err(std::io::Error::other(format!(
                         "cannot create {} (no parent)",
                         current.display()
                     )));
-                };
+                }
                 current = parent.to_path_buf();
             }
             Err(err) => return Err(err),
@@ -791,6 +797,30 @@ fn enforce_bundle_not_older_than_persisted_mark(
         }
         Ok(())
     })
+}
+
+/// State-only lane (Codex P2, cap#165 round 5): ENCLAVA_PLATFORM_RELEASE_STATE
+/// is wired but no release lane is active (no trustee reads, no USE flag, no
+/// override path). Run ONLY the bundled-lane removal guard so a previously
+/// accepted override still floors the bundled release — without adopting the
+/// bundled release as a configuration source, which would impose
+/// release-derived env requirements (TRUSTEE_KBS_URL, TENANT_CADDY_*) on
+/// fresh debug installs that merely pre-wire the state var and have no mark
+/// yet (the guard itself is a documented no-op without a state file).
+pub fn enforce_state_only_removal_guard() -> Result<(), PlatformReleaseError> {
+    let state_env = std::env::var("ENCLAVA_PLATFORM_RELEASE_STATE")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    enforce_state_only_removal_guard_with(state_env)
+}
+
+fn enforce_state_only_removal_guard_with(
+    state_env: Option<String>,
+) -> Result<(), PlatformReleaseError> {
+    match resolve_high_water_state(None, state_env)? {
+        Some(state_path) => enforce_bundle_not_older_than_persisted_mark(&state_path),
+        None => Ok(()),
+    }
 }
 
 /// Reject `release` when it is older than the release compiled into this
@@ -1178,6 +1208,11 @@ mod tests {
 
     /// Mirrors main.rs: load is check-only; the mark advances only when
     /// startup validation accepts, via commit_override_acceptance.
+    /// cwd is process-global: the tests that chdir must not run
+    /// concurrently with each other (or with any test resolving relative
+    /// paths against the cwd).
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn load_and_maybe_commit(
         raw: String,
         state: &std::path::Path,
@@ -1667,6 +1702,80 @@ mod tests {
     }
 
     #[test]
+    fn relative_state_path_creates_missing_ancestor_tree() {
+        // Codex P2 (cap#165 round 5): a RELATIVE state path with missing
+        // directories (`a/b/release.accepted`) walks up to `a`, whose
+        // parent() is Some("") — the empty parent must resolve to the
+        // working directory instead of failing with "no parent".
+        let dir = std::env::temp_dir().join(format!(
+            "pr-hwm-reltree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap();
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let state = std::path::PathBuf::from("a")
+            .join("b")
+            .join("release.accepted");
+        let result = {
+            let newer = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+            load_and_maybe_commit(newer, &state, true)
+        };
+        std::env::set_current_dir(prev_cwd).unwrap();
+        assert!(
+            result.is_ok(),
+            "relative state path with missing ancestors must not fail: {result:?}"
+        );
+        assert!(dir.join("a").join("b").join("release.accepted").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn state_only_lane_enforces_removal_guard_without_release() {
+        // Codex P2 (cap#165 round 5): ENCLAVA_PLATFORM_RELEASE_STATE alone
+        // must floor the bundled release against a persisted newer mark
+        // (removal guard) — the guard is a no-op when no mark exists, so a
+        // fresh state-only wiring passes without loading a release.
+        let dir = std::env::temp_dir().join(format!(
+            "pr-hwm-stateonly-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+        // No mark yet → guard is a no-op (fresh install passes).
+        let fresh =
+            enforce_state_only_removal_guard_with(Some(state.to_string_lossy().into_owned()));
+        // A persisted newer mark → the bundled release is refused.
+        let t2 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        let parsed: PlatformReleaseEnvelope = serde_json::from_str(&t2).unwrap();
+        std::fs::write(
+            &state,
+            serde_json::to_vec(&AcceptedOverrideMark::of(&parsed.payload).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let guarded =
+            enforce_state_only_removal_guard_with(Some(state.to_string_lossy().into_owned()));
+        assert!(
+            fresh.is_ok(),
+            "state-only lane with no mark must be a no-op: {fresh:?}"
+        );
+        assert!(matches!(
+            guarded,
+            Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn bundled_lane_does_not_persist_or_commit_a_mark() {
         // main.rs commits the pending high-water mark after startup
         // validation; the bundled lane must never carry that obligation
@@ -1731,6 +1840,7 @@ mod tests {
     fn relative_state_path_persists_and_syncs_cwd() {
         let dir = std::env::temp_dir().join(format!("pr-hwm-relpath-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap();
         let prev_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(&dir).unwrap();
 
