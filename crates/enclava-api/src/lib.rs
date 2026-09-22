@@ -112,16 +112,48 @@ async fn freeze_workload_authority_mutations(
         .into_response()
 }
 
+/// Classify whether a request is a tenant workload-authority mutation that
+/// the deployment freeze gate must block while dispatch is disabled.
+///
+/// Invariant: this function must classify the raw segments the router will
+/// match — the only deliberate divergence is the leading/trailing slash
+/// trim described below, which is fail-closed. Axum 0.8 dispatches through
+/// matchit 0.8, which matches the raw
+/// (still percent-encoded) URI path, splits parameters on a literal `/`
+/// only, and never decodes `%2F` or resolves `.`/`..` segments (there is no
+/// `NormalizePath` layer in `build_router_inner`). The gate therefore also
+/// splits on literal `/` and compares raw segments: `%2F` inside a segment
+/// is NOT a separator here, because it is not one to the router either.
+///
+/// A path that matches no allow pattern below is a mutation (deny-by-default),
+/// so raw variants such as `/apps%2Fdemo/deploy`, `//apps//demo//deploy`,
+/// `/apps/demo/deploy/`, or `/apps/./demo/deploy` are all blocked: the
+/// router would not serve them as allow-listed control-plane writes.
+///
+/// Interior empty segments (`//`) are preserved, because matchit treats an
+/// empty path parameter as a value: `PUT /internal/paas/orgs//keyring` is
+/// dispatched to the keyring handler with an empty `paas_org_id`, so the
+/// gate must see the five-segment shape (mutation), not a collapsed
+/// four-segment shape that would hit the org-upsert allow rule. Only the
+/// leading/trailing slashes are trimmed; that divergence from matchit is
+/// fail-closed (a trailing slash can only make a path look like a shorter
+/// allow pattern that matchit would not route, or leave it deny-by-default).
+///
+/// Do NOT "normalize" by percent-decoding or resolving dot segments before
+/// matching: that rewrites the path into shapes the router never selected,
+/// and can only move requests from the blocked set into the allowed set
+/// (fail-open). For example, decoding `/apps/x%2F..%2F..%2Fauth%2Flogin/deploy`
+/// — which the router dispatches to the deploy handler — would make it look
+/// like an `auth`-prefixed control-plane write and let it through the gate.
 fn is_workload_authority_mutation(method: &Method, path: &str) -> bool {
     if matches!(method, &Method::GET | &Method::HEAD | &Method::OPTIONS) {
         return false;
     }
 
-    let segments = path
-        .trim_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
+    // Split on literal '/' with interior empty segments preserved (see the
+    // invariant comment above): an empty segment is a parameter value to
+    // matchit, not a separator to collapse.
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
 
     if method == Method::DELETE
         && matches!(
@@ -639,6 +671,191 @@ mod runtime_gate_tests {
         ] {
             assert!(!is_workload_authority_mutation(&method, path));
         }
+    }
+
+    #[test]
+    fn workload_gate_classifies_raw_path_variants_fail_closed() {
+        // Raw variants of workload mutations (encoded slashes, doubled
+        // slashes, trailing slash, dot segments) must never fall through the
+        // gate's allow patterns. The router (matchit 0.8) matches the raw
+        // path with literal `/` separators only, so the gate must classify
+        // these same raw bytes — and must classify every one of them as a
+        // mutation.
+        for (method, path) in [
+            (Method::POST, "/apps%2Fdemo/deploy"),
+            (Method::POST, "/apps%2fdemo/deploy"),
+            (Method::POST, "//apps//demo//deploy"),
+            (Method::POST, "/apps/demo/deploy/"),
+            (Method::POST, "/apps/./demo/deploy"),
+            (Method::POST, "/apps/x/../demo/deploy"),
+            // A `%2F`/`..` poisoned path parameter on a route the router
+            // still dispatches to a mutation handler.
+            (Method::POST, "/apps/x%2F..%2F..%2Fauth%2Flogin/deploy"),
+            (Method::POST, "/apps/x%2f..%2f..%2fauth/deploy"),
+            (Method::DELETE, "/apps/demo/domains/.."),
+            (Method::DELETE, "/apps/demo/domains/%2e%2e"),
+            (Method::DELETE, "/apps/demo/domains/x%2F..%2F.."),
+            (Method::DELETE, "/apps/demo/config/x%2F..%2F..%2Fauth/meta"),
+            (Method::PUT, "/internal%2Fpaas/orgs/org-1/deployments"),
+            (Method::POST, "/auth%2Flogin"),
+            // Interior empty segment as a poisoned parameter: matchit
+            // dispatches this to the keyring handler (empty paas_org_id),
+            // so it must NOT collapse onto the org-upsert allow rule.
+            (Method::PUT, "/internal/paas/orgs//keyring"),
+        ] {
+            assert!(
+                is_workload_authority_mutation(&method, path),
+                "{method} {path} must be classified as a workload authority mutation"
+            );
+        }
+
+        // Allow-listed control-plane writes keep working, including when a
+        // still-literal segment carries an encoded character.
+        for (method, path) in [
+            (Method::POST, "/auth/login"),
+            (Method::PUT, "/internal/paas/orgs/org%2F1/entitlements"),
+            (Method::PUT, "/internal/paas/orgs/org-1/members/user%2F1"),
+            (Method::DELETE, "/internal/paas/orgs/org-1/apps/demo"),
+            // Interior empty segments inside allow patterns: matchit
+            // dispatches these to the allow-listed handlers (the empty
+            // segment is the parameter value), so they must stay allowed —
+            // an over-strict gate that rejects empty segments inside allow
+            // rules would false-block control-plane writes.
+            (Method::PUT, "/internal/paas/orgs//members/u"),
+            (Method::PUT, "/internal/paas/orgs//entitlements"),
+            (Method::DELETE, "/internal/paas/orgs//apps/demo"),
+            (Method::POST, "/orgs//invite"),
+            (Method::DELETE, "/orgs//members/user-1"),
+        ] {
+            assert!(
+                !is_workload_authority_mutation(&method, path),
+                "{method} {path} must not be classified as a workload authority mutation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn router_freeze_gate_blocks_encoded_and_dot_segment_variants() {
+        // End-to-end through the real router middleware: while dispatch is
+        // disabled, every raw variant of a workload mutation must receive
+        // 503 deploy_blocked, never reach a handler. The poisoned-parameter
+        // cases are the ones a percent-decoding normalizer would wrongly
+        // allow: the router dispatches them to mutation handlers while a
+        // decoded/dot-resolved view collapses them into an allow pattern.
+        let mut state = crate::test_support::lazy_state();
+        state.deployment_dispatch_enabled = false;
+        state.mark_startup_ready();
+        let app = test_router(state);
+
+        for (method, path) in [
+            (Method::POST, "/apps/demo/deploy"),
+            (Method::POST, "/apps%2Fdemo/deploy"),
+            (Method::POST, "//apps//demo//deploy"),
+            (Method::POST, "/apps/demo/deploy/"),
+            (Method::POST, "/apps/./demo/deploy"),
+            (Method::POST, "/apps/x%2F..%2F..%2Fauth%2Flogin/deploy"),
+            (Method::POST, "/apps/x%2f..%2f..%2fauth/deploy"),
+            (Method::DELETE, "/apps/demo/domains/.."),
+            (Method::DELETE, "/apps/demo/domains/%2e%2e"),
+            (Method::DELETE, "/apps/demo/domains/x%2F..%2F.."),
+            (Method::DELETE, "/apps/demo/config/x%2F..%2F..%2Fauth/meta"),
+            // Interior empty segment as a poisoned paas_org_id: matchit
+            // dispatches this to the keyring handler, so the freeze gate —
+            // not the handler — must answer while dispatch is disabled.
+            (Method::PUT, "/internal/paas/orgs//keyring"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{method} {path} must be blocked by the freeze gate"
+            );
+            // The 503 must be the freeze gate itself, not some other
+            // middleware that happens to return 503.
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                body["error"], "deploy_blocked",
+                "{method} {path} must carry the freeze-gate error body"
+            );
+            assert_eq!(
+                body["reason"], "deployment_dispatch_disabled",
+                "{method} {path} must carry the freeze-gate reason"
+            );
+        }
+
+        // In PaasManaged mode the internal keyring route is actually
+        // mounted; the poisoned-parameter request must still be answered
+        // by the gate (503 deploy_blocked), never by the handler (which
+        // would 400 on the empty org id after InternalAuth).
+        let mut paas_state = crate::test_support::lazy_state();
+        paas_state.management_mode = crate::state::CapManagementMode::PaasManaged;
+        paas_state.deployment_dispatch_enabled = false;
+        paas_state.mark_startup_ready();
+        let paas_app = test_router(paas_state);
+        let response = paas_app
+            .oneshot(
+                Request::put("/internal/paas/orgs//keyring")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "deploy_blocked");
+        assert_eq!(body["reason"], "deployment_dispatch_disabled");
+
+        // Control-plane writes are still served (they fail downstream auth,
+        // not at the gate) — the gate must not over-block the allow list.
+        for (method, path) in [
+            (Method::POST, "/auth/login"),
+            (Method::POST, "/orgs"),
+            (Method::DELETE, "/apps/demo"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{method} {path} must not be blocked by the freeze gate"
+            );
+        }
+
+        // Raw first segment `auth`, so the gate's control-plane allow list
+        // matches it — but matchit has no such route, so the router must
+        // 404 it. Asserting the 404 (not just "not 503") pins the router
+        // agreement: if a future route table ever dispatches this shape to
+        // a mutation handler, this test fails and forces a gate update.
+        let response = app
+            .oneshot(
+                Request::post("/auth/%2e%2e/apps/demo/deploy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
