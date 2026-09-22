@@ -128,16 +128,27 @@ pub fn role_name(role: Role) -> &'static str {
     }
 }
 
-pub fn require_owner_to_modify_owner(
+/// Privileged-role membership changes (admin or owner) are owner-gated: an
+/// admin must not promote another member to admin, change another admin's
+/// role, or remove an existing admin — only owners manage privileged roles.
+/// Admins keep full control over plain members.
+pub fn require_owner_to_modify_privileged_role(
     caller_role: Role,
     current_role: Option<Role>,
     requested_role: Option<Role>,
 ) -> AuthzResult {
-    let touches_owner = current_role == Some(Role::Owner) || requested_role == Some(Role::Owner);
-    if touches_owner {
-        require_owner_role(caller_role)?;
+    let touches_privileged = current_role.is_some_and(is_privileged_role)
+        || requested_role.is_some_and(is_privileged_role);
+    if touches_privileged && !matches!(caller_role, Role::Owner) {
+        return Err(forbidden(
+            "only owners can grant, change, or remove admin and owner roles",
+        ));
     }
     Ok(())
+}
+
+fn is_privileged_role(role: Role) -> bool {
+    matches!(role, Role::Owner | Role::Admin)
 }
 
 /// Lock active owner rows and verify the requested membership mutation leaves
@@ -202,25 +213,104 @@ mod tests {
 
     #[test]
     fn admin_cannot_grant_or_remove_owner_role() {
+        // Granting the owner role.
         assert!(
-            require_owner_to_modify_owner(Role::Admin, Some(Role::Member), Some(Role::Owner))
-                .is_err()
+            require_owner_to_modify_privileged_role(
+                Role::Admin,
+                Some(Role::Member),
+                Some(Role::Owner)
+            )
+            .is_err()
         );
+        // Changing an existing owner's role.
         assert!(
-            require_owner_to_modify_owner(Role::Admin, Some(Role::Owner), Some(Role::Admin))
-                .is_err()
+            require_owner_to_modify_privileged_role(
+                Role::Admin,
+                Some(Role::Owner),
+                Some(Role::Admin)
+            )
+            .is_err()
         );
+        // Removing an owner.
         assert!(
-            require_owner_to_modify_owner(Role::Owner, Some(Role::Admin), Some(Role::Owner))
-                .is_ok()
+            require_owner_to_modify_privileged_role(Role::Admin, Some(Role::Owner), None).is_err()
+        );
+        // Owner-to-owner changes remain owner-gated but allowed for owners.
+        assert!(
+            require_owner_to_modify_privileged_role(
+                Role::Owner,
+                Some(Role::Admin),
+                Some(Role::Owner)
+            )
+            .is_ok()
         );
     }
 
     #[test]
-    fn admin_can_modify_non_owner_roles() {
+    fn admin_cannot_promote_demote_or_remove_admins() {
+        // Promoting a member to admin.
         assert!(
-            require_owner_to_modify_owner(Role::Admin, Some(Role::Member), Some(Role::Admin))
-                .is_ok()
+            require_owner_to_modify_privileged_role(
+                Role::Admin,
+                Some(Role::Member),
+                Some(Role::Admin)
+            )
+            .is_err()
+        );
+        // Changing an existing admin's role (demotion or re-invite as admin).
+        assert!(
+            require_owner_to_modify_privileged_role(
+                Role::Admin,
+                Some(Role::Admin),
+                Some(Role::Member)
+            )
+            .is_err()
+        );
+        assert!(
+            require_owner_to_modify_privileged_role(
+                Role::Admin,
+                Some(Role::Admin),
+                Some(Role::Admin)
+            )
+            .is_err()
+        );
+        // Removing an existing admin (no requested role).
+        assert!(
+            require_owner_to_modify_privileged_role(Role::Admin, Some(Role::Admin), None).is_err()
+        );
+        // Inviting a brand-new admin (no current role).
+        assert!(
+            require_owner_to_modify_privileged_role(Role::Admin, None, Some(Role::Admin)).is_err()
+        );
+        // Owner changes touching admins are allowed.
+        assert!(
+            require_owner_to_modify_privileged_role(
+                Role::Owner,
+                Some(Role::Member),
+                Some(Role::Admin)
+            )
+            .is_ok()
+        );
+        assert!(
+            require_owner_to_modify_privileged_role(Role::Owner, Some(Role::Admin), None).is_ok()
+        );
+    }
+
+    #[test]
+    fn admin_can_modify_plain_members() {
+        assert!(
+            require_owner_to_modify_privileged_role(
+                Role::Admin,
+                Some(Role::Member),
+                Some(Role::Member)
+            )
+            .is_ok()
+        );
+        assert!(
+            require_owner_to_modify_privileged_role(Role::Admin, Some(Role::Member), None).is_ok()
+        );
+        assert!(
+            require_owner_to_modify_privileged_role(Role::Admin, None, Some(Role::Member)).is_ok()
         );
         assert!(require_admin_role(Role::Admin).is_ok());
         assert!(require_admin_role(Role::Owner).is_ok());

@@ -1170,7 +1170,7 @@ pub async fn invite_member(
     .await
     .map_err(|_| db_error())?;
 
-    scopes::require_owner_to_modify_owner(
+    scopes::require_owner_to_modify_privileged_role(
         current_caller_role,
         existing_role,
         Some(requested_role),
@@ -1304,7 +1304,7 @@ pub async fn remove_member(
     .await
     .map_err(|_| db_error())?;
 
-    scopes::require_owner_to_modify_owner(current_caller_role, target_role, None)?;
+    scopes::require_owner_to_modify_privileged_role(current_caller_role, target_role, None)?;
 
     if target_role == Some(Role::Owner) {
         scopes::ensure_last_owner_invariant(&mut tx, org_id, member_id, None).await?;
@@ -1937,5 +1937,210 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete keyring race users");
+    }
+
+    fn membership_test_auth(
+        user_id: Uuid,
+        org_id: Uuid,
+        org_name: &str,
+        role: Role,
+    ) -> AuthContext {
+        AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.to_string(),
+            role,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        }
+    }
+
+    #[tokio::test]
+    async fn membership_privileged_role_changes_require_owner() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let owner_id = Uuid::new_v4();
+        let admin_id = Uuid::new_v4();
+        let victim_admin_id = Uuid::new_v4();
+        let member_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("member-escalation-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert member escalation org");
+        sqlx::query(
+            "INSERT INTO users (id, display_name)
+             VALUES ($1, 'Escalation Owner'), ($2, 'Escalation Admin'),
+                    ($3, 'Victim Admin'), ($4, 'Plain Member')",
+        )
+        .bind(owner_id)
+        .bind(admin_id)
+        .bind(victim_admin_id)
+        .bind(member_id)
+        .execute(&pool)
+        .await
+        .expect("insert member escalation users");
+        sqlx::query(
+            "INSERT INTO memberships (user_id, org_id, role)
+             VALUES ($1, $5, 'owner'), ($2, $5, 'admin'),
+                    ($3, $5, 'admin'), ($4, $5, 'member')",
+        )
+        .bind(owner_id)
+        .bind(admin_id)
+        .bind(victim_admin_id)
+        .bind(member_id)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("insert member escalation memberships");
+        let victim_email = format!("victim-admin-{suffix}@example.test");
+        let member_email = format!("plain-member-{suffix}@example.test");
+        sqlx::query(
+            "INSERT INTO user_identities (id, user_id, provider, identifier)
+             VALUES ($1, $3, 'email', $5), ($2, $4, 'email', $6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(victim_admin_id)
+        .bind(member_id)
+        .bind(&victim_email)
+        .bind(&member_email)
+        .execute(&pool)
+        .await
+        .expect("insert member escalation identities");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let admin_auth = membership_test_auth(admin_id, org_id, &org_name, Role::Admin);
+        let owner_auth = membership_test_auth(owner_id, org_id, &org_name, Role::Owner);
+
+        // Admin cannot promote a plain member to admin (invite path).
+        let promote = invite_member(
+            admin_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(InviteRequest {
+                email: member_email.clone(),
+                role: Some("admin".to_string()),
+            }),
+        )
+        .await
+        .expect_err("admin must not promote a member to admin");
+        assert_eq!(promote.0, StatusCode::FORBIDDEN);
+
+        // Admin cannot remove an existing admin.
+        let remove_admin = remove_member(
+            admin_auth.clone(),
+            State(state.clone()),
+            Path((org_name.clone(), victim_admin_id)),
+        )
+        .await
+        .expect_err("admin must not remove another admin");
+        assert_eq!(remove_admin.0, StatusCode::FORBIDDEN);
+
+        // Admin cannot demote an existing admin by re-inviting as member.
+        let demote = invite_member(
+            admin_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(InviteRequest {
+                email: victim_email.clone(),
+                role: Some("member".to_string()),
+            }),
+        )
+        .await
+        .expect_err("admin must not demote another admin");
+        assert_eq!(demote.0, StatusCode::FORBIDDEN);
+        let victim_role: String = sqlx::query_scalar(
+            "SELECT role::text FROM memberships
+              WHERE org_id = $1 AND user_id = $2 AND removed_at IS NULL",
+        )
+        .bind(org_id)
+        .bind(victim_admin_id)
+        .fetch_one(&pool)
+        .await
+        .expect("victim admin role unchanged after rejected demotion");
+        assert_eq!(victim_role, "admin");
+
+        // Admin can still manage plain members (invite as member, remove).
+        let invite_member_ok = invite_member(
+            admin_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(InviteRequest {
+                email: member_email.clone(),
+                role: Some("member".to_string()),
+            }),
+        )
+        .await
+        .expect("admin can re-invite a plain member as member");
+        assert_eq!(invite_member_ok.0, StatusCode::OK);
+        let remove_member_ok = remove_member(
+            admin_auth.clone(),
+            State(state.clone()),
+            Path((org_name.clone(), member_id)),
+        )
+        .await
+        .expect("admin can remove a plain member");
+        assert_eq!(remove_member_ok, StatusCode::NO_CONTENT);
+
+        // Owner can still promote to admin and remove an admin.
+        let owner_promote = invite_member(
+            owner_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(InviteRequest {
+                email: member_email.clone(),
+                role: Some("admin".to_string()),
+            }),
+        )
+        .await
+        .expect("owner can promote a member to admin");
+        assert_eq!(owner_promote.0, StatusCode::OK);
+        let owner_remove = remove_member(
+            owner_auth,
+            State(state),
+            Path((org_name.clone(), victim_admin_id)),
+        )
+        .await
+        .expect("owner can remove an admin");
+        assert_eq!(owner_remove, StatusCode::NO_CONTENT);
+
+        // The rejected admin mutations must not have altered memberships:
+        // the victim admin is only gone because the owner removed them, and
+        // the plain member is an admin only because the owner promoted them.
+        let roles: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT user_id, role::text FROM memberships
+              WHERE org_id = $1 AND removed_at IS NULL ORDER BY user_id",
+        )
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .expect("load post-escalation-attempt memberships");
+        let role_of = |uid: Uuid| {
+            roles
+                .iter()
+                .find(|(id, _)| *id == uid)
+                .map(|(_, role)| role.as_str())
+                .unwrap_or("removed")
+        };
+        assert_eq!(role_of(owner_id), "owner");
+        assert_eq!(role_of(admin_id), "admin");
+        assert_eq!(role_of(victim_admin_id), "removed");
+        assert_eq!(role_of(member_id), "admin");
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete member escalation org");
+        sqlx::query("DELETE FROM users WHERE id IN ($1, $2, $3, $4)")
+            .bind(owner_id)
+            .bind(admin_id)
+            .bind(victim_admin_id)
+            .bind(member_id)
+            .execute(&pool)
+            .await
+            .expect("delete member escalation users");
     }
 }
