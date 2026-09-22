@@ -291,14 +291,19 @@ fn follow_spool(
             *offset = 0;
             let mut adopted = file;
             adopted.seek(SeekFrom::Start(0))?;
-            let (bytes, delivered) = drain_from(&mut adopted, 0)?;
-            // Use the ACTUAL cursor position as the offset: the writer is a
-            // separate process and can append during the read. Those bytes are
-            // delivered in this response, so the next poll must resume past them.
-            // A trailing incomplete fragment (writer mid-append) sits at the end
-            // of the delivered range; the next poll will read from this offset,
-            // see the now-complete line, and deliver it.
-            *offset = delivered;
+            let (bytes, _delivered) = drain_from(&mut adopted, 0)?;
+            // Resume at the END OF THE LAST COMPLETE LINE, not the drain
+            // cursor: a trailing incomplete fragment (writer mid-append into
+            // the fresh inode) must be re-read next poll and delivered as a
+            // whole line once completed. Advancing past its prefix would
+            // emit only the suffix as a bogus NDJSON line; and if the writer
+            // then rolls the partial write back (set_len), an offset inside
+            // the retracted range would trip the truncation fallback below.
+            let mut delivered_end = 0usize;
+            while let Some(idx) = bytes[delivered_end..].iter().position(|&b| b == b'\n') {
+                delivered_end += idx + 1;
+            }
+            *offset = delivered_end as u64;
             // Write to the client BEFORE holding the fd: a stalled client would keep
             // this fd open, pinning the old inode's ~32 MiB against deletion.
             // The inode identity is already captured in `current_identity` for
@@ -309,9 +314,14 @@ fn follow_spool(
             continue;
         }
         if len < *offset {
-            // Fallback for same-inode truncation (not the rotation path,
-            // but cheap insurance if the rotation mechanism ever changes).
+            // Same-inode truncation: the writer's rollback path (set_len to
+            // its pre-write length after a failed append) retracts bytes the
+            // follower may already be positioned past. Reset to 0 and
+            // re-send through the sequence dedup path so already-delivered
+            // frames are not replayed — same handler as a rotation resync.
             *offset = 0;
+            remainder_dedup_resend(stream, &mut file, offset, &mut last_seq)?;
+            continue;
         }
         if len == *offset {
             continue;
@@ -340,6 +350,29 @@ fn follow_spool(
         }
         stream.flush()?;
     }
+}
+
+/// Re-read the spool from offset 0 and re-send it with sequence dedup after
+/// a same-inode truncation (the writer's rollback path retracts bytes the
+/// follower was positioned past). Shares the rotation-resync semantics:
+/// only complete lines are emitted, already-delivered sequences are
+/// skipped, and the follow offset is left at the end of the last complete
+/// line so an in-flight fragment is re-read next poll.
+fn remainder_dedup_resend(
+    stream: &mut TcpStream,
+    file: &mut File,
+    offset: &mut u64,
+    last_seq: &mut Option<u64>,
+) -> io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    let (bytes, _delivered) = drain_from(file, 0)?;
+    let mut delivered_end = 0usize;
+    while let Some(idx) = bytes[delivered_end..].iter().position(|&b| b == b'\n') {
+        delivered_end += idx + 1;
+    }
+    *offset = delivered_end as u64;
+    write_deduped_after_rotation(stream, &bytes, last_seq)?;
+    stream.flush()
 }
 
 /// Re-send spool bytes after a rotation resync, dropping complete frames
