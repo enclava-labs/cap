@@ -313,11 +313,10 @@ fn verifying_key(certificate: &Certificate) -> Result<VerifyingKey, AmdVerificat
 /// SHA-384 as the hash, MGF1 over SHA-384, a 48-byte salt, and trailer field
 /// 0xBC (explicit value 1 or the DER default when the field is omitted).
 ///
-/// `verify_rsa_pss_sha384` below still recovers the salt from the encoded
-/// block, so a lying declaration cannot weaken verification — but requiring
-/// the declaration to match closes the gap where a future AMD certificate
-/// with different declared parameters would silently be checked against the
-/// hard-coded ones (enclava-labs/cap#141).
+/// `verify_rsa_pss_sha384` pins the separator at the declared salt length,
+/// so a signature actually made with a different salt length is rejected
+/// even when the declaration itself is well-formed — the declaration and
+/// the encoded signature must agree (enclava-labs/cap#141 review).
 fn pss_parameters_match(algorithm: &AlgorithmIdentifierOwned) -> bool {
     let Some(parameters) = algorithm.parameters.as_ref() else {
         return false;
@@ -391,6 +390,28 @@ fn verify_rsa_pss_sha384(
     message: &[u8],
     signature: &[u8],
 ) -> bool {
+    verify_rsa_pss_sha384_salt_len(modulus, exponent, message, signature, Some(PSS_SALT_LENGTH))
+}
+
+/// Verify with the salt length recovered from the encoded block instead of
+/// fixed at the pinned 48 bytes (cap#141 review).
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn verify_rsa_pss_sha384_recover_salt(
+    modulus: &[u8],
+    exponent: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    verify_rsa_pss_sha384_salt_len(modulus, exponent, message, signature, None)
+}
+
+fn verify_rsa_pss_sha384_salt_len(
+    modulus: &[u8],
+    exponent: &[u8],
+    message: &[u8],
+    signature: &[u8],
+    expected_salt_len: Option<u64>,
+) -> bool {
     const HASH_BYTES: usize = 48;
 
     let modulus = num_bigint::BigUint::from_bytes_be(modulus);
@@ -435,16 +456,34 @@ fn verify_rsa_pss_sha384(
         .map(|(left, right)| left ^ right)
         .collect::<Vec<_>>();
     db[0] &= 0xff >> unused_bits;
-    // RFC 8017 § 8.1.2 step 10/11: DB = PS || 0x01 || salt. Recover the
-    // salt from the block itself instead of assuming the declared length,
-    // so the primitive accepts any well-formed PSS encoding and the pinned
-    // salt length is enforced on the declared parameters (cap#141).
-    let separator = db.iter().position(|byte| *byte == 1);
-    let salt = match separator {
-        Some(separator) if db[..separator].iter().all(|byte| *byte == 0) && db_len > separator => {
+    // RFC 8017 § 8.1.2 step 10/11: DB = PS || 0x01 || salt. With the salt
+    // length pinned (the default), the separator position is fixed at
+    // `db_len - salt_len - 1`, so a signature made with any other salt
+    // length is rejected outright. `None` recovers the salt from the block
+    // itself (tests / fuzzing only).
+    let salt: &[u8] = match expected_salt_len {
+        Some(salt_len) => {
+            let salt_len = salt_len as usize;
+            if db_len < salt_len + 1 {
+                return false;
+            }
+            let separator = db_len - salt_len - 1;
+            if db[..separator].iter().any(|byte| *byte != 0) || db[separator] != 1 {
+                return false;
+            }
             &db[separator + 1..]
         }
-        _ => return false,
+        None => {
+            let separator = db.iter().position(|byte| *byte == 1);
+            match separator {
+                Some(separator)
+                    if db[..separator].iter().all(|byte| *byte == 0) && db_len > separator =>
+                {
+                    &db[separator + 1..]
+                }
+                _ => return false,
+            }
+        }
     };
     let message_hash = Sha384::digest(message);
     let expected = Sha384::new()
@@ -704,14 +743,18 @@ mod tests {
             &modulus, &exponent, message, &corrupted
         ));
 
-        // The salt is recovered from the encoded block, so a PSS signature
-        // made with a different (valid) salt length still verifies at the
-        // primitive level — the pinned salt length is enforced on the
-        // declared parameters (see pss_declared_parameters_are_enforced),
-        // which a lying declaration cannot bypass.
+        // The pinned path fixes the separator at db_len - 48 - 1, so a PSS
+        // signature made with a different salt length must be rejected —
+        // the declared parameters and the encoded signature have to agree
+        // (cap#141 review). The recover-salt variant (tests/fuzzing only)
+        // still accepts it, proving the rejection comes from the salt-length
+        // pin and not from a broken encoding.
         let odd_salt = SigningKey::<RsaSha384>::new_with_salt_len(key, 47);
         let signature = odd_salt.sign_with_rng(&mut rng, message).to_vec();
-        assert!(verify_rsa_pss_sha384(
+        assert!(!verify_rsa_pss_sha384(
+            &modulus, &exponent, message, &signature
+        ));
+        assert!(verify_rsa_pss_sha384_recover_salt(
             &modulus, &exponent, message, &signature
         ));
     }

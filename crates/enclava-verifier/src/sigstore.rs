@@ -372,6 +372,15 @@ fn verify_inclusion_proof(proof: &Value, body: &[u8]) -> bool {
     // tree builder in the tests (merkle_inclusion_proof_matches_reference)
     // and fuzzed via fuzz_targets/verify_inclusion_proof.rs (cap#141).
     let inner = u64::BITS as usize - (index ^ (tree_size - 1)).leading_zeros() as usize;
+    // A tree_size > 2^63 sets the MSB of `index ^ (tree_size - 1)`,
+    // making inner == 64 — `index >> inner` is then a shift overflow
+    // (panic in debug builds, silently wrapped in release). treeSize is
+    // attacker-controlled inside the bundle's Rekor entry, and no real
+    // transparency log approaches 2^63 entries, so reject before shifting
+    // (cap#141 review).
+    if inner >= u64::BITS as usize {
+        return false;
+    }
     let border = (index >> inner).count_ones() as usize;
     if hashes.len() != inner + border {
         return false;
@@ -621,6 +630,25 @@ fn decode_b64(value: &str) -> Result<Vec<u8>, SigstoreError> {
 mod tests {
     use super::*;
     use enclava_common::canonical::ce_v1_bytes;
+
+    #[test]
+    fn oversized_tree_size_is_rejected_without_overflow() {
+        // cap#141 review: treeSize is attacker-controlled inside the
+        // bundle's Rekor entry. A tree_size > 2^63 sets the MSB of
+        // `index ^ (tree_size - 1)`, so inner == 64 and `index >> inner`
+        // would shift-overflow (panic in debug builds). Must be rejected
+        // as a plain malformed proof instead.
+        let mut proof = serde_json::json!({
+            "logIndex": "0",
+            "treeSize": u64::MAX.to_string(),
+            "rootHash": base64::engine::general_purpose::STANDARD.encode([0xab; 32]),
+            "hashes": [],
+        });
+        assert!(!verify_inclusion_proof(&proof, b"body"));
+        // Same for the largest power-of-two tree size with a small index.
+        proof["treeSize"] = serde_json::json!((1u64 << 63).to_string());
+        assert!(!verify_inclusion_proof(&proof, b"body"));
+    }
 
     #[test]
     fn merkle_inclusion_proof_matches_reference_implementation() {

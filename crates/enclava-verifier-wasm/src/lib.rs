@@ -80,6 +80,7 @@ fn verify_input(
     policy: &[u8],
     context_json: &str,
 ) -> Result<enclava_verifier::AppraisalResult, JsError> {
+    install_panic_hook();
     let context: ContextInput = serde_json::from_str(context_json)?;
     let challenge_nonce = decode_32(&context.challenge_nonce, "challenge_nonce")
         .map_err(|error| JsError::new(&error))?;
@@ -90,9 +91,16 @@ fn verify_input(
         .transpose()
         .map_err(|error| JsError::new(&error))?;
     // Panic isolation (cap#141): the wasm module runs inside the relying
-    // party's page — a panic must surface as a catchable JsError, not
-    // abort the whole module (which would poison every later call in the
-    // same JS context).
+    // party's page. Panic behavior depends on the target: on unwind-capable
+    // targets (the native test build) catch_unwind converts the panic into
+    // the JsError below. On the browser target (wasm32-unknown-unknown,
+    // panic=abort — `-C panic=unwind` does not build against the distributed
+    // std for that target) the panic traps after the panic hook runs: JS
+    // observes a *catchable* WebAssembly.RuntimeError and the instance
+    // remains usable for later calls (verified by web/verifier/panic-test.html
+    // in CI, built with the debug-panic-probe feature). The panic hook
+    // installed in verify_input logs the payload to the JS console either
+    // way, so a hostile bundle that trips a latent panic stays diagnosable.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         enclava_verifier::verify(
             bundle,
@@ -128,6 +136,56 @@ fn decode_32(value: &str, name: &str) -> Result<[u8; 32], String> {
         .and_then(|bytes| bytes.try_into().ok())
         .filter(|_| value.bytes().all(|byte| !byte.is_ascii_uppercase()))
         .ok_or_else(|| format!("{name} must be 32-byte lowercase hex"))
+}
+
+#[wasm_bindgen]
+extern "C" {
+    /// `console.error(message)`, bound directly so the shipped module
+    /// needs no extra JS-facing dependency.
+    #[wasm_bindgen(js_namespace = console)]
+    fn error(message: String);
+}
+
+/// Route Rust panics to the JS console (cap#141 review). On the browser
+/// target (panic=abort) the hook is the only code that runs before the
+/// trap, so it is what makes a panic diagnosable from the relying party's
+/// page; on unwind-capable targets it complements the catch_unwind path.
+/// Installed lazily and idempotently — entry points may be called many
+/// times per page.
+fn install_panic_hook() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let reason = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|message| message.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+        error(format!(
+            "enclava-verifier-wasm panicked: {reason} (at {})",
+            info.location().map(|l| l.to_string()).unwrap_or_default()
+        ));
+        previous(info);
+    }));
+}
+
+/// Test-only probe (cap#141 review): deliberately panic inside the panic
+/// hook / catch_unwind boundary so the browser-side test
+/// (web/verifier/panic-test.html) can assert on the real wasm target that
+/// a panic is catchable from JS and does not poison later calls.
+#[cfg(feature = "debug-panic-probe")]
+#[wasm_bindgen]
+pub fn debug_panic_probe() {
+    install_panic_hook();
+    panic!("debug-panic-probe: intentional panic for the browser panic-isolation test");
 }
 
 #[cfg(test)]

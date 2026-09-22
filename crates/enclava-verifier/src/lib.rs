@@ -528,23 +528,55 @@ fn simple_check(id: &str, passes: bool, reason: &str) -> CheckResult {
 /// origin and policy origins are raw strings; a mixed-case but otherwise
 /// identical origin must not be rejected (cap#141).
 ///
-/// An origin that fails to parse as a URL compares unequal to everything
-/// (fail-closed): a malformed expected origin surfaces as a plain
-/// mismatch rather than a distinct "invalid" error, which is deliberate
-/// — unparseable input must never pass an equivalence check.
+/// Both inputs must be bare HTTPS origins — the same invariant bundle.rs
+/// enforces on the bundle origin (no path, query, fragment, or credentials,
+/// and the serialized origin must round-trip to the input). A URL like
+/// `https://trusted.example/path` therefore fails closed instead of
+/// comparing equal to `https://trusted.example` after `Url::origin()`
+/// discards the path (cap#141 review). Unparseable input likewise compares
+/// unequal to everything: a malformed expected origin surfaces as a plain
+/// mismatch rather than a distinct "invalid" error, which is deliberate —
+/// unparseable input must never pass an equivalence check.
 fn origins_equivalent(left: &str, right: &str) -> bool {
     if left == right {
-        return true;
+        // Identical strings skip re-validation only when they are a valid
+        // bare HTTPS origin; two identical malformed values must not pass.
+        return is_bare_https_origin(left);
     }
     let parse = |origin: &str| {
-        url::Url::parse(origin)
-            .ok()
-            .map(|url| url.origin().ascii_serialization())
+        is_bare_https_origin(origin)
+            .then(|| {
+                url::Url::parse(origin)
+                    .ok()
+                    .map(|url| url.origin().ascii_serialization())
+            })
+            .flatten()
     };
     match (parse(left), parse(right)) {
         (Some(left), Some(right)) => left == right,
         _ => false,
     }
+}
+
+/// The bare-origin invariant enforced on bundle origins (bundle.rs): HTTPS
+/// scheme, host present, no credentials / path / query / fragment, and the
+/// serialized origin must round-trip to the input. Unlike bundle.rs (which
+/// stores canonical lowercase origins), the input here may mix case in the
+/// host — the only component `Url::parse` normalizes — so the round-trip
+/// comparison is against the lowercased input. Any other deviation (IDNA,
+/// percent-encoding, an explicit default port, a trailing dot) fails to
+/// round-trip and is rejected.
+fn is_bare_https_origin(origin: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed.host().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.origin().ascii_serialization() == origin.to_ascii_lowercase()
 }
 
 fn equality_check(
@@ -640,6 +672,60 @@ mod tests {
         let mut other = context([7; 32]);
         other.expected_target_origin = "https://other.example".into();
         let result = verify(&bundle(&[7; 32]), b"", other);
+        assert!(result.checks.iter().any(|check| {
+            check.id == "binding.target_origin" && check.reason_code == "TARGET_ORIGIN_MISMATCH"
+        }));
+    }
+
+    #[test]
+    fn non_bare_origin_urls_fail_closed() {
+        // cap#141 review: `Url::origin()` discards path/query/fragment and
+        // credentials, so a URL like `https://trusted.example/path` must
+        // not compare equal to the bundle origin after normalization —
+        // the same bare-HTTPS-origin invariant bundle.rs enforces.
+        for hostile in [
+            "https://app.example/path",
+            "https://app.example?query=1",
+            "https://app.example/#fragment",
+            "https://user:pass@app.example",
+            "https://app.example:443",
+            "not a url",
+            "",
+        ] {
+            assert!(
+                !origins_equivalent(hostile, "https://app.example"),
+                "{hostile:?} must not be equivalent to a bare origin"
+            );
+            assert!(
+                !origins_equivalent("https://app.example", hostile),
+                "bare origin must not be equivalent to {hostile:?}"
+            );
+            // Two identical malformed values must not pass via the string
+            // equality fast path either.
+            assert!(
+                !origins_equivalent(hostile, hostile),
+                "{hostile:?} must not be equivalent to itself"
+            );
+        }
+        // The normalization this PR exists for still works: mixed-case
+        // host and nothing else.
+        assert!(origins_equivalent(
+            "https://APP.example",
+            "https://app.example"
+        ));
+        assert!(origins_equivalent(
+            "https://app.example",
+            "https://APP.example"
+        ));
+    }
+
+    #[test]
+    fn expected_origin_with_path_fails_target_origin_binding() {
+        // End-to-end: an expected origin carrying a path must fail the
+        // binding check, not silently match the bare bundle origin.
+        let mut with_path = context([7; 32]);
+        with_path.expected_target_origin = "https://app.example/attacker".into();
+        let result = verify(&bundle(&[7; 32]), b"", with_path);
         assert!(result.checks.iter().any(|check| {
             check.id == "binding.target_origin" && check.reason_code == "TARGET_ORIGIN_MISMATCH"
         }));
