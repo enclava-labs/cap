@@ -194,6 +194,14 @@ impl PlatformReleaseEnvelope {
         let mut high_water = None;
         if let Some(path) = &override_path {
             high_water = Some(override_high_water_mark_state_path(Path::new(path)));
+        } else if let Some(state) = std::env::var("ENCLAVA_PLATFORM_RELEASE_STATE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            // No override configured, but this deployment wires high-water
+            // state: keep guarding the bundled lane against a vanished
+            // override (accidental manifest rollback, env-var removal).
+            high_water = Some(PathBuf::from(state));
         }
         Self::load_verified_from_raw(raw, override_path.is_some(), high_water.as_deref())
     }
@@ -215,6 +223,13 @@ impl PlatformReleaseEnvelope {
             if let Some(state_path) = high_water_state {
                 enforce_override_not_older_than_last_accepted(state_path, &envelope.payload)?;
             }
+        } else if let Some(state_path) = high_water_state {
+            // The override lane is inactive, but persisted accepted-release
+            // state exists: removing ENCLAVA_PLATFORM_RELEASE_PATH must not
+            // silently drop the API back to an older bundled release. Only
+            // deployments that wired the state var are affected; fresh
+            // installs (no state file) start untouched.
+            enforce_bundle_not_older_than_persisted_mark(state_path)?;
         }
         Ok(envelope)
     }
@@ -430,11 +445,71 @@ fn enforce_override_not_older_than_last_accepted_locked(
             }
         })?;
         // fsync the directory so the rename itself survives power loss.
-        if let Some(parent) = state_path.parent()
-            && let Ok(dir) = std::fs::File::open(parent)
-        {
-            let _ = dir.sync_all();
+        // Failure to make the rename durable is a failed persist, not a
+        // warning: after a crash the old mark could resurface and re-admit
+        // a release the gate already refused.
+        if let Some(parent) = state_path.parent() {
+            let dir = std::fs::File::open(parent).map_err(|error| {
+                PlatformReleaseError::HighWaterMarkPersistFailed {
+                    state_path: state_path.display().to_string(),
+                    source: error,
+                }
+            })?;
+            dir.sync_all()
+                .map_err(|error| PlatformReleaseError::HighWaterMarkPersistFailed {
+                    state_path: state_path.display().to_string(),
+                    source: error,
+                })?;
         }
+    }
+    Ok(())
+}
+
+/// Bundled-lane companion to the override high-water gate: when a deployment
+/// wires `ENCLAVA_PLATFORM_RELEASE_STATE` but `ENCLAVA_PLATFORM_RELEASE_PATH`
+/// is unset/empty, the bundled release is compared against the persisted
+/// mark before it is served. Removing the override env var (accidental
+/// manifest rollback, env-var tampering) must not silently drop the API back
+/// to a release older than anything this state lane has already accepted.
+/// No state file yet (fresh install, override never used) → no-op, so
+/// deployments that wire the state var "for later" are not blocked. Corrupt
+/// state fails closed exactly like the override lane.
+fn enforce_bundle_not_older_than_persisted_mark(
+    state_path: &Path,
+) -> Result<(), PlatformReleaseError> {
+    let persisted =
+        match std::fs::read_to_string(state_path) {
+            Ok(raw) => Some(serde_json::from_str::<AcceptedOverrideMark>(&raw).map_err(
+                |error| PlatformReleaseError::HighWaterMarkPersistFailed {
+                    state_path: state_path.display().to_string(),
+                    source: std::io::Error::other(format!(
+                        "corrupt high-water-mark state ({error}); \
+                     if the corruption is benign, remove the file after verifying \
+                     with the operator"
+                    )),
+                },
+            )?),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(PlatformReleaseError::HighWaterMarkPersistFailed {
+                    state_path: state_path.display().to_string(),
+                    source: err,
+                });
+            }
+        };
+    let Some(mark) = newest_mark(persisted)? else {
+        return Ok(());
+    };
+    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
+    let bundled_mark = AcceptedOverrideMark::of(&bundled.payload)?;
+    if mark_is_older(&bundled_mark, &mark)? {
+        return Err(PlatformReleaseError::OverrideDowngradeRefused {
+            override_version: bundled_mark.platform_release_version,
+            override_created: bundled_mark.created_at,
+            accepted_version: mark.platform_release_version,
+            accepted_created: mark.created_at,
+            state_path: state_path.display().to_string(),
+        });
     }
     Ok(())
 }
@@ -1148,6 +1223,52 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
         assert_eq!(mark.created_at, "2999-01-01T00:00:00Z");
         assert_eq!(mark.payload_sha256.len(), 64);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn override_removal_does_not_bypass_the_persisted_mark() {
+        // Codex P1: after accepting an override at T2, removing/emptying
+        // ENCLAVA_PLATFORM_RELEASE_PATH while the state lane stays wired
+        // must not silently serve the (older) bundled release.
+        let dir = std::env::temp_dir().join(format!("pr-hwm-removal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+
+        // Accept T2 via the override lane (persists the mark).
+        let t2 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        assert!(PlatformReleaseEnvelope::load_verified_from_raw(t2, true, Some(&state)).is_ok());
+
+        // Override env var removed: the bundled lane now compares against
+        // the persisted mark and refuses (bundle < T2).
+        assert!(matches!(
+            PlatformReleaseEnvelope::load_verified_from_raw(
+                BUNDLED_PLATFORM_RELEASE.to_string(),
+                false,
+                Some(&state)
+            ),
+            Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bundled_lane_without_state_file_starts_untouched() {
+        // Fresh install: state var wired but no mark persisted yet — the
+        // bundled release serves normally.
+        let dir = std::env::temp_dir().join(format!("pr-hwm-fresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+        assert!(
+            PlatformReleaseEnvelope::load_verified_from_raw(
+                BUNDLED_PLATFORM_RELEASE.to_string(),
+                false,
+                Some(&state)
+            )
+            .is_ok()
+        );
+        // No mark is created by the bundled lane read-only check.
+        assert!(!state.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

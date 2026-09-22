@@ -227,3 +227,34 @@ def test_release_generator_accepts_valid_ipv4_host():
     payload = base_payload()
     payload["trustee_kbs_url"] = "https://192.168.0.1/"
     generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_bracketed_non_ipv6_hosts():
+    # Codex P2: `https://[v1.fe80]/` is an IPvFuture form — urlparse
+    # reports hostname `v1.fe80` (passes the ASCII denylist, last label
+    # isn't numeric), but reqwest::Url::parse rejects it ("invalid IPv6
+    # address"). WHATWG allows brackets only for literal IPv6.
+    for value in (
+        "https://[v1.fe80]/",
+        "https://[v1.fe80]:8443/",
+        "https://[fe80::1%25eth0]/",
+        "https://[not_ipv6]/",
+    ):
+        payload = base_payload()
+        payload["trustee_kbs_url"] = value
+
+        with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
+            generate_platform_release.validate_payload(payload)
+
+        payload = base_payload()
+        payload["tenant_caddy_acme_ca"] = value
+
+        with pytest.raises(ValueError, match="tenant_caddy_acme_ca must be https"):
+            generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_accepts_valid_ipv6_hosts():
+    # Positive control: a literal IPv6 address the url crate accepts.
+    payload = base_payload()
+    payload["trustee_kbs_url"] = "https://[2001:db8::1]/"
+    generate_platform_release.validate_payload(payload)

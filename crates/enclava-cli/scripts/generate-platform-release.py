@@ -166,6 +166,21 @@ def _idna_ok(host: str) -> bool:
 
 
 def _host_ok(host: str) -> bool:
+    # Bracketed hosts (netloc `[...]`): WHATWG only allows brackets for
+    # literal IPv6 addresses — IPvFuture forms like `[v1.fe80]` pass
+    # urlparse (hostname `v1.fe80`) but the url crate rejects them
+    # ("invalid IPv6 address"), so validate the bracket content as strict
+    # IPv6. A zone index (`[fe80::1%25eth0]`) is also rejected: the url
+    # crate rejects it for https, and a release URL must never carry one.
+    if host.startswith("[") and host.endswith("]"):
+        inner = host[1:-1]
+        if "%" in inner:
+            return False
+        try:
+            ipaddress.IPv6Address(inner)
+        except ValueError:
+            return False
+        return True
     if any(
         ord(ch) < 0x20 or ord(ch) == 0x7F or ch in _FORBIDDEN_HOST_CHARS
         for ch in host
@@ -190,6 +205,28 @@ def _host_ok(host: str) -> bool:
 
 
 def _authority_ok(netloc: str) -> bool:
+    # Bracketed hosts: WHATWG only allows brackets for literal IPv6.
+    # urlparse's `.hostname` STRIPS the brackets, so IPvFuture forms like
+    # `[v1.fe80]` reach host checks as `v1.fe80` (a plausible hostname),
+    # while the url crate rejects the whole URL ("invalid IPv6 address").
+    # Validate the bracket content here, on the raw netloc. A zone index
+    # (`[fe80::1%25eth0]`) is rejected too — the url crate rejects it for
+    # special schemes, and a release URL must never carry one.
+    host_part = netloc.rsplit("@", 1)[-1]
+    if host_part.startswith("["):
+        end = host_part.find("]")
+        if end == -1:
+            return False
+        inner = host_part[1:end]
+        if "%" in inner:
+            return False
+        try:
+            ipaddress.IPv6Address(inner)
+        except ValueError:
+            return False
+        # Nothing but an optional :port may follow the bracket.
+        if host_part[end + 1 :] and not host_part[end + 1 :].startswith(":"):
+            return False
     # Python's urlparse and the WHATWG parser disagree on netloc structure:
     # urlparse splits userinfo at the LAST "@" and treats "\" as an ordinary
     # character, while WHATWG ends the authority at the first "\" (special

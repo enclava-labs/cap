@@ -193,6 +193,10 @@ ReadWriteOnce. An operator who can delete the state file
 can reset the floor: for the full threat model, point the state path at
 separately-protected storage. Intentional rollbacks require clearing the
 state file (after operator verification), which the refusal message names.
+Removing `ENCLAVA_PLATFORM_RELEASE_PATH` while `ENCLAVA_PLATFORM_RELEASE_STATE`
+stays wired does not bypass the gate: the bundled release is then compared
+against the persisted mark as well (no state file yet → fresh install,
+untouched).
 
 ### Rotating the production root
 
