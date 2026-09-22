@@ -9,6 +9,12 @@ rate-limit keying model are enabled there. The in-repo
 `deploy/api/network-policy.yaml` is the reference; the live overlay in
 enclava-ops-manifests is what actually rolls out — mirror any change to both.
 
+Service coordinates used below: `deploy/api/service.yaml` defines a Service
+named `enclava-api` (namespace `enclava-platform`) on service port 80 →
+targetPort 3000, so in-cluster callers use
+`http://enclava-api.enclava-platform.svc.cluster.local` (port 80 implied;
+`:3000` would fail DNS/service routing since the Service does not expose it).
+
 ## 1. Selector labels exist on the target cluster
 
 ```sh
@@ -28,9 +34,9 @@ Deploy (or exec into) a tenant pod and confirm the two enclava-init routes on
 the CAP API service answer:
 
 ```sh
-# from a tenant namespace pod:
-wget -qO- --header="Authorization: Bearer <workload token>" \
-  http://cap-api.enclava-platform.svc.cluster.local:3000/api/v1/workload/artifacts
+# from a tenant namespace pod (Service name enclava-api, service port 80):
+wget -qO- --header="Authorization: Bearer <token>" \
+  http://enclava-api.enclava-platform.svc.cluster.local:80/api/v1/workload/artifacts
 ```
 
 A timeout here means the tenant ingress rule (namespace label
@@ -55,22 +61,130 @@ kubectl -n ingress-nginx get cm ingress-nginx-controller -o yaml | grep -i forwa
   case either set it to false for the CAP host, or narrow
   TRUSTED_PROXY_CIDRS to exclude the class of clients that can reach it.
 
-End-to-end check from an external client:
+End-to-end check from an external client, against a GOVERNED route
+(`/.well-known/enclava` is not registered by this API — an outer-router 404
+never reaches the governor; `POST /auth/device/start` is registered and
+carries the tight 1 r/s burst-10 governor):
 
 ```sh
-curl -s -o /dev/null -w '%{http_code}\n' https://api.<cluster>/.well-known/enclava \
-  -H 'X-Real-IP: 1.2.3.4' -H 'X-Forwarded-For: 1.2.3.4'
-# then without the headers, repeatedly — both must behave identically
-# (headers must not change the rate-limit outcome).
+# 15 rapid starts WITH rotating spoofed headers — if the ingress overwrote
+# them correctly, all requests share ONE per-IP budget and this must produce
+# 429s within ~10 requests:
+for i in $(seq 1 15); do
+  curl -s -o /dev/null -w '%{http_code}\n' -X POST https://api.<cluster>/auth/device/start \
+    -H 'Content-Type: application/json' -d '{}' \
+    -H "X-Real-IP: 198.51.100.$i" -H "X-Forwarded-For: 198.51.100.$i"
+done | sort | uniq -c
+# Expect a handful of 200/4xx (before the budget drains) and then 429s.
+# If all 15 succeed, the spoofed headers are being honored as distinct
+# rate-limit keys — STOP the rollout and re-check the controller config.
+# Then repeat the loop WITHOUT the spoofed headers: the 429 threshold must
+# be the same (headers must not change the rate-limit outcome).
 ```
+
+Note: each 200 inserts a device-login session row; the reaper purges expired
+rows hourly, so this smoke test is self-cleaning.
+
+## 3b. Narrow TRUSTED_PROXY_CIDRS to the ingress controllers (mandatory)
+
+The in-repo default `TRUSTED_PROXY_CIDRS=10.0.0.0/8` trusts the whole pod
+network because a static manifest cannot know where the target cluster's
+ingress controllers run. Tenant workload pods (which this PR's NetworkPolicy
+intentionally admits for artifact/certificate fetches) then sit inside the
+trusted range: a malicious tenant could set `X-Real-IP` directly against the
+ClusterIP and rotate rate-limit keys. Closing that completely requires
+per-cluster knowledge, so before enabling the policy on a target cluster:
+
+```sh
+kubectl get pods -n ingress-nginx -o wide   # controller pod IPs / nodes
+kubectl get nodes -o wide                   # map pod IPs to the node+pod CIDR in use
+```
+
+Set `TRUSTED_PROXY_CIDRS` in the live overlay to the smallest CIDR (or
+explicit IP list) covering ONLY the ingress-nginx controller pods, and re-run
+the §3-style spoofed-header check from a tenant pod directly against the
+ClusterIP:
+
+```sh
+# from a tenant pod — spoofed headers must NOT buy extra /auth/device/start
+# budget once the pod's own IP is the rate-limit key:
+for i in $(seq 1 15); do
+  wget -qO- /dev/null --server-response \
+    --header="X-Real-IP: 198.51.100.$i" \
+    --post-data='{}' \
+    http://enclava-api.enclava-platform.svc.cluster.local:80/auth/device/start 2>&1 \
+    | grep 'HTTP/1.1' | tail -1
+done | sort | uniq -c
+# 429s within ~10 requests = good (keyed by the pod's own address).
+# All 15 succeeding = the tenant pod's headers are still trusted = the CIDR
+# is too wide — do not enable the policy until it is narrowed.
+```
+
+If the cluster cannot pin controller addresses (fully dynamic pools), split
+the API into a proxy-facing and a workload-facing port and scope header trust
+to the proxy-facing port — tracked as follow-up hardening.
+
+## 3c. Provision TRUSTED_PROXY_SECRET and the ingress header injection (mandatory)
+
+The deployment references `secretKeyRef: api-secrets / trusted-proxy-secret`.
+Both halves must be in place BEFORE the new API revision rolls out:
+
+1. Create the secret key in the API namespace:
+
+```sh
+kubectl -n enclava-platform create secret generic api-secrets \
+  --from-literal=trusted-proxy-secret="$(head -c32 /dev/urandom | base64)" \
+  --dry-run=client -o yaml | kubectl label --local -f - \
+  app.kubernetes.io/part-of=cap --dry-run=client -o yaml | kubectl apply -f -
+# (if api-secrets already exists, `kubectl patch secret api-secrets -p
+#  '{"stringData":{"trusted-proxy-secret":"<value>"}}'` instead)
+```
+
+2. Configure ingress-nginx to inject the same value as a request header on
+   every proxied request, overwriting anything the client sent. With the
+   controller's global `proxy-set-headers` ConfigMap:
+
+```sh
+kubectl -n ingress-nginx get cm ingress-nginx-controller -o yaml
+# ensure `data["proxy-set-headers"]` points at a ConfigMap containing:
+#   data:
+#     x-enclava-proxy-secret: "<same value as trusted-proxy-secret>"
+```
+
+Verifying the wiring is the FIRST thing to do if per-client rate limiting
+regresses: if the controller does not inject the header (or the values
+differ), every public request arrives secret-less from a trusted CIDR peer
+and is keyed by the controller pod IP — one shared bucket for all public
+clients. The §3 spoofed-header check exercises exactly this path: with the
+secret correctly wired, spoofed and unspoofed loops must behave identically
+and both must hit 429s.
 
 ## 4. PaaS internal path and SAN trust boundary
 
+Use the registered cluster-status route (`/internal/paas/status`; there is no
+`/internal/paas/health` — an unregistered path 404s at the router and never
+reaches the `InternalAuth` extractor):
+
 ```sh
 # from an enclava-paas pod, direct to the ClusterIP (not via ingress):
-curl -s http://cap-api.enclava-platform.svc.cluster.local:3000/internal/paas/health \
-  -H 'Authorization: Bearer <service token>' \
+curl -s -w '\n%{http_code}\n' \
+  http://enclava-api.enclava-platform.svc.cluster.local/internal/paas/status \
+  -H 'Authorization: Bearer <internal service token>' \
   -H 'x-enclava-internal-client-san: <allowed SAN>'
+# Expect 200 with a JSON body (extractor accepted token + SAN).
+
+# Denied case — an SAN not in CAP_INTERNAL_ALLOWED_CLIENT_SANS must be 401:
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://enclava-api.enclava-platform.svc.cluster.local/internal/paas/status \
+  -H 'Authorization: Bearer <internal service token>' \
+  -H 'x-enclava-internal-client-san: not-allowed.example'
+# Expect 401.
+
+# Denied case — missing token must be 401:
+curl -s -o /dev/null -w '%{http_code}\n' \
+  http://enclava-api.enclava-platform.svc.cluster.local/internal/paas/status \
+  -H 'x-enclava-internal-client-san: <allowed SAN>'
+# Expect 401.
 ```
 
 Confirm a pod in the namespace WITHOUT the `app.kubernetes.io/name=enclava-paas`
@@ -78,3 +192,22 @@ label is refused (NetworkPolicy drop). If the mTLS handshake terminates at a
 proxy in front of the PaaS rather than at the PaaS client itself, set
 `CAP_INTERNAL_TRUSTED_PROXY_SECRET` so SAN assertions are pinned to the
 verified proxy.
+
+## 5. Rate-limit budget is per replica
+
+The governors are in-process (tower-governor): each API pod keeps its own
+counters, so with N replicas a single client gets N × (1 r/s, burst 10) on
+`/auth/device/start` — the budget multiplies with scale. The aggregate cap
+belongs at the ingress tier where it is enforced once; if the cluster runs
+multiple API replicas, add an nginx `limit-rps` annotation (or equivalent) on
+the `/auth/device/start` path in the live overlay before relying on the
+per-IP budget, e.g.:
+
+```yaml
+metadata:
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: "1"
+```
+
+The in-process governor then remains as defense-in-depth for direct
+ClusterIP callers that bypass the ingress.

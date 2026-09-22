@@ -965,10 +965,25 @@ async fn purge_expired_device_login_sessions_removes_only_long_expired_rows() {
         .await
         .expect("age out purge candidate");
 
+    // A persistent local test database may contain older stale rows from
+    // other tests/runs that the purge is equally entitled to remove, so
+    // the global return count is not deterministic. What must hold: this
+    // test's long-expired row is gone and its fresh row survives.
     let purged = enclava_api::routes::auth::purge_expired_device_login_sessions(&pool)
         .await
         .expect("purge runs");
-    assert_eq!(purged, 1, "only the long-expired session is deleted");
+    assert!(
+        purged >= 1,
+        "the long-expired session must be deleted (got {purged})"
+    );
+
+    let purged_row: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM device_login_sessions WHERE device_code_hash = $1")
+            .bind(device_code_hash(&purged_code))
+            .fetch_optional(&pool)
+            .await
+            .expect("purged lookup");
+    assert_eq!(purged_row, None, "long-expired session is purged");
 
     let kept: Option<i32> =
         sqlx::query_scalar("SELECT 1 FROM device_login_sessions WHERE device_code_hash = $1")

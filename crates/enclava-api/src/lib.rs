@@ -354,6 +354,15 @@ fn device_auth_routes(
     // `start` is rare per user (once per login), so even ~10 concurrent
     // logins behind one NAT fit inside the burst; if a hosted-tenant NAT
     // ever trips this, key by IP + requested org instead.
+    //
+    // Per-replica note: tower-governor counters live in-process, so each
+    // API replica keeps an independent budget — with N replicas one client
+    // effectively gets N × (1 r/s, burst 10). That approximation is
+    // deliberate for this route: `start` is a cheap, single INSERT and the
+    // budget exists to stop unbounded session-row floods, not to enforce an
+    // exact global rate. The exact aggregate cap belongs at the ingress
+    // tier (nginx `limit-rps`); see runbooks/cap-api-network-policy-rollout.md
+    // §5 for the rollout check.
     let start = Router::new().route(
         "/auth/device/start",
         axum::routing::post(routes::auth::start_device_login),

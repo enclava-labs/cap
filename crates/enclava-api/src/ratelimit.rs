@@ -1,14 +1,25 @@
 //! Rate-limiter key extractor that only honours client-address headers
-//! from configured trusted proxy CIDRs.
+//! from configured trusted proxy CIDRs — and, when a shared proxy secret
+//! is configured, only from peers that also present that secret.
 //!
 //! Untrusted peers fall back to the direct TCP peer address; spoofed XFF
 //! headers from the open internet cannot move another tenant's bucket.
+//! The secret requirement exists because the trusted CIDR (the cluster
+//! pod network) also contains workloads that may connect to the API
+//! directly (tenant enclava-init pods, admitted by the API NetworkPolicy):
+//! without it, such a caller could rotate `X-Real-IP`/XFF per request and
+//! receive a fresh rate-limit bucket each time. ingress-nginx overwrites
+//! the secret header via its `proxy-set-headers` ConfigMap, so public
+//! clients cannot supply it. When no secret is configured (local dev),
+//! CIDR membership alone grants header trust.
+//!
 //! For a trusted peer the key is derived, in order of preference, from:
 //!
 //! 1. `X-Real-IP` — ingress-nginx rewrites this with the address that
 //!    actually connected to it (default `use-forwarded-headers=false`), so
 //!    no client — public or on the trusted pod network — can seed it.
-//!    This is the verified-proxy-metadata source and takes precedence.
+//!    This is the verified-proxy-metadata source and takes precedence
+//!    whenever the peer is trusted (not only when XFF is absent).
 //! 2. A rightmost-untrusted walk over `X-Forwarded-For` — for proxies that
 //!    only append to XFF. The public client may put arbitrary leftmost
 //!    entries in the header, but the rightmost entries are appended by
@@ -36,12 +47,31 @@ pub struct TrustedProxyKeyExtractor {
 #[derive(Debug, Clone, Default)]
 pub struct TrustedProxyMatcher {
     cidrs: Vec<(IpAddr, u8)>,
+    /// Shared secret that a peer must present (in addition to sitting in a
+    /// trusted CIDR) for its forwarding headers to be honoured. Injected by
+    /// the ingress controllers via proxy-set-headers; see module docs.
+    proxy_secret_sha256: Option<[u8; 32]>,
+}
+
+/// Header the ingress controllers carry the shared proxy secret in.
+const PROXY_SECRET_HEADER: &str = "x-enclava-proxy-secret";
+
+fn sha256_hex(value: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.trim().as_bytes());
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 impl TrustedProxyMatcher {
     pub fn from_env() -> Self {
         let raw = std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default();
-        Self::from_csv(&raw)
+        let secret = std::env::var("TRUSTED_PROXY_SECRET")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        Self::from_csv(&raw).with_proxy_secret(secret.as_deref())
     }
 
     pub fn from_csv(raw: &str) -> Self {
@@ -65,13 +95,47 @@ impl TrustedProxyMatcher {
             }
             tracing::warn!("ignoring invalid TRUSTED_PROXY_CIDRS entry: {}", entry);
         }
-        Self { cidrs }
+        Self {
+            cidrs,
+            proxy_secret_sha256: None,
+        }
+    }
+
+    /// Require peers to present this shared secret (via the
+    /// `x-enclava-proxy-secret` header) before their forwarding headers are
+    /// honoured. `None` restores CIDR-only trust.
+    pub fn with_proxy_secret(mut self, secret: Option<&str>) -> Self {
+        self.proxy_secret_sha256 = secret
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(sha256_hex);
+        self
     }
 
     pub fn is_trusted(&self, addr: IpAddr) -> bool {
         self.cidrs
             .iter()
             .any(|(net, bits)| ip_in_cidr(addr, *net, *bits))
+    }
+
+    /// True when the request carries the configured proxy secret (constant
+    /// time when a secret is set). When no secret is configured, CIDR
+    /// membership alone is sufficient (local/dev deployments).
+    fn presents_proxy_secret<B>(&self, req: &Request<B>) -> bool {
+        let Some(expected) = self.proxy_secret_sha256.as_ref() else {
+            return true;
+        };
+        let Some(value) = req
+            .headers()
+            .get(PROXY_SECRET_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        use subtle::ConstantTimeEq;
+        expected.ct_eq(&sha256_hex(value)).into()
     }
 }
 
@@ -133,7 +197,9 @@ impl TrustedProxyKeyExtractor {
             .collect()
     }
 
-    /// Fallback to `X-Real-IP` when `X-Forwarded-For` is absent.
+    /// `X-Real-IP` from a trusted peer. Preferred source whenever the peer
+    /// is trusted (not only when XFF is absent): ingress-nginx rewrites the
+    /// header with the address that actually connected to it.
     fn real_ip<B>(&self, req: &Request<B>) -> Option<IpAddr> {
         req.headers()
             .get("x-real-ip")
@@ -169,6 +235,14 @@ impl TrustedProxyKeyExtractor {
     pub fn extract_ip<B>(&self, req: &Request<B>) -> Option<IpAddr> {
         let peer = self.peer_addr(req);
         let peer_is_trusted = peer.map(|ip| self.trusted.is_trusted(ip)).unwrap_or(false);
+        // Header trust requires BOTH CIDR membership and (when configured)
+        // the shared proxy secret. The secret is what stops a tenant or PaaS
+        // pod — which the NetworkPolicy admits directly and whose IPs sit
+        // inside the trusted pod-network CIDR — from rotating X-Real-IP/XFF
+        // to mint a fresh rate-limit bucket per request. Only the ingress
+        // controllers, which overwrite the header via proxy-set-headers,
+        // present it.
+        let peer_is_trusted = peer_is_trusted && self.trusted.presents_proxy_secret(req);
         if peer_is_trusted {
             // Preferred source: X-Real-IP as rewritten by ingress-nginx with
             // the address that actually connected to it. Unlike XFF (which
@@ -353,5 +427,87 @@ mod tests {
             .insert("x-real-ip", "198.51.100.7".parse().unwrap());
         let ip = extractor.extract_ip(&req).unwrap();
         assert_eq!(ip.to_string(), "203.0.113.5");
+    }
+
+    fn req_with_headers(peer: &str, headers: &[(&str, String)]) -> Request<()> {
+        let mut req = Request::builder().uri("/").body(()).unwrap();
+        let socket: SocketAddr = format!("{peer}:54321").parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(socket));
+        for (name, value) in headers {
+            let name =
+                axum::http::HeaderName::from_lowercase(name.as_bytes()).expect("valid header name");
+            let value = value
+                .parse::<axum::http::HeaderValue>()
+                .expect("valid header value");
+            req.headers_mut().insert(name, value);
+        }
+        req
+    }
+
+    #[test]
+    fn proxy_secret_required_for_header_trust_when_configured() {
+        // Self-check Critical finding: tenant/PaaS pods sit inside the
+        // trusted pod-network CIDR and the NetworkPolicy admits them
+        // directly, so CIDR membership alone must not grant header trust.
+        // Without the shared proxy secret, headers are ignored and the
+        // caller is keyed by its peer (pod) IP.
+        let extractor = TrustedProxyKeyExtractor::new(
+            TrustedProxyMatcher::from_csv("10.0.0.0/8").with_proxy_secret(Some("ingress-secret")),
+        );
+        // Tenant pod calls the ClusterIP directly, rotating X-Real-IP and
+        // XFF per request without knowing the secret.
+        let req = req_with_headers(
+            "10.42.7.7",
+            &[
+                ("x-real-ip", "198.51.100.7".to_string()),
+                ("x-forwarded-for", "1.2.3.4, 203.0.113.9".to_string()),
+            ],
+        );
+        let ip = extractor.extract_ip(&req).unwrap();
+        assert_eq!(
+            ip.to_string(),
+            "10.42.7.7",
+            "secret-less trusted-CIDR peer must be keyed by peer IP"
+        );
+
+        // Same pod presents a wrong secret: still keyed by peer IP.
+        let req = req_with_headers(
+            "10.42.7.7",
+            &[
+                ("x-enclava-proxy-secret", "wrong".to_string()),
+                ("x-real-ip", "198.51.100.7".to_string()),
+            ],
+        );
+        let ip = extractor.extract_ip(&req).unwrap();
+        assert_eq!(ip.to_string(), "10.42.7.7");
+    }
+
+    #[test]
+    fn proxy_secret_grants_header_trust_to_ingress() {
+        // The ingress controller (trusted CIDR + correct secret) still gets
+        // per-client keys from X-Real-IP.
+        let extractor = TrustedProxyKeyExtractor::new(
+            TrustedProxyMatcher::from_csv("10.0.0.0/8").with_proxy_secret(Some("ingress-secret")),
+        );
+        let req = req_with_headers(
+            "10.10.5.5",
+            &[
+                ("x-enclava-proxy-secret", "ingress-secret".to_string()),
+                ("x-real-ip", "198.51.100.7".to_string()),
+            ],
+        );
+        let ip = extractor.extract_ip(&req).unwrap();
+        assert_eq!(ip.to_string(), "198.51.100.7");
+    }
+
+    #[test]
+    fn proxy_secret_absent_config_restores_cidr_only_trust() {
+        // No secret configured (local dev): CIDR membership alone grants
+        // header trust, as before this gate existed.
+        let extractor =
+            TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.10.0.0/16"));
+        let req = req_with_headers("10.10.5.5", &[("x-real-ip", "198.51.100.7".to_string())]);
+        let ip = extractor.extract_ip(&req).unwrap();
+        assert_eq!(ip.to_string(), "198.51.100.7");
     }
 }
