@@ -11,7 +11,7 @@ use enclava_init::config::{Config, Mode, VolumeConfig};
 use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
-    dev_no_luks_override, kbs_fetch, log_relay, luks, seeds, socket, tls_certificate,
+    dev_no_luks_override, env_override, kbs_fetch, log_relay, luks, seeds, socket, tls_certificate,
     trustee_verify, unlock, writes,
 };
 use serde::Deserialize;
@@ -66,7 +66,10 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             report_failure(&e);
-            if stay_alive_enabled() {
+            // Prod-strict fails fast: an indefinitely-alive failed sidecar
+            // masks the failure from orchestration (no restart, no backoff).
+            // Dev builds keep the diagnostics-readable stay-alive.
+            if stay_alive_enabled() && !cfg!(feature = "prod-strict") {
                 tracing::error!(
                     "enclava-init failed; keeping sidecar alive so diagnostics remain readable"
                 );
@@ -187,7 +190,9 @@ fn stay_alive_enabled() -> bool {
 }
 
 fn start_log_relay_if_configured() -> Result<Option<std::thread::JoinHandle<()>>> {
-    let Some(config) = log_relay::LogRelayConfig::from_env_optional() else {
+    let Some(config) = log_relay::LogRelayConfig::from_env_optional()
+        .context("resolving encrypted log relay configuration")?
+    else {
         return Ok(None);
     };
     tracing::info!(
@@ -200,33 +205,33 @@ fn start_log_relay_if_configured() -> Result<Option<std::thread::JoinHandle<()>>
 }
 
 fn ready_file_path() -> PathBuf {
-    std::env::var("ENCLAVA_INIT_READY_FILE")
+    env_override("ENCLAVA_INIT_READY_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_READY_FILE))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_READY_FILE))
 }
 
 fn error_file_path() -> PathBuf {
-    std::env::var("ENCLAVA_INIT_ERROR_FILE")
+    env_override("ENCLAVA_INIT_ERROR_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ERROR_FILE))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ERROR_FILE))
 }
 
 fn acme_cooldown_file_path() -> PathBuf {
-    std::env::var("ENCLAVA_INIT_ACME_COOLDOWN_FILE")
+    env_override("ENCLAVA_INIT_ACME_COOLDOWN_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ACME_COOLDOWN_FILE))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ACME_COOLDOWN_FILE))
 }
 
 fn stage_file_path() -> PathBuf {
-    std::env::var("ENCLAVA_INIT_STAGE_FILE")
+    env_override("ENCLAVA_INIT_STAGE_FILE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_STAGE_FILE))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STAGE_FILE))
 }
 
 fn started_dir_path() -> PathBuf {
-    std::env::var("ENCLAVA_INIT_STARTED_DIR")
+    env_override("ENCLAVA_INIT_STARTED_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/run/enclava/containers"))
+        .unwrap_or_else(|| PathBuf::from("/run/enclava/containers"))
 }
 
 #[path = "main/init_stats.rs"]
@@ -271,9 +276,9 @@ fn record_failure_file(safe_json: &str) {
     if let Err(err) = writes::atomic_write(&path, body.as_bytes(), 0o644) {
         eprintln!("enclava-init: failed to write init error file: {err}");
     }
-    let termination_path = std::env::var("ENCLAVA_INIT_TERMINATION_LOG")
+    let termination_path = env_override("ENCLAVA_INIT_TERMINATION_LOG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/dev/termination-log"));
+        .unwrap_or_else(|| PathBuf::from("/dev/termination-log"));
     if let Err(err) = write_termination_log_in_place(&termination_path, body.as_bytes()) {
         eprintln!("enclava-init: failed to write termination log: {err}");
     }
@@ -1305,7 +1310,7 @@ fn run_in_tee_verification(cfg: &Config) -> Result<()> {
         .transpose()?;
 
     let token = trustee_verify::resolve_kbs_attestation_token(
-        std::env::var("KBS_ATTESTATION_TOKEN").ok().as_deref(),
+        enclava_init::env_override("KBS_ATTESTATION_TOKEN").as_deref(),
         &cfg.kbs_attestation_token_url,
         std::time::Duration::from_secs(15),
     )

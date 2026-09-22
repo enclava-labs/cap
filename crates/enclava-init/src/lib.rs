@@ -24,6 +24,26 @@ fn dev_no_luks_override_for(raw: Option<&str>) -> bool {
             .unwrap_or(false)
 }
 
+/// Read a host-mutable env override for an enclava-init operational
+/// parameter (paths, tokens, keep-alive knobs).
+///
+/// Prod-strict builds bind operational behavior to the signed-config
+/// defaults only: the pod environment is host-controlled and unbound to the
+/// signed cc_init_data, so honoring it there would let a tampered host
+/// redirect init surfaces (error/ready/stage/termination files, attestation
+/// tokens) away from their attested values. Overrides are honored
+/// exclusively in non-prod-strict (dev/CI debug) builds.
+pub fn env_override(name: &str) -> Option<String> {
+    env_override_for(std::env::var(name).ok().as_deref())
+}
+
+fn env_override_for(raw: Option<&str>) -> Option<String> {
+    if cfg!(feature = "prod-strict") {
+        return None;
+    }
+    raw.map(str::to_string)
+}
+
 pub mod chown;
 pub mod config;
 pub mod errors;
@@ -152,6 +172,67 @@ mod tests {
         assert!(!super::dev_no_luks_override_for(Some("0")));
         assert!(!super::dev_no_luks_override_for(Some("yes")));
         assert!(!super::dev_no_luks_override_for(None));
+    }
+
+    #[cfg(feature = "prod-strict")]
+    #[test]
+    fn prod_strict_ignores_env_overrides() {
+        assert!(super::env_override_for(Some("value")).is_none());
+        assert!(super::env_override_for(None).is_none());
+    }
+
+    #[cfg(all(debug_assertions, not(feature = "prod-strict")))]
+    #[test]
+    fn dev_builds_honor_env_overrides() {
+        assert_eq!(
+            super::env_override_for(Some("value")).as_deref(),
+            Some("value")
+        );
+        assert!(super::env_override_for(None).is_none());
+    }
+
+    #[test]
+    fn prod_strict_gates_host_mutable_env_overrides() {
+        let main_source = include_str!("main.rs").replace("\r\n", "\n");
+        // Every host-controlled operational env var read in main.rs must go
+        // through env_override (compiled out under prod-strict), never a
+        // bare std::env::var that a tampered host could redirect.
+        for var in [
+            "ENCLAVA_INIT_READY_FILE",
+            "ENCLAVA_INIT_ERROR_FILE",
+            "ENCLAVA_INIT_STAGE_FILE",
+            "ENCLAVA_INIT_STARTED_DIR",
+            "ENCLAVA_INIT_ACME_COOLDOWN_FILE",
+            "ENCLAVA_INIT_TERMINATION_LOG",
+        ] {
+            assert!(
+                !main_source.contains(&format!("std::env::var(\"{var}\")")),
+                "{var} must be read via env_override, not std::env::var"
+            );
+        }
+        assert!(
+            main_source.contains("env_override(\"ENCLAVA_INIT_READY_FILE\")"),
+            "ready file path must resolve through env_override"
+        );
+        // The failure-path keep-alive masks failed boots from orchestration;
+        // prod-strict must fail fast instead.
+        assert!(
+            main_source.contains("stay_alive_enabled() && !cfg!(feature = \"prod-strict\")"),
+            "failure-path stay-alive must be compiled out of prod-strict builds"
+        );
+        // The KBS attestation token env bypass must be gated too: prod-strict
+        // resolves the token from the signed kbs_attestation_token_url only.
+        for source in [
+            main_source.as_str(),
+            include_str!("tls_certificate.rs")
+                .replace("\r\n", "\n")
+                .as_str(),
+        ] {
+            assert!(
+                !source.contains("std::env::var(\"KBS_ATTESTATION_TOKEN\")"),
+                "KBS_ATTESTATION_TOKEN must be read via env_override, not std::env::var"
+            );
+        }
     }
 
     #[test]

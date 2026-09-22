@@ -13,6 +13,18 @@ const MAX_TAIL_LINES: usize = 1_000;
 const MAX_TAIL_BYTES: u64 = 2 * 1024 * 1024;
 const FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+fn open_spool_nofollow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NOFOLLOW: the spool path is host-writable before init takes over;
+    // a symlink planted there must not redirect log reads at arbitrary
+    // files. Fail closed with ELOOP instead of following the link.
+    let flags = nix::fcntl::OFlag::O_NOFOLLOW.bits();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+}
+
 #[derive(Clone, Debug)]
 pub struct LogRelayConfig {
     pub bind: String,
@@ -21,26 +33,54 @@ pub struct LogRelayConfig {
 }
 
 impl LogRelayConfig {
-    pub fn from_env_defaults() -> Self {
-        Self {
-            bind: std::env::var("ENCLAVA_LOG_RELAY_BIND")
-                .unwrap_or_else(|_| DEFAULT_BIND.to_string()),
+    pub fn from_env_defaults() -> io::Result<Self> {
+        Ok(Self {
+            bind: require_loopback_bind(
+                &std::env::var("ENCLAVA_LOG_RELAY_BIND")
+                    .unwrap_or_else(|_| DEFAULT_BIND.to_string()),
+            )?,
             spool_path: std::env::var_os("ENCLAVA_LOG_RELAY_SPOOL_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_SPOOL_PATH)),
             container: std::env::var("ENCLAVA_LOG_RELAY_CONTAINER")
                 .unwrap_or_else(|_| DEFAULT_CONTAINER.to_string()),
-        }
+        })
     }
 
-    pub fn from_env_optional() -> Option<Self> {
-        std::env::var_os("ENCLAVA_LOG_RELAY_SPOOL_PATH")?;
-        Some(Self::from_env_defaults())
+    pub fn from_env_optional() -> io::Result<Option<Self>> {
+        if std::env::var_os("ENCLAVA_LOG_RELAY_SPOOL_PATH").is_none() {
+            return Ok(None);
+        }
+        Some(Self::from_env_defaults()).transpose()
+    }
+}
+
+/// The relay serves unauthenticated tenant log tails, so only a loopback
+/// bind is ever allowed. A host-controlled `ENCLAVA_LOG_RELAY_BIND` pointing
+/// off-loopback (including wildcard 0.0.0.0/::) must fail closed instead of
+/// exposing the relay pod-wide.
+fn require_loopback_bind(bind: &str) -> io::Result<String> {
+    use std::net::ToSocketAddrs;
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("log relay bind {bind:?} must be loopback"),
+        )
+    };
+    let addr = bind
+        .to_socket_addrs()
+        .map_err(|_| invalid())?
+        .next()
+        .ok_or_else(invalid)?;
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_loopback() => Ok(bind.to_string()),
+        std::net::IpAddr::V6(ip) if ip.is_loopback() => Ok(bind.to_string()),
+        _ => Err(invalid()),
     }
 }
 
 pub fn run_from_env() -> io::Result<()> {
-    run(LogRelayConfig::from_env_defaults())
+    run(LogRelayConfig::from_env_defaults()?)
 }
 
 pub fn spawn(config: LogRelayConfig) -> io::Result<thread::JoinHandle<()>> {
@@ -149,7 +189,7 @@ impl LogRelayQuery {
 }
 
 fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64)> {
-    let mut file = File::open(path)?;
+    let mut file = open_spool_nofollow(path)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(MAX_TAIL_BYTES);
     file.seek(SeekFrom::Start(start))?;
@@ -174,7 +214,7 @@ fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64)> {
 fn follow_spool(stream: &mut TcpStream, path: &Path, offset: &mut u64) -> io::Result<()> {
     loop {
         thread::sleep(FOLLOW_POLL_INTERVAL);
-        let Ok(mut file) = File::open(path) else {
+        let Ok(mut file) = open_spool_nofollow(path) else {
             continue;
         };
         let len = file.metadata()?.len();
@@ -250,4 +290,57 @@ fn write_response_head(
         write!(stream, "content-length: {len}\r\n")?;
     }
     stream.write_all(b"\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_binds_are_accepted() {
+        for bind in ["127.0.0.1:8082", "localhost:8082", "[::1]:9000"] {
+            assert_eq!(require_loopback_bind(bind).unwrap(), bind);
+        }
+    }
+
+    #[test]
+    fn off_loopback_binds_are_rejected() {
+        for bind in [
+            "0.0.0.0:8082",
+            "[::]:8082",
+            "10.0.0.5:8082",
+            "192.168.1.10:9443",
+            "example.com:80",
+            "not-a-bind",
+        ] {
+            let err = require_loopback_bind(bind).expect_err("off-loopback bind must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bind}: {err}");
+            assert!(
+                err.to_string().contains("must be loopback"),
+                "{bind}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn spool_symlink_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("spool-target.jsonl");
+        let link = dir.path().join("app.jsonl");
+        std::fs::write(&target, b"line\n").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = open_spool_nofollow(&link).expect_err("spool symlink must be rejected");
+        assert_eq!(err.raw_os_error(), Some(nix::errno::Errno::ELOOP as i32));
+    }
+
+    #[test]
+    fn spool_regular_file_is_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("app.jsonl");
+        std::fs::write(&spool, b"{}\n").unwrap();
+        let (lines, offset) = tail_lines(&spool, 10).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(offset > 0);
+    }
 }
