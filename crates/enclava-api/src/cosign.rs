@@ -186,6 +186,19 @@ async fn load_trust_root() -> Result<Arc<SigstoreTrustRoot>, CosignError> {
         return Ok(Arc::new(root));
     }
 
+    // Release builds must not bootstrap sigstore trust from the network at
+    // runtime: a MITM'd first TUF fetch would anchor all subsequent cosign
+    // verification (issue #140). Production deployments ship a pinned
+    // trusted_root.json and set SIGSTORE_TUF_ROOT_PATH; the network fallback
+    // remains available for debug/dev builds only.
+    if !cfg!(debug_assertions) {
+        return Err(CosignError::TrustRoot(
+            "SIGSTORE_TUF_ROOT_PATH is not set; release builds must pin a bundled \
+             trusted_root.json instead of fetching the sigstore TUF root from the network"
+                .to_string(),
+        ));
+    }
+
     let root = SigstoreTrustRoot::new(None)
         .await
         .map_err(|e| CosignError::TrustRoot(format!("sigstore TUF fetch failed: {e}")))?;

@@ -156,6 +156,16 @@ jobs:
       - name: Run cargo deny
         run: cargo deny check advisories sources
 
+  supply-chain:
+    name: Supply-chain hygiene (issue #140)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify vendored rdrand delta against the reviewed patch
+        run: bash scripts/verify-vendored-rdrand.sh
+
   build:
     name: Build all crates
     runs-on: ubuntu-latest

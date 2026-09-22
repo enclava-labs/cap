@@ -48,6 +48,42 @@ fn ci_serializes_tests_that_share_postgres_authority() {
     );
 }
 
+#[test]
+fn dockerfiles_pin_base_images_by_digest() {
+    // Mutable tags can be repointed by the registry at any time; every FROM
+    // must carry the immutable digest that was reviewed (issue #140).
+    let mut checked = 0;
+    for entry in fs::read_dir(workspace_root().join("crates"))
+        .expect("list crates")
+        .filter_map(|e| e.ok())
+    {
+        let dockerfile = entry.path().join("Dockerfile");
+        let Ok(content) = fs::read_to_string(&dockerfile) else {
+            continue;
+        };
+        for line in content.lines() {
+            let Some(rest) = line.strip_prefix("FROM ") else {
+                continue;
+            };
+            let image = rest.split_whitespace().next().unwrap_or("");
+            // BUILD stages can use the implicit latest; scratch has no bytes.
+            if image == "SCRATCH" || image == "scratch" {
+                continue;
+            }
+            assert!(
+                image.contains("@sha256:"),
+                "{}: FROM `{image}` must be pinned by digest",
+                dockerfile.display()
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "expected to check at least one Dockerfile FROM line"
+    );
+}
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

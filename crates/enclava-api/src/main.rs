@@ -93,12 +93,20 @@ fn load_internal_auth_config() -> Option<InternalAuthConfig> {
     ))
 }
 
-fn load_management_mode() -> CapManagementMode {
-    env_nonempty("CAP_MANAGEMENT_MODE")
+fn load_management_mode() -> Result<CapManagementMode, String> {
+    load_management_mode_with_env(|name| std::env::var(name).ok())
+}
+
+fn load_management_mode_with_env(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<CapManagementMode, String> {
+    lookup("CAP_MANAGEMENT_MODE")
         .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .unwrap_or("standalone")
         .parse()
-        .expect("invalid CAP_MANAGEMENT_MODE")
+        .map_err(|err| format!("invalid CAP_MANAGEMENT_MODE: {err}"))
 }
 
 fn load_caddy_tls_mode() -> anyhow::Result<CaddyTlsMode> {
@@ -834,7 +842,13 @@ async fn main() {
         max_concurrent_applies,
         "configured deployment apply concurrency"
     );
-    let management_mode = load_management_mode();
+    let management_mode = match load_management_mode() {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("startup refused: {error}");
+            std::process::exit(1);
+        }
+    };
     let internal_auth = load_internal_auth_config();
     if management_mode == CapManagementMode::PaasManaged
         && !internal_auth
@@ -1130,5 +1144,59 @@ mod tests {
             err.to_string().contains("TENANT_TEE_CA_CERT_PEM"),
             "error should name the invalid tenant TEE CA env var: {err}"
         );
+    }
+
+    #[test]
+    fn management_mode_resolves_documented_values_and_rejects_typos() {
+        assert_eq!(
+            load_management_mode_with_env(|name| match name {
+                "CAP_MANAGEMENT_MODE" => None,
+                _ => None,
+            })
+            .unwrap(),
+            CapManagementMode::Standalone
+        );
+        for value in [
+            "standalone",
+            "self_service",
+            "paas_managed",
+            "paas",
+            "paas-managed",
+        ] {
+            let mode = load_management_mode_with_env(|name| match name {
+                "CAP_MANAGEMENT_MODE" => Some(value.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|e| panic!("`{value}` must parse: {e}"));
+            assert_eq!(mode.as_str(), {
+                if value.starts_with("paas") {
+                    "paas_managed"
+                } else {
+                    "standalone"
+                }
+            });
+        }
+        for invalid in ["managed", "PAAS_MANAGED", "paas managed"] {
+            assert!(
+                load_management_mode_with_env(|name| match name {
+                    "CAP_MANAGEMENT_MODE" => Some(invalid.to_string()),
+                    _ => None,
+                })
+                .is_err(),
+                "`{invalid:?}` must be rejected instead of panicking at startup (issue #140)"
+            );
+        }
+        // Whitespace-only and unset fall back to the documented default,
+        // matching env_nonempty semantics (trim, empty == unset).
+        for unset_like in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                load_management_mode_with_env(|name| match name {
+                    "CAP_MANAGEMENT_MODE" => unset_like.map(str::to_string),
+                    _ => None,
+                })
+                .unwrap(),
+                CapManagementMode::Standalone
+            );
+        }
     }
 }
