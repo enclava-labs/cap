@@ -583,9 +583,10 @@ pub async fn release_customer_config_hold(
     if updated.rows_affected() != 1 {
         return Err(DeploymentJobError::LeaseLost);
     }
-    // The hold hid this deployment from signed-policy selection. Publish it
-    // now that the roll is allowed to replace the running workload.
-    crate::kbs::enqueue_signed_policy_reconciliation(&mut tx).await?;
+    // Publish the released deployment only when signed-policy mode is already
+    // active. An unconditional generation bump would turn a legacy-policy
+    // installation's unsigned redeploy into an empty signed policy.
+    crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx).await?;
     tx.commit().await?;
     Ok(CustomerConfigHoldRelease::Released)
 }

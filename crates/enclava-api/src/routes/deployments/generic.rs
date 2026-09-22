@@ -340,7 +340,8 @@ pub async fn create_generic_deployment(
     };
     let org_id = auth.org_id;
     let (status, Json(deployed)) =
-        super::deploy_app_candidate(auth, state.clone(), app, deploy_request, app_mutation).await?;
+        super::deploy_app_candidate(auth, state.clone(), app, deploy_request, app_mutation, true)
+            .await?;
     let (deployment, app) = fetch_deployment_with_app(&state, org_id, deployed.deployment_id)
         .await?
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
@@ -627,6 +628,24 @@ pub(super) fn ensure_idempotent_retry_matches(
         serde_json::to_value(&body.security.log_encryption).unwrap_or(serde_json::Value::Null);
     if existing_log_encryption != requested_log_encryption {
         return Err(idempotency_conflict("security.log_encryption"));
+    }
+    let stored_hold = deployment
+        .spec_snapshot
+        .get("customer_config_roll_hold_seconds")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let requested_hold = serde_json::json!(
+        crate::deployment_jobs::normalize_customer_config_roll_hold_seconds(
+            body.customer_config_roll_hold_seconds,
+            crate::deployment_jobs::customer_config_roll_hold_applies(
+                false,
+                matches!(app.status, crate::models::AppStatus::Running),
+                app.tee_domain.as_deref(),
+            ),
+        )
+    );
+    if stored_hold != requested_hold {
+        return Err(idempotency_conflict("customer_config_roll_hold_seconds"));
     }
     Ok(())
 }
