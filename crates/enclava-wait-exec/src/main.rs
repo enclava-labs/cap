@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -35,6 +35,13 @@ const LOG_SPOOL_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
 /// After rotation, keep this prefix of the pre-rotation spool so the relay's
 /// tail reads still span the rotation boundary.
 const LOG_SPOOL_KEEP_BYTES: u64 = 8 * 1024 * 1024;
+/// Cap on a single input record buffered from the child. Longer lines are
+/// split at this boundary into consecutive frames (same stream, consecutive
+/// sequence numbers, order preserved) so a pathological writer cannot grow
+/// the wrapper's memory without bound or produce a frame larger than the
+/// rotation headroom below the 64 MiB volume cap. 256 KiB of plaintext
+/// encodes to well under 512 KiB of framed output.
+const MAX_LOG_RECORD_BYTES: usize = 256 * 1024;
 const TERMINATION_SIGNALS: [Signal; 4] = [
     Signal::SIGHUP,
     Signal::SIGINT,
@@ -295,10 +302,10 @@ where
 {
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
+    let mut dropped_frames: u64 = 0;
     loop {
         buf.clear();
-        let n = reader
-            .read_until(b'\n', &mut buf)
+        let n = read_capped_record(&mut reader, &mut buf)
             .map_err(|err| format!("failed to read child {stream}: {err}"))?;
         if n == 0 {
             return Ok(());
@@ -321,37 +328,96 @@ where
         let mut spool = spool
             .lock()
             .map_err(|_| "encrypted log spool lock poisoned".to_string())?;
-        spool
+        // Rotate BEFORE writing, projected against the encoded frame length:
+        // records are capped (see MAX_LOG_RECORD_BYTES), so the spool never
+        // grows past the rotate threshold between checks and a single frame
+        // can never outrun the headroom below the emptyDir cap. Best-effort
+        // by design — a rotation failure is logged and skipped so the
+        // forwarding thread keeps draining the child's pipe.
+        if let Err(err) =
+            rotate_spool_if_needed(&mut spool, line.len() as u64 + 1, &logs.spool_path)
+        {
+            eprintln!("enclava-wait-exec: log spool rotation failed: {err}");
+        }
+        // A spool write failure (e.g. a transient ENOSPC against the volume
+        // cap) must not terminate the forwarding thread either: exiting here
+        // closes the child's pipe and exposes a healthy workload to SIGPIPE.
+        // Drop the frame instead and keep draining; report the first failure
+        // and then every 1000th dropped frame so persistent loss is visible.
+        if let Err(err) = spool
             .write_all(&line)
             .and_then(|_| spool.write_all(b"\n"))
             .and_then(|_| spool.flush())
-            .map_err(|err| format!("failed to write encrypted log spool: {err}"))?;
-        // Bounded rotation; best-effort by design — a rotation failure must
-        // not terminate the forwarding thread (that would close the child's
-        // pipe and expose it to SIGPIPE), so it is logged and skipped.
-        if let Err(err) = rotate_spool_if_needed(&mut spool) {
-            eprintln!("enclava-wait-exec: log spool rotation failed: {err}");
+        {
+            dropped_frames += 1;
+            if dropped_frames == 1 || dropped_frames % 1000 == 0 {
+                eprintln!(
+                    "enclava-wait-exec: encrypted log spool write failed \
+                     ({dropped_frames} frames dropped so far): {err}"
+                );
+            }
         }
     }
 }
 
-/// Bound the encrypted log spool: once it exceeds `LOG_SPOOL_ROTATE_BYTES`,
-/// retain only the last `LOG_SPOOL_KEEP_BYTES` of frames. Rotation is a
-/// prefix truncation on the same inode: the relay's `follow_spool` detects
-/// `len < offset` and resumes from 0, and `tail_lines` reads the last
-/// MAX_TAIL_BYTES regardless, so readers stay correct across rotation.
-/// Callers hold the spool mutex, so the check-then-truncate is race-free.
+/// Read one input record from the child, capped at
+/// `MAX_LOG_RECORD_BYTES`: a longer line is returned as consecutive
+/// chunks (each without a trailing newline except the final chunk), which
+/// the caller frames separately — same stream, consecutive sequence
+/// numbers, order preserved, no data dropped. The cap bounds both the
+/// wrapper's memory and the largest frame the spool can ever see.
+/// Implemented via fill_buf/consume rather than `Take::read_until` so the
+/// cap boundary is exact (no byte duplication or loss at the limit).
+fn read_capped_record<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+    buf.clear();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(buf.len());
+        }
+        let remaining = MAX_LOG_RECORD_BYTES - buf.len();
+        let search = &available[..available.len().min(remaining)];
+        match search.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                buf.extend_from_slice(&search[..=i]);
+                reader.consume(i + 1);
+                return Ok(buf.len());
+            }
+            None => {
+                buf.extend_from_slice(search);
+                let n = search.len();
+                reader.consume(n);
+                if buf.len() == MAX_LOG_RECORD_BYTES {
+                    return Ok(buf.len());
+                }
+            }
+        }
+    }
+}
+
+/// Bound the encrypted log spool: rotate when the current length plus the
+/// incoming encoded frame would exceed `LOG_SPOOL_ROTATE_BYTES`, retaining
+/// only the last `LOG_SPOOL_KEEP_BYTES` of frames. Rotation writes the
+/// retained tail to a sibling temp file and atomically renames it over the
+/// spool path, so the spool always becomes a NEW inode and readers never
+/// observe a half-truncated file: the relay's `follow_spool` tracks the
+/// file identity (dev/ino) and restarts from offset 0 when it changes
+/// (with `len < offset` kept as a belt-and-braces fallback), and `tail_lines`
+/// reads the last MAX_TAIL_BYTES by path regardless. The caller holds the
+/// spool mutex, and the handle is reopened onto the new inode in-place, so
+/// the check-rotate-rename sequence is race-free for both forwarders.
 /// Rotation is best-effort: failures are logged by the caller and never
 /// terminate the forwarding threads, which keep draining the child pipes.
-fn rotate_spool_if_needed(spool: &mut File) -> std::io::Result<()> {
+/// If the reopen fails after a successful rename, the old handle keeps
+/// absorbing appends on the unlinked inode and the next call retries —
+/// writes stay lossless-visible once a reopen succeeds.
+fn rotate_spool_if_needed(spool: &mut File, incoming: u64, path: &Path) -> std::io::Result<()> {
     let len = spool.metadata()?.len();
-    if len < LOG_SPOOL_ROTATE_BYTES {
+    if len + incoming <= LOG_SPOOL_ROTATE_BYTES {
         return Ok(());
     }
-    // Copy the retained tail to a scratch buffer, then rewrite the file
-    // in place. The file was opened with O_APPEND; ftruncate + rewind via
-    // seek works because writes are positioned at end-of-file by the flag,
-    // so we only need to shrink it and re-write the retained prefix.
+    // Copy the retained tail to a scratch buffer from the old inode, then
+    // atomically swap the spool to a fresh inode carrying only that tail.
     let keep_from = len.saturating_sub(LOG_SPOOL_KEEP_BYTES);
     let mut retain_buf = Vec::new();
     spool.seek(SeekFrom::Start(keep_from))?;
@@ -368,12 +434,29 @@ fn rotate_spool_if_needed(spool: &mut File) -> std::io::Result<()> {
             retain_buf.clear();
         }
     }
-    spool.set_len(0)?;
-    spool.seek(SeekFrom::Start(0))?;
-    // With O_APPEND the write lands at the current end (0) regardless of
-    // the read cursor; flush keeps ordering with the subsequent appends.
-    spool.write_all(&retain_buf)?;
-    spool.flush()
+    let rotate_tmp = PathBuf::from(format!("{}.rotate.{}", path.display(), process::id()));
+    // Clear a leftover temp from a crashed rotation; O_NOFOLLOW below makes
+    // a pre-planted symlink fail safely with ELOOP instead of being opened.
+    let _ = fs::remove_file(&rotate_tmp);
+    {
+        let mut tmp = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o640)
+            .custom_flags(O_NOFOLLOW)
+            .open(&rotate_tmp)?;
+        tmp.write_all(&retain_buf)?;
+        tmp.sync_all()?;
+    }
+    fs::rename(&rotate_tmp, path)?;
+    // Reopen the spool path so subsequent appends land on the new inode.
+    // An error here leaves the old handle appending to the unlinked inode —
+    // visible to no reader, but safe (no pipe close); the next rotation
+    // call retries the swap.
+    *spool = open_log_spool(path)
+        .map_err(|message| io::Error::other(format!("spool reopen after rotation: {message}")))?;
+    Ok(())
 }
 
 fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
@@ -663,15 +746,17 @@ mod tests {
 
     /// Rotation must bound the spool: once past the rotate threshold the
     /// file shrinks to roughly the retained window, the retained content is
-    /// the newest frames (line-aligned), and subsequent appends still land
-    /// at end-of-file. Regression test for the round-3 review SIGPIPE/ENOSPC
-    /// finding: without rotation a full `logs` emptyDir killed the forwarder
-    /// thread and exposed the child to SIGPIPE.
+    /// the newest frames (line-aligned), rotation swaps in a NEW inode, and
+    /// subsequent appends still land at end-of-file. Regression test for the
+    /// round-3 review SIGPIPE/ENOSPC finding: without rotation a full
+    /// `logs` emptyDir killed the forwarder thread and exposed the child
+    /// to SIGPIPE.
     #[test]
     fn spool_rotation_bounds_file_and_keeps_newest_frames() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.jsonl");
         let mut spool = open_log_spool(&path).unwrap();
+        let inode_before = fs::metadata(&path).unwrap().ino();
 
         // Write just past the rotate threshold using complete frames.
         let line: String = "x".repeat(63);
@@ -683,12 +768,19 @@ mod tests {
         }
         spool.flush().unwrap();
 
-        rotate_spool_if_needed(&mut spool).unwrap();
+        rotate_spool_if_needed(&mut spool, 0, &path).unwrap();
 
         let len = fs::metadata(&path).unwrap().len();
         assert!(
             len <= LOG_SPOOL_KEEP_BYTES + frame_len,
             "spool must shrink to ~KEEP_BYTES, got {len}"
+        );
+        // Rotation swaps in a new inode so identity-tracking followers
+        // (the relay's follow_spool) resynchronize deterministically.
+        assert_ne!(
+            fs::metadata(&path).unwrap().ino(),
+            inode_before,
+            "rotation must replace the spool inode"
         );
         // Appends still land at end-of-file after rotation.
         let before = fs::metadata(&path).unwrap().len();
@@ -715,7 +807,85 @@ mod tests {
         writeln!(spool, "small").unwrap();
         spool.flush().unwrap();
         let len_before = fs::metadata(&path).unwrap().len();
-        rotate_spool_if_needed(&mut spool).unwrap();
+        let inode_before = fs::metadata(&path).unwrap().ino();
+        rotate_spool_if_needed(&mut spool, 0, &path).unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), len_before);
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode_before);
+    }
+
+    /// Rotation is projected against the incoming frame: the spool never
+    /// grows past the rotate threshold even when the check races a large
+    /// frame (round-4 review finding — oversized lines previously filled
+    /// the volume before the post-write check could fire).
+    #[test]
+    fn spool_rotation_projects_incoming_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let mut spool = open_log_spool(&path).unwrap();
+
+        let line: String = "x".repeat(63);
+        let frame = format!("{line}\n");
+        let frame_len = frame.len() as u64;
+        // Each record is the 6-digit index + the 64-byte frame; stop below
+        // the rotate threshold with room for a 1 MiB incoming frame.
+        let record_len = 6 + frame.len() as u64;
+        let total = (LOG_SPOOL_ROTATE_BYTES - 1024) / record_len;
+        for i in 0..total {
+            write!(spool, "{i:06}{frame}").unwrap();
+        }
+        spool.flush().unwrap();
+        let len_before = fs::metadata(&path).unwrap().len();
+        assert!(len_before <= LOG_SPOOL_ROTATE_BYTES - 1024);
+
+        // A 1 MiB incoming frame would push past the threshold: rotation
+        // must fire now, not after the write.
+        rotate_spool_if_needed(&mut spool, 1024 * 1024, &path).unwrap();
+        let len_after = fs::metadata(&path).unwrap().len();
+        assert!(
+            len_after <= LOG_SPOOL_KEEP_BYTES + frame_len,
+            "projected rotation must bound the spool, got {len_after}"
+        );
+    }
+
+    /// Input records are capped at MAX_LOG_RECORD_BYTES: a longer line is
+    /// returned as consecutive chunks preserving order and content, so the
+    /// wrapper's memory and the maximum frame size stay bounded (round-4
+    /// review finding — one unbounded line previously bypassed rotation).
+    #[test]
+    fn read_capped_record_splits_oversized_lines() {
+        // The newline must land beyond the cap so the first read is a
+        // newline-free chunk of exactly MAX_LOG_RECORD_BYTES.
+        let chunk = "a".repeat(MAX_LOG_RECORD_BYTES + 8);
+        let input = format!("{chunk}BCDEFGHIJKLMNOPQRSTUVWXYZ\nsecond line\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+
+        let mut first = Vec::new();
+        let n1 = read_capped_record(&mut reader, &mut first).unwrap();
+        assert_eq!(n1, MAX_LOG_RECORD_BYTES);
+        assert_eq!(first.len(), MAX_LOG_RECORD_BYTES);
+        assert!(!first.ends_with(b"\n"), "capped chunk has no newline yet");
+
+        // The remainder of the same line (up to its newline) is the next
+        // record — content is preserved across the split, nothing dropped.
+        let mut second = Vec::new();
+        let n2 = read_capped_record(&mut reader, &mut second).unwrap();
+        let expected_remainder = format!("{}BCDEFGHIJKLMNOPQRSTUVWXYZ\n", "a".repeat(8));
+        assert_eq!(second, expected_remainder.as_bytes());
+        assert!(n2 > 0);
+
+        let mut third = Vec::new();
+        let n3 = read_capped_record(&mut reader, &mut third).unwrap();
+        assert_eq!(third, b"second line\n");
+        assert!(n3 > 0);
+
+        let mut fourth = Vec::new();
+        assert_eq!(read_capped_record(&mut reader, &mut fourth).unwrap(), 0);
+        assert!(fourth.is_empty());
+
+        // Reassembled content equals the input minus the record split.
+        let mut reassembled = first.clone();
+        reassembled.extend_from_slice(&second);
+        reassembled.extend_from_slice(&third);
+        assert_eq!(reassembled, input.as_bytes());
     }
 }

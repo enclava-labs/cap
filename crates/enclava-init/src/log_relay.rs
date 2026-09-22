@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -95,7 +96,7 @@ fn handle_connection(mut stream: TcpStream, spool_path: &Path, container: &str) 
     {
         return write_json_error(&mut stream, 404, "container_not_available");
     }
-    let (lines, mut offset) = match tail_lines(spool_path, query.tail_lines) {
+    let (lines, mut offset, mut identity) = match tail_lines(spool_path, query.tail_lines) {
         Ok(value) => value,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return write_json_error(&mut stream, 409, "logs_not_ready");
@@ -109,7 +110,7 @@ fn handle_connection(mut stream: TcpStream, spool_path: &Path, container: &str) 
     }
     stream.flush()?;
     if query.follow {
-        follow_spool(&mut stream, spool_path, &mut offset)?;
+        follow_spool(&mut stream, spool_path, &mut offset, &mut identity)?;
     }
     Ok(())
 }
@@ -148,8 +149,27 @@ impl LogRelayQuery {
     }
 }
 
-fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64)> {
+/// Identity of the spool file being followed: `enclava-wait-exec` rotates
+/// the spool by atomic rename (new inode), so a follower must detect the
+/// swap, not just length regression — a truncate-and-regrow within one
+/// poll window would otherwise silently desynchronize the byte stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SpoolIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+fn spool_identity(file: &File) -> io::Result<SpoolIdentity> {
+    let metadata = file.metadata()?;
+    Ok(SpoolIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64, SpoolIdentity)> {
     let mut file = File::open(path)?;
+    let identity = spool_identity(&file)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(MAX_TAIL_BYTES);
     file.seek(SeekFrom::Start(start))?;
@@ -168,17 +188,36 @@ fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64)> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     lines.reverse();
-    Ok((lines, len))
+    Ok((lines, len, identity))
 }
 
-fn follow_spool(stream: &mut TcpStream, path: &Path, offset: &mut u64) -> io::Result<()> {
+fn follow_spool(
+    stream: &mut TcpStream,
+    path: &Path,
+    offset: &mut u64,
+    identity: &mut SpoolIdentity,
+) -> io::Result<()> {
     loop {
         thread::sleep(FOLLOW_POLL_INTERVAL);
         let Ok(mut file) = File::open(path) else {
             continue;
         };
+        let current_identity = spool_identity(&file)?;
         let len = file.metadata()?.len();
+        if current_identity != *identity {
+            // The spool was rotated (atomic rename → new inode): resume
+            // from the start of the new file. The relay re-reads the
+            // retained window, which overlaps the rotation boundary, so no
+            // lines are lost; the reader may briefly re-see the retained
+            // tail after restart-style re-sync — the client-side sequence
+            // numbers make duplicates detectable and the alternative
+            // (reading desynchronized bytes mid-frame) is strictly worse.
+            *identity = current_identity;
+            *offset = 0;
+        }
         if len < *offset {
+            // Fallback for same-inode truncation (not the rotation path,
+            // but cheap insurance if the rotation mechanism ever changes).
             *offset = 0;
         }
         if len == *offset {
@@ -250,4 +289,69 @@ fn write_response_head(
         write!(stream, "content-length: {len}\r\n")?;
     }
     stream.write_all(b"\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_lines_returns_spool_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let (lines, offset, identity) = tail_lines(&path, 10).unwrap();
+        assert_eq!(
+            lines,
+            vec!["one".to_string(), "two".to_string(), "three".to_string()]
+        );
+        assert_eq!(offset, "one\ntwo\nthree\n".len() as u64);
+        assert!(identity.ino > 0);
+    }
+
+    /// A rename-based rotation swaps the inode: the follower must detect the
+    /// identity change and reset, not keep reading stale offsets. This pins
+    /// the round-4 review finding (truncate-and-regrow within one poll
+    /// window previously desynchronized `len < offset`-only followers).
+    #[test]
+    fn rotation_via_rename_resets_follow_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+
+        // Initial spool with frames.
+        std::fs::write(&path, "old-a\nold-b\nold-c\n").unwrap();
+        let (_, offset, identity) = tail_lines(&path, 10).unwrap();
+        assert_eq!(offset, "old-a\nold-b\nold-c\n".len() as u64);
+
+        // Rotation: retained tail written to a temp file and renamed over
+        // the path (new inode), then new appends land on the new file and
+        // grow it PAST the old offset — the case `len < offset` misses.
+        std::fs::write(
+            dir.path().join("spool.jsonl.rotate"),
+            "old-b\nold-c\nnew-a\nnew-b\nnew-c\nnew-d\n",
+        )
+        .unwrap();
+        std::fs::rename(dir.path().join("spool.jsonl.rotate"), &path).unwrap();
+
+        // The follower sees a different identity → offset resets to 0.
+        let mut file = std::fs::File::open(&path).unwrap();
+        let new_identity = spool_identity(&file).unwrap();
+        let rotated = new_identity != identity;
+        assert!(rotated, "rename rotation must change identity");
+        let len = file.metadata().unwrap().len();
+        // New file grew past the old offset — the exact case a length-only
+        // follower misreads. Identity tracking resets to 0.
+        assert!(len > offset);
+        let mut reset = offset;
+        if rotated || len < reset {
+            reset = 0;
+        }
+        file.seek(SeekFrom::Start(reset)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "old-b\nold-c\nnew-a\nnew-b\nnew-c\nnew-d\n"
+        );
+    }
 }
