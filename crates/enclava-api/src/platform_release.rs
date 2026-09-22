@@ -128,6 +128,16 @@ pub enum PlatformReleaseError {
         state_path: String,
         source: std::io::Error,
     },
+    #[error(
+        "ENCLAVA_PLATFORM_RELEASE_PATH is set but ENCLAVA_PLATFORM_RELEASE_STATE is not: \
+         the override anti-rollback floor must live at an explicit, writable path that \
+         survives removal of the override variable. Without it, clearing the override \
+         would also erase the only pointer to the persisted high-water mark and silently \
+         re-admit an older bundled or override release. Set ENCLAVA_PLATFORM_RELEASE_STATE \
+         (see deploy/api/components/platform-release-state) or unset \
+         ENCLAVA_PLATFORM_RELEASE_PATH"
+    )]
+    MissingOverrideStatePath,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,22 +217,14 @@ impl PlatformReleaseEnvelope {
         let override_path = std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH")
             .ok()
             .filter(|path| !path.trim().is_empty());
+        let state_env = std::env::var("ENCLAVA_PLATFORM_RELEASE_STATE")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let high_water = resolve_high_water_state(override_path.as_deref(), state_env)?;
         let raw = match &override_path {
             Some(path) => std::fs::read_to_string(Path::new(path))?,
             None => BUNDLED_PLATFORM_RELEASE.to_string(),
         };
-        let mut high_water = None;
-        if let Some(path) = &override_path {
-            high_water = Some(override_high_water_mark_state_path(Path::new(path)));
-        } else if let Some(state) = std::env::var("ENCLAVA_PLATFORM_RELEASE_STATE")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-        {
-            // No override configured, but this deployment wires high-water
-            // state: keep guarding the bundled lane against a vanished
-            // override (accidental manifest rollback, env-var removal).
-            high_water = Some(PathBuf::from(state));
-        }
         Self::load_verified_from_raw(raw, override_path.is_some(), high_water.as_deref())
     }
 
@@ -273,20 +275,30 @@ impl PlatformReleaseEnvelope {
     }
 }
 
-/// Where the override lane's high-water mark lives: next to the override
-/// file by default, or `$ENCLAVA_PLATFORM_RELEASE_STATE` when set. The
-/// override file itself is typically a read-only configmap mount, so
-/// operators point the state var at a writable path.
-fn override_high_water_mark_state_path(override_path: &Path) -> PathBuf {
-    if let Some(state) = std::env::var("ENCLAVA_PLATFORM_RELEASE_STATE")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-    {
-        return PathBuf::from(state);
+/// Resolve the high-water-mark state lane.
+///
+/// The override lane (ENCLAVA_PLATFORM_RELEASE_PATH set) REQUIRES an explicit
+/// ENCLAVA_PLATFORM_RELEASE_STATE: when the mark's location is only derived
+/// from the override path (the old `<override-path>.accepted` default),
+/// removing the override var also erases the only pointer to the mark, and
+/// the bundled release is served without consulting the existing floor —
+/// re-enabling the T2→T0 rollback the gate exists to refuse. Fail closed at
+/// startup instead; the wired kustomize component sets the state var, so
+/// correctly-wired deployments are unaffected.
+///
+/// Without an override, an explicit state var still guards the bundled lane
+/// against a vanished override (accidental manifest rollback, env-var
+/// removal); no state var at all means no high-water lane (fresh installs).
+fn resolve_high_water_state(
+    override_path: Option<&str>,
+    state_env: Option<String>,
+) -> Result<Option<PathBuf>, PlatformReleaseError> {
+    match (override_path, state_env) {
+        (Some(_), Some(state)) => Ok(Some(PathBuf::from(state))),
+        (Some(_), None) => Err(PlatformReleaseError::MissingOverrideStatePath),
+        (None, Some(state)) => Ok(Some(PathBuf::from(state))),
+        (None, None) => Ok(None),
     }
-    let mut s = override_path.as_os_str().to_os_string();
-    s.push(".accepted");
-    PathBuf::from(s)
 }
 
 /// Persisted newest-accepted override. `payload_sha256` digests the exact
@@ -1073,6 +1085,35 @@ mod tests {
         envelope.signature = hex::encode(key.sign(&canonical).to_bytes());
         envelope.signing_pubkey = hex::encode(key.verifying_key().as_bytes());
         serde_json::to_string(&envelope).unwrap()
+    }
+
+    #[test]
+    fn override_lane_requires_explicit_state_path() {
+        // Codex P1 (cap#165): with only ENCLAVA_PLATFORM_RELEASE_PATH set,
+        // the old derived default (`<override-path>.accepted`) left the mark
+        // undiscoverable once the override var was removed, silently
+        // re-enabling the T2→T0 rollback. The override lane now fails closed
+        // unless the state var is wired explicitly.
+        assert!(matches!(
+            resolve_high_water_state(Some("/etc/platform-release.json"), None),
+            Err(PlatformReleaseError::MissingOverrideStatePath)
+        ));
+        // Explicit state on the override lane: used as-is.
+        assert_eq!(
+            resolve_high_water_state(
+                Some("/etc/platform-release.json"),
+                Some("/var/lib/enclava/platform-release.accepted".into())
+            )
+            .unwrap(),
+            Some(PathBuf::from("/var/lib/enclava/platform-release.accepted"))
+        );
+        // Bundled lane: explicit state still guards against a vanished
+        // override; no state var at all means no high-water lane.
+        assert_eq!(
+            resolve_high_water_state(None, Some("release.accepted".into())).unwrap(),
+            Some(PathBuf::from("release.accepted"))
+        );
+        assert_eq!(resolve_high_water_state(None, None).unwrap(), None);
     }
 
     #[test]

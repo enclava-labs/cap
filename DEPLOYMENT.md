@@ -179,8 +179,12 @@ Release verification checks:
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.
 
-The high-water mark lives at `ENCLAVA_PLATFORM_RELEASE_STATE` (default:
-`<override-path>.accepted`). It must point at durable writable storage — the
+The high-water mark lives at `ENCLAVA_PLATFORM_RELEASE_STATE`, which is
+REQUIRED whenever `ENCLAVA_PLATFORM_RELEASE_PATH` is set: the API refuses to
+start on the override lane without it (a derived default such as
+`<override-path>.accepted` would leave the mark undiscoverable once the
+override var is removed — silently re-enabling the rollback the gate exists
+to refuse). It must point at durable writable storage — the
 override envelope itself is typically a read-only configmap mount, and an
 `emptyDir` would reset the anti-rollback floor on every pod replacement. The
 base deployment does not wire this state (the override lane is inactive there
@@ -200,12 +204,10 @@ state file (after operator verification), which the refusal message names.
 Removing `ENCLAVA_PLATFORM_RELEASE_PATH` while `ENCLAVA_PLATFORM_RELEASE_STATE`
 stays wired does not bypass the gate: the bundled release is then compared
 against the persisted mark as well (no state file yet → fresh install,
-untouched). Note this removal guard only covers deployments that set the
-explicit state var: with the default `<override-path>.accepted` location the
-mark's path is derived from the override path itself, so once the override
-var is removed the mark is undiscoverable — deployments that want the
-removal guard should set `ENCLAVA_PLATFORM_RELEASE_STATE` explicitly (as the
-kustomize component does).
+untouched). Because the state path is now mandatory on the override lane,
+every deployment that ever wired the override lane keeps the removal guard:
+there is no default-path configuration whose guard could be lost by removing
+the override var.
 
 ### Rotating the production root
 
