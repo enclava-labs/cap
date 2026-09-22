@@ -534,6 +534,24 @@ mod tests {
         assert!(spool_identity(&file).is_ok());
     }
 
+    /// Round-6 review finding (connect path): a spool ending mid-frame must
+    /// not emit the in-flight fragment as a tail line, and the follow offset
+    /// must point at the fragment's first byte so the follow loop can
+    /// complete it once the writer finishes the append.
+    #[test]
+    fn tail_lines_holds_back_incomplete_trailing_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, "one\ntwo\nthree\n{\"partial").unwrap();
+        let (lines, offset, _file) = tail_lines(&path, 10).unwrap();
+        assert_eq!(
+            lines,
+            vec!["one".to_string(), "two".to_string(), "three".to_string()]
+        );
+        // Offset points at the start of the incomplete fragment, not past it.
+        assert_eq!(offset, "one\ntwo\nthree\n".len() as u64);
+    }
+
     /// Round-6 review finding: the delivered boundary after a drain must be
     /// the file's actual cursor, not a pre-read metadata length — the writer
     /// is a separate process and can append mid-read; those bytes are
