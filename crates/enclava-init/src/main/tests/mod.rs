@@ -366,32 +366,25 @@ fn container_sentinel_names_reject_record_injection_characters() {
 #[test]
 fn sentinel_with_wrong_owner_gid_is_rejected() {
     let dir = tempdir().unwrap();
-    // Use a guaranteed-mismatching GID: 65534 (nobody) is extremely unlikely
-    // to match any test runner's primary or supplemental group.
-    const FILE_GID: u32 = 65534;
-    const EXPECTED_GID: u32 = 10001; // Different from FILE_GID to ensure mismatch
-
-    write_fake_proc(dir.path(), 789, "web", 10001, FILE_GID, 555);
+    write_fake_proc(dir.path(), 789, "web", 10001, 10001, 555);
     let sentinel = dir.path().join("web");
     std::fs::write(
         &sentinel,
-        format!(
-            "version=1\ncontainer=web\npid=789\nuid=10001\ngid={}\nstart_time_ticks=555\n",
-            FILE_GID
-        ),
+        "version=1\ncontainer=web\npid=789\nuid=10001\ngid=10001\nstart_time_ticks=555\n",
     )
     .unwrap();
-
-    // The file's real gid is FILE_GID (65534), but we expect a different gid,
-    // so the validation should reject it with a specific error message.
+    let meta = std::fs::metadata(&sentinel).unwrap();
+    let uid = std::os::unix::fs::MetadataExt::uid(&meta);
+    let inode_gid = std::os::unix::fs::MetadataExt::gid(&meta);
+    // Derive a guaranteed-mismatching expected gid from the inode's real
+    // gid: 0 is never a valid test-process group here (we created the
+    // file), so the inode-gid rejection path is exercised on every host.
+    assert_ne!(inode_gid, 0, "sentinel inode unexpectedly owned by gid 0");
     let err = read_sentinel_pid(
         &sentinel,
         dir.path(),
         "web",
-        ExpectedIdentity {
-            uid: std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&sentinel).unwrap()),
-            gid: EXPECTED_GID,
-        },
+        ExpectedIdentity { uid, gid: 0 },
     )
     .unwrap_err();
     assert!(

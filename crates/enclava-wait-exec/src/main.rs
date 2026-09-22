@@ -562,39 +562,51 @@ mod tests {
         let dir = unique_dir();
         fs::create_dir_all(&dir).unwrap();
 
-        // Skip gracefully if no supplemental group is available (common in
-        // minimal containers where the process belongs only to its primary group).
-        let supplemental = match supplemental_gid() {
-            Some(g) => g,
-            None => {
-                eprintln!(
-                    "SKIP: test process has no supplemental group (common in minimal containers)"
-                );
-                return;
-            }
-        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            let uid = unsafe { nix::libc::getuid() } as u32;
+            let primary_gid = unsafe { nix::libc::getgid() } as u32;
+            // Prefer a supplemental group distinct from the primary gid —
+            // that models the deployed started dir most faithfully. When
+            // none exists (minimal containers), fall back so the test
+            // always exercises signal_started instead of skipping: root
+            // can adopt any arbitrary gid, and otherwise the primary gid
+            // still drives the file through the setgid-inherit + re-own
+            // path, just with a weaker pre-state.
+            let dir_gid = supplemental_gid()
+                .filter(|g| *g != primary_gid)
+                .or({
+                    if uid == 0 {
+                        Some(65534) // nobody: any gid works for root
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(primary_gid);
+            let strong_case = dir_gid != primary_gid;
             let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
-            let rc =
-                unsafe { nix::libc::chown(c_path.as_ptr(), nix::libc::getuid(), supplemental) };
+            let rc = unsafe { nix::libc::chown(c_path.as_ptr(), uid, dir_gid) };
             assert_eq!(rc, 0, "failed to set up test dir group");
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o2770)).unwrap();
+
+            signal_started(&dir, "web").unwrap();
+
+            let meta = fs::metadata(dir.join("web")).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o600);
+            assert_eq!(
+                (meta.uid(), meta.gid()),
+                (uid, primary_gid),
+                "sentinel must be re-owned to the writer's uid:gid despite the setgid dir"
+            );
+            if strong_case {
+                assert_ne!(
+                    meta.gid(),
+                    dir_gid,
+                    "setgid dir must not leave its group on the sentinel"
+                );
+            }
         }
-
-        signal_started(&dir, "web").unwrap();
-
-        let meta = fs::metadata(dir.join("web")).unwrap();
-        assert_eq!(meta.mode() & 0o777, 0o600);
-        assert_eq!(
-            (meta.uid(), meta.gid()),
-            (
-                unsafe { nix::libc::getuid() } as u32,
-                unsafe { nix::libc::getgid() } as u32
-            ),
-            "sentinel must be re-owned to the writer's uid:gid despite the setgid dir"
-        );
         fs::remove_dir_all(dir).unwrap();
     }
 
