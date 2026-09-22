@@ -94,7 +94,7 @@ pub fn verify(
         ));
         checks.push(equality_check(
             "binding.target_origin",
-            bundle.target_origin == context.expected_target_origin,
+            origins_equivalent(bundle.target_origin, &context.expected_target_origin),
             bundle.target_origin.into(),
             context.expected_target_origin.clone(),
             "TARGET_ORIGIN_MISMATCH",
@@ -311,7 +311,7 @@ fn verify_evidence(
             .target
             .origins
             .iter()
-            .any(|origin| origin == bundle.target_origin),
+            .any(|origin| origins_equivalent(origin, bundle.target_origin)),
         "TARGET_ORIGIN_REJECTED",
     ));
     let artifacts = report
@@ -522,6 +522,31 @@ fn simple_check(id: &str, passes: bool, reason: &str) -> CheckResult {
     }
 }
 
+/// Compare origin strings case-insensitively on the host component.
+/// Bundles carry canonical lowercase origins (bundle.rs enforces
+/// `ascii_serialization() == origin`), but the caller-supplied expected
+/// origin and policy origins are raw strings; a mixed-case but otherwise
+/// identical origin must not be rejected (cap#141).
+///
+/// An origin that fails to parse as a URL compares unequal to everything
+/// (fail-closed): a malformed expected origin surfaces as a plain
+/// mismatch rather than a distinct "invalid" error, which is deliberate
+/// — unparseable input must never pass an equivalence check.
+fn origins_equivalent(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let parse = |origin: &str| {
+        url::Url::parse(origin)
+            .ok()
+            .map(|url| url.origin().ascii_serialization())
+    };
+    match (parse(left), parse(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
 fn equality_check(
     id: &str,
     matches: bool,
@@ -594,6 +619,29 @@ mod tests {
         assert_eq!(result.verdict, Verdict::Fail);
         assert!(result.checks.iter().any(|check| {
             check.id == "binding.challenge_nonce" && check.reason_code == "NONCE_MISMATCH"
+        }));
+    }
+
+    #[test]
+    fn mixed_case_expected_origin_is_not_rejected() {
+        // cap#141: the bundle origin is canonical lowercase; a caller
+        // supplying the same origin with mixed host case must not fail
+        // binding.target_origin.
+        let mut mixed_case = context([7; 32]);
+        mixed_case.expected_target_origin = "https://APP.example".into();
+        let result = verify(&bundle(&[7; 32]), b"", mixed_case);
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|check| { check.id == "binding.target_origin" && check.reason_code == "OK" })
+        );
+        // A genuinely different origin still fails.
+        let mut other = context([7; 32]);
+        other.expected_target_origin = "https://other.example".into();
+        let result = verify(&bundle(&[7; 32]), b"", other);
+        assert!(result.checks.iter().any(|check| {
+            check.id == "binding.target_origin" && check.reason_code == "TARGET_ORIGIN_MISMATCH"
         }));
     }
 
