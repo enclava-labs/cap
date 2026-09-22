@@ -275,6 +275,34 @@ impl PlatformReleaseEnvelope {
     }
 }
 
+/// Lexically absolutize and normalize a path WITHOUT touching the
+/// filesystem: resolve `.`/`..` components against the process cwd and
+/// drop redundant separators. Unlike `std::fs::canonicalize` this works
+/// for paths that do not exist yet (pre-open validation), but it cannot
+/// resolve symlinks — that gap is covered by the canonicalize comparison
+/// in `resolve_high_water_state` for files that already exist.
+fn lexical_absolute(path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // `..` at the root stays at the root.
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
 /// Resolve the high-water-mark state lane.
 ///
 /// The override lane (ENCLAVA_PLATFORM_RELEASE_PATH set) REQUIRES an explicit
@@ -295,19 +323,41 @@ fn resolve_high_water_state(
 ) -> Result<Option<PathBuf>, PlatformReleaseError> {
     match (override_path, state_env) {
         (Some(override_path), Some(state)) => {
-            // Codex P2 (cap#165): the state file must never alias the
-            // override envelope — the deferred commit renames the mark over
-            // the state path, which would atomically destroy the signed
-            // envelope and brick every subsequent restart. Compare the
-            // lexical paths (symlink resolution is unavailable pre-open and
-            // lexical equality already catches the config mistake).
-            if Path::new(override_path) == Path::new(&state) {
+            // Codex P2 + Devin (cap#165): the state file (and its derived
+            // `<state>.tmp` / `<state>.lock` siblings, which the commit
+            // path truncates/creates) must never alias the override
+            // envelope — the deferred commit renames the mark over the
+            // state path, which would atomically destroy the signed
+            // envelope and brick every subsequent restart. Compare
+            // lexically-normalized absolute paths (catches `./release.json`
+            // vs `release.json` and `a/../b` forms) and, when both files
+            // already exist, canonicalized paths (catches symlinks). This
+            // can over-equate through symlinked `..` components; rejecting
+            // a suspicious config is the safe direction for this guard.
+            let norm_override = lexical_absolute(Path::new(override_path));
+            let norm_state = lexical_absolute(Path::new(&state));
+            let derived: [PathBuf; 2] = {
+                let suffix = |sfx: &str| {
+                    let mut os = norm_state.clone().into_os_string();
+                    os.push(sfx);
+                    PathBuf::from(os)
+                };
+                [suffix(".tmp"), suffix(".lock")]
+            };
+            let aliasing = norm_override == norm_state
+                || derived.contains(&norm_override)
+                || std::fs::canonicalize(Path::new(override_path))
+                    .ok()
+                    .zip(std::fs::canonicalize(&state).ok())
+                    .is_some_and(|(o, s)| o == s);
+            if aliasing {
                 return Err(PlatformReleaseError::InvalidField {
                     field: "ENCLAVA_PLATFORM_RELEASE_STATE",
                     message: format!(
-                        "must not alias ENCLAVA_PLATFORM_RELEASE_PATH ({state}); \
-                         the deferred high-water-mark commit would replace \
-                         the signed override envelope"
+                        "must not alias ENCLAVA_PLATFORM_RELEASE_PATH ({state}) or its \
+                         derived <state>.tmp/<state>.lock siblings; the deferred \
+                         high-water-mark commit would replace the signed override \
+                         envelope"
                     ),
                 });
             }
@@ -1150,6 +1200,77 @@ mod tests {
             Some(PathBuf::from("release.accepted"))
         );
         assert_eq!(resolve_high_water_state(None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn override_lane_rejects_normalized_and_derived_state_aliases() {
+        // Codex P2 + Devin (cap#165): lexical equality alone missed
+        // `./release.json` vs `release.json` and the derived
+        // `<state>.tmp` sibling that the deferred commit truncates and
+        // renames away — persisting the mark would destroy the signed
+        // envelope and brick every subsequent restart.
+        let cwd = std::env::current_dir().unwrap();
+        // (override, state) pairs that must all be rejected as aliases.
+        let aliases = [
+            // Normalized-equal relative spellings.
+            ("release.json", "./release.json"),
+            ("release.json", "sub/../release.json"),
+            // Derived .tmp sibling of the state path: the deferred commit
+            // truncates then renames this path over the state file.
+            ("release.accepted.tmp", "release.accepted"),
+            // Derived .lock sibling of the state path.
+            ("release.accepted.lock", "release.accepted"),
+        ];
+        for (override_path, state) in aliases {
+            assert!(
+                matches!(
+                    resolve_high_water_state(Some(override_path), Some(state.to_string())),
+                    Err(PlatformReleaseError::InvalidField { field, .. }) if field == "ENCLAVA_PLATFORM_RELEASE_STATE"
+                ),
+                "expected alias rejection for override={override_path:?} state={state:?}"
+            );
+        }
+        // Non-aliasing config still passes.
+        assert!(
+            resolve_high_water_state(Some("release.json"), Some("release.accepted".to_string()))
+                .is_ok()
+        );
+        // Sanity: the relative aliases really did resolve against cwd.
+        assert_eq!(
+            lexical_absolute(Path::new("release.json")),
+            cwd.join("release.json")
+        );
+    }
+
+    #[test]
+    fn override_lane_rejects_symlinked_state_alias() {
+        // When both files already exist, canonicalized comparison catches
+        // a state path that symlinks to the override envelope.
+        let dir = std::env::temp_dir().join(format!(
+            "cap165-alias-symlink-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let envelope = dir.join("release.json");
+        let link = dir.join("state.accepted");
+        std::fs::write(&envelope, b"{}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&envelope, &link).unwrap();
+        let result = resolve_high_water_state(
+            Some(envelope.to_str().unwrap()),
+            Some(link.to_str().unwrap().to_string()),
+        );
+        #[cfg(unix)]
+        assert!(
+            matches!(result, Err(PlatformReleaseError::InvalidField { field, .. }) if field == "ENCLAVA_PLATFORM_RELEASE_STATE"),
+            "symlinked state alias must be rejected"
+        );
+        #[cfg(not(unix))]
+        let _ = result;
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

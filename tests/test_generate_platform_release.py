@@ -282,3 +282,43 @@ def test_release_generator_accepts_valid_ipv6_hosts():
     payload = base_payload()
     payload["trustee_kbs_url"] = "https://[2001:db8::1]/"
     generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_accepts_ipv4_mapped_ipv6_hosts():
+    # Codex P2 (cap#165 follow-up): urlparse's `.hostname` strips the
+    # brackets, so `https://[::ffff:192.0.2.128]/` reaches _host_ok as
+    # `::ffff:192.0.2.128`; its dotted tail previously tripped the WHATWG
+    # IPv4-ending rule even though the url crate (WHATWG parser) accepts
+    # and normalizes the URL. Valid IPv6 — mapped forms included — must
+    # pass for KBS, ACME, and signing-service endpoints alike.
+    for value in (
+        "https://[::ffff:192.0.2.128]/",
+        "https://[::ffff:192.0.2.128]:8443/",
+        "https://[2001:db8:0:0:0:0:192.0.2.1]/",
+    ):
+        payload = base_payload()
+        payload["trustee_kbs_url"] = value
+        generate_platform_release.validate_payload(payload)
+
+        payload = base_payload()
+        payload["tenant_caddy_acme_ca"] = value
+        generate_platform_release.validate_payload(payload)
+
+        # https signing-service URL lane exercises the same checks.
+        payload = base_payload()
+        payload["signing_service_url"] = value
+        generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_invalid_unbracketed_colon_hosts():
+    # The `:`-bearing host branch must fail closed: anything that is not
+    # a strict IPv6 literal (e.g. a port-colon leak or garbage) stays
+    # rejected instead of falling through to the domain checks.
+    for value in (
+        "https://kbs.example:notaport/",
+        "https://[::ffff:192.0.2.999]/",  # invalid embedded IPv4
+    ):
+        payload = base_payload()
+        payload["trustee_kbs_url"] = value
+        with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
+            generate_platform_release.validate_payload(payload)

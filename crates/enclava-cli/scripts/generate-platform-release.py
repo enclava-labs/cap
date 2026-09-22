@@ -185,6 +185,21 @@ def _host_ok(host: str) -> bool:
         except ValueError:
             return False
         return True
+    # Bracket-stripped IPv6 literals (urlparse's `.hostname` removes the
+    # `[...]`): a valid IPv6 host — including IPv4-mapped forms like
+    # `::ffff:192.0.2.128` whose dotted tail would otherwise trip the
+    # WHATWG IPv4-ending rule below, even though the url crate (WHATWG
+    # parser) accepts and normalizes it. `_authority_ok` already validated
+    # the bracketed netloc shape; here any `:`-bearing host must parse as
+    # strict IPv6 or be rejected (whatwg, Codex P2 cap#165).
+    if ":" in host:
+        if "%" in host:
+            return False
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return False
+        return True
     if any(
         ord(ch) < 0x20 or ord(ch) == 0x7F or ch in _FORBIDDEN_HOST_CHARS
         for ch in host
