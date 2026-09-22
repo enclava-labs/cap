@@ -125,3 +125,40 @@ def test_release_generator_accepts_valid_boundary_ports():
     payload["tenant_caddy_acme_ca"] = "https://acme.example.test:1/directory"
 
     generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_whatwg_forbidden_host_chars():
+    # <, >, ^, |, `, {, } survive Python urlparse but are forbidden domain
+    # code points in the WHATWG parser (reqwest::Url) — reject at sign time.
+    for ch in ("<", ">", "^", "|", "`", "{", "}"):
+        payload = base_payload()
+        payload["trustee_kbs_url"] = f"https://kbs.example{ch}test/"
+
+        with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
+            generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_off_loopback_http_signing_url():
+    # Mirror of the Rust rule: http is only for loopback/cluster-internal
+    # signing services; cleartext off-cluster must not be signed.
+    for value in (
+        "http://signing.example.test:8123/",
+        "http://10.0.0.1:8123/",
+        "ftp://signing.example.test/",
+        "https://signing.example.test:bad/",
+    ):
+        payload = base_payload()
+        payload["signing_service_url"] = value
+
+        with pytest.raises(ValueError, match="signing_service_url"):
+            generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_accepts_loopback_and_cluster_http_signing_url():
+    payload = base_payload()
+    payload["signing_service_url"] = "http://signing.release.svc:8123/"
+    generate_platform_release.validate_payload(payload)
+
+    payload = base_payload()
+    payload["signing_service_url"] = "http://127.0.0.1:8123/"
+    generate_platform_release.validate_payload(payload)

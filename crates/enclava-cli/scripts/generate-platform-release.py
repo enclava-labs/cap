@@ -10,6 +10,7 @@ development artifact verified by enclava-cli's fallback fixture root.
 import argparse
 import copy
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -127,6 +128,20 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
     return out
 
 
+# WHATWG forbidden domain code points that Python's urlparse does NOT treat
+# as delimiters (it only splits on / ? #): everything in this set (plus
+# control/0x7F chars) makes the url crate reject the host, so the generator
+# must reject it too rather than sign an unloadable envelope.
+_FORBIDDEN_HOST_CHARS = set(" #%<>@[\\]^|`{}")
+
+
+def _host_ok(host: str) -> bool:
+    return not any(
+        ord(ch) < 0x20 or ord(ch) == 0x7F or ch in _FORBIDDEN_HOST_CHARS
+        for ch in host
+    )
+
+
 def _is_https(value: str) -> bool:
     # urlparse lowercases the scheme, so `HTTPS://` is accepted exactly as
     # the Rust validators (parsed-URL scheme) accept it. The authority is
@@ -137,8 +152,8 @@ def _is_https(value: str) -> bool:
     #     like `https://` or `https:` with EmptyHost),
     #   * reading `.port` raises ValueError for non-numeric or
     #     out-of-range ports (`https://kbs.example:bad/`, `:99999`),
-    #   * space, control, or NUL characters and percent signs in the host
-    #     are forbidden domain code points in the WHATWG URL parser.
+    #   * forbidden domain code points in the host are rejected (see
+    #     _FORBIDDEN_HOST_CHARS).
     try:
         parsed = urlparse(value)
         parsed.port  # noqa: B018 — property access raises for malformed ports
@@ -147,14 +162,49 @@ def _is_https(value: str) -> bool:
         return False
     if parsed.scheme != "https" or not host:
         return False
-    return not any(
-        ord(ch) < 0x20 or ord(ch) == 0x7F or ch in (" ", "%") for ch in host
-    )
+    return _host_ok(host)
+
+
+def _plain_http_host_allowed(host: str) -> bool:
+    # Mirror of enclava_common::hostnames::plain_http_host_allowed: cleartext
+    # is only for loopback or cluster-internal signing services.
+    if host.lower() == "localhost":
+        return True
+    bare = host.strip("[]")
+    try:
+        return ipaddress.ip_address(bare).is_loopback
+    except ValueError:
+        return bare.lower().endswith((".svc", ".svc.cluster.local"))
+
+
+def _is_valid_signing_service_url(value: str) -> bool:
+    # Mirror of the Rust validate_release_payload rule for
+    # signing_service_url: parseable URL, scheme http or https, and http is
+    # only allowed for loopback/cluster-internal hosts (the bearer token
+    # must not transit cleartext off-cluster).
+    try:
+        parsed = urlparse(value)
+        parsed.port  # noqa: B018 — property access raises for malformed ports
+        host = parsed.hostname
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not host:
+        return False
+    if not _host_ok(host):
+        return False
+    if parsed.scheme == "http":
+        return _plain_http_host_allowed(host)
+    return True
 
 
 def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = False) -> None:
     if payload["schema_version"] != "v1":
         raise ValueError("schema_version must be v1")
+    if not _is_valid_signing_service_url(payload["signing_service_url"]):
+        raise ValueError(
+            "signing_service_url must be a valid http(s) URL "
+            "(http only for loopback/cluster-internal hosts)"
+        )
     for field in ["attestation_proxy_image", "caddy_ingress_image"]:
         if not GHCR_DIGEST_RE.fullmatch(payload[field]):
             raise ValueError(f"{field} must be a ghcr.io/enclava-labs digest-pinned ref")
