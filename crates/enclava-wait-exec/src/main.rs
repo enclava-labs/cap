@@ -358,14 +358,12 @@ where
                 buf.pop();
             }
         }
-        // Skip records that are empty after newline handling: these arise when a
-        // capped chunk boundary coincides with a newline — the first call returns
-        // capped bytes up to but not including the newline, the second call
-        // returns only that newline. Writing an empty frame would produce a spurious
-        // empty log entry in the encrypted stream.
-        if buf.is_empty() {
-            continue;
-        }
+        // Genuine blank records (a lone `\n`, or `\r\n`) survive the strip as
+        // an empty buffer and MUST still be encrypted and appended — they are
+        // real log entries the previous implementation preserved. The only
+        // other historical source of an empty buffer, the synthetic
+        // newline-only read after an exact capped-boundary chunk, can no
+        // longer occur: read_capped_record consumes that newline itself.
         // Allocate the sequence number while HOLDING the spool mutex and
         // only after acquiring it: encrypt_log_frame runs here, inside the
         // lock, so a faster forwarder cannot reserve a higher sequence,
@@ -498,8 +496,7 @@ fn read_capped_record<R: BufRead>(
                     // there is no terminator to consume; the chunk stays
                     // `capped` so its final byte (possible CR content)
                     // survives verbatim.
-                    let boundary_newline =
-                        reader.fill_buf()?.first() == Some(&b'\n');
+                    let boundary_newline = reader.fill_buf()?.first() == Some(&b'\n');
                     if boundary_newline {
                         reader.consume(1);
                         return Ok(CappedRecord {
@@ -1088,6 +1085,53 @@ mod tests {
         reassembled.extend_from_slice(&second);
         reassembled.extend_from_slice(&third);
         assert_eq!(reassembled, input.as_bytes());
+    }
+
+    /// Genuine blank records must be preserved as empty-plaintext frames;
+    /// a capped-boundary newline must not fabricate one. Round-7 finding.
+    #[test]
+    fn blank_records_are_preserved_and_boundary_newlines_fabricate_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let spool = Arc::new(Mutex::new(open_log_spool(&path).unwrap()));
+
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        let recipient = validate_public_key(
+            "logs-prod",
+            &keypair.public_key_base64url,
+            &keypair.public_key_sha256,
+        )
+        .unwrap();
+        let logs = EncryptedLogConfig {
+            recipient,
+            context: enclava_common::log_encryption::LogFrameContext {
+                org_id: "org-123".to_string(),
+                app_name: "secure-app".to_string(),
+                deployment_id: "deploy-123".to_string(),
+            },
+            spool_path: path.clone(),
+            container: "web".to_string(),
+        };
+
+        let sequence = Arc::new(AtomicU64::new(1));
+        // `before`, one blank line, `after`, then a record whose length is an
+        // EXACT multiple of the cap followed by `next`: the boundary newline
+        // must be consumed by the reader, not become an empty frame.
+        let mut input = "before\n\nafter\n".to_string();
+        input.push_str(&"a".repeat(MAX_LOG_RECORD_BYTES));
+        input.push_str("\nnext\n");
+        let reader = std::io::Cursor::new(input);
+        forward_encrypted_logs(reader, "stdout", &logs, &spool, &sequence).unwrap();
+
+        // Exactly 5 frames: before, blank, after, capped record, next — the
+        // genuine blank record preserved, no fabricated empty frame at the cap.
+        let content = fs::read_to_string(&path).unwrap();
+        let frames: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            frames.len(),
+            5,
+            "before, blank, after, capped record, next — and no fabricated empty frame"
+        );
     }
 
     /// Round-5 review finding: a `\r` that happens to sit exactly at an
