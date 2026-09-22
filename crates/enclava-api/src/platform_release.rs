@@ -236,20 +236,34 @@ fn override_high_water_mark_state_path(override_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Persisted newest-accepted override (`{version, created_at}` JSON).
+/// Persisted newest-accepted override. `payload_sha256` digests the exact
+/// canonical bytes the envelope signature covers, so two envelopes that reuse
+/// the same `{version, created_at}` pair with different signed content
+/// (measurements, policy, digests) cannot pass as "the same release".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct AcceptedOverrideMark {
     platform_release_version: String,
     created_at: String,
+    payload_sha256: String,
 }
 
-impl From<&PlatformRelease> for AcceptedOverrideMark {
-    fn from(release: &PlatformRelease) -> Self {
-        Self {
+impl AcceptedOverrideMark {
+    fn of(release: &PlatformRelease) -> Result<Self, PlatformReleaseError> {
+        Ok(Self {
             platform_release_version: release.platform_release_version.clone(),
             created_at: release.created_at.clone(),
-        }
+            payload_sha256: release_payload_sha256(release)?,
+        })
     }
+}
+
+fn release_payload_sha256(release: &PlatformRelease) -> Result<String, PlatformReleaseError> {
+    // Canonicalization re-validates the hex fields; for an envelope that
+    // already passed verify_envelope this cannot fail, but refuse rather
+    // than persist an empty (match-anything) digest if it ever does.
+    Ok(hex::encode(Sha256::digest(
+        &canonical_platform_release_bytes(release)?,
+    )))
 }
 
 /// The downgrade baseline must never regress below the bundle: a newer API
@@ -259,21 +273,29 @@ fn newest_mark(
     persisted: Option<AcceptedOverrideMark>,
 ) -> Result<Option<AcceptedOverrideMark>, PlatformReleaseError> {
     let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
-    let bundled_mark = AcceptedOverrideMark::from(&bundled.payload);
+    let bundled_mark = AcceptedOverrideMark::of(&bundled.payload)?;
     Ok(match persisted {
-        Some(p)
-            if !release_pair_is_older(
-                (&p.platform_release_version, &p.created_at),
-                (
-                    &bundled_mark.platform_release_version,
-                    &bundled_mark.created_at,
-                ),
-            )? =>
-        {
-            Some(p)
-        }
+        Some(p) if !mark_is_older(&p, &bundled_mark)? => Some(p),
         _ => Some(bundled_mark),
     })
+}
+
+/// Candidate is stale-or-suspect relative to the baseline: strictly older
+/// timestamp, or an equal timestamp with ANY divergence — different opaque
+/// version OR different signed payload digest. Two envelopes that reuse the
+/// same `{version, created_at}` pair with different measurements, policy, or
+/// image digests are unorderable and fail closed instead of passing as
+/// "the same release".
+fn mark_is_older(
+    candidate: &AcceptedOverrideMark,
+    baseline: &AcceptedOverrideMark,
+) -> Result<bool, PlatformReleaseError> {
+    let candidate_ts = parse_release_timestamp(&candidate.created_at)?;
+    let baseline_ts = parse_release_timestamp(&baseline.created_at)?;
+    Ok(candidate_ts < baseline_ts
+        || (candidate_ts == baseline_ts
+            && (candidate.platform_release_version != baseline.platform_release_version
+                || candidate.payload_sha256 != baseline.payload_sha256)))
 }
 
 /// Second downgrade gate for the env-path override lane: compare against the
@@ -283,11 +305,55 @@ fn newest_mark(
 /// bundled`. Corrupt state fails closed (an attacker must not be able to
 /// disable the gate by scribbling on the state file), and a failed persist
 /// fails closed too (accepting without recording would reset the mark).
+///
+/// The whole read-compare-persist sequence runs under an exclusive flock on
+/// `<state>.lock`: with two API replicas racing a projected override that
+/// changes T2 → T1, both would otherwise read the same older floor before
+/// either persists, and the T1 replica could overwrite the T2 mark and start
+/// with the stale release. The lock makes the sequence atomic across
+/// processes; it is auto-released on process death.
 fn enforce_override_not_older_than_last_accepted(
     state_path: &Path,
     release: &PlatformRelease,
 ) -> Result<(), PlatformReleaseError> {
     parse_release_timestamp(&release.created_at)?;
+    let mut lock_path = state_path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            PlatformReleaseError::HighWaterMarkPersistFailed {
+                state_path: state_path.display().to_string(),
+                source: error,
+            }
+        })?;
+    }
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| PlatformReleaseError::HighWaterMarkPersistFailed {
+            state_path: state_path.display().to_string(),
+            source: error,
+        })?;
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _guard = lock
+        .write()
+        .map_err(|err| PlatformReleaseError::HighWaterMarkPersistFailed {
+            state_path: state_path.display().to_string(),
+            source: std::io::Error::new(
+                err.kind(),
+                format!("acquire {}: {err}", lock_path.display()),
+            ),
+        })?;
+    enforce_override_not_older_than_last_accepted_locked(state_path, release)
+}
+
+fn enforce_override_not_older_than_last_accepted_locked(
+    state_path: &Path,
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
     let persisted =
         match std::fs::read_to_string(state_path) {
             Ok(raw) => Some(serde_json::from_str::<AcceptedOverrideMark>(&raw).map_err(
@@ -310,10 +376,7 @@ fn enforce_override_not_older_than_last_accepted(
         };
     let floor = newest_mark(persisted)?;
     if let Some(mark) = &floor
-        && release_pair_is_older(
-            (&release.platform_release_version, &release.created_at),
-            (&mark.platform_release_version, &mark.created_at),
-        )?
+        && mark_is_older(&AcceptedOverrideMark::of(release)?, mark)?
     {
         return Err(PlatformReleaseError::OverrideDowngradeRefused {
             override_version: release.platform_release_version.clone(),
@@ -323,15 +386,8 @@ fn enforce_override_not_older_than_last_accepted(
             state_path: state_path.display().to_string(),
         });
     }
-    let mark = AcceptedOverrideMark::from(release);
+    let mark = AcceptedOverrideMark::of(release)?;
     if floor.as_ref() != Some(&mark) {
-        let parent = state_path.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent).map_err(|error| {
-            PlatformReleaseError::HighWaterMarkPersistFailed {
-                state_path: state_path.display().to_string(),
-                source: error,
-            }
-        })?;
         std::fs::write(state_path, serde_json::to_vec_pretty(&mark)?).map_err(|error| {
             PlatformReleaseError::HighWaterMarkPersistFailed {
                 state_path: state_path.display().to_string(),
@@ -352,12 +408,9 @@ pub fn enforce_release_not_older_than_bundled(
     release: &PlatformRelease,
 ) -> Result<(), PlatformReleaseError> {
     let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
-    let candidate_ts = parse_release_timestamp(&release.created_at)?;
-    let bundled_ts = parse_release_timestamp(&bundled.payload.created_at)?;
-    if candidate_ts < bundled_ts
-        || (candidate_ts == bundled_ts
-            && release.platform_release_version != bundled.payload.platform_release_version)
-    {
+    let bundled_mark = AcceptedOverrideMark::of(&bundled.payload)?;
+    let candidate_mark = AcceptedOverrideMark::of(release)?;
+    if mark_is_older(&candidate_mark, &bundled_mark)? {
         return Err(PlatformReleaseError::DowngradeRefused {
             override_version: release.platform_release_version.clone(),
             override_created: release.created_at.clone(),
@@ -377,17 +430,6 @@ fn parse_release_timestamp(
             message: format!("must be RFC3339: {error}"),
         }
     })
-}
-
-/// `candidate` predates `baseline` (strictly older timestamp, or equal
-/// timestamp with a divergent opaque version — unorderable, fail closed).
-fn release_pair_is_older(
-    candidate: (&str, &str),
-    baseline: (&str, &str),
-) -> Result<bool, PlatformReleaseError> {
-    let candidate_ts = parse_release_timestamp(candidate.1)?;
-    let baseline_ts = parse_release_timestamp(baseline.1)?;
-    Ok(candidate_ts < baseline_ts || (candidate_ts == baseline_ts && candidate.0 != baseline.0))
 }
 
 pub fn verify_envelope(
@@ -792,6 +834,18 @@ mod tests {
     }
 
     fn resigned_envelope_with_created_at(created_at: &str) -> String {
+        resigned_envelope_with(
+            created_at,
+            &format!("dev-stale-{}", created_at).replace(':', ""),
+            None,
+        )
+    }
+
+    fn resigned_envelope_with(
+        created_at: &str,
+        platform_release_version: &str,
+        trustee_kbs_url: Option<&str>,
+    ) -> String {
         use ed25519_dalek::{Signer, SigningKey};
         // The committed fixture key (DEV_FIXTURE_SIGNING_KEY_HEX in
         // crates/enclava-cli/scripts/generate-platform-release.py) matches
@@ -801,8 +855,10 @@ mod tests {
         let mut envelope =
             serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE).unwrap();
         envelope.payload.created_at = created_at.to_string();
-        envelope.payload.platform_release_version =
-            format!("dev-stale-{}", created_at).replace(':', "");
+        envelope.payload.platform_release_version = platform_release_version.to_string();
+        if let Some(url) = trustee_kbs_url {
+            envelope.payload.trustee_kbs_url = url.to_string();
+        }
         let canonical = canonical_platform_release_bytes(&envelope.payload).unwrap();
         envelope.signature = hex::encode(key.sign(&canonical).to_bytes());
         envelope.signing_pubkey = hex::encode(key.verifying_key().as_bytes());
@@ -909,6 +965,7 @@ mod tests {
         let stale_mark = AcceptedOverrideMark {
             platform_release_version: "ancient".to_string(),
             created_at: "2020-01-01T00:00:00Z".to_string(),
+            payload_sha256: "0".repeat(64),
         };
         std::fs::write(&state, serde_json::to_vec(&stale_mark).unwrap()).unwrap();
 
@@ -957,6 +1014,99 @@ mod tests {
             result,
             Err(PlatformReleaseError::HighWaterMarkPersistFailed { .. })
         ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn override_high_water_mark_same_pair_divergent_payload_refused() {
+        // Codex P1: two validly-signed envelopes reusing the same
+        // {platform_release_version, created_at} pair with different signed
+        // content must not pass as "the same release" — the mark now binds
+        // the canonical payload digest (the exact bytes the signature
+        // covers).
+        let dir = std::env::temp_dir().join(format!("pr-hwm-digest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+
+        let first = resigned_envelope_with(
+            "2999-01-01T00:00:00Z",
+            "dev-same-pair",
+            Some("https://kbs-first.example.test"),
+        );
+        let divergent = resigned_envelope_with(
+            "2999-01-01T00:00:00Z",
+            "dev-same-pair",
+            Some("https://kbs-second.example.test"),
+        );
+        // Both pass signature verification on their own.
+        for raw in [&first, &divergent] {
+            let parsed: PlatformReleaseEnvelope = serde_json::from_str(raw).unwrap();
+            assert!(verify_envelope(parsed).is_ok());
+        }
+
+        // First accepted; the divergent same-pair envelope is then refused.
+        assert!(PlatformReleaseEnvelope::load_verified_from_raw(first, true, Some(&state)).is_ok());
+        assert!(matches!(
+            PlatformReleaseEnvelope::load_verified_from_raw(divergent, true, Some(&state)),
+            Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
+        ));
+
+        // Re-presenting the exact same envelope is still fine (steady state).
+        let again = resigned_envelope_with(
+            "2999-01-01T00:00:00Z",
+            "dev-same-pair",
+            Some("https://kbs-first.example.test"),
+        );
+        assert!(PlatformReleaseEnvelope::load_verified_from_raw(again, true, Some(&state)).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn override_high_water_mark_gate_is_serialized_by_flock() {
+        // Codex P1: two replicas racing a projected override change must not
+        // interleave read/compare/write. The gate serializes on an exclusive
+        // flock at `<state>.lock`; while another process holds that lock the
+        // gate must block, so a stale accept can never slip between a
+        // concurrent accept's read and persist.
+        let dir = std::env::temp_dir().join(format!("pr-hwm-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+
+        // Bootstrap: accept T2 once so the floor exists (creates the lock file).
+        let t2 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        let parsed: PlatformReleaseEnvelope = serde_json::from_str(&t2).unwrap();
+        let release_t2 = verify_envelope(parsed).unwrap();
+        assert!(enforce_override_not_older_than_last_accepted(&state, &release_t2).is_ok());
+
+        // Hold the gate's lock the way a concurrent replica would.
+        let lock_path = dir.join("release.accepted.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        let mut external = fd_lock::RwLock::new(lock_file);
+        let guard = external.write().unwrap();
+
+        let state_clone = state.clone();
+        let release_clone = release_t2.clone();
+        let gate = std::thread::spawn(move || {
+            enforce_override_not_older_than_last_accepted(&state_clone, &release_clone)
+        });
+
+        // While the lock is held the gate cannot finish.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !gate.is_finished(),
+            "gate must block on the flock, not read torn state"
+        );
+        drop(guard);
+
+        // Once released it completes (steady-state reload of the same release).
+        assert!(gate.join().unwrap().is_ok());
+        let mark: AcceptedOverrideMark =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        assert_eq!(mark.created_at, "2999-01-01T00:00:00Z");
+        assert_eq!(mark.payload_sha256.len(), 64);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

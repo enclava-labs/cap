@@ -169,10 +169,26 @@ Release verification checks:
 - policy template hash;
 - runtime class expected by the engine;
 - when `ENCLAVA_PLATFORM_RELEASE_PATH` overrides the bundle: the override
-  is not older than the bundled release (downgrade refused).
+  is not older than the bundled release (downgrade refused), not older than
+  the newest release ever accepted on this override lane (persisted
+  high-water mark, downgrade refused), and not a same-`{version, created_at}`
+  envelope with different signed content (the mark pins the canonical
+  payload digest). The mark's read-compare-persist runs under an exclusive
+  flock so concurrent API replicas cannot interleave their updates.
 
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.
+
+The high-water mark lives at `ENCLAVA_PLATFORM_RELEASE_STATE` (default:
+`<override-path>.accepted`). It must point at durable writable storage — the
+override envelope itself is typically a read-only configmap mount, and an
+`emptyDir` would reset the anti-rollback floor on every pod replacement. The
+base deployment wires it to a small ReadWriteMany PVC
+(`deploy/api/platform-release-state-pvc.yaml`); overlays that run a single
+replica may relax the access mode. An operator who can delete the state file
+can reset the floor: for the full threat model, point the state path at
+separately-protected storage. Intentional rollbacks require clearing the
+state file (after operator verification), which the refusal message names.
 
 ### Rotating the production root
 
