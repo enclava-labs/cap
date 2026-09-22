@@ -344,9 +344,13 @@ where
         // closes the child's pipe and exposes a healthy workload to SIGPIPE.
         // Drop the frame instead and keep draining; report the first failure
         // and then every 1000th dropped frame so persistent loss is visible.
+        // Use a single atomic write (line + newline) to avoid partial-frame
+        // corruption: if the write succeeds, both frame and newline are on disk;
+        // if it fails, neither is, so the log stream stays valid NDJSON.
+        let mut frame_with_newline = line;
+        frame_with_newline.push(b'\n');
         if let Err(err) = spool
-            .write_all(&line)
-            .and_then(|_| spool.write_all(b"\n"))
+            .write_all(&frame_with_newline)
             .and_then(|_| spool.flush())
         {
             dropped_frames += 1;
