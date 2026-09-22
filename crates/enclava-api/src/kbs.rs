@@ -1642,7 +1642,24 @@ fn find_managed_marker_unique(
         let inside_string = states[at..at + marker.len()]
             .iter()
             .any(|state| matches!(state, RegoLexState::QuotedString | RegoLexState::RawString));
-        if occupies_whole_line && !inside_string {
+        if inside_string {
+            // Codex P2 (cap#165): marker text inside a string literal is
+            // string content, never a splice target — skip regardless of
+            // line shape.
+            continue;
+        }
+        if !occupies_whole_line && haystack[line_start..at].chars().all(char::is_whitespace) {
+            // Codex P2 (cap#165): a line-LEADING marker with trailing
+            // non-whitespace (e.g. `# BEGIN CAP MANAGED ... # note`) is a
+            // malformed marker, not an absent one — treating it as absent
+            // would append a second managed section and leave the stale
+            // bindings in the original one active. Fail closed.
+            return Err(KbsPolicyError::MalformedManagedMarkers(format!(
+                "{label} appears with trailing content on its line — \
+                 malformed managed marker; refusing to splice"
+            )));
+        }
+        if occupies_whole_line {
             hits.push(at);
         }
     }

@@ -356,6 +356,12 @@ fn platform_release_enabled(trustee_policy_read_available: bool) -> bool {
     trustee_policy_read_available
         || env_flag("ENCLAVA_USE_PLATFORM_RELEASE")
         || env_nonempty("ENCLAVA_PLATFORM_RELEASE_PATH").is_some()
+        // Codex P2 (cap#165): a wired state path alone must keep the gate
+        // active — otherwise removing the override env var in a deployment
+        // where trustee reads are disabled skips the bundled-lane removal
+        // guard entirely and silently re-enables the T2→T0 rollback it
+        // exists to refuse.
+        || env_nonempty("ENCLAVA_PLATFORM_RELEASE_STATE").is_some()
 }
 
 fn validate_platform_release_runtime_class(
@@ -710,15 +716,26 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        if !release.trustee_kbs_ca_cert_pem.trim().is_empty()
-            && let Err(e) = require_env_matches_release(
+        if !release.trustee_kbs_ca_cert_pem.trim().is_empty() {
+            if let Err(e) = require_env_matches_release(
                 "TRUSTEE_KBS_CA_CERT_PEM",
                 &release.trustee_kbs_ca_cert_pem,
                 true,
-            )
-        {
-            eprintln!("startup refused: {e}");
-            std::process::exit(1);
+            ) {
+                eprintln!("startup refused: {e}");
+                std::process::exit(1);
+            }
+            // Codex P1 (cap#165): parse the PEM before the high-water mark
+            // is advanced — build_trustee_http_client (which parses it
+            // again) runs after the commit, and a signed release with an
+            // unloadable CA must not raise the floor and strand startup.
+            let cert_pem = release.trustee_kbs_ca_cert_pem.replace("\\n", "\n");
+            if let Err(e) = reqwest::Certificate::from_pem(cert_pem.as_bytes()) {
+                eprintln!(
+                    "startup refused: signed platform release carries an invalid TRUSTEE_KBS_CA_CERT_PEM: {e}"
+                );
+                std::process::exit(1);
+            }
         }
     }
 

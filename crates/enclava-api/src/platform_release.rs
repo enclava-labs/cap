@@ -294,7 +294,25 @@ fn resolve_high_water_state(
     state_env: Option<String>,
 ) -> Result<Option<PathBuf>, PlatformReleaseError> {
     match (override_path, state_env) {
-        (Some(_), Some(state)) => Ok(Some(PathBuf::from(state))),
+        (Some(override_path), Some(state)) => {
+            // Codex P2 (cap#165): the state file must never alias the
+            // override envelope — the deferred commit renames the mark over
+            // the state path, which would atomically destroy the signed
+            // envelope and brick every subsequent restart. Compare the
+            // lexical paths (symlink resolution is unavailable pre-open and
+            // lexical equality already catches the config mistake).
+            if Path::new(override_path) == Path::new(&state) {
+                return Err(PlatformReleaseError::InvalidField {
+                    field: "ENCLAVA_PLATFORM_RELEASE_STATE",
+                    message: format!(
+                        "must not alias ENCLAVA_PLATFORM_RELEASE_PATH ({state}); \
+                         the deferred high-water-mark commit would replace \
+                         the signed override envelope"
+                    ),
+                });
+            }
+            Ok(Some(PathBuf::from(state)))
+        }
         (Some(_), None) => Err(PlatformReleaseError::MissingOverrideStatePath),
         (None, Some(state)) => Ok(Some(PathBuf::from(state))),
         (None, None) => Ok(None),
