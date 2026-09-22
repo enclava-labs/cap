@@ -228,6 +228,25 @@ def test_release_generator_rejects_whatwg_ipv4_ending_host_shapes():
             generate_platform_release.validate_payload(payload)
 
 
+def test_release_generator_rejects_idna_normalized_ipv4_overflow():
+    # Codex P2: fullwidth digits (U+FF10-U+FF19) are numeric per WHATWG
+    # but not recognized as decimal by _label_looks_numeric. After UTS46
+    # normalization they become regular digits, triggering the IPv4 check.
+    # Example: "０＆#120717; is fullwidth "x" (U+FF58), " gou" is invalid hex.
+    # More direct: U+FF18 (fullwidth 8) normalizes to "8", so "０＆#120717;
+    # becomes "0x100000000" (overflows IPv4).
+    pytest.importorskip("idna")
+    for value in (
+        "https://０＆#120717;/",  # fullwidth "8" -> 8, but the hex part is invalid
+        "https://０＆#120720;/",  # fullwidth "0" + "x" + hex digits
+    ):
+        payload = base_payload()
+        payload["trustee_kbs_url"] = value
+
+        with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
+            generate_platform_release.validate_payload(payload)
+
+
 def test_release_generator_accepts_valid_ipv4_host():
     payload = base_payload()
     payload["trustee_kbs_url"] = "https://192.168.0.1/"

@@ -591,8 +591,7 @@ fn enforce_bundle_not_older_than_persisted_mark(
         };
     let Some(mark) = newest_mark(persisted)? else {
         return Ok(());
-    };
-    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
+    };    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
     let bundled_mark = AcceptedOverrideMark::of(&bundled.payload)?;
     if mark_is_older(&bundled_mark, &mark)? {
         return Err(PlatformReleaseError::OverrideDowngradeRefused {

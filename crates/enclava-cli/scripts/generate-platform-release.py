@@ -149,23 +149,24 @@ def _label_looks_numeric(label: str) -> bool:
     )
 
 
-def _idna_ok(host: str) -> bool:
+def _idna_normalize(host: str) -> str | None:
     # Non-ASCII hosts go through the same UTS46/IDNA2008 processing the url
     # crate performs (stdlib .encode("idna") is IDNA2003 and accepts inputs
     # like a non-breaking space that the url crate rejects, so it cannot be
     # used here). If the `idna` package is unavailable, fail closed: reject
     # every non-ASCII host rather than risk signing an unloadable envelope.
+    # Returns the UTS46-normalized ASCII host, or None if invalid/unavailable.
     if host.isascii():
-        return True
+        return host
     try:
         import idna  # type: ignore[import-not-found]
     except ImportError:
-        return False
+        return None
     try:
-        idna.encode(host, uts46=True)
+        normalized = idna.encode(host, uts46=True).decode("ascii")
     except (idna.IDNAError, UnicodeError, ValueError):
-        return False
-    return True
+        return None
+    return normalized
 
 
 def _host_ok(host: str) -> bool:
@@ -189,14 +190,16 @@ def _host_ok(host: str) -> bool:
         for ch in host
     ):
         return False
-    if not _idna_ok(host):
+    normalized = _idna_normalize(host)
+    if normalized is None:
         return False
     # WHATWG IPv4 ending rule (see _label_looks_numeric): when the last
     # label is numeric the whole host must be a valid IPv4 address or the
     # url crate rejects it. IPv4Address is stricter than WHATWG for exotic
     # forms (pure-integer `12345`, hex/octal octets) — rejecting those is
-    # generator-stricter, which is the safe direction.
-    bare = host.rstrip(".")
+    # generator-stricter, which is the safe direction. Apply to the UTS46-
+    # normalized host to catch fullwidth forms like０ｘ１００.
+    bare = normalized.rstrip(".")
     if bare:
         last_label = bare.rsplit(".", 1)[-1]
         if _label_looks_numeric(last_label):
