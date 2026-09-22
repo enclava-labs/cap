@@ -8,6 +8,8 @@
 #
 # If the target cluster runs its ingress controllers somewhere other than
 # the `ingress-nginx` namespace, adjust the namespaceSelector to match.
+# Note: kubelet health probes use the node's host IP (not a pod in the
+# namespace), so they bypass NetworkPolicy and don't need an explicit rule.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -28,15 +30,6 @@ spec:
       podSelector:
         matchLabels:
           app.kubernetes.io/name: ingress-nginx
-    ports:
-    - protocol: TCP
-      port: 3000
-  # kubelet health probes originate from the node; allow them so the pod is
-  # not marked Unready on clusters enforcing NetworkPolicy by default.
-  - from:
-    - namespaceSelector:
-        matchLabels:
-          kubernetes.io/metadata.name: enclava-platform
     ports:
     - protocol: TCP
       port: 3000

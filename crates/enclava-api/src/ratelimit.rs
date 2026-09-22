@@ -124,6 +124,14 @@ impl TrustedProxyKeyExtractor {
             .collect()
     }
 
+    /// Fallback to `X-Real-IP` when `X-Forwarded-For` is absent.
+    fn real_ip<B>(&self, req: &Request<B>) -> Option<IpAddr> {
+        req.headers()
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+    }
+
     /// Rightmost-untrusted walk over `X-Forwarded-For`.
     ///
     /// Only called when the direct peer is a trusted proxy. Each trusted
@@ -154,6 +162,13 @@ impl TrustedProxyKeyExtractor {
             && let Some(client) = self.client_ip_from_forwarded(req)
         {
             return Some(client);
+        }
+        // Fall back to X-Real-IP if peer is trusted but X-Forwarded-For is absent/unusable.
+        if let Some(peer_ip) = peer
+            && self.trusted.is_trusted(peer_ip)
+            && let Some(real_ip) = self.real_ip(req)
+        {
+            return Some(real_ip);
         }
         peer
     }
@@ -272,5 +287,51 @@ mod tests {
         let req = req_with("10.10.5.5", Some("garbage, 198.51.100.7"));
         let ip = extractor.extract_ip(&req).unwrap();
         assert_eq!(ip.to_string(), "198.51.100.7");
+    }
+
+    #[test]
+    fn x_real_ip_fallback_when_xff_absent() {
+        // When X-Forwarded-For is absent but X-Real-IP is present from a
+        // trusted proxy, use the real IP as the client.
+        let extractor =
+            TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.10.0.0/16"));
+        let mut req = Request::builder().uri("/").body(()).unwrap();
+        let socket: SocketAddr = "10.10.5.5:54321".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(socket));
+        req.headers_mut()
+            .insert("x-real-ip", "198.51.100.7".parse().unwrap());
+        let ip = extractor.extract_ip(&req).unwrap();
+        assert_eq!(ip.to_string(), "198.51.100.7");
+    }
+
+    #[test]
+    fn xff_preferred_over_x_real_ip() {
+        // When both XFF and X-Real-IP are present, XFF takes precedence.
+        let extractor =
+            TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.10.0.0/16"));
+        let mut req = Request::builder().uri("/").body(()).unwrap();
+        let socket: SocketAddr = "10.10.5.5:54321".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(socket));
+        req.headers_mut()
+            .insert("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        req.headers_mut()
+            .insert("x-real-ip", "203.0.113.99".parse().unwrap());
+        let ip = extractor.extract_ip(&req).unwrap();
+        assert_eq!(ip.to_string(), "198.51.100.7");
+    }
+
+    #[test]
+    fn x_real_ip_ignored_when_peer_untrusted() {
+        // When the direct peer is not trusted, fall back to peer IP even if
+        // X-Real-IP is present (prevents a compromised proxy from setting it).
+        let extractor =
+            TrustedProxyKeyExtractor::new(TrustedProxyMatcher::from_csv("10.10.0.0/16"));
+        let mut req = Request::builder().uri("/").body(()).unwrap();
+        let socket: SocketAddr = "203.0.113.5:54321".parse().unwrap();
+        req.extensions_mut().insert(ConnectInfo(socket));
+        req.headers_mut()
+            .insert("x-real-ip", "198.51.100.7".parse().unwrap());
+        let ip = extractor.extract_ip(&req).unwrap();
+        assert_eq!(ip.to_string(), "203.0.113.5");
     }
 }
