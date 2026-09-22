@@ -139,23 +139,36 @@ pub fn verify(
         }
     }
 
+    // A required check only counts as satisfied by an explicit Pass. A
+    // Skipped required check (e.g. `transport.tls_channel_spki` when the
+    // appraiser cannot observe the live channel) must degrade the verdict to
+    // Fail, not Inconclusive: the policy demanded evidence the verifier did
+    // not produce. Inconclusive remains reserved for the diagnostic case
+    // where no policy was supplied at all and nothing can be appraised.
+    let required_check_satisfied = |id: &str| {
+        checks
+            .iter()
+            .any(|check| check.id == id && check.outcome == CheckOutcome::Pass)
+    };
     let verdict = if checks
         .iter()
         .any(|check| check.outcome == CheckOutcome::Fail)
     {
         Verdict::Fail
     } else if let Some(policy) = policy.as_ref()
-        && policy.required_checks.iter().all(|required| {
-            checks
-                .iter()
-                .any(|check| &check.id == required && check.outcome == CheckOutcome::Pass)
-        })
+        && policy
+            .required_checks
+            .iter()
+            .all(|required| required_check_satisfied(required))
         && (!policy.transport.require_tls_channel_spki
-            || checks.iter().any(|check| {
-                check.id == "transport.tls_channel_spki" && check.outcome == CheckOutcome::Pass
-            }))
+            || required_check_satisfied("transport.tls_channel_spki"))
     {
         Verdict::Pass
+    } else if policy.is_some() {
+        // A well-formed policy was supplied but a required check is neither
+        // Pass nor Fail (e.g. Skipped): the demanded evidence was not
+        // produced, so fail closed rather than degrade to Inconclusive.
+        Verdict::Fail
     } else {
         Verdict::Inconclusive
     };
