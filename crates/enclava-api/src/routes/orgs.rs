@@ -1174,6 +1174,7 @@ pub async fn invite_member(
         current_caller_role,
         existing_role,
         Some(requested_role),
+        invitee_id == auth.user_id,
     )?;
 
     if existing_role == Some(Role::Owner) && requested_role != Role::Owner {
@@ -1304,7 +1305,12 @@ pub async fn remove_member(
     .await
     .map_err(|_| db_error())?;
 
-    scopes::require_owner_to_modify_privileged_role(current_caller_role, target_role, None)?;
+    scopes::require_owner_to_modify_privileged_role(
+        current_caller_role,
+        target_role,
+        None,
+        member_id == auth.user_id,
+    )?;
 
     if target_role == Some(Role::Owner) {
         scopes::ensure_last_owner_invariant(&mut tx, org_id, member_id, None).await?;
@@ -1995,16 +2001,20 @@ mod tests {
         .expect("insert member escalation memberships");
         let victim_email = format!("victim-admin-{suffix}@example.test");
         let member_email = format!("plain-member-{suffix}@example.test");
+        let admin_email = format!("self-admin-{suffix}@example.test");
         sqlx::query(
             "INSERT INTO user_identities (id, user_id, provider, identifier)
-             VALUES ($1, $3, 'email', $5), ($2, $4, 'email', $6)",
+             VALUES ($1, $4, 'email', $7), ($2, $5, 'email', $8), ($3, $6, 'email', $9)",
         )
+        .bind(Uuid::new_v4())
         .bind(Uuid::new_v4())
         .bind(Uuid::new_v4())
         .bind(victim_admin_id)
         .bind(member_id)
+        .bind(admin_id)
         .bind(&victim_email)
         .bind(&member_email)
+        .bind(&admin_email)
         .execute(&pool)
         .await
         .expect("insert member escalation identities");
@@ -2084,6 +2094,59 @@ mod tests {
         .expect("admin can remove a plain member");
         assert_eq!(remove_member_ok, StatusCode::NO_CONTENT);
 
+        // Self-service: the admin cannot re-invite themselves as admin
+        // (keeping the privileged role), but CAN demote themselves to
+        // member — the self-release exemption.
+        let self_keep = invite_member(
+            admin_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(InviteRequest {
+                email: admin_email.clone(),
+                role: Some("admin".to_string()),
+            }),
+        )
+        .await
+        .expect_err("admin must not re-grant their own admin role");
+        assert_eq!(self_keep.0, StatusCode::FORBIDDEN);
+        let self_demote = invite_member(
+            admin_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(InviteRequest {
+                email: admin_email.clone(),
+                role: Some("member".to_string()),
+            }),
+        )
+        .await
+        .expect("admin can demote themselves to member");
+        assert_eq!(self_demote.0, StatusCode::OK);
+        let self_role: String = sqlx::query_scalar(
+            "SELECT role::text FROM memberships
+              WHERE org_id = $1 AND user_id = $2 AND removed_at IS NULL",
+        )
+        .bind(org_id)
+        .bind(admin_id)
+        .fetch_one(&pool)
+        .await
+        .expect("admin role after self-demotion");
+        assert_eq!(self_role, "member");
+
+        // After self-demotion the caller is a plain member: the org:admin
+        // scope gate now rejects further privileged management attempts.
+        let demoted_promote = invite_member(
+            admin_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(InviteRequest {
+                email: member_email.clone(),
+                role: Some("admin".to_string()),
+            }),
+        )
+        .await
+        .expect_err("demoted admin must not promote anyone");
+        assert_eq!(demoted_promote.0, StatusCode::FORBIDDEN);
+
         // Owner can still promote to admin and remove an admin.
         let owner_promote = invite_member(
             owner_auth.clone(),
@@ -2107,8 +2170,9 @@ mod tests {
         assert_eq!(owner_remove, StatusCode::NO_CONTENT);
 
         // The rejected admin mutations must not have altered memberships:
-        // the victim admin is only gone because the owner removed them, and
-        // the plain member is an admin only because the owner promoted them.
+        // the victim admin is only gone because the owner removed them, the
+        // plain member is an admin only because the owner promoted them, and
+        // the acting admin is a member only because they demoted themselves.
         let roles: Vec<(Uuid, String)> = sqlx::query_as(
             "SELECT user_id, role::text FROM memberships
               WHERE org_id = $1 AND removed_at IS NULL ORDER BY user_id",
@@ -2125,7 +2189,7 @@ mod tests {
                 .unwrap_or("removed")
         };
         assert_eq!(role_of(owner_id), "owner");
-        assert_eq!(role_of(admin_id), "admin");
+        assert_eq!(role_of(admin_id), "member");
         assert_eq!(role_of(victim_admin_id), "removed");
         assert_eq!(role_of(member_id), "admin");
 
