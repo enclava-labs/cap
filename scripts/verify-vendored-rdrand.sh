@@ -7,7 +7,9 @@
 # reviewed delta recorded in scripts/rdrand-0.8.3-nonx86.patch.
 #
 # It never trusts the network for the comparison: the tarball is pinned by
-# sha256 and can also be supplied offline via RDRAND_TARBALL.
+# sha256, is committed to the repo as scripts/rdrand-0.8.3.pristine.crate
+# (verified against the pinned sha256 below, so the network is never a
+# build dependency), and can additionally be overridden via RDRAND_TARBALL.
 set -Eeuo pipefail
 
 TARBALL_SHA256="d92195228612ac8eed47adbc2ed0f04e513a4ccb98175b6f2bd04d963b533655"
@@ -20,8 +22,14 @@ REVIEWED_PATCH="$SCRIPT_DIR/rdrand-0.8.3-nonx86.patch"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-tarball="${RDRAND_TARBALL:-$work/rdrand-0.8.3.crate}"
-if [[ ! -f "$tarball" ]]; then
+# Preference order: explicit RDRAND_TARBALL override, then the committed
+# pristine copy (offline default), then the network as a last resort.
+if [[ -n "${RDRAND_TARBALL:-}" && -f "$RDRAND_TARBALL" ]]; then
+    tarball="$RDRAND_TARBALL"
+elif [[ -f "$SCRIPT_DIR/rdrand-0.8.3.pristine.crate" ]]; then
+    tarball="$SCRIPT_DIR/rdrand-0.8.3.pristine.crate"
+else
+    tarball="$work/rdrand-0.8.3.crate"
     curl -fsSL "$TARBALL_URL" -o "$tarball"
 fi
 

@@ -80,22 +80,14 @@ pub async fn resolve_tag_to_digest(
 
     // Cap the manifest read like every other registry body: an allowlisted
     // but hostile registry must not be able to OOM the API pod with an
-    // oversized "manifest".
+    // oversized "manifest". The cap is enforced against the bytes actually
+    // received (chunked read), not just an advertised or absent
+    // Content-Length, so an unbounded stream is cut off at the limit
+    // instead of being buffered first.
     let limit = client.body_limit();
-    if let Some(len) = response.content_length()
-        && len > limit
-    {
-        return Err(RegistryError::ResolveFailed(format!(
-            "manifest body length {len} exceeds client body limit {limit}"
-        )));
-    }
-    let manifest = response.bytes().await?;
-    if manifest.len() as u64 > limit {
-        return Err(RegistryError::ResolveFailed(format!(
-            "manifest body length {} exceeds client body limit {limit}",
-            manifest.len()
-        )));
-    }
+    let manifest = crate::clients::read_body_capped(response, limit)
+        .await
+        .map_err(RegistryError::Client)?;
     verify_advertised_digest(&advertised_digest, &manifest, registry, repository, tag)
 }
 

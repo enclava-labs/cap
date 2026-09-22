@@ -147,11 +147,16 @@ jobs:
         with:
           tool: cargo-audit,cargo-deny
 
+      - name: Check audit/deny ignore lockstep
+        # deny.toml is the single source of truth; this fails if the ci.yml
+        # cargo audit ignores ever diverge from it.
+        run: bash scripts/check-audit-lockstep.sh
+
       - name: Run cargo audit
-        # Ignore list is kept in lockstep with deny.toml [advisories]:
-        # every id there must appear here (and vice versa) so the two
-        # gates can never diverge on which advisories are accepted.
-        run: cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2026-0173 --ignore RUSTSEC-2026-0221
+        # Ignore list is generated from deny.toml [advisories] so the two
+        # dependency gates can never diverge on which advisories are
+        # accepted (lockstep enforced by the step above).
+        run: cargo audit $(bash scripts/cargo-audit-args.sh)
 
       - name: Run cargo deny
         run: cargo deny check advisories sources
