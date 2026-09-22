@@ -200,14 +200,20 @@ counters, so with N replicas a single client gets N × (1 r/s, burst 10) on
 `/auth/device/start` — the budget multiplies with scale. The aggregate cap
 belongs at the ingress tier where it is enforced once; if the cluster runs
 multiple API replicas, add an nginx `limit-rps` annotation (or equivalent) on
-the `/auth/device/start` path in the live overlay before relying on the
-per-IP budget, e.g.:
+the `/auth/device/start` path in the live overlay, e.g.:
 
 ```yaml
 metadata:
   annotations:
     nginx.ingress.kubernetes.io/limit-rps: "1"
 ```
+
+Caveat: `limit-rps` state is controller-local, so with M ingress-nginx
+controller replicas the effective sustained allowance is the annotation
+value × M. Size the annotation accordingly (annotation = target / M) or use
+a cluster-wide limiter if the target cluster runs multiple controllers;
+verify the effective aggregate by driving §3's spoofed-header loop through
+the threshold after configuring it.
 
 The in-process governor then remains as defense-in-depth for direct
 ClusterIP callers that bypass the ingress.

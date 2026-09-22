@@ -787,6 +787,96 @@ async fn device_login_approved_code_is_single_use_and_still_expires() {
 }
 
 #[tokio::test]
+async fn device_login_sessions_with_legacy_hash_remain_pollable_and_approvable() {
+    // Rollout transition: sessions created by the previous binary store the
+    // plain SHA-256 digest of the codes. Until they expire (10-minute TTL),
+    // poll must still find them by device code and approve by user code.
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state.clone());
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let (session_token, org_id) = signup_owner(&server, "legacy-hash").await;
+
+    let start = server
+        .post("/auth/device/start")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({}))
+        .await;
+    start.assert_status_ok();
+    let start_body: Value = start.json();
+    let device_code = start_body["device_code"].as_str().expect("device_code");
+    let user_code = start_body["user_code"].as_str().expect("user_code");
+
+    // Rewrite the row as the previous binary would have stored it (plain
+    // SHA-256 of the code; the old code_hash had no normalization beyond
+    // what start_device_login already applied to the user code).
+    let legacy_device = Sha256::digest(device_code.as_bytes()).to_vec();
+    let normalized_user: String = user_code
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_uppercase)
+        .collect();
+    let legacy_user = Sha256::digest(normalized_user.as_bytes()).to_vec();
+    sqlx::query(
+        "UPDATE device_login_sessions SET device_code_hash = $1 WHERE device_code_hash = $2",
+    )
+    .bind(&legacy_device)
+    .bind(device_code_hash(device_code))
+    .execute(&pool)
+    .await
+    .expect("rewrite device hash to legacy format");
+    sqlx::query("UPDATE device_login_sessions SET user_code_hash = $1 WHERE device_code_hash = $2")
+        .bind(&legacy_user)
+        .bind(&legacy_device)
+        .execute(&pool)
+        .await
+        .expect("rewrite user hash to legacy format");
+
+    // Poll finds the legacy row and reports pending.
+    let pending = server
+        .post("/auth/device/poll")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({ "device_code": device_code }))
+        .await;
+    pending.assert_status_ok();
+    let pending_body: Value = pending.json();
+    assert_eq!(pending_body["status"], "pending");
+
+    // Approve finds the legacy row by user code and flips it to approved.
+    let approve = server
+        .post("/auth/device/approve")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "user_code": user_code,
+            "org_id": org_id,
+        }))
+        .await;
+    approve.assert_status_ok();
+    let approve_body: Value = approve.json();
+    assert_eq!(approve_body["status"], "approved");
+
+    // Redeeming poll still works against the legacy row and issues a token.
+    // (Poll interval is 5s; the first poll above set last_polled_at.)
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let approved = server
+        .post("/auth/device/poll")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({ "device_code": device_code }))
+        .await;
+    approved.assert_status_ok();
+    let approved_body: Value = approved.json();
+    assert_eq!(approved_body["status"], "approved");
+    assert!(approved_body["auth"]["token"].as_str().is_some());
+
+    // Cleanup: remove this test's row (legacy digest).
+    sqlx::query("DELETE FROM device_login_sessions WHERE device_code_hash = $1")
+        .bind(&legacy_device)
+        .execute(&pool)
+        .await
+        .expect("cleanup legacy-hash row");
+}
+
+#[tokio::test]
 async fn device_login_codes_are_stored_with_keyed_hash_and_uri_hides_user_code() {
     let (state, pool) = setup_test_state().await;
     let app = test_router(state.clone());
