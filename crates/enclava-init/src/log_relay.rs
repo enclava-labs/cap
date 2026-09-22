@@ -318,14 +318,22 @@ fn follow_spool(
             *offset = 0;
             let mut adopted = file;
             adopted.seek(SeekFrom::Start(0))?;
-            let (bytes, delivered) = drain_from(&mut adopted, 0)?;
-            // Use the ACTUAL cursor position as the offset: the writer is a
-            // separate process and can append during the read. Those bytes are
-            // delivered in this response, so the next poll must resume past them.
-            // A trailing incomplete fragment (writer mid-append) sits at the end
-            // of the delivered range; the next poll will read from this offset,
-            // see the now-complete line, and deliver it.
-            *offset = delivered;
+            let (bytes, _delivered) = drain_from(&mut adopted, 0)?;
+            // Resume at the END OF THE LAST COMPLETE LINE delivered by
+            // write_deduped_after_rotation, NOT the drain cursor: an
+            // in-flight trailing fragment (writer mid-append into the fresh
+            // inode) is withheld from the client, so the next poll must
+            // re-read it from its first byte and deliver the completed line
+            // whole. Resuming at the drain cursor would emit only the
+            // fragment's suffix as a bogus NDJSON line. Re-reading the
+            // fragment is by design: the writer appends frame+newline
+            // atomically, so the re-read returns the prefix plus its
+            // completion as one line.
+            let mut delivered_end = 0usize;
+            while let Some(idx) = bytes[delivered_end..].iter().position(|&b| b == b'\n') {
+                delivered_end += idx + 1;
+            }
+            *offset = delivered_end as u64;
             // Write to the client BEFORE holding the fd: a stalled client would keep
             // this fd open, pinning the old inode's ~32 MiB against deletion.
             // The inode identity is already captured in `current_identity` for
