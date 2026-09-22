@@ -118,12 +118,24 @@ async fn freeze_workload_authority_mutations(
 /// Invariant: this function must classify the raw segments the router will
 /// match — the only deliberate divergence is the leading/trailing slash
 /// trim described below, which is fail-closed. Axum 0.8 dispatches through
-/// matchit 0.8, which matches the raw
+/// matchit 0.8.x, which matches the raw
 /// (still percent-encoded) URI path, splits parameters on a literal `/`
 /// only, and never decodes `%2F` or resolves `.`/`..` segments (there is no
 /// `NormalizePath` layer in `build_router_inner`). The gate therefore also
 /// splits on literal `/` and compares raw segments: `%2F` inside a segment
 /// is NOT a separator here, because it is not one to the router either.
+///
+/// These matcher semantics were verified empirically against the locked
+/// matchit version (probe: insert the route table into a fresh
+/// `matchit::Router` and feed it the raw variants) — not assumed from the
+/// changelog. The invariant itself is enforced by
+/// `workload_gate_classification_agrees_with_matchit_dispatch`, which
+/// mirrors the route table into a `matchit::Router` and asserts gate
+/// classification ↔ router dispatch agreement over generated poisoned raw
+/// paths: if a matchit upgrade (0.x or 1.x) ever changes raw-path semantics
+/// (e.g. adds trailing-slash tolerance or percent-decodes before matching),
+/// that test fails instead of the alignment breaking silently. Re-run the
+/// same probe when bumping matchit majors.
 ///
 /// A path that matches no allow pattern below is a mutation (deny-by-default),
 /// so raw variants such as `/apps%2Fdemo/deploy`, `//apps//demo//deploy`,
@@ -670,6 +682,346 @@ mod runtime_gate_tests {
             (Method::DELETE, "/internal/paas/orgs/org-1/apps/demo"),
         ] {
             assert!(!is_workload_authority_mutation(&method, path));
+        }
+    }
+
+    #[test]
+    fn workload_gate_classification_agrees_with_matchit_dispatch() {
+        // Property: whenever the router (matchit — the exact crate/version
+        // axum resolves in Cargo.lock) would dispatch a raw (method, path)
+        // to a handler, the freeze gate's classification must equal the
+        // handler's mutation-ness. This pins the gate/router alignment
+        // invariant beyond the enumerated cases above: if a matchit upgrade
+        // ever changes raw-path semantics (e.g. starts percent-decoding,
+        // collapsing interior empty segments, or tolerating trailing
+        // slashes), a generated poisoned path will dispatch to a handler
+        // the gate misclassifies and this test fails instead of the
+        // alignment breaking silently.
+        //
+        // The mirror below must list every route pattern from
+        // build_router_inner (public routes plus the PaasManaged internal
+        // routes — the union of what can ever be mounted) with the methods
+        // each pattern serves and whether that (pattern, method) is an
+        // allow-listed control-plane write (true) or a tenant
+        // workload-authority mutation (false). GETs are always allows: the
+        // gate passes all GET/HEAD/OPTIONS through.
+        const ALLOW: bool = true;
+        const MUTATION: bool = false;
+        let route_table: &[(&str, &[(&str, bool)])] = &[
+            // health
+            ("/livez", &[("GET", ALLOW)]),
+            ("/readyz", &[("GET", ALLOW)]),
+            ("/health", &[("GET", ALLOW)]),
+            // auth
+            ("/auth/signup", &[("POST", ALLOW)]),
+            ("/auth/login", &[("POST", ALLOW)]),
+            ("/auth/device/start", &[("POST", ALLOW)]),
+            ("/auth/device/poll", &[("POST", ALLOW)]),
+            ("/auth/device/approve", &[("POST", ALLOW)]),
+            ("/auth/api-keys", &[("POST", ALLOW)]),
+            ("/auth/api-keys/{id}", &[("DELETE", ALLOW)]),
+            // users
+            ("/users/me", &[("GET", ALLOW)]),
+            ("/users/me/public-keys", &[("POST", MUTATION)]),
+            // platform
+            ("/platform/deployment-context", &[("GET", ALLOW)]),
+            // orgs
+            ("/orgs", &[("GET", ALLOW), ("POST", ALLOW)]),
+            ("/orgs/{name}/invite", &[("POST", ALLOW)]),
+            ("/orgs/{name}/members", &[("GET", ALLOW)]),
+            ("/orgs/{name}/members/{id}", &[("DELETE", ALLOW)]),
+            ("/orgs/{name}/keyring", &[("GET", ALLOW), ("PUT", MUTATION)]),
+            (
+                "/orgs/{name}/keyring/bootstrap-signing-service",
+                &[("POST", MUTATION)],
+            ),
+            ("/orgs/{name}/keyring/rotate-owner", &[("POST", MUTATION)]),
+            // apps
+            ("/apps", &[("GET", ALLOW), ("POST", MUTATION)]),
+            ("/apps/{name}", &[("GET", ALLOW), ("DELETE", ALLOW)]),
+            ("/apps/{name}/signer", &[("PATCH", MUTATION)]),
+            ("/apps/{name}/signer/rotation-token", &[("POST", MUTATION)]),
+            // deployments
+            ("/deployments", &[("POST", MUTATION)]),
+            ("/deployments/{deployment_id}", &[("GET", ALLOW)]),
+            (
+                "/deployments/{deployment_id}/config-token",
+                &[("POST", MUTATION)],
+            ),
+            ("/apps/{name}/deploy", &[("POST", MUTATION)]),
+            ("/apps/{name}/agent-policy", &[("POST", MUTATION)]),
+            ("/apps/{name}/deployments", &[("GET", ALLOW)]),
+            ("/apps/{name}/rollback", &[("POST", MUTATION)]),
+            // config
+            ("/apps/{name}/config-token", &[("POST", MUTATION)]),
+            ("/apps/{name}/config", &[("GET", ALLOW)]),
+            ("/apps/{name}/config/sync", &[("POST", MUTATION)]),
+            ("/apps/{name}/config/{key}/meta", &[("DELETE", MUTATION)]),
+            // domains
+            ("/apps/{name}/domain", &[("GET", ALLOW)]),
+            ("/apps/{name}/domains", &[("POST", MUTATION)]),
+            (
+                "/apps/{name}/domains/{domain}/verify",
+                &[("POST", MUTATION)],
+            ),
+            ("/apps/{name}/domains/{domain}", &[("DELETE", MUTATION)]),
+            // status
+            ("/apps/{name}/status", &[("GET", ALLOW)]),
+            ("/apps/{name}/logs", &[("GET", ALLOW)]),
+            // unlock
+            ("/apps/{name}/unlock/status", &[("GET", ALLOW)]),
+            ("/apps/{name}/unlock/endpoint", &[("GET", ALLOW)]),
+            ("/apps/{name}/unlock/mode", &[("PUT", MUTATION)]),
+            // workload
+            ("/api/v1/workload/artifacts", &[("GET", ALLOW)]),
+            (
+                "/api/v1/workload/tls/dns01-certificate",
+                &[("POST", MUTATION)],
+            ),
+            ("/workload/artifacts", &[("GET", ALLOW)]),
+            ("/workload/tls/dns01-certificate", &[("POST", MUTATION)]),
+            // internal (PaasManaged)
+            ("/internal/paas/status", &[("GET", ALLOW)]),
+            (
+                "/internal/paas/platform/deployment-context",
+                &[("GET", ALLOW)],
+            ),
+            ("/internal/paas/orgs/{paas_org_id}", &[("PUT", ALLOW)]),
+            (
+                "/internal/paas/orgs/{paas_org_id}/members/{paas_user_id}",
+                &[("PUT", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/entitlements",
+                &[("PUT", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps",
+                &[("GET", ALLOW), ("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}",
+                &[("DELETE", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/desired-state",
+                &[("PUT", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/logs",
+                &[("GET", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/proof-bundle",
+                &[("GET", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/members",
+                &[("GET", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/deployments",
+                &[("GET", ALLOW), ("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/status",
+                &[("GET", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/deploy",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/agent-policy",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/users/me/public-keys",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/keyring",
+                &[("GET", ALLOW), ("PUT", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/signing-readiness",
+                &[("GET", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/keyring/bootstrap-signing-service",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/keyring/rotate-owner",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/signer/rotation-token",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/signer",
+                &[("PATCH", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domain",
+                &[("GET", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domains",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domains/{domain}/verify",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/domains/{domain}",
+                &[("DELETE", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config",
+                &[("GET", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config-token",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config/sync",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/config/{key_name}/meta",
+                &[("DELETE", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/rollback",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}",
+                &[("GET", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/config-token",
+                &[("POST", MUTATION)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/status",
+                &[("GET", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/endpoint",
+                &[("GET", ALLOW)],
+            ),
+            (
+                "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/mode",
+                &[("PUT", MUTATION)],
+            ),
+        ];
+
+        // Inserting must succeed: axum inserts this exact pattern set into
+        // its own matchit tree at router construction, so a conflict here
+        // means the mirror has drifted from the real route table.
+        let mut mirror = matchit::Router::new();
+        for (index, (pattern, _)) in route_table.iter().enumerate() {
+            mirror
+                .insert(*pattern, index)
+                .unwrap_or_else(|e| panic!("mirror insert failed for {pattern}: {e}"));
+        }
+
+        // Deterministic generator (xorshift64*): no external proptest
+        // dependency, fully reproducible failures from the printed seed.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            let mut x = state;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            state = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        // Poisoned segment pool: route-table literals, dot segments,
+        // percent-encoded slashes/dots (case variants), and the empty
+        // segment (interior `//`), which matchit treats as a parameter
+        // value.
+        let pool: [&str; 26] = [
+            "apps",
+            "orgs",
+            "internal",
+            "paas",
+            "auth",
+            "deploy",
+            "members",
+            "entitlements",
+            "keyring",
+            "invite",
+            "config",
+            "domains",
+            "deployments",
+            "unlock",
+            "demo",
+            "org-1",
+            "",
+            ".",
+            "..",
+            "%2e%2e",
+            "%2F",
+            "x%2F..%2F..%2Fauth%2Flogin",
+            "x%2f..%2f..%2fauth",
+            "org%2F1",
+            "user%2F1",
+            "api-keys",
+        ];
+        let methods = [
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ];
+
+        for case in 0..50_000u32 {
+            let segment_count = 1 + next() % 7;
+            let segments = (0..segment_count)
+                .map(|_| pool[(next() % pool.len() as u64) as usize])
+                .collect::<Vec<_>>();
+            // The router always sees an absolute path; optionally poison
+            // the shape with a trailing slash (matchit has no tolerance —
+            // if that ever changes, this property must catch it).
+            let mut path = format!("/{}", segments.join("/"));
+            if next() % 4 == 0 {
+                path.push('/');
+            }
+            let method = methods[(next() % methods.len() as u64) as usize].clone();
+
+            let gate_mutation = is_workload_authority_mutation(&method, &path);
+            if let Ok(matched) = mirror.at(&path) {
+                let (pattern, served_methods) = route_table[*matched.value];
+                if let Some(&(_, handler_is_allow)) = served_methods
+                    .iter()
+                    .find(|(served, _)| *served == method.as_str())
+                {
+                    // The router dispatches this (method, path) to a real
+                    // handler: the gate must agree with the handler's
+                    // mutation-ness in both directions.
+                    assert_eq!(
+                        gate_mutation,
+                        !handler_is_allow,
+                        "gate/router disagreement (seed case {case}): {method} {path} \
+                         dispatches to {pattern} but the gate classifies it as \
+                         {}",
+                        if gate_mutation { "mutation" } else { "allowed" },
+                    );
+                }
+                // Method not served on the matched pattern -> 405 at the
+                // router; the gate's deny-by-default classification is
+                // safe either way.
+            }
+            // No route matched -> 404; unconstrained (the gate may allow or
+            // block shapes no handler serves).
         }
     }
 

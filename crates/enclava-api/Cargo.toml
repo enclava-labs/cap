@@ -67,3 +67,8 @@ prod-strict = ["enclava-engine/prod-strict"]
 [dev-dependencies]
 axum-test = "20"
 tower = { version = "0.5", features = ["util"] }
+# Test-only mirror of the router's matcher: the freeze-gate property test
+# asserts gate classification matches matchit dispatch on generated raw
+# paths. Must stay the same matchit minor that axum resolves to (see
+# Cargo.lock) so the mirror exercises the real matching semantics.
+matchit = "0.8"
