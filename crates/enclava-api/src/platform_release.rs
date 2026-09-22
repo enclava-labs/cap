@@ -303,6 +303,41 @@ fn lexical_absolute(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Canonicalize the nearest existing ancestor of `path`: walk up until a
+/// component exists, `canonicalize` it (resolving symlinks), then re-append
+/// the missing tail. Returns the fully canonical form when `path` itself
+/// exists. Returns `None` when no ancestor can be resolved (or a non-NotFound
+/// IO error occurs) — callers treat that as "no information", same as before.
+///
+/// Codex P2 (cap#165): `canonicalize` alone returns `NotFound` for the
+/// not-yet-created state file, so a symlink in a PARENT directory (state at
+/// `/link/release.accepted` with `/link` → `/real`, override at
+/// `/real/release.accepted.tmp`) hid the alias between the state's derived
+/// `.tmp` sibling and the override envelope.
+fn canonicalize_nearest_existing(path: &Path) -> Option<PathBuf> {
+    let mut current = lexical_absolute(path);
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&current) {
+            Ok(resolved) => {
+                let mut result = resolved;
+                for component in tail.iter().rev() {
+                    result.push(component);
+                }
+                return Some(result);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tail.push(current.file_name()?.to_os_string());
+                current = current.parent()?.to_path_buf();
+            }
+            // A non-NotFound error (permissions, loop, …): resolving anyway
+            // could hide an alias, so report "unresolvable" and let the
+            // lexical checks stand.
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Resolve the high-water-mark state lane.
 ///
 /// The override lane (ENCLAVA_PLATFORM_RELEASE_PATH set) REQUIRES an explicit
@@ -330,10 +365,13 @@ fn resolve_high_water_state(
             // state path, which would atomically destroy the signed
             // envelope and brick every subsequent restart. Compare
             // lexically-normalized absolute paths (catches `./release.json`
-            // vs `release.json` and `a/../b` forms) and, when both files
-            // already exist, canonicalized paths (catches symlinks). This
-            // can over-equate through symlinked `..` components; rejecting
-            // a suspicious config is the safe direction for this guard.
+            // vs `release.json` and `a/../b` forms) and canonicalized paths
+            // resolved through the nearest EXISTING ancestor (catches
+            // symlinks on the files themselves and in parent directories,
+            // even when the state file does not exist yet — Codex P2,
+            // cap#165). This can over-equate through symlinked `..`
+            // components; rejecting a suspicious config is the safe
+            // direction for this guard.
             let norm_override = lexical_absolute(Path::new(override_path));
             let norm_state = lexical_absolute(Path::new(&state));
             let derived: [PathBuf; 2] = {
@@ -344,12 +382,17 @@ fn resolve_high_water_state(
                 };
                 [suffix(".tmp"), suffix(".lock")]
             };
+            let resolved_override = canonicalize_nearest_existing(Path::new(override_path));
+            let resolved_state = canonicalize_nearest_existing(Path::new(&state));
+            let resolved_derived: [Option<PathBuf>; 2] = [
+                canonicalize_nearest_existing(&derived[0]),
+                canonicalize_nearest_existing(&derived[1]),
+            ];
             let aliasing = norm_override == norm_state
                 || derived.contains(&norm_override)
-                || std::fs::canonicalize(Path::new(override_path))
-                    .ok()
-                    .zip(std::fs::canonicalize(&state).ok())
-                    .is_some_and(|(o, s)| o == s);
+                || resolved_override.is_some()
+                    && (resolved_override == resolved_state
+                        || resolved_derived.contains(&resolved_override));
             if aliasing {
                 return Err(PlatformReleaseError::InvalidField {
                     field: "ENCLAVA_PLATFORM_RELEASE_STATE",
@@ -494,6 +537,55 @@ fn enforce_override_gate(
     })
 }
 
+/// Create `path` and any missing ancestors durably: every newly created
+/// directory entry is fsynced in ITS parent, so a power loss cannot discard
+/// a freshly created ancestor (and the high-water mark inside it) that the
+/// later final-directory sync cannot cover — `create_dir_all` creates the
+/// whole chain with a single metadata write per directory and never syncs.
+/// Codex P2 (cap#165).
+fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
+    let target = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    // Collect the missing suffix, shallowest-last.
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut current = target.to_path_buf();
+    loop {
+        match std::fs::metadata(&current) {
+            Ok(meta) if meta.is_dir() => break,
+            Ok(_) => {
+                return Err(std::io::Error::other(format!(
+                    "state path component {} exists and is not a directory",
+                    current.display()
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(current.clone());
+                let Some(parent) = current.parent() else {
+                    return Err(std::io::Error::other(format!(
+                        "cannot create {} (no parent)",
+                        current.display()
+                    )));
+                };
+                current = parent.to_path_buf();
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    for dir in missing.iter().rev() {
+        std::fs::create_dir(dir)?;
+        // fsync the parent so the new directory entry itself is durable.
+        let parent = dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Open `<state>.lock` and run `body` under an exclusive flock, serializing
 /// every read-compare-persist sequence (override lane AND bundled-lane
 /// removal guard) across concurrent API replicas sharing the state volume.
@@ -506,7 +598,7 @@ fn with_state_lock<T>(
     lock_path.push(".lock");
     let lock_path = PathBuf::from(lock_path);
     if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
+        create_dir_all_durable(parent).map_err(|error| {
             PlatformReleaseError::HighWaterMarkPersistFailed {
                 state_path: state_path.display().to_string(),
                 source: error,
@@ -560,7 +652,7 @@ fn enforce_override_not_older_than_last_accepted_locked(
                 });
             }
         };
-    let floor = newest_mark(persisted)?;
+    let floor = newest_mark(persisted.clone())?;
     if let Some(mark) = &floor
         && mark_is_older(&AcceptedOverrideMark::of(release)?, mark)?
     {
@@ -573,7 +665,16 @@ fn enforce_override_not_older_than_last_accepted_locked(
         });
     }
     let mark = AcceptedOverrideMark::of(release)?;
-    if floor.as_ref() != Some(&mark) && persist {
+    // Codex P1 (cap#165): decide whether to persist by comparing against
+    // the ACTUAL stored mark, not the synthetic bundle-inclusive floor.
+    // When the override is identical to a newer bundled release (the normal
+    // shape when a new API image and its matching override roll out
+    // together) and the stored mark is absent or older, `floor` equals the
+    // candidate and the old `floor != mark` check skipped the write — a
+    // later binary rollback would then leave the state recording only the
+    // old release (or nothing), letting the override be swapped back to
+    // that stale release despite the newer one having been accepted.
+    if persisted.as_ref() != Some(&mark) && persist {
         // Durable atomic persist: write a sibling temp file, fsync it, then
         // rename over the mark. A bare truncate-in-place write could tear on
         // crash (next boot fails closed) or silently lose the mark on power
@@ -1274,6 +1375,44 @@ mod tests {
     }
 
     #[test]
+    fn override_lane_rejects_symlinked_parent_dir_alias() {
+        // Codex P2 (cap#165): the state file itself does NOT exist yet, but
+        // a parent directory is a symlink — /link → /real. The derived
+        // `<state>.tmp` sibling resolves to /real/release.accepted.tmp,
+        // which IS the override envelope; plain canonicalize(state) would
+        // return NotFound and hide the alias.
+        let dir = std::env::temp_dir().join(format!(
+            "cap165-alias-parent-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        // The override envelope lives at the derived .tmp sibling under the
+        // REAL directory; the state is spelled through the symlinked one.
+        std::fs::write(real.join("release.accepted.tmp"), b"{}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, dir.join("link")).unwrap();
+
+        let state = dir.join("link").join("release.accepted");
+        let override_path = real.join("release.accepted.tmp");
+        let result = resolve_high_water_state(
+            Some(override_path.to_str().unwrap()),
+            Some(state.to_str().unwrap().to_string()),
+        );
+        #[cfg(unix)]
+        assert!(
+            matches!(result, Err(PlatformReleaseError::InvalidField { field, .. }) if field == "ENCLAVA_PLATFORM_RELEASE_STATE"),
+            "symlinked-parent alias must be rejected"
+        );
+        #[cfg(not(unix))]
+        let _ = result;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn env_override_path_rejects_validly_signed_stale_release() {
         // A stale envelope that PASSES signature verification must still be
         // refused when it arrives via the ENCLAVA_PLATFORM_RELEASE_PATH
@@ -1463,6 +1602,67 @@ mod tests {
             Some("https://kbs-first.example.test"),
         );
         assert!(load_and_maybe_commit(again, &state, true).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn override_matching_newer_bundle_still_persists_mark() {
+        // Codex P1 (cap#165): when the override is identical to a NEWER
+        // bundled release and the stored mark is absent/older, the old
+        // code compared against the bundle-inclusive floor and skipped the
+        // persist. After a binary rollback the state then recorded nothing
+        // (or only the old release), letting the override be swapped back
+        // to a stale release despite the newer one having been accepted.
+        let dir = std::env::temp_dir().join(format!(
+            "pr-hwm-bundle-match-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+
+        // An override strictly newer than the compiled-in bundle, accepted
+        // and committed: the mark MUST be persisted even though the
+        // bundle-inclusive floor already equals the candidate.
+        let newer = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        assert!(load_and_maybe_commit(newer, &state, true).is_ok());
+        assert!(
+            state.exists(),
+            "candidate equal to the bundle-inclusive floor must still persist"
+        );
+        let mark: AcceptedOverrideMark =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        assert_eq!(mark.created_at, "2999-01-01T00:00:00Z");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn state_directory_tree_is_created_and_usable() {
+        // Codex P2 (cap#165): a state path pointing into a NOT-yet-existing
+        // directory tree must be created (durably — each new ancestor is
+        // fsynced in its parent) and the first acceptance must succeed.
+        let dir = std::env::temp_dir().join(format!(
+            "pr-hwm-dirtree-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state = dir.join("a").join("b").join("release.accepted");
+        let newer = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        assert!(load_and_maybe_commit(newer, &state, true).is_ok());
+        assert!(state.exists());
+        // Steady state: re-loading the same release must not rewrite the
+        // mark (persisted == candidate → no write).
+        let before = std::fs::metadata(&state).unwrap().modified().unwrap();
+        let again = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        assert!(load_and_maybe_commit(again, &state, true).is_ok());
+        let after = std::fs::metadata(&state).unwrap().modified().unwrap();
+        assert_eq!(before, after);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -150,13 +150,25 @@ def _label_looks_numeric(label: str) -> bool:
 
 
 def _idna_normalize(host: str) -> str | None:
-    # Non-ASCII hosts go through the same UTS46/IDNA2008 processing the url
-    # crate performs (stdlib .encode("idna") is IDNA2003 and accepts inputs
-    # like a non-breaking space that the url crate rejects, so it cannot be
-    # used here). If the `idna` package is unavailable, fail closed: reject
-    # every non-ASCII host rather than risk signing an unloadable envelope.
-    # Returns the UTS46-normalized ASCII host, or None if invalid/unavailable.
-    if host.isascii():
+    # All hosts — ASCII and non-ASCII alike — go through the same
+    # UTS46/IDNA2008 processing the url crate performs (stdlib
+    # .encode("idna") is IDNA2003 and accepts inputs like a non-breaking
+    # space that the url crate rejects, so it cannot be used here). ASCII
+    # hosts are NOT exempt: an invalid ACE label like `xn--` (empty
+    # Punycode payload) or `xn--a` passes urlparse and the character
+    # denylist but is rejected by the url crate's IDNA processing, so
+    # signing it would produce an unloadable envelope (Codex P2, cap#165).
+    # ASCII inputs that contain no `xn--` label and no non-ASCII codepoint
+    # can only differ from UTS46 output by case-mapping, which every
+    # consumer downcases anyway — those are validated without requiring
+    # the idna package; any host with a Punycode label or non-ASCII
+    # codepoint requires it (fail closed when unavailable).
+    def _has_punycode_label(value: str) -> bool:
+        return any(
+            label.lower().startswith("xn--") for label in value.split(".")
+        )
+
+    if host.isascii() and not _has_punycode_label(host):
         return host
     try:
         import idna  # type: ignore[import-not-found]

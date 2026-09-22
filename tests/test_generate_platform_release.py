@@ -213,6 +213,34 @@ def test_release_generator_accepts_valid_unicode_idna_host():
     generate_platform_release.validate_payload(payload)
 
 
+def test_release_generator_rejects_invalid_ascii_ace_labels():
+    # Codex P2 (cap#165): an ASCII but malformed ACE label like `xn--`
+    # (empty Punycode payload) or `xn--mnchen-3ya-` (bad delimiter) passes
+    # urlparse and the character denylist, but the url crate's IDNA
+    # processing rejects it — the generator must not sign such a host.
+    pytest.importorskip("idna")
+    for value in (
+        "https://xn--/",
+        "https://xn--.example.test/",
+        "https://xn--mnchen-3ya-.example.test/",
+        "https://kbs.xn--/ ",
+    ):
+        payload = base_payload()
+        payload["trustee_kbs_url"] = value
+
+        with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
+            generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_accepts_valid_ascii_ace_labels():
+    # Positive control: a well-formed ACE label round-trips through
+    # idna.encode and must remain signable.
+    pytest.importorskip("idna")
+    payload = base_payload()
+    payload["trustee_kbs_url"] = "https://xn--mnchen-3ya.example.test/"
+    generate_platform_release.validate_payload(payload)
+
+
 def test_release_generator_rejects_whatwg_ipv4_ending_host_shapes():
     # WHATWG runs the IPv4 parser when the last label is numeric; Python
     # urlparse leaves `1.2.3.4.5` / `999.1.1.1` untouched in .hostname but
