@@ -1503,7 +1503,8 @@ async fn process_apply_job(
             }
         }
         Ok(Ok(JobApplyOutcome::ApplyFailed(error, mutation))) => {
-            fail_apply_job_with_mutation(&state, &job, &error, Some(mutation)).await;
+            fail_apply_job_with_mutation(&state, &job, &error, Some(mutation), Some(&payload.app))
+                .await;
         }
         Ok(Err(error)) if error.should_requeue_without_terminal_failure() => {
             if let Err(requeue_error) = requeue_apply_job(&state.db, &job, error.code()).await {
@@ -2334,7 +2335,7 @@ async fn deployment_is_terminal(
 }
 
 async fn fail_apply_job(state: &AppState, job: &ClaimedJob, error: &DeploymentJobError) {
-    fail_apply_job_with_mutation(state, job, error, None).await;
+    fail_apply_job_with_mutation(state, job, error, None, None).await;
 }
 
 async fn reconcile_pending_kbs_with_mutation(
@@ -2396,6 +2397,7 @@ async fn fail_apply_job_with_mutation(
     job: &ClaimedJob,
     error: &DeploymentJobError,
     mut mutation: Option<crate::mutation_leases::AppMutationLease>,
+    failed_app: Option<&App>,
 ) {
     let published =
         match publish_apply_failure_with_mutation(&state.db, job, mutation.as_mut()).await {
@@ -2409,6 +2411,20 @@ async fn fail_apply_job_with_mutation(
                 false
             }
         };
+    // Compensating provider cleanup for the partial state this apply may have
+    // published (HAProxy routes, namespace objects). Runs while the mutation
+    // lease still owns the edge/namespace fences, before any fence release.
+    // Best-effort by design: failures keep the fences quarantined for
+    // operator/periodic reconciliation.
+    if published && let (Some(mutation), Some(app)) = (mutation.as_ref(), failed_app) {
+        crate::deployment_failure_cleanup::cleanup_after_terminal_apply_failure(
+            state,
+            app,
+            job.deployment_id,
+            mutation,
+        )
+        .await;
+    }
     if published && let Some(mutation) = mutation.as_mut() {
         if reconcile_pending_kbs_with_mutation(state, mutation)
             .await
