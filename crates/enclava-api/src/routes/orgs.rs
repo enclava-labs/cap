@@ -1637,8 +1637,13 @@ mod tests {
     /// The database name is suffixed with the current process id: sibling CI
     /// worktrees share one PostgreSQL server, and a fixed name would let two
     /// processes mutate the same singleton row concurrently.  The database is
-    /// created fresh (a stale leftover from a crashed run is dropped first)
-    /// and dropped at the end of the test.
+    /// created fresh (a stale leftover from a crashed run is dropped first).
+    ///
+    /// The pool must be returned to [`drop_isolated_database`] when the test
+    /// body finishes; that closes the pool and drops the database so repeated
+    /// CI runs do not accumulate fully migrated databases on the shared
+    /// PostgreSQL server (the pid suffix means a later run's initial
+    /// DROP IF EXISTS never matches an earlier run's leftover).
     async fn isolated_database_test_pool(name: &str) -> sqlx::PgPool {
         let base_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
@@ -1675,6 +1680,33 @@ mod tests {
             .await
             .expect("migrate isolated keyring database");
         pool
+    }
+
+    /// Companion to [`isolated_database_test_pool`]: closes the pool and
+    /// drops the per-process database.  Without this, every test run leaves
+    /// a fully migrated database behind on the shared PostgreSQL server (the
+    /// pid suffix means a later run's initial `DROP IF EXISTS` targets a
+    /// different name and never reclaims it).
+    async fn drop_isolated_database(name: &str, pool: sqlx::PgPool) {
+        let base_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let db_name = format!("{name}_{}", std::process::id());
+        // All clones share one connection pool, so this closes every handle
+        // the test (and its AppState clones) hold; DROP ... WITH (FORCE)
+        // would terminate any stragglers regardless.
+        pool.close().await;
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&base_url)
+            .await
+            .expect("connect isolated keyring database admin for drop");
+        sqlx::query(&format!(
+            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+        ))
+        .execute(&admin)
+        .await
+        .expect("drop isolated keyring database");
+        admin.close().await;
     }
 
     #[tokio::test]
@@ -1801,6 +1833,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete keyring enqueue user");
+        drop_isolated_database("cap130_keyring_enqueue_put", pool).await;
     }
 
     #[tokio::test]
@@ -1994,6 +2027,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete rotate enqueue user");
+        drop_isolated_database("cap130_keyring_enqueue_rotate", pool).await;
     }
 
     #[tokio::test]
