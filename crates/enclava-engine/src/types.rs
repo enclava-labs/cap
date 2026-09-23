@@ -100,6 +100,16 @@ pub struct WorkloadArtifactBinding {
     pub descriptor_signing_pubkey: [u8; 32],
     #[serde(with = "hex_bytes32")]
     pub org_keyring_fingerprint: [u8; 32],
+    /// Render-compatibility pin for pre-claim signed artifacts. Artifacts
+    /// signed before the `log_encryption_json` cc_init_data claim existed
+    /// carry an `expected_cc_init_data_hash` computed over a render without
+    /// the claim. When artifact validation detects that only that legacy
+    /// render matches, it sets this flag so every downstream consumer
+    /// (statefulset, KBS policy/TLS binding) renders the exact bytes the
+    /// artifact was signed over. Freshly signed artifacts always render the
+    /// modern layout (`false`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub omit_log_encryption_claim: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

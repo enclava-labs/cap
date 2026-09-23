@@ -21,7 +21,7 @@ COPY crates ./crates
 RUN if [ "${BUILD_PROFILE}" = "release" ]; then \
       cargo build --locked --release -p enclava-init --features prod-strict --bin enclava-init && \
       cargo build --locked --release -p enclava-init --features prod-strict --bin enclava-log-relay && \
-      cargo build --locked --release -p enclava-wait-exec --target x86_64-unknown-linux-musl && \
+      cargo build --locked --release -p enclava-wait-exec --features prod-strict --target x86_64-unknown-linux-musl && \
       mkdir -p /out && \
       cp target/release/enclava-init /out/enclava-init && \
       cp target/release/enclava-log-relay /out/enclava-log-relay && \

@@ -121,6 +121,19 @@ jobs:
         # that the cfg string exists in source. Needs no DATABASE_URL.
         run: cargo test --locked -p enclava-init --lib --features prod-strict -- --test-threads=1
 
+      - name: Run enclava-init prod-strict binary tests
+        # Failure-path tests redirect init surfaces through the cfg(test)-only
+        # override map (env vars are compiled out under prod-strict), so the
+        # full binary suite must pass under prod-strict too.
+        run: cargo test --locked -p enclava-init --bins --features prod-strict -- --test-threads=1
+
+      - name: Run enclava-wait-exec prod-strict tests
+        # Proves the readiness/started-dir env gates are compiled out of the
+        # prod-strict wait-exec build (readiness handoff pinned to the
+        # compiled defaults, mirroring enclava-init). Bin unit tests only:
+        # the integration tests exercise the dev-build env-override behavior.
+        run: cargo test --locked -p enclava-wait-exec --bins --features prod-strict -- --test-threads=1
+
       - name: Run doctests
         run: cargo test --doc
 

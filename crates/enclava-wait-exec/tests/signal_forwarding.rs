@@ -6,7 +6,11 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// Signal forwarding tests require env overrides to redirect paths to temp dirs.
+// In prod-strict builds, env overrides are compiled out, so these tests
+// cannot run (the binary would look for hardcoded paths that don't exist).
 #[test]
+#[cfg(not(feature = "prod-strict"))]
 fn disabled_logging_does_not_block_on_unread_host_pipes() {
     let dir = env::temp_dir().join(format!(
         "enclava-wait-exec-unread-pipe-test-{}-{}",
@@ -70,6 +74,7 @@ fn disabled_logging_does_not_block_on_unread_host_pipes() {
 }
 
 #[test]
+#[cfg(not(feature = "prod-strict"))]
 fn encrypted_log_wrapper_forwards_sigterm_to_child() {
     let dir = env::temp_dir().join(format!(
         "enclava-wait-exec-signal-test-{}-{}",

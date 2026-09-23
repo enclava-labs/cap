@@ -322,6 +322,7 @@ fn toml_contains_workload_artifact_binding_when_present() {
         descriptor_core_hash: [0xab; 32],
         descriptor_signing_pubkey: [0xcd; 32],
         org_keyring_fingerprint: [0xef; 32],
+        omit_log_encryption_claim: false,
     });
     let toml = build_toml(&app);
     assert!(toml.contains(&format!("descriptor_core_hash = \"{}\"", "ab".repeat(32))));
@@ -539,4 +540,72 @@ fn runtime_class_rejects_unknown_values() {
         err,
         RuntimeClassConfigError::Unsupported("kata-qemu-tdx".to_string())
     );
+}
+
+#[test]
+fn log_encryption_claim_is_bound_to_cc_init_data() {
+    let mut app = sample_app();
+    app.log_encryption = Some(enclava_engine::types::LogEncryptionConfig {
+        algorithm: "x25519-hpke-v1".to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+    });
+    let toml = build_toml(&app);
+    let value: toml::Value = toml::from_str(&toml).unwrap();
+    let data = value.get("data").and_then(toml::Value::as_table).unwrap();
+    let handoff: serde_json::Value = serde_json::from_str(
+        data.get("log_encryption_json")
+            .and_then(toml::Value::as_str)
+            .expect("log_encryption_json claim"),
+    )
+    .unwrap();
+    assert_eq!(handoff["algorithm"], "x25519-hpke-v1");
+    assert_eq!(handoff["key_id"], "logs-prod");
+    assert_eq!(
+        handoff["public_key_base64url"],
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    );
+    assert_eq!(
+        handoff["public_key_sha256"],
+        "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU"
+    );
+    // Rollback-stable frame labels (org_id, app_name) are part of the
+    // measured claim: both are constants of the app across the re-renders
+    // that reuse one signed artifact (rollback, unlock transition, queued-
+    // job replay), so their presence does not break hash reuse.
+    assert_eq!(handoff["org_id"], "test-org");
+    assert_eq!(handoff["app_name"], "test-app");
+    // deployment_id deliberately stays OUT: those operations render under a
+    // fresh deployment UUID, so including it would break signed hash reuse.
+    assert!(
+        handoff.get("deployment_id").is_none(),
+        "deployment_id must not be part of the measured log_encryption_json claim"
+    );
+
+    // `omit_log_encryption_claim` reproduces the pre-claim byte layout for
+    // artifacts signed before this field existed (legacy render pin).
+    let mut legacy = app.clone();
+    legacy.workload_artifact_binding = Some(WorkloadArtifactBinding {
+        descriptor_core_hash: [0u8; 32],
+        descriptor_signing_pubkey: [0u8; 32],
+        org_keyring_fingerprint: [0u8; 32],
+        omit_log_encryption_claim: true,
+    });
+    let legacy_toml = build_toml(&legacy);
+    let legacy_value: toml::Value = toml::from_str(&legacy_toml).unwrap();
+    let legacy_data = legacy_value
+        .get("data")
+        .and_then(toml::Value::as_table)
+        .unwrap();
+    assert!(
+        legacy_data.get("log_encryption_json").is_none(),
+        "omit_log_encryption_claim must reproduce the pre-claim byte layout"
+    );
+
+    // Absent when log encryption is not configured.
+    let plain = build_toml(&sample_app());
+    let value: toml::Value = toml::from_str(&plain).unwrap();
+    let data = value.get("data").and_then(toml::Value::as_table).unwrap();
+    assert!(data.get("log_encryption_json").is_none());
 }
