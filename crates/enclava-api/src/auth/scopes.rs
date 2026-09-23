@@ -133,12 +133,15 @@ pub fn role_name(role: Role) -> &'static str {
 /// role, or remove an existing admin — only owners manage privileged roles.
 /// Admins keep full control over plain members.
 ///
-/// Self-service exception: a caller targeting *themselves* with a
+/// Self-service exception: an admin targeting *themselves* with a
 /// non-privileged requested role (demote-to-member via invite, or removal)
-/// is allowed regardless of caller role. Such a change only ever lowers the
-/// caller's own privileges, so it cannot escalate anything; it exists so an
-/// admin is never trapped in the role when no owner is available. Granting
-/// or keeping a privileged role — even to oneself — still requires an owner.
+/// is allowed. Such a change only ever lowers the caller's own privileges,
+/// so it cannot escalate anything; it exists so an admin is never trapped
+/// in the role when no owner is available. Granting or keeping a privileged
+/// role — even to oneself — still requires an owner. The exemption requires
+/// the caller's in-transaction role read AND the FOR UPDATE-locked target
+/// row to both say admin, so a stale admin read against a concurrently
+/// promoted-to-owner row fails closed into the owner gate.
 pub fn require_owner_to_modify_privileged_role(
     caller_role: Role,
     current_role: Option<Role>,
@@ -147,7 +150,10 @@ pub fn require_owner_to_modify_privileged_role(
 ) -> AuthzResult {
     let touches_privileged = current_role.is_some_and(is_privileged_role)
         || requested_role.is_some_and(is_privileged_role);
-    let self_release = target_is_caller && !requested_role.is_some_and(is_privileged_role);
+    let self_release = target_is_caller
+        && matches!(caller_role, Role::Admin)
+        && current_role == Some(Role::Admin)
+        && !requested_role.is_some_and(is_privileged_role);
     if touches_privileged && !self_release && !matches!(caller_role, Role::Owner) {
         return Err(forbidden(
             "only owners can grant, change, or remove admin and owner roles",
@@ -395,6 +401,34 @@ mod tests {
                 false
             )
             .is_err()
+        );
+        // Stale-read hardening: a stale admin caller-role read paired with a
+        // target row that has since been promoted to owner fails closed into
+        // the owner gate instead of waiving it.
+        assert!(
+            require_owner_to_modify_privileged_role(
+                Role::Admin,
+                Some(Role::Owner),
+                Some(Role::Member),
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            require_owner_to_modify_privileged_role(Role::Admin, Some(Role::Owner), None, true)
+                .is_err()
+        );
+        // A member self-targeting never passes either: member rows do not
+        // touch privileged roles (no gate), but a stale admin read paired
+        // with a demoted-to-member row must not resurrect the exemption.
+        assert!(
+            require_owner_to_modify_privileged_role(
+                Role::Admin,
+                Some(Role::Member),
+                Some(Role::Member),
+                true
+            )
+            .is_ok()
         );
     }
 
