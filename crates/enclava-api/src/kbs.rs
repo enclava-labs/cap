@@ -2721,12 +2721,19 @@ owner_resource_bindings := {}
         }
     }
 
+    /// Regression coverage for the #130 keyring-rotation generation bump.
+    /// Runs against its own uniquely named per-process database (see
+    /// [`crate::test_support::isolated_database_test_pool`]): this test asserts
+    /// exact `kbs_signed_policy_reconciliation` singleton values and resets
+    /// them, and on the shared test database another test process (a sibling
+    /// CI worktree on the same PostgreSQL server) could bump the generation
+    /// between this test's commit and its exact assertion, or have its own
+    /// state clobbered by this test's final reset.  The process-local
+    /// `SIGNED_POLICY_SINGLETON_LOCK` cannot fence across processes.
     #[tokio::test]
     async fn keyring_rotation_enqueues_signed_policy_reconciliation_only_when_active() {
-        let _singleton = crate::test_support::SIGNED_POLICY_SINGLETON_LOCK
-            .lock()
-            .await;
-        let pool = database_test_pool().await;
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap130_rotation_enqueue").await;
 
         // Unsigned-only installs must not enter signed-policy mode.
         sqlx::query(
@@ -2781,19 +2788,7 @@ owner_resource_bindings := {}
         .unwrap();
         assert_eq!(desired, 2);
 
-        sqlx::query(
-            "UPDATE kbs_signed_policy_reconciliation
-                SET desired_generation = 0,
-                    configmap_generation = 0,
-                    applied_generation = 0,
-                    configmap_policy_sha256 = NULL,
-                    applied_policy_sha256 = NULL,
-                    configmap_resource_version = NULL
-              WHERE singleton",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        crate::test_support::drop_isolated_database("cap130_rotation_enqueue", pool).await;
     }
 
     /// Regression for #130: a retained historical artifact must stop
