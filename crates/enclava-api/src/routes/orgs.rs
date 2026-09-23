@@ -5179,6 +5179,33 @@ mod tests {
         }
     }
 
+    /// Companion to [`isolated_database_test_pool`]: closes the pool and
+    /// drops the per-process database.  Without this, every test run leaves
+    /// a fully migrated database behind on the shared PostgreSQL server (the
+    /// pid suffix means a later run's initial `DROP IF EXISTS` targets a
+    /// different name and never reclaims it).
+    async fn drop_isolated_database(name: &str, pool: sqlx::PgPool) {
+        let base_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+        let db_name = format!("{name}_{}", std::process::id());
+        // All clones share one connection pool, so this closes every handle
+        // the test (and its AppState clones) hold; DROP ... WITH (FORCE)
+        // would terminate any stragglers regardless.
+        pool.close().await;
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&base_url)
+            .await
+            .expect("connect isolated keyring database admin for drop");
+        sqlx::query(&format!(
+            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+        ))
+        .execute(&admin)
+        .await
+        .expect("drop isolated keyring database");
+        admin.close().await;
+    }
+
     #[tokio::test]
     async fn put_keyring_reports_success_only_after_kbs_publication() {
         let _singleton = keyring_enqueue_guard().await;
