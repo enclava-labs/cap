@@ -114,7 +114,15 @@ fn run() -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from("/etc/enclava-init/config.toml"));
     let cfg = Config::load(&cfg_path).with_context(|| format!("loading {}", cfg_path.display()))?;
     record_stage("validating signed config").ok();
-    let log_encryption_handoff = validate_configmap_transport_against_signed_cc_init_data(&cfg)?;
+    // Read the projected cc_init_data ConfigMap exactly once per boot and use
+    // this single byte snapshot for BOTH the ConfigMap transport cross-check
+    // and the later in-TEE hash/signature verification. Re-reading the file
+    // between those steps would let a malicious host swap in different bytes
+    // after the cross-check (e.g. an attacker-controlled log_encryption_json)
+    // but before the forward-chain hash check pins the authentic bytes again.
+    let cc_init_data = read_cc_init_data(&cfg)?;
+    let log_encryption_handoff =
+        validate_configmap_transport_against_signed_cc_init_data(&cfg, cc_init_data.as_deref())?;
     // The relay starts only after the signed-config check passes: it serves
     // an unauthenticated log-tail endpoint keyed off host-visible env, so
     // it must not come up while the transport is still unverified.
@@ -144,7 +152,7 @@ fn run() -> Result<()> {
     // Fail-closed: any verification gap (missing inputs, missing policy-read
     // availability) returns Err and aborts before seed release.
     let phase = stats.elapsed_ms();
-    run_in_tee_verification(&cfg)?;
+    run_in_tee_verification(&cfg, cc_init_data.as_deref())?;
     stats.record_tee_verify(phase);
 
     record_stage("provisioning static tls certificate").ok();
@@ -476,9 +484,11 @@ fn acquire_owner_seed_password(cfg: &Config) -> Result<OwnerSeed> {
     }
 }
 
-fn validate_configmap_transport_against_signed_cc_init_data(
-    cfg: &Config,
-) -> Result<LogEncryptionHandoffFile> {
+/// Read the projected cc_init_data ConfigMap once so the exact same byte
+/// snapshot feeds both the transport cross-check and the in-TEE hash /
+/// signature verification (TOCTOU hardening against a host that rewrites the
+/// file between the two reads).
+fn read_cc_init_data(cfg: &Config) -> Result<Option<Vec<u8>>> {
     if !cfg.trustee_policy_read_available {
         if cfg!(feature = "prod-strict") {
             anyhow::bail!(
@@ -486,16 +496,35 @@ fn validate_configmap_transport_against_signed_cc_init_data(
             );
         }
         if cfg.cc_init_data_path.is_none() {
-            return Ok(LogEncryptionHandoffFile::Unconfigured);
+            return Ok(None);
         }
     }
     let cc_path = cfg
         .cc_init_data_path
         .as_deref()
         .ok_or_else(|| anyhow!("verification requires cc_init_data_path"))?;
-    let cc_toml = std::fs::read_to_string(cc_path).with_context(|| format!("reading {cc_path}"))?;
-    let parsed: toml::Value =
-        toml::from_str(&cc_toml).with_context(|| format!("parsing {cc_path}"))?;
+    let bytes = std::fs::read(cc_path).with_context(|| format!("reading {cc_path}"))?;
+    Ok(Some(bytes))
+}
+
+fn validate_configmap_transport_against_signed_cc_init_data(
+    cfg: &Config,
+    cc_init_data: Option<&[u8]>,
+) -> Result<LogEncryptionHandoffFile> {
+    if !cfg.trustee_policy_read_available {
+        if cfg!(feature = "prod-strict") {
+            anyhow::bail!(
+                "prod-strict refuses trustee_policy_read_available=false; signed cc_init_data verification cannot be skipped"
+            );
+        }
+        if cc_init_data.is_none() {
+            return Ok(LogEncryptionHandoffFile::Unconfigured);
+        }
+    }
+    let cc_bytes =
+        cc_init_data.ok_or_else(|| anyhow!("verification requires cc_init_data bytes"))?;
+    let cc_toml = std::str::from_utf8(cc_bytes).context("parsing cc_init_data as utf-8")?;
+    let parsed: toml::Value = toml::from_str(cc_toml).context("parsing cc_init_data")?;
     let data = parsed
         .get("data")
         .and_then(toml::Value::as_table)
@@ -1426,7 +1455,7 @@ fn derive_volume_key(owner: &OwnerSeed, info: &str) -> Result<DerivedSeed> {
     Ok(derived)
 }
 
-fn run_in_tee_verification(cfg: &Config) -> Result<()> {
+fn run_in_tee_verification(cfg: &Config, cc_init_data: Option<&[u8]>) -> Result<()> {
     if !cfg.trustee_policy_read_available {
         return Ok(trustee_verify::verify_chain_required(None)?);
     }
@@ -1438,13 +1467,13 @@ fn run_in_tee_verification(cfg: &Config) -> Result<()> {
         .trustee_policy_url
         .as_deref()
         .ok_or_else(|| anyhow!("trustee_policy_read_available=true requires trustee_policy_url"))?;
-    let cc_path = cfg
-        .cc_init_data_path
-        .as_deref()
-        .ok_or_else(|| anyhow!("verification requires cc_init_data_path"))?;
+    // Reuse the byte snapshot read before the ConfigMap transport cross-check:
+    // the forward-chain expected_cc_init_data_hash must pin the exact bytes
+    // that produced the log-encryption handoff, not a fresh host-controlled
+    // read of the projected ConfigMap.
     let cc_bytes =
-        std::fs::read(cc_path).with_context(|| format!("reading cc_init_data from {cc_path}"))?;
-    let cc_claims = parse_cc_init_data_claims(&cc_bytes)?;
+        cc_init_data.ok_or_else(|| anyhow!("verification requires cc_init_data bytes"))?;
+    let cc_claims = parse_cc_init_data_claims(cc_bytes)?;
     let signer_pk = cfg
         .platform_trustee_policy_pubkey_hex
         .as_deref()
@@ -1473,7 +1502,7 @@ fn run_in_tee_verification(cfg: &Config) -> Result<()> {
         policy_envelope: &envelope,
         artifacts: &bundle,
         cc_init_data_claims: &cc_claims,
-        local_cc_init_data_toml: &cc_bytes,
+        local_cc_init_data_toml: cc_bytes,
         platform_trustee_policy_pubkey: signer_pk.as_ref(),
         signing_service_pubkey: signing_pk.as_ref(),
     };

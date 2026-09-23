@@ -1,6 +1,6 @@
 use super::*;
 use chrono::TimeDelta;
-use enclava_init::config::AppBindMountConfig;
+use enclava_init::config::{AppBindMountConfig, LogEncryptionSection};
 use enclava_init::safe_diagnostics::SafeDiagnosticCode;
 use enclava_init::tls_certificate::TlsBrokerFailure;
 use serde_json::json;
@@ -775,12 +775,19 @@ fn config_with_matching_signed_cc(dir: &Path) -> Config {
     cfg
 }
 
+/// Mirrors the production sequence: read the projected cc_init_data once,
+/// then run the transport cross-check against that exact byte snapshot.
+fn validate_transport(cfg: &Config) -> Result<LogEncryptionHandoffFile> {
+    let bytes = read_cc_init_data(cfg)?;
+    validate_configmap_transport_against_signed_cc_init_data(cfg, bytes.as_deref())
+}
+
 #[test]
 fn signed_cc_init_data_claims_bind_configmap_critical_values() {
     let dir = tempdir().unwrap();
     let cfg = config_with_matching_signed_cc(dir.path());
 
-    validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap();
+    validate_transport(&cfg).unwrap();
 }
 
 #[test]
@@ -789,7 +796,7 @@ fn signed_cc_init_data_mismatch_rejects_configmap_transport() {
     let mut cfg = config_with_matching_signed_cc(dir.path());
     cfg.kbs_resource_path = Some("default/other-owner/seed-encrypted".to_string());
 
-    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    let err = validate_transport(&cfg).unwrap_err();
     assert!(err.to_string().contains("kbs-resource-path"));
 }
 
@@ -799,7 +806,7 @@ fn signed_cc_init_data_mismatch_rejects_device_path() {
     let mut cfg = config_with_matching_signed_cc(dir.path());
     cfg.state.device = "/dev/evil".to_string();
 
-    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    let err = validate_transport(&cfg).unwrap_err();
     assert!(err.to_string().contains("state.device"));
 }
 
@@ -812,7 +819,7 @@ fn signed_cc_init_data_mismatch_rejects_changed_bind_mount() {
         mount_path: "/app/data".to_string(),
     });
 
-    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    let err = validate_transport(&cfg).unwrap_err();
     assert!(err.to_string().contains("app-bind-mounts"));
 }
 
@@ -828,7 +835,7 @@ fn signed_cc_init_data_rejects_dotdot_bind_mount_path() {
     cfg.cc_init_data_path = Some(cc_path.display().to_string());
     std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
 
-    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    let err = validate_transport(&cfg).unwrap_err();
     assert!(err.to_string().contains(".."));
 }
 
@@ -844,7 +851,7 @@ fn signed_cc_init_data_rejects_root_bind_mount_path() {
     cfg.cc_init_data_path = Some(cc_path.display().to_string());
     std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
 
-    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    let err = validate_transport(&cfg).unwrap_err();
     assert!(err.to_string().contains("below root"));
 }
 
@@ -860,7 +867,7 @@ fn signed_cc_init_data_rejects_slash_only_bind_mount_path() {
     cfg.cc_init_data_path = Some(cc_path.display().to_string());
     std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
 
-    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    let err = validate_transport(&cfg).unwrap_err();
     assert!(err.to_string().contains("below root"));
 }
 
@@ -870,7 +877,7 @@ fn signed_cc_init_data_mismatch_rejects_changed_mode() {
     let mut cfg = config_with_matching_signed_cc(dir.path());
     cfg.mode = Mode::Password;
 
-    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+    let err = validate_transport(&cfg).unwrap_err();
     assert!(err.to_string().contains("mode"));
 }
 
@@ -883,7 +890,7 @@ fn password_mode_signed_cc_init_data_binds_mode_claim() {
     cfg.cc_init_data_path = Some(cc_path.display().to_string());
     std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
 
-    validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap();
+    validate_transport(&cfg).unwrap();
 }
 
 #[test]
@@ -893,10 +900,10 @@ fn trustee_policy_unavailable_skip_requires_missing_cc_init_data_path() {
     cfg.cc_init_data_path = None;
 
     if cfg!(feature = "prod-strict") {
-        let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+        let err = validate_transport(&cfg).unwrap_err();
         assert!(err.to_string().contains("prod-strict"));
     } else {
-        validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap();
+        validate_transport(&cfg).unwrap();
     }
 }
 
@@ -912,14 +919,84 @@ fn trustee_policy_unavailable_still_binds_host_fields_when_cc_init_data_present(
     std::fs::write(&cc_path, signed_cc_claims_toml(&cfg)).unwrap();
 
     if cfg!(feature = "prod-strict") {
-        let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+        let err = validate_transport(&cfg).unwrap_err();
         assert!(err.to_string().contains("prod-strict"));
     } else {
-        validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap();
+        validate_transport(&cfg).unwrap();
         cfg.state.device = "/dev/evil".to_string();
-        let err = validate_configmap_transport_against_signed_cc_init_data(&cfg).unwrap_err();
+        let err = validate_transport(&cfg).unwrap_err();
         assert!(err.to_string().contains("state.device"));
     }
+}
+
+/// Regression test for the cc_init_data read TOCTOU (PR #169 review): the
+/// transport cross-check and the later hash/signature verification must
+/// operate on ONE byte snapshot read at boot. Here the host rewrites the
+/// projected ConfigMap after the read: the attacker bytes carry a different
+/// (attacker-controlled) log_encryption_json claim, while the file on disk
+/// holds bytes whose hash would still match the signed descriptor. The
+/// published handoff must come from the snapshot that will be hashed —
+/// because both consumers share `read_cc_init_data`'s buffer, the swap is
+/// irrelevant: the handoff is derived from the same bytes that will be
+/// pinned by expected_cc_init_data_hash, and rewriting the file mid-boot has
+/// no effect on already-parsed decisions.
+#[test]
+fn log_encryption_handoff_uses_single_cc_init_data_snapshot() {
+    let dir = tempdir().unwrap();
+    let mut cfg = unsigned_config();
+    cfg.log_encryption = Some(LogEncryptionSection {
+        algorithm: Some("x25519-xsalsa20poly1305".to_string()),
+        key_id: Some("k1".to_string()),
+        public_key_base64url: Some("key-material-b64url".to_string()),
+        public_key_sha256: Some("aa".repeat(32)),
+    });
+    let mut cc_body = signed_cc_claims_toml(&cfg);
+    let claim_json = serde_json::to_string(&serde_json::json!({
+        "algorithm": "x25519-xsalsa20poly1305",
+        "key_id": "k1",
+        "public_key_base64url": "key-material-b64url",
+        "public_key_sha256": "aa".repeat(32),
+        "org_id": "org-1",
+        "app_name": "app-1",
+    }))
+    .unwrap();
+    cc_body.push_str(&format!(
+        "log_encryption_json = {}\n",
+        toml::Value::String(claim_json.clone())
+    ));
+    let cc_path = dir.path().join("cc-init-data.toml");
+    cfg.cc_init_data_path = Some(cc_path.display().to_string());
+    std::fs::write(&cc_path, &cc_body).unwrap();
+
+    // Production sequence: read once, cross-check, verify — all on one buffer.
+    let snapshot = read_cc_init_data(&cfg).unwrap();
+    let outcome =
+        validate_configmap_transport_against_signed_cc_init_data(&cfg, snapshot.as_deref())
+            .unwrap();
+    let LogEncryptionHandoffFile::Enabled(handoff) = outcome else {
+        panic!("expected enabled handoff");
+    };
+    assert_eq!(handoff.public_key_base64url, "key-material-b64url");
+
+    // The malicious host rewrites the projected ConfigMap mid-boot: the
+    // on-disk file now carries attacker key material. The already-derived
+    // handoff (and the claims that will feed run_in_tee_verification) came
+    // from the snapshot, so the attacker bytes never enter the trusted
+    // path.
+    let mut attacker_body = cc_body.replace("key-material-b64url", "attacker-key-b64url");
+    attacker_body = attacker_body.replace(&"a".repeat(64), &"b".repeat(64));
+    std::fs::write(&cc_path, attacker_body).unwrap();
+    assert_eq!(handoff.public_key_base64url, "key-material-b64url");
+
+    // And a fresh boot against the attacker bytes alone fails the
+    // ConfigMap cross-check (the section no longer matches the claim).
+    let fresh = read_cc_init_data(&cfg).unwrap();
+    let err = validate_configmap_transport_against_signed_cc_init_data(&cfg, fresh.as_deref())
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("does not match signed cc_init_data claim")
+    );
 }
 
 #[test]
