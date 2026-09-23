@@ -593,7 +593,9 @@ fn signed_test_artifact_blobs(
 }
 
 fn device_code_hash(code: &str) -> Vec<u8> {
-    Sha256::digest(code.as_bytes()).to_vec()
+    // Must mirror the test state's session HMAC key ([0u8; 32], see
+    // setup_test_state_with_mode) and the server's keyed hash.
+    enclava_api::routes::auth::device_code_hash(code, &[0u8; 32])
 }
 
 #[tokio::test]
@@ -782,6 +784,313 @@ async fn device_login_approved_code_is_single_use_and_still_expires() {
     let expired_body: Value = expired_poll.json();
     assert_eq!(expired_body["status"], "expired");
     assert_eq!(expired_body["auth"], Value::Null);
+}
+
+#[tokio::test]
+async fn device_login_sessions_with_legacy_hash_remain_pollable_and_approvable() {
+    // Rollout transition: sessions created by the previous binary store the
+    // plain SHA-256 digest of the codes. Until they expire (10-minute TTL),
+    // poll must still find them by device code and approve by user code.
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state.clone());
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+    let (session_token, org_id) = signup_owner(&server, "legacy-hash").await;
+
+    let start = server
+        .post("/auth/device/start")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({}))
+        .await;
+    start.assert_status_ok();
+    let start_body: Value = start.json();
+    let device_code = start_body["device_code"].as_str().expect("device_code");
+    let user_code = start_body["user_code"].as_str().expect("user_code");
+
+    // Rewrite the row as the previous binary would have stored it (plain
+    // SHA-256 of the code; the old code_hash had no normalization beyond
+    // what start_device_login already applied to the user code).
+    let legacy_device = Sha256::digest(device_code.as_bytes()).to_vec();
+    let normalized_user: String = user_code
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_uppercase)
+        .collect();
+    let legacy_user = Sha256::digest(normalized_user.as_bytes()).to_vec();
+    sqlx::query(
+        "UPDATE device_login_sessions SET device_code_hash = $1 WHERE device_code_hash = $2",
+    )
+    .bind(&legacy_device)
+    .bind(device_code_hash(device_code))
+    .execute(&pool)
+    .await
+    .expect("rewrite device hash to legacy format");
+    sqlx::query("UPDATE device_login_sessions SET user_code_hash = $1 WHERE device_code_hash = $2")
+        .bind(&legacy_user)
+        .bind(&legacy_device)
+        .execute(&pool)
+        .await
+        .expect("rewrite user hash to legacy format");
+
+    // Poll finds the legacy row and reports pending.
+    let pending = server
+        .post("/auth/device/poll")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({ "device_code": device_code }))
+        .await;
+    pending.assert_status_ok();
+    let pending_body: Value = pending.json();
+    assert_eq!(pending_body["status"], "pending");
+
+    // Approve finds the legacy row by user code and flips it to approved.
+    let approve = server
+        .post("/auth/device/approve")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .authorization_bearer(&session_token)
+        .json(&serde_json::json!({
+            "user_code": user_code,
+            "org_id": org_id,
+        }))
+        .await;
+    approve.assert_status_ok();
+    let approve_body: Value = approve.json();
+    assert_eq!(approve_body["status"], "approved");
+
+    // Redeeming poll still works against the legacy row and issues a token.
+    // (Poll interval is 5s; the first poll above set last_polled_at.)
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    let approved = server
+        .post("/auth/device/poll")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({ "device_code": device_code }))
+        .await;
+    approved.assert_status_ok();
+    let approved_body: Value = approved.json();
+    assert_eq!(approved_body["status"], "approved");
+    assert!(approved_body["auth"]["token"].as_str().is_some());
+
+    // Cleanup: remove this test's row (legacy digest).
+    sqlx::query("DELETE FROM device_login_sessions WHERE device_code_hash = $1")
+        .bind(&legacy_device)
+        .execute(&pool)
+        .await
+        .expect("cleanup legacy-hash row");
+}
+
+#[tokio::test]
+async fn device_login_codes_are_stored_with_keyed_hash_and_uri_hides_user_code() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state.clone());
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    let start = server
+        .post("/auth/device/start")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({}))
+        .await;
+    start.assert_status_ok();
+    let start_body: Value = start.json();
+    let device_code = start_body["device_code"].as_str().expect("device_code");
+    let user_code = start_body["user_code"].as_str().expect("user_code");
+
+    // The test state's session HMAC key is [0u8; 32]; the helper mirrors it.
+    let expected_device_hash = enclava_api::routes::auth::device_code_hash(device_code, &[0u8; 32]);
+    let plain_hash: Vec<u8> = Sha256::digest(device_code.as_bytes()).to_vec();
+
+    let stored: (Vec<u8>, String) = sqlx::query_as(
+        "SELECT device_code_hash, verification_uri_complete FROM device_login_sessions WHERE device_code_hash = $1",
+    )
+    .bind(&expected_device_hash)
+    .fetch_one(&pool)
+    .await
+    .expect("session stored under keyed device code hash");
+
+    assert_ne!(
+        stored.0, plain_hash,
+        "device code must not be stored as unsalted SHA-256"
+    );
+    assert!(
+        !stored.1.contains(user_code),
+        "persisted verification_uri_complete must not carry the plaintext user code: {}",
+        stored.1
+    );
+
+    let normalized_user_code: String = user_code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let expected_user_hash =
+        enclava_api::routes::auth::user_code_hash(&normalized_user_code, &[0u8; 32]);
+    let user_row: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT user_code_hash FROM device_login_sessions WHERE user_code_hash = $1",
+    )
+    .bind(&expected_user_hash)
+    .fetch_optional(&pool)
+    .await
+    .expect("user code hash lookup");
+    assert!(
+        user_row.is_some(),
+        "user code must be stored under keyed hash"
+    );
+}
+
+#[tokio::test]
+async fn device_login_start_is_rate_limited_per_ip() {
+    let (state, _pool) = setup_test_state().await;
+    // build_router (unlike test_router) enables the governor layers. The
+    // governor keys on the peer IP, so the app must carry ConnectInfo the
+    // same way main.rs serves it.
+    let app = enclava_api::build_router(state)
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    // The first request must succeed (compliant single CLI start), then a
+    // sustained burst from the same IP must hit the tighter device-auth
+    // budget. Exact burst boundaries are not asserted: the governor refills
+    // at 1 r/s, so the cut-off point depends on elapsed test time.
+    let first = server
+        .post("/auth/device/start")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({}))
+        .await;
+    first.assert_status_ok();
+
+    let mut saw_too_many_requests = false;
+    for _ in 0..15 {
+        let response = server
+            .post("/auth/device/start")
+            .add_header("x-forwarded-for", "127.0.0.1")
+            .json(&serde_json::json!({}))
+            .await;
+        if response.status_code() == StatusCode::TOO_MANY_REQUESTS {
+            saw_too_many_requests = true;
+            break;
+        }
+    }
+    assert!(
+        saw_too_many_requests,
+        "burst of /auth/device/start requests must eventually be rate limited"
+    );
+}
+
+#[tokio::test]
+async fn device_login_poll_and_approve_are_not_in_start_rate_limit_bucket() {
+    let (state, _pool) = setup_test_state().await;
+    let app = enclava_api::build_router(state)
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    // Exhaust the tight /auth/device/start budget for this peer IP, then
+    // prove poll (and approve's route check, which requires a session
+    // token) still answer from the generic governor budget rather than
+    // sharing the exhausted device-start bucket. Approve without a token
+    // must yield 401, never 429.
+    let mut start_throttled = false;
+    for _ in 0..15 {
+        let response = server
+            .post("/auth/device/start")
+            .add_header("x-forwarded-for", "127.0.0.1")
+            .json(&serde_json::json!({}))
+            .await;
+        if response.status_code() == StatusCode::TOO_MANY_REQUESTS {
+            start_throttled = true;
+            break;
+        }
+    }
+    assert!(start_throttled, "start burst must exhaust the start bucket");
+
+    for _ in 0..12 {
+        let poll = server
+            .post("/auth/device/poll")
+            .add_header("x-forwarded-for", "127.0.0.1")
+            .json(&serde_json::json!({ "device_code": "nonexistent" }))
+            .await;
+        assert_eq!(
+            poll.status_code(),
+            StatusCode::BAD_REQUEST,
+            "poll must stay out of the exhausted start bucket (any 429 here means the routes share a governor)"
+        );
+    }
+
+    let approve = server
+        .post("/auth/device/approve")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({}))
+        .await;
+    assert_eq!(
+        approve.status_code(),
+        StatusCode::UNAUTHORIZED,
+        "approve must be auth-gated (401), not starved by the start bucket (429)"
+    );
+}
+
+#[tokio::test]
+async fn purge_expired_device_login_sessions_removes_only_long_expired_rows() {
+    let (state, pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    let mut kept_code = String::new();
+    let mut purged_code = String::new();
+    for slot in 0..2 {
+        let start = server
+            .post("/auth/device/start")
+            .add_header("x-forwarded-for", "127.0.0.1")
+            .json(&serde_json::json!({}))
+            .await;
+        start.assert_status_ok();
+        let code: String = start.json::<Value>()["device_code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        if slot == 0 {
+            kept_code = code;
+        } else {
+            purged_code = code;
+        }
+    }
+
+    sqlx::query("UPDATE device_login_sessions SET expires_at = now() - interval '25 hours' WHERE device_code_hash = $1")
+        .bind(device_code_hash(&purged_code))
+        .execute(&pool)
+        .await
+        .expect("age out purge candidate");
+
+    // A persistent local test database may contain older stale rows from
+    // other tests/runs that the purge is equally entitled to remove, so
+    // the global return count is not deterministic. What must hold: this
+    // test's long-expired row is gone and its fresh row survives.
+    let purged = enclava_api::routes::auth::purge_expired_device_login_sessions(&pool)
+        .await
+        .expect("purge runs");
+    assert!(
+        purged >= 1,
+        "the long-expired session must be deleted (got {purged})"
+    );
+
+    let purged_row: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM device_login_sessions WHERE device_code_hash = $1")
+            .bind(device_code_hash(&purged_code))
+            .fetch_optional(&pool)
+            .await
+            .expect("purged lookup");
+    assert_eq!(purged_row, None, "long-expired session is purged");
+
+    let kept: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM device_login_sessions WHERE device_code_hash = $1")
+            .bind(device_code_hash(&kept_code))
+            .fetch_optional(&pool)
+            .await
+            .expect("kept lookup");
+    // SELECT 1 returns i64=1 when present.
+    assert_eq!(kept, Some(1), "recent session survives the purge");
+
+    // Clean up test rows to avoid polluting other tests' purge assertions.
+    sqlx::query("DELETE FROM device_login_sessions WHERE device_code_hash IN ($1, $2)")
+        .bind(device_code_hash(&kept_code))
+        .bind(device_code_hash(&purged_code))
+        .execute(&pool)
+        .await
+        .expect("test cleanup");
 }
 
 #[tokio::test]

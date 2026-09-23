@@ -40,6 +40,14 @@ pub fn build_router(state: AppState) -> Router {
 
 fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
     let key_extractor = TrustedProxyKeyExtractor::from_env();
+    // The device-start route carries its own tight governor and is merged
+    // OUTSIDE the generic API governor below: if it ran inside, a flood of
+    // starts would charge the shared burst-100 bucket before the tight
+    // governor rejects them, starving /auth/device/poll, /auth/device/approve
+    // and every other route keyed to the same peer. The tight governor
+    // (1 r/s, burst 10) is strictly tighter than the generic one for the
+    // same key, so excluding start from the shared bucket loses nothing.
+    let device_start = device_start_routes(enable_rate_limits, key_extractor.clone());
     let api_routes = build_api_routes(enable_rate_limits, key_extractor);
     let api_routes = if enable_rate_limits {
         api_routes.layer(GovernorLayer::new(
@@ -61,6 +69,7 @@ fn build_router_inner(state: AppState, enable_rate_limits: bool) -> Router {
 
     router
         .merge(api_routes)
+        .merge(device_start)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -323,9 +332,67 @@ fn auth_routes() -> Router<AppState> {
         .route("/auth/signup", axum::routing::post(routes::auth::signup))
         .route("/auth/login", axum::routing::post(routes::auth::login))
         .route(
-            "/auth/device/start",
-            axum::routing::post(routes::auth::start_device_login),
+            "/auth/api-keys",
+            axum::routing::post(routes::auth::create_api_key_route),
         )
+        .route(
+            "/auth/api-keys/{id}",
+            axum::routing::delete(routes::auth::revoke_api_key_route),
+        )
+        .merge(device_auth_routes())
+}
+
+/// The `/auth/device/start` router with its tight per-IP governor. Kept
+/// separate from `device_auth_routes` so `build_router_inner` can merge it
+/// OUTSIDE the generic burst-100 API governor — see the comment there.
+fn device_start_routes(
+    enable_rate_limits: bool,
+    key_extractor: TrustedProxyKeyExtractor,
+) -> Router<AppState> {
+    // The device-login surface is reachable before authentication, and
+    // /auth/device/start inserts a session row per call, so only the start
+    // route gets the tight per-IP budget. Poll and approve deliberately
+    // stay out of this bucket: CLIs poll at the advertised 5-second
+    // interval, so a shared 1 r/s budget would throttle any group of
+    // users behind one public IP, and an unauthenticated start flood must
+    // not be able to starve authenticated approvals. Both remain covered
+    // by the generic per-IP API governor.
+    //
+    // Same-NAT note: keying by IP means users sharing one public egress IP
+    // (corporate NAT, CI runners) share the 1 start/s burst-10 budget.
+    // `start` is rare per user (once per login), so even ~10 concurrent
+    // logins behind one NAT fit inside the burst; if a hosted-tenant NAT
+    // ever trips this, key by IP + requested org instead.
+    //
+    // Per-replica note: tower-governor counters live in-process, so each
+    // API replica keeps an independent budget — with N replicas one client
+    // effectively gets N × (1 r/s, burst 10). That approximation is
+    // deliberate for this route: `start` is a cheap, single INSERT and the
+    // budget exists to stop unbounded session-row floods, not to enforce an
+    // exact global rate. The exact aggregate cap belongs at the ingress
+    // tier (nginx `limit-rps`); see runbooks/cap-api-network-policy-rollout.md
+    // §5 for the rollout check.
+    let start = Router::new().route(
+        "/auth/device/start",
+        axum::routing::post(routes::auth::start_device_login),
+    );
+
+    if enable_rate_limits {
+        start.layer(GovernorLayer::new(
+            GovernorConfigBuilder::default()
+                .per_second(1)
+                .burst_size(10)
+                .key_extractor(key_extractor)
+                .finish()
+                .expect("device auth governor config"),
+        ))
+    } else {
+        start
+    }
+}
+
+fn device_auth_routes() -> Router<AppState> {
+    Router::new()
         .route(
             "/auth/device/poll",
             axum::routing::post(routes::auth::poll_device_login),
@@ -333,14 +400,6 @@ fn auth_routes() -> Router<AppState> {
         .route(
             "/auth/device/approve",
             axum::routing::post(routes::auth::approve_device_login),
-        )
-        .route(
-            "/auth/api-keys",
-            axum::routing::post(routes::auth::create_api_key_route),
-        )
-        .route(
-            "/auth/api-keys/{id}",
-            axum::routing::delete(routes::auth::revoke_api_key_route),
         )
 }
 

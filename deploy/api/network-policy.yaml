@@ -1,0 +1,90 @@
+# Restricts inbound traffic to the API pods to the ingress-nginx controllers,
+# the enclava-paas internal caller, and tenant workload pods. This matters for
+# the rate-limiter's trusted-proxy model: TRUSTED_PROXY_CIDRS grants
+# X-Forwarded-For/X-Real-IP trust to the pod network, so the only peers that
+# should reach the API directly are the ones with a reason to: the ingress
+# controllers (the proxies that actually set those headers), the PaaS service
+# (mTLS identity on /internal/paas/*), and tenant enclava-init pods (see
+# below). Any other cluster workload connecting directly is untrusted at the
+# network layer and can neither spoof a client IP nor consume a public
+# client's bucket.
+#
+# If the target cluster runs its ingress controllers somewhere other than
+# the `ingress-nginx` namespace, adjust the namespaceSelector to match.
+# Note: kubelet probes use the node's host IP (not a pod in the
+# namespace), so they bypass NetworkPolicy and don't need an explicit rule.
+#
+# The enclava-paas rule exists because /internal/paas/* requires the
+# caller's mTLS client identity (see cap-paas-internal-logs.contract.yaml);
+# TLS-terminating ingress would discard the client certificate, so the PaaS
+# service must call the API ClusterIP directly. Those routes authenticate
+# with a service token + mTLS and are not part of the unauthenticated
+# rate-limit surface this policy protects. The podSelector narrows the rule
+# to the PaaS service pods themselves so an arbitrary pod scheduled into the
+# namespace cannot reach the internal routes; adjust the label to the actual
+# PaaS pod labels and verify against the live cluster before rollout. Note
+# the residual trust model: any caller holding the internal service token
+# may assert any allowed client SAN — when the mTLS handshake terminates at
+# a proxy rather than the PaaS client itself, CAP_INTERNAL_TRUSTED_PROXY_SECRET
+# must be set so only the verified proxy can assert SANs.
+#
+# The tenant-workload rule exists because tenant enclava-init pods fetch
+# attestation artifacts and TLS certificates directly from the API service
+# when WORKLOAD_ARTIFACTS_URL / TLS_CERTIFICATE_BROKER_URL point at it
+# (crates/enclava-engine/src/manifest/network_policy.rs admits that egress;
+# crates/enclava-init fetches /api/v1/workload/artifacts and
+# /api/v1/workload/tls/dns01-certificate). Tenant namespaces are selected by
+# the enclava.dev/tenant label that CAP stamps on every namespace it renders
+# (crates/enclava-engine/src/manifest/namespace.rs). Those routes are
+# attestation-gated, and enclava-init sets no forwarding headers, so tenant
+# traffic is rate-limit keyed by pod IP. Residual (pre-existing before this
+# policy: the API previously admitted every cluster peer): a malicious tenant
+# workload could send X-Real-IP/XFF directly to rotate rate-limit keys, since
+# tenant pod IPs sit inside TRUSTED_PROXY_CIDRS. Follow-up hardening options
+# are a dedicated workload-facing port or narrowed per-cluster proxy CIDRs;
+# see runbooks/cap-api-network-policy-rollout.md.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cap-api-ingress-only
+  namespace: enclava-platform
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cap-api
+  policyTypes:
+  - Ingress
+  ingress:
+  # Public traffic via the ingress-nginx controllers.
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 3000
+  # Internal enclava-paas caller (service token + mTLS on /internal/paas/*).
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: enclava-paas
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: enclava-paas
+    ports:
+    - protocol: TCP
+      port: 3000
+  # Tenant workload pods (enclava-init artifact/certificate fetches). Selected
+  # by the namespace label CAP stamps on tenant namespaces; matchExpressions
+  # is required because the label value is the per-tenant id.
+  - from:
+    - namespaceSelector:
+        matchExpressions:
+        - key: enclava.dev/tenant
+          operator: Exists
+    ports:
+    - protocol: TCP
+      port: 3000
