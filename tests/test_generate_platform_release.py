@@ -244,10 +244,15 @@ def test_release_generator_accepts_valid_ascii_ace_labels():
 def test_release_generator_rejects_whatwg_ipv4_ending_host_shapes():
     # WHATWG runs the IPv4 parser when the last label is numeric; Python
     # urlparse leaves `1.2.3.4.5` / `999.1.1.1` untouched in .hostname but
-    # reqwest rejects them ("invalid IPv4 address").
+    # reqwest rejects them ("invalid IPv4 address"). A bare `0x` label
+    # (empty hex payload) is numeric-zero per WHATWG, so `foo.0x` also
+    # runs the IPv4 parser and is rejected by reqwest (Codex P2, cap#165).
     for value in (
         "https://1.2.3.4.5/",
         "https://999.1.1.1/",
+        "https://foo.0x/",
+        "https://foo.0X/",
+        "https://0x/",
     ):
         payload = base_payload()
         payload["trustee_kbs_url"] = value

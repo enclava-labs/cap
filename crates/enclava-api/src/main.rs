@@ -899,6 +899,58 @@ async fn main() {
         eprintln!("startup refused: {e}");
         std::process::exit(1);
     }
+    // Codex P1 (cap#165): the flock serializes each commit, but older-first
+    // ordering across replicas is still legal — a T1 replica that committed
+    // first keeps serving stale release metadata after another replica
+    // commits T2. Revalidate the running release against the shared
+    // high-water mark periodically and terminate on refusal so the
+    // orchestrator replaces this pod with one that loads the newer release.
+    if let (Some(state_path), Some(envelope)) = (&pending_high_water, &platform_release_envelope) {
+        let state_path = state_path.clone();
+        let running_release = envelope.payload.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                match enclava_api::platform_release::check_running_release_current(
+                    &state_path,
+                    &running_release,
+                ) {
+                    Ok(()) => {}
+                    Err(
+                        e @ enclava_api::platform_release::PlatformReleaseError::OverrideDowngradeRefused { .. },
+                    ) => {
+                        // The shared mark advanced past the release this
+                        // replica loaded at startup. Terminate so the
+                        // orchestrator replaces this pod with one that
+                        // loads the newer release. abort() rather than
+                        // exit(): exit() from a tokio worker can deadlock
+                        // in atexit/stdio while other threads hold the
+                        // allocator or the tracing subscriber (reviewer
+                        // High, cap#165 self-check).
+                        eprintln!(
+                            "terminating: the platform-release high-water mark advanced past the \
+                             release this replica is serving ({e}); the orchestrator should replace \
+                             this pod so it loads the newer release"
+                        );
+                        std::process::abort();
+                    }
+                    Err(e) => {
+                        // Transient state I/O (ENOSPC, EIO, ESTALE on the
+                        // shared volume, corrupt-but-recoverable state):
+                        // killing the pod here would crash-loop healthy
+                        // replicas and stall the flock for everyone. Log
+                        // and retry on the next tick; startup itself
+                        // already fails closed on unrecoverable state.
+                        eprintln!(
+                            "platform-release watchdog: recheck failed, retrying next tick: {e}"
+                        );
+                    }
+                }
+            }
+        });
+    }
     let require_customer_signed_policy_artifact =
         env_flag("REQUIRE_CUSTOMER_SIGNED_POLICY_ARTIFACT");
     let max_concurrent_applies = std::env::var("CAP_MAX_CONCURRENT_APPLIES")
@@ -1300,10 +1352,10 @@ mod tests {
             std::env::set_var("ENCLAVA_PLATFORM_RELEASE_STATE", "/var/lib/enclava/x");
             assert!(!platform_release_enabled(false));
             // Each real release-lane trigger enables it (with STATE still
-            // set, matching a fully-wired deployment).
-            std::env::set_var("TRUSTEE_POLICY_READ_AVAILABLE", "true");
-            assert!(platform_release_enabled(false));
-            std::env::remove_var("TRUSTEE_POLICY_READ_AVAILABLE");
+            // set, matching a fully-wired deployment). The trustee flag is
+            // passed as a parameter (the production caller reads the env
+            // var once), so exercise it via the argument, not the env.
+            assert!(platform_release_enabled(true));
             std::env::set_var("ENCLAVA_USE_PLATFORM_RELEASE", "true");
             assert!(platform_release_enabled(false));
             std::env::remove_var("ENCLAVA_USE_PLATFORM_RELEASE");

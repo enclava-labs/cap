@@ -144,7 +144,11 @@ def _label_looks_numeric(label: str) -> bool:
     # urlparse happily leaves `1.2.3.4.5` or `999.1.1.1` in .hostname.
     if label.isdigit():
         return True
-    return len(label) > 2 and label.lower().startswith("0x") and all(
+    # A bare `0x` (empty hex payload) counts too: WHATWG parses it as the
+    # number 0, so a multi-label host ending in `0x` (e.g. `foo.0x`) runs
+    # the full IPv4 parser and is rejected by the url crate — it must be
+    # gated here (Codex P2, cap#165).
+    return len(label) >= 2 and label.lower().startswith("0x") and all(
         ch in "0123456789abcdef" for ch in label[2:].lower()
     )
 

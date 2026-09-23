@@ -312,7 +312,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install generator dependencies
-        run: pip install -r crates/enclava-cli/scripts/requirements.txt
+        run: pip install -r crates/enclava-cli/scripts/requirements.txt pytest
 
       - name: Run generator tests
         run: python -m pytest tests/test_generate_platform_release.py -v

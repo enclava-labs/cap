@@ -526,6 +526,21 @@ fn check_override_not_older_than_last_accepted(
     enforce_override_gate(state_path, release, false)
 }
 
+/// Running-replica revalidation (Codex P1, cap#165). The flock serializes
+/// each commit individually, but older-first ordering is still legal: two
+/// replicas observing different projected override versions can commit T1
+/// and then T2, leaving the T1 replica running with stale release metadata
+/// (measurements, policy, sidecar digests) even though the shared mark now
+/// records T2. The API arms a periodic watchdog that calls this and
+/// terminates the process on refusal, so the orchestrator replaces the pod
+/// with one that loads the newer release.
+pub fn check_running_release_current(
+    state_path: &Path,
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    check_override_not_older_than_last_accepted(state_path, release)
+}
+
 fn enforce_override_gate(
     state_path: &Path,
     release: &PlatformRelease,
@@ -581,7 +596,21 @@ fn create_dir_all_durable(path: &Path) -> std::io::Result<()> {
         }
     }
     for dir in missing.iter().rev() {
-        std::fs::create_dir(dir)?;
+        // Tolerate a concurrent replica winning the race: AlreadyExists
+        // means the directory now exists, which is all we need (Devin bug
+        // + Codex P2, cap#165). Any other error — including a non-directory
+        // having appeared in the meantime — still fails closed; the
+        // metadata check below rejects a same-named file.
+        match std::fs::create_dir(dir) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                match std::fs::metadata(dir) {
+                    Ok(meta) if meta.is_dir() => {}
+                    _ => return Err(err),
+                }
+            }
+            Err(err) => return Err(err),
+        }
         // fsync the parent so the new directory entry itself is durable.
         let parent = dir
             .parent()
@@ -671,6 +700,30 @@ fn enforce_override_not_older_than_last_accepted_locked(
         });
     }
     let mark = AcceptedOverrideMark::of(release)?;
+    // Always sync the parent directory while holding the flock — even when
+    // the visible mark already equals the candidate. A prior commit may have
+    // completed the rename but failed the directory fsync (ENOSPC, EIO):
+    // the error surfaced, the new mark is visible, and this startup is the
+    // retry that must complete the unconfirmed durability barrier. Skipping
+    // the sync for matching marks would let a power loss resurrect the older
+    // floor (Codex P2, cap#165).
+    let parent = state_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    {
+        let dir = std::fs::File::open(parent).map_err(|error| {
+            PlatformReleaseError::HighWaterMarkPersistFailed {
+                state_path: state_path.display().to_string(),
+                source: error,
+            }
+        })?;
+        dir.sync_all()
+            .map_err(|error| PlatformReleaseError::HighWaterMarkPersistFailed {
+                state_path: state_path.display().to_string(),
+                source: error,
+            })?;
+    }
     // Codex P1 (cap#165): decide whether to persist by comparing against
     // the ACTUAL stored mark, not the synthetic bundle-inclusive floor.
     // When the override is identical to a newer bundled release (the normal
@@ -2001,6 +2054,122 @@ mod tests {
         );
         // No mark is created by the bundled lane read-only check.
         assert!(!state.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_dir_all_durable_tolerates_concurrent_creation() {
+        // Devin bug + Codex P2 (cap#165): two replicas racing to create the
+        // same missing state directory — the loser's AlreadyExists must not
+        // abort startup once the directory exists.
+        let dir = std::env::temp_dir().join(format!(
+            "pr-durable-race-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        let nested = dir.join("a").join("b");
+        // Simulate the loser: the exact missing suffix exists already.
+        std::fs::create_dir_all(&nested).unwrap();
+        create_dir_all_durable(&nested).expect(
+            "AlreadyExists from a concurrent winner must be tolerated when the \
+             path is now a directory",
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        // A same-named FILE in place of the directory still fails closed.
+        let dir = std::env::temp_dir().join(format!(
+            "pr-durable-file-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("state-dir");
+        std::fs::write(&target, b"not a directory").unwrap();
+        assert!(create_dir_all_durable(&target).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dir_sync_runs_even_when_mark_matches() {
+        // Codex P2 (cap#165): when the visible mark already equals the
+        // candidate (a prior commit renamed but its dir fsync failed), the
+        // check-only load must still fsync the parent so the retry can
+        // complete the durability barrier. Exercise the shared helper via
+        // the public path: commit twice with persist, then re-run the
+        // check-only load — success (not HighWaterMarkPersistFailed) is the
+        // observable contract, and the sync running for matching marks is
+        // what guarantees it can repair an indeterminate prior commit.
+        let dir = std::env::temp_dir().join(format!(
+            "pr-hwm-sync-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+        let release = PlatformRelease::load_verified().unwrap();
+        // First acceptance persists the mark.
+        commit_override_acceptance(&state, &release).unwrap();
+        // Second run: mark matches — must still succeed AND sync the dir.
+        commit_override_acceptance(&state, &release).unwrap();
+        // Check-only load with the matching mark must also pass (its
+        // internal dir sync is the retry path for an unconfirmed rename).
+        assert!(
+            PlatformReleaseEnvelope::load_verified_from_raw(
+                BUNDLED_PLATFORM_RELEASE.to_string(),
+                false,
+                Some(&state)
+            )
+            .is_ok()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn running_recheck_detects_floor_advanced_by_another_replica() {
+        // Codex P1 (cap#165): older-first commit ordering is legal — a T1
+        // replica that committed first must detect on later revalidation
+        // that the shared mark now records T2 and refuse, so the API
+        // watchdog terminates the stale replica.
+        let dir = std::env::temp_dir().join(format!(
+            "pr-hwm-recheck-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+
+        // T1 replica: loads and commits T1 (no newer mark yet — legal).
+        let t1 = resigned_envelope_with_created_at("2998-01-01T00:00:00Z");
+        let loaded_t1 = PlatformReleaseEnvelope::load_verified_from_raw(t1, true, Some(&state))
+            .expect("T1 load must pass on an empty mark");
+        commit_override_acceptance(
+            loaded_t1.pending_high_water.as_ref().unwrap(),
+            &loaded_t1.envelope.payload,
+        )
+        .expect("T1 commit must pass when it is the newest seen");
+
+        // A second replica accepts T2: the shared mark advances.
+        let t2 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        let loaded_t2 = PlatformReleaseEnvelope::load_verified_from_raw(t2, true, Some(&state))
+            .expect("T2 load must pass (newer than T1 mark)");
+        commit_override_acceptance(
+            loaded_t2.pending_high_water.as_ref().unwrap(),
+            &loaded_t2.envelope.payload,
+        )
+        .expect("T2 commit must pass");
+
+        // The still-running T1 replica revalidates: the mark now records T2,
+        // so the recheck must refuse (driving the watchdog to terminate it).
+        assert!(matches!(
+            check_running_release_current(&state, &loaded_t1.envelope.payload),
+            Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
+        ));
+        // Steady state: the T2 replica's own recheck keeps passing.
+        assert!(check_running_release_current(&state, &loaded_t2.envelope.payload).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
