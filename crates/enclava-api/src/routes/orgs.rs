@@ -1644,10 +1644,21 @@ mod tests {
     /// CI runs do not accumulate fully migrated databases on the shared
     /// PostgreSQL server (the pid suffix means a later run's initial
     /// DROP IF EXISTS never matches an earlier run's leftover).
-    async fn isolated_database_test_pool(name: &str) -> sqlx::PgPool {
+    ///
+    /// The returned [`IsolatedDatabaseCleanup`] guard is the panic-path
+    /// backstop: the explicit drop runs only on the happy path, but a failing
+    /// assertion (or any panic) would otherwise leak the fully migrated
+    /// per-process database forever.  The guard drops the database during
+    /// unwind as well; its final `DROP IF EXISTS` is idempotent with the
+    /// explicit drop.
+    async fn isolated_database_test_pool(name: &str) -> (IsolatedDatabaseCleanup, sqlx::PgPool) {
         let base_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
         let db_name = format!("{name}_{}", std::process::id());
+        let cleanup = IsolatedDatabaseCleanup {
+            db_name: db_name.clone(),
+            base_url: base_url.clone(),
+        };
         let admin = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .connect(&base_url)
@@ -1679,7 +1690,46 @@ mod tests {
         crate::db::pool::run_migrations(&pool)
             .await
             .expect("migrate isolated keyring database");
-        pool
+        (cleanup, pool)
+    }
+
+    /// Panic-path backstop for [`isolated_database_test_pool`]: drops the
+    /// per-process database even when the test panics before reaching its
+    /// explicit [`drop_isolated_database`] call.  Runs on a dedicated thread
+    /// with its own short-lived runtime so it can block on the async driver
+    /// from synchronous unwind code.
+    struct IsolatedDatabaseCleanup {
+        db_name: String,
+        base_url: String,
+    }
+
+    impl Drop for IsolatedDatabaseCleanup {
+        fn drop(&mut self) {
+            let db_name = self.db_name.clone();
+            let base_url = self.base_url.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build isolated database cleanup runtime");
+                rt.block_on(async move {
+                    let admin = sqlx::postgres::PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect(&base_url)
+                        .await;
+                    if let Ok(admin) = admin {
+                        let _ = sqlx::query(&format!(
+                            "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
+                        ))
+                        .execute(&admin)
+                        .await;
+                        admin.close().await;
+                    }
+                });
+            })
+            .join()
+            .expect("isolated database cleanup thread");
+        }
     }
 
     /// Companion to [`isolated_database_test_pool`]: closes the pool and
@@ -1712,7 +1762,7 @@ mod tests {
     #[tokio::test]
     async fn put_keyring_route_enqueues_signed_policy_reconciliation_in_transaction() {
         let _singleton = keyring_enqueue_guard().await;
-        let pool = isolated_database_test_pool("cap130_keyring_enqueue_put").await;
+        let (_db_cleanup, pool) = isolated_database_test_pool("cap130_keyring_enqueue_put").await;
         let org_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
         let suffix = org_id.simple().to_string();
@@ -1839,7 +1889,8 @@ mod tests {
     #[tokio::test]
     async fn rotate_owner_route_enqueues_signed_policy_reconciliation_in_transaction() {
         let _singleton = keyring_enqueue_guard().await;
-        let pool = isolated_database_test_pool("cap130_keyring_enqueue_rotate").await;
+        let (_db_cleanup, pool) =
+            isolated_database_test_pool("cap130_keyring_enqueue_rotate").await;
         let org_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
         let suffix = org_id.simple().to_string();
