@@ -43,14 +43,20 @@ const DEVICE_LOGIN_TTL_MINUTES: i64 = 10;
 /// horizons discoverable together.
 const DEVICE_LOGIN_PURGE_RETENTION_HOURS: i64 = 24;
 const DEVICE_LOGIN_POLL_INTERVAL_SECONDS: i64 = 5;
+// FLAT tuples: sqlx 0.8's FromRow for tuples calls try_get once per
+// top-level element, so a nested tuple (Vec<u8>, (String, ...)) would try
+// to decode the second element as a single Postgres RECORD and fail with a
+// 500 at request time (the build still compiles). Keep every column as a
+// top-level tuple element.
 type DeviceLoginPollRow = (
+    Vec<u8>,
     String,
     DateTime<Utc>,
     Option<DateTime<Utc>>,
     Option<Uuid>,
     Option<Uuid>,
 );
-type DeviceLoginApproveRow = (String, DateTime<Utc>, Option<String>);
+type DeviceLoginApproveRow = (Vec<u8>, String, DateTime<Utc>, Option<String>);
 
 async fn fetch_org_name(
     db: &sqlx::PgPool,
@@ -403,7 +409,7 @@ pub async fn poll_device_login(
     // digest the row was actually found by, used for the follow-up UPDATEs.
     let hash = device_code_hash(&body.device_code, &state.hmac_key);
     let legacy_hash = legacy_code_hash(&body.device_code);
-    let row: Option<(Vec<u8>, DeviceLoginPollRow)> = sqlx::query_as(
+    let row: Option<DeviceLoginPollRow> = sqlx::query_as(
         "SELECT device_code_hash, status, expires_at, last_polled_at, approved_user_id, approved_org_id
          FROM device_login_sessions
          WHERE device_code_hash = $1 OR device_code_hash = $2",
@@ -419,10 +425,8 @@ pub async fn poll_device_login(
         )
     })?;
 
-    let Some((
-        stored_hash,
-        (status, expires_at, last_polled_at, approved_user_id, approved_org_id),
-    )) = row
+    let Some((stored_hash, status, expires_at, last_polled_at, approved_user_id, approved_org_id)) =
+        row
     else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -642,7 +646,7 @@ pub async fn approve_device_login(
     let hash = user_code_hash(&normalized_user_code, &state.hmac_key);
     let legacy_hash = legacy_code_hash(&normalized_user_code);
 
-    let row: Option<(Vec<u8>, DeviceLoginApproveRow)> = sqlx::query_as(
+    let row: Option<DeviceLoginApproveRow> = sqlx::query_as(
         "SELECT user_code_hash, status, expires_at, requested_org_name
          FROM device_login_sessions
          WHERE user_code_hash = $1 OR user_code_hash = $2",
@@ -658,7 +662,7 @@ pub async fn approve_device_login(
         )
     })?;
 
-    let Some((stored_hash, (status, expires_at, requested_org_name))) = row else {
+    let Some((stored_hash, status, expires_at, requested_org_name)) = row else {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid user_code"})),

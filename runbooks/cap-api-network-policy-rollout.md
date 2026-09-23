@@ -164,24 +164,45 @@ Both halves must be in place BEFORE the new API revision rolls out:
 1. Create the secret key in the API namespace:
 
 ```sh
-kubectl -n enclava-platform create secret generic api-secrets \
-  --from-literal=trusted-proxy-secret="$(head -c32 /dev/urandom | base64)" \
-  --dry-run=client -o yaml | kubectl label --local -f - \
-  app.kubernetes.io/part-of=cap --dry-run=client -o yaml | kubectl apply -f -
-# (if api-secrets already exists, `kubectl patch secret api-secrets -p
-#  '{"stringData":{"trusted-proxy-secret":"<value>"}}'` instead)
+# If api-secrets already exists (it does in every live cluster — it holds
+# database-url, cloudflare-api-token, tenant-dns-target), ADD the key with
+# a patch. Do NOT `kubectl apply` a Secret manifest containing only this
+# key: the three-way merge drops keys present in the last-applied config
+# but absent from the new manifest, the API loses database-url and will
+# not start.
+kubectl -n enclava-platform patch secret api-secrets \
+  -p '{"stringData":{"trusted-proxy-secret":"<value>"}}'
+# (for a fresh cluster with no api-secrets yet:
+#  kubectl -n enclava-platform create secret generic api-secrets \
+#    --from-literal=trusted-proxy-secret="$(head -c32 /dev/urandom | base64)")
 ```
 
 2. Configure ingress-nginx to inject the same value as a request header on
-   every proxied request, overwriting anything the client sent. With the
-   controller's global `proxy-set-headers` ConfigMap:
+   every proxied request, overwriting anything the client sent. Scope the
+   injection to the two CAP Ingress objects ONLY, via the per-Ingress
+   `nginx.ingress.kubernetes.io/proxy-set-headers` annotation pointing at a
+   ConfigMap in `enclava-platform`:
 
 ```sh
-kubectl -n ingress-nginx get cm ingress-nginx-controller -o yaml
-# ensure `data["proxy-set-headers"]` points at a ConfigMap containing:
-#   data:
-#     x-enclava-proxy-secret: "<same value as trusted-proxy-secret>"
+# 1) ConfigMap holding the header (same value as trusted-proxy-secret):
+kubectl -n enclava-platform create configmap cap-proxy-headers \
+  --from-literal=x-enclava-proxy-secret="<same value as trusted-proxy-secret>"
+# 2) Reference it from BOTH CAP Ingress objects (enclava-api and
+#    enclava-api-device-start) — see deploy/api/ingress.yaml, which sets:
+#   metadata:
+#     annotations:
+#       nginx.ingress.kubernetes.io/proxy-set-headers: "enclava-platform/cap-proxy-headers"
 ```
+
+Do NOT put the header in the controller's global `proxy-set-headers`
+ConfigMap: the global map injects the secret into every request that
+controller proxies — including requests to OTHER upstreams (enclava-paas,
+tenant workloads) that the API NetworkPolicy admits. Any of those
+upstreams could read the header and replay it on a direct ClusterIP call to
+CAP, minting a fresh rate-limit bucket per request — exactly the bypass
+this secret exists to close. Public clients through ingress cannot do this
+(ingress overwrites both the secret and X-Real-IP); per-Ingress scoping
+closes the leak to other upstreams.
 
 3. **Verify the secret actually reaches CAP** (critical sanity check):
 
@@ -191,6 +212,11 @@ only on the ingress→CAP leg), and there is no debug endpoint exposing
 request headers. Verify behaviorally instead, with a POSITIVE control:
 
 ```sh
+# PREP: pin the API to ONE replica for the duration of the check
+# (kubectl -n enclava-platform scale deploy/enclava-api --replicas=1):
+# the governor is per-process, so with N replicas a shared ingress-IP key
+# is N buckets and machine B can miss the drained one — a false PASS.
+#
 # Run BOTH loops CONCURRENTLY (not sequentially) to prevent the burst
 # from refilling between tests — CAP's bucket refills at 1 r/s, so sequential
 # tests could give a false pass even with broken secret wiring.
@@ -202,11 +228,25 @@ request headers. Verify behaviorally instead, with a POSITIVE control:
 # host's single public IP, land in one bucket either way, and the check
 # below cannot distinguish per-client keying from shared keying.
 #
-# --- MACHINE A (public IP A) — start this first, then IMMEDIATELY: ---
-( for i in $(seq 1 15); do
-    curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-      https://api.<cluster>/auth/device/start \
-      -H 'Content-Type: application/json' -d '{}'
+# ⚠️ VERIFY DIFFERENT IPs BEFORE PROCEEDING: run this on EACH machine
+# and confirm the reported IPs are different. If they're the same, the test
+# is invalid — find a different network path for one of the machines.
+# MACHINE A: curl -s https://api.<cluster>/auth/device/start -w '%{remote_ip}\n' -o /dev/null
+# MACHINE B: curl -s https://api.<cluster>/auth/device/start -w '%{remote_ip}\n' -o /dev/null
+#
+# --- MACHINE A (public IP A) — start this first and KEEP IT RUNNING: ---
+# The 15-request burst finishes in seconds, but the shared fallback bucket
+# refills at 1 token/s — if machine A stops while you walk over to machine
+# B, the bucket refills and a missing secret looks like "B starts fresh"
+# (false PASS). Machine A must KEEP firing until machine B is done: this
+# loop re-fires the burst every 5 s (well below the 1/s refill) for 3 min.
+( for round in $(seq 1 36); do
+    for i in $(seq 1 15); do
+      curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+        https://api.<cluster>/auth/device/start \
+        -H 'Content-Type: application/json' -d '{}'
+    done
+    sleep 5
   done ) > /tmp/ip1.out
 sort /tmp/ip1.out | uniq -c; rm /tmp/ip1.out
 
@@ -220,6 +260,7 @@ sort /tmp/ip2.out | uniq -c; rm /tmp/ip2.out
 
 # Compare the two summaries side by side (the two machines cannot write to
 # a shared /tmp, so collect each machine's `sort | uniq -c` output by hand).
+# Restore the API replica count afterwards.
 #
 # NOTE: Running these sequentially (first loop, then second loop) can give a
 # false pass because CAP's bucket refills at 1 r/s. If there's any delay >~10s
@@ -239,6 +280,11 @@ sort /tmp/ip2.out | uniq -c; rm /tmp/ip2.out
 #   and mask CAP's answer. ingress-nginx throttling returns 503, CAP's
 #   governor returns 429 — distinguish the tiers by status code, and
 #   count only 429s as evidence about the secret wiring.
+#   If you see ONLY 503s on both machines, the check is INCONCLUSIVE:
+#   the ingress limiter answered every request and CAP's governor was
+#   never exercised. Temporarily raise the device-start Ingress's
+#   limit-burst-multiplier (or lower machine A's offered rate) and
+#   repeat until 429s appear.
 # Do NOT enable the policy on a FAIL.
 ```
 
@@ -300,9 +346,13 @@ verified proxy.
 The governors are in-process (tower-governor): each API pod keeps its own
 counters, so with N replicas a single client gets N × (1 r/s, burst 10) on
 `/auth/device/start` — the budget multiplies with scale. The aggregate cap
-belongs at the ingress tier where it is enforced once; if the cluster runs
-multiple API replicas, add an nginx `limit-rps` annotation (or equivalent) on
-the `/auth/device/start` path in the live overlay, e.g.:
+belongs at the ingress tier where it is enforced once: this repository
+already ships it as the exact-path `enclava-api-device-start` Ingress in
+deploy/api/ingress.yaml (limit-rps "1" with limit-burst-multiplier "10",
+scoped to `/auth/device/start` only). Do NOT add a bare `limit-rps` to the
+main `/` Ingress — that throttles every route. If a live overlay overrides
+these objects, keep the exact-path shape (and the burst multiplier) rather
+than inlining a snippet like:
 
 ```yaml
 metadata:

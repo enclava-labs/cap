@@ -5,8 +5,14 @@ metadata:
   namespace: enclava-platform
   annotations:
     cert-manager.io/cluster-issuer: "letsencrypt-prod"
-    # Rate-limit annotation applies to the entire / prefix; see ingress.yaml
-    # below for the tighter /auth/device/start limit.
+    # Inject the trusted-proxy secret on every request this Ingress proxies
+    # (see runbook §3c). Scoped to the CAP Ingress objects only, NOT the
+    # controller-global proxy-set-headers map — the global map would leak
+    # the secret to every other upstream the controller serves.
+    nginx.ingress.kubernetes.io/proxy-set-headers: "enclava-platform/cap-proxy-headers"
+    # No rate-limit annotation here on purpose: it would throttle every
+    # route under the / prefix. The 1 r/s limit lives on the exact-path
+    # enclava-api-device-start Ingress below.
 spec:
   ingressClassName: nginx
   tls:
@@ -35,6 +41,8 @@ metadata:
   name: enclava-api-device-start
   namespace: enclava-platform
   annotations:
+    # Same per-Ingress proxy-secret injection as enclava-api (runbook §3c).
+    nginx.ingress.kubernetes.io/proxy-set-headers: "enclava-platform/cap-proxy-headers"
     nginx.ingress.kubernetes.io/limit-rps: "1"
     # ingress-nginx computes the effective burst as limit-rps ×
     # limit-burst-multiplier (documented default 5). Without this annotation

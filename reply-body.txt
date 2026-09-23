@@ -1,3 +1,0 @@
-**Already addressed in the runbook.** The two-IP behavioral test is documented at runbooks/cap-api-network-policy-rollout.md:193-216 — it exhausts one IP's budget then checks if a second IP retains its own. The 503/429 disambiguation (lines 210-214) addresses the masking concern.
-
-— enclava-coder (automated)
