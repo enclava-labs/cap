@@ -23,20 +23,42 @@ ALTER TABLE org_keyrings
         ) = 'array') IS TRUE
     );
 
--- #130 rollout safety: load_signed_policy_candidates now filters candidates by
--- current keyring membership, so on any install where a rotated-out signer's
--- artifact was already applied (the exact production state issue #130 fixes),
--- the desired policy hash changes at an UNCHANGED desired_generation. Startup
--- reconciliation treats that as PolicyGenerationConflict and exits(1) before
--- the API is ready, and the runtime generation bump in
--- enqueue_signed_policy_reconciliation_if_active can never run because no
--- keyring write can reach the API. Bump the generation here -- same UPDATE the
--- runtime helper uses -- so the first reconcile on the new build treats the
--- filtered candidate set as a new generation and replaces the policy body
--- instead of crash-looping. Unsigned-only installs (desired_generation = 0)
--- stay untouched, matching enqueue_signed_policy_reconciliation_if_active.
+-- #130 rollout safety: load_signed_policy_candidates now filters candidates
+-- by current keyring membership, so on any install where a rotated-out
+-- signer's artifact was already applied (the exact production state issue
+-- #130 fixes), the desired policy hash changes at an UNCHANGED
+-- desired_generation.  Startup reconciliation treats that as
+-- PolicyGenerationConflict and exits before the API is ready, and no runtime
+-- bump can rescue it because no keyring write can reach a refusing API.  A
+-- generation bump is owed.
+--
+-- It must NOT be performed here, though.  With DATABASE_MIGRATION_MODE=verify
+-- (deploy/api/deployment.yaml) this migration runs in a rollout step that
+-- precedes the new binary while a previous replica is still live: that
+-- replica's 30-second reconciler would consume a direct bump using the old,
+-- unfiltered candidate query and publish the old policy body at the new
+-- generation.  The new binary would then compute the filtered hash at the
+-- already-published generation and crash-loop on PolicyGenerationConflict
+-- with no bump left to recover.
+--
+-- Instead record the owed bump as a pending marker that only the post-0049
+-- implementation interprets: consume_deferred_selector_bump
+-- (crates/enclava-api/src/kbs.rs) performs the actual desired_generation
+-- increment at the start of a reconciliation run held under the global KBS
+-- mutation fence and converges the filtered candidate set within that same
+-- fenced run.  A pre-0049 reconciler therefore never sees the owed
+-- generation as a raw desired generation: it keeps finding an unchanged
+-- generation whose unfiltered hash matches the published body and stays
+-- quiescent, and once the bumped generation is published its content-bound
+-- generation annotation turns any late unfiltered republication into a
+-- same-generation conflict.  Unsigned-only installs (desired_generation = 0)
+-- are not marked, matching enqueue_signed_policy_reconciliation_if_active;
+-- the marker invariant is selector_bump_pending => desired_generation > 0.
+ALTER TABLE kbs_signed_policy_reconciliation
+    ADD COLUMN selector_bump_pending boolean NOT NULL DEFAULT false;
+
 UPDATE kbs_signed_policy_reconciliation
-   SET desired_generation = desired_generation + 1,
+   SET selector_bump_pending = true,
        updated_at = clock_timestamp()
  WHERE singleton
    AND desired_generation > 0;
