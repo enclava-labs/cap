@@ -259,13 +259,7 @@ fn verify_evidence(
         checks.push(simple_check(
             "amd.revocation.freshness",
             revocation.is_ok(),
-            match revocation {
-                Err(AmdVerificationError::RevocationDataExpired) => "REVOCATION_DATA_EXPIRED",
-                Err(AmdVerificationError::RevocationDataStale) => "REVOCATION_DATA_STALE",
-                Err(AmdVerificationError::RevocationTimeMissing) => "REVOCATION_TIME_MISSING",
-                Err(AmdVerificationError::AskRevoked) => "ASK_REVOKED",
-                _ => "AMD_REVOCATION_INVALID",
-            },
+            revocation_reason_code(revocation.err().as_ref()),
         ));
         checks.push(simple_check(
             "amd.measurement",
@@ -521,6 +515,19 @@ fn artifact_failure_checks(error: &ArtifactError) -> [CheckResult; 2] {
     ]
 }
 
+/// Maps an `amd.revocation.freshness` failure to its stable, operator-facing
+/// reason code. Extracted so tests can pin every emitted string.
+fn revocation_reason_code(error: Option<&AmdVerificationError>) -> &'static str {
+    match error {
+        Some(AmdVerificationError::RevocationDataExpired) => "REVOCATION_DATA_EXPIRED",
+        Some(AmdVerificationError::RevocationDataStale) => "REVOCATION_DATA_STALE",
+        Some(AmdVerificationError::RevocationTimeMissing) => "REVOCATION_TIME_MISSING",
+        Some(AmdVerificationError::AskRevoked) => "ASK_REVOKED",
+        Some(AmdVerificationError::VcekRevoked) => "VCEK_REVOKED",
+        _ => "AMD_REVOCATION_INVALID",
+    }
+}
+
 fn simple_check(id: &str, passes: bool, reason: &str) -> CheckResult {
     CheckResult {
         id: id.into(),
@@ -642,5 +649,38 @@ mod tests {
             "POLICY_ARTIFACT_SIGNATURE_INVALID"
         );
         assert_eq!(signature[1].outcome, CheckOutcome::Skipped);
+    }
+
+    #[test]
+    fn revocation_failures_emit_distinct_stable_reason_codes() {
+        // The appraisal boundary must report each revocation failure with
+        // its own reason string (#126 pins VCEK_REVOKED alongside
+        // ASK_REVOKED); a dropped match arm would fall through to
+        // AMD_REVOCATION_INVALID and change operator-visible output.
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::RevocationDataExpired)),
+            "REVOCATION_DATA_EXPIRED"
+        );
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::RevocationDataStale)),
+            "REVOCATION_DATA_STALE"
+        );
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::RevocationTimeMissing)),
+            "REVOCATION_TIME_MISSING"
+        );
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::AskRevoked)),
+            "ASK_REVOKED"
+        );
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::VcekRevoked)),
+            "VCEK_REVOKED"
+        );
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::UntrustedArk)),
+            "AMD_REVOCATION_INVALID"
+        );
+        assert_eq!(revocation_reason_code(None), "AMD_REVOCATION_INVALID");
     }
 }

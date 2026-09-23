@@ -36,6 +36,8 @@ pub enum AmdVerificationError {
     InvalidRevocationList,
     #[error("AMD ASK is revoked")]
     AskRevoked,
+    #[error("AMD VCEK is revoked")]
+    VcekRevoked,
     #[error("AMD revocation data has no signed nextUpdate")]
     RevocationTimeMissing,
     #[error("AMD revocation data is stale")]
@@ -105,17 +107,36 @@ pub fn verify_amd_revocation(
         return Err(AmdVerificationError::InvalidRevocationList);
     }
     verify_revocation_times(&crl, now_unix_seconds, maximum_age_seconds)?;
-    if crl
-        .tbs_cert_list
-        .revoked_certificates
-        .as_ref()
-        .is_some_and(|revoked| {
-            revoked
-                .iter()
-                .any(|entry| entry.serial_number == ask.tbs_certificate.serial_number)
-        })
-    {
-        return Err(AmdVerificationError::AskRevoked);
+    // Defense-in-depth serial walk over the single ARK-signed product CRL
+    // that AMD KDS publishes per product line. Today that list carries ASK
+    // serials (the Genoa CRL's only entry, 020001, is the retired ASK); AMD
+    // does not currently revoke individual VCEKs by serial — TCB
+    // requirements supersede a chip's previous certificates, and shipped
+    // VCEKs share serial 0 — and go-sev-guest therefore compares only the
+    // ASK. If AMD ever does list a VCEK serial here, this check rejects it
+    // instead of silently accepting a revoked endorsement key.
+    //
+    // Design note (issuer scoping): X.509 serial numbers are issuer-scoped,
+    // and this CRL is ARK-issued, so strictly its entries revoke ARK-issued
+    // certificates (like the ASK); a VCEK (ASK-issued) serial match could
+    // in principle collide with an unrelated ARK-issued certificate. We
+    // still fail closed (#126): the CRL reaching this walk is policy-pinned
+    // to a trusted ARK and RSA-PSS signature-verified, i.e. AMD-authored
+    // content either way, and shipped VCEKs share serial 0 — so a false
+    // positive requires AMD deliberately listing serial 0 on a product CRL,
+    // self-breakage the same trust could equally inflict by revoking the
+    // ASK outright. Behavior on all current AMD CRL contents is identical
+    // to go-sev-guest; this arm only fires if AMD ever publishes a VCEK
+    // serial, and rejecting then is the safe reading.
+    if let Some(revoked) = crl.tbs_cert_list.revoked_certificates.as_ref() {
+        for entry in revoked {
+            if entry.serial_number == ask.tbs_certificate.serial_number {
+                return Err(AmdVerificationError::AskRevoked);
+            }
+            if entry.serial_number == vcek.tbs_certificate.serial_number {
+                return Err(AmdVerificationError::VcekRevoked);
+            }
+        }
     }
     Ok(())
 }
@@ -517,6 +538,33 @@ mod tests {
                 trusted,
             ),
             Err(AmdVerificationError::AskRevoked)
+        );
+
+        // #126: the serial walk must also reject a VCEK whose serial appears
+        // on the ARK-signed CRL. Issuer-scoping counterargument considered
+        // and documented in verify_amd_revocation; decision is fail-closed.
+        // The unmodified ASK serial stays off the CRL, so an ASK-only check
+        // would return Ok — exactly the gap #126 reports. This fixture is
+        // not a chain-valid certificate: only the serial is under test.
+        let mut revoked_vcek = Certificate::from_der(&vcek).unwrap();
+        revoked_vcek.tbs_certificate.serial_number = parsed_crl
+            .tbs_cert_list
+            .revoked_certificates
+            .as_ref()
+            .unwrap()[0]
+            .serial_number
+            .clone();
+        assert_eq!(
+            verify_amd_revocation(
+                &ark,
+                &ask,
+                &revoked_vcek.to_der().unwrap(),
+                &crl,
+                1_785_844_800,
+                30 * 86_400,
+                trusted,
+            ),
+            Err(AmdVerificationError::VcekRevoked)
         );
     }
 
