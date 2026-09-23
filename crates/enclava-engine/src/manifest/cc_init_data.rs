@@ -273,16 +273,31 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     // enclava-init re-publishes this claim as the trusted in-guest handoff for
     // enclava-wait-exec, so a tampered host cannot swap the recipient key (and
     // thereby capture workload log plaintext) through pod env or ConfigMap.
-    // The claim deliberately carries ONLY key material: per-deployment frame
-    // labels (org/app/deployment) stay out of it so the cc_init_data hash of a
-    // rollback — which builds an app_spec with a fresh deployment UUID but
-    // reuses the target's signed artifact and expected hash — stays identical.
-    if let Some(log_encryption) = &app.log_encryption {
+    // The claim carries the key material plus the two rollback-stable frame
+    // labels (org_id, app_name): both are constants of the app across the
+    // re-renders that reuse one signed artifact (rollback, unlock transition,
+    // queued-job replay), so the cc_init_data hash of those operations stays
+    // identical to the signed expectation. deployment_id is deliberately
+    // excluded — every such operation renders under a fresh deployment UUID —
+    // so prod-strict wait-exec takes it from the pod env, where it is a
+    // non-trust-bearing routing label only (key material still comes
+    // exclusively from this signed claim). `omit_log_encryption_claim` on the
+    // workload artifact binding reproduces the pre-claim byte layout for
+    // artifacts signed before this field existed.
+    let omit_claim = app
+        .workload_artifact_binding
+        .as_ref()
+        .is_some_and(|binding| binding.omit_log_encryption_claim);
+    if let Some(log_encryption) = &app.log_encryption
+        && !omit_claim
+    {
         let handoff = serde_json::json!({
             "algorithm": log_encryption.algorithm,
             "key_id": log_encryption.key_id,
             "public_key_base64url": log_encryption.public_key_base64url,
             "public_key_sha256": log_encryption.public_key_sha256,
+            "org_id": app.tenant_id,
+            "app_name": app.name,
         });
         push_toml_string(&mut toml, "log_encryption_json", &handoff.to_string());
     }

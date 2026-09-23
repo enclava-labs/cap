@@ -715,6 +715,7 @@ pub(crate) async fn build_signed_deploy_blobs(
         descriptor_core_hash,
         descriptor_signing_pubkey: deployer_key.public.to_bytes(),
         org_keyring_fingerprint,
+        omit_log_encryption_claim: false,
     };
     let (generated_agent_policy, log_encryption) =
         fetch_generated_agent_policy(api, &release, &descriptor).await?;

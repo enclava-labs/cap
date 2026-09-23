@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
-use enclava_init::config::{Config, LogEncryptionHandoff, Mode, VolumeConfig};
+use enclava_init::config::{
+    Config, LogEncryptionHandoff, LogEncryptionHandoffFile, Mode, VolumeConfig,
+};
 use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
@@ -150,7 +152,7 @@ fn run() -> Result<()> {
     record_stage("writing component seeds").ok();
     let phase = stats.elapsed_ms();
     write_per_component_seeds(&cfg, &owner)?;
-    write_log_encryption_handoff(&cfg, log_encryption_handoff.as_ref())?;
+    write_log_encryption_handoff(&cfg, &log_encryption_handoff)?;
     stats.record_component_seeds(phase);
 
     if stay_alive {
@@ -476,7 +478,7 @@ fn acquire_owner_seed_password(cfg: &Config) -> Result<OwnerSeed> {
 
 fn validate_configmap_transport_against_signed_cc_init_data(
     cfg: &Config,
-) -> Result<Option<LogEncryptionHandoff>> {
+) -> Result<LogEncryptionHandoffFile> {
     if !cfg.trustee_policy_read_available {
         if cfg!(feature = "prod-strict") {
             anyhow::bail!(
@@ -484,7 +486,7 @@ fn validate_configmap_transport_against_signed_cc_init_data(
             );
         }
         if cfg.cc_init_data_path.is_none() {
-            return Ok(None);
+            return Ok(LogEncryptionHandoffFile::Unconfigured);
         }
     }
     let cc_path = cfg
@@ -676,28 +678,34 @@ fn validate_configmap_transport_against_signed_cc_init_data(
 fn signed_log_encryption_handoff(
     data: &toml::map::Map<String, toml::Value>,
     cfg: &Config,
-) -> Result<Option<LogEncryptionHandoff>> {
+) -> Result<LogEncryptionHandoffFile> {
     let signed = data
         .get("log_encryption_json")
         .and_then(toml::Value::as_str);
     match (signed, cfg.log_encryption.as_ref()) {
-        (None, None) => Ok(None),
+        (None, None) => Ok(LogEncryptionHandoffFile::Unconfigured),
         // Init-first rollout compatibility: during the transition window where
         // the new init binary is live but the old API still renders manifests,
         // the ConfigMap may have [log-encryption] while cc_init_data lacks the
-        // new log_encryption_json claim. We tolerate this but the trust binding
-        // is DOWNGRADED: encrypted logs are disabled because we cannot verify
-        // the key material came from a trusted manifest source (it's purely
-        // host-controlled ConfigMap at this point). Once the API rolls out and
-        // begins emitting log_encryption_json, this branch is no longer taken
-        // and full trust binding is restored.
+        // new log_encryption_json claim (the same shape occurs on every later
+        // restart of a pre-claim signed artifact pinned to the legacy render).
+        // We tolerate this but the trust binding is DOWNGRADED: encrypted logs
+        // stay off until the app is re-signed because we cannot verify the key
+        // material came from a trusted manifest source (it's purely
+        // host-controlled ConfigMap at this point), and an explicit disabled
+        // marker is published so prod-strict wait-exec treats encryption as
+        // off instead of failing on a handoff that can never exist. The relay
+        // discards log frames rather than emitting them in plaintext; key
+        // material is never taken from env or ConfigMap.
         (None, Some(_)) => {
             tracing::warn!(
                 "ConfigMap has [log-encryption] but signed cc_init_data lacks \
-                 log_encryption_json claim: legacy API manifest in transition window? \
-                 Encrypted logs are DISABLED for this workload until API rollout completes."
+                 log_encryption_json claim (legacy API manifest or pre-claim \
+                 signed artifact): encrypted logging stays DISABLED until the \
+                 app is re-signed; log frames are discarded, not emitted in \
+                 plaintext."
             );
-            Ok(None)
+            Ok(LogEncryptionHandoffFile::DisabledMarker)
         }
         (Some(signed), section) => {
             let handoff: LogEncryptionHandoff = serde_json::from_str(signed)
@@ -729,7 +737,7 @@ fn signed_log_encryption_handoff(
                     "signed cc_init_data carries log_encryption_json but the ConfigMap has no [log-encryption] section"
                 );
             }
-            Ok(Some(handoff))
+            Ok(LogEncryptionHandoffFile::Enabled(handoff))
         }
     }
 }
@@ -1529,19 +1537,45 @@ fn write_per_component_seeds(cfg: &Config, owner: &OwnerSeed) -> Result<()> {
 /// cross-checks the host-controlled ConfigMap section against it). It is
 /// published onto the decrypted state volume — the only path the host
 /// cannot write (it only ever sees LUKS ciphertext) — so prod-strict
-/// enclava-wait-exec resolves the recipient (and the log frame context)
-/// from this file instead of the host-controlled pod environment. The file
-/// carries only public key material; it is written after unlock and before
-/// the ready file flips, so consumers never see readiness without it.
-fn write_log_encryption_handoff(
-    cfg: &Config,
-    handoff: Option<&LogEncryptionHandoff>,
-) -> Result<()> {
-    let Some(handoff) = handoff else {
-        return Ok(());
-    };
+/// enclava-wait-exec resolves the recipient (and the rollback-stable frame
+/// labels) from this file instead of the host-controlled pod environment.
+/// The file carries the key material plus org_id/app_name and is written
+/// after unlock and strictly before the ready file flips, so consumers
+/// never see readiness without it. When the ConfigMap has a
+/// `[log-encryption]` section but no signed claim exists (init-first
+/// rollout transition window), an explicit `{"disabled": true}` marker is
+/// written instead so wait-exec disables encrypted logging rather than
+/// failing on a handoff that can never exist.
+fn write_log_encryption_handoff(cfg: &Config, outcome: &LogEncryptionHandoffFile) -> Result<()> {
     let path = Path::new(&cfg.state_root).join("app/log-encryption.json");
-    let body = serde_json::to_vec_pretty(handoff).context("serializing log-encryption handoff")?;
+    let body = match outcome {
+        // No log encryption configured anywhere this boot: make sure no
+        // handoff from an earlier boot survives — the file is init's
+        // decision for THIS boot, and a stale one must not be readable
+        // as an enabled handoff after readiness. Removal, not rewrite,
+        // keeps "absent" unambiguous. (Defense in depth: honest renders
+        // set no activation hint in this case either.)
+        LogEncryptionHandoffFile::Unconfigured => {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(anyhow!(err).context(format!(
+                        "removing stale log-encryption handoff {}",
+                        path.display()
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        LogEncryptionHandoffFile::DisabledMarker => {
+            serde_json::to_vec_pretty(&serde_json::json!({ "disabled": true }))
+                .context("serializing log-encryption disabled marker")?
+        }
+        LogEncryptionHandoffFile::Enabled(handoff) => {
+            serde_json::to_vec_pretty(handoff).context("serializing log-encryption handoff")?
+        }
+    };
     writes::atomic_write(&path, &body, 0o640)
         .with_context(|| format!("writing log-encryption handoff {}", path.display()))?;
     chown::chown(&path, numeric_identity(cfg.app_uid, cfg.app_gid))

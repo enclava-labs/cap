@@ -194,7 +194,10 @@ fn required_env(name: &str) -> Result<String, String> {
 /// Trusted encrypted-log recipient handoff written by enclava-init onto the
 /// decrypted state volume (contents from the signed cc_init_data
 /// `log_encryption_json` claim). Prod-strict builds read this instead of the
-/// host-controlled log-encryption env vars.
+/// host-controlled log-encryption env vars. The file carries the claim's key
+/// material plus the rollback-stable frame labels (org_id, app_name);
+/// deployment_id is not part of the measured claim (rollback re-renders under
+/// a fresh deployment UUID) and is taken from the validated pod env instead.
 #[cfg(feature = "prod-strict")]
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -202,9 +205,9 @@ struct LogEncryptionHandoff {
     key_id: String,
     public_key_base64url: String,
     public_key_sha256: String,
+    algorithm: String,
     org_id: String,
     app_name: String,
-    deployment_id: String,
 }
 
 /// Location of the trusted handoff on the decrypted state volume; mirrors
@@ -231,20 +234,77 @@ fn handoff_container_name() -> Result<String, String> {
 
 #[cfg(feature = "prod-strict")]
 fn encrypted_log_config_from_handoff() -> Result<Option<EncryptedLogConfig>, String> {
-    let handoff = fs::read_to_string(LOG_ENCRYPTION_HANDOFF_FILE)
-        .map_err(|err| format!("reading {LOG_ENCRYPTION_HANDOFF_FILE}: {err}"))?;
-    let handoff: LogEncryptionHandoff = serde_json::from_str(&handoff)
-        .map_err(|err| format!("parsing {LOG_ENCRYPTION_HANDOFF_FILE}: {err}"))?;
+    encrypted_log_config_from_handoff_at(Path::new(LOG_ENCRYPTION_HANDOFF_FILE))
+}
+
+/// Read and validate the trusted handoff at `path`.
+///
+/// Three outcomes are possible after readiness:
+/// - the handoff file parses: encrypted logging engages with the claim's key
+///   material and frame labels;
+/// - the file carries the explicit `{"disabled": true}` marker enclava-init
+///   writes during the init-first rollout transition window (ConfigMap
+///   `[log-encryption]` present, no signed claim): encrypted logging is off —
+///   there is no trustable recipient key, so proceeding unencrypted is the
+///   only safe option;
+/// - the file is absent (with a warning): init published no decision at all.
+///   The state volume is guest-only after LUKS unlock and init writes its
+///   decision strictly before the ready file flips, so after readiness an
+///   absent file means no signed claim existed. Fail-closed on
+///   confidentiality: launch unencrypted rather than exit 127 and brick the
+///   workload. Key material is never taken from host-controlled sources.
+#[cfg(feature = "prod-strict")]
+fn encrypted_log_config_from_handoff_at(path: &Path) -> Result<Option<EncryptedLogConfig>, String> {
+    let handoff_content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "enclava-wait-exec: log-encryption handoff {} absent after readiness; encrypted logging disabled",
+                path.display()
+            );
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(format!("reading {}: {}", path.display(), err));
+        }
+    };
+    // Explicit disabled marker (init-first rollout transition window).
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&handoff_content)
+        && value.get("disabled").and_then(|flag| flag.as_bool()) == Some(true)
+    {
+        eprintln!(
+            "enclava-wait-exec: log-encryption handoff {} is explicitly disabled (no signed cc_init_data claim); encrypted logging disabled",
+            path.display()
+        );
+        return Ok(None);
+    }
+    let handoff: LogEncryptionHandoff = serde_json::from_str(&handoff_content)
+        .map_err(|err| format!("parsing {}: {}", path.display(), err))?;
+    // The claim's algorithm must be the one supported scheme; a future
+    // algorithm must not silently encrypt under the hardcoded scheme.
+    if handoff.algorithm != enclava_common::log_encryption::LOG_ENCRYPTION_ALGORITHM {
+        return Err(format!(
+            "log-encryption handoff {} carries unsupported algorithm {} (expected {})",
+            path.display(),
+            handoff.algorithm,
+            enclava_common::log_encryption::LOG_ENCRYPTION_ALGORITHM
+        ));
+    }
     let recipient = validate_public_key(
         handoff.key_id,
         handoff.public_key_base64url,
         handoff.public_key_sha256,
     )
     .map_err(|err| format!("invalid log encryption public key metadata: {err}"))?;
+    // deployment_id is a routing label only (it is not part of the measured
+    // claim because rollback re-renders under a fresh deployment UUID); the
+    // manifest always sets it when log encryption is configured.
+    let deployment_id = env::var("ENCLAVA_LOG_DEPLOYMENT_ID")
+        .map_err(|_| "ENCLAVA_LOG_DEPLOYMENT_ID is required".to_string())?;
     for (name, value) in [
         ("org_id", &handoff.org_id),
         ("app_name", &handoff.app_name),
-        ("deployment_id", &handoff.deployment_id),
+        ("deployment_id", &deployment_id),
     ] {
         if value.is_empty()
             || value
@@ -252,14 +312,14 @@ fn encrypted_log_config_from_handoff() -> Result<Option<EncryptedLogConfig>, Str
                 .any(|byte| byte == 0 || byte == b'\n' || byte == b'\r')
         {
             return Err(format!(
-                "log-encryption handoff {name} must not be empty or contain line breaks"
+                "log-encryption frame label {name} must not be empty or contain line breaks"
             ));
         }
     }
     let context = LogFrameContext {
         org_id: handoff.org_id,
         app_name: handoff.app_name,
-        deployment_id: handoff.deployment_id,
+        deployment_id,
     };
     let container = handoff_container_name()?;
     // Spool pinned to the dedicated log spool dir: the host-controlled
@@ -697,6 +757,141 @@ mod tests {
         // Note: We don't check that encrypted_log_config_from_raw_env is absent because
         // it's gated with #[cfg(not(feature = "prod-strict"))] in the source, which is correct.
         // The function exists in dev builds but is compiled out in prod-strict.
+    }
+
+    #[cfg(feature = "prod-strict")]
+    fn unique_handoff_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "enclava-wait-exec-handoff-{}-{}-{}.json",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Serializes tests that mutate process env (Rust runs tests on parallel
+    /// threads; set_var/remove_var on shared env would otherwise race).
+    #[cfg(feature = "prod-strict")]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn handoff_marker_disables_encrypted_logging() {
+        let path = unique_handoff_path("marker");
+        fs::write(&path, "{\"disabled\": true}").unwrap();
+        assert!(
+            encrypted_log_config_from_handoff_at(&path)
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn handoff_absent_disables_encrypted_logging() {
+        let path = unique_handoff_path("absent");
+        assert!(
+            encrypted_log_config_from_handoff_at(&path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn handoff_parses_claim_and_env_deployment_label() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        let path = unique_handoff_path("claim");
+        let claim = serde_json::json!({
+            "algorithm": enclava_common::log_encryption::LOG_ENCRYPTION_ALGORITHM.to_string(),
+            "key_id": "logs-prod".to_string(),
+            "public_key_base64url": keypair.public_key_base64url.clone(),
+            "public_key_sha256": keypair.public_key_sha256.clone(),
+            "org_id": "acme".to_string(),
+            "app_name": "secure-app".to_string(),
+        });
+        fs::write(&path, claim.to_string()).unwrap();
+        unsafe {
+            env::set_var(
+                "ENCLAVA_LOG_DEPLOYMENT_ID",
+                "11111111-1111-1111-1111-111111111111",
+            );
+            env::set_var("ENCLAVA_CONTAINER_NAME", "web");
+        }
+        let config = encrypted_log_config_from_handoff_at(&path)
+            .unwrap()
+            .expect("handoff engages encrypted logging");
+        assert_eq!(config.context.org_id, "acme");
+        assert_eq!(config.context.app_name, "secure-app");
+        assert_eq!(
+            config.context.deployment_id,
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(config.container, "web");
+        unsafe {
+            env::remove_var("ENCLAVA_LOG_DEPLOYMENT_ID");
+            env::remove_var("ENCLAVA_CONTAINER_NAME");
+        }
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn handoff_with_unsupported_algorithm_fails() {
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        let path = unique_handoff_path("badalg");
+        let claim = serde_json::json!({
+            "algorithm": "x25519-xsalsa20-poly1305".to_string(),
+            "key_id": "logs-prod".to_string(),
+            "public_key_base64url": keypair.public_key_base64url.clone(),
+            "public_key_sha256": keypair.public_key_sha256.clone(),
+            "org_id": "acme".to_string(),
+            "app_name": "secure-app".to_string(),
+        });
+        fs::write(&path, claim.to_string()).unwrap();
+        unsafe {
+            env::set_var("ENCLAVA_LOG_DEPLOYMENT_ID", "deploy-123");
+            env::set_var("ENCLAVA_CONTAINER_NAME", "web");
+        }
+        let err = encrypted_log_config_from_handoff_at(&path).unwrap_err();
+        assert!(err.contains("unsupported algorithm"), "got: {err}");
+        unsafe {
+            env::remove_var("ENCLAVA_LOG_DEPLOYMENT_ID");
+            env::remove_var("ENCLAVA_CONTAINER_NAME");
+        }
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn handoff_without_deployment_env_label_fails() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        let path = unique_handoff_path("nolabel");
+        let claim = serde_json::json!({
+            "algorithm": enclava_common::log_encryption::LOG_ENCRYPTION_ALGORITHM.to_string(),
+            "key_id": "logs-prod".to_string(),
+            "public_key_base64url": keypair.public_key_base64url.clone(),
+            "public_key_sha256": keypair.public_key_sha256.clone(),
+            "org_id": "acme".to_string(),
+            "app_name": "secure-app".to_string(),
+        });
+        fs::write(&path, claim.to_string()).unwrap();
+        unsafe {
+            env::remove_var("ENCLAVA_LOG_DEPLOYMENT_ID");
+            env::set_var("ENCLAVA_CONTAINER_NAME", "web");
+        }
+        let err = encrypted_log_config_from_handoff_at(&path).unwrap_err();
+        assert!(err.contains("ENCLAVA_LOG_DEPLOYMENT_ID"), "got: {err}");
+        unsafe {
+            env::remove_var("ENCLAVA_CONTAINER_NAME");
+        }
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -322,6 +322,7 @@ fn toml_contains_workload_artifact_binding_when_present() {
         descriptor_core_hash: [0xab; 32],
         descriptor_signing_pubkey: [0xcd; 32],
         org_keyring_fingerprint: [0xef; 32],
+        omit_log_encryption_claim: false,
     });
     let toml = build_toml(&app);
     assert!(toml.contains(&format!("descriptor_core_hash = \"{}\"", "ab".repeat(32))));
@@ -569,15 +570,38 @@ fn log_encryption_claim_is_bound_to_cc_init_data() {
         handoff["public_key_sha256"],
         "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU"
     );
-    // Per-deployment frame labels stay OUT of the measured claim so signed
-    // rollback hash reuse (fresh deployment UUID, reused artifact) is not
-    // broken by this field.
-    for label in ["org_id", "app_name", "deployment_id"] {
-        assert!(
-            handoff.get(label).is_none(),
-            "{label} must not be part of the measured log_encryption_json claim"
-        );
-    }
+    // Rollback-stable frame labels (org_id, app_name) are part of the
+    // measured claim: both are constants of the app across the re-renders
+    // that reuse one signed artifact (rollback, unlock transition, queued-
+    // job replay), so their presence does not break hash reuse.
+    assert_eq!(handoff["org_id"], "test-org");
+    assert_eq!(handoff["app_name"], "test-app");
+    // deployment_id deliberately stays OUT: those operations render under a
+    // fresh deployment UUID, so including it would break signed hash reuse.
+    assert!(
+        handoff.get("deployment_id").is_none(),
+        "deployment_id must not be part of the measured log_encryption_json claim"
+    );
+
+    // `omit_log_encryption_claim` reproduces the pre-claim byte layout for
+    // artifacts signed before this field existed (legacy render pin).
+    let mut legacy = app.clone();
+    legacy.workload_artifact_binding = Some(WorkloadArtifactBinding {
+        descriptor_core_hash: [0u8; 32],
+        descriptor_signing_pubkey: [0u8; 32],
+        org_keyring_fingerprint: [0u8; 32],
+        omit_log_encryption_claim: true,
+    });
+    let legacy_toml = build_toml(&legacy);
+    let legacy_value: toml::Value = toml::from_str(&legacy_toml).unwrap();
+    let legacy_data = legacy_value
+        .get("data")
+        .and_then(toml::Value::as_table)
+        .unwrap();
+    assert!(
+        legacy_data.get("log_encryption_json").is_none(),
+        "omit_log_encryption_claim must reproduce the pre-claim byte layout"
+    );
 
     // Absent when log encryption is not configured.
     let plain = build_toml(&sample_app());
