@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -83,6 +84,15 @@ fn validate_sentinel_name(name: &str) -> Result<(), String> {
     }
     if name.as_bytes().contains(&b'/') || name.as_bytes().contains(&0) {
         return Err("ENCLAVA_CONTAINER_NAME must be a single path component".to_string());
+    }
+    // The name lands in the sentinel's key=value record (`container=<name>`)
+    // and in file paths: newlines would inject extra record lines and `=`
+    // would corrupt the key; reject both along with all other control
+    // characters (#137).
+    if name.bytes().any(|b| b.is_ascii_control() || b == b'=') {
+        return Err(
+            "ENCLAVA_CONTAINER_NAME must not contain control characters or '='".to_string(),
+        );
     }
     Ok(())
 }
@@ -328,14 +338,54 @@ fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
         ));
     }
     let body = sentinel_record(name)?;
+    // 0o600 (#137): the started dir is group-writable (0o2770) so sibling
+    // containers can create their own sentinels; the sentinel itself must
+    // stay owner-writable only, or a same-group process could overwrite
+    // another container's record.
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .mode(0o640)
+        .mode(0o600)
         .custom_flags(O_NOFOLLOW)
         .open(&sentinel)
         .map_err(|err| format!("failed to write sentinel {}: {err}", sentinel.display()))?;
+    // Normalize ownership to the writer's own uid:gid (#137). The started
+    // dir is setgid, so a fresh file inherits the directory's group; the
+    // reader (enclava-init) validates the sentinel's owner gid against the
+    // container's expected identity, and this fchown is what makes that
+    // hold for every writer. fd-based, so it cannot be redirected by a
+    // path race. Note: chowning to the process's own ids is permitted for
+    // a fresh or self-owned inode; a pre-created inode owned by another
+    // uid fails with EPERM here, which is the safe outcome (#175 review).
+    let (uid, gid) = current_uid_gid()?;
+    // SAFETY: plain libc wrappers around the process's own ids and an
+    // owned fd; no path traversal is involved.
+    unsafe {
+        if nix::libc::fchown(
+            file.as_raw_fd(),
+            uid as nix::libc::uid_t,
+            gid as nix::libc::gid_t,
+        ) != 0
+        {
+            return Err(format!(
+                "failed to own sentinel {}: {}",
+                sentinel.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        // `.mode(0o600)` above only applies when the file is created; a
+        // reused inode (container restart with the dir still present)
+        // keeps its previous mode. fchmod the fd so the owner-only
+        // invariant holds on reopen too (#175 review).
+        if nix::libc::fchmod(file.as_raw_fd(), 0o600) != 0 {
+            return Err(format!(
+                "failed to set sentinel {} mode: {}",
+                sentinel.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
     use std::io::Write;
     file.write_all(body.as_bytes())
         .map_err(|err| format!("failed to write sentinel {}: {err}", sentinel.display()))?;
@@ -482,6 +532,139 @@ mod tests {
             assert!(validate_sentinel_name(name).is_err(), "{name:?}");
         }
         assert!(validate_sentinel_name("tenant-ingress").is_ok());
+    }
+
+    #[test]
+    fn rejects_record_injection_sentinel_names() {
+        // Names land in the sentinel key=value record: newlines inject
+        // lines, '=' corrupts keys, and other control characters have no
+        // legitimate use (#137).
+        for name in [
+            "web\npid=1",
+            "web\n",
+            "con=tainer",
+            "web\r",
+            "web\ttab",
+            "web\0nul",
+        ] {
+            assert!(validate_sentinel_name(name).is_err(), "{name:?}");
+        }
+        assert!(validate_sentinel_name("tenant-ingress").is_ok());
+    }
+
+    #[test]
+    fn signal_started_writes_owner_only_sentinel() {
+        let dir = unique_dir();
+        signal_started(&dir, "web").unwrap();
+        let mode = fs::metadata(dir.join("web")).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "sentinel must be owner-writable only (group writes would let a same-group process overwrite it)"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_started_renormalizes_reused_sentinel_mode() {
+        // A reused inode (container restart, started dir still populated)
+        // can carry a group-writable mode; `.mode(0o600)` only applies at
+        // creation, so signal_started must fchmod the fd back to 0o600
+        // (#175 review).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let sentinel = dir.join("web");
+        fs::write(&sentinel, "stale").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o664)).unwrap();
+        signal_started(&dir, "web").unwrap();
+        let mode = fs::metadata(&sentinel).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "reused sentinel must be re-chmodded to owner-only"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn signal_started_normalizes_sentinel_gid_under_setgid_dir() {
+        // Model the deployed started dir: setgid (0o2770) with a group the
+        // writer is a member of. A freshly created file inherits the dir's
+        // gid; the sentinel must still end up owned by the writer's own
+        // uid:gid because enclava-init validates the owner gid (#137).
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let uid = unsafe { nix::libc::getuid() } as u32;
+            let primary_gid = unsafe { nix::libc::getgid() } as u32;
+            // Prefer a supplemental group distinct from the primary gid —
+            // that models the deployed started dir most faithfully. When
+            // none exists (minimal containers), fall back so the test
+            // always exercises signal_started instead of skipping: root
+            // can adopt any arbitrary gid, and otherwise the primary gid
+            // still drives the file through the setgid-inherit + re-own
+            // path, just with a weaker pre-state.
+            let dir_gid = supplemental_gid()
+                .filter(|g| *g != primary_gid)
+                .or({
+                    if uid == 0 {
+                        Some(65534) // nobody: any gid works for root
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(primary_gid);
+            let strong_case = dir_gid != primary_gid;
+            if !strong_case {
+                eprintln!(
+                    "NOTE: no supplemental group available; setgid-inherit gid \
+                     normalization tested only in the weak form (dir gid == \
+                     primary gid, so inheritance alone cannot detect a \
+                     missing fchown). Run the suite with a supplemental \
+                     group or as root for full coverage."
+                );
+            }
+            let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+            let rc = unsafe { nix::libc::chown(c_path.as_ptr(), uid, dir_gid) };
+            assert_eq!(rc, 0, "failed to set up test dir group");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o2770)).unwrap();
+
+            signal_started(&dir, "web").unwrap();
+
+            let meta = fs::metadata(dir.join("web")).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o600);
+            assert_eq!(
+                (meta.uid(), meta.gid()),
+                (uid, primary_gid),
+                "sentinel must be re-owned to the writer's uid:gid despite the setgid dir"
+            );
+            if strong_case {
+                assert_ne!(
+                    meta.gid(),
+                    dir_gid,
+                    "setgid dir must not leave its group on the sentinel"
+                );
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn supplemental_gid() -> Option<u32> {
+        // Supplemental groups of the test process; one distinct from the
+        // primary gid models the deployed started dir's group.
+        let path = std::path::Path::new("/proc/self/status");
+        let status = fs::read_to_string(path).ok()?;
+        let line = status.lines().find(|l| l.starts_with("Groups:"))?;
+        line.split_whitespace()
+            .skip(1)
+            .filter_map(|g| g.parse::<u32>().ok())
+            .find(|g| *g != unsafe { nix::libc::getgid() } as u32)
     }
 
     #[test]

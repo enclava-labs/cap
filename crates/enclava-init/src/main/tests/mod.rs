@@ -344,6 +344,114 @@ fn container_sentinel_names_are_single_path_components() {
 }
 
 #[test]
+fn container_sentinel_names_reject_record_injection_characters() {
+    // Newlines inject extra key=value lines into the sentinel record and
+    // '=' corrupts the key; both must be rejected (#137).
+    for name in [
+        "web\npid=1",
+        "web\n",
+        "con=tainer",
+        "web\r",
+        "web\ttab",
+        "web\0nul",
+    ] {
+        assert!(validate_sentinel_name(name).is_err(), "{name:?}");
+    }
+    assert_eq!(
+        validate_sentinel_name("tenant-ingress").unwrap(),
+        "tenant-ingress"
+    );
+}
+
+#[test]
+fn sentinel_with_wrong_owner_gid_is_rejected() {
+    let dir = tempdir().unwrap();
+    write_fake_proc(dir.path(), 789, "web", 10001, 10001, 555);
+    let sentinel = dir.path().join("web");
+    std::fs::write(&sentinel, "").unwrap();
+    // The record mirrors the real inode gid so the only mismatch is the
+    // expected gid; this exercises the inode-owner-gid rejection on every
+    // host (the tempdir file inherits the runner's gid, whatever it is).
+    let inode_gid = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&sentinel).unwrap());
+    std::fs::write(
+        &sentinel,
+        format!(
+            "version=1\ncontainer=web\npid=789\nuid=10001\ngid={inode_gid}\nstart_time_ticks=555\n"
+        ),
+    )
+    .unwrap();
+    let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&sentinel).unwrap());
+    // expected gid differs from the inode gid by construction.
+    let expected_gid = inode_gid.wrapping_add(1);
+    let err = read_sentinel_pid(
+        &sentinel,
+        dir.path(),
+        "web",
+        ExpectedIdentity {
+            uid,
+            gid: expected_gid,
+        },
+    )
+    .unwrap_err();
+    // "owner gid" pins the inode-gid rejection specifically; the record-gid
+    // mismatch message says "sentinel gid ..." instead.
+    assert!(
+        err.to_string().contains("owner gid"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn sentinel_group_writable_mode_is_rejected() {
+    let dir = tempdir().unwrap();
+    write_fake_proc(dir.path(), 789, "web", 10001, 10001, 555);
+    let sentinel = dir.path().join("web");
+    std::fs::write(
+        &sentinel,
+        "version=1\ncontainer=web\npid=789\nuid=10001\ngid=10001\nstart_time_ticks=555\n",
+    )
+    .unwrap();
+    let meta = std::fs::metadata(&sentinel).unwrap();
+    let uid = std::os::unix::fs::MetadataExt::uid(&meta);
+    let gid = std::os::unix::fs::MetadataExt::gid(&meta);
+    // Make the sentinel group-writable while keeping the current owner
+    // uid/gid, so only the new mode check can reject it.
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o660)).unwrap();
+
+    let err =
+        read_sentinel_pid(&sentinel, dir.path(), "web", ExpectedIdentity { uid, gid }).unwrap_err();
+    assert!(
+        err.to_string().contains("group- or world-writable"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn sentinel_matching_owner_gid_and_read_only_mode_is_accepted() {
+    let dir = tempdir().unwrap();
+    // Fake /proc, record, file ownership, and expectation all carry the
+    // test process's real ids (unprivileged tests cannot chown to
+    // arbitrary identities) with an owner-only mode: the acceptance path.
+    let probe = dir.path().join("probe");
+    std::fs::write(&probe, b"").unwrap();
+    let meta = std::fs::metadata(&probe).unwrap();
+    let uid = std::os::unix::fs::MetadataExt::uid(&meta);
+    let gid = std::os::unix::fs::MetadataExt::gid(&meta);
+    write_fake_proc(dir.path(), 789, "web", uid, gid, 555);
+    let sentinel = dir.path().join("web");
+    std::fs::write(
+        &sentinel,
+        format!("version=1\ncontainer=web\npid=789\nuid={uid}\ngid={gid}\nstart_time_ticks=555\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let pid =
+        read_sentinel_pid(&sentinel, dir.path(), "web", ExpectedIdentity { uid, gid }).unwrap();
+    assert_eq!(pid, 789);
+}
+
+#[test]
 fn same_object_check_detects_identical_and_distinct_dirs() {
     let dir = tempdir().unwrap();
     let one = dir.path().join("one");
