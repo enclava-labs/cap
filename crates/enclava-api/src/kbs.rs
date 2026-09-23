@@ -510,6 +510,51 @@ async fn enqueue_signed_policy_bootstrap_if_idle(
     Ok(result.rows_affected() == 1)
 }
 
+/// Consume the deferred candidate-selector generation bump marked by
+/// migration 0049 and perform the real increment here.
+///
+/// Only the post-0049 implementation -- the one filtering signed-policy
+/// candidates by current keyring membership -- may interpret the marker.
+/// `deploy/api/deployment.yaml` runs the API with
+/// `DATABASE_MIGRATION_MODE=verify`, so the migration step can precede the
+/// new binary by minutes while a pre-0049 replica keeps reconciling every 30
+/// seconds: a generation bumped at migration time would be consumed by that
+/// replica's unfiltered candidate query and published as the old policy body
+/// at the new generation, after which this build would crash-loop on
+/// [`KbsPolicyError::PolicyGenerationConflict`] with no bump left to
+/// recover.  Performing the increment here instead means it happens at the
+/// start of a reconciliation run that holds the global KBS mutation fence
+/// and converges the filtered candidate set within that same fenced run, so
+/// a pre-0049 reconciler can never observe the owed generation as a raw
+/// desired generation.
+///
+/// Consumption is a single guarded `UPDATE`, so concurrent replicas consume
+/// the marker exactly once and every later call is a no-op.  The marker is
+/// only ever set where `desired_generation > 0` (migration 0049's own WHERE
+/// clause, mirroring [`enqueue_signed_policy_reconciliation_if_active`]);
+/// if a stray marker ever lands on an unsigned-only row it is cleared
+/// without bumping so the install cannot be pushed into signed-policy mode.
+/// Returns the new generation when this call performed the bump.
+async fn consume_deferred_selector_bump(db: &PgPool) -> Result<Option<i64>, KbsPolicyError> {
+    let bumped: Option<Option<i64>> = sqlx::query_scalar(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = CASE
+                    WHEN desired_generation > 0 THEN desired_generation + 1
+                    ELSE desired_generation
+                END,
+                selector_bump_pending = false,
+                updated_at = clock_timestamp()
+          WHERE singleton
+            AND selector_bump_pending
+        RETURNING CASE WHEN desired_generation > 0 THEN desired_generation END",
+    )
+    .fetch_optional(db)
+    .await?;
+    // `Some(None)` is the marker cleared on an unsigned-only row: no bump
+    // happened and signed-policy mode was not entered.
+    Ok(bumped.flatten())
+}
+
 async fn load_signed_policy_reconciliation(
     db: &PgPool,
 ) -> Result<SignedPolicyReconciliationRow, KbsPolicyError> {
@@ -855,6 +900,11 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
     expected_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
     client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
+    // Perform any deferred selector generation bump (migration 0049) before
+    // the candidate set is computed below: the filtered candidates must be
+    // published as a new generation within this fenced run, so a pre-0049
+    // reconciler can never consume the owed bump with its unfiltered query.
+    consume_deferred_selector_bump(db).await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
         let state = load_signed_policy_reconciliation(db).await?;
@@ -2789,6 +2839,82 @@ owner_resource_bindings := {}
         assert_eq!(desired, 2);
 
         crate::test_support::drop_isolated_database("cap130_rotation_enqueue", pool).await;
+    }
+
+    /// Migration 0049 marks its owed selector generation bump instead of
+    /// performing it, so a pre-0049 replica still reconciling during the
+    /// rollout cannot consume the bump with its unfiltered candidate query.
+    /// Only the post-0049 reconciler interprets the marker, exactly once, and
+    /// never on behalf of an unsigned-only install -- what this test pins
+    /// down.  Runs against its own per-process database: like the rotation
+    /// test, it asserts exact singleton state that another test process could
+    /// perturb through the shared server.
+    #[tokio::test]
+    async fn deferred_selector_bump_is_consumed_once_by_the_filtered_reconciler() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap130_selector_bump").await;
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    selector_bump_pending = false
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Nothing marked: consuming is a no-op.
+        assert_eq!(consume_deferred_selector_bump(&pool).await.unwrap(), None);
+
+        // Migration 0049 marks signed-mode installs; consumption performs the
+        // bump exactly once and clears the marker.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 3,
+                    selector_bump_pending = true
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            consume_deferred_selector_bump(&pool).await.unwrap(),
+            Some(4)
+        );
+        let (desired, pending): (i64, bool) = sqlx::query_as(
+            "SELECT desired_generation, selector_bump_pending
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((desired, pending), (4, false));
+        assert_eq!(consume_deferred_selector_bump(&pool).await.unwrap(), None);
+
+        // A stray marker on an unsigned-only install must never push it into
+        // signed-policy mode: the marker is cleared without bumping.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    selector_bump_pending = true
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(consume_deferred_selector_bump(&pool).await.unwrap(), None);
+        let (desired, pending): (i64, bool) = sqlx::query_as(
+            "SELECT desired_generation, selector_bump_pending
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((desired, pending), (0, false));
+
+        crate::test_support::drop_isolated_database("cap130_selector_bump", pool).await;
     }
 
     /// Regression for #130: a retained historical artifact must stop
