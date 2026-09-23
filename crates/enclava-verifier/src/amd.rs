@@ -7,10 +7,25 @@ use sha2::{Digest, Sha256, Sha384};
 use x509_cert::{
     Certificate,
     crl::CertificateList,
-    der::{Decode, Encode},
+    der::{
+        Decode, Encode, Reader,
+        asn1::{ContextSpecific, ObjectIdentifier},
+    },
+    spki::{AlgorithmIdentifierOwned, AlgorithmIdentifierRef},
 };
 
 use crate::SnpReport;
+
+/// id-RSASSA-PSS (RFC 8017 § 8.1): every AMD ARK/ASK-signed object the
+/// verifier accepts must declare its PSS parameters under this OID.
+const OID_RSASSA_PSS: &str = "1.2.840.113549.1.1.10";
+/// id-sha384: the only hash and MGF1 hash algorithm implemented.
+const PSS_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.2");
+/// id-mgf1: the only mask generation function implemented.
+const PSS_MGF1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.8");
+/// Salt length the implementation recovers from the padded block; AMD ARK/ASK
+/// declare 48, and only 48 is accepted.
+const PSS_SALT_LENGTH: u64 = 48;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AmdVerificationError {
@@ -24,6 +39,8 @@ pub enum AmdVerificationError {
     CertificateSignatureMismatch,
     #[error("AMD certificate does not use RSA-PSS")]
     UnsupportedCertificateSignature,
+    #[error("AMD RSA-PSS parameters do not match the verification performed")]
+    PssParameterMismatch,
     #[error("AMD ARK fingerprint is not trusted by policy")]
     UntrustedArk,
     #[error("SNP report signature is invalid")]
@@ -89,7 +106,8 @@ pub fn verify_amd_revocation(
     let crl = CertificateList::from_der(crl_der)
         .map_err(|_| AmdVerificationError::InvalidRevocationList)?;
     if crl.signature_algorithm != crl.tbs_cert_list.signature
-        || crl.signature_algorithm.oid.to_string() != "1.2.840.113549.1.1.10"
+        || crl.signature_algorithm.oid.to_string() != OID_RSASSA_PSS
+        || !pss_parameters_match(&crl.signature_algorithm)
     {
         return Err(AmdVerificationError::InvalidRevocationList);
     }
@@ -266,8 +284,9 @@ fn verify_certificate_signature(
     certificate: &Certificate,
     issuer: &Certificate,
 ) -> Result<(), AmdVerificationError> {
-    if certificate.signature_algorithm.oid.to_string() != "1.2.840.113549.1.1.10"
+    if certificate.signature_algorithm.oid.to_string() != OID_RSASSA_PSS
         || certificate.signature_algorithm != certificate.tbs_certificate.signature
+        || !pss_parameters_match(&certificate.signature_algorithm)
     {
         return Err(AmdVerificationError::UnsupportedCertificateSignature);
     }
@@ -310,11 +329,122 @@ fn verifying_key(certificate: &Certificate) -> Result<VerifyingKey, AmdVerificat
     VerifyingKey::from_public_key_der(&spki).map_err(|_| AmdVerificationError::InvalidPublicKey)
 }
 
+/// Confirm that the PSS `AlgorithmIdentifier` parameters carried by an
+/// AMD-signed object declare exactly the verification this module performs:
+/// SHA-384 as the hash, MGF1 over SHA-384, a 48-byte salt, and trailer field
+/// 0xBC (explicit value 1 or the DER default when the field is omitted).
+///
+/// `verify_rsa_pss_sha384` pins the separator at the declared salt length,
+/// so a signature actually made with a different salt length is rejected
+/// even when the declaration itself is well-formed — the declaration and
+/// the encoded signature must agree (enclava-labs/cap#141 review).
+/// RFC 4055 § 2.1 / RFC 8017 Appendix B: the digest AlgorithmIdentifiers
+/// inside a RSASSA-PSS declaration (hashAlgorithm and the MGF1 hash) take
+/// no parameters, so they must be absent or ASN.1 NULL. The parameters are
+/// decoded as ASN.1 NULL rather than inspected by tag alone: a malformed
+/// NULL that carries content bytes (e.g. `05 01 00`) has the right tag but
+/// is not a valid NULL encoding and must fail closed (cap#168 review).
+fn hash_parameters_are_absent_or_null(algorithm: &AlgorithmIdentifierRef<'_>) -> bool {
+    algorithm
+        .parameters
+        .as_ref()
+        .is_none_or(|parameters| parameters.decode_as::<x509_cert::der::asn1::Null>().is_ok())
+}
+
+fn pss_parameters_match(algorithm: &AlgorithmIdentifierOwned) -> bool {
+    let Some(parameters) = algorithm.parameters.as_ref() else {
+        return false;
+    };
+    // RSASSA-PSS-params ::= SEQUENCE {
+    //   hashAlgorithm      [0] HashAlgorithm      DEFAULT sha1,
+    //   maskGenAlgorithm   [1] MaskGenAlgorithm   DEFAULT mgf1SHA1,
+    //   saltLength         [2] INTEGER            DEFAULT 20,
+    //   trailerField       [3] INTEGER            DEFAULT 1 }
+    // DER requires DEFAULT fields to be omitted when they carry the default
+    // value, so an absent field means the default (sha1 / mgf1-SHA1 / 20 / 1)
+    // — everything we require must therefore be explicitly present, except
+    // trailerField whose default (1) we accept.
+    parameters
+        .sequence(|fields| {
+            let hash = ContextSpecific::<AlgorithmIdentifierRef<'_>>::decode_explicit(
+                fields,
+                x509_cert::der::TagNumber::N0,
+            )?;
+            let mgf = ContextSpecific::<AlgorithmIdentifierRef<'_>>::decode_explicit(
+                fields,
+                x509_cert::der::TagNumber::N1,
+            )?;
+            let salt =
+                ContextSpecific::<u64>::decode_explicit(fields, x509_cert::der::TagNumber::N2)?;
+            let trailer =
+                ContextSpecific::<u64>::decode_explicit(fields, x509_cert::der::TagNumber::N3)?;
+            if !fields.is_finished() {
+                // Trailing garbage after trailerField: reject.
+                return Err(x509_cert::der::Error::incomplete(
+                    x509_cert::der::Length::ZERO,
+                ));
+            }
+            Ok((hash, mgf, salt, trailer))
+        })
+        .is_ok_and(|(hash, mgf, salt, trailer)| {
+            // RFC 8017 / RFC 4055 § 2.1: the hash AlgorithmIdentifier's
+            // parameters must be absent or NULL — and per RFC 5280 § 4.1.1.2
+            // an AlgorithmIdentifier with no defined parameters encodes them
+            // as NULL, so "absent" is tolerated. Any other ASN.1 type (an
+            // empty OCTET STRING, SEQUENCE, etc.) with the right OID is a
+            // malformed declaration and rejected by checking the tag, not
+            // just the encoded length (cap#168 review).
+            let hash_ok = hash.is_some_and(|hash| {
+                hash.value.oid == PSS_SHA384 && hash_parameters_are_absent_or_null(&hash.value)
+            });
+            // MGF1 params are AlgorithmIdentifier { algorithm id-sha384,
+            // parameters NULL } — a plain SEQUENCE, not context-tagged.
+            let mgf_ok = mgf.is_some_and(|mgf| {
+                mgf.value.oid == PSS_MGF1
+                    && mgf
+                        .value
+                        .parameters
+                        .and_then(|parameters| {
+                            parameters.decode_as::<AlgorithmIdentifierRef>().ok()
+                        })
+                        .is_some_and(|hash| {
+                            hash.oid == PSS_SHA384 && hash_parameters_are_absent_or_null(&hash)
+                        })
+            });
+            hash_ok
+                && mgf_ok
+                && salt.is_some_and(|salt| salt.value == PSS_SALT_LENGTH)
+                && trailer.is_none_or(|trailer| trailer.value == 1)
+        })
+}
+
 fn verify_rsa_pss_sha384(
     modulus: &[u8],
     exponent: &[u8],
     message: &[u8],
     signature: &[u8],
+) -> bool {
+    verify_rsa_pss_sha384_salt_len(modulus, exponent, message, signature, Some(PSS_SALT_LENGTH))
+}
+
+/// Verify with the salt length recovered from the encoded block instead of
+/// fixed at the pinned 48 bytes (cap#141 review).
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn verify_rsa_pss_sha384_recover_salt(
+    modulus: &[u8],
+    exponent: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    verify_rsa_pss_sha384_salt_len(modulus, exponent, message, signature, None)
+}
+
+fn verify_rsa_pss_sha384_salt_len(
+    modulus: &[u8],
+    exponent: &[u8],
+    message: &[u8],
+    signature: &[u8],
+    expected_salt_len: Option<u64>,
 ) -> bool {
     const HASH_BYTES: usize = 48;
 
@@ -360,11 +490,35 @@ fn verify_rsa_pss_sha384(
         .map(|(left, right)| left ^ right)
         .collect::<Vec<_>>();
     db[0] &= 0xff >> unused_bits;
-    let separator = db_len - HASH_BYTES - 1;
-    if db[..separator].iter().any(|byte| *byte != 0) || db[separator] != 1 {
-        return false;
-    }
-    let salt = &db[separator + 1..];
+    // RFC 8017 § 8.1.2 step 10/11: DB = PS || 0x01 || salt. With the salt
+    // length pinned (the default), the separator position is fixed at
+    // `db_len - salt_len - 1`, so a signature made with any other salt
+    // length is rejected outright. `None` recovers the salt from the block
+    // itself (tests / fuzzing only).
+    let salt: &[u8] = match expected_salt_len {
+        Some(salt_len) => {
+            let salt_len = salt_len as usize;
+            if db_len < salt_len + 1 {
+                return false;
+            }
+            let separator = db_len - salt_len - 1;
+            if db[..separator].iter().any(|byte| *byte != 0) || db[separator] != 1 {
+                return false;
+            }
+            &db[separator + 1..]
+        }
+        None => {
+            let separator = db.iter().position(|byte| *byte == 1);
+            match separator {
+                Some(separator)
+                    if db[..separator].iter().all(|byte| *byte == 0) && db_len > separator =>
+                {
+                    &db[separator + 1..]
+                }
+                _ => return false,
+            }
+        }
+    };
     let message_hash = Sha384::digest(message);
     let expected = Sha384::new()
         .chain_update([0; 8])
@@ -421,6 +575,310 @@ mod tests {
         base64::engine::general_purpose::STANDARD
             .decode(encoded.trim())
             .unwrap()
+    }
+
+    /// Minimal deterministic RNG so PSS interop tests are reproducible.
+    struct TestRng(u64);
+    impl rsa::rand_core::RngCore for TestRng {
+        fn next_u32(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 32) as u32
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.next_u32() as u64 | ((self.next_u32() as u64) << 32)
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for chunk in dest.chunks_mut(8) {
+                let bytes = self.next_u64().to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+    impl rsa::rand_core::CryptoRng for TestRng {}
+
+    fn der_tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        if body.len() < 128 {
+            out.push(body.len() as u8);
+        } else {
+            let length_bytes = body.len().to_be_bytes();
+            let first = length_bytes.iter().position(|byte| *byte != 0).unwrap();
+            out.push(0x80 | (length_bytes.len() - first) as u8);
+            out.extend_from_slice(&length_bytes[first..]);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn minimal_der_integer(value: u64) -> Vec<u8> {
+        if value == 0 {
+            return vec![0];
+        }
+        let bytes = value.to_be_bytes();
+        let first = bytes.iter().position(|byte| *byte != 0).unwrap();
+        let mut body = bytes[first..].to_vec();
+        if body[0] & 0x80 != 0 {
+            body.insert(0, 0);
+        }
+        body
+    }
+
+    fn oid_bytes(oid: &str) -> Vec<u8> {
+        let parsed = ObjectIdentifier::new_unwrap(oid);
+        parsed.to_der().unwrap()
+    }
+
+    /// Build a full RSASSA-PSS `AlgorithmIdentifier` with the given parameter
+    /// mutations, exactly as a future AMD certificate would declare them.
+    fn pss_algorithm_identifier(
+        hash_oid: &str,
+        mgf_hash_oid: &str,
+        salt: u64,
+        trailer: Option<u64>,
+        trailing_garbage: bool,
+    ) -> AlgorithmIdentifierOwned {
+        let null = der_tlv(0x05, &[]);
+        let hash_alg = der_tlv(0x30, &[oid_bytes(hash_oid), null.clone()].concat());
+        let mgf_hash_alg = der_tlv(0x30, &[oid_bytes(mgf_hash_oid), null].concat());
+        let mgf_alg = der_tlv(
+            0x30,
+            &[oid_bytes("1.2.840.113549.1.1.8"), mgf_hash_alg].concat(),
+        );
+        let mut params_body = Vec::new();
+        params_body.extend(der_tlv(0xA0, &hash_alg));
+        params_body.extend(der_tlv(0xA1, &mgf_alg));
+        params_body.extend(der_tlv(0xA2, &der_tlv(0x02, &minimal_der_integer(salt))));
+        if let Some(trailer) = trailer {
+            params_body.extend(der_tlv(0xA3, &der_tlv(0x02, &minimal_der_integer(trailer))));
+        }
+        if trailing_garbage {
+            params_body.extend(der_tlv(0xA4, &[0x00]));
+        }
+        let params = der_tlv(0x30, &params_body);
+        let full = der_tlv(0x30, &[oid_bytes(OID_RSASSA_PSS), params].concat());
+        AlgorithmIdentifierOwned::from_der(&full).unwrap()
+    }
+
+    /// Like [`pss_algorithm_identifier`] but with the message-hash
+    /// AlgorithmIdentifier parameters set to an arbitrary TLV instead of
+    /// NULL — used to prove non-NULL parameter tags fail closed.
+    fn pss_algorithm_identifier_with_hash_params(
+        tag: u8,
+        value: &[u8],
+    ) -> AlgorithmIdentifierOwned {
+        pss_algorithm_identifier_with_params(tag, value, None)
+    }
+
+    /// Like [`pss_algorithm_identifier`] but with the MGF1 hash
+    /// AlgorithmIdentifier parameters set to an arbitrary TLV instead of
+    /// NULL.
+    fn pss_algorithm_identifier_with_mgf_hash_params(
+        tag: u8,
+        value: &[u8],
+    ) -> AlgorithmIdentifierOwned {
+        pss_algorithm_identifier_with_params(tag, value, Some(()))
+    }
+
+    fn pss_algorithm_identifier_with_params(
+        tag: u8,
+        value: &[u8],
+        mgf: Option<()>,
+    ) -> AlgorithmIdentifierOwned {
+        let null = der_tlv(0x05, &[]);
+        let non_null = der_tlv(tag, value);
+        let (hash_params, mgf_hash_params) = match mgf {
+            None => (non_null.clone(), null),
+            Some(()) => (null, non_null),
+        };
+        let hash_alg = der_tlv(
+            0x30,
+            &[oid_bytes("2.16.840.1.101.3.4.2.2"), hash_params].concat(),
+        );
+        let mgf_hash_alg = der_tlv(
+            0x30,
+            &[oid_bytes("2.16.840.1.101.3.4.2.2"), mgf_hash_params].concat(),
+        );
+        let mgf_alg = der_tlv(
+            0x30,
+            &[oid_bytes("1.2.840.113549.1.1.8"), mgf_hash_alg].concat(),
+        );
+        let mut params_body = Vec::new();
+        params_body.extend(der_tlv(0xA0, &hash_alg));
+        params_body.extend(der_tlv(0xA1, &mgf_alg));
+        params_body.extend(der_tlv(0xA2, &der_tlv(0x02, &minimal_der_integer(48))));
+        params_body.extend(der_tlv(0xA3, &der_tlv(0x02, &minimal_der_integer(1))));
+        let params = der_tlv(0x30, &params_body);
+        let full = der_tlv(0x30, &[oid_bytes(OID_RSASSA_PSS), params].concat());
+        AlgorithmIdentifierOwned::from_der(&full).unwrap()
+    }
+
+    #[test]
+    fn pss_declared_parameters_are_enforced() {
+        let sha384 = "2.16.840.1.101.3.4.2.2";
+        let sha256 = "2.16.840.1.101.3.4.2.1";
+        // Exact declaration the verifier performs.
+        assert!(pss_parameters_match(&pss_algorithm_identifier(
+            sha384,
+            sha384,
+            48,
+            Some(1),
+            false
+        )));
+        // Omitted trailerField means the DER default (1): accepted.
+        assert!(pss_parameters_match(&pss_algorithm_identifier(
+            sha384, sha384, 48, None, false
+        )));
+        // Wrong hash, wrong MGF1 hash, wrong salt, wrong trailer: rejected.
+        assert!(!pss_parameters_match(&pss_algorithm_identifier(
+            sha256,
+            sha384,
+            48,
+            Some(1),
+            false
+        )));
+        assert!(!pss_parameters_match(&pss_algorithm_identifier(
+            sha384,
+            sha256,
+            48,
+            Some(1),
+            false
+        )));
+        assert!(!pss_parameters_match(&pss_algorithm_identifier(
+            sha384,
+            sha384,
+            32,
+            Some(1),
+            false
+        )));
+        assert!(!pss_parameters_match(&pss_algorithm_identifier(
+            sha384,
+            sha384,
+            48,
+            Some(2),
+            false
+        )));
+        // Trailing garbage inside the parameters: rejected.
+        assert!(!pss_parameters_match(&pss_algorithm_identifier(
+            sha384,
+            sha384,
+            48,
+            Some(1),
+            true
+        )));
+        // Non-NULL zero-length hash parameters (empty OCTET STRING /
+        // SEQUENCE / BOOLEAN) must be rejected even though they encode to
+        // zero bytes — only absent-or-NULL is a valid SHA-384 declaration
+        // (cap#168 review).
+        for tag in [0x04u8, 0x30, 0x01] {
+            let alg = pss_algorithm_identifier_with_hash_params(tag, &[]);
+            assert!(
+                !pss_parameters_match(&alg),
+                "empty non-NULL hash parameters (tag {tag:#04x}) must be rejected"
+            );
+        }
+        // Same for the MGF1 hash parameters.
+        for tag in [0x04u8, 0x30, 0x01] {
+            let alg = pss_algorithm_identifier_with_mgf_hash_params(tag, &[]);
+            assert!(
+                !pss_parameters_match(&alg),
+                "empty non-NULL MGF1 hash parameters (tag {tag:#04x}) must be rejected"
+            );
+        }
+        // A NULL-tagged value that carries content bytes (e.g. `05 01 00`)
+        // is not a valid ASN.1 NULL encoding and must be rejected on both
+        // the message-hash and MGF1-hash paths, even though the tag alone
+        // is correct (cap#168 review).
+        for value in [&[0x00u8][..], &[0x00, 0x00][..]] {
+            let alg = pss_algorithm_identifier_with_hash_params(0x05, value);
+            assert!(
+                !pss_parameters_match(&alg),
+                "NULL with content bytes {value:?} must be rejected on the hash path"
+            );
+            let alg = pss_algorithm_identifier_with_mgf_hash_params(0x05, value);
+            assert!(
+                !pss_parameters_match(&alg),
+                "NULL with content bytes {value:?} must be rejected on the MGF1 hash path"
+            );
+        }
+        // DEFAULT-omitted hash/MGF/salt (i.e. sha1/mgf1-SHA1/20): rejected.
+        let params = der_tlv(0x30, &[]);
+        let full = der_tlv(0x30, &[oid_bytes(OID_RSASSA_PSS), params].concat());
+        let empty_params = AlgorithmIdentifierOwned::from_der(&full).unwrap();
+        assert!(!pss_parameters_match(&empty_params));
+        // No parameters at all: rejected.
+        let full = der_tlv(0x30, &[oid_bytes(OID_RSASSA_PSS)].concat());
+        assert!(!pss_parameters_match(
+            &AlgorithmIdentifierOwned::from_der(&full).unwrap()
+        ));
+    }
+
+    #[test]
+    fn pss_params_parse_live_amd_certificates_and_crl() {
+        let ark = fixture("ark");
+        let crl = fixture("crl");
+        assert!(pss_parameters_match(
+            &Certificate::from_der(&ark).unwrap().signature_algorithm
+        ));
+        assert!(pss_parameters_match(
+            &CertificateList::from_der(&crl).unwrap().signature_algorithm
+        ));
+    }
+
+    #[test]
+    fn hand_rolled_pss_interops_with_the_rsa_crate() {
+        use rsa::pss::SigningKey;
+        use rsa::signature::{RandomizedSigner, SignatureEncoding};
+        use rsa::traits::PublicKeyParts;
+        use rsa::{BigUint, RsaPrivateKey, RsaPublicKey};
+        use sha2::Sha384 as RsaSha384;
+
+        let mut rng = TestRng(0x141);
+        let key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public = RsaPublicKey::from(&key);
+        let modulus = BigUint::to_bytes_be(public.n());
+        let exponent = BigUint::to_bytes_be(public.e());
+
+        let signing = SigningKey::<RsaSha384>::new_with_salt_len(key.clone(), 48);
+        let message = b"enclava interop probe";
+        let signature = signing.sign_with_rng(&mut rng, message).to_vec();
+        assert!(verify_rsa_pss_sha384(
+            &modulus, &exponent, message, &signature
+        ));
+        // Wrong message must not verify.
+        assert!(!verify_rsa_pss_sha384(
+            &modulus,
+            &exponent,
+            b"different message",
+            &signature
+        ));
+        // Flipped signature bit must not verify.
+        let mut corrupted = signature.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 1;
+        assert!(!verify_rsa_pss_sha384(
+            &modulus, &exponent, message, &corrupted
+        ));
+
+        // The pinned path fixes the separator at db_len - 48 - 1, so a PSS
+        // signature made with a different salt length must be rejected —
+        // the declared parameters and the encoded signature have to agree
+        // (cap#141 review). The recover-salt variant (tests/fuzzing only)
+        // still accepts it, proving the rejection comes from the salt-length
+        // pin and not from a broken encoding.
+        let odd_salt = SigningKey::<RsaSha384>::new_with_salt_len(key, 47);
+        let signature = odd_salt.sign_with_rng(&mut rng, message).to_vec();
+        assert!(!verify_rsa_pss_sha384(
+            &modulus, &exponent, message, &signature
+        ));
+        assert!(verify_rsa_pss_sha384_recover_salt(
+            &modulus, &exponent, message, &signature
+        ));
     }
 
     #[test]

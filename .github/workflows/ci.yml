@@ -333,3 +333,21 @@ jobs:
               > "/tmp/enclava-verifier-${field}-dom.html"
             grep -E '<pre id="result">PASS [0-9a-f]{64}</pre>' "/tmp/enclava-verifier-${field}-dom.html"
           done
+
+      - name: Assert panic isolation on the real wasm target
+        # cap#141 review: wasm32-unknown-unknown uses the abort panic
+        # strategy, so catch_unwind alone cannot convert a panic into a
+        # JsError in the shipped module. Prove on the real target that a
+        # panic traps into a catchable JS exception and the instance stays
+        # usable — using a test-only probe feature, never in the release
+        # build.
+        run: |
+          rustup run stable cargo build -p enclava-verifier-wasm --release --target wasm32-unknown-unknown \
+            --features debug-panic-probe
+          wasm-bindgen --target web --out-dir web/verifier/pkg \
+            target/wasm32-unknown-unknown/release/enclava_verifier_wasm.wasm
+          google-chrome --headless --no-sandbox --disable-gpu --virtual-time-budget=30000 \
+            --dump-dom http://127.0.0.1:8000/web/verifier/panic-test.html \
+            > /tmp/enclava-verifier-panic-dom.html
+          cat /tmp/enclava-verifier-panic-dom.html
+          grep -E '<pre id="result">PASS panic-isolated</pre>' /tmp/enclava-verifier-panic-dom.html
