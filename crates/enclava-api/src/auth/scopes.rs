@@ -418,9 +418,21 @@ mod tests {
             require_owner_to_modify_privileged_role(Role::Admin, Some(Role::Owner), None, true)
                 .is_err()
         );
-        // A member self-targeting never passes either: member rows do not
-        // touch privileged roles (no gate), but a stale admin read paired
-        // with a demoted-to-member row must not resurrect the exemption.
+        // A stale admin caller-role read paired with a target row demoted to
+        // member must not resurrect the exemption: re-requesting admin (a
+        // privileged write) with self targeting still hits the owner gate.
+        assert!(
+            require_owner_to_modify_privileged_role(
+                Role::Admin,
+                Some(Role::Member),
+                Some(Role::Admin),
+                true
+            )
+            .is_err()
+        );
+        // For completeness, a member self-targeting a member role is a plain
+        // non-privileged write, so it passes because nothing touches a
+        // privileged role — not because any exemption applied.
         assert!(
             require_owner_to_modify_privileged_role(
                 Role::Admin,

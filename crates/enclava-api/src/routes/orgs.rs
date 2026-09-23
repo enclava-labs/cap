@@ -2161,8 +2161,8 @@ mod tests {
         .expect("owner can promote a member to admin");
         assert_eq!(owner_promote.0, StatusCode::OK);
         let owner_remove = remove_member(
-            owner_auth,
-            State(state),
+            owner_auth.clone(),
+            State(state.clone()),
             Path((org_name.clone(), victim_admin_id)),
         )
         .await
@@ -2192,6 +2192,41 @@ mod tests {
         assert_eq!(role_of(admin_id), "member");
         assert_eq!(role_of(victim_admin_id), "removed");
         assert_eq!(role_of(member_id), "admin");
+
+        // Self-removal via DELETE: owner re-promotes the acting admin, then
+        // the admin removes themselves without an owner present. The
+        // self-release exemption must waive the owner gate (target is caller,
+        // requested role None, both reads say admin) and the row must end up
+        // removed in the database.
+        let owner_repromote = invite_member(
+            owner_auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(InviteRequest {
+                email: admin_email.clone(),
+                role: Some("admin".to_string()),
+            }),
+        )
+        .await
+        .expect("owner re-promotes admin for self-removal case");
+        assert_eq!(owner_repromote.0, StatusCode::OK);
+        let self_remove = remove_member(admin_auth, State(state), Path((org_name, admin_id)))
+            .await
+            .expect("admin can remove themselves without an owner");
+        assert_eq!(self_remove, StatusCode::NO_CONTENT);
+        let removed_role: Option<String> = sqlx::query_scalar(
+            "SELECT role::text FROM memberships
+              WHERE org_id = $1 AND user_id = $2 AND removed_at IS NOT NULL",
+        )
+        .bind(org_id)
+        .bind(admin_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("load admin row after self-removal");
+        assert!(
+            removed_role.is_some(),
+            "self-removed admin row must be tombstoned, still active"
+        );
 
         sqlx::query("DELETE FROM organizations WHERE id = $1")
             .bind(org_id)
