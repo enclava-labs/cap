@@ -361,16 +361,37 @@ impl WebhookClient {
     }
 }
 
-async fn read_capped(resp: reqwest::Response, limit: u64) -> Result<String, ClientError> {
+/// Read a response body into memory while enforcing `limit` against the
+/// bytes actually received, not just the advertised Content-Length: a
+/// hostile server can omit the header or lie about it, so bodies are
+/// consumed incrementally and the read is aborted as soon as the cap is
+/// exceeded — the oversized body is never buffered.
+pub(crate) async fn read_body_capped(
+    mut resp: reqwest::Response,
+    limit: u64,
+) -> Result<bytes::Bytes, ClientError> {
     if let Some(len) = resp.content_length()
         && len > limit
     {
         return Err(ClientError::BodyTooLarge { limit });
     }
-    let bytes = resp.bytes().await?;
-    if bytes.len() as u64 > limit {
-        return Err(ClientError::BodyTooLarge { limit });
+    let mut body = bytes::BytesMut::with_capacity(
+        resp.content_length()
+            .unwrap_or(0)
+            .min(limit)
+            .min(u32::MAX as u64) as usize,
+    );
+    while let Some(chunk) = resp.chunk().await.map_err(ClientError::Http)? {
+        if body.len() as u64 + chunk.len() as u64 > limit {
+            return Err(ClientError::BodyTooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
     }
+    Ok(body.freeze())
+}
+
+async fn read_capped(resp: reqwest::Response, limit: u64) -> Result<String, ClientError> {
+    let bytes = read_body_capped(resp, limit).await?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -507,5 +528,48 @@ mod tests {
         // asserting cfg().body_limit_bytes is propagated.
         let client = RegistryClient::new(cfg(), AllowList::from_env_or_default(None)).unwrap();
         assert_eq!(client.body_limit(), 1024);
+    }
+
+    #[tokio::test]
+    async fn body_limit_is_enforced_mid_stream_when_content_length_is_absent() {
+        // A hostile server can omit Content-Length and stream an unbounded
+        // body; the read must abort at the cap instead of buffering the
+        // whole body first (follow-up to the #140 manifest body cap).
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..4)
+            .map(|_| Ok(bytes::Bytes::from(vec![b'x'; 512])))
+            .collect();
+        let stream = futures::stream::iter(chunks);
+        let body = reqwest::Body::wrap_stream(stream);
+        let http_response = http::Response::builder()
+            .status(200)
+            .body(body)
+            .expect("synthetic response");
+        let response = reqwest::Response::from(http_response);
+        assert!(response.content_length().is_none());
+
+        let err = read_body_capped(response, 1024).await.unwrap_err();
+        assert!(
+            matches!(err, ClientError::BodyTooLarge { limit: 1024 }),
+            "streamed body over the cap must be rejected mid-read: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_under_limit_streams_fully_without_content_length() {
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+            Ok(bytes::Bytes::from_static(b"hello ")),
+            Ok(bytes::Bytes::from_static(b"world")),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let body = reqwest::Body::wrap_stream(stream);
+        let http_response = http::Response::builder()
+            .status(200)
+            .body(body)
+            .expect("synthetic response");
+        let response = reqwest::Response::from(http_response);
+        assert!(response.content_length().is_none());
+
+        let bytes = read_body_capped(response, 1024).await.unwrap();
+        assert_eq!(&bytes[..], b"hello world");
     }
 }

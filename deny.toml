@@ -3,6 +3,13 @@ yanked = "deny"
 unmaintained = "none"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "Transitive via sigstore/openidconnect; CAP does not perform RSA private-key operations, and upstream has no fixed rsa release yet. Revisit when sigstore moves off openidconnect/rsa 0.9.x." },
+    # Tracked transitive advisories with no actionable fix today (issue #140).
+    # All are unreachable from CAP's own code paths; each is pinned by a
+    # direct dependency that must accept it before we can drop the entry.
+    { id = "RUSTSEC-2024-0384", reason = "`instant` unmaintained; transitive via nostr (enclava-api, enclava-cli). No fixed nostr release; revisit on nostr upgrade." },
+    { id = "RUSTSEC-2025-0119", reason = "`number_prefix` unmaintained; transitive via indicatif (enclava-cli progress bars). Cosmetic dependency; revisit when indicatif drops it." },
+    { id = "RUSTSEC-2026-0173", reason = "`proc-macro-error2` unmaintained; transitive via getset/oci-spec/oci-client. Revisit when oci-spec moves off getset." },
+    { id = "RUSTSEC-2026-0221", reason = "`event-listener` StackSlot !Send unsoundness; transitive via sqlx-core and kube/async-broadcast. CAP never shares StackSlot across threads; revisit on sqlx/kube upgrades." },
 ]
 
 [sources]
