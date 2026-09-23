@@ -9,8 +9,6 @@ use tokio::time::Instant;
 use super::engine::{ApplyEngine, ApplyError};
 use super::generation::{MutationGeneration, apply_existing_partial, delete_resource};
 use crate::manifest::volumes::CAP_VCT_NAMES;
-use enclava_common::validate::validate_dns_label;
-
 /// Result of a single cleanup step.
 #[derive(Debug, Clone)]
 pub struct CleanupStep {
@@ -213,23 +211,30 @@ pub async fn delete_statefulset(
     }
 }
 
-/// Delete CAP-owned PVCs in a namespace and wait for PV cleanup.
+/// Delete the target StatefulSet's CAP-owned PVCs in a namespace and wait
+/// for PV cleanup.
 ///
-/// Only PVCs whose names match the StatefulSet volumeClaimTemplate pattern
-/// `<vct>-<statefulset>-<ordinal>` for a CAP-rendered VCT name are selected
-/// (#138): a namespace-colocated PVC created by another actor must not be
-/// swept by tenant teardown. Matching is by name shape because VCT metadata
-/// (labels) is immutable in Kubernetes and existing StatefulSets cannot be
-/// relabeled.
+/// Only PVCs whose names match the exact StatefulSet volumeClaimTemplate
+/// pattern `<vct>-<statefulset>-<ordinal>` for a CAP-rendered VCT name AND
+/// the target StatefulSet's own name are selected (#138): a shared
+/// namespace may legitimately contain another StatefulSet whose claim
+/// template is also named `state` or `tls-state` (e.g. `state-postgres-0`),
+/// and a DNS-valid name shape proves only that SOME StatefulSet could have
+/// created the claim — not that CAP's target app owns it. Matching the
+/// exact `<vct>-<sts>-<ordinal>` prefix scopes teardown to the target
+/// workload alone. (VCT metadata labels are immutable in Kubernetes, so
+/// name matching remains the only ownership signal available without an
+/// owner-UID check.)
 pub async fn delete_pvcs_and_wait(
     engine: &ApplyEngine,
     namespace: &str,
+    statefulset: &str,
     timeout_duration: Duration,
     generation: MutationGeneration,
 ) -> Result<(), ApplyError> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(engine.client().clone(), namespace);
 
-    // List all PVCs in the namespace, keep only the CAP-owned name shapes.
+    // List all PVCs in the namespace, keep only the target StatefulSet's.
     let pvcs: Vec<String> = api
         .list(&ListParams::default())
         .await?
@@ -239,7 +244,7 @@ pub async fn delete_pvcs_and_wait(
             pvc.metadata
                 .name
                 .as_deref()
-                .is_some_and(is_cap_owned_pvc_name)
+                .is_some_and(|name| is_cap_owned_pvc_name(name, statefulset))
         })
         .filter_map(|pvc| pvc.metadata.name.clone())
         .collect();
@@ -281,7 +286,7 @@ pub async fn delete_pvcs_and_wait(
                     pvc.metadata
                         .name
                         .as_deref()
-                        .is_some_and(is_cap_owned_pvc_name)
+                        .is_some_and(|name| is_cap_owned_pvc_name(name, statefulset))
                 })
                 .filter_map(|pvc| pvc.metadata.name.clone())
                 .collect();
@@ -306,7 +311,7 @@ pub async fn delete_pvcs_and_wait(
             pvc.metadata
                 .name
                 .as_deref()
-                .is_some_and(is_cap_owned_pvc_name)
+                .is_some_and(|name| is_cap_owned_pvc_name(name, statefulset))
         }) {
             tracing::info!(namespace = %namespace, "all CAP-owned PVCs deleted");
             return Ok(());
@@ -318,27 +323,37 @@ pub async fn delete_pvcs_and_wait(
     Ok(())
 }
 
-/// True for PVC names created by a CAP StatefulSet:
+/// True for PVC names created by the TARGET CAP StatefulSet:
 /// `<vct>-<statefulset>-<ordinal>` where `<vct>` is one of the CAP-rendered
-/// volumeClaimTemplate names and the trailing segment is the pod ordinal.
-/// The StatefulSet (app) name may itself contain hyphens, so the VCT is
-/// matched as a prefix, not by splitting on the last-but-one hyphen. The
-/// statefulset segment must be a valid DNS label (names come from
-/// `validate_name`, which enforces `[a-z0-9-]` with no leading/trailing
-/// hyphen): a namespace actor naming a foreign PVC `state--0` or
-/// `state-evil.example-0` must not get it swept by tenant teardown.
-fn is_cap_owned_pvc_name(name: &str) -> bool {
+/// volumeClaimTemplate names, `<statefulset>` is the target StatefulSet's
+/// exact name, and the trailing segment is the pod ordinal. The StatefulSet
+/// (app) name may itself contain hyphens, so the match is on the full
+/// `<vct>-<statefulset>` stem. Exact-name matching (not name-shape) is what
+/// scopes teardown to the target workload: a shared namespace may host
+/// another StatefulSet whose claim template is also named `state` or
+/// `tls-state` (`state-postgres-0`), and that PVC must NOT be swept.
+fn is_cap_owned_pvc_name(name: &str, statefulset: &str) -> bool {
     let Some((stem, ordinal)) = name.rsplit_once('-') else {
         return false;
     };
     if ordinal.is_empty() || !ordinal.chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
-    CAP_VCT_NAMES.iter().any(|vct| {
-        stem.strip_prefix(vct)
-            .and_then(|rest| rest.strip_prefix('-'))
-            .is_some_and(|app| validate_dns_label(app).is_ok())
-    })
+    // Canonical ordinal only (no leading zeros): Kubernetes StatefulSet
+    // pod ordinals are rendered without them, so `state-app-00` can never
+    // be the target's claim and must not be swept.
+    if ordinal.len() > 1 && ordinal.starts_with('0') {
+        return false;
+    }
+    // Exact `<vct>-<statefulset>` prefix: a shared namespace may host
+    // another StatefulSet whose claim template is also named `state` or
+    // `tls-state` (e.g. `state-postgres-0`); a DNS-valid name shape alone
+    // proves only that SOME StatefulSet could have created the claim, not
+    // that the CAP target owns it. The statefulset segment must equal the
+    // target StatefulSet's own name exactly.
+    CAP_VCT_NAMES
+        .iter()
+        .any(|vct| stem == format!("{vct}-{statefulset}"))
 }
 
 /// Delete a namespace and wait for it to be fully removed.
@@ -423,13 +438,14 @@ mod tests {
     #[test]
     fn cap_owned_pvc_names_match() {
         // `<vct>-<statefulset>-<ordinal>` for every CAP VCT name, including
-        // hyphenated StatefulSet (app) names.
+        // hyphenated StatefulSet (app) names — but ONLY for the target
+        // StatefulSet's own name.
         for vct in CAP_VCT_NAMES {
             for sts in ["app", "my-app", "a-b-c"] {
                 for ordinal in ["0", "1", "12"] {
                     assert!(
-                        is_cap_owned_pvc_name(&format!("{vct}-{sts}-{ordinal}")),
-                        "{vct}-{sts}-{ordinal} must match"
+                        is_cap_owned_pvc_name(&format!("{vct}-{sts}-{ordinal}"), sts),
+                        "{vct}-{sts}-{ordinal} must match target {sts}"
                     );
                 }
             }
@@ -456,7 +472,41 @@ mod tests {
             "state-app..x-0",
             "tls-state-evil.example-1",
         ] {
-            assert!(!is_cap_owned_pvc_name(name), "{name} must not match");
+            assert!(
+                !is_cap_owned_pvc_name(name, "app"),
+                "{name} must not match target app"
+            );
+        }
+    }
+
+    /// Round-11 review finding (P1): a shared/pre-existing namespace may
+    /// host another StatefulSet whose claim template is ALSO named `state`
+    /// or `tls-state` — its PVCs (`state-postgres-0`) are perfectly valid
+    /// Kubernetes PVC names created by a legitimate StatefulSet, but they
+    /// are not the CAP target's. A DNS-valid name shape only proves that
+    /// SOME StatefulSet could have created the claim; teardown must match
+    /// the exact `<vct>-<target-sts>-<ordinal>` name.
+    #[test]
+    fn other_statefulsets_claims_are_not_swept() {
+        // Target app `my-app`: its own PVCs match on both VCT names...
+        assert!(is_cap_owned_pvc_name("state-my-app-0", "my-app"));
+        assert!(is_cap_owned_pvc_name("tls-state-my-app-1", "my-app"));
+        // ...while a colocated `postgres` StatefulSet with a same-named VCT
+        // (`state-postgres-0`) and every other DNS-valid variation does not.
+        for foreign in [
+            "state-postgres-0",
+            "state-postgres-12",
+            "tls-state-postgres-0",
+            "state-app-0",
+            "state-my-apps-0",
+            "state-my--app-0",
+            "state-my-app-00",
+            "state-My-App-0",
+        ] {
+            assert!(
+                !is_cap_owned_pvc_name(foreign, "my-app"),
+                "{foreign} must not be swept when tearing down my-app"
+            );
         }
     }
 }
