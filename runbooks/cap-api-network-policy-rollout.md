@@ -204,31 +204,51 @@ kubectl -n enclava-platform patch secret api-secrets \
 ```
 
 2. Configure ingress-nginx to inject the same value as a request header on
-   every proxied request, overwriting anything the client sent. Scope the
-   injection to the two CAP Ingress objects ONLY, via the per-Ingress
-   `nginx.ingress.kubernetes.io/proxy-set-headers` annotation pointing at a
-   ConfigMap in `enclava-platform`:
+   every proxied request, overwriting anything the client sent. There is
+   NO per-Ingress mechanism for this: `proxy-set-headers` is a key on the
+   ingress-nginx CONTROLLER ConfigMap (the official annotations index has
+   no `proxy-set-headers` annotation — only `auth-proxy-set-headers`, which
+   applies to auth-url subrequests, and `configuration-snippet`, which is
+   disabled by default since controller v1.9 and is not used here). Use the
+   controller ConfigMap:
 
 ```sh
 # 1) ConfigMap holding the header (same value as trusted-proxy-secret):
 kubectl -n enclava-platform create configmap cap-proxy-headers \
   --from-literal=x-enclava-proxy-secret="<same value as trusted-proxy-secret>"
-# 2) Reference it from BOTH CAP Ingress objects (enclava-api and
-#    enclava-api-device-start) — see deploy/api/ingress.yaml, which sets:
-#   metadata:
-#     annotations:
-#       nginx.ingress.kubernetes.io/proxy-set-headers: "enclava-platform/cap-proxy-headers"
+# 2) Point the CONTROLLER at it (namespace/name):
+kubectl -n ingress-nginx patch configmap ingress-nginx-controller \
+  -p '{"data":{"proxy-set-headers":"enclava-platform/cap-proxy-headers"}}'
+#    (adjust the controller ConfigMap name where it differs, e.g.
+#     ingress-nginx or a values-override name; list with
+#     kubectl -n ingress-nginx get configmap)
+# 3) The controller pods reload nginx config automatically on ConfigMap
+#    change; verify with:
+kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller
 ```
 
-Do NOT put the header in the controller's global `proxy-set-headers`
-ConfigMap: the global map injects the secret into every request that
-controller proxies — including requests to OTHER upstreams (enclava-paas,
-tenant workloads) that the API NetworkPolicy admits. Any of those
-upstreams could read the header and replay it on a direct ClusterIP call to
-CAP, minting a fresh rate-limit bucket per request — exactly the bypass
-this secret exists to close. Public clients through ingress cannot do this
-(ingress overwrites both the secret and X-Real-IP); per-Ingress scoping
-closes the leak to other upstreams.
+Why the controller-global map is acceptable here — the trust check is
+two-factor: `TrustedProxyKeyExtractor` honours forwarding headers only
+when the peer BOTH sits inside `TRUSTED_PROXY_CIDRS` AND presents the
+secret (ratelimit.rs `presents_proxy_secret`). The global map does copy
+`x-enclava-proxy-secret` onto every request that controller proxies,
+including requests to other upstreams (enclava-paas, tenant workloads)
+the API NetworkPolicy admits. A holder of the leaked secret could replay
+it on a direct ClusterIP call to CAP — but only from a source address
+inside `TRUSTED_PROXY_CIDRS` does that matter, and §3b (mandatory before
+enabling the policy) narrows that list to the ingress-nginx controller
+addresses ONLY. A tenant pod or the PaaS presenting the secret is keyed
+by its pod IP: CIDR check fails → forwarding headers ignored → no bucket
+rotation. Non-ingress upstreams and public clients cannot combine both
+factors.
+
+The two-factor gate depends on §3b being applied: with the shipped
+default `TRUSTED_PROXY_CIDRS=10.0.0.0/8` and the global map, ANY cluster
+pod holding the leaked secret would qualify on both factors and could
+rotate buckets. Order of operations is therefore: §3b (narrow CIDRs)
+BEFORE this step (global header injection) BEFORE enabling the
+NetworkPolicy / rolling the new API revision. Do not enable the policy
+on a cluster where §3b has not been completed.
 
 3. **Verify the secret actually reaches CAP** (critical sanity check):
 
