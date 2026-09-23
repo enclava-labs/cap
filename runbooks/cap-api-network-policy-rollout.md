@@ -123,8 +123,8 @@ already wired:
   by inspecting the live value against the controller pod IPs:
 
 ```sh
-kubectl -n enclava-platform get deploy enclava-api -o jsonpath=\
-  '{.spec.template.spec.containers[0].env[?(@.name=="TRUSTED_PROXY_CIDRS")].value}'
+kubectl -n enclava-platform get deploy enclava-api \
+  -o 'jsonpath={.spec.template.spec.containers[0].env[?(@.name=="TRUSTED_PROXY_CIDRS")].value}'
 kubectl get pods -n ingress-nginx -o wide   # every controller IP must fall
                                             # inside the printed CIDR(s), and
                                             # tenant pod CIDRs must NOT
@@ -212,14 +212,27 @@ only on the ingress→CAP leg), and there is no debug endpoint exposing
 request headers. Verify behaviorally instead, with a POSITIVE control:
 
 ```sh
-# PREP: pin the API to ONE replica for the duration of the check
-# (kubectl -n enclava-platform scale deploy/enclava-api --replicas=1):
-# the governor is per-process, so with N replicas a shared ingress-IP key
-# is N buckets and machine B can miss the drained one — a false PASS.
-#
-# Run BOTH loops CONCURRENTLY (not sequentially) to prevent the burst
-# from refilling between tests — CAP's bucket refills at 1 r/s, so sequential
-# tests could give a false pass even with broken secret wiring.
+# PREP — three conditions for a valid check:
+# 1) Pin the API to ONE replica for the duration of the check
+#    (kubectl -n enclava-platform scale deploy/enclava-api --replicas=1):
+#    the governor is per-process, so with N replicas a shared ingress-IP key
+#    is N buckets and machine B can miss the drained one — a false PASS.
+# 2) Pin BOTH clients to ONE ingress-nginx controller pod for the duration
+#    of the check (the fallback bucket is keyed by the CONTROLLER pod IP,
+#    not by the API replica): with multiple controller pods, machine A can
+#    drain controller A's bucket while machine B is load-balanced onto
+#    controller B and receives a fresh budget — another false PASS. On a
+#    multi-controller cluster, either scale the controller to 1 replica
+#    for the duration of the check
+#    (kubectl -n ingress-nginx scale deploy/<controller> --replicas=1),
+#    or drive machine A's keep-firing loop with enough CONCURRENT curl
+#    workers to keep EVERY controller's fallback bucket drained while
+#    machine B runs (list the controller pods first:
+#      kubectl -n ingress-nginx get pods -o wide ).
+# 3) Run BOTH loops CONCURRENTLY (not sequentially) to prevent the burst
+#    from refilling between tests — CAP's bucket refills at 1 r/s, so
+#    sequential tests could give a false pass even with broken secret
+#    wiring.
 #
 # IMPORTANT — different egress is mandatory: both snippets below must run
 # on TWO SEPARATE MACHINES with different public source IPs (e.g. laptop +
@@ -228,11 +241,18 @@ request headers. Verify behaviorally instead, with a POSITIVE control:
 # host's single public IP, land in one bucket either way, and the check
 # below cannot distinguish per-client keying from shared keying.
 #
-# ⚠️ VERIFY DIFFERENT IPs BEFORE PROCEEDING: run this on EACH machine
-# and confirm the reported IPs are different. If they're the same, the test
-# is invalid — find a different network path for one of the machines.
-# MACHINE A: curl -s https://api.<cluster>/auth/device/start -w '%{remote_ip}\n' -o /dev/null
-# MACHINE B: curl -s https://api.<cluster>/auth/device/start -w '%{remote_ip}\n' -o /dev/null
+# ⚠️ VERIFY DISTINCT EGRESS BEFORE PROCEEDING — on EACH machine, ask an
+# external what-is-my-IP service for the address the wider internet sees
+# (NOT curl's %{remote_ip}: that is the server you connected TO — the load
+# balancer/ingress — which both machines normally share, so it says nothing
+# about the caller's source address):
+#   MACHINE A: curl -s https://api.ipify.org; echo
+#   MACHINE B: curl -s https://api.ipify.org; echo
+# The two printed addresses MUST differ. If they are the same, the test is
+# invalid — find a different network path for one of the machines. (If in
+# doubt about the probe itself, compare against the address your cloud
+# provider's metadata service reports, or pick any other what-is-my-IP
+# endpoint.)
 #
 # --- MACHINE A (public IP A) — start this first and KEEP IT RUNNING: ---
 # The 15-request burst finishes in seconds, but the shared fallback bucket
