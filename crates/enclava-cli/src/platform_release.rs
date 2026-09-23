@@ -616,6 +616,27 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn baseline_store_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "pr-baseline-perms-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.join("baselines.json");
+
+        let api_release = release("preprod-2026.09.01-x", "2026-09-01T00:00:00Z");
+        enforce_release_not_older_than_last_accepted(&store, "https://preprod.api", &api_release)
+            .unwrap();
+
+        let mode = std::fs::metadata(&store).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "baseline store must be owner-only");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn api_release_older_than_bundle_is_refused() {
         // The bundled release is current by definition; anything with an
@@ -969,6 +990,19 @@ fn enforce_release_not_older_than_last_accepted_locked(
         let parent = store_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
+        // The baseline carries the per-API downgrade high-water mark; the
+        // tempfile is pinned owner-only (explicit 0600 on unix -- not left
+        // to tempfile's umask-dependent default) so no other local user can
+        // read or tamper with it before the atomic rename, and a future
+        // tempfile behavior change cannot silently widen it.
+        #[cfg(unix)]
+        let mut tmp = {
+            use std::os::unix::fs::PermissionsExt;
+            tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o600))
+                .tempfile_in(parent)?
+        };
+        #[cfg(not(unix))]
         let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
         serde_json::to_writer_pretty(tmp.as_file_mut(), &baseline)?;
         tmp.as_file().sync_all()?;
