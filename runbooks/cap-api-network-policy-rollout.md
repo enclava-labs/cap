@@ -20,13 +20,19 @@ targetPort 3000, so in-cluster callers use
 ```sh
 kubectl get ns ingress-nginx   # must carry kubernetes.io/metadata.name=ingress-nginx (automatic)
 kubectl get pods -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx   # must list the controllers
-kubectl get ns enclava-paas    # PaaS namespace; pods must carry app.kubernetes.io/name=enclava-paas
+kubectl get ns enclava-paas    # PaaS namespace
+kubectl get pods -n enclava-paas -l app.kubernetes.io/name=enclava-paas   # MUST be non-empty
 kubectl get ns -l enclava.dev/tenant   # must list every CAP-rendered tenant namespace
 ```
 
-If any selector is empty, traffic for that class is DROPPED once the policy is
-enforced. Adjust the selectors in the overlay to the cluster's actual labels
-before applying.
+Note the asymmetry: the namespace checks alone prove nothing about pod labels.
+The NetworkPolicy's enclava-paas rule pairs the namespaceSelector with a
+podSelector on `app.kubernetes.io/name=enclava-paas`, so an empty pod query
+means the policy admits NOTHING from that namespace — every PaaS-to-CAP
+internal API call (deployments, status DTOs) would be dropped the moment the
+policy is enforced. If the live PaaS deployment uses a different pod label,
+either the policy's podSelector or the deployment's labels must be adjusted
+BEFORE rollout; do not proceed on a green `get ns` with an empty pod list.
 
 ## 2. Tenant workload egress path is intact
 
@@ -108,6 +114,26 @@ kubectl get nodes -o wide                   # map pod IPs to the node+pod CIDR i
 
 Set `TRUSTED_PROXY_CIDRS` in the live overlay to the smallest CIDR (or
 explicit IP list) covering ONLY the ingress-nginx controller pods.
+
+Because controller pods are frequently rescheduled, a snapshot of today's pod
+IPs is not a durable configuration: the next node drain or crash-loop moves a
+controller to an address outside the list, `TrustedProxyKeyExtractor` stops
+recognizing it as a configured proxy peer, and that controller's traffic is
+keyed by its pod IP — one shared fallback bucket for all clients routed
+through it, i.e. cross-client 429s. The narrowed value must therefore be
+STABLE by construction, in one of these forms (preferred first):
+
+1. A dedicated node pool / subnet for ingress controllers, with
+   `TRUSTED_PROXY_CIDRS` set to that subnet (works for both
+   hostNetwork-on-pool-nodes and pod-IP pools carved per node pool).
+2. A static, controller-reserved pod IP range (e.g. a reserved slice of the
+   cluster's pod CIDR that only controller pods can draw from).
+3. If neither exists on the target cluster: an explicit IP list is acceptable
+   ONLY together with automation that re-checks coverage and updates the
+   overlay on every controller restart/reschedule (a bare snapshot is NOT an
+   acceptable end state — treat it as a time bomb, not a configuration).
+
+Verify the narrowed value whenever controllers are touched:
 
 How to verify the narrowing depends on whether the proxy secret (§3c) is
 already wired:
