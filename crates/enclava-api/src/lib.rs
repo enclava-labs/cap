@@ -693,8 +693,9 @@ mod runtime_gate_tests {
         //
         // 1. Mirror freshness: the annotated pattern set below must equal
         //    the route declarations in this file (scanned from the source
-        //    at compile time), so adding a route without updating the
-        //    table fails here instead of drifting silently.
+        //    at compile time), including each route's served methods, so
+        //    adding a route or a method on an existing route without
+        //    updating the table fails here instead of drifting silently.
         // 2. Single matcher: Cargo.lock must contain exactly one matchit
         //    package, pinned via the `=0.8.4` dev-dependency. If axum and
         //    this mirror ever resolve to different matchit copies, the
@@ -935,35 +936,195 @@ mod runtime_gate_tests {
         ];
 
         // (1) The route declarations of this file, scanned at compile
-        // time, must match the annotated table exactly (as a set: the
-        // same path may be declared twice with different methods). Only
-        // the router-construction section is scanned — everything from
-        // the test module onward (including this scanner's own source)
-        // is excluded.
+        // time, must match the annotated table exactly — both the set
+        // of paths and, per path, the set of served methods (a path
+        // may be declared twice with different methods or chained via
+        // `.get(...).post(...)`). Adding a route or adding/changing a
+        // method on an existing route fails here instead of drifting
+        // silently. Only the router-construction section is scanned —
+        // everything from the test module onward (including this
+        // scanner's own source) is excluded.
         let source = include_str!("lib.rs");
         let source = &source[..source
             .find("mod runtime_gate_tests")
             .expect("test module must exist; the route scanner depends on its position")];
-        let mut declared: Vec<&str> = Vec::new();
-        let mut rest_scan = source;
-        while let Some(pos) = rest_scan.find(".route(") {
-            rest_scan = &rest_scan[pos + ".route(".len()..];
-            if let Some(literal) = rest_scan.trim_start().strip_prefix('"') {
-                // route paths are plain literals without escapes
-                if let Some(end) = literal.find('"') {
-                    declared.push(&literal[..end]);
+        const METHOD_VERBS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
+        // Builder calls that may appear inside a route handler
+        // expression without serving a method.
+        const NON_METHOD_CALLS: [&str; 6] = [
+            "layer",
+            "route_layer",
+            "with_state",
+            "handle_error",
+            "fallback",
+            "fallback_service",
+        ];
+
+        // Blank string-literal bodies and comments with spaces (byte
+        // positions preserved) so structural scans see only code.
+        fn blank_noncode(src: &str) -> Vec<u8> {
+            let b = src.as_bytes();
+            let mut out = b.to_vec();
+            let mut i = 0;
+            let mut in_string = false;
+            while i < b.len() {
+                let c = b[i];
+                if in_string {
+                    out[i] = b' ';
+                    if c == b'\\' && i + 1 < b.len() {
+                        out[i + 1] = b' ';
+                        i += 2;
+                        continue;
+                    }
+                    if c == b'"' {
+                        in_string = false;
+                    }
+                    i += 1;
+                } else {
+                    match c {
+                        b'"' => {
+                            in_string = true;
+                            out[i] = b' ';
+                            i += 1;
+                        }
+                        b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
+                            while i < b.len() && b[i] != b'\n' {
+                                out[i] = b' ';
+                                i += 1;
+                            }
+                        }
+                        b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                            out[i] = b' ';
+                            out[i + 1] = b' ';
+                            i += 2;
+                            while i < b.len() {
+                                if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/' {
+                                    out[i] = b' ';
+                                    out[i + 1] = b' ';
+                                    i += 2;
+                                    break;
+                                }
+                                out[i] = b' ';
+                                i += 1;
+                            }
+                        }
+                        _ => i += 1,
+                    }
+                }
+            }
+            out
+        }
+
+        let blanked = blank_noncode(source);
+        let code = std::str::from_utf8(&blanked).expect("blanking preserves UTF-8 validity");
+        // (path, method verb) pairs, one per served method
+        let mut declared: Vec<(&str, &str)> = Vec::new();
+        let mut search_from = 0usize;
+        while let Some(rel) = code[search_from..].find(".route(") {
+            let pos = search_from + rel;
+            // The .route(...) call is bounded by its matching paren —
+            // never anything beyond it — so later code cannot be
+            // misattributed to this route.
+            let open = pos + ".route(".len() - 1;
+            let mut depth = 0usize;
+            let mut close = None;
+            for (i, c) in code[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close = close.expect("unbalanced .route( call");
+            search_from = close + 1;
+            let call = &code[pos..=close];
+            // route paths are plain literals without escapes; look the
+            // literal up in the original source (the blanked copy has
+            // no quotes left)
+            let src_call = &source[pos..=close];
+            let q1 = src_call
+                .find('"')
+                .expect("route path must be a string literal");
+            let q2 = src_call[q1 + 1..]
+                .find('"')
+                .expect("route path literal must close")
+                + q1
+                + 1;
+            let path = &src_call[q1 + 1..q2];
+            let comma = call[q2 + 1..]
+                .find(',')
+                .expect("route must have a handler argument")
+                + q2
+                + 1;
+            let handler = &call[comma + 1..call.len() - 1];
+            // Leading verb: `axum::routing::get(handler)` or `get(handler)`
+            let trimmed = handler.trim_start();
+            let paren = trimmed.find('(').expect("handler must be a call");
+            let ident_path = trimmed[..paren].trim_end();
+            let leading = ident_path.rsplit("::").next().unwrap();
+            assert!(
+                METHOD_VERBS.contains(&leading),
+                "route {path}: unrecognized handler {ident_path:?}; the freshness \
+                 scanner only understands verb calls (get/post/put/patch/delete, \
+                 optionally module-qualified) — restructure the route or teach \
+                 the scanner about it"
+            );
+            declared.push((path, leading));
+            // Every dotted call chained on the handler must be a known
+            // method verb or a known non-method builder. Anything else
+            // (`.on(MethodFilter, ...)`, `.any(...)`, `.merge(...)`,
+            // `get_service`-style forms, ...) may serve a method this
+            // table cannot see — fail instead of tracking it wrongly.
+            let mut scan = 0usize;
+            while let Some(dot) = handler[scan..].find('.') {
+                let at = scan + dot;
+                scan = at + 1;
+                let after = &handler[at + 1..];
+                let name_len = after
+                    .find(|c: char| !(c.is_ascii_alphabetic() || c == '_'))
+                    .unwrap_or(after.len());
+                if name_len == 0 || !handler[at + 1 + name_len..].starts_with('(') {
+                    continue; // not a call
+                }
+                let name = &after[..name_len];
+                if METHOD_VERBS.contains(&name) {
+                    declared.push((path, name));
+                } else if !NON_METHOD_CALLS.contains(&name) {
+                    panic!(
+                        "route {path}: chained call .{name}( is not a known method \
+                         verb or non-method builder; it may serve a method the \
+                         mirrored table cannot track — restructure the route or \
+                         teach the scanner about it"
+                    );
                 }
             }
         }
-        let mut declared_set = declared.clone();
-        declared_set.sort_unstable();
-        declared_set.dedup();
-        let mut table_set: Vec<&str> = route_table.iter().map(|(p, _)| *p).collect();
-        table_set.sort_unstable();
-        table_set.dedup();
+        let mut declared_map: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for (path, verb) in declared {
+            declared_map
+                .entry(path)
+                .or_default()
+                .insert(verb.to_uppercase());
+        }
+        let mut table_map: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for (path, served) in route_table {
+            table_map
+                .entry(path)
+                .or_default()
+                .extend(served.iter().map(|(m, _)| m.to_string()));
+        }
         assert_eq!(
-            declared_set, table_set,
-            "route table mirror drifted from the route declarations in this file"
+            declared_map, table_map,
+            "route table mirror (paths AND per-path method sets) drifted from the \
+             route declarations in this file"
         );
 
         // (2) Exactly one matchit in the lockfile, and it is the pinned
