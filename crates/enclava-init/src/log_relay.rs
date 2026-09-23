@@ -1,10 +1,18 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
+
+/// O_NOFOLLOW for Linux: reject a final-path-component symlink instead of
+/// following it. The relay runs as root inside enclava-init and reads files
+/// from `/run/enclava-logs`, a directory the workload user (gid 10001) can
+/// write to — a compromised workload must not be able to swap the spool for
+/// a symlink into init-only state (TLS seeds, KBS material) and have the
+/// relay stream it to logs clients.
+const O_NOFOLLOW: i32 = 0o400000;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8082";
 const DEFAULT_SPOOL_PATH: &str = "/run/enclava-logs/app.jsonl";
@@ -229,8 +237,43 @@ fn advance_last_sequence(bytes: &[u8], last_seq: &mut Option<u64>) {
     }
 }
 
+/// Open the spool for reading without following a final-component symlink
+/// and without accepting anything but a regular file. The spool directory
+/// is group-writable by the workload, so a compromised workload could
+/// otherwise point the relay (root) at init-only state and have it streamed
+/// out as "logs". Returns NotFound on a symlink so the follow loop's
+/// existing `else { continue; }` path simply retries until the spool is a
+/// real file again.
+fn open_spool_for_read(path: &Path) -> io::Result<File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| {
+            // ELOOP (40) is what O_NOFOLLOW returns for a final-component
+            // symlink; normalize it to NotFound so the follow loop's existing
+            // `else { continue; }` path treats a planted symlink exactly like
+            // a missing spool (retry until it is a real file again).
+            // ErrorKind::FilesystemLoop is still unstable (io_error_more),
+            // so match the raw errno.
+            if e.raw_os_error() == Some(40) {
+                io::Error::new(io::ErrorKind::NotFound, e.to_string())
+            } else {
+                e
+            }
+        })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "spool is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64, File)> {
-    let mut file = File::open(path)?;
+    let mut file = open_spool_for_read(path)?;
     let len = file.metadata()?.len();
     let start = len.saturating_sub(MAX_TAIL_BYTES);
     file.seek(SeekFrom::Start(start))?;
@@ -278,8 +321,8 @@ fn drain_from(file: &mut File, expected_start: u64) -> io::Result<(Vec<u8>, u64)
     Ok((bytes, delivered))
 }
 
-fn follow_spool(
-    stream: &mut TcpStream,
+fn follow_spool<W: Write>(
+    stream: &mut W,
     path: &Path,
     offset: &mut u64,
     held: &mut Option<File>,
@@ -295,7 +338,7 @@ fn follow_spool(
     let mut last_seq: Option<u64> = initial_last_seq;
     loop {
         thread::sleep(FOLLOW_POLL_INTERVAL);
-        let Ok(mut file) = File::open(path) else {
+        let Ok(mut file) = open_spool_for_read(path) else {
             continue;
         };
         let current_identity = spool_identity(&file)?;
@@ -313,8 +356,7 @@ fn follow_spool(
             // The spool was rotated (atomic rename → new inode): re-read the
             // retained window from the start of the new file, filtering out
             // already-delivered frames by sequence. Never seek a stale byte
-            // offset into the rewritten tail. Adopt the new file as the
-            // held handle (drop the old fd only after adopting the new one).
+            // offset into the rewritten tail.
             *offset = 0;
             let mut adopted = file;
             adopted.seek(SeekFrom::Start(0))?;
@@ -334,10 +376,16 @@ fn follow_spool(
                 delivered_end += idx + 1;
             }
             *offset = delivered_end as u64;
-            // Write to the client BEFORE holding the fd: a stalled client would keep
-            // this fd open, pinning the old inode's ~32 MiB against deletion.
-            // The inode identity is already captured in `current_identity` for
-            // rotation detection, so we reopen on the next poll if needed.
+            // Drop the OLD held fd BEFORE the (potentially blocking) client
+            // write: the old inode is already unlinked by the rotation, and a
+            // stalled client can hold write_deduped_after_rotation blocked
+            // for up to FOLLOW_IO_TIMEOUT — during that window the pinned
+            // ~32 MiB inode counts against the emptyDir cap, and staggered
+            // stalled followers could each pin a different rotation
+            // generation past the volume limit. Rotation detection does not
+            // need the old fd once the identity mismatch is established
+            // (same_as_held is false); it re-opens the path fresh next poll.
+            *held = None;
             write_deduped_after_rotation(stream, &bytes, &mut last_seq)?;
             stream.flush()?;
             *held = Some(adopted);
@@ -388,8 +436,8 @@ fn follow_spool(
 /// only complete lines are emitted, already-delivered sequences are
 /// skipped, and the follow offset is left at the end of the last complete
 /// line so an in-flight fragment is re-read next poll.
-fn remainder_dedup_resend(
-    stream: &mut TcpStream,
+fn remainder_dedup_resend<W: Write>(
+    stream: &mut W,
     file: &mut File,
     offset: &mut u64,
     last_seq: &mut Option<u64>,
@@ -567,6 +615,28 @@ mod tests {
         assert_eq!(last_seq, Some(9));
     }
 
+    /// The relay runs as root and the spool directory is group-writable by
+    /// the workload: a planted symlink at the spool path must be REJECTED,
+    /// not followed — otherwise the relay would stream whatever init-only
+    /// file the workload pointed it at as "logs" (grok round-8 self-check).
+    #[test]
+    fn tail_lines_rejects_planted_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "init-only material\n").unwrap();
+        let spool = dir.path().join("spool.jsonl");
+        std::os::unix::fs::symlink(&secret, &spool).unwrap();
+        let err = tail_lines(&spool, 10).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        // The follow path's per-poll open uses the same guarded helper.
+        let err = open_spool_for_read(&spool).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        // A regular file at the same path still opens fine.
+        std::fs::remove_file(&spool).unwrap();
+        std::fs::write(&spool, "frame\n").unwrap();
+        assert!(open_spool_for_read(&spool).is_ok());
+    }
+
     #[test]
     fn tail_lines_returns_open_spool_handle() {
         let dir = tempfile::tempdir().unwrap();
@@ -691,6 +761,54 @@ mod tests {
         // but pinned) — no data race between the two handles.
         drop(file);
         drop(held_file);
+    }
+
+    /// Round-9 review finding (P1): the OLD held fd must be dropped BEFORE
+    /// the post-rotation client write, not only after adopting the new one.
+    /// A stalled client can block write_deduped_after_rotation for up to
+    /// FOLLOW_IO_TIMEOUT while the unlinked old inode (~32 MiB) stays
+    /// pinned; staggered stalled followers could each pin a different
+    /// rotation generation past the 64 MiB emptyDir cap. Deterministic pin:
+    /// a writer that fails the post-rotation write must leave `held` empty —
+    /// previously the old handle was only replaced after a successful write
+    /// and flush, so a failed/blocked write kept it pinned.
+    #[test]
+    fn rotation_resync_drops_old_handle_before_client_write() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("simulated stalled client"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, "{\"sequence\":1}\n{\"sequence\":2}\n").unwrap();
+        let (_, mut offset, held_file) = tail_lines(&path, 10).unwrap();
+        let old_identity = spool_identity(&held_file).unwrap();
+        let mut held = Some(held_file);
+
+        // Rotate: new inode over the spool path.
+        let rotated = dir.path().join("spool.jsonl.rotate");
+        std::fs::write(&rotated, "{\"sequence\":2}\n{\"sequence\":3}\n").unwrap();
+        std::fs::rename(&rotated, &path).unwrap();
+
+        let mut sink = FailingWriter;
+        let last_seq = Some(2u64);
+        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, last_seq);
+        assert!(result.is_err(), "failing writer must unwind the follower");
+        assert!(
+            held.is_none(),
+            "old fd must be dropped before the post-rotation client write"
+        );
+        // Sanity: the dropped handle really was the pre-rotation inode.
+        assert_ne!(
+            spool_identity(&std::fs::File::open(&path).unwrap()).unwrap(),
+            old_identity
+        );
     }
 
     /// Round-7 review finding (P1): a follow client that stops reading
