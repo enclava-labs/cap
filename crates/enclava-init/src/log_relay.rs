@@ -138,6 +138,14 @@ fn handle_connection(
         }
         Err(err) => return Err(err),
     };
+    // Release the tail handle BEFORE any client write (round-10 review P1):
+    // the writes below can block for up to FOLLOW_IO_TIMEOUT on a client
+    // that stops reading — follow or not — and a rotation landing in that
+    // window unlinks the inode this fd pins (~32 MiB). Staggered stalled
+    // clients could otherwise pin successive rotation generations past the
+    // 64 MiB emptyDir cap, exactly the hazard the rotation-resync path
+    // already guards against inside follow_spool.
+    drop(spool_file);
     write_response_head(&mut stream, 200, "application/x-ndjson", None)?;
     let mut last_seq: Option<u64> = None;
     for line in &lines {
@@ -148,12 +156,15 @@ fn handle_connection(
     stream.flush()?;
     if query.follow {
         // `last_seq` was seeded while streaming the initial tail above, so
-        // the first rotation after connect does not replay frames the client
-        // just received in this response body. The tail's File handle is
-        // kept open and becomes the follower's held handle: rotation
-        // detection compares against the HELD inode (which the filesystem
-        // cannot recycle while we hold it), not a bare remembered number.
-        let mut held = Some(spool_file);
+        // the follower never replays frames the client just received. The
+        // tail's File handle was dropped before the writes (see above), so
+        // the follower starts with NO held handle: the first poll takes the
+        // rotation-resync path, adopts the CURRENT inode fresh, re-reads
+        // from offset 0, and dedups against the seeded `last_seq`. That is
+        // sound even when a rotation lands mid-tail-write: offsets never
+        // cross the swap undetected, because the first poll trusts no
+        // offset computed against a (possibly replaced) older inode.
+        let mut held = None;
         follow_spool(&mut stream, spool_path, &mut offset, &mut held, last_seq)?;
     }
     Ok(())
@@ -301,9 +312,10 @@ fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64, File)>
         .map(str::to_string)
         .collect::<Vec<_>>();
     lines.reverse();
-    // The File handle is returned so the follower can HOLD it open: while
-    // the old inode stays open the filesystem cannot recycle its number
-    // into a rotation temp file, making identity comparison sound.
+    // The File handle is returned (rather than dropped here) so callers
+    // control its lifetime explicitly: handle_connection drops it BEFORE
+    // any client write so a stalled client cannot pin the tail inode
+    // across a rotation (the follow loop re-adopts a handle itself).
     Ok((lines, follow_from, file))
 }
 
@@ -816,6 +828,57 @@ mod tests {
     /// holds) forever. The connection must carry socket timeouts: a short
     /// one in tests (FOLLOW_IO_TIMEOUT in production), so a stalled
     /// write_all/strandead head read errors out and unwinds the handler.
+    /// Round-10 review finding (P1, connect path): handle_connection now
+    /// drops the tail handle BEFORE the (potentially blocking) initial
+    /// client writes, so the follower enters follow_spool with NO held
+    /// handle. This test pins that contract: a follower seeded from a tail
+    /// (last_seq from the old inode, offset computed against it) must not
+    /// replay already-delivered frames when the first poll adopts the
+    /// current inode — the held=None entry takes the rotation-resync path
+    /// and dedups by sequence, which is also correct when a rotation lands
+    /// mid-tail-write.
+    #[test]
+    fn follow_entry_without_held_handle_resyncs_without_replay() {
+        // Fails the resync flush so follow_spool unwinds after exactly one
+        // poll — otherwise the loop would spin on the len==offset no-op
+        // branch forever (a healthy idle follower never blocks).
+        struct FailingFlushWriter {
+            sink: Vec<u8>,
+        }
+        impl std::io::Write for FailingFlushWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.sink.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("stop after first resync flush"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        // Tail delivered sequences 1-2 from the (now gone) old inode;
+        // `offset` was computed against that old inode and must not be
+        // trusted against the current one.
+        std::fs::write(&path, "{\"sequence\":2}\n{\"sequence\":3}\n").unwrap();
+        let mut offset = 100u64; // stale, points past the current file
+        let mut held = None; // handle_connection drops the tail fd pre-write
+        let mut sink = FailingFlushWriter { sink: Vec::new() };
+        let last_seq = Some(2u64);
+        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, last_seq);
+        assert!(result.is_err(), "failing flush must unwind the loop");
+        // Sequence 2 was already delivered in the tail: it must NOT be
+        // replayed by the held=None resync; sequence 3 is forwarded once.
+        let sent = String::from_utf8(sink.sink).unwrap();
+        assert_eq!(sent, "{\"sequence\":3}\n");
+        // The resync recomputed the offset against the CURRENT inode
+        // (end of last complete line), ignoring the stale entry offset.
+        assert_eq!(offset, "{\"sequence\":2}\n{\"sequence\":3}\n".len() as u64);
+        // The flush error unwound the loop BEFORE the adopted fd was
+        // stored — held stays None, nothing is pinned.
+        assert!(held.is_none());
+    }
+
     #[test]
     fn stalled_follow_client_times_out_and_releases_thread() {
         use std::io::{Read as _, Write as _};
