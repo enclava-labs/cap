@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -333,11 +333,37 @@ fn drain_from(file: &mut File, expected_start: u64) -> io::Result<(Vec<u8>, u64)
     Ok((bytes, delivered))
 }
 
+/// Anchor for rotation detection that does NOT require holding a spool fd
+/// across (potentially blocking) client writes. `identity` is the dev/ino of
+/// the inode the follower's `offset` was computed against; `tail_byte` is the
+/// byte at `offset - 1` on that inode (None only while offset == 0). Holding
+/// an open fd was the old rotation signal — while pinned, the filesystem
+/// cannot recycle the inode number — but a stalled client can block a socket
+/// write for up to FOLLOW_IO_TIMEOUT and every open fd keeps an unlinked
+/// ~32 MiB rotation generation alive against the 64 MiB emptyDir cap. The
+/// anchor trades the non-recycling guarantee for a continuity probe: a
+/// recycled inode that happens to collide numerically is still caught
+/// because the byte just before the follow offset no longer matches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FollowAnchor {
+    identity: SpoolIdentity,
+    tail_byte: Option<u8>,
+}
+
+/// Read the single byte at `pos`, or None past end-of-file.
+fn byte_at(file: &mut File, pos: u64) -> io::Result<Option<u8>> {
+    let mut buf = [0u8; 1];
+    match file.read_at(&mut buf, pos)? {
+        0 => Ok(None),
+        _ => Ok(Some(buf[0])),
+    }
+}
+
 fn follow_spool<W: Write>(
     stream: &mut W,
     path: &Path,
     offset: &mut u64,
-    held: &mut Option<File>,
+    held: &mut Option<FollowAnchor>,
     initial_last_seq: Option<u64>,
 ) -> io::Result<()> {
     // Highest frame sequence already delivered to this client. On rotation
@@ -350,67 +376,70 @@ fn follow_spool<W: Write>(
     let mut last_seq: Option<u64> = initial_last_seq;
     loop {
         thread::sleep(FOLLOW_POLL_INTERVAL);
+        // The spool fd is opened fresh each poll and dropped before ANY
+        // client write below: no descriptor survives across blocking socket
+        // I/O, so a stalled client cannot pin a rotation generation for the
+        // FOLLOW_IO_TIMEOUT window (round-11 review P1). Rotation is
+        // detected from the remembered FollowAnchor instead.
         let Ok(mut file) = open_spool_for_read(path) else {
             continue;
         };
         let current_identity = spool_identity(&file)?;
-        // Rotation detection compares against the HELD handle's inode, not
-        // a remembered number: while the old fd stays open the filesystem
-        // cannot recycle that inode number into a rotation temp file, so an
-        // identity match genuinely means "same file" (canonical tail -F
-        // semantics).
-        let same_as_held = held
-            .as_ref()
-            .and_then(|held_file| spool_identity(held_file).ok())
-            .is_some_and(|held_identity| held_identity == current_identity);
         let len = file.metadata()?.len();
+        // Same-inode check: remembered identity PLUS a continuity probe of
+        // the byte at offset-1. This catches everything the old held-fd
+        // comparison caught (atomic-rename rotations change the inode) and
+        // additionally the residual hazard of a numerically recycled inode:
+        // a rewritten file at the same (dev,ino) no longer contains the byte
+        // the follower last delivered. `len < offset` (the writer's rollback
+        // truncation, or a shorter recycled file) also fails the probe and
+        // funnels into the same resync path.
+        let same_as_held = match held.as_ref() {
+            Some(anchor) if anchor.identity == current_identity => {
+                if *offset == 0 {
+                    anchor.tail_byte.is_none()
+                } else {
+                    byte_at(&mut file, *offset - 1)? == anchor.tail_byte
+                }
+            }
+            _ => false,
+        };
         if !same_as_held {
-            // The spool was rotated (atomic rename → new inode): re-read the
-            // retained window from the start of the new file, filtering out
-            // already-delivered frames by sequence. Never seek a stale byte
-            // offset into the rewritten tail.
+            // The spool was rotated (atomic rename → new inode), truncated
+            // by the writer's rollback path, or replaced under a recycled
+            // inode number: re-read the current file from the start,
+            // filtering out already-delivered frames by sequence. Never seek
+            // a stale byte offset into rewritten content.
             *offset = 0;
-            let mut adopted = file;
-            adopted.seek(SeekFrom::Start(0))?;
-            let (bytes, _delivered) = drain_from(&mut adopted, 0)?;
+            file.seek(SeekFrom::Start(0))?;
+            let (bytes, _delivered) = drain_from(&mut file, 0)?;
             // Resume at the END OF THE LAST COMPLETE LINE delivered by
             // write_deduped_after_rotation, NOT the drain cursor: an
-            // in-flight trailing fragment (writer mid-append into the fresh
-            // inode) is withheld from the client, so the next poll must
-            // re-read it from its first byte and deliver the completed line
-            // whole. Resuming at the drain cursor would emit only the
-            // fragment's suffix as a bogus NDJSON line. Re-reading the
-            // fragment is by design: the writer appends frame+newline
-            // atomically, so the re-read returns the prefix plus its
-            // completion as one line.
+            // in-flight trailing fragment (writer mid-append) is withheld
+            // from the client, so the next poll must re-read it from its
+            // first byte and deliver the completed line whole. Resuming at
+            // the drain cursor would emit only the fragment's suffix as a
+            // bogus NDJSON line. Re-reading the fragment is by design: the
+            // writer appends frame+newline atomically, so the re-read
+            // returns the prefix plus its completion as one line.
             let mut delivered_end = 0usize;
             while let Some(idx) = bytes[delivered_end..].iter().position(|&b| b == b'\n') {
                 delivered_end += idx + 1;
             }
             *offset = delivered_end as u64;
-            // Drop the OLD held fd BEFORE the (potentially blocking) client
-            // write: the old inode is already unlinked by the rotation, and a
-            // stalled client can hold write_deduped_after_rotation blocked
-            // for up to FOLLOW_IO_TIMEOUT — during that window the pinned
-            // ~32 MiB inode counts against the emptyDir cap, and staggered
-            // stalled followers could each pin a different rotation
-            // generation past the volume limit. Rotation detection does not
-            // need the old fd once the identity mismatch is established
-            // (same_as_held is false); it re-opens the path fresh next poll.
-            *held = None;
+            // Anchor the new inode and drop the spool fd BEFORE the
+            // (potentially blocking) client write + flush: a stalled client
+            // can block write_deduped_after_rotation for up to
+            // FOLLOW_IO_TIMEOUT — during that window no fd may pin the
+            // unlinked previous generation (~32 MiB against the emptyDir
+            // cap). The anchor carries no descriptor.
+            *held = Some(FollowAnchor {
+                identity: current_identity,
+                tail_byte: (delivered_end > 0).then(|| bytes[delivered_end - 1]),
+            });
+            drop(file);
             write_deduped_after_rotation(stream, &bytes, &mut last_seq)?;
             stream.flush()?;
-            *held = Some(adopted);
-            continue;
-        }
-        if len < *offset {
-            // Same-inode truncation: the writer's rollback path (set_len to
-            // its pre-write length after a failed append) retracts bytes the
-            // follower may already be positioned past. Reset to 0 and
-            // re-send through the sequence dedup path so already-delivered
-            // frames are not replayed — same handler as a rotation resync.
-            *offset = 0;
-            remainder_dedup_resend(stream, &mut file, offset, &mut last_seq)?;
             continue;
         }
         if len == *offset {
@@ -435,34 +464,22 @@ fn follow_spool<W: Write>(
         if complete_end > 0 {
             let complete = &bytes[..complete_end];
             advance_last_sequence(complete, &mut last_seq);
-            stream.write_all(complete)?;
+            // Advance the offset and anchor the delivered boundary, then
+            // drop the spool fd BEFORE the blocking write + flush (round-11
+            // review P1): this same-inode append branch previously kept
+            // both the local fd and the held fd open across network I/O, so
+            // a concurrent rotation left BOTH pinning the now-unlinked
+            // ~32 MiB inode until the socket write returned.
             *offset += complete_end as u64;
+            *held = Some(FollowAnchor {
+                identity: current_identity,
+                tail_byte: complete.last().copied(),
+            });
+            drop(file);
+            stream.write_all(complete)?;
+            stream.flush()?;
         }
-        stream.flush()?;
     }
-}
-
-/// Re-read the spool from offset 0 and re-send it with sequence dedup after
-/// a same-inode truncation (the writer's rollback path retracts bytes the
-/// follower was positioned past). Shares the rotation-resync semantics:
-/// only complete lines are emitted, already-delivered sequences are
-/// skipped, and the follow offset is left at the end of the last complete
-/// line so an in-flight fragment is re-read next poll.
-fn remainder_dedup_resend<W: Write>(
-    stream: &mut W,
-    file: &mut File,
-    offset: &mut u64,
-    last_seq: &mut Option<u64>,
-) -> io::Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    let (bytes, _delivered) = drain_from(file, 0)?;
-    let mut delivered_end = 0usize;
-    while let Some(idx) = bytes[delivered_end..].iter().position(|&b| b == b'\n') {
-        delivered_end += idx + 1;
-    }
-    *offset = delivered_end as u64;
-    write_deduped_after_rotation(stream, &bytes, last_seq)?;
-    stream.flush()
 }
 
 /// Re-send spool bytes after a rotation resync, dropping complete frames
@@ -801,7 +818,16 @@ mod tests {
         std::fs::write(&path, "{\"sequence\":1}\n{\"sequence\":2}\n").unwrap();
         let (_, mut offset, held_file) = tail_lines(&path, 10).unwrap();
         let old_identity = spool_identity(&held_file).unwrap();
-        let mut held = Some(held_file);
+        // Seed the anchor the way a live follower would after delivering
+        // the tail: identity of the (old) inode plus its last delivered
+        // byte. Round-11: `held` carries NO file descriptor — rotation
+        // tracking is anchor-based precisely so a client stalled in the
+        // blocking write below cannot pin any inode.
+        drop(held_file);
+        let mut held = Some(FollowAnchor {
+            identity: old_identity,
+            tail_byte: Some(b'\n'),
+        });
 
         // Rotate: new inode over the spool path.
         let rotated = dir.path().join("spool.jsonl.rotate");
@@ -812,15 +838,20 @@ mod tests {
         let last_seq = Some(2u64);
         let result = follow_spool(&mut sink, &path, &mut offset, &mut held, last_seq);
         assert!(result.is_err(), "failing writer must unwind the follower");
-        assert!(
-            held.is_none(),
-            "old fd must be dropped before the post-rotation client write"
-        );
-        // Sanity: the dropped handle really was the pre-rotation inode.
-        assert_ne!(
-            spool_identity(&std::fs::File::open(&path).unwrap()).unwrap(),
-            old_identity
-        );
+        // The follower may hold an ANCHOR (identity + probe byte, no fd)
+        // across the blocking write — never a descriptor — and the anchor
+        // already points at the NEW inode, so the pinned old generation is
+        // released the moment the rotation was detected, not after the
+        // client write returns.
+        let new_identity = spool_identity(&std::fs::File::open(&path).unwrap()).unwrap();
+        assert_ne!(new_identity, old_identity);
+        match held {
+            Some(anchor) => assert_eq!(
+                anchor.identity, new_identity,
+                "anchor must reference the rotated-in inode, not the old one"
+            ),
+            None => panic!("anchor must be established before the client write"),
+        }
     }
 
     /// Round-7 review finding (P1): a follow client that stops reading
@@ -874,9 +905,70 @@ mod tests {
         // The resync recomputed the offset against the CURRENT inode
         // (end of last complete line), ignoring the stale entry offset.
         assert_eq!(offset, "{\"sequence\":2}\n{\"sequence\":3}\n".len() as u64);
-        // The flush error unwound the loop BEFORE the adopted fd was
-        // stored — held stays None, nothing is pinned.
-        assert!(held.is_none());
+        // The flush error unwound the loop AFTER the resync established its
+        // anchor but BEFORE any further work: `held` is an anchor (no fd)
+        // referencing the current inode — nothing is pinned by a descriptor.
+        match held {
+            Some(anchor) => assert_eq!(
+                anchor.identity,
+                spool_identity(&std::fs::File::open(&path).unwrap()).unwrap()
+            ),
+            None => panic!("resync must anchor the current inode"),
+        }
+    }
+
+    /// Round-11 review finding (P1): in the SAME-INODE append branch no
+    /// spool descriptor may survive across the (potentially blocking)
+    /// client write + flush. Previously both the freshly opened fd and the
+    /// held fd stayed open across `write_all`, so a rotation landing under
+    /// a stalled client pinned the unlinked ~32 MiB inode for the whole
+    /// FOLLOW_IO_TIMEOUT window. The follow state is now a FollowAnchor
+    /// (identity + probe byte, NO descriptor), and the fd is dropped
+    /// before the write. This test pins the ordering: a write that fails
+    /// must still observe the offset advanced and the anchor moved to the
+    /// new delivered boundary — state that can only be committed before
+    /// the blocking write, because no fd exists to commit afterwards.
+    #[test]
+    fn same_inode_append_holds_no_fd_across_client_write() {
+        struct FailingWriter;
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("simulated stalled client"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, "{\"sequence\":1}\n").unwrap();
+        let identity = spool_identity(&std::fs::File::open(&path).unwrap()).unwrap();
+        let mut offset = "{\"sequence\":1}\n".len() as u64;
+        let mut held = Some(FollowAnchor {
+            identity,
+            tail_byte: Some(b'\n'),
+        });
+
+        // Same inode, new complete frame appended: takes the append branch.
+        let mut append = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        append.write_all(b"{\"sequence\":2}\n").unwrap();
+        drop(append);
+
+        let mut sink = FailingWriter;
+        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, Some(1));
+        assert!(result.is_err(), "failing writer must unwind the follower");
+        // The delivered boundary was committed BEFORE the write: offset
+        // spans both frames and the anchor probes the new last byte on the
+        // SAME inode — the state the next poll (had the client survived)
+        // would resume from, with no descriptor ever held across the write.
+        assert_eq!(offset, "{\"sequence\":1}\n{\"sequence\":2}\n".len() as u64);
+        let anchor = held.expect("anchor must be established before the write");
+        assert_eq!(anchor.identity, identity, "same inode: no rotation");
+        assert_eq!(anchor.tail_byte, Some(b'\n'));
     }
 
     #[test]

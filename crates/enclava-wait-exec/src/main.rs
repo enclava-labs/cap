@@ -483,22 +483,33 @@ fn read_capped_record<R: BufRead>(
                 let n = search.len();
                 reader.consume(n);
                 if buf.len() == MAX_LOG_RECORD_BYTES {
-                    // If the record's newline lands EXACTLY at the cap
+                    // If the record's terminator lands EXACTLY at the cap
                     // boundary, consume it here instead of letting the
-                    // next call return it as a lone-newline record: the
+                    // next call return it as a lone-terminator record: the
                     // caller's terminator strip would leave an empty
                     // plaintext that still gets encrypted and appended,
                     // fabricating an empty log frame after every record
-                    // whose length is an exact multiple of the cap.
-                    // Consuming the boundary newline reports the record as
-                    // terminated (`capped: false`) so the caller strips a
-                    // trailing CR/LF exactly as for a short record. At EOF
-                    // there is no terminator to consume; the chunk stays
-                    // `capped` so its final byte (possible CR content)
-                    // survives verbatim.
-                    let boundary_newline = reader.fill_buf()?.first() == Some(&b'\n');
-                    if boundary_newline {
-                        reader.consume(1);
+                    // whose length is an exact multiple of the cap. Both
+                    // terminator forms are recognized — `\n` and `\r\n`
+                    // (round-11 review: a CRLF boundary previously peeked
+                    // `\r`, fell through as capped, and the next read
+                    // returned only the `\r\n` remainder). Consuming the
+                    // boundary terminator reports the record as terminated
+                    // (`capped: false`) so the caller strips a trailing
+                    // CR/LF exactly as for a short record. At EOF there is
+                    // no terminator to consume; the chunk stays `capped`
+                    // so its final byte (possible CR content) survives
+                    // verbatim. A lone `\r` at the boundary is NOT a
+                    // terminator (round-5: CR can be record content), so
+                    // it is left for the next chunk.
+                    let peek = reader.fill_buf()?;
+                    let boundary_terminator = match peek.first() {
+                        Some(b'\n') => Some(1),
+                        Some(b'\r') if peek.get(1) == Some(&b'\n') => Some(2),
+                        _ => None,
+                    };
+                    if let Some(terminator_len) = boundary_terminator {
+                        reader.consume(terminator_len);
                         return Ok(CappedRecord {
                             len: buf.len(),
                             capped: false,
@@ -1134,6 +1145,39 @@ mod tests {
         );
     }
 
+    /// Round-11 review finding (P2): a record of EXACTLY
+    /// MAX_LOG_RECORD_BYTES followed by `\r\n` must have the two-byte
+    /// terminator consumed at the boundary. Previously the peek saw `\r`
+    /// (not `\n`), returned the chunk as capped, and the next read
+    /// returned only `\r\n` — stripped to an empty buffer and encrypted as
+    /// a fabricated blank frame between the capped record and `next`.
+    #[test]
+    fn read_capped_record_consumes_crlf_at_chunk_boundary() {
+        let payload = "a".repeat(MAX_LOG_RECORD_BYTES);
+        let input = format!("{payload}\r\nnext\r\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert_eq!(first, payload.as_bytes());
+        assert!(
+            !r1.capped,
+            "CRLF terminator at the boundary must be consumed, chunk reported terminated"
+        );
+
+        // The next record is `next`, not a leftover `\r\n` terminator.
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second).unwrap();
+        assert_eq!(second, b"next\r\n");
+        assert!(!r2.capped);
+
+        let mut third = Vec::new();
+        let r3 = read_capped_record(&mut reader, &mut third).unwrap();
+        assert_eq!(r3.len, 0);
+        assert!(third.is_empty());
+    }
+
     /// Round-5 review finding: a `\r` that happens to sit exactly at an
     /// artificial chunk boundary is record content, not a line terminator.
     /// `read_capped_record` must report the chunk as capped so the caller
@@ -1196,6 +1240,59 @@ mod tests {
         std::fs::write(&path, "not-json\nalso not json\n").unwrap();
         let mut spool = open_log_spool(&path).unwrap();
         assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 1);
+    }
+
+    /// Round-11 review finding (P2): a record whose payload is EXACTLY
+    /// MAX_LOG_RECORD_BYTES followed by `\r\n` — the boundary peek sees
+    /// `\r` (not `\n`), and previously fell through as a capped chunk whose
+    /// next read returned only the `\r\n` remainder. Terminator stripping
+    /// reduced that remainder to an empty buffer which the caller still
+    /// encrypted, fabricating a blank log frame. The two-byte CRLF
+    /// terminator must be recognized and consumed at the boundary.
+    #[test]
+    fn read_capped_record_consumes_crlf_at_exact_chunk_boundary() {
+        let payload = "a".repeat(MAX_LOG_RECORD_BYTES);
+        let input = format!("{payload}\r\nnext\r\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+
+        // First read: the full cap of payload with the boundary CRLF
+        // consumed as the record terminator — not capped, so the caller's
+        // strip sees a complete record.
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert!(!r1.capped, "boundary CRLF terminates the record");
+        assert_eq!(first.as_slice(), payload.as_bytes());
+
+        // Second read is `next\r\n` — NOT the orphaned `\r\n` remainder.
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second).unwrap();
+        assert_eq!(
+            second, b"next\r\n",
+            "no fabricated blank frame before `next`"
+        );
+        assert!(!r2.capped);
+
+        // EOF.
+        let mut third = Vec::new();
+        let r3 = read_capped_record(&mut reader, &mut third).unwrap();
+        assert_eq!(r3.len, 0);
+        assert!(third.is_empty());
+    }
+
+    /// A lone `\r` at the cap boundary (not followed by `\n`) is record
+    /// content, not a terminator — the chunk stays capped (round-5 rule
+    /// still holds under the round-11 CRLF handling).
+    #[test]
+    fn read_capped_record_lone_cr_at_boundary_stays_capped() {
+        let prefix = "a".repeat(MAX_LOG_RECORD_BYTES - 1);
+        let input = format!("{prefix}\rX\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert!(r1.capped, "lone CR at the boundary is content, not CRLF");
+        assert_eq!(first.last(), Some(&b'\r'));
     }
 
     /// CR/LF terminators are still stripped from records that ended at a
