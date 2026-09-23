@@ -78,6 +78,15 @@ const _: () = {
 
 #[derive(Debug, Error)]
 pub enum PlatformReleaseError {
+    #[error(
+        "platform release high-water mark {persisted_version} ({persisted_created}) and the bundled release {bundled_version} ({bundled_created}) share created_at but diverge (version or signed payload digest); the two are unorderable, so neither may silently replace the other — clear the high-water-mark state after verifying with the operator which release is intended"
+    )]
+    EqualTimestampDivergentMark {
+        persisted_version: String,
+        persisted_created: String,
+        bundled_version: String,
+        bundled_created: String,
+    },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
@@ -456,8 +465,69 @@ fn newest_mark(
     let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
     let bundled_mark = AcceptedOverrideMark::of(&bundled.payload)?;
     Ok(match persisted {
-        Some(p) if !mark_is_older(&p, &bundled_mark)? => Some(p),
-        _ => Some(bundled_mark),
+        // Strictly older persisted mark: the bundle is the effective floor.
+        Some(p)
+            if matches!(
+                mark_ordering(&p, &bundled_mark)?,
+                MarkOrdering::CandidateOlder
+            ) =>
+        {
+            Some(bundled_mark)
+        }
+        // Equal-timestamp divergence between the persisted mark and the
+        // bundle (e.g. a binary rollback to a differently signed image
+        // whose release reused the timestamp) is UNORDERABLE: silently
+        // preferring either side would let a bundle-identical override
+        // replace a divergent accepted mark (bypassing the equal-
+        // timestamp fail-closed rule) or vice versa. Fail closed.
+        Some(p)
+            if matches!(
+                mark_ordering(&p, &bundled_mark)?,
+                MarkOrdering::EqualTimestampDivergent
+            ) =>
+        {
+            return Err(PlatformReleaseError::EqualTimestampDivergentMark {
+                persisted_version: p.platform_release_version,
+                persisted_created: p.created_at,
+                bundled_version: bundled_mark.platform_release_version,
+                bundled_created: bundled_mark.created_at,
+            });
+        }
+        // Equal or strictly newer persisted mark: it remains the floor.
+        Some(p) => Some(p),
+        None => Some(bundled_mark),
+    })
+}
+
+/// Candidate is stale-or-suspect relative to the baseline: strictly older
+/// timestamp, or an equal timestamp with ANY divergence — different opaque
+/// version OR different signed payload digest. Two envelopes that reuse the
+/// same `{version, created_at}` pair with different measurements, policy, or
+/// image digests are unorderable and fail closed instead of passing as
+/// "the same release".
+enum MarkOrdering {
+    CandidateOlder,
+    CandidateNewer,
+    Equal,
+    EqualTimestampDivergent,
+}
+
+fn mark_ordering(
+    candidate: &AcceptedOverrideMark,
+    baseline: &AcceptedOverrideMark,
+) -> Result<MarkOrdering, PlatformReleaseError> {
+    let candidate_ts = parse_release_timestamp(&candidate.created_at)?;
+    let baseline_ts = parse_release_timestamp(&baseline.created_at)?;
+    Ok(if candidate_ts < baseline_ts {
+        MarkOrdering::CandidateOlder
+    } else if candidate_ts > baseline_ts {
+        MarkOrdering::CandidateNewer
+    } else if candidate.platform_release_version == baseline.platform_release_version
+        && candidate.payload_sha256 == baseline.payload_sha256
+    {
+        MarkOrdering::Equal
+    } else {
+        MarkOrdering::EqualTimestampDivergent
     })
 }
 
@@ -471,12 +541,10 @@ fn mark_is_older(
     candidate: &AcceptedOverrideMark,
     baseline: &AcceptedOverrideMark,
 ) -> Result<bool, PlatformReleaseError> {
-    let candidate_ts = parse_release_timestamp(&candidate.created_at)?;
-    let baseline_ts = parse_release_timestamp(&baseline.created_at)?;
-    Ok(candidate_ts < baseline_ts
-        || (candidate_ts == baseline_ts
-            && (candidate.platform_release_version != baseline.platform_release_version
-                || candidate.payload_sha256 != baseline.payload_sha256)))
+    Ok(matches!(
+        mark_ordering(candidate, baseline)?,
+        MarkOrdering::CandidateOlder | MarkOrdering::EqualTimestampDivergent
+    ))
 }
 
 /// Second downgrade gate for the env-path override lane: compare against the
@@ -1109,6 +1177,21 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: "scheme must be https".to_string(),
         });
     }
+    // Codex P1 (cap#165): the value is interpolated VERBATIM into the
+    // tenant Caddyfile. Url::parse scheme checks (and any prefix-only
+    // check) are NOT the renderer's predicate — `HTTPS://…`, `;`,
+    // `{`/`}`, quotes, tabs/newlines, and non-ASCII all parse as valid
+    // https URLs but fail Caddyfile rendering. Apply the engine's exact
+    // validator so the release can never be accepted (and its high-water
+    // mark persisted) if any ACME-mode render would later fail.
+    if let Err(err) =
+        enclava_engine::manifest::ingress::validate_https_url(release.tenant_caddy_acme_ca.trim())
+    {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_acme_ca",
+            message: format!("must be renderable into the tenant Caddyfile ({err})"),
+        });
+    }
     if release.genpolicy_version.trim().is_empty()
         || release.genpolicy_version.contains("unconfigured")
         || release.genpolicy_version.contains("unpinned")
@@ -1257,6 +1340,115 @@ mod tests {
         assert!(
             matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca")
         );
+    }
+
+    #[test]
+    fn release_payload_rejects_uppercase_scheme_acme_ca() {
+        // Codex P1 (cap#165): `HTTPS://` parses with scheme https, but the
+        // enclava-engine Caddyfile renderer interpolates the value verbatim
+        // and requires the literal lowercase `https://` prefix — accepting
+        // it would advance the high-water mark and then fail every
+        // ACME-mode render with no rollback path.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.tenant_caddy_acme_ca = "HTTPS://acme.example.test/directory".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca"),
+            "uppercase-scheme ACME CA must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_url_parseable_but_unrenderable_acme_ca() {
+        // Codex P1 (cap#165, reviewer follow-up): these all pass
+        // Url::parse with scheme https yet fail the Caddyfile renderer's
+        // predicate — a prefix-only acceptance check would strand the
+        // deployment above its last working override.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        for bad in [
+            "https://acme.example.test/directory;extra",
+            "https://acme.example.test/dir{x}",
+            "https://acme.example.test/dir}x",
+            "https://acme.example.test/dir`x",
+            "https://acme.example.test/dir\"x",
+            "https://acme.example.test/dir'x",
+            "https://acme.example.test/directory\tx",
+            "https://acme.example.test/directory\nx",
+            "https://exämple.test/directory",
+        ] {
+            let mut payload = raw.payload.clone();
+            payload.tenant_caddy_acme_ca = bad.to_string();
+            // Sanity: the url crate DOES accept these as https (that is
+            // the trap the shared renderer predicate closes).
+            assert!(
+                reqwest::Url::parse(bad).is_ok_and(|u| u.scheme() == "https"),
+                "sample {bad:?} must parse as https for this test to pin the trap"
+            );
+            let err = validate_release_payload(&payload).unwrap_err();
+            assert!(
+                matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca"),
+                "unrenderable ACME CA {bad:?} must be rejected: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn newest_mark_fails_closed_on_equal_timestamp_divergence_with_bundle() {
+        // Codex P1 (cap#165 round 6): a persisted mark sharing created_at
+        // with the bundled release but diverging in version/digest must
+        // NOT be silently discarded in favor of the bundle — the state-only
+        // removal guard would then compare the bundle against itself and
+        // an override identical to the bundle could replace the divergent
+        // accepted mark, bypassing the equal-timestamp fail-closed rule.
+        let bundled = bundled_payload();
+        let mut divergent = AcceptedOverrideMark::of(&bundled).unwrap();
+        divergent.platform_release_version =
+            format!("{}-divergent", divergent.platform_release_version);
+        assert!(matches!(
+            newest_mark(Some(divergent)),
+            Err(PlatformReleaseError::EqualTimestampDivergentMark { .. })
+        ));
+    }
+
+    #[test]
+    fn override_lane_refuses_equal_timestamp_divergent_persisted_mark() {
+        // End-to-end shape of the same P1 on the override lane: with a
+        // divergent equal-timestamp mark persisted, loading ANY release
+        // (here: a newer one) must refuse rather than computing a floor by
+        // silently discarding the persisted mark.
+        let dir = std::env::temp_dir().join(format!(
+            "pr-hwm-eqts-div-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+        let bundled = bundled_payload();
+        let mut divergent = bundled.clone();
+        divergent.platform_release_version =
+            format!("{}-divergent", bundled.platform_release_version);
+        std::fs::write(
+            &state,
+            serde_json::to_vec(&AcceptedOverrideMark::of(&divergent).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let newer = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        assert!(matches!(
+            load_and_maybe_commit(newer, &state, true),
+            Err(PlatformReleaseError::EqualTimestampDivergentMark { .. })
+        ));
+        // The state-only removal guard must refuse too, instead of
+        // comparing the bundle against itself.
+        assert!(matches!(
+            enforce_state_only_removal_guard_with(Some(state.to_string_lossy().into_owned())),
+            Err(PlatformReleaseError::EqualTimestampDivergentMark { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Mirrors main.rs: load is check-only; the mark advances only when

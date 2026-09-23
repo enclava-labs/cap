@@ -356,6 +356,29 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
         )
     if not _is_https(payload["tenant_caddy_acme_ca"]):
         raise ValueError("tenant_caddy_acme_ca must be https")
+    # Codex P1 (cap#165): the ACME CA URL is interpolated verbatim into the
+    # tenant Caddyfile, and enclava-engine's renderer applies an exact
+    # predicate: literal lowercase `https://` prefix after trim, no
+    # \n \r space \t NUL backtick " ' { } ; bytes anywhere, ASCII-only.
+    # Url-parse-level checks (scheme https, valid host) do NOT cover this —
+    # signing a value the renderer rejects would let the API accept and
+    # advance the high-water mark, after which every ACME-mode Caddyfile
+    # render fails with the older working override no longer restorable.
+    # Mirror of enclava_engine::manifest::ingress::validate_https_url.
+    # (trustee_kbs_url keeps parsed-scheme semantics: consumed via
+    # Url::parse only.)
+    acme = payload["tenant_caddy_acme_ca"].strip()
+    _CADDY_FORBIDDEN = "\n\r \t\x00`\"'{};"
+    if (
+        not acme.startswith("https://")
+        or any(ch in acme for ch in _CADDY_FORBIDDEN)
+        or not acme.isascii()
+    ):
+        raise ValueError(
+            "tenant_caddy_acme_ca must be renderable into the tenant Caddyfile "
+            "(literal lowercase 'https://' prefix, no newlines/spaces/tabs/"
+            "quotes/braces/semicolons, ASCII-only)"
+        )
     hex32_bytes("signing_service_pubkey_hex", payload["signing_service_pubkey_hex"])
     hex32_bytes("policy_template_sha256", payload["policy_template_sha256"])
     hex32_bytes(

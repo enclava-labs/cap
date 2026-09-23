@@ -471,6 +471,18 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: "scheme must be https".to_string(),
         });
     }
+    // Codex P1 (cap#165): parity with the API validator — apply the
+    // enclava-engine Caddyfile renderer's EXACT predicate (not just a
+    // scheme or prefix check), so a release whose ACME URL would fail
+    // rendering is refused before it is ever offered or accepted.
+    if let Err(err) =
+        enclava_engine::manifest::ingress::validate_https_url(release.tenant_caddy_acme_ca.trim())
+    {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_acme_ca",
+            message: format!("must be renderable into the tenant Caddyfile ({err})"),
+        });
+    }
     if release.genpolicy_version.trim().is_empty()
         || release.genpolicy_version.contains("unconfigured")
         || release.genpolicy_version.contains("unpinned")
@@ -691,6 +703,46 @@ mod tests {
         assert!(
             matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca")
         );
+    }
+
+    #[test]
+    fn release_payload_rejects_uppercase_scheme_acme_ca() {
+        // Codex P1 (cap#165): HTTPS:// parses as scheme https but the
+        // Caddyfile renderer requires the literal lowercase prefix; the
+        // CLI validator must reject before an override is even offered.
+        let mut payload = serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+            .unwrap()
+            .payload;
+        payload.tenant_caddy_acme_ca = "HTTPS://acme.example.test/directory".into();
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca"),
+            "uppercase-scheme ACME CA must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_url_parseable_but_unrenderable_acme_ca() {
+        // Codex P1 (cap#165, reviewer follow-up): values that pass
+        // Url::parse as https but fail the shared Caddyfile renderer
+        // predicate must be refused before the release is offered.
+        let base = serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+            .unwrap()
+            .payload;
+        for bad in [
+            "https://acme.example.test/directory;extra",
+            "https://acme.example.test/dir{x}",
+            "https://acme.example.test/directory\tx",
+            "https://exämple.test/directory",
+        ] {
+            let mut payload = base.clone();
+            payload.tenant_caddy_acme_ca = bad.into();
+            let err = validate_release_payload(&payload);
+            assert!(
+                matches!(err, Err(PlatformReleaseError::InvalidField { field, .. }) if field == "tenant_caddy_acme_ca"),
+                "unrenderable ACME CA {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]

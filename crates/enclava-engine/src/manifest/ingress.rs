@@ -84,7 +84,13 @@ impl CaddyfileSpec {
     }
 }
 
-fn validate_https_url(url: &str) -> Result<(), IngressRenderError> {
+/// Caddyfile ACME CA URL predicate — the SINGLE source of truth shared by
+/// every acceptance point (API/CLI release validators, env gate) so a
+/// release can never be accepted and persisted whose ACME URL the
+/// renderer would later reject (Codex P1, cap#165: a value that passes
+/// Url::parse but fails here strands the deployment above its last
+/// working override once the high-water mark advances).
+pub fn validate_https_url(url: &str) -> Result<(), IngressRenderError> {
     if !url.starts_with("https://") {
         return Err(IngressRenderError::InvalidAcmeUrl(
             "must start with https://".to_string(),

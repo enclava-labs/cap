@@ -17,6 +17,10 @@ pub enum EnvGateError {
         "env var `{0}` must use https; cleartext ACME would leak account credentials and challenge traffic"
     )]
     CleartextAcmeUrl(&'static str),
+    #[error(
+        "env var `{0}` must start with literal lowercase 'https://' — the value is interpolated verbatim into the tenant Caddyfile, whose renderer only accepts the lowercase prefix"
+    )]
+    NonCanonicalAcmeUrl(&'static str),
 }
 
 const CAP_ALLOW_PRODUCTION_ACME: &str = "CAP_ALLOW_PRODUCTION_ACME";
@@ -140,6 +144,23 @@ fn enforce_with(
                     production_acme_allowed,
                     false,
                 )?;
+                // Codex P1 (cap#165): TENANT_CADDY_ACME_CA is interpolated
+                // verbatim into tenant Caddyfiles. Url::parse scheme checks
+                // (and prefix-only checks) are NOT the renderer's
+                // predicate — `HTTPS://`, `;`, braces, quotes, tabs, and
+                // non-ASCII all parse as https but fail rendering. Apply
+                // the engine's exact validator so the value can never be
+                // accepted here while every ACME-mode render fails.
+                // ACME_DIRECTORY_URL keeps parsed-scheme semantics — the
+                // API's own ACME client consumes it via Url::parse only.
+                // Release builds only, matching the https gate's debug
+                // exemption for local cleartext directories.
+                if acme_source_name == "TENANT_CADDY_ACME_CA"
+                    && !debug_assertions
+                    && enclava_engine::manifest::ingress::validate_https_url(value.trim()).is_err()
+                {
+                    return Err(EnvGateError::NonCanonicalAcmeUrl(acme_source_name));
+                }
             }
         }
 
@@ -489,6 +510,55 @@ mod tests {
             "https://acme-v02.api.letsencrypt.org/directory",
         );
         run(env, false).expect("explicit production ACME override should be allowed");
+    }
+
+    #[test]
+    fn release_rejects_uppercase_scheme_tenant_caddy_acme_ca() {
+        // Codex P1 (cap#165): HTTPS:// parses with scheme https (the
+        // cleartext gate passes), but the value is interpolated verbatim
+        // into tenant Caddyfiles whose renderer requires the literal
+        // lowercase prefix — release builds must refuse it up front.
+        let mut env = ok_required();
+        env.insert(
+            "TENANT_CADDY_ACME_CA",
+            "HTTPS://acme-staging-v02.api.letsencrypt.org/directory",
+        );
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::NonCanonicalAcmeUrl("TENANT_CADDY_ACME_CA")
+        ));
+        // The gate applies the renderer's full predicate, not just a
+        // prefix check: URL-parseable but unrenderable values too.
+        for bad in [
+            "https://acme-staging-v02.api.letsencrypt.org/directory;extra",
+            "https://acme-staging-v02.api.letsencrypt.org/dir{x}",
+        ] {
+            let mut env = ok_required();
+            env.insert("TENANT_CADDY_ACME_CA", bad);
+            assert!(
+                matches!(
+                    run(env, false).unwrap_err(),
+                    EnvGateError::NonCanonicalAcmeUrl(_)
+                ),
+                "unrenderable {bad:?} must be rejected"
+            );
+        }
+        // ACME_DIRECTORY_URL keeps parsed-scheme semantics (consumed via
+        // Url::parse by the API's own ACME client): HTTPS:// stays valid.
+        let mut env = ok_required();
+        env.insert(
+            "ACME_DIRECTORY_URL",
+            "HTTPS://acme-staging-v02.api.letsencrypt.org/directory",
+        );
+        assert!(run(env, false).is_ok());
+        // Debug builds are exempt, matching the cleartext exemption.
+        let mut env = ok_required();
+        env.insert(
+            "TENANT_CADDY_ACME_CA",
+            "HTTPS://acme-staging-v02.api.letsencrypt.org/directory",
+        );
+        assert!(run(env, true).is_ok());
     }
 
     #[test]

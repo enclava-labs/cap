@@ -50,9 +50,50 @@ def test_release_generator_scheme_check_is_case_insensitive():
     # valid scheme, not a rejected prefix.
     payload = base_payload()
     payload["trustee_kbs_url"] = "HTTPS://kbs.example.test:8080"
-    payload["tenant_caddy_acme_ca"] = "HTTPS://acme.example.test/directory"
 
     generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_uppercase_scheme_acme_ca():
+    # Codex P1 (cap#165): the ACME CA URL is interpolated verbatim into the
+    # tenant Caddyfile, whose renderer (enclava-engine) requires the literal
+    # lowercase `https://` prefix. Signing `HTTPS://…` would let the API
+    # accept and advance the high-water mark, after which every ACME-mode
+    # Caddyfile render fails with no rollback path. trustee_kbs_url (above)
+    # keeps parsed-scheme semantics — it is consumed via Url::parse only.
+    payload = base_payload()
+    payload["tenant_caddy_acme_ca"] = "HTTPS://acme.example.test/directory"
+
+    with pytest.raises(
+        ValueError, match="tenant_caddy_acme_ca must be renderable"
+    ):
+        generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_url_parseable_but_unrenderable_acme_ca():
+    # Codex P1 (cap#165, reviewer follow-up): all of these pass the
+    # url-crate style parse (scheme https, valid host) but fail the
+    # Caddyfile renderer predicate mirrored above — the generator must not
+    # sign any of them.
+    for bad in [
+        "https://acme.example.test/directory;extra",
+        "https://acme.example.test/directory?a=1;b=2",
+        "https://acme.example.test/dir{x}",
+        "https://acme.example.test/dir}x",
+        "https://acme.example.test/dir`x",
+        'https://acme.example.test/dir"x',
+        "https://acme.example.test/dir'x",
+        "https://acme.example.test/directory\tx",
+        "https://acme.example.test/direc\ntory",
+        "https://exämple.test/directory",
+    ]:
+        payload = base_payload()
+        payload["tenant_caddy_acme_ca"] = bad
+
+        with pytest.raises(
+            ValueError, match="tenant_caddy_acme_ca must be renderable"
+        ):
+            generate_platform_release.validate_payload(payload)
 
 
 def test_release_generator_rejects_http_acme_ca():
