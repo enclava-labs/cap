@@ -155,6 +155,16 @@ fn handle_connection(
     }
     stream.flush()?;
     if query.follow {
+        // Release the tail BUFFER before entering follow mode (round-12
+        // review P1): `lines` can carry up to MAX_TAIL_BYTES (2 MiB) of
+        // decoded frames per connection; leaving it borrowed here would
+        // keep the entire initial tail alive in `handle_connection` for
+        // the whole unbounded follow session. The ingress template
+        // exposes this endpoint directly, so a few hundred idle followers
+        // could retain hundreds of MiB inside enclava-init (512 MiB
+        // memory limit) and OOM-kill the privileged sidecar. Everything
+        // follow_spool needs (`offset`, `last_seq`) is an extracted copy.
+        drop(lines);
         // `last_seq` was seeded while streaming the initial tail above, so
         // the follower never replays frames the client just received. The
         // tail's File handle was dropped before the writes (see above), so
