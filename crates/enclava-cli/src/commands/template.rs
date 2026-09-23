@@ -6246,7 +6246,8 @@ mod tests {
         // The owner-wait is caller-supplied deploy metadata (unlock mode + the
         // shared ssh-timeout budget), never a lookup from inside the wait,
         // and the delivery loop must consult it on both retry arms.
-        let source = include_str!("template.rs");
+        // Windows checkouts carry CRLF; the multi-line needle below embeds LF.
+        let source = include_str!("template.rs").replace("\r\n", "\n");
 
         assert!(
             source.contains("password_mode: template.unlock_mode == \"password\""),
