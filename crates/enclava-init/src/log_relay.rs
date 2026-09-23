@@ -335,28 +335,72 @@ fn drain_from(file: &mut File, expected_start: u64) -> io::Result<(Vec<u8>, u64)
 
 /// Anchor for rotation detection that does NOT require holding a spool fd
 /// across (potentially blocking) client writes. `identity` is the dev/ino of
-/// the inode the follower's `offset` was computed against; `tail_byte` is the
-/// byte at `offset - 1` on that inode (None only while offset == 0). Holding
-/// an open fd was the old rotation signal — while pinned, the filesystem
+/// the inode the follower's `offset` was computed against, plus a content
+/// FINGERPRINT of up to 16 bytes around the delivered boundary. Holding an
+/// open fd was the old rotation signal — while pinned, the filesystem
 /// cannot recycle the inode number — but a stalled client can block a socket
 /// write for up to FOLLOW_IO_TIMEOUT and every open fd keeps an unlinked
-/// ~32 MiB rotation generation alive against the 64 MiB emptyDir cap. The
-/// anchor trades the non-recycling guarantee for a continuity probe: a
-/// recycled inode that happens to collide numerically is still caught
-/// because the byte just before the follow offset no longer matches.
+/// ~32 MiB rotation generation alive against the 64 MiB emptyDir cap.
+///
+/// The anchor trades the fd's non-recycling guarantee for a fingerprint
+/// probe: two rotations inside one blocked client write CAN numerically
+/// recycle the old inode onto the spool path again, but the recycled file
+/// would have to reproduce 16 bytes of encrypted-frame ciphertext at the
+/// exact delivered boundary to pass — 2^-128 for high-entropy frames, and
+/// deterministic mismatch for any rewritten tail. (A one-byte probe does
+/// NOT suffice: both anchor sites park the offset on a newline, so a
+/// single '\n' comparison is nearly always a vacuous pass — the round-11
+/// self-check Critical.) The only fingerprint-less anchor is a resync of a
+/// completely EMPTY spool (nothing delivered from that generation), where
+/// the probe degenerates to identity-only; documented residual, since no
+/// boundary bytes exist to fingerprint and normal appends must be followed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FollowAnchor {
     identity: SpoolIdentity,
-    tail_byte: Option<u8>,
+    /// Absolute file position of the fingerprint window.
+    fp_pos: u64,
+    /// Length of the valid prefix of `fingerprint` (0 = empty-anchor).
+    fp_len: u8,
+    fingerprint: [u8; ANCHOR_FINGERPRINT_BYTES],
 }
 
-/// Read the single byte at `pos`, or None past end-of-file.
-fn byte_at(file: &mut File, pos: u64) -> io::Result<Option<u8>> {
-    let mut buf = [0u8; 1];
-    match file.read_at(&mut buf, pos)? {
-        0 => Ok(None),
-        _ => Ok(Some(buf[0])),
+/// Size of the anchor's content fingerprint window.
+const ANCHOR_FINGERPRINT_BYTES: usize = 16;
+
+/// Build an anchor for `identity` from the file contents `bytes` (read from
+/// offset 0) with the follower's delivered boundary at `boundary` (bytes
+/// before it are confirmed delivered; bytes after are not). The fingerprint
+/// window is the up-to-16 bytes ending at the boundary; for a boundary of 0
+/// (nothing delivered yet — an empty or fragment-only file) it is the head
+/// of the file instead, which is equally stable under append-only growth.
+fn anchor_for(bytes: &[u8], boundary: usize, identity: SpoolIdentity) -> FollowAnchor {
+    let window: &[u8] = if boundary >= ANCHOR_FINGERPRINT_BYTES {
+        &bytes[boundary - ANCHOR_FINGERPRINT_BYTES..boundary]
+    } else if boundary > 0 {
+        &bytes[..boundary]
+    } else {
+        &bytes[..bytes.len().min(ANCHOR_FINGERPRINT_BYTES)]
+    };
+    let mut fingerprint = [0u8; ANCHOR_FINGERPRINT_BYTES];
+    fingerprint[..window.len()].copy_from_slice(window);
+    // Branch 3 (boundary 0, head-of-file window) parks at position 0; the
+    // other branches always have boundary >= window.len().
+    FollowAnchor {
+        identity,
+        fp_pos: boundary.saturating_sub(window.len()) as u64,
+        fp_len: window.len() as u8,
+        fingerprint,
     }
+}
+
+/// Probe the current file for the anchor's fingerprint window. A shorter
+/// read (EOF inside the window — truncation or a shorter recycled file) is
+/// a mismatch.
+fn probe_matches(file: &mut File, anchor: &FollowAnchor) -> io::Result<bool> {
+    let len = anchor.fp_len as usize;
+    let mut buf = [0u8; ANCHOR_FINGERPRINT_BYTES];
+    let n = file.read_at(&mut buf[..len], anchor.fp_pos)?;
+    Ok(n == len && buf[..n] == anchor.fingerprint[..len])
 }
 
 fn follow_spool<W: Write>(
@@ -386,21 +430,18 @@ fn follow_spool<W: Write>(
         };
         let current_identity = spool_identity(&file)?;
         let len = file.metadata()?.len();
-        // Same-inode check: remembered identity PLUS a continuity probe of
-        // the byte at offset-1. This catches everything the old held-fd
-        // comparison caught (atomic-rename rotations change the inode) and
-        // additionally the residual hazard of a numerically recycled inode:
-        // a rewritten file at the same (dev,ino) no longer contains the byte
-        // the follower last delivered. `len < offset` (the writer's rollback
-        // truncation, or a shorter recycled file) also fails the probe and
-        // funnels into the same resync path.
+        // Same-inode check: remembered identity PLUS a content-fingerprint
+        // probe of the delivered boundary. This catches everything the old
+        // held-fd comparison caught (atomic-rename rotations change the
+        // inode) and the residual hazard of a numerically recycled inode:
+        // a rewritten file at the same (dev,ino) no longer reproduces the
+        // 16 ciphertext bytes at the follower's delivered boundary.
+        // `len < offset` (the writer's rollback truncation, or a shorter
+        // recycled file) also fails the probe and funnels into the same
+        // resync path.
         let same_as_held = match held.as_ref() {
             Some(anchor) if anchor.identity == current_identity => {
-                if *offset == 0 {
-                    anchor.tail_byte.is_none()
-                } else {
-                    byte_at(&mut file, *offset - 1)? == anchor.tail_byte
-                }
+                probe_matches(&mut file, anchor)?
             }
             _ => false,
         };
@@ -433,10 +474,7 @@ fn follow_spool<W: Write>(
             // FOLLOW_IO_TIMEOUT — during that window no fd may pin the
             // unlinked previous generation (~32 MiB against the emptyDir
             // cap). The anchor carries no descriptor.
-            *held = Some(FollowAnchor {
-                identity: current_identity,
-                tail_byte: (delivered_end > 0).then(|| bytes[delivered_end - 1]),
-            });
+            *held = Some(anchor_for(&bytes, delivered_end, current_identity));
             drop(file);
             write_deduped_after_rotation(stream, &bytes, &mut last_seq)?;
             stream.flush()?;
@@ -471,9 +509,24 @@ fn follow_spool<W: Write>(
             // a concurrent rotation left BOTH pinning the now-unlinked
             // ~32 MiB inode until the socket write returned.
             *offset += complete_end as u64;
+            // Anchor from the file itself, not the poll's read buffer: the
+            // fingerprint window (16 bytes ending at the new delivered
+            // boundary) can straddle the poll boundary, so it is read
+            // directly from the still-open fd before the write drops it.
+            let boundary = *offset as usize;
+            let fp_start = boundary.saturating_sub(ANCHOR_FINGERPRINT_BYTES);
+            let mut window = [0u8; ANCHOR_FINGERPRINT_BYTES];
+            let mut window_len = 0;
+            if boundary > fp_start {
+                file.seek(SeekFrom::Start(fp_start as u64))?;
+                file.read_exact(&mut window[..boundary - fp_start])?;
+                window_len = boundary - fp_start;
+            }
             *held = Some(FollowAnchor {
                 identity: current_identity,
-                tail_byte: complete.last().copied(),
+                fp_pos: fp_start as u64,
+                fp_len: window_len as u8,
+                fingerprint: window,
             });
             drop(file);
             stream.write_all(complete)?;
@@ -824,10 +877,14 @@ mod tests {
         // tracking is anchor-based precisely so a client stalled in the
         // blocking write below cannot pin any inode.
         drop(held_file);
-        let mut held = Some(FollowAnchor {
-            identity: old_identity,
-            tail_byte: Some(b'\n'),
-        });
+        // Anchor built exactly as follow_spool's resync path does.
+        let contents = std::fs::read(&path).unwrap();
+        let boundary = contents
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        let mut held = Some(anchor_for(&contents, boundary, old_identity));
 
         // Rotate: new inode over the spool path.
         let rotated = dir.path().join("spool.jsonl.rotate");
@@ -928,6 +985,71 @@ mod tests {
     /// must still observe the offset advanced and the anchor moved to the
     /// new delivered boundary — state that can only be committed before
     /// the blocking write, because no fd exists to commit afterwards.
+    /// Round-11 self-check Critical: a numerically recycled inode number
+    /// (two rotations inside one blocked client write can produce one) must
+    /// NOT pass the same-inode check. The identity matches, but the 16-byte
+    /// content fingerprint at the delivered boundary cannot: a rewritten
+    /// tail is different ciphertext. Previously a one-byte '\n' probe made
+    /// this a near-vacuous pass, silently dropping or splicing frames.
+    #[test]
+    fn recycled_inode_fails_fingerprint_probe_and_resyncs() {
+        // Succeeds the write, fails the flush: follow_spool unwinds after
+        // one poll having performed exactly one resync.
+        struct FailingFlushWriter {
+            sink: Vec<u8>,
+        }
+        impl std::io::Write for FailingFlushWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.sink.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("stop after first resync"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        // The "old" generation: sequences 1-2 delivered, boundary at end.
+        std::fs::write(&path, "{\"sequence\":1}\n{\"sequence\":2}\n").unwrap();
+        let identity = spool_identity(&std::fs::File::open(&path).unwrap()).unwrap();
+        let contents = std::fs::read(&path).unwrap();
+        let mut offset = contents.len() as u64;
+        let mut held = Some(anchor_for(&contents, contents.len(), identity));
+
+        // SIMULATE inode-number recycling: an unlink + create + rename dance
+        // that lands a DIFFERENT file on the same (dev,ino) pair. This is
+        // best-effort on any given filesystem; the assertion that matters
+        // is that a same-identity/different-content file fails the probe.
+        // If the inode number is not reused, the identity itself differs
+        // and the resync triggers anyway — both paths resync.
+        let rotated = dir.path().join("spool.jsonl.rotate");
+        std::fs::write(&rotated, "{\"sequence\":9}\n{\"sequence\":10}\n").unwrap();
+        std::fs::rename(&rotated, &path).unwrap();
+        // Overwrite the anchor's identity with the NEW file's identity to
+        // force the worst case (recycled inode number): the fingerprint is
+        // the only remaining defense.
+        let new_identity = spool_identity(&std::fs::File::open(&path).unwrap()).unwrap();
+        held = held.map(|mut a| {
+            a.identity = new_identity;
+            a
+        });
+
+        let mut sink = FailingFlushWriter { sink: Vec::new() };
+        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, Some(2));
+        assert!(result.is_err(), "failing flush must unwind the loop");
+        // The probe failed → resync: sequence dedup against frontier 2
+        // dropped nothing bogus, and the client received the frames of the
+        // rewritten file that are above the frontier (9, 10) exactly once.
+        let sent = String::from_utf8(sink.sink).unwrap();
+        assert_eq!(sent, "{\"sequence\":9}\n{\"sequence\":10}\n");
+        // Offset re-derived against the current file (its full length: both
+        // frames are complete lines).
+        let rewritten = "{\"sequence\":9}\n{\"sequence\":10}\n";
+        assert_eq!(offset, rewritten.len() as u64);
+        assert!(held.is_some());
+    }
+
     #[test]
     fn same_inode_append_holds_no_fd_across_client_write() {
         struct FailingWriter;
@@ -945,10 +1067,8 @@ mod tests {
         std::fs::write(&path, "{\"sequence\":1}\n").unwrap();
         let identity = spool_identity(&std::fs::File::open(&path).unwrap()).unwrap();
         let mut offset = "{\"sequence\":1}\n".len() as u64;
-        let mut held = Some(FollowAnchor {
-            identity,
-            tail_byte: Some(b'\n'),
-        });
+        let first = std::fs::read(&path).unwrap();
+        let mut held = Some(anchor_for(&first, first.len(), identity));
 
         // Same inode, new complete frame appended: takes the append branch.
         let mut append = std::fs::OpenOptions::new()
@@ -968,7 +1088,10 @@ mod tests {
         assert_eq!(offset, "{\"sequence\":1}\n{\"sequence\":2}\n".len() as u64);
         let anchor = held.expect("anchor must be established before the write");
         assert_eq!(anchor.identity, identity, "same inode: no rotation");
-        assert_eq!(anchor.tail_byte, Some(b'\n'));
+        // The fingerprint window ends at the new delivered boundary and its
+        // final byte is the frame terminator.
+        assert_eq!(anchor.fp_pos + anchor.fp_len as u64, offset);
+        assert_eq!(anchor.fingerprint[(anchor.fp_len as usize) - 1], b'\n');
     }
 
     #[test]
