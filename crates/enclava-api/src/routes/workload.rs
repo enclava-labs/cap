@@ -199,6 +199,12 @@ pub(crate) async fn read_limited_upstream_body(response: &mut reqwest::Response)
     loop {
         match response.chunk().await {
             Ok(Some(bytes)) => {
+                // Zero-length DATA frames (legal in HTTP/2) carry no bytes;
+                // skip them so a peer cannot spin this loop until the client
+                // timeout with empty frames.
+                if bytes.is_empty() {
+                    continue;
+                }
                 let remaining = UPSTREAM_READ_LIMIT - retained.len();
                 if bytes.len() >= remaining {
                     retained.extend_from_slice(&bytes[..remaining]);
