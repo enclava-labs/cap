@@ -197,7 +197,7 @@ pub struct BootstrapSigningServiceResponse {
     pub owner_pubkey_fingerprint: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RotateOrgOwnerRequest {
     pub version: i64,
     pub keyring_payload: serde_json::Value,
@@ -912,6 +912,20 @@ pub async fn rotate_org_owner(
     replacement_key
         .verify(&canonical_bytes, &Signature::from_bytes(&keyring_signature))
         .map_err(|_| bad_request("replacement keyring signature verification failed"))?;
+    // Bind the directive to live keyring authority (issue #120): a signed
+    // directive is only acceptable while it is fresh. `signed_at` may not be
+    // in the future beyond clock-skew tolerance, and may not predate the
+    // creation of the keyring version whose owner signed it. A directive
+    // captured before the current keyring version existed cannot grant
+    // authority over the current one, so replays of old directives fail here
+    // even while the (current -> replacement) pair itself is still valid.
+    const MAX_DIRECTIVE_CLOCK_SKEW_SECONDS: i64 = 300;
+    let now = Utc::now();
+    if body.signed_at > now + chrono::Duration::seconds(MAX_DIRECTIVE_CLOCK_SKEW_SECONDS) {
+        return Err(bad_request(
+            "owner rotation directive signed_at is too far in the future",
+        ));
+    }
     let directive = owner_rotation_directive_bytes(
         org_id,
         &current_owner,
@@ -932,9 +946,9 @@ pub async fn rotate_org_owner(
         scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_owner_role(current_role)?;
 
-    type AuthorityRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
+    type AuthorityRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>, DateTime<Utc>);
     let latest: AuthorityRow = sqlx::query_as(
-        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey
+        "SELECT ok.version, ok.keyring_payload, ok.signature, usk.pubkey, ok.created_at
            FROM org_keyrings ok
            JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
           WHERE ok.org_id = $1
@@ -986,6 +1000,39 @@ pub async fn rotate_org_owner(
         return Err(bad_request(
             "rotation signer does not match the current pinned owner",
         ));
+    }
+    // Consume-once + version binding for the rotation directive (issue #120).
+    // Only the retry-identical replay of an already-applied rotation (the
+    // `insert_new_version == false` branch, byte-identical keyring payload and
+    // signatures) stays idempotent. Any directive that creates a new keyring
+    // version must be younger than the version it rotates and must never have
+    // been accepted for this org before.
+    if insert_new_version {
+        if body.signed_at < latest.4 - chrono::Duration::seconds(MAX_DIRECTIVE_CLOCK_SKEW_SECONDS) {
+            return Err(bad_request(
+                "owner rotation directive predates the current keyring version",
+            ));
+        }
+        let directive_digest = Sha256::digest(&directive);
+        let consumed = sqlx::query(
+            "INSERT INTO org_rotation_directives (org_id, directive_sha256)
+             VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(org_id)
+        .bind(directive_digest.as_slice())
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| db_error())?
+        .rows_affected();
+        if consumed == 0 {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "owner rotation directive was already used"
+                })),
+            ));
+        }
     }
     let current_keyring: SignedOrgKeyring =
         serde_json::from_slice(&base_payload).map_err(|_| db_error())?;
@@ -1355,6 +1402,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn create_org_rejects_non_dns_safe_names_before_database_access() {
@@ -1585,6 +1633,325 @@ mod tests {
             api_key,
             management_origin: crate::auth::middleware::ManagementOrigin::Public,
         }
+    }
+
+    /// Minimal in-process stand-in for the platform signing service's owner
+    /// authority surface: `GET /orgs/{id}/owner` and `POST /rotate-owner`.
+    async fn mock_signing_service_owner_api(org_id: Uuid, initial_owner: [u8; 32]) -> String {
+        let owner = Arc::new(std::sync::Mutex::new(initial_owner));
+        let status_owner = owner.clone();
+        let rotate_owner = owner;
+        let app = axum::Router::new()
+            .route(
+                &format!("/orgs/{org_id}/owner"),
+                axum::routing::get(move || async move {
+                    let current = *status_owner.lock().expect("mock owner lock");
+                    axum::Json(serde_json::json!({
+                        "org_id": org_id,
+                        "state": "ready",
+                        "version": 1,
+                        "owner_pubkey_hex": hex::encode(current),
+                        "last_changed_at": Utc::now(),
+                    }))
+                }),
+            )
+            .route(
+                "/rotate-owner",
+                axum::routing::post(
+                    move |axum::Json(req): axum::Json<serde_json::Value>| async move {
+                        let replacement: [u8; 32] = B64
+                            .decode(req["replacement_owner_pubkey_b64"].as_str().unwrap_or(""))
+                            .expect("mock replacement owner decodes")
+                            .try_into()
+                            .expect("mock replacement owner is 32 bytes");
+                        *rotate_owner.lock().expect("mock owner lock") = replacement;
+                        axum::Json(serde_json::json!({
+                            "org_id": req["org_id"].clone(),
+                            "version": 1,
+                            "owner_pubkey_fingerprint": hex::encode(replacement),
+                            "rotated_at": Utc::now(),
+                        }))
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock signing service");
+        let address = listener.local_addr().expect("mock signing service address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock signing service");
+        });
+        format!("http://{address}/")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rotation_request(
+        org_id: Uuid,
+        user_id: Uuid,
+        current: &SigningKey,
+        replacement: &SigningKey,
+        version: i64,
+        second: u32,
+        signed_at: DateTime<Utc>,
+        reason: &str,
+    ) -> RotateOrgOwnerRequest {
+        let added_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let updated_at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, second).unwrap();
+        let keyring = SignedOrgKeyring {
+            org_id,
+            version: version as u64,
+            members: vec![SignedOrgKeyringMember {
+                user_id,
+                pubkey: replacement.verifying_key().to_bytes(),
+                role: SignedOrgKeyringRole::Owner,
+                added_at,
+            }],
+            updated_at,
+        };
+        let signature = replacement.sign(&canonical_keyring_bytes(&keyring));
+        let directive = owner_rotation_directive_bytes(
+            org_id,
+            &current.verifying_key().to_bytes(),
+            &replacement.verifying_key().to_bytes(),
+            signed_at,
+            reason,
+        );
+        RotateOrgOwnerRequest {
+            version,
+            keyring_payload: serde_json::json!({
+                "org_id": org_id,
+                "version": version,
+                "members": [{
+                    "user_id": user_id,
+                    "pubkey": hex::encode(replacement.verifying_key().to_bytes()),
+                    "role": "owner",
+                    "added_at": added_at,
+                }],
+                "updated_at": updated_at,
+            }),
+            signature: hex::encode(signature.to_bytes()),
+            replacement_signing_pubkey: hex::encode(replacement.verifying_key().to_bytes()),
+            current_signing_pubkey: hex::encode(current.verifying_key().to_bytes()),
+            signed_at,
+            reason: reason.to_string(),
+            rotation_signature: hex::encode(current.sign(&directive).to_bytes()),
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_rotation_directive_is_fresh_bound_and_single_use() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-directive-replay-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert directive replay org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Directive Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert directive owner user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert directive owner membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(current_key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert directive owner signing keys");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes())
+                    .await,
+                None,
+            )
+            .expect("build mock signing service client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+        )
+        .await
+        .expect("publish v1 keyring");
+
+        // A directive whose signed_at predates the current keyring version
+        // (beyond clock-skew tolerance) must be rejected even though the
+        // signature itself is perfectly valid.
+        let stale = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now() - chrono::Duration::hours(1),
+            "regression",
+        );
+        let rejected = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(stale),
+        )
+        .await
+        .expect_err("stale rotation directive must be rejected");
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected.1.0["error"],
+            "owner rotation directive predates the current keyring version"
+        );
+
+        // A directive dated unreasonably far in the future is rejected.
+        let future = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now() + chrono::Duration::minutes(30),
+            "regression",
+        );
+        let rejected = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(future),
+        )
+        .await
+        .expect_err("future-dated rotation directive must be rejected");
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected.1.0["error"],
+            "owner rotation directive signed_at is too far in the future"
+        );
+
+        // A fresh directive rotates normally...
+        let first_signed_at = Utc::now();
+        let forward = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            first_signed_at,
+            "regression",
+        );
+        let _ = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(forward.clone()),
+        )
+        .await
+        .expect("fresh directive rotates the owner");
+        // ...and an exact retry of the same, already-applied request stays
+        // idempotent (same version, byte-identical payload and signatures).
+        let _ = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(forward),
+        )
+        .await
+        .expect("exact retry of an applied rotation is idempotent");
+
+        // Rotate back so the original pair is valid again: the pinned owner
+        // is once more the key that signed the first directive.
+        let _ = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(rotation_request(
+                org_id,
+                user_id,
+                &replacement_key,
+                &current_key,
+                3,
+                3,
+                Utc::now(),
+                "regression-back",
+            )),
+        )
+        .await
+        .expect("rotate owner back to the original key");
+
+        // Replaying the captured first directive now targets a fresh keyring
+        // version (v4) with a still-valid signature and a still-valid
+        // (current -> replacement) pair. The consume-once ledger must reject
+        // it.
+        let replay = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            4,
+            4,
+            first_signed_at,
+            "regression",
+        );
+        let rejected = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(replay),
+        )
+        .await
+        .expect_err("replayed rotation directive must be rejected");
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        assert_eq!(
+            rejected.1.0["error"],
+            "owner rotation directive was already used"
+        );
+
+        let directive_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_rotation_directives WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count consumed rotation directives");
+        assert_eq!(directive_rows, 2, "only the two applied directives consume");
+
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete directive replay audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete directive replay org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete directive replay user");
     }
 
     #[test]
