@@ -50,7 +50,7 @@ pub async fn artifacts(State(state): State<AppState>, headers: HeaderMap) -> imp
             .into_response();
     };
 
-    let verify_response = match trustee_attestation_verify_request(
+    let mut verify_response = match trustee_attestation_verify_request(
         &state.trustee_http_client,
         verify_url,
         token,
@@ -65,7 +65,7 @@ pub async fn artifacts(State(state): State<AppState>, headers: HeaderMap) -> imp
 
     if !verify_response.status().is_success() {
         let status = verify_response.status().as_u16();
-        let body = verify_response.text().await.unwrap_or_default();
+        let body = read_limited_upstream_body(&mut verify_response).await;
         return attestation_denied(status, &body).into_response();
     }
 
@@ -159,10 +159,14 @@ pub(crate) fn attestation_bearer(headers: &HeaderMap) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
-/// Cap on upstream-body text retained in server-side logs. Enough to
-/// diagnose a Trustee failure, small enough to keep log volume bounded;
-/// the raw body never reaches the client response.
+/// Caps on upstream-body text retained from a failed Trustee verify: at
+/// most UPSTREAM_READ_LIMIT bytes are read off the wire (the response has
+/// no other consumer after this change, so an unbounded read is unjustified
+/// exposure to a misbehaving upstream), and at most UPSTREAM_LOG_BODY_LIMIT
+/// characters reach the log field. The raw body never reaches the client
+/// response (#122).
 const UPSTREAM_LOG_BODY_LIMIT: usize = 512;
+const UPSTREAM_READ_LIMIT: usize = 2048;
 
 fn truncate_for_log(value: &str) -> &str {
     match value.char_indices().nth(UPSTREAM_LOG_BODY_LIMIT) {
@@ -171,13 +175,60 @@ fn truncate_for_log(value: &str) -> &str {
     }
 }
 
+/// Formats an error together with its full `source()` chain. reqwest's
+/// `Display` carries only the error kind and URL; the DNS failure, TLS
+/// alert, or serde decode message operators need lives on the source
+/// chain and would otherwise be lost (#122).
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut chain = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        chain.push_str(": ");
+        chain.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    chain
+}
+
+/// Reads at most [`UPSTREAM_READ_LIMIT`] bytes of a non-success Trustee
+/// verify response for the server-side log. Read failures are logged and
+/// yield whatever was retained so far instead of silently degrading to an
+/// empty log field.
+pub(crate) async fn read_limited_upstream_body(response: &mut reqwest::Response) -> String {
+    let mut retained: Vec<u8> = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(bytes)) => {
+                let remaining = UPSTREAM_READ_LIMIT - retained.len();
+                if bytes.len() >= remaining {
+                    retained.extend_from_slice(&bytes[..remaining]);
+                    break;
+                }
+                retained.extend_from_slice(&bytes);
+            }
+            Ok(None) => break,
+            Err(err) => {
+                tracing::warn!(
+                    error = %format_error_chain(&err),
+                    "Trustee error body read failed before reaching the log cap"
+                );
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&retained).into_owned()
+}
+
 /// 502 for a transport failure reaching the Trustee attestation endpoint.
 ///
-/// The reqwest error can name internal hosts, ports, and TLS detail; it is
-/// logged server-side only and the client gets the fixed code (#122).
-pub(crate) fn trustee_verify_unreachable(err: &dyn std::fmt::Display) -> (StatusCode, Json<Value>) {
+/// The reqwest error (with its source chain) can name internal hosts,
+/// ports, and TLS detail; it is logged server-side only and the client
+/// gets the fixed code (#122).
+pub(crate) fn trustee_verify_unreachable(
+    err: &(dyn std::error::Error + 'static),
+) -> (StatusCode, Json<Value>) {
     tracing::warn!(
-        error = %err,
+        error = format_error_chain(err),
         "Trustee attestation verify request failed to reach upstream"
     );
     (
@@ -208,11 +259,14 @@ pub(crate) fn attestation_denied(
 
 /// 502 when Trustee returns success but a non-JSON body.
 ///
-/// The decode error can quote fragments of the upstream payload; it is
-/// logged server-side only and the client gets the fixed code (#122).
-pub(crate) fn attestation_claims_invalid(err: &dyn std::fmt::Display) -> (StatusCode, Json<Value>) {
+/// The decode error can quote fragments of the upstream payload in its
+/// source chain; it is logged server-side only and the client gets the
+/// fixed code (#122).
+pub(crate) fn attestation_claims_invalid(
+    err: &(dyn std::error::Error + 'static),
+) -> (StatusCode, Json<Value>) {
     tracing::warn!(
-        error = %err,
+        error = format_error_chain(err),
         "Trustee attestation verify response did not decode as JSON claims"
     );
     (
@@ -228,7 +282,7 @@ pub(crate) fn attestation_claims_invalid(err: &dyn std::fmt::Display) -> (Status
 /// code (#122).
 pub(crate) fn workload_artifacts_query_failed(err: &sqlx::Error) -> (StatusCode, Json<Value>) {
     tracing::error!(
-        error = %err,
+        error = format_error_chain(err),
         "workload_artifacts database query failed"
     );
     (
@@ -288,12 +342,45 @@ pub(crate) fn parse_hex32(value: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// Minimal error with a source chain, standing in for a reqwest error
+    /// whose `Display` alone would hide the underlying cause.
+    #[derive(Debug)]
+    struct ChainedError;
+    impl std::fmt::Display for ChainedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "error sending request for url (https://trustee.internal.example.test:8443/attest)"
+            )
+        }
+    }
+    impl std::error::Error for ChainedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&SourceError)
+        }
+    }
+    #[derive(Debug)]
+    struct SourceError;
+    impl std::fmt::Display for SourceError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "dns failure: trustee.internal.example.test")
+        }
+    }
+    impl std::error::Error for SourceError {}
+
+    #[test]
+    fn format_error_chain_includes_sources_display_hides() {
+        let chain = format_error_chain(&ChainedError);
+        assert!(chain.contains("error sending request"));
+        assert!(chain.contains("dns failure: trustee.internal.example.test"));
+    }
+
     #[test]
     fn trustee_error_responses_never_carry_upstream_or_internal_detail() {
         // Synthetic secrets stand in for the internal hostnames, connection
         // detail, and upstream body text that the legacy responses leaked.
-        let transport = "error trying to connect: dns error: trustee.internal.example.test:8443";
-        let transport_err: &dyn std::fmt::Display = &transport;
+        let transport = ChainedError;
+        let transport_err: &(dyn std::error::Error + 'static) = &transport;
 
         let (status, Json(body)) = trustee_verify_unreachable(transport_err);
         assert_eq!(status, StatusCode::BAD_GATEWAY);
