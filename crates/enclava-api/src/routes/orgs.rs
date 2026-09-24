@@ -1142,15 +1142,22 @@ pub async fn invite_member(
     .await
     .map_err(|_| db_error())?;
 
-    // Anti-enumeration (issue #121): validate caller-independent input
-    // BEFORE the lookup so a bad role fails identically for known and
-    // unknown emails, and make the unknown-invitee path walk the same
-    // privilege checks and the same transaction shape (lane locks, role
-    // read) as a real invite, then return the same generic 403. It must
-    // not return a success-shaped response: a fake 200 would both lie to
-    // the caller (CLI prints "Invited ...") and re-open the oracle via
+    // Anti-enumeration (issue #121): a bad role fails identically for
+    // known and unknown emails (the lookup result is only consumed after
+    // parse_role), and the unknown-invitee path walks the same privilege
+    // checks and transaction work (lane locks, caller role read,
+    // membership row read) as a real invite. It must not return a
+    // success-shaped response: a fake 200 would both lie to the caller
+    // (CLI prints "Invited ...") and re-open the oracle via
     // GET /orgs/{name}/members, where a real invite adds a visible row
     // and this one would not.
+    //
+    // RESIDUAL RISK (accepted, like the signup 201-vs-400 split): a
+    // successful invite still returns 200 while an unknown email returns
+    // this generic 403, so a determined org admin can infer account
+    // existence. Fully closing it needs a pending-invite model (invite
+    // token emailed to the address, membership only on accept) — a
+    // product change with a new table, out of scope for this fix.
     let requested_role = scopes::parse_role(body.role.as_deref().unwrap_or("member"))?;
 
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
@@ -1164,23 +1171,21 @@ pub async fn invite_member(
         scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_admin_role(current_caller_role)?;
 
-    let (invitee_id, existing_role): (Uuid, Option<Role>) = match invitee {
-        Some((invitee_id,)) => {
-            let existing_role: Option<Role> = sqlx::query_scalar(
-                "SELECT role as \"role: _\"
-                 FROM memberships
-                 WHERE user_id = $1 AND org_id = $2 AND removed_at IS NULL
-                 FOR UPDATE",
-            )
-            .bind(invitee_id)
-            .bind(org_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|_| db_error())?;
-            (invitee_id, existing_role)
-        }
-        None => (Uuid::nil(), None),
-    };
+    // Both paths read the membership row for the invitee id (the nil UUID
+    // for an unknown email matches no row), keeping the query count
+    // identical between known and unknown invitees.
+    let invitee_id = invitee.map(|(id,)| id).unwrap_or_else(Uuid::nil);
+    let existing_role: Option<Role> = sqlx::query_scalar(
+        "SELECT role as \"role: _\"
+         FROM memberships
+         WHERE user_id = $1 AND org_id = $2 AND removed_at IS NULL
+         FOR UPDATE",
+    )
+    .bind(invitee_id)
+    .bind(org_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| db_error())?;
 
     scopes::require_owner_to_modify_privileged_role(
         current_caller_role,

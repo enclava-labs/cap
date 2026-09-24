@@ -1024,9 +1024,15 @@ async fn device_login_poll_and_approve_are_not_in_start_rate_limit_bucket() {
 }
 
 #[tokio::test]
-async fn email_auth_does_not_disclose_account_existence() {
-    // Regression test for issue #121: login, signup-conflict, and org invite
-    // responses must be identical for known and unknown emails.
+async fn email_auth_enumeration_hardening() {
+    // Regression test for issue #121. Login is fully closed: the
+    // unknown-email path runs the same Argon2 decoy work and returns the
+    // exact same 401 body as a wrong password. Signup and org invite are
+    // PARTIALLY hardened: their duplicate/unknown paths no longer state
+    // the reason ("email already registered" / "user not found"), but the
+    // HTTP status still differs (201-vs-400, 200-vs-403) — an accepted
+    // residual documented in the code; fully closing them needs
+    // out-of-band email verification / a pending-invite model.
     let (state, _pool) = setup_test_state().await;
     let app = test_router(state);
     let server = axum_test::TestServer::builder().http_transport().build(app);
@@ -1104,6 +1110,19 @@ async fn email_auth_does_not_disclose_account_existence() {
         unknown_email_elapsed.as_millis() >= 5,
         "unknown-email login must perform real Argon2 work (took {unknown_email_elapsed:?}, \
          known-email wrong-password took {wrong_pw_elapsed:?}) — timing oracle is back"
+    );
+    assert!(
+        wrong_pw_elapsed.as_millis() >= 5,
+        "known-email wrong-password login must also perform Argon2 work (took {wrong_pw_elapsed:?})"
+    );
+    // The unknown-email path must cost the same order of Argon2 work as the
+    // known-email wrong-password path (both ~tens of ms; allow a wide 10x
+    // band for scheduler noise, but catch a skipped/degraded decoy verify).
+    let ratio = unknown_email_elapsed.as_secs_f64() / wrong_pw_elapsed.as_secs_f64().max(1e-9);
+    assert!(
+        ratio > 0.1,
+        "unknown-email login was {ratio:.3}x the cost of a known-email wrong-password \
+         login — the decoy Argon2 verify is missing or degraded"
     );
 
     // Correct login still works for the known account.

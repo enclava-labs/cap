@@ -161,7 +161,7 @@ pub async fn login(
         return Err(EmailAuthError::PasswordRequired);
     }
 
-    let row: Option<(Uuid, String, Option<String>)> = sqlx::query_as(
+    let row: Option<(Uuid, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT ui.user_id, ui.credential_hash, u.display_name
          FROM user_identities ui
          JOIN users u ON u.id = ui.user_id
@@ -171,18 +171,20 @@ pub async fn login(
     .fetch_optional(pool)
     .await?;
 
-    // Anti-enumeration: when the email is unknown, verify the submitted
-    // password against the fixed decoy hash so this path performs the same
-    // Argon2 work (and returns the same InvalidCredentials error) as a
-    // wrong password for a known account (issue #121). A NULL/garbage
-    // stored hash is treated as a wrong password (after the decoy work on
-    // the missing-row side) so error bodies cannot distinguish accounts
-    // with unusable credentials.
+    // Anti-enumeration: every failure path must do the same Argon2 work
+    // against the fixed decoy hash and return the same InvalidCredentials
+    // error (issue #121): unknown email, NULL credential_hash, garbage
+    // stored hash, and wrong password are indistinguishable in body and
+    // cost. (verify_password parses the PHC string before running Argon2,
+    // so the unparseable cases must still run a decoy verify to match the
+    // timing of a real wrong-password attempt.)
     let password_ok = match row.as_ref() {
-        Some((_user_id, hash_str, _display_name)) => {
-            verify_password(password, hash_str).unwrap_or(false)
-        }
-        None => verify_password(password, DUMMY_CREDENTIAL_HASH).unwrap_or(false),
+        Some((_user_id, Some(hash_str), _display_name)) => verify_password(password, hash_str)
+            .unwrap_or_else(|_| {
+                let _ = verify_password(password, DUMMY_CREDENTIAL_HASH);
+                false
+            }),
+        _ => verify_password(password, DUMMY_CREDENTIAL_HASH).unwrap_or(false),
     };
 
     if !password_ok {
@@ -265,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn signup_error_messages_do_not_disclose_account_existence() {
+    fn signup_error_message_is_generic_for_duplicate_emails() {
         // The duplicate-email signup error must be the generic SignupFailed
         // message, not "email already registered". (The signup endpoint
         // still reveals existence via 201-vs-400 status; closing that needs
