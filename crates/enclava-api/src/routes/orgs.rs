@@ -916,14 +916,14 @@ pub async fn rotate_org_owner(
     // The directive's CE-v1 bytes are a cross-repo contract with the platform
     // signing service (policy-templates re-derives them verbatim), so the
     // binding is enforced by the authoritative verifier in CAP:
-    // - signed_at must lie within a bounded window of the API clock: not in
-    //   the future beyond clock-skew tolerance, and not older than a short
-    //   max-age. A captured directive is not a standing bearer token for the
-    //   (current -> replacement) pair, even on first use. The max-age is a
-    //   first-use bound only: a byte-identical retry of an already-applied
-    //   rotation stays idempotent past the window because the consume-once
-    //   ledger (org_rotation_directives, never purged) proves the exact
-    //   directive authorized the completed rotation (PR #185 review).
+    // - signed_at must never be in the future beyond clock-skew tolerance.
+    // - the signed_at max-age is a first-use bound, enforced only when the
+    //   rotation creates a new keyring version: a captured directive is not
+    //   a standing bearer token for the (current -> replacement) pair. A
+    //   retry of an already-applied rotation must stay idempotent at any
+    //   age (response-loss recovery, pre-ledger rotations from before this
+    //   deployment) and is instead proven by the byte-identical stored
+    //   keyring content, signatures, and pinned-owner checks below.
     // - when the rotation creates a new keyring version, signed_at may not
     //   predate the creation of the keyring version whose owner signed it.
     // - each accepted directive is consumed exactly once (ledger below);
@@ -947,26 +947,6 @@ pub async fn rotate_org_owner(
     current_key
         .verify(&directive, &Signature::from_bytes(&rotation_signature))
         .map_err(|_| bad_request("owner rotation signature verification failed"))?;
-    let directive_digest = Sha256::digest(&directive);
-    // The max-age is a first-use bound: past the window, the request is only
-    // acceptable as a byte-identical retry of an already-applied rotation,
-    // which the consume-once ledger proves by the exact directive digest
-    // (the directive signature has already verified above, so a ledger hit
-    // can only mean CAP accepted this exact directive before).
-    if body.signed_at < now - chrono::Duration::seconds(MAX_DIRECTIVE_AGE_SECONDS) {
-        let previously_applied: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM org_rotation_directives
-              WHERE org_id = $1 AND directive_sha256 = $2",
-        )
-        .bind(org_id)
-        .bind(directive_digest.as_slice())
-        .fetch_one(&state.db)
-        .await
-        .map_err(|_| db_error())?;
-        if previously_applied == 0 {
-            return Err(bad_request("owner rotation directive signed_at is too old"));
-        }
-    }
 
     let payload_bytes = serde_json::to_vec(&body.keyring_payload).map_err(|_| db_error())?;
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
@@ -1034,19 +1014,25 @@ pub async fn rotate_org_owner(
     }
     // Consume-once + version binding for the rotation directive (issue #120).
     // A directive that creates a new keyring version must be younger than the
-    // version it rotates (no skew allowance: a pre-creation capture must fail)
-    // and must never have been accepted for this org before. The comparison
-    // uses the version row's created_at, whose default is clock_timestamp()
-    // (migration 0051): the actual insertion time, not the start of the
-    // inserting transaction -- uploads and rotations queue on the shared
-    // signing-authority lane before inserting, so a transaction-start
-    // timestamp could predate the insert by the full lock wait and would
-    // accept directives signed inside that lag. A retry on the
-    // already-applied path is only idempotent when it presents the exact
-    // directive that authorized the original rotation -- a different valid
-    // directive for the same pair is not a retry and must be consumed (or
-    // rejected) rather than silently accepted.
+    // version it rotates (no skew allowance: a pre-creation capture must fail),
+    // must fall inside the first-use max-age window (a captured directive is
+    // not a standing bearer token), and must never have been accepted for
+    // this org before. The comparison uses the version row's created_at,
+    // whose default is clock_timestamp() (migration 0051): the actual
+    // insertion time, not the start of the inserting transaction -- uploads
+    // and rotations queue on the shared signing-authority lane before
+    // inserting, so a transaction-start timestamp could predate the insert
+    // by the full lock wait and would accept directives signed inside that
+    // lag. The already-applied path below proves a retry by the byte-
+    // identical stored keyring content, signatures, and pinned-owner checks
+    // instead of the ledger, so retries of rotations performed before this
+    // ledger existed (or whose response was lost and retried past the
+    // window) stay idempotent at any age.
+    let directive_digest = Sha256::digest(&directive);
     if insert_new_version {
+        if body.signed_at < now - chrono::Duration::seconds(MAX_DIRECTIVE_AGE_SECONDS) {
+            return Err(bad_request("owner rotation directive signed_at is too old"));
+        }
         if body.signed_at < latest.4 {
             return Err(bad_request(
                 "owner rotation directive predates the current keyring version",
@@ -1072,25 +1058,11 @@ pub async fn rotate_org_owner(
             ));
         }
     } else {
-        // Already-applied rotation: the presented directive must be the one
-        // that was consumed when this version was originally accepted.
-        let known: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM org_rotation_directives
-              WHERE org_id = $1 AND directive_sha256 = $2",
-        )
-        .bind(org_id)
-        .bind(directive_digest.as_slice())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|_| db_error())?;
-        if known == 0 {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "owner rotation directive was already used"
-                })),
-            ));
-        }
+        // Already-applied rotation: the byte-identical stored version
+        // content, the verified keyring and directive signatures, and the
+        // pinned-owner checks above prove this is a retry of the completed
+        // rotation (main's pre-ledger idempotency contract). Nothing is
+        // mutated on this path, so no ledger consult is required.
     }
     let current_keyring: SignedOrgKeyring =
         serde_json::from_slice(&base_payload).map_err(|_| db_error())?;
@@ -1970,8 +1942,11 @@ mod tests {
         .expect("exact retry of an applied rotation is idempotent");
 
         // A DIFFERENT valid directive (fresh signed_at) presented against the
-        // already-applied version is not a retry: it must be rejected, not
-        // silently accepted and left unconsumed for later first-use replay.
+        // already-applied version is indistinguishable from an original
+        // request whose response was lost: main's idempotency contract
+        // accepts it (the stored version content, signatures, and pinned
+        // owner all match) and nothing is mutated. It is NOT recorded in the
+        // ledger, so it can never authorize a later new-version rotation.
         let different = rotation_request(
             org_id,
             user_id,
@@ -1982,19 +1957,14 @@ mod tests {
             Utc::now(),
             "regression-second-signature",
         );
-        let rejected = rotate_org_owner(
+        let _ = rotate_org_owner(
             auth.clone(),
             State(state.clone()),
             Path(org_name.clone()),
             Json(different),
         )
         .await
-        .expect_err("different directive on the applied path must be rejected");
-        assert_eq!(rejected.0, StatusCode::CONFLICT);
-        assert_eq!(
-            rejected.1.0["error"],
-            "owner rotation directive was already used"
-        );
+        .expect("different valid directive on the applied path is an idempotent no-op");
 
         // Rotate back so the original pair is valid again: the pinned owner
         // is once more the key that signed the first directive.
@@ -2137,7 +2107,9 @@ mod tests {
         .expect("publish v1 keyring");
 
         // The "committed first attempt": v2 exists with the replacement
-        // owner pinned and the directive consumed in the ledger.
+        // owner pinned. No org_rotation_directives row exists, standing in
+        // for a rotation performed before the ledger deployment (or a
+        // crash-recovered commit) -- the retry must still be idempotent.
         let applied_signed_at = Utc::now() - chrono::Duration::minutes(30);
         let applied = rotation_request(
             org_id,
@@ -2163,21 +2135,6 @@ mod tests {
         .execute(&pool)
         .await
         .expect("insert committed v2 keyring row");
-        let directive = owner_rotation_directive_bytes(
-            org_id,
-            &current_key.verifying_key().to_bytes(),
-            &replacement_key.verifying_key().to_bytes(),
-            applied_signed_at,
-            "expired-retry",
-        );
-        sqlx::query(
-            "INSERT INTO org_rotation_directives (org_id, directive_sha256) VALUES ($1, $2)",
-        )
-        .bind(org_id)
-        .bind(Sha256::digest(&directive).as_slice())
-        .execute(&pool)
-        .await
-        .expect("seed consumed directive ledger row");
 
         // Byte-identical retry past the max-age window: idempotent success.
         let retried = rotate_org_owner(
@@ -2195,12 +2152,13 @@ mod tests {
         );
 
         // A never-applied directive older than the window is still rejected:
-        // the max-age bound holds on first use.
+        // the max-age bound holds on first use. The pinned owner is now the
+        // replacement key, so the would-be v3 rotation is signed by it.
         let stale = rotation_request(
             org_id,
             user_id,
-            &current_key,
             &replacement_key,
+            &current_key,
             3,
             3,
             Utc::now() - chrono::Duration::minutes(30),
