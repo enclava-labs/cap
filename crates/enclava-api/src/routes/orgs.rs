@@ -1066,6 +1066,19 @@ pub async fn rotate_org_owner(
     .await
     .map_err(|_| db_error())?
     .ok_or_else(|| bad_request("org keyring must be uploaded before owner rotation"))?;
+    // Migration watermark (migration 0054): rows whose INSERT ran under
+    // pre-0051 code keep legacy transaction-start created_at semantics and
+    // can predate their real insertion by the full signing-authority lane
+    // wait. A catalog-default change binds every insert the moment it
+    // commits, so all legacy-semantics rows were inserted strictly before
+    // 0054 recorded this watermark; such rows are compared against the
+    // watermark itself instead of their unreliable stored timestamp.
+    let created_at_watermark: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT watermarked_at FROM org_keyrings_created_at_watermark")
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| db_error())?;
+    let version_created_at_floor = created_at_watermark.unwrap_or(latest.4).max(latest.4);
 
     let (base_payload, expected_current_owner, insert_new_version) = if body.version == latest.0 {
         if latest.1 != payload_bytes
@@ -1112,8 +1125,9 @@ pub async fn rotate_org_owner(
     // version it rotates (no skew allowance: a pre-creation capture must fail),
     // must fall inside the first-use max-age window (a captured directive is
     // not a standing bearer token), and must never have been accepted for
-    // this org before. The comparison uses the version row's created_at,
-    // whose default is clock_timestamp() (migration 0051): the actual
+    // this org before. The comparison uses the version row's created_at --
+    // floored at the migration-0054 watermark (see below) -- whose default
+    // is clock_timestamp() (migration 0051): the actual
     // insertion time, not the start of the inserting transaction -- uploads
     // and rotations queue on the shared signing-authority lane before
     // inserting, so a transaction-start timestamp could predate the insert
@@ -1193,7 +1207,7 @@ pub async fn rotate_org_owner(
                 return Err(bad_request("owner rotation directive signed_at is too old"));
             }
         }
-        if body.signed_at < latest.4 {
+        if body.signed_at < version_created_at_floor {
             return Err(bad_request(
                 "owner rotation directive predates the current keyring version",
             ));
@@ -2460,6 +2474,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_rotation_version_bound_floors_legacy_rows_at_migration_watermark() {
+        // Regression (PR #185 review, codex P2 on migration 0051): a
+        // keyring version committed by pre-migration code keeps a
+        // transaction-start created_at that can predate its real
+        // insertion by the full signing-authority lane wait. Without the
+        // migration-0054 watermark floor, a directive signed while the
+        // legacy upload sat queued on the lane compares as "newer than
+        // the version" and is accepted during the post-rollout first-use
+        // window even though it predates the version's real insertion.
+        // Model the legacy row exactly: v1's stored created_at is moved
+        // into the past (what a transaction-start default recorded),
+        // while the watermark stays at migration time. The directive is
+        // signed "now" -- after v1's stored timestamp, inside the
+        // first-use window, never consumed -- and must be rejected by
+        // the watermark floor rather than compared against the stale
+        // legacy timestamp.
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-legacy-watermark-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert legacy watermark org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Legacy Watermark Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert legacy watermark user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert legacy watermark membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(current_key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert legacy watermark signing keys");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes())
+                    .await,
+                None,
+            )
+            .expect("build mock signing service client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+        )
+        .await
+        .expect("publish v1 keyring");
+
+        // Legacy semantics: the stored created_at predates the row's real
+        // insertion (transaction-start clock). Pin the watermark explicitly
+        // (as it would be minutes after rollout) so the scenario does not
+        // depend on when this test database was migrated.
+        sqlx::query("UPDATE org_keyrings SET created_at = $2 WHERE org_id = $1 AND version = 1")
+            .bind(org_id)
+            .bind(Utc::now() - chrono::Duration::minutes(10))
+            .execute(&pool)
+            .await
+            .expect("backdate v1 to legacy transaction-start timestamp");
+        sqlx::query("UPDATE org_keyrings_created_at_watermark SET watermarked_at = $1")
+            .bind(Utc::now() - chrono::Duration::minutes(6))
+            .execute(&pool)
+            .await
+            .expect("pin watermark to rollout time");
+
+        // A directive signed 8 minutes ago: after v1's stored legacy
+        // timestamp (now-10m), inside the first-use window, never consumed
+        // -- but before the watermark (now-6m), hence before the version's
+        // earliest provable insertion semantics. Against the stale stored
+        // value it would pass; against the watermark floor it must fail.
+        let rejected = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(rotation_request(
+                org_id,
+                user_id,
+                &current_key,
+                &replacement_key,
+                2,
+                2,
+                Utc::now() - chrono::Duration::minutes(8),
+                "legacy-watermark",
+            )),
+        )
+        .await
+        .expect_err("directive signed inside a legacy created_at lag must be rejected");
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected.1.0["error"],
+            "owner rotation directive predates the current keyring version"
+        );
+
+        // Control: once the org has a post-watermark version (uploaded
+        // after migration 0054, created_at = clock_timestamp()), a
+        // directive signed after that insertion rotates normally -- the
+        // floor does not wedge forward rotations.
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 2, 2)),
+        )
+        .await
+        .expect("publish v2 keyring under post-migration semantics");
+        let _ = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(rotation_request(
+                org_id,
+                user_id,
+                &current_key,
+                &replacement_key,
+                3,
+                3,
+                Utc::now(),
+                "legacy-watermark-forward",
+            )),
+        )
+        .await
+        .expect("post-watermark directive rotates normally");
+
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete legacy watermark audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete legacy watermark org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete legacy watermark user");
+    }
+
+    #[tokio::test]
     async fn owner_rotation_recovers_when_service_already_holds_replacement() {
         // Regression (PR #185 review, codex P1/P2): if the upstream
         // rotate-owner succeeds but the CAP transaction rolls back, the
@@ -2562,6 +2740,16 @@ mod tests {
             .execute(&pool)
             .await
             .expect("backdate v1 creation");
+        // The drift this test models began before the current rollout: age
+        // the migration-0054 watermark the same way so the version-recency
+        // floor stays at the (backdated) v1 created_at, as it would be for
+        // an org whose drift predates the deployment that introduced the
+        // watermark.
+        sqlx::query("UPDATE org_keyrings_created_at_watermark SET watermarked_at = $1")
+            .bind(Utc::now() - chrono::Duration::minutes(30))
+            .execute(&pool)
+            .await
+            .expect("backdate created_at watermark");
 
         // Negative case 1 (a different directive over the same pair gets
         // no waiver): a DIFFERENT directive over the same
