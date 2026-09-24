@@ -124,13 +124,8 @@ async fn dns01_certificate_inner(
                 .into_response();
         }
         Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(
-                    json!({"error": "workload_artifacts_query_failed", "detail": err.to_string()}),
-                ),
-            )
-                .into_response();
+            let (status, body) = crate::routes::workload::workload_artifacts_query_failed(&err);
+            return (status, body).into_response();
         }
     };
 
@@ -150,9 +145,12 @@ async fn dns01_certificate_inner(
             return (StatusCode::BAD_REQUEST, Json(json!({"error": "csr_empty"}))).into_response();
         }
         Err(err) => {
+            // Base64 decode errors carry no tenant data, but the fixed code
+            // is all a caller needs; keep the decode detail server-side (#122).
+            tracing::warn!(error = %err, "certificate CSR base64 decode failed");
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "csr_base64_invalid", "detail": err.to_string()})),
+                Json(json!({"error": "csr_base64_invalid"})),
             )
                 .into_response();
         }
@@ -237,37 +235,22 @@ async fn verify_attestation(
     {
         Ok(response) => response,
         Err(err) => {
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": "trustee_attestation_verify_failed", "detail": err.to_string()})),
-            )
-                .into_response()
-                .into());
+            let (status, body) = crate::routes::workload::trustee_verify_unreachable(&err);
+            return Err((status, body).into_response().into());
         }
     };
 
     if !verify_response.status().is_success() {
         let status = verify_response.status().as_u16();
         let body = verify_response.text().await.unwrap_or_default();
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "attestation_denied",
-                "upstream_status": status,
-                "upstream_body": body,
-            })),
-        )
-            .into_response()
-            .into());
+        let (denied_status, denied_body) =
+            crate::routes::workload::attestation_denied(status, &body);
+        return Err((denied_status, denied_body).into_response().into());
     }
 
     verify_response.json().await.map_err(|err| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "attestation_claims_invalid", "detail": err.to_string()})),
-        )
-            .into_response()
-            .into()
+        let (status, body) = crate::routes::workload::attestation_claims_invalid(&err);
+        (status, body).into_response().into()
     })
 }
 
