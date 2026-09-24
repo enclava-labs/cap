@@ -47,7 +47,8 @@ pub struct DescriptorPlatformBinding {
 impl DescriptorPlatformBinding {
     /// A binding with no configured sources of truth: every platform-field
     /// cross-check is skipped except the canonical `kbs_resource_path` shape,
-    /// which is always derived from the descriptor's own namespace/name.
+    /// which is always derived from the app row's namespace/name (never the
+    /// descriptor's own copies of those fields).
     pub const EMPTY: Self = Self {
         platform_release_version: None,
         policy_template_id: None,

@@ -513,6 +513,25 @@ fn rejects_descriptor_custom_domains_not_matching_app_row() {
             &platform_binding(),
         )
         .expect("descriptor custom domain matching the app row validates");
+
+    // Pin the empty-string semantics: the CLI signer maps a Some("") app row
+    // to custom_domains [""] (no empty filter), so [] must not match it.
+    // Guards against reintroducing a filter that would silently accept a
+    // descriptor whose custom_domains list is empty.
+    let mut app_empty_domain =
+        api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+    app_empty_domain.custom_domain = Some(String::new());
+    let mut empty_list_descriptor = descriptor.clone();
+    empty_list_descriptor.custom_domains = Vec::new();
+    let err = signing_artifacts(empty_list_descriptor)
+        .validate_deployment_inputs(
+            &app_empty_domain,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+            &platform_binding(),
+        )
+        .unwrap_err();
+    assert!(matches!(err, SigningServiceError::Mismatch(field) if field == "custom_domains"));
 }
 
 #[test]
