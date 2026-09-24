@@ -674,9 +674,10 @@ where
         // lock, so a faster forwarder cannot reserve a higher sequence,
         // lose the CPU to its peer, and let the lower sequence reach the
         // spool second. File order therefore always equals sequence order,
-        // which is the invariant the relay's rotation dedup relies on
-        // (last_seq is a contiguous delivery frontier, only sound when
-        // spool position is monotonic in sequence).
+        // which the relay's rotation-resync dedup relies on: sent
+        // sequences are a SET (round-14 self-check — never a max
+        // frontier), and set membership only matches replayed lines to
+        // their originals when spool position orders sequences.
         let mut spool = spool
             .lock()
             .map_err(|_| "encrypted log spool lock poisoned".to_string())?;
