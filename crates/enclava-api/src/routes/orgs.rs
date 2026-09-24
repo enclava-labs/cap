@@ -916,7 +916,13 @@ pub async fn rotate_org_owner(
     // The directive's CE-v1 bytes are a cross-repo contract with the platform
     // signing service (policy-templates re-derives them verbatim), so the
     // binding is enforced by the authoritative verifier in CAP:
-    // - signed_at must never be in the future beyond clock-skew tolerance.
+    // - when a rotation creates a new keyring version, signed_at must be
+    //   neither in the future (no skew allowance: a pre-creation capture
+    //   must not pass as newer than the version it rotates) nor older than
+    //   the first-use max-age window, both measured against the
+    //   authoritative clock observed after the signing-authority lane is
+    //   acquired (queueing on the lane can outlast any window captured
+    //   before the lock).
     // - the signed_at max-age is a first-use bound, enforced only when the
     //   rotation creates a new keyring version: a captured directive is not
     //   a standing bearer token for the (current -> replacement) pair. A
@@ -929,14 +935,7 @@ pub async fn rotate_org_owner(
     // - each accepted directive is consumed exactly once (ledger below);
     //   only a retry of the byte-identical, already-applied rotation stays
     //   idempotent.
-    const MAX_DIRECTIVE_CLOCK_SKEW_SECONDS: i64 = 300;
     const MAX_DIRECTIVE_AGE_SECONDS: i64 = 900;
-    let now = Utc::now();
-    if body.signed_at > now + chrono::Duration::seconds(MAX_DIRECTIVE_CLOCK_SKEW_SECONDS) {
-        return Err(bad_request(
-            "owner rotation directive signed_at is too far in the future",
-        ));
-    }
     let directive = owner_rotation_directive_bytes(
         org_id,
         &current_owner,
@@ -950,7 +949,13 @@ pub async fn rotate_org_owner(
 
     let payload_bytes = serde_json::to_vec(&body.keyring_payload).map_err(|_| db_error())?;
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
-    crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
+    // The signing-authority lane is a blocking advisory lock and this
+    // handler performs signing-service requests while holding it, so
+    // queue time behind other writers can outlast any freshness window.
+    // All freshness bounds therefore use the reference time observed
+    // strictly after the lane is acquired, on the same database clock
+    // that witnesses org_keyrings.created_at (migration 0051).
+    let lane_now = crate::signing_service::lock_org_signing_authority_lane_now(&mut tx, org_id)
         .await
         .map_err(|_| db_error())?;
     let current_role =
@@ -1030,7 +1035,12 @@ pub async fn rotate_org_owner(
     // window) stay idempotent at any age.
     let directive_digest = Sha256::digest(&directive);
     if insert_new_version {
-        if body.signed_at < now - chrono::Duration::seconds(MAX_DIRECTIVE_AGE_SECONDS) {
+        if body.signed_at > lane_now {
+            return Err(bad_request(
+                "owner rotation directive signed_at is in the future",
+            ));
+        }
+        if body.signed_at < lane_now - chrono::Duration::seconds(MAX_DIRECTIVE_AGE_SECONDS) {
             return Err(bad_request("owner rotation directive signed_at is too old"));
         }
         if body.signed_at < latest.4 {
@@ -1855,7 +1865,11 @@ mod tests {
             "owner rotation directive predates the current keyring version"
         );
 
-        // A directive dated unreasonably far in the future is rejected.
+        // A directive dated unreasonably far in the future is rejected: on
+        // the insert-new-version path there is no skew allowance, because
+        // signed_at is attacker-chosen at signing time and a future-dated
+        // directive could otherwise compare as newer than a keyring version
+        // that already existed when it was captured (PR #185 review).
         let future = rotation_request(
             org_id,
             user_id,
@@ -1877,7 +1891,7 @@ mod tests {
         assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
         assert_eq!(
             rejected.1.0["error"],
-            "owner rotation directive signed_at is too far in the future"
+            "owner rotation directive signed_at is in the future"
         );
 
         // The issue's core replay: a directive signed while the current
@@ -2039,6 +2053,133 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete directive replay user");
+    }
+
+    #[tokio::test]
+    async fn owner_rotation_rejects_future_dated_directive_despite_version_recency() {
+        // Regression (PR #185 review): the old +300s clock-skew allowance
+        // made the version-recency bound bypassable. signed_at is chosen by
+        // the signer, not the server: a directive captured at 12:00 with
+        // signed_at = 12:04 compares as newer than a v2 uploaded at 12:01
+        // and still passes the future-skew check when submitted at 12:05,
+        // even though it predates v2. On the insert-new-version path
+        // signed_at must not be in the future at all (measured after the
+        // signing-authority lane is acquired).
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-future-dated-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert future-dated org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Future Dated Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert future-dated user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert future-dated membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(current_key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert future-dated signing keys");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes())
+                    .await,
+                None,
+            )
+            .expect("build mock signing service client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+        )
+        .await
+        .expect("publish v1 keyring");
+
+        // The directive is captured now but claims to be signed four
+        // minutes in the future -- inside the old +300s skew allowance.
+        let directive_signed_at = Utc::now() + chrono::Duration::minutes(4);
+        // A v2 upload lands while the directive's claimed timestamp is
+        // still in the future.
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 2, 2)),
+        )
+        .await
+        .expect("publish v2 keyring");
+        // Submit the directive for v3 while its claimed signed_at is still
+        // four minutes in the future -- squarely inside the old +300s skew
+        // allowance. Under the old code it would sail through every check:
+        // inside the skew allowance, inside the TTL, and newer than v2's
+        // created_at, despite having been captured before v2 existed. The
+        // no-skew bound rejects it: signed_at is still in the future
+        // measured against the lane clock at submission.
+        let replay = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            3,
+            3,
+            directive_signed_at,
+            "future-dated",
+        );
+        let rejected = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(replay),
+        )
+        .await
+        .expect_err("directive submitted before its claimed signed_at must be rejected");
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected.1.0["error"],
+            "owner rotation directive signed_at is in the future"
+        );
+
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete future-dated audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete future-dated org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete future-dated user");
     }
 
     #[tokio::test]
