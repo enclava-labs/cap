@@ -169,9 +169,11 @@ fn enforce_with(
     // Surface the armed opt-out at startup, before the first internal host
     // is accepted: the per-host audit log only fires on tenant submissions.
     if lookup(CAP_EGRESS_ALLOW_INTERNAL_HOSTS).is_some_and(|value| flag_is_truthy(&value)) {
+        let production_ack_armed = lookup(CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS)
+            .is_some_and(|value| flag_is_truthy(&value));
         tracing::warn!(
             flag = CAP_EGRESS_ALLOW_INTERNAL_HOSTS,
-            production_ack = CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS,
+            production_ack = production_ack_armed,
             "tenant egress to internal endpoints is ENABLED for this process"
         );
     }
