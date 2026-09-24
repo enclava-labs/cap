@@ -212,8 +212,18 @@ impl PlatformRelease {
 pub struct LoadedPlatformRelease {
     pub envelope: PlatformReleaseEnvelope,
     /// State path to commit once startup validation accepts the release.
-    /// `None` when no high-water lane is active.
+    /// `None` when no commit is owed: only the override lane may ever
+    /// persist a mark (a bundle roll-forward cannot raise the override
+    /// lane's floor).
     pub pending_high_water: Option<PathBuf>,
+    /// State path for the read-only running-replica revalidation watchdog.
+    /// Present on EVERY lane that wires `ENCLAVA_PLATFORM_RELEASE_STATE`,
+    /// including the bundled lane where `pending_high_water` is deliberately
+    /// `None`: a bundled-serving replica must still terminate once the
+    /// shared mark advances past its bundled release (Codex P2, cap#165) —
+    /// exactly the condition the bundled-lane removal guard refuses at
+    /// startup but that a long-running pod would otherwise never re-check.
+    pub revalidation_state: Option<PathBuf>,
 }
 
 impl PlatformReleaseEnvelope {
@@ -271,7 +281,12 @@ impl PlatformReleaseEnvelope {
         }
         // The pending-commit obligation exists only on the override lane:
         // the bundled lane must never persist a mark (a bundle roll-forward
-        // cannot raise the override lane's floor).
+        // cannot raise the override lane's floor). The read-only
+        // revalidation state, however, is wired on BOTH lanes: a
+        // bundled-serving replica must still notice the shared mark
+        // advancing past its bundled release and let the watchdog terminate
+        // it (Codex P2, cap#165) — the removal guard above only checks
+        // that at startup.
         let pending_high_water = if override_active {
             high_water_state.map(Path::to_path_buf)
         } else {
@@ -280,6 +295,7 @@ impl PlatformReleaseEnvelope {
         Ok(LoadedPlatformRelease {
             envelope,
             pending_high_water,
+            revalidation_state: high_water_state.map(Path::to_path_buf),
         })
     }
 }
@@ -629,12 +645,46 @@ fn check_override_not_older_than_last_accepted(
 /// (measurements, policy, sidecar digests) even though the shared mark now
 /// records T2. The API arms a periodic watchdog that calls this and
 /// terminates the process on refusal, so the orchestrator replaces the pod
-/// with one that loads the newer release.
+/// with one that loads the newer release. The watchdog covers EVERY
+/// state-wired lane (Codex P2, cap#165), including the bundled/state-only
+/// lanes — see `check_bundled_release_current`.
 pub fn check_running_release_current(
     state_path: &Path,
     release: &PlatformRelease,
 ) -> Result<(), PlatformReleaseError> {
     check_override_not_older_than_last_accepted(state_path, release)
+}
+
+/// State-only-lane twin of `check_running_release_current` (Codex P2,
+/// cap#165): a pod with no release lane active serves no release-derived
+/// configuration, but its binary's BUNDLED release is still floored by the
+/// accepted mark — that is exactly what the startup removal guard
+/// (`enforce_bundle_not_older_than_persisted_mark`) enforces at boot. The
+/// watchdog revalidates the bundled release against the shared mark so the
+/// pod terminates once a coexisting override-lane replica accepts something
+/// newer, instead of running below the accepted floor indefinitely.
+pub fn check_bundled_release_current(state_path: &Path) -> Result<(), PlatformReleaseError> {
+    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
+    check_running_release_current(state_path, &bundled.payload)
+}
+
+impl PlatformReleaseError {
+    /// Watchdog classification (Codex P2, cap#165): does this error mean
+    /// the release this replica is running is DEFINITIVELY no longer
+    /// admitted by the shared high-water mark — strictly older
+    /// (`OverrideDowngradeRefused`) or unorderable equal-timestamp
+    /// divergence against this binary's bundle (`EqualTimestampDivergentMark`)
+    /// — as opposed to transient state trouble (I/O, corrupt-but-recoverable
+    /// state)? Only definitive refusals terminate the process: retrying
+    /// them would let the replica keep serving exactly the release the mark
+    /// no longer admits (startup would refuse it), while an ailing volume
+    /// must not crash-loop healthy replicas.
+    pub fn is_running_release_refused(&self) -> bool {
+        matches!(
+            self,
+            Self::OverrideDowngradeRefused { .. } | Self::EqualTimestampDivergentMark { .. }
+        )
+    }
 }
 
 fn enforce_override_gate(
@@ -956,7 +1006,13 @@ fn enforce_bundle_not_older_than_persisted_mark(
 /// release-derived env requirements (TRUSTEE_KBS_URL, TENANT_CADDY_*) on
 /// fresh debug installs that merely pre-wire the state var and have no mark
 /// yet (the guard itself is a documented no-op without a state file).
-pub fn enforce_state_only_removal_guard() -> Result<(), PlatformReleaseError> {
+///
+/// Returns the resolved state path when the state var is wired (Codex P2,
+/// cap#165 round 8) so main.rs can arm the running-replica revalidation
+/// watchdog for this lane too: the removal guard only checks at startup, and
+/// this pod must not keep running below an accepted mark that advances while
+/// it is up.
+pub fn enforce_state_only_removal_guard() -> Result<Option<PathBuf>, PlatformReleaseError> {
     let state_env = std::env::var("ENCLAVA_PLATFORM_RELEASE_STATE")
         .ok()
         .filter(|v| !v.trim().is_empty());
@@ -965,10 +1021,13 @@ pub fn enforce_state_only_removal_guard() -> Result<(), PlatformReleaseError> {
 
 fn enforce_state_only_removal_guard_with(
     state_env: Option<String>,
-) -> Result<(), PlatformReleaseError> {
+) -> Result<Option<PathBuf>, PlatformReleaseError> {
     match resolve_high_water_state(None, state_env)? {
-        Some(state_path) => enforce_bundle_not_older_than_persisted_mark(&state_path),
-        None => Ok(()),
+        Some(state_path) => {
+            enforce_bundle_not_older_than_persisted_mark(&state_path)?;
+            Ok(Some(state_path))
+        }
+        None => Ok(None),
     }
 }
 
@@ -2126,6 +2185,10 @@ mod tests {
             loaded.pending_high_water.is_none(),
             "bundled lane must not carry a pending high-water commit"
         );
+        // Codex P2 (cap#165 round 8): the read-only revalidation state IS
+        // wired on the bundled lane — the running-replica watchdog needs it
+        // even though no commit is owed.
+        assert_eq!(loaded.revalidation_state.as_deref(), Some(state.as_path()));
         assert!(!state.exists(), "bundled lane must not persist a mark");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2451,6 +2514,179 @@ mod tests {
         ));
         // Steady state: the T2 replica's own recheck keeps passing.
         assert!(check_running_release_current(&state, &loaded_t2.envelope.payload).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bundled_recheck_detects_mark_advanced_by_another_replica() {
+        // Codex P2 (cap#165 round 8): the bundled/state-only lanes must run
+        // the same running-replica revalidation as the override lane. A pod
+        // wiring only ENCLAVA_PLATFORM_RELEASE_STATE passes the bundled
+        // removal guard at T2 (nothing accepted yet when it starts), and
+        // must NOT keep serving T2 after a coexisting override-lane pod
+        // accepts T3 — the watchdog's recheck has to refuse.
+        let dir = std::env::temp_dir().join(format!(
+            "pr-hwm-bundled-recheck-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+
+        // Startup: empty state → the bundled load and its removal guard
+        // pass, exactly like the pod in the report.
+        let loaded = PlatformReleaseEnvelope::load_verified_from_raw(
+            BUNDLED_PLATFORM_RELEASE.to_string(),
+            false,
+            Some(&state),
+        )
+        .expect("bundled load must pass with no mark yet");
+        let revalidation_state = loaded
+            .revalidation_state
+            .clone()
+            .expect("bundled lane must carry the revalidation state");
+        assert_eq!(revalidation_state, state);
+
+        // Steady state: the watchdog's recheck passes while the mark
+        // admits everything the replica serves.
+        check_running_release_current(&revalidation_state, &loaded.envelope.payload).unwrap();
+        check_bundled_release_current(&revalidation_state).unwrap();
+
+        // A coexisting override-lane replica accepts T3: the shared mark
+        // advances past the bundled release.
+        let t3 = resigned_envelope_with_created_at("2999-01-01T00:00:00Z");
+        let parsed: PlatformReleaseEnvelope = serde_json::from_str(&t3).unwrap();
+        commit_override_acceptance(&state, &parsed.payload).expect("T3 commit must pass");
+
+        // The still-running bundled replica must now refuse on recheck —
+        // driving the watchdog to terminate it.
+        assert!(matches!(
+            check_running_release_current(&revalidation_state, &loaded.envelope.payload),
+            Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
+        ));
+        // The state-only lane (no release lane active) revalidates the
+        // BUNDLED release and must refuse identically.
+        assert!(matches!(
+            check_bundled_release_current(&revalidation_state),
+            Err(PlatformReleaseError::OverrideDowngradeRefused { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn state_only_guard_hands_back_the_revalidation_state_path() {
+        // Codex P2 (cap#165 round 8): main.rs arms the running-replica
+        // watchdog from the path this guard returns, so the state-only lane
+        // gets the same revalidation the override lane has.
+        let dir = std::env::temp_dir().join(format!(
+            "pr-hwm-state-only-path-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+        assert_eq!(
+            enforce_state_only_removal_guard_with(Some(state.to_string_lossy().into_owned()))
+                .unwrap(),
+            Some(state.clone())
+        );
+        assert!(
+            enforce_state_only_removal_guard_with(None)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn equal_timestamp_divergence_is_a_terminal_running_release_refusal() {
+        // Codex P2 (cap#165 round 8): the watchdog must TERMINATE, not
+        // retry, when the shared mark and this binary's bundle are
+        // unorderable at one timestamp — startup refuses that state
+        // (EqualTimestampDivergentMark), so a running replica that reaches
+        // it may not keep serving; retrying would do exactly that.
+        let dir = std::env::temp_dir().join(format!(
+            "pr-hwm-eqts-terminal-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = dir.join("release.accepted");
+        let bundled = bundled_payload();
+        let mut divergent = bundled.clone();
+        divergent.platform_release_version =
+            format!("{}-divergent", bundled.platform_release_version);
+        std::fs::write(
+            &state,
+            serde_json::to_vec(&AcceptedOverrideMark::of(&divergent).unwrap()).unwrap(),
+        )
+        .unwrap();
+        // End-to-end: the recheck the watchdog runs on the state-only lane
+        // surfaces the same refusal startup does, and it is terminal.
+        let err = check_bundled_release_current(&state).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PlatformReleaseError::EqualTimestampDivergentMark { .. }
+            ),
+            "{err:?}"
+        );
+        assert!(err.is_running_release_refused(), "{err:?}");
+        // Same divergence surfaced through an OVERRIDE-payload recheck (the
+        // override lane's watchdog): the refusal comes from the mark-vs-
+        // bundle floor computation, not the candidate, and is terminal.
+        let override_payload = serde_json::from_str::<PlatformReleaseEnvelope>(
+            &resigned_envelope_with_created_at("2999-01-01T00:00:00Z"),
+        )
+        .unwrap()
+        .payload;
+        let err = check_running_release_current(&state, &override_payload).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PlatformReleaseError::EqualTimestampDivergentMark { .. }
+            ),
+            "{err:?}"
+        );
+        assert!(err.is_running_release_refused(), "{err:?}");
+        // Legacy pre-digest mark (empty payload_sha256): same {version,
+        // created_at} as the bundle but an unmatched digest can never equal
+        // a freshly computed one, so it must diverge-and-refuse rather than
+        // pass as "the same release".
+        let mut legacy = AcceptedOverrideMark::of(&bundled).unwrap();
+        legacy.payload_sha256 = String::new();
+        std::fs::write(&state, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let err = check_bundled_release_current(&state).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PlatformReleaseError::EqualTimestampDivergentMark { .. }
+            ),
+            "{err:?}"
+        );
+        assert!(err.is_running_release_refused(), "{err:?}");
+        assert!(
+            PlatformReleaseError::OverrideDowngradeRefused {
+                override_version: "t1".into(),
+                override_created: "2026-01-01T00:00:00Z".into(),
+                accepted_version: "t2".into(),
+                accepted_created: "2026-01-02T00:00:00Z".into(),
+                state_path: state.display().to_string(),
+            }
+            .is_running_release_refused()
+        );
+        // Transient state trouble stays retryable: an ailing shared volume
+        // must not crash-loop healthy replicas.
+        assert!(
+            !PlatformReleaseError::HighWaterMarkPersistFailed {
+                state_path: state.display().to_string(),
+                source: std::io::Error::other("shared volume on fire"),
+            }
+            .is_running_release_refused()
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

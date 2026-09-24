@@ -691,19 +691,26 @@ async fn main() {
     // State-only lane (Codex P2, cap#165): when no release lane is active
     // but ENCLAVA_PLATFORM_RELEASE_STATE is wired, a previously accepted
     // override must still floor the bundled release (removal guard) —
-    // without adopting the release as a configuration source.
-    if platform_release_loaded.is_none()
-        && let Err(e) = enclava_api::platform_release::enforce_state_only_removal_guard()
-    {
-        eprintln!("startup refused: {e}");
-        std::process::exit(1);
-    }
+    // without adopting the release as a configuration source. The guard
+    // hands back the resolved state path so the running-replica watchdog
+    // below covers this lane too (Codex P2, cap#165 round 8).
+    let state_only_revalidation_state = if platform_release_loaded.is_none() {
+        match enclava_api::platform_release::enforce_state_only_removal_guard() {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("startup refused: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     let platform_release_envelope = platform_release_loaded
         .as_ref()
         .map(|loaded| loaded.envelope.clone());
-    let pending_high_water = match platform_release_loaded {
-        Some(loaded) => loaded.pending_high_water,
-        None => None,
+    let (pending_high_water, revalidation_state) = match platform_release_loaded {
+        Some(loaded) => (loaded.pending_high_water, loaded.revalidation_state),
+        None => (None, state_only_revalidation_state),
     };
     if let Some(envelope) = &platform_release_envelope {
         let release = &envelope.payload;
@@ -905,24 +912,44 @@ async fn main() {
     // commits T2. Revalidate the running release against the shared
     // high-water mark periodically and terminate on refusal so the
     // orchestrator replaces this pod with one that loads the newer release.
-    if let (Some(state_path), Some(envelope)) = (&pending_high_water, &platform_release_envelope) {
+    // Codex P2 (cap#165 round 8): armed whenever the state var is wired —
+    // including the bundled and state-only lanes, where pending_high_water
+    // is deliberately None (the bundle must never persist a mark). Without
+    // this, a state-only pod serving its bundled T2 keeps serving it
+    // indefinitely after a coexisting override-lane pod accepts T3 during a
+    // non-Recreate rollout: the removal guard only checks at startup.
+    if let Some(state_path) = &revalidation_state {
         let state_path = state_path.clone();
-        let running_release = envelope.payload.clone();
+        let running_release = platform_release_envelope
+            .as_ref()
+            .map(|e| e.payload.clone());
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                match enclava_api::platform_release::check_running_release_current(
-                    &state_path,
-                    &running_release,
-                ) {
+                let recheck = match &running_release {
+                    Some(release) => enclava_api::platform_release::check_running_release_current(
+                        &state_path,
+                        release,
+                    ),
+                    // State-only lane: no release is served as a
+                    // configuration source, but the binary's bundled
+                    // release is still floored by the accepted mark (the
+                    // startup removal guard) — revalidate that one.
+                    None => {
+                        enclava_api::platform_release::check_bundled_release_current(&state_path)
+                    }
+                };
+                match recheck {
                     Ok(()) => {}
-                    Err(
-                        e @ enclava_api::platform_release::PlatformReleaseError::OverrideDowngradeRefused { .. },
-                    ) => {
-                        // The shared mark advanced past the release this
-                        // replica loaded at startup. Terminate so the
+                    Err(e) if e.is_running_release_refused() => {
+                        // The shared mark no longer admits the release
+                        // this replica is serving: it advanced past it
+                        // (downgrade refused), or the persisted mark and
+                        // this binary's bundle are unorderable
+                        // (equal-timestamp divergence — startup would
+                        // refuse this replica too). Terminate so the
                         // orchestrator replaces this pod with one that
                         // loads the newer release. abort() rather than
                         // exit(): exit() from a tokio worker can deadlock
@@ -930,7 +957,7 @@ async fn main() {
                         // allocator or the tracing subscriber (reviewer
                         // High, cap#165 self-check).
                         eprintln!(
-                            "terminating: the platform-release high-water mark advanced past the \
+                            "terminating: the platform-release high-water mark no longer admits the \
                              release this replica is serving ({e}); the orchestrator should replace \
                              this pod so it loads the newer release"
                         );
