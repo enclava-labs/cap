@@ -533,6 +533,8 @@ pub(crate) fn validate_egress_allowlist(
 /// server or cloud metadata endpoints is a platform-level risk, not a tenant
 /// preference. Operators with an explicit use case can opt in process-wide
 /// with `CAP_EGRESS_ALLOW_INTERNAL_HOSTS=true` (audited, logged per host).
+/// Release builds additionally require the second production opt-in
+/// `CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS=true` (see `env_gates.rs`).
 fn enforce_egress_allowlist_host(host: &str) -> Result<(), String> {
     let reasons = egress_allowlist_host_audit_reasons(host);
     if reasons.is_empty() {
