@@ -474,27 +474,6 @@ pub async fn enqueue_signed_policy_revocation_if_active(
     Ok(generation)
 }
 
-/// Enqueue a signed-policy recomputation only when CAP has already entered
-/// signed-policy mode.  Keyring writes no longer call this: migration
-/// 0050's `org_keyrings` INSERT trigger owes the bump inside the writer's
-/// own transaction (see [`consume_deferred_selector_bumps`]), which fences
-/// pre-0050 replicas too.  Unsigned-only installs stay untouched.
-pub async fn enqueue_signed_policy_reconciliation_if_active(
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<Option<i64>, KbsPolicyError> {
-    let generation = sqlx::query_scalar(
-        "UPDATE kbs_signed_policy_reconciliation
-            SET desired_generation = desired_generation + 1,
-                updated_at = clock_timestamp()
-          WHERE singleton
-            AND desired_generation > 0
-        RETURNING desired_generation",
-    )
-    .fetch_optional(&mut **tx)
-    .await?;
-    Ok(generation)
-}
-
 async fn enqueue_signed_policy_bootstrap_if_idle(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<bool, KbsPolicyError> {
@@ -514,7 +493,8 @@ async fn enqueue_signed_policy_bootstrap_if_idle(
 ///
 /// Migration 0050's trigger owes selector generation bumps only where
 /// `desired_generation > 0` (mirroring
-/// [`enqueue_signed_policy_reconciliation_if_active`]), so the debt
+/// [`enqueue_signed_policy_revocation_if_active`]'s active-mode guard), so
+/// the debt
 /// invariant is `selector_bumps_owed > 0 => desired_generation > 0`.  If a
 /// stray debt ever lands on an unsigned-only row (manual psql, a future
 /// backfill), it is cleared here without bumping so the install cannot be
