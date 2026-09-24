@@ -517,8 +517,11 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
 /// The spool directory is workload-writable, so the scan is over
 /// attacker-influenced content: a forged `{"sequence":u64::MAX}` line must
 /// not wrap the resumed counter to 0 (round-14 self-check Critical), so
-/// the resume point is clamped to a ceiling that still leaves headroom
-/// for a long-lived workload (u32::MAX frames ≈ years at kilo-frame/s).
+/// the resume point is wrap-guarded with a small reserve below u64::MAX
+/// that a legitimate monotonic writer can never reach (round-17 review
+/// P2: the earlier u32::MAX ceiling wrongly LOWERED the resume point of
+/// a long-lived workload past u32::MAX real frames, re-using sequence
+/// numbers still resident in the relay's dedup set).
 ///
 /// The scan is per-record BOUNDED (round-15 review P2):
 /// `BufRead::lines()` buffers a complete record with no size limit, so a
@@ -604,11 +607,24 @@ fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
             max_sequence = sequence;
         }
     }
-    // Clamp before +1: a forged sequence must not wrap the counter to 0,
-    // which would make every post-restart frame replay-suppressed (the
-    // old frontier dedup) or duplicate earlier sequence numbers.
-    const SEQUENCE_RESUME_CEILING: u64 = u32::MAX as u64;
-    Ok(max_sequence.min(SEQUENCE_RESUME_CEILING) + 1)
+    // Wrap guard before +1: a forged sequence adjacent to u64::MAX must
+    // not wrap the counter to 0, which would make every post-restart
+    // frame replay-suppressed (the old frontier dedup) or duplicate
+    // earlier sequence numbers. Round-17 review P2 (Codex): the OLD clamp
+    // (`min(u32::MAX)`) also LOWERED the resume point of a legitimately
+    // long-lived workload past u32::MAX real frames back down to
+    // u32::MAX + 1 — those re-used sequence numbers were still resident
+    // in the relay's DeliveredSequences dedup set (capacity 65,536,
+    // FIFO-evicted), so up to 65,536 live frames were silently suppressed
+    // as apparent rotation replays after a restart. Only wrap-adjacent
+    // values are clamped now: the reserve matches the relay's dedup
+    // window (DELIVERED_SET_CAP), a legitimate monotonic writer can never
+    // reach it (u64::MAX frames is unreachable), and a forged near-MAX
+    // sequence merely loses headroom it never owned.
+    const SEQUENCE_RESUME_WRAP_RESERVE: u64 = 65_536;
+    Ok(max_sequence
+        .saturating_add(1)
+        .min(u64::MAX - SEQUENCE_RESUME_WRAP_RESERVE))
 }
 
 fn spawn_log_forwarder<R>(
@@ -2012,7 +2028,8 @@ mod tests {
     /// workload-writable, so a forged `{"sequence":u64::MAX}` line must
     /// not wrap the resumed counter to 0 — that would make every
     /// post-restart frame land at/below the relay's dedup state and be
-    /// silently dropped. The resume point is clamped before +1.
+    /// silently dropped. The resume point is wrap-guarded: only values
+    /// within SEQUENCE_RESUME_WRAP_RESERVE of u64::MAX are lowered.
     #[test]
     fn initial_spool_sequence_does_not_wrap_on_forged_max() {
         let dir = tempfile::tempdir().unwrap();
@@ -2025,8 +2042,46 @@ mod tests {
         let resumed = initial_spool_sequence(&mut spool).unwrap();
         assert_eq!(
             resumed,
-            u32::MAX as u64 + 1,
-            "resume clamps to the ceiling + 1, never wraps to 0"
+            u64::MAX - 65_536,
+            "wrap-adjacent forged sequence resumes just below the wrap reserve, never 0"
+        );
+
+        // A forged sequence just outside the reserve passes through
+        // unclamped (only wrap-adjacent values are guarded).
+        let body = format!("{}\n{}\n", frame(417), frame(u64::MAX - 100_000));
+        std::fs::write(&path, body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(
+            initial_spool_sequence(&mut spool).unwrap(),
+            u64::MAX - 100_000 + 1
+        );
+    }
+
+    /// Round-17 review P2 (Codex): the OLD `min(u32::MAX)` ceiling lowered
+    /// the resume point of a legitimately long-lived workload (more than
+    /// u32::MAX real frames emitted) back down to u32::MAX + 1 after a
+    /// restart — every re-used sequence number still resident in the
+    /// relay's DeliveredSequences dedup set (capacity 65,536) was
+    /// suppressed as an apparent rotation replay. Sequence allocation must
+    /// stay monotonic past the old ceiling.
+    #[test]
+    fn initial_spool_sequence_stays_monotonic_past_u32_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        // A surviving spool from a workload well past the old u32::MAX
+        // ceiling (rotation retains only a tail; only the head room of
+        // the counter matters here).
+        let high = u32::MAX as u64 + 12_345;
+        let body: String = (high - 3..=high)
+            .map(|s| format!("{}\n", frame(s)))
+            .collect();
+        std::fs::write(&path, body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        assert_eq!(
+            initial_spool_sequence(&mut spool).unwrap(),
+            high + 1,
+            "resume continues after the real highest u64 sequence, not u32::MAX + 1"
         );
     }
 
