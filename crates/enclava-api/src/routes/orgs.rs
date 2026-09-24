@@ -1014,7 +1014,13 @@ pub async fn rotate_org_owner(
     // Consume-once + version binding for the rotation directive (issue #120).
     // A directive that creates a new keyring version must be younger than the
     // version it rotates (no skew allowance: a pre-creation capture must fail)
-    // and must never have been accepted for this org before. A retry on the
+    // and must never have been accepted for this org before. The comparison
+    // uses the version row's created_at, whose default is clock_timestamp()
+    // (migration 0051): the actual insertion time, not the start of the
+    // inserting transaction -- uploads and rotations queue on the shared
+    // signing-authority lane before inserting, so a transaction-start
+    // timestamp could predate the insert by the full lock wait and would
+    // accept directives signed inside that lag. A retry on the
     // already-applied path is only idempotent when it presents the exact
     // directive that authorized the original rotation -- a different valid
     // directive for the same pair is not a retry and must be consumed (or
@@ -2043,6 +2049,169 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete directive replay user");
+    }
+
+    #[tokio::test]
+    async fn owner_rotation_version_bound_uses_actual_keyring_insertion_time() {
+        // Regression (PR #185 review): org_keyrings.created_at must witness
+        // the moment a version row is actually inserted, not the start of the
+        // inserting transaction. A keyring upload that queues on the shared
+        // signing-authority lane pins now() == transaction_timestamp() at
+        // BEGIN; a directive captured after BEGIN but before the queued
+        // version lands would then compare as "newer than the version" and be
+        // accepted, defeating the pre-creation replay bound. Migration 0051
+        // switches the default to clock_timestamp() and this test fails
+        // against the old transaction-start semantics.
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-lane-lag-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert lane lag org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Lane Lag Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert lane lag user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert lane lag membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(current_key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert lane lag signing keys");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes())
+                    .await,
+                None,
+            )
+            .expect("build mock signing service client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+        )
+        .await
+        .expect("publish v1 keyring");
+
+        // Hold the org's signing-authority lane so a v2 upload queues behind
+        // this transaction, exactly like any concurrent signing-authority
+        // writer would.
+        let mut lane_blocker = pool.begin().await.expect("begin lane blocker");
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(crate::signing_service::ORG_SIGNING_AUTHORITY_LANE_DOMAIN)
+            .bind(crate::signing_service::org_signing_advisory_key(org_id))
+            .execute(&mut *lane_blocker)
+            .await
+            .expect("hold signing authority lane");
+
+        let writer_application = format!("keyring-lane-lag-writer-{suffix}");
+        let mut writer_state = crate::test_support::lazy_state();
+        writer_state.db = named_database_test_pool(&writer_application).await;
+        writer_state.signing_service = state.signing_service.clone();
+        let writer = tokio::spawn(put_keyring(
+            auth.clone(),
+            State(writer_state),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 2, 2)),
+        ));
+        wait_for_named_lock_waiter(&pool, &writer_application).await;
+
+        // The upload transaction has begun and is queued on the lane. Capture
+        // the directive timestamp now: after the writer's BEGIN, before the
+        // v2 row can possibly be inserted. Under the old now() default this
+        // predates v2's created_at and the directive is accepted as "newer".
+        let directive_signed_at = Utc::now();
+        lane_blocker
+            .rollback()
+            .await
+            .expect("release signing authority lane");
+        let _ = writer
+            .await
+            .expect("join queued keyring upload")
+            .expect("queued v2 keyring upload commits");
+
+        // The stored witness must be the true insertion time: strictly after
+        // the directive captured while the upload was still queued.
+        let v2_created_at: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT created_at FROM org_keyrings WHERE org_id = $1 AND version = 2",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read v2 insertion witness");
+        assert!(
+            v2_created_at > directive_signed_at,
+            "v2 created_at must be the actual insertion time (clock_timestamp), \
+             not the queued transaction's start time"
+        );
+
+        // The directive predates v2's actual creation and must be rejected on
+        // the insert-new-version path (v3) even though it is inside the TTL
+        // window, freshly signed, and never consumed.
+        let replay = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            3,
+            3,
+            directive_signed_at,
+            "lane-lag",
+        );
+        let rejected = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(replay),
+        )
+        .await
+        .expect_err("directive captured during lane lag must be rejected");
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected.1.0["error"],
+            "owner rotation directive predates the current keyring version"
+        );
+
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete lane lag audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete lane lag org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete lane lag user");
     }
 
     #[test]

@@ -22,9 +22,9 @@ use uuid::Uuid;
 use crate::models::App;
 
 const DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS: u64 = 120;
-const ORG_SIGNING_AUTHORITY_LANE_DOMAIN: i32 = 0x5349_474e;
+pub(crate) const ORG_SIGNING_AUTHORITY_LANE_DOMAIN: i32 = 0x5349_474e;
 
-fn org_signing_advisory_key(id: Uuid) -> i32 {
+pub(crate) fn org_signing_advisory_key(id: Uuid) -> i32 {
     let bytes = id.as_bytes();
     let a = u32::from_be_bytes(bytes[0..4].try_into().expect("UUID word"));
     let b = u32::from_be_bytes(bytes[4..8].try_into().expect("UUID word"));
