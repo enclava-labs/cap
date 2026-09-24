@@ -41,12 +41,12 @@ ALTER TABLE org_keyrings
 -- already-published generation and crash-loop on PolicyGenerationConflict
 -- with no bump left to recover.
 --
--- Instead record the owed bump as a pending marker that only the post-0049
+-- Instead record the owed bump as a pending marker that only the post-0050
 -- implementation interprets: consume_deferred_selector_bump
 -- (crates/enclava-api/src/kbs.rs) performs the actual desired_generation
 -- increment at the start of a reconciliation run held under the global KBS
 -- mutation fence and converges the filtered candidate set within that same
--- fenced run.  A pre-0049 reconciler therefore never sees the owed
+-- fenced run.  A pre-0050 reconciler therefore never sees the owed
 -- generation as a raw desired generation: it keeps finding an unchanged
 -- generation whose unfiltered hash matches the published body and stays
 -- quiescent, and once the bumped generation is published its content-bound
