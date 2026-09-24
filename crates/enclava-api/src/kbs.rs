@@ -1011,7 +1011,7 @@ async fn load_signed_policy_candidates(
         ),
         -- The cast is safe at two levels: org_keyrings rows are written only
         -- by the put/rotate handlers, which serialize validated JSON, and the
-        -- org_keyrings_payload_wellformed CHECK constraint (migration 0049)
+        -- org_keyrings_payload_wellformed CHECK constraint (migration 0050)
         -- rejects any non-JSON or non-object payload or a non-array members
         -- entry at INSERT time, so a malformed row from a backfill script or
         -- manual psql fix can never take down candidate loading for every
