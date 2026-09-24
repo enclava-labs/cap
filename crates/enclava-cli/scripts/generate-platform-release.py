@@ -26,6 +26,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 DEV_FIXTURE_SIGNING_KEY_HEX = "c0" * 32
+DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX = "c1" * 32
 DEFAULT_RELEASE_PATH = Path(__file__).resolve().parents[1] / "platform-release.json"
 GHCR_DIGEST_RE = re.compile(
     r"^ghcr\.io/enclava-labs/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
@@ -68,6 +69,13 @@ def canonical_platform_release_bytes(payload: dict[str, str]) -> bytes:
                     payload["signing_service_pubkey_hex"],
                 ),
             ),
+            (
+                "platform_trustee_policy_pubkey",
+                hex32_bytes(
+                    "platform_trustee_policy_pubkey_hex",
+                    payload["platform_trustee_policy_pubkey_hex"],
+                ),
+            ),
             ("policy_template_id", payload["policy_template_id"].encode()),
             (
                 "policy_template_sha256",
@@ -103,6 +111,7 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
         "PLATFORM_RELEASE_VERSION": "platform_release_version",
         "SIGNING_SERVICE_URL": "signing_service_url",
         "SIGNING_SERVICE_PUBKEY_HEX": "signing_service_pubkey_hex",
+        "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX": "platform_trustee_policy_pubkey_hex",
         "POLICY_TEMPLATE_ID": "policy_template_id",
         "ATTESTATION_PROXY_IMAGE": "attestation_proxy_image",
         "CADDY_INGRESS_IMAGE": "caddy_ingress_image",
@@ -378,7 +387,16 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
             "(literal lowercase 'https://' prefix, no newlines/spaces/tabs/"
             "quotes/braces/semicolons, ASCII-only)"
         )
-    hex32_bytes("signing_service_pubkey_hex", payload["signing_service_pubkey_hex"])
+    trustee_key = hex32_bytes(
+        "platform_trustee_policy_pubkey_hex", payload["platform_trustee_policy_pubkey_hex"]
+    )
+    if trustee_key == hex32_bytes(
+        "signing_service_pubkey_hex", payload["signing_service_pubkey_hex"]
+    ):
+        raise ValueError(
+            "platform_trustee_policy_pubkey_hex must differ from signing_service_pubkey_hex "
+            "(two trust domains must not share one key)"
+        )
     hex32_bytes("policy_template_sha256", payload["policy_template_sha256"])
     hex32_bytes(
         "expected_firmware_measurement", payload["expected_firmware_measurement"]
@@ -401,7 +419,10 @@ def signing_seed(args: argparse.Namespace) -> str:
 
 def generate(args: argparse.Namespace) -> str:
     base = json.loads(args.input.read_text())
-    payload = env_overlay(base["payload"])
+    payload = base["payload"]
+    if args.dev_fixture_key and not payload.get("platform_trustee_policy_pubkey_hex"):
+        payload["platform_trustee_policy_pubkey_hex"] = DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX
+    payload = env_overlay(payload)
     validate_payload(payload, allow_dev_internal_tls=args.dev_fixture_key)
 
     seed = hex32_bytes("ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX", signing_seed(args))

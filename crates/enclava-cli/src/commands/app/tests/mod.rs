@@ -76,6 +76,7 @@ fn test_release() -> PlatformRelease {
             platform_release_version: "test".to_string(),
             signing_service_url: "https://signing.example.test".to_string(),
             signing_service_pubkey_hex: "11".repeat(32),
+            platform_trustee_policy_pubkey_hex: "33".repeat(32),
             policy_template_id: "trustee-resource-policy-v1".to_string(),
             policy_template_sha256: "22".repeat(32),
             policy_template_text: "package policy\n".to_string(),

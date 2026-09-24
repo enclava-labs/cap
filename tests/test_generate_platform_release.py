@@ -395,3 +395,19 @@ def test_release_generator_rejects_invalid_unbracketed_colon_hosts():
         payload["trustee_kbs_url"] = value
         with pytest.raises(ValueError, match="trustee_kbs_url must be https"):
             generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_collapsed_trustee_and_signing_keys():
+    payload = base_payload()
+    payload["platform_trustee_policy_pubkey_hex"] = payload["signing_service_pubkey_hex"]
+
+    with pytest.raises(ValueError, match="must differ from signing_service_pubkey_hex"):
+        generate_platform_release.validate_payload(payload)
+
+
+def test_release_generator_rejects_missing_trustee_policy_key():
+    payload = base_payload()
+    del payload["platform_trustee_policy_pubkey_hex"]
+
+    with pytest.raises(KeyError):
+        generate_platform_release.validate_payload(payload)

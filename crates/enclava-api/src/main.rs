@@ -414,6 +414,46 @@ fn release_env_value(
     }
 }
 
+/// Loads the two policy-authority pubkeys, each from its own signed release
+/// field (or matching env override). The platform trustee policy key and the
+/// signing-service key are distinct trust domains: collapsing them into one
+/// key is an error, not a fallback (cap#118).
+fn load_policy_authority_pubkeys(
+    platform_release: Option<&PlatformRelease>,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let platform_trustee_policy_pubkey_hex = load_pubkey_hex_value(
+        "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
+        release_env_value(
+            "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
+            platform_release.map(|release| release.platform_trustee_policy_pubkey_hex.as_str()),
+            false,
+        )?,
+        false,
+    )?;
+    let signing_service_pubkey_hex = load_pubkey_hex_value(
+        "SIGNING_SERVICE_PUBKEY_HEX",
+        release_env_value(
+            "SIGNING_SERVICE_PUBKEY_HEX",
+            platform_release.map(|release| release.signing_service_pubkey_hex.as_str()),
+            false,
+        )?,
+        false,
+    )?;
+    if let (Some(trustee_key), Some(signing_key)) = (
+        &platform_trustee_policy_pubkey_hex,
+        &signing_service_pubkey_hex,
+    ) && trustee_key == signing_key
+    {
+        anyhow::bail!(
+            "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX and SIGNING_SERVICE_PUBKEY_HEX must be distinct keys (in-TEE policy authority vs signing service); collapsing them is not allowed"
+        );
+    }
+    Ok((
+        platform_trustee_policy_pubkey_hex,
+        signing_service_pubkey_hex,
+    ))
+}
+
 fn load_attestation_config(
     platform_release: Option<&PlatformRelease>,
 ) -> anyhow::Result<Option<AttestationConfig>> {
@@ -471,18 +511,13 @@ fn load_attestation_config(
     )?;
     let amd_kds_base_url = load_url_env("AMD_KDS_BASE_URL", true)?;
     let trustee_policy_url = load_url_env("TRUSTEE_POLICY_URL", trustee_policy_read_available)?;
-    let release_pubkey =
-        platform_release.map(|release| release.signing_service_pubkey_hex.as_str());
-    let platform_trustee_policy_pubkey_hex = load_pubkey_hex_value(
-        "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
-        release_env_value("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", release_pubkey, false)?,
-        false,
-    )?;
-    let signing_service_pubkey_hex = load_pubkey_hex_value(
-        "SIGNING_SERVICE_PUBKEY_HEX",
-        release_env_value("SIGNING_SERVICE_PUBKEY_HEX", release_pubkey, false)?,
-        false,
-    )?;
+    // The platform trustee policy key and the signing-service key are two
+    // distinct trust domains (in-TEE policy authority vs off-cluster signing
+    // service). Each comes from its own signed release field; a release (or
+    // env override) that collapses them into one key is an error, not a
+    // fallback — compromise or revocation of either must not collapse both.
+    let (platform_trustee_policy_pubkey_hex, signing_service_pubkey_hex) =
+        load_policy_authority_pubkeys(platform_release)?;
 
     Ok(AttestationConfig {
         proxy_image: parse_image_ref("ATTESTATION_PROXY_IMAGE", &proxy_image_ref)?,
@@ -1011,6 +1046,26 @@ mod tests {
             "18446744073709551616",
         ] {
             assert!(parse_acme_dns_lookup_settings(None, Some(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn policy_authority_pubkeys_reject_collapse_to_one_key() {
+        // cap#118: the platform trustee policy key and the signing-service
+        // key are two trust domains. Without a signed release they may come
+        // from env; an operator (or legacy config) that sets both to the
+        // same hex must fail startup instead of silently collapsing the
+        // domains.
+        let key = "11".repeat(32);
+        unsafe {
+            std::env::set_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", &key);
+            std::env::set_var("SIGNING_SERVICE_PUBKEY_HEX", &key);
+        }
+        let err = load_policy_authority_pubkeys(None).unwrap_err();
+        assert!(err.to_string().contains("must be distinct keys"));
+        unsafe {
+            std::env::remove_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX");
+            std::env::remove_var("SIGNING_SERVICE_PUBKEY_HEX");
         }
     }
 

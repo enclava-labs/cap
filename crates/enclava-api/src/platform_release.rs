@@ -123,6 +123,7 @@ pub struct PlatformRelease {
     pub platform_release_version: String,
     pub signing_service_url: String,
     pub signing_service_pubkey_hex: String,
+    pub platform_trustee_policy_pubkey_hex: String,
     pub policy_template_id: String,
     pub policy_template_sha256: String,
     pub policy_template_text: String,
@@ -158,6 +159,17 @@ impl PlatformRelease {
         hex32(
             "signing_service_pubkey_hex",
             &self.signing_service_pubkey_hex,
+        )
+    }
+
+    /// Dedicated in-TEE policy authority key. Must differ from
+    /// `signing_service_pubkey_hex`: the two are distinct trust domains
+    /// (in-TEE policy authority vs off-cluster signing service) and a
+    /// release that collapses them is rejected at validation time.
+    pub fn platform_trustee_policy_pubkey_bytes(&self) -> Result<[u8; 32], PlatformReleaseError> {
+        hex32(
+            "platform_trustee_policy_pubkey_hex",
+            &self.platform_trustee_policy_pubkey_hex,
         )
     }
 }
@@ -277,6 +289,7 @@ pub fn canonical_platform_release_bytes(
         "signing_service_pubkey_hex",
         &release.signing_service_pubkey_hex,
     )?;
+    let platform_trustee_policy_pubkey = release.platform_trustee_policy_pubkey_bytes()?;
     let policy_template_sha256 = release.policy_template_sha256_bytes()?;
     let expected_firmware_measurement = release.expected_firmware_measurement_bytes()?;
     Ok(ce_v1_bytes(&[
@@ -291,6 +304,10 @@ pub fn canonical_platform_release_bytes(
             release.signing_service_url.as_bytes(),
         ),
         ("signing_service_pubkey", &signing_service_pubkey),
+        (
+            "platform_trustee_policy_pubkey",
+            &platform_trustee_policy_pubkey,
+        ),
         ("policy_template_id", release.policy_template_id.as_bytes()),
         ("policy_template_sha256", &policy_template_sha256),
         (
@@ -365,6 +382,13 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
         "signing_service_pubkey_hex",
         &release.signing_service_pubkey_hex,
     )?;
+    let platform_trustee_policy_pubkey = release.platform_trustee_policy_pubkey_bytes()?;
+    if platform_trustee_policy_pubkey == release.signing_service_pubkey_bytes()? {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "platform_trustee_policy_pubkey_hex",
+            message: "platform trustee policy key must be distinct from the signing-service key (two trust domains must not share one key)".to_string(),
+        });
+    }
     hex32("policy_template_sha256", &release.policy_template_sha256)?;
     hex32(
         "expected_firmware_measurement",
@@ -546,6 +570,31 @@ mod tests {
             .push_str("-tampered");
         let err = verify_envelope(tampered).unwrap_err();
         assert!(matches!(err, PlatformReleaseError::BadSignature(_)));
+    }
+
+    #[test]
+    fn bundled_release_carries_a_distinct_platform_trustee_policy_key() {
+        // cap#118: the in-TEE policy authority and the off-cluster signing
+        // service are two trust domains. The bundled signed release must pin
+        // a dedicated trustee policy key that differs from the
+        // signing-service key.
+        let release = PlatformRelease::load_verified().unwrap();
+        let trustee = release.platform_trustee_policy_pubkey_bytes().unwrap();
+        let signing = release.signing_service_pubkey_bytes().unwrap();
+        assert_ne!(trustee, signing);
+    }
+
+    #[test]
+    fn release_payload_rejects_collapsed_trustee_and_signing_keys() {
+        // A release (hand-crafted or mis-rotated) that collapses the two
+        // trust domains onto one key must fail validation, not fall back.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.platform_trustee_policy_pubkey_hex = payload.signing_service_pubkey_hex.clone();
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "platform_trustee_policy_pubkey_hex")
+        );
     }
 
     #[test]
