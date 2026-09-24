@@ -30,10 +30,11 @@ CREATE INDEX idx_withdrawn_signer_artifacts_app
 
 -- Backfill: an app whose current signer identity differs from an artifact's
 -- signed descriptor identity has already been rotated; withdraw those
--- artifacts so the selector stops re-admitting them. The predicate mirrors
--- the runtime withdrawal (a descriptor signer_identity object that no longer
--- matches the app's pinned identity), and only rows with the object present
--- are considered.
+-- artifacts so the selector stops re-admitting them. Unlike the runtime
+-- withdrawal (which matches the exact rotated-out identity), this backfill
+-- withdraws any descriptor signer_identity object that no longer equals the
+-- app's currently pinned identity; only rows with the object present are
+-- considered.
 INSERT INTO withdrawn_signer_artifacts (
     descriptor_core_hash, app_id, rotated_out_at
 )
@@ -54,6 +55,9 @@ ON CONFLICT DO NOTHING;
 -- durable desired generation in the same migration so the reconciler
 -- renders and publishes the withdrawal instead of seeing a same-generation
 -- content change (which it reports as a conflict and retries forever).
+-- The guard keeps unsigned-only installs (no artifacts, generation 0) out
+-- of signed mode. Note: a rollback to a withdrawn artifact stays refused by
+-- the selector — fail-closed is intentional for a rotated-out signer.
 UPDATE kbs_signed_policy_reconciliation
    SET desired_generation = desired_generation + 1,
        updated_at = clock_timestamp()
