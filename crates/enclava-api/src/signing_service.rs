@@ -49,6 +49,28 @@ pub async fn lock_org_signing_authority_lane(
     Ok(())
 }
 
+/// Acquire the signing-authority lane and return the authoritative
+/// "now" observed strictly after the lock is held.
+///
+/// The lane is a blocking advisory lock: callers can queue behind other
+/// signing-authority writers (which perform signing-service requests while
+/// holding it) for longer than any freshness window. A reference time
+/// captured before locking therefore describes the past, not the moment
+/// the caller's own checks run. This reads clock_timestamp() from the
+/// already-locked transaction so freshness bounds use the post-acquisition
+/// instant on the same clock that witnesses org_keyrings.created_at
+/// (migration 0051).
+pub async fn lock_org_signing_authority_lane_now(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: Uuid,
+) -> Result<DateTime<Utc>, sqlx::Error> {
+    lock_org_signing_authority_lane(tx, org_id).await?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(now)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SigningServiceError {
     #[error("customer_descriptor_blob and org_keyring_blob must be provided together")]
