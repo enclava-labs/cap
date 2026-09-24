@@ -1026,6 +1026,13 @@ async fn load_signed_policy_candidates(
                    ORDER BY org_id, version DESC
               ) AS latest,
               jsonb_array_elements(latest.keyring->'members') AS member
+            -- Mirror the verifier's deploy-authority predicate
+            -- (enclava-verifier artifacts.rs: only owner/admin/deployer
+            -- members may sign policy).  A member without a string role
+            -- matches neither side and is excluded here, exactly as
+            -- verification would reject its artifacts -- fail closed if a
+            -- non-deploy role is ever added to keyring payloads.
+            WHERE (member.value->>'role') IN ('owner', 'admin', 'deployer')
         ),
         eligible_current_job_operations AS (
             SELECT *
