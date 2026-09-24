@@ -1053,7 +1053,16 @@ fn rotate_spool_if_needed(spool: &mut File, incoming: u64, path: &Path) -> std::
     let keep_from = len.saturating_sub(LOG_SPOOL_KEEP_BYTES);
     let mut retain_buf = Vec::new();
     spool.seek(SeekFrom::Start(keep_from))?;
-    spool.read_to_end(&mut retain_buf)?;
+    // Bounded retention read (round-19 review P2): never read past the
+    // sampled `len`. The workload shares the group-writable logs volume and
+    // can append directly to the spool inode while rotation runs; an
+    // unbounded read_to_end would keep consuming those bytes (allocating
+    // up to the 64 MiB volume cap) while the spool mutex is held, starving
+    // both forwarders and eventually blocking the child's stdout/stderr.
+    // Only the snapshot that existed when `len` was sampled is retained.
+    Read::by_ref(spool)
+        .take(len - keep_from)
+        .read_to_end(&mut retain_buf)?;
     // Align the retained window to the next frame boundary: rotation can
     // start mid-line, and the relay's tail_lines only discards a partial
     // first line when its read offset is nonzero.
