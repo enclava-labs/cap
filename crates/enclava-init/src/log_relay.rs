@@ -430,17 +430,28 @@ fn remember_delivered_line(bytes: &[u8], delivered: &mut DeliveredSequences) {
 /// hashed (rotation retains at most `LOG_SPOOL_KEEP_BYTES` = 8 MiB of
 /// pre-rotation content in `enclava-wait-exec`, and anything older can
 /// never be replayed) and past WITHHELD_SET_CAP the oldest hashes are
-/// FIFO-evicted — a poisoned spool of tiny lines costs replay of some
-/// old lines to that one client, never unbounded memory and never a
-/// dropped frame. If wait-exec's retain window ever grows past
-/// WITHHELD_SCAN_BYTES the failure mode is likewise replay, not loss.
+/// FIFO-evicted. The set cap is deliberately SMALL (round-16 self-check
+/// P2): this set is retained per follower for the whole session — an idle
+/// follower never writes, so its socket timeout never fires — and the cap
+/// × ~32 B/hash bounds one follower's withheld state to a few hundred KiB
+/// instead of the multi-MiB footprint a full 8 MiB window of tiny lines
+/// would otherwise pin against enclava-init's 512 MiB limit. A window
+/// with more distinct lines than the cap (tiny lines, or deliberate
+/// poisoning) evicts the oldest hashes: the cost is bounded REPLAY of
+/// those pre-tail lines to that one client after a rotation — never
+/// unbounded memory, never a dropped frame. If wait-exec's retain window
+/// ever grows past WITHHELD_SCAN_BYTES the failure mode is likewise
+/// replay, not loss.
 #[derive(Debug, Default)]
 struct WithheldContent {
     hashes: std::collections::HashSet<u128>,
     insertion_order: std::collections::VecDeque<u128>,
 }
 
-const WITHHELD_SET_CAP: usize = 65_536;
+// Deliberately small: retained per follower (including idle ones) for the
+// whole session — see the `WithheldContent` docs. 8192 × ~32 B ≈ 256 KiB
+// worst case per follower; eviction costs bounded replay, never loss.
+const WITHHELD_SET_CAP: usize = 8_192;
 const WITHHELD_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 
 impl WithheldContent {
@@ -785,13 +796,15 @@ fn follow_spool<W: Write>(
     // behavior for anything not a frame).
     let mut delivered = initial_delivered;
     loop {
-        thread::sleep(FOLLOW_POLL_INTERVAL);
         // The spool fd is opened fresh each poll and dropped before ANY
         // client write below: no descriptor survives across blocking socket
         // I/O, so a stalled client cannot pin a rotation generation for the
         // FOLLOW_IO_TIMEOUT window (round-11 review P1). Rotation is
         // detected from the remembered FollowAnchor instead.
         let Ok(mut file) = open_spool_for_read(path) else {
+            // Missing, replaced, or planted-symlink spool: retry at the
+            // poll cadence instead of spinning.
+            thread::sleep(FOLLOW_POLL_INTERVAL);
             continue;
         };
         let current_identity = spool_identity(&file)?;
@@ -826,10 +839,15 @@ fn follow_spool<W: Write>(
         // directly, and ~16 synchronized followers could allocate past
         // enclava-init's 512 MiB limit and OOM the privileged sidecar. A
         // catch-up larger than the bound is delivered in bounded quanta
-        // across polls: the scan stops before the next never-delivered
-        // line and the next poll resumes exactly there — nothing dropped,
-        // nothing replayed.
+        // across back-to-back (unpaced) polls: the scan stops before the
+        // next never-delivered line and the next poll resumes exactly
+        // there — nothing dropped and nothing replayed while the inode
+        // survives (a rotation can still delete a gap a lagging follower
+        // never reached — the poll pacing below keeps that lag bounded).
         if same_as_held && len == *offset {
+            // Caught up (nothing past the delivered boundary): pace the
+            // poll loop.
+            thread::sleep(FOLLOW_POLL_INTERVAL);
             continue;
         }
         let from = if same_as_held { *offset } else { 0 };
@@ -866,7 +884,33 @@ fn follow_spool<W: Write>(
             stream.write_all(&plan.out)?;
         }
         stream.flush()?;
+        // Poll pacing (round-16 self-check P2): sleep ONLY when this poll
+        // is caught up. A planner that stopped early on the bounded send
+        // budget mid-catch-up (progress made, more bytes waiting) continues
+        // with its next quantum IMMEDIATELY: pacing every poll capped a
+        // follower at ~MAX_TAIL_BYTES per FOLLOW_POLL_INTERVAL (~4 MiB/s),
+        // and a writer faster than that pulls the follower more than
+        // LOG_SPOOL_KEEP_BYTES behind, so the next rotation deletes the gap
+        // before it was ever sent (the quanta are lossless only while the
+        // inode survives). A poll that made NO progress (an in-flight
+        // trailing fragment still unterminated) paces like an idle poll
+        // instead of spinning.
+        if should_pace_poll(from, plan.offset, len) {
+            thread::sleep(FOLLOW_POLL_INTERVAL);
+        }
     }
+}
+
+/// Poll pacing decision (round-16 self-check P2): pace (sleep) whenever the
+/// poll is caught up — the planner consumed everything up to the scanned
+/// end (`planned >= len`) — or made no progress (`planned == from`: only an
+/// in-flight fragment past the cursor, waiting on the writer; never spin).
+/// An UNFINISHED catch-up (progressed but short of the scanned end: the
+/// bounded send budget stopped the plan) must NOT be paced, or a follower
+/// drains at most one quantum per interval and a fast writer drags it past
+/// the rotation retain window.
+fn should_pace_poll(from: u64, planned: u64, len: u64) -> bool {
+    !(planned > from && planned < len)
 }
 
 /// Bounded streaming delivery plan (round-13 review P1): scan the spool
@@ -1869,6 +1913,24 @@ mod tests {
         assert_eq!(sent, format!("{}\n", frame(7)));
         // The cursor advanced to the new end of the last complete line.
         assert_eq!(offset, (body.len() + frame(7).len() + 1) as u64);
+    }
+
+    /// Round-16 self-check P2: the follow loop only paces (sleeps between
+    /// polls) when the poll is CAUGHT UP. An unfinished bounded-quantum
+    /// catch-up (progress made, more bytes waiting) must continue
+    /// immediately, or a follower drains at most ~MAX_TAIL_BYTES per
+    /// FOLLOW_POLL_INTERVAL (~4 MiB/s) and a fast writer pulls it past the
+    /// rotation retain window — the gap is then deleted unsent. No-progress
+    /// polls (an in-flight fragment past the cursor) pace like idle polls
+    /// instead of spinning.
+    #[test]
+    fn poll_pacing_only_applies_when_caught_up_or_stalled() {
+        // Unfinished catch-up: progressed but short of the scanned end.
+        assert!(!should_pace_poll(0, 4096, 8192));
+        // Caught up at the scanned end (also a skipped-only resync scan).
+        assert!(should_pace_poll(0, 8192, 8192));
+        // No progress (offset parked at `from` on an in-flight fragment).
+        assert!(should_pace_poll(4096, 4096, 8192));
     }
 
     /// `tail_lines`' SNAPSHOT anchor must equal the `anchor_for`

@@ -646,8 +646,10 @@ where
         let record = read_capped_record(&mut reader, &mut buf, &mut pending_cr)
             .map_err(|err| format!("failed to read child {stream}: {err}"))?;
         if record.terminator_only {
-            // The previous capped chunk's boundary CRLF was resolved here:
-            // its record was already framed and appended — just read on.
+            // The previous capped chunk's boundary CRLF was resolved here,
+            // or its parked boundary CR turned out to be the historical
+            // trailing-CR cleanup byte at EOF: its record was already
+            // framed and appended — just read on.
             continue;
         }
         if record.len == 0 {
@@ -777,7 +779,10 @@ struct CappedRecord {
 /// byte is consumed from the reader and parked in `pending_cr`; the next
 /// call resolves it — `\n` next means the pair was the record's
 /// terminator (consumed, nothing returned), anything else means the `\r`
-/// was record content (round-5) and is prepended to the next chunk.
+/// was record content (round-5) and is prepended to the next chunk, and
+/// EOF means the historical trailing-CR cleanup byte — already excluded
+/// from the framed capped chunk — and is discarded with no record
+/// (round-16 self-check P2).
 fn read_capped_record<R: BufRead>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -786,10 +791,30 @@ fn read_capped_record<R: BufRead>(
     buf.clear();
     // Round-12: resolve a CR parked at the previous call's cap boundary.
     // It was already consumed from the reader, so decide from the next
-    // visible byte only.
+    // visible byte only: `\n` next means the pair was the record's
+    // terminator (consumed, nothing returned), a non-LF byte means the
+    // `\r` was record content (round-5) and is prepended to the next chunk,
+    // and EOF means the historical trailing-CR cleanup byte (discarded —
+    // round-16 self-check P2).
     if *pending_cr {
         *pending_cr = false;
         let peek = reader.fill_buf()?;
+        if peek.is_empty() {
+            // EOF right after the parked CR (round-16 self-check P2): the
+            // capped chunk that parked it has already been framed WITHOUT
+            // this byte, and a trailing CR at EOF is exactly the historical
+            // cleanup case (one record, trailing CR stripped). Returning
+            // the parked byte as a record here produced a CR-only final
+            // record that the caller's strip emptied and then encrypted —
+            // a fabricated blank frame after every cap-boundary record
+            // whose stream ended on a lone CR. Discard it: no record, just
+            // read on to the EOF return.
+            return Ok(CappedRecord {
+                len: 0,
+                capped: false,
+                terminator_only: true,
+            });
+        }
         if let Some(b'\n') = peek.first() {
             reader.consume(1);
             // The parked `\r` plus this `\n` were the capped record's
@@ -2112,6 +2137,52 @@ mod tests {
         assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
         assert!(r1.capped, "lone CR at the boundary is content, not CRLF");
         assert_eq!(first.last(), Some(&b'\r'));
+    }
+
+    /// Round-16 self-check P2: a CR parked at the cap boundary when the
+    /// stream ENDS must not come back as a record. The capped chunk was
+    /// already framed without the parked byte, and a trailing CR at EOF is
+    /// the historical cleanup case — one record, trailing CR stripped.
+    /// Returning the parked byte as a CR-only record made the caller's
+    /// strip produce an empty buffer that was still encrypted and appended:
+    /// a fabricated blank frame after every cap-boundary record whose stream
+    /// ended on a lone CR (where the pre-chunker emitted exactly one frame).
+    #[test]
+    fn read_capped_record_pending_cr_at_eof_is_discarded_not_a_record() {
+        let payload = "a".repeat(MAX_LOG_RECORD_BYTES);
+        // Windows: exactly the cap of payload, then the lone `\r` — and the
+        // stream ends (the `X` of the `\rX` content case never comes).
+        let mut reader = ChunkedReader {
+            parts: [payload.clone().into_bytes(), b"\r".to_vec()]
+                .into_iter()
+                .collect(),
+        };
+
+        // First read: the capped chunk; the lone `\r` is parked (it could
+        // still be content per round-5 if a byte follows).
+        let mut pending_cr = false;
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES);
+        assert!(r1.capped);
+        assert!(pending_cr);
+        assert_eq!(first.as_slice(), payload.as_bytes());
+
+        // EOF resolution: the parked CR is the historical trailing-CR
+        // cleanup byte — no record (previously len=1, capped=false, which
+        // the caller stripped to empty and encrypted as a blank frame).
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        assert!(r2.terminator_only, "EOF-parked CR must not become a record");
+        assert_eq!(r2.len, 0);
+        assert!(second.is_empty());
+        assert!(!pending_cr);
+
+        // The stream is at EOF.
+        let mut third = Vec::new();
+        let r3 = read_capped_record(&mut reader, &mut third, &mut pending_cr).unwrap();
+        assert_eq!(r3.len, 0);
+        assert!(!r3.terminator_only);
     }
 
     /// A `BufRead` whose fill_buf windows are exactly the given parts —

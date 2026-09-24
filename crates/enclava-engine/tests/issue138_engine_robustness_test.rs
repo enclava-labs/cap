@@ -384,6 +384,32 @@ fn validate_rejects_quantities_exceeding_api_precision_bounds() {
     assert!(validate_app(&app).is_ok());
 }
 
+/// Round-16 self-check P3: the overflow gate must run on the API's
+/// `ScaledDecimal` NORMALIZED coefficient, not the raw digit string. The API
+/// (entitlements.rs `normalized()`) strips trailing fractional zeros before
+/// `checked_mul`, so a long zero-fraction quantity it accepts must pass the
+/// engine gate too — and trailing zeros must not MASK a real overflow.
+#[test]
+fn validate_matches_api_trailing_zero_normalization() {
+    let mut app = sample_app();
+    // 38 digits with a 24-zero fraction: the raw coefficient is 10^37 and
+    // the Ti multiply overflows u128, but the API normalizes to 10^13 first
+    // (10^13 * 2^20 fits comfortably).
+    app.storage.app_data.size = format!("10000000000000.{}Ti", "0".repeat(24));
+    assert!(validate_app(&app).is_ok());
+    // Normalization does not mask overflows: 38 ones has no trailing zeros
+    // to strip and 1.1e37 * 2^20 still overflows u128.
+    app.storage.app_data.size = format!("{}Ti", "1".repeat(38));
+    assert!(
+        matches!(
+            validate_app(&app),
+            Err(ValidationError::InvalidStorageSize { field, .. })
+                if field == "storage.app_data.size"
+        ),
+        "unnormalizable overflow must still be rejected"
+    );
+}
+
 /// Round 3 review (Codex P2): tee_domain flows into the attestation
 /// container's TEE_DOMAIN env and the TEE TLSRoute hostname, so a malformed
 /// value must fail deploy validation like the other domains.

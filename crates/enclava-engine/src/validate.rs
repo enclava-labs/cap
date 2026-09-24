@@ -269,6 +269,19 @@ fn validate_scaled_decimal(number: &str, multiplier: u128) -> Result<(), String>
     if coefficient == 0 {
         return Err("must be positive".to_string());
     }
+    // Mirror `ScaledDecimal::parse`'s trailing-zero normalization
+    // (entitlements.rs `normalized()`) before the exact-Mi multiply: the
+    // API divides trailing zeros out of the coefficient as it lowers the
+    // scale, so `10000000000000.000000000000000000000000Ti` multiplies
+    // 10^13 by 2^20 there — while the raw 38-digit coefficient (10^37)
+    // times 2^20 overflows u128. Without this step the engine gate
+    // rejected quantities the API accepts (round-16 self-check P3).
+    let mut coefficient = coefficient;
+    let mut scale = fraction.len();
+    while scale > 0 && coefficient.is_multiple_of(10) {
+        coefficient /= 10;
+        scale -= 1;
+    }
     coefficient
         .checked_mul(multiplier)
         .ok_or_else(|| "is too large".to_string())?;
