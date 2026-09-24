@@ -532,12 +532,7 @@ impl DeploymentSigningArtifacts {
         {
             return Err(SigningServiceError::Mismatch("tee_domain".into()));
         }
-        let app_custom_domains: Vec<&str> = app
-            .custom_domain
-            .as_deref()
-            .into_iter()
-            .filter(|domain| !domain.is_empty())
-            .collect();
+        let app_custom_domains: Vec<&str> = app.custom_domain.as_deref().into_iter().collect();
         if self.descriptor.custom_domains != app_custom_domains {
             return Err(SigningServiceError::Mismatch("custom_domains".into()));
         }
@@ -582,7 +577,7 @@ impl DeploymentSigningArtifacts {
         if self.org_keyring.org_id != app.org_id {
             return Err(SigningServiceError::Mismatch("org_keyring.org_id".into()));
         }
-        self.validate_platform_binding(platform)?;
+        self.validate_platform_binding(app, platform)?;
         Ok(())
     }
 
@@ -590,11 +585,12 @@ impl DeploymentSigningArtifacts {
     /// this API instance actually runs (issue #129): the descriptor's
     /// customer-signed platform fields must match the loaded signed platform
     /// release and the configured attestation sidecar digests, and the KBS
-    /// owner resource path must match the app's namespace/name-derived
-    /// canonical path so a descriptor cannot self-authorize access to another
-    /// app's owner resources.
+    /// owner resource path must match the canonical path derived from the
+    /// app row itself so a descriptor cannot self-authorize access to
+    /// another app's owner resources.
     fn validate_platform_binding(
         &self,
+        app: &App,
         platform: &DescriptorPlatformBinding,
     ) -> Result<(), SigningServiceError> {
         let mismatch = |field: &'static str| SigningServiceError::Mismatch(field.into());
@@ -633,9 +629,12 @@ impl DeploymentSigningArtifacts {
         {
             return Err(mismatch("sidecars.caddy_digest"));
         }
+        // Derived from the app row, not the descriptor's own copy of the
+        // same fields: this stays a cross-check even if the descriptor
+        // equality checks above are ever relaxed or reordered.
         let expected_kbs_resource_path = format!(
             "default/{}-{}-owner/seed-encrypted",
-            self.descriptor.namespace, self.descriptor.app_name
+            app.namespace, app.name
         );
         if self.descriptor.kbs_resource_path != expected_kbs_resource_path {
             return Err(mismatch("kbs_resource_path"));

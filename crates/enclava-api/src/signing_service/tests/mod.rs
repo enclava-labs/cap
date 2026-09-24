@@ -516,6 +516,110 @@ fn rejects_descriptor_custom_domains_not_matching_app_row() {
 }
 
 #[test]
+fn rejects_full_width_firmware_measurement_under_v1_release() {
+    // The v1 platform release carries a 32-byte measurement; a v2 descriptor
+    // with a 48-byte measurement must be rejected (fail-closed) until the
+    // release format grows a full-width value and an explicit width policy.
+    let mut descriptor = descriptor();
+    descriptor.expected_firmware_measurement =
+        enclava_common::descriptor::FirmwareMeasurement::Full([3; 48]);
+    let artifacts = signing_artifacts(descriptor.clone());
+    let app = api_app_for_descriptor(&descriptor, crate::models::UnlockMode::Password);
+
+    let err = artifacts
+        .validate_deployment_inputs(
+            &app,
+            &descriptor.image_digest,
+            &descriptor.api_signing_pubkey,
+            &platform_binding(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&err, SigningServiceError::Mismatch(field) if field == "expected_firmware_measurement"),
+        "48-byte measurement must not silently match the 32-byte release prefix, got {err:?}"
+    );
+}
+
+fn test_platform_release() -> crate::platform_release::PlatformRelease {
+    serde_json::from_str::<crate::platform_release::PlatformReleaseEnvelope>(include_str!(
+        "../../../../enclava-cli/platform-release.json"
+    ))
+    .unwrap()
+    .payload
+}
+
+fn test_attestation_config() -> AttestationConfig {
+    AttestationConfig {
+        proxy_image: ImageRef::parse(
+            "ghcr.io/enclava-labs/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap(),
+        caddy_image: ImageRef::parse(
+            "ghcr.io/enclava-labs/caddy-ingress@sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        )
+        .unwrap(),
+        acme_ca_url: enclava_engine::types::default_acme_ca_url(),
+        caddy_tls_mode: enclava_engine::types::CaddyTlsMode::Acme,
+        trustee_policy_read_available: true,
+        workload_artifacts_url: None,
+        tls_certificate_broker_url: None,
+        amd_kds_base_url: None,
+        trustee_policy_url: None,
+        local_workload_artifacts_json: None,
+        local_trustee_policy_json: None,
+        platform_trustee_policy_pubkey_hex: None,
+        signing_service_pubkey_hex: None,
+        verification_material: None,
+    }
+}
+
+#[test]
+fn from_runtime_resolves_sidecar_and_release_fields() {
+    let release = test_platform_release();
+    let attestation = test_attestation_config();
+    let binding =
+        DescriptorPlatformBinding::from_runtime(Some(&release), Some(&attestation), "1Gi").unwrap();
+    assert_eq!(
+        binding.attestation_proxy_digest.as_deref(),
+        Some(attestation.proxy_image.digest())
+    );
+    assert_eq!(
+        binding.caddy_digest.as_deref(),
+        Some(attestation.caddy_image.digest())
+    );
+    assert_eq!(
+        binding.platform_release_version.as_deref(),
+        Some(release.platform_release_version.as_str())
+    );
+    assert_eq!(
+        binding.policy_template_sha256,
+        Some(release.policy_template_sha256_bytes().unwrap())
+    );
+    // 1Gi is a standard shape: the release default class applies.
+    assert_eq!(
+        binding.expected_runtime_class.as_deref(),
+        Some(release.expected_runtime_class.as_str())
+    );
+}
+
+#[test]
+fn from_runtime_small_memory_limit_selects_small_runtime_class() {
+    let release = test_platform_release();
+    let binding = DescriptorPlatformBinding::from_runtime(Some(&release), None, "256Mi").unwrap();
+    assert_eq!(
+        binding.expected_runtime_class.as_deref(),
+        Some(enclava_engine::manifest::shape::SMALL_RUNTIME_CLASS)
+    );
+    // No attestation config: sidecar digests are skipped, release fields stay.
+    assert_eq!(binding.attestation_proxy_digest, None);
+    assert_eq!(binding.caddy_digest, None);
+    assert_eq!(
+        binding.platform_release_version.as_deref(),
+        Some(release.platform_release_version.as_str())
+    );
+}
+
+#[test]
 fn platform_binding_skips_unconfigured_fields() {
     let descriptor = descriptor();
     let artifacts = signing_artifacts(descriptor.clone());
