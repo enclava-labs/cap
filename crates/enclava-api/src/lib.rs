@@ -2140,14 +2140,18 @@ pub(crate) mod test_support {
             .await
             .expect("create isolated keyring database");
         admin.close().await;
-        // Same URL with only the database path replaced.
-        let path_start = base_url
-            .rfind('/')
-            .expect("database URL has a path component");
-        let isolated_url = format!("{}/{}", &base_url[..path_start], db_name);
+        // Same connection settings with only the database replaced: parse
+        // the URL instead of slicing it so query parameters (sslmode, a
+        // Unix-socket `host`, `options`, ...) survive the swap.  String
+        // slicing on the last '/' would drop the whole query string and a
+        // socket-host URL can even place a '/' inside the query.
+        let options = base_url
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("parse DATABASE_URL for isolated keyring database")
+            .database(&db_name);
         let pool = PgPoolOptions::new()
             .max_connections(4)
-            .connect(&isolated_url)
+            .connect_with(options)
             .await
             .expect("connect isolated keyring database");
         crate::db::pool::run_migrations(&pool)
@@ -2193,6 +2197,31 @@ pub(crate) mod test_support {
             .join()
             .expect("isolated database cleanup thread");
         }
+    }
+
+    #[test]
+    fn isolated_database_url_preserves_query_parameters() {
+        // The isolated pool must keep every connection option carried in the
+        // URL's query string (sslmode, options, a socket host, ...) and only
+        // swap the database name; string slicing on the last '/' would drop
+        // the whole query (and a socket-host URL can even place a '/' inside
+        // it).  Regression guard for the Codex review finding on #178.
+        let base = "postgresql://test:test@localhost:5432/test?sslmode=require"
+            .parse::<sqlx::postgres::PgConnectOptions>()
+            .expect("parse DATABASE_URL");
+        assert_eq!(base.get_database(), Some("test"));
+        let swapped = base.clone().database("cap130_swap");
+        assert_eq!(swapped.get_database(), Some("cap130_swap"));
+        assert_eq!(swapped.get_host(), base.get_host());
+        assert_eq!(swapped.get_port(), base.get_port());
+        assert_eq!(swapped.get_username(), base.get_username());
+        // The sslmode=require query parameter survives the database swap
+        // (PgSslMode has no PartialEq; Debug is derived and exhaustive).
+        assert_eq!(
+            format!("{:?}", swapped.get_ssl_mode()),
+            format!("{:?}", base.get_ssl_mode())
+        );
+        assert_eq!(format!("{:?}", swapped.get_ssl_mode()), "Require");
     }
 
     /// Companion to [`isolated_database_test_pool`]: closes the pool and
