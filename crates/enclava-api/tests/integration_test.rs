@@ -1137,10 +1137,12 @@ async fn email_auth_enumeration_hardening() {
         .await;
     assert_eq!(ok.status_code(), StatusCode::OK);
 
-    // Org invite: unknown email must not 404 "user not found". It gets the
-    // same generic 403 "invite not permitted" as a disallowed privileged
-    // invite of a known user — and an owner inviting a KNOWN email as
-    // member still succeeds, so the endpoint remains usable.
+    // Org invite: unknown email must not 404 "user not found". It gets a
+    // generic 403 "invite not permitted" (distinct from the owner-gate
+    // 403 a disallowed privileged invite of a known user returns — an
+    // accepted residual, see the comment in routes/orgs.rs). An owner
+    // inviting a KNOWN email as member still succeeds, so the endpoint
+    // remains usable.
     let (session_token, _org_id) = signup_owner(&server, "invite-oracle").await;
     // Look up the owner's org name via /users/me.
     let me = server

@@ -177,14 +177,20 @@ pub async fn login(
     // stored hash, and wrong password are indistinguishable in body and
     // cost. (verify_password parses the PHC string before running Argon2,
     // so the unparseable cases must still run a decoy verify to match the
-    // timing of a real wrong-password attempt.)
+    // timing of a real wrong-password attempt.) Decoy success never
+    // authenticates: only verification against a real stored hash does.
     let password_ok = match row.as_ref() {
         Some((_user_id, Some(hash_str), _display_name)) => verify_password(password, hash_str)
             .unwrap_or_else(|_| {
                 let _ = verify_password(password, DUMMY_CREDENTIAL_HASH);
                 false
             }),
-        _ => verify_password(password, DUMMY_CREDENTIAL_HASH).unwrap_or(false),
+        _ => {
+            // Unknown email or NULL/garbage hash: run the decoy work for
+            // timing parity, then always fail.
+            let _ = verify_password(password, DUMMY_CREDENTIAL_HASH);
+            false
+        }
     };
 
     if !password_ok {
