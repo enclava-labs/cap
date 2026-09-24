@@ -7,14 +7,25 @@ use uuid::Uuid;
 
 use crate::auth::provider::VerifiedIdentity;
 
+/// A fixed, parseable argon2id hash used as a decoy target when an email
+/// login names no account. Verifying the submitted password against this
+/// constant makes the missing-row path do the same Argon2 work as the
+/// hit path, so login timing and response shape do not reveal whether
+/// the email is registered (issue #121). It is a hash of a random
+/// 256-bit OsRng secret generated once when this constant was authored
+/// and never stored or disclosed anywhere else.
+const DUMMY_CREDENTIAL_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$d4t67vzZ6lgVAEyVBkQwcQ$lB19QKhSbbMwhV8LfbGVNM+N+vntLboyrQRIVQb1Rx4";
+
 #[derive(Debug, thiserror::Error)]
 pub enum EmailAuthError {
     #[error("email is required")]
     EmailRequired,
     #[error("password is required")]
     PasswordRequired,
-    #[error("email already registered")]
-    EmailExists,
+    /// Generic signup failure used for duplicate emails so the response does
+    /// not disclose whether the address is already registered (issue #121).
+    #[error("signup failed")]
+    SignupFailed,
     #[error("invalid email or password")]
     InvalidCredentials,
     #[error("database error: {0}")]
@@ -63,11 +74,16 @@ pub async fn signup(
     .fetch_one(pool)
     .await?;
 
+    // Anti-enumeration (issue #121): hash the password BEFORE the conflict
+    // check so that a duplicate-email signup costs the same Argon2 work as
+    // a fresh one, and keep the error message identical to a failed signup
+    // ("signup failed") instead of "email already registered".
+    let credential_hash = hash_password(password)?;
+
     if exists {
-        return Err(EmailAuthError::EmailExists);
+        return Err(EmailAuthError::SignupFailed);
     }
 
-    let credential_hash = hash_password(password)?;
     let user_id = Uuid::new_v4();
     let org_id = Uuid::new_v4();
     let identity_id = Uuid::new_v4();
@@ -137,11 +153,20 @@ pub async fn login(
     .fetch_optional(pool)
     .await?;
 
-    let (_user_id, hash_str, display_name) = row.ok_or(EmailAuthError::InvalidCredentials)?;
+    // Anti-enumeration: when the email is unknown, verify the submitted
+    // password against the fixed decoy hash so this path performs the same
+    // Argon2 work (and returns the same InvalidCredentials error) as a
+    // wrong password for a known account (issue #121).
+    let password_ok = match row.as_ref() {
+        Some((_user_id, hash_str, _display_name)) => verify_password(password, hash_str)?,
+        None => verify_password(password, DUMMY_CREDENTIAL_HASH)?,
+    };
 
-    if !verify_password(password, &hash_str)? {
+    if !password_ok {
         return Err(EmailAuthError::InvalidCredentials);
     }
+
+    let (_user_id, _hash_str, display_name) = row.ok_or(EmailAuthError::InvalidCredentials)?;
 
     Ok(VerifiedIdentity {
         identifier: email.to_string(),
@@ -149,4 +174,60 @@ pub async fn login(
         display_name: display_name
             .unwrap_or_else(|| email.split('@').next().unwrap_or("user").to_string()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dummy_hash_is_parseable_and_rejects_common_passwords() {
+        // The decoy must parse (so the missing-row path performs a real
+        // Argon2 verification) and must not verify typical passwords.
+        for pw in ["password", "correct horse battery staple", "hunter2", ""] {
+            assert!(
+                !verify_password(pw, DUMMY_CREDENTIAL_HASH).unwrap(),
+                "dummy hash must not verify {pw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_missing_email_performs_full_argon2_work() {
+        // Regression test for issue #121: the unknown-email login path must
+        // do real Argon2 verification work (comparable duration to the
+        // known-email wrong-password path), not return instantly.
+        let dummy_hash = hash_password("some real hash material").unwrap();
+        let iterations = 3;
+        let mut missing_row_elapsed = std::time::Duration::ZERO;
+        for _ in 0..iterations {
+            let start = std::time::Instant::now();
+            let _ = verify_password("attacker guess", DUMMY_CREDENTIAL_HASH).unwrap();
+            missing_row_elapsed += start.elapsed();
+        }
+        let mut hit_elapsed = std::time::Duration::ZERO;
+        for _ in 0..iterations {
+            let start = std::time::Instant::now();
+            let _ = verify_password("attacker guess", &dummy_hash).unwrap();
+            hit_elapsed += start.elapsed();
+        }
+        assert!(
+            missing_row_elapsed.as_nanos() > 50_000,
+            "missing-row path must do real Argon2 work, took {missing_row_elapsed:?}"
+        );
+        // Same order of magnitude as the hit path (within 10x — Argon2 runs
+        // are ~tens of ms with default params, network jitter excluded).
+        let ratio = missing_row_elapsed.as_secs_f64() / hit_elapsed.as_secs_f64().max(1e-9);
+        assert!(
+            ratio > 0.1 && ratio < 10.0,
+            "missing-row and hit-path Argon2 work must be comparable: ratio {ratio:.3}"
+        );
+    }
+
+    #[test]
+    fn signup_error_messages_do_not_disclose_account_existence() {
+        // The duplicate-email signup error must be the generic SignupFailed
+        // message, not "email already registered".
+        assert_eq!(EmailAuthError::SignupFailed.to_string(), "signup failed");
+    }
 }

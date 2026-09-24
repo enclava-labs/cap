@@ -1142,10 +1142,18 @@ pub async fn invite_member(
     .await
     .map_err(|_| db_error())?;
 
-    let (invitee_id,) = invitee.ok_or((
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error": "user not found"})),
-    ))?;
+    // Anti-enumeration (issue #121): the response must not disclose whether
+    // the email belongs to a registered account. An unknown email gets the
+    // same 200 "invited" response as a successful invite, but no membership
+    // row is written. (A perfect oracle fix needs emailed invite tokens;
+    // that is a product change — this removes the status/body/timing
+    // oracle from this endpoint.)
+    let Some((invitee_id,)) = invitee else {
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "invited"})),
+        ));
+    };
 
     let requested_role = scopes::parse_role(body.role.as_deref().unwrap_or("member"))?;
 
