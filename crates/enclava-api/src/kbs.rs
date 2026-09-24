@@ -2611,9 +2611,10 @@ owner_resource_bindings := {}
         }));
 
         // Signer rotation withdraws every artifact signed under the previous
-        // identity (issue #119): the withdrawal is recorded by the runtime
-        // helper's predicate (descriptor signer_identity equality) and the
-        // selector must refuse the hash on every path.
+        // identity (issue #119): the withdrawal row is recorded and the
+        // selector must refuse the hash on every path. (The runtime
+        // subject/issuer predicate itself is exercised end-to-end by the
+        // rotate_signer route test.)
         let mut tx = pool.begin().await.expect("begin withdrawal tx");
         sqlx::query(
             "INSERT INTO withdrawn_signer_artifacts (descriptor_core_hash, app_id)

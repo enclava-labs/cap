@@ -2205,8 +2205,9 @@ pub async fn rotate_signer(
             .take()
             .expect("non-initial rotations verify a token above");
         // Consume the token's jti atomically with the rotation below. A jti
-        // that was already consumed is a replay and aborts the transaction
-        // before any state changes (issue #119).
+        // that was already consumed is a replay: roll back this transaction
+        // (the signer UPDATE above has not committed) and refuse (issue
+        // #119).
         let consumed = sqlx::query(
             "INSERT INTO consumed_signer_rotation_tokens (
                  jti, user_id, org_id, app_id, subject, issuer, expires_at
@@ -2231,6 +2232,7 @@ pub async fn rotate_signer(
                 user_id = %auth.user_id,
                 "rejected replayed signer rotation token"
             );
+            tx.rollback().await.map_err(|_| internal_server_error())?;
             return Err((
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({"error": "invalid email_confirmation_token"})),
@@ -2252,13 +2254,16 @@ pub async fn rotate_signer(
         .map_err(|_| internal_server_error())?;
         // The candidate set may change even when no new withdrawal row was
         // inserted (e.g. a later rotation of an already-withdrawn artifact),
-        // so bump unconditionally: the durable generation is what makes the
-        // reconciler publish the withdrawal instead of reporting a
-        // same-generation content conflict.
-        crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
+        // so bump on every rotation that is already in signed mode: the
+        // durable generation is what makes the reconciler publish the
+        // withdrawal instead of reporting a same-generation content
+        // conflict. revocation_if_active no-ops on an unsigned-only install
+        // so rotation never flips such an install into signed mode (where an
+        // empty artifact set would deny every workload).
+        kbs_policy_write_pending = crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
             .await
-            .map_err(|_| internal_server_error())?;
-        kbs_policy_write_pending = true;
+            .map_err(|_| internal_server_error())?
+            .is_some();
     }
 
     // Audit. Rotation withdraws the previous signer's artifacts from KBS
@@ -2296,26 +2301,46 @@ pub async fn rotate_signer(
 
     // The withdrawal is durable, but the live Trustee policy only reflects
     // it once the reconciler converges the enqueued generation. Converge
-    // under the KBS fence before reporting success, like app deletion; a
-    // KBS-side failure surfaces as 503 with the durable intent retained
-    // (the background reconciler keeps retrying).
+    // under the KBS fence before reporting success, like app deletion. The
+    // rotation itself is already committed at this point: a KBS-side
+    // failure surfaces as 500 (the durable intent is retained, but this
+    // route holds the KBS fence until its lease expires, so the background
+    // reconciler's retry can lag by up to the lease quarantine window).
     if kbs_policy_write_pending && state.kbs_policy.is_some() {
-        let lease = crate::mutation_leases::claim_resources(
+        let lease = match crate::mutation_leases::claim_resources(
             &state,
             "kbs_signer_rotation_policy",
             Uuid::new_v4(),
             vec![crate::mutation_leases::ResourceFence::kbs_policy()],
         )
         .await
-        .map_err(|_| internal_server_error())?;
-        lease
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    error = %error,
+                    error_code = "kbs_policy_fence_unavailable",
+                    "signer rotation committed but KBS policy reconciliation fence was unavailable"
+                );
+                return Err(internal_server_error());
+            }
+        };
+        if let Err(error) = lease
             .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
                 &state.db,
                 state.kbs_policy.as_ref(),
             ))
             .await
-            .map_err(|_| internal_server_error())?
-            .map_err(|_| internal_server_error())?;
+        {
+            tracing::warn!(
+                app_id = %app.id,
+                error = %error,
+                error_code = "kbs_policy_reconciliation_failed",
+                "signer rotation committed but KBS policy reconciliation failed"
+            );
+            return Err(internal_server_error());
+        }
         lease.finish().await.map_err(|_| internal_server_error())?;
     }
 

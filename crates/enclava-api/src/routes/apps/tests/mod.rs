@@ -952,6 +952,15 @@ async fn signer_rotation_token_is_single_use_and_withdraws_rotated_out_artifacts
         desired > desired_before,
         "rotation must enqueue policy reconciliation"
     );
+    // The consumed jti ledger row is committed with the rotation.
+    let jti_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count consumed jti rows");
+    assert_eq!(jti_rows, 1, "rotation must record the consumed jti");
 
     // Rotate back to the previous identity so the original token's claims
     // (previous=old, new=new) match again, then replay it: it must be
@@ -1043,6 +1052,166 @@ async fn signer_rotation_token_is_single_use_and_withdraws_rotated_out_artifacts
         .execute(&pool)
         .await
         .expect("delete signer rotation fixture");
+}
+
+#[tokio::test]
+async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect unsigned rotation regression database");
+    crate::db::pool::run_migrations(&pool)
+        .await
+        .expect("migrate unsigned rotation regression database");
+
+    let org_id = uuid::Uuid::new_v4();
+    let user_id = uuid::Uuid::new_v4();
+    let app_id = uuid::Uuid::new_v4();
+    let suffix = app_id.simple().to_string();
+    sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+        .bind(org_id)
+        .bind(format!("unsigned-rotation-{suffix}"))
+        .bind(&suffix[..8])
+        .execute(&pool)
+        .await
+        .expect("insert unsigned rotation organization");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'unsigned owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert unsigned rotation user");
+    sqlx::query(
+        "INSERT INTO memberships (user_id, org_id, role, created_at, removed_at)
+         VALUES ($1, $2, 'owner', now(), NULL)",
+    )
+    .bind(user_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert unsigned rotation membership");
+    sqlx::query(
+        "INSERT INTO apps (
+             id, org_id, name, namespace, instance_id, tenant_id,
+             service_account, bootstrap_owner_pubkey_hash,
+             tenant_instance_identity_hash, domain, status,
+             signer_identity_subject, signer_identity_issuer
+         ) VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+             'running'::app_status_enum, $11, $12
+         )",
+    )
+    .bind(app_id)
+    .bind(org_id)
+    .bind(format!("app-{}", &suffix[..12]))
+    .bind(format!("cap-{}", &suffix[..12]))
+    .bind(format!("instance-{suffix}"))
+    .bind(&suffix[..8])
+    .bind(format!("cap-{}-sa", &suffix[..12]))
+    .bind("11".repeat(32))
+    .bind("22".repeat(32))
+    .bind(format!("{}.example.test", &suffix[..12]))
+    .bind("https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main")
+    .bind("https://token.actions.githubusercontent.com")
+    .execute(&pool)
+    .await
+    .expect("insert unsigned rotation app");
+
+    // Pin the install to the unsigned-only state: desired_generation = 0.
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 0,
+                configmap_generation = 0,
+                applied_generation = 0,
+                configmap_policy_sha256 = NULL,
+                applied_policy_sha256 = NULL,
+                configmap_resource_version = NULL
+          WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("reset reconciliation state to unsigned");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let hmac_key = [7u8; 32];
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "unsigned-rotation-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+
+    let token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: previous_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue unsigned rotation token");
+
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load unsigned app name");
+
+    let Json(rotated) = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: previous_issuer.to_string(),
+            email_confirmation_token: Some(token),
+        }),
+    )
+    .await
+    .expect("unsigned rotation succeeds");
+    assert_eq!(
+        rotated.signer_identity_subject.as_deref(),
+        Some(new_subject)
+    );
+
+    // The install must still be unsigned: rotation never enters signed mode.
+    let desired: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read desired generation after unsigned rotation");
+    assert_eq!(
+        desired, 0,
+        "rotation on an unsigned-only install must not enter signed mode"
+    );
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete unsigned rotation audit rows");
+    sqlx::query("DELETE FROM consumed_signer_rotation_tokens WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete unsigned rotation consumed tokens");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete unsigned rotation fixture");
 }
 
 fn clone_auth(auth: &AuthContext) -> AuthContext {
