@@ -493,7 +493,14 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
     }
     // read+append: appends position writes at end-of-file, while the read
     // side lets the rotation path retain the newest frames in place.
-    OpenOptions::new()
+    // S_ISREG check (round-19 self-check Critical): the logs dir is
+    // group-writable by the workload, so a compromised workload could
+    // replace the spool path with a FIFO (rename race or direct swap). An
+    // O_RDWR|O_CREAT open of a FIFO does not block — the hang lands on
+    // the next write once the pipe buffer fills, under the spool mutex.
+    // Refusing non-regular files here keeps the forwarder on its old
+    // (unlinked) inode: rotation retries, logs stay lossless-visible.
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
         .read(true)
@@ -505,7 +512,17 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
                 "failed to open encrypted log spool {}: {err}",
                 path.display()
             )
-        })
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|err| format!("stat encrypted log spool {}: {err}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "encrypted log spool {} is not a regular file",
+            path.display()
+        ));
+    }
+    Ok(file)
 }
 
 /// Highest frame sequence present in the surviving spool, plus one. Called
@@ -1000,6 +1017,32 @@ fn read_capped_record<R: BufRead>(
 /// If the reopen fails after a successful rename, the old handle keeps
 /// absorbing appends on the unlinked inode and the next call retries —
 /// writes stay lossless-visible once a reopen succeeds.
+/// Random component for rotation temp names (round-19 review P2): hex
+/// from /dev/urandom (32 random bits per attempt — a racing workload must
+/// guess among ~4 billion names per try, and create_new still enforces
+/// exclusivity with retry on collision), falling back to pid + nanos if
+/// the read fails. Only uniqueness and unpredictability matter.
+fn random_suffix() -> String {
+    let mut buf = [0u8; 4];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+        .is_ok();
+    if ok {
+        format!("{:08x}", u32::from_ne_bytes(buf))
+    } else {
+        format!("{}-{}", process::id(), monotonic_nanos())
+    }
+}
+
+/// Monotonic-ish nanosecond timestamp for the urandom-failure fallback.
+fn monotonic_nanos() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
 fn rotate_spool_if_needed(spool: &mut File, incoming: u64, path: &Path) -> std::io::Result<()> {
     let len = spool.metadata()?.len();
     if len + incoming <= LOG_SPOOL_ROTATE_BYTES {
@@ -1023,21 +1066,67 @@ fn rotate_spool_if_needed(spool: &mut File, incoming: u64, path: &Path) -> std::
             retain_buf.clear();
         }
     }
-    let rotate_tmp = PathBuf::from(format!("{}.rotate.{}", path.display(), process::id()));
-    // Clear a leftover temp from a crashed rotation; O_NOFOLLOW below makes
-    // a pre-planted symlink fail safely with ELOOP instead of being opened.
-    let _ = fs::remove_file(&rotate_tmp);
-    {
-        let mut tmp = OpenOptions::new()
-            .create(true)
+    // Fresh randomized exclusive temp name (round-19 review P2): the logs
+    // directory is group-writable by the workload, so a compromised
+    // workload could race the old predictable `<spool>.rotate.<pid>` path —
+    // re-creating a FIFO between the remove_file and the open. Unlike the
+    // symlink case (guarded by O_NOFOLLOW), opening a FIFO with no reader
+    // BLOCKS indefinitely while the spool mutex is held, hanging both
+    // forwarders and the workload's stdout/stderr. A randomized
+    // create_new (O_EXCL) name cannot be pre-planted: the workload cannot
+    // guess it, and any collision (astronomically unlikely) retries with a
+    // fresh name.
+    let mut rotate_tmp: Option<(PathBuf, File)> = None;
+    for _ in 0..8 {
+        let candidate = PathBuf::from(format!("{}.rotate.{}", path.display(), random_suffix()));
+        match OpenOptions::new()
+            .create_new(true)
             .write(true)
-            .truncate(true)
             .mode(0o640)
             .custom_flags(O_NOFOLLOW)
-            .open(&rotate_tmp)?;
-        tmp.write_all(&retain_buf)?;
-        tmp.sync_all()?;
+            .open(&candidate)
+        {
+            Ok(mut tmp) => {
+                if let Err(err) = tmp.write_all(&retain_buf).and_then(|()| tmp.sync_all()) {
+                    // Don't leak the half-written temp on failure.
+                    drop(tmp);
+                    let _ = fs::remove_file(&candidate);
+                    return Err(err);
+                }
+                rotate_tmp = Some((candidate, tmp));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
     }
+    let (rotate_tmp, tmp) =
+        rotate_tmp.ok_or_else(|| io::Error::other("rotation temp name collisions exhausted"))?;
+    // Inode-identity guard (round-19 self-check Critical): the temp's NAME
+    // is visible in the group-writable dir while it is written, and the
+    // workload shares our uid — it can unlink the temp and park a FIFO (or
+    // its own file) at the name between our write and the rename. Renaming
+    // by path would then install the impostor as the spool. fstat the fd
+    // we hold (it still points at OUR inode even if the name was swapped)
+    // and stat the path: they must agree on dev+ino, else the name no
+    // longer refers to our temp — abort (the leaked temp is inert; later
+    // rotations use fresh names) and let the next rotation call retry.
+    // The fd staying open also keeps our inode alive across the rename.
+    use std::os::unix::fs::MetadataExt as _;
+    let fd_meta = tmp.metadata()?;
+    let path_meta = fs::metadata(&rotate_tmp).map_err(|err| {
+        io::Error::other(format!(
+            "rotation temp {} disappeared before rename: {err}",
+            rotate_tmp.display()
+        ))
+    })?;
+    if fd_meta.dev() != path_meta.dev() || fd_meta.ino() != path_meta.ino() {
+        return Err(io::Error::other(format!(
+            "rotation temp {} was replaced before rename (dev/ino mismatch) — aborting rotation",
+            rotate_tmp.display()
+        )));
+    }
+    drop(tmp);
     fs::rename(&rotate_tmp, path)?;
     // Reopen the spool path so subsequent appends land on the new inode.
     // An error here leaves the old handle appending to the unlinked inode —
@@ -2528,5 +2617,55 @@ mod tests {
         let r3 = read_capped_record(&mut reader, &mut buf, &mut pending_cr).unwrap();
         assert_eq!(buf, b"line-three\r\n");
         assert!(!r3.capped);
+    }
+}
+
+#[cfg(test)]
+mod round19_tests {
+    use super::*;
+    use std::fs::OpenOptions;
+
+    /// Round-19 review P2: rotation temps must be unpredictable AND
+    /// exclusive — the old predictable `<spool>.rotate.<pid>` path let a
+    /// racing workload plant a FIFO that `create(true)` then opened (and
+    /// blocked on) while the spool mutex was held. Now every temp gets a
+    /// fresh random suffix under create_new (O_EXCL), so a pre-planted
+    /// FIFO at any guessed name is simply never opened.
+    #[test]
+    fn rotation_temps_are_random_and_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let mut spool = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        // Force one rotation and capture the temp name in use.
+        let big = vec![b'x'; LOG_SPOOL_ROTATE_BYTES as usize + 1];
+        spool.write_all(&big).unwrap();
+        let names_before: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        rotate_spool_if_needed(&mut spool, 0, &path).unwrap();
+        let names_after: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        // No leftover temp files remain after a successful rotation.
+        assert!(
+            !names_after.iter().any(|n| n.contains(".rotate.")),
+            "successful rotation must not leave temp files: {names_after:?}"
+        );
+        // And the temp name is not the predictable pid-based one.
+        assert!(
+            !names_before
+                .iter()
+                .chain(names_after.iter())
+                .any(|n| n == &format!("spool.jsonl.rotate.{}", process::id())),
+            "the predictable pid-based temp name must never be used"
+        );
     }
 }

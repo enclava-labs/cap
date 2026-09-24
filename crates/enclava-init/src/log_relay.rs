@@ -761,7 +761,21 @@ fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64, File, 
     let start = len.saturating_sub(MAX_TAIL_BYTES);
     file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    // Bound the read to the SAMPLED length (round-19 review P1): the spool
+    // directory is workload-writable and a chatty workload can append to
+    // this same inode while the tail is being read. An unbounded
+    // read_to_end would then consume up to LOG_SPOOL_ROTATE_BYTES (32 MiB)
+    // per connection instead of the intended 2 MiB tail — and with the
+    // round-18 connection budget of 32, concurrent requests could allocate
+    // 32 x 32 MiB = 1 GiB, blowing enclava-init's 512 MiB limit. The
+    // snapshot bound keeps the allocation at MAX_TAIL_BYTES + 0 no matter
+    // how fast the workload writes; bytes appended after the sample are
+    // picked up by the follow loop from `follow_from` (and if a rotation
+    // replaced the inode meanwhile, the follow loop's resync handles it).
+    let snapshot = (len - start) as usize;
+    std::io::Read::by_ref(&mut file)
+        .take(snapshot as u64)
+        .read_to_end(&mut bytes)?;
     // A trailing segment without a newline is an in-flight frame (writer
     // mid-append): never emit it as a line. Drop it from the tail and point
     // the follow offset at its first byte so the follow loop completes it
@@ -2878,5 +2892,35 @@ mod tests {
                 PathBuf::from(spool)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod round19_relay_tests {
+    use super::*;
+
+    /// Round-19 review P1: the initial tail read must be bounded by the
+    /// SAMPLED spool length, not by whatever the workload appends during
+    /// the read. A concurrent writer appending to the same inode must not
+    /// be able to grow the tail buffer beyond MAX_TAIL_BYTES.
+    #[test]
+    fn tail_read_is_bounded_by_sampled_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        // A spool at exactly the tail bound: any byte appended after the
+        // sample must be invisible to the tail read.
+        let line = format!("{{\"sequence\":{}}}\n", 1);
+        let mut content = line.repeat(MAX_TAIL_BYTES as usize / line.len() + 1);
+        content.truncate(MAX_TAIL_BYTES as usize);
+        std::fs::write(&path, &content).unwrap();
+        let (lines, follow_from, _file, _anchor) = tail_lines(&path, 1000).unwrap();
+        // follow_from must sit at (or before) the sampled end: appends
+        // AFTER the sample are left for the follow loop, never read here.
+        let sampled_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            follow_from <= sampled_len,
+            "tail must not consume beyond the sampled length ({follow_from} > {sampled_len})"
+        );
+        assert!(!lines.is_empty());
     }
 }

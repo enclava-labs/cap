@@ -624,9 +624,15 @@ fn push_toml_multiline_string(toml: &mut String, key: &str, body: &str) {
     } else {
         toml.push_str("'''\n");
         toml.push_str(body);
-        if !body.ends_with('\n') {
-            toml.push('\n');
-        }
+        // Byte-exact round-trip (round-19 review P2): TOML trims only the
+        // first newline AFTER the opening delimiter — nothing before the
+        // closing one. A body ending in '\n' therefore keeps its own LF
+        // with the delimiter on the next line, and a body with NO final LF
+        // gets the delimiter DIRECTLY after it. The historical layout
+        // inserted an LF before the delimiter, so `data.policy.rego`
+        // parsed back as policy_text + "\n" — not the exact signed bytes,
+        // failing enclava-init's sha256 trustee verification of
+        // no-final-newline Rego (which is valid without one).
         toml.push_str("'''\n");
     }
 }
@@ -714,5 +720,35 @@ pub fn verify_runtime_class_binding(
             "rendered Pod runtimeClassName is `{other}`, expected `{expected}`"
         )),
         None => Err("rendered Pod has no runtimeClassName".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod round19_tests {
+    use super::push_toml_multiline_string;
+
+    /// Byte-exactness invariant of the literal-block path (round-19 review
+    /// P2): whatever the caller's final byte, parsing the emitted TOML must
+    /// yield EXACTLY the input body — descriptor signatures commit to the
+    /// sha256 of these bytes and enclava-init verifies that hash.
+    #[test]
+    fn multiline_literal_round_trips_with_and_without_final_newline() {
+        for body in [
+            "package enclava\n\ndefault allow := false\n",
+            "package enclava\n\ndefault allow := false", // no final LF
+            "x",                                         // single line, no LF
+            "a\r\nb\r\n",                                // CRLF forces fallback
+            "contains ''' delimiter",                    // forces fallback
+        ] {
+            let mut toml = String::new();
+            push_toml_multiline_string(&mut toml, "\"policy.rego\"", body);
+            let parsed: std::collections::BTreeMap<String, String> =
+                toml::from_str(&toml).expect("emitted TOML must parse");
+            assert_eq!(
+                parsed.get("policy.rego").map(String::as_str),
+                Some(body),
+                "round-trip must be byte-exact for {body:?}; emitted: {toml:?}"
+            );
+        }
     }
 }
