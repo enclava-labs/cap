@@ -38,6 +38,14 @@ flows, and confidential-workload deployment machinery. A real deployment still
 requires the surrounding platform services described in
 [DEPLOYMENT.md](DEPLOYMENT.md).
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/enclava-labs/cap/main/scripts/install.sh | bash
+```
+
+Installs the latest release to `~/.enclava/bin` (checksum + cosign verified). Set `ENCLAVA_VERSION=vX.Y.Z` for a specific release. Windows: download `enclava-windows-x86_64.tar.gz` from the [releases page](https://github.com/enclava-labs/cap/releases).
+
 ## CLI Flow
 
 After authenticating against a CAP API, the normal app flow is:

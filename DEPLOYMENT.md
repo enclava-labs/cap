@@ -239,8 +239,3 @@ kubectl -n enclava-platform get deploy enclava-api
 kubectl -n enclava-platform exec deploy/enclava-api -- wget -q -O- http://127.0.0.1:3000/health
 ```
 
-For a live app proof that does not require direct cluster access:
-
-```bash
-python3 scripts/cap_hermes_proof.py --help
-```
