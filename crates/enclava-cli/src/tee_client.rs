@@ -833,16 +833,20 @@ impl TeeClient {
         let evidence = B64_STANDARD
             .decode(attestation.evidence.payload_b64.as_bytes())
             .map_err(|_| TeeError::Attestation("evidence payload is not base64".to_string()))?;
-        let verified_launch_identity =
-            verify_evidence_report_data(&attestation.evidence, &evidence, &expected_report_data)
-                .await?;
-        let evidence_sha256 = hex::encode(Sha256::digest(evidence));
+        let (verified_launch_identity, quote) = verify_evidence_report_data_for_transition(
+            &attestation.evidence,
+            &evidence,
+            &expected_report_data,
+        )
+        .await?;
+        let evidence_sha256 = hex::encode(Sha256::digest(&evidence));
         let transition_attestation = TransitionReceiptAttestation {
             tee_domain: endpoint.host,
             nonce: nonce_b64,
             leaf_spki_sha256: leaf_spki_hex,
             receipt_pubkey_sha256: attestation.runtime_data_binding.receipt_pubkey_sha256,
             attestation_evidence_sha256: evidence_sha256,
+            quote,
         };
         let attested_client = self
             .with_http(pinned_http)
@@ -1028,11 +1032,22 @@ fn verify_receipt_matches_attestation(
     Ok(())
 }
 
-async fn verify_evidence_report_data(
+/// Verifies the receipt-key attestation evidence and, when a raw SNP report
+/// with an anchored chain is present, returns the report and chain the API
+/// can independently re-verify. The JSON-only development path yields no
+/// portable quote, so unlock-mode transitions from such TEEs cannot be
+/// submitted with a quote and will fail closed at the API.
+async fn verify_evidence_report_data_for_transition(
     evidence: &AttestationEvidence,
     evidence_bytes: &[u8],
     expected_report_data: &[u8; 64],
-) -> Result<Option<VerifiedSnpLaunchIdentity>, TeeError> {
+) -> Result<
+    (
+        Option<VerifiedSnpLaunchIdentity>,
+        Option<crate::api_types::TransitionSnpQuote>,
+    ),
+    TeeError,
+> {
     verify_evidence_report_data_with_json_fallback(
         evidence,
         evidence_bytes,
@@ -1047,7 +1062,13 @@ async fn verify_evidence_report_data_with_json_fallback(
     evidence_bytes: &[u8],
     expected_report_data: &[u8; 64],
     allow_json_report_data_only: bool,
-) -> Result<Option<VerifiedSnpLaunchIdentity>, TeeError> {
+) -> Result<
+    (
+        Option<VerifiedSnpLaunchIdentity>,
+        Option<crate::api_types::TransitionSnpQuote>,
+    ),
+    TeeError,
+> {
     let evidence_json = evidence
         .json
         .as_ref()
@@ -1090,10 +1111,18 @@ async fn verify_evidence_report_data_with_json_fallback(
         // HOST_DATA and the firmware measurement were verified together with
         // the same AMD chain that authenticated report_data: preserve both as
         // the launch identity of exactly this endpoint.
-        return Ok(Some(VerifiedSnpLaunchIdentity {
-            host_data: report.host_data,
-            firmware_measurement: report.firmware_measurement,
-        }));
+        return Ok((
+            Some(VerifiedSnpLaunchIdentity {
+                host_data: report.host_data,
+                firmware_measurement: report.firmware_measurement,
+            }),
+            Some(crate::api_types::TransitionSnpQuote {
+                report_b64: B64_STANDARD.encode(&snp_report_bytes),
+                ark_der_b64: B64_STANDARD.encode(&chain.ark_der),
+                ask_der_b64: B64_STANDARD.encode(&chain.ask_der),
+                vcek_der_b64: B64_STANDARD.encode(&chain.vcek_der),
+            }),
+        ));
     }
 
     if !allow_json_report_data_only {
@@ -1112,7 +1141,7 @@ async fn verify_evidence_report_data_with_json_fallback(
     }
     // The development JSON path carries no raw SNP report, so no trusted
     // launch identity exists: callers fail closed on deployment binding.
-    Ok(None)
+    Ok((None, None))
 }
 
 #[derive(Debug)]

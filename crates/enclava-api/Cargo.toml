@@ -53,6 +53,7 @@ sigstore = { workspace = true }
 oci-client = { workspace = true }
 hickory-resolver = { workspace = true }
 k8s-openapi = { workspace = true }
+enclava-verifier = { workspace = true }
 kube = { workspace = true }
 instant-acme = "0.8"
 rustls = { workspace = true }

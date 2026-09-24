@@ -210,14 +210,15 @@ async fn verifies_attestation_evidence_report_data_binding() {
         })),
     };
 
-    // The development JSON evidence path yields no trusted launch identity:
-    // callers fail closed on deployment binding.
-    assert!(
+    // The development JSON evidence path yields no trusted launch identity
+    // and no portable transition quote: callers fail closed on deployment
+    // binding and the API rejects quote-less unlock transitions.
+    let (identity, quote) =
         super::verify_evidence_report_data_with_json_fallback(&evidence, b"", &expected, true)
             .await
-            .unwrap()
-            .is_none()
-    );
+            .unwrap();
+    assert!(identity.is_none());
+    assert!(quote.is_none());
 }
 
 #[tokio::test]
