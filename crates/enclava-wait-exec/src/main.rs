@@ -43,6 +43,20 @@ const LOG_SPOOL_KEEP_BYTES: u64 = 8 * 1024 * 1024;
 /// rotation headroom below the 64 MiB volume cap. 256 KiB of plaintext
 /// encodes to well under 512 KiB of framed output.
 const MAX_LOG_RECORD_BYTES: usize = 256 * 1024;
+/// Cap on one spool line during the startup sequence scan. A
+/// writer-produced frame line is `MAX_LOG_RECORD_BYTES` of plaintext
+/// "encoded to well under 512 KiB of framed output" (see
+/// `MAX_LOG_RECORD_BYTES`) — base64url of the ciphertext plus a small
+/// JSON envelope. A "line" claiming more than this therefore cannot be a
+/// writer-produced frame, and the spool is workload-influenced content
+/// (the shared `logs` emptyDir), so the scan must never buffer such a
+/// record whole (round-15 review P2: `BufRead::lines()` turned one
+/// newline-free record — up to the whole 64 MiB volume — into a single
+/// String allocation before the child spawned, OOM-looping a constrained
+/// container while the same spool remained). Below the relay's 2 MiB
+/// `MAX_TAIL_BYTES` line cap, so anything this scan accepts as a frame is
+/// also a line the relay will forward.
+const MAX_SPOOL_LINE_BYTES: u64 = 2 * MAX_LOG_RECORD_BYTES as u64;
 const TERMINATION_SIGNALS: [Signal; 4] = [
     Signal::SIGHUP,
     Signal::SIGINT,
@@ -501,16 +515,85 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
 /// not wrap the resumed counter to 0 (round-14 self-check Critical), so
 /// the resume point is clamped to a ceiling that still leaves headroom
 /// for a long-lived workload (u32::MAX frames ≈ years at kilo-frame/s).
+///
+/// The scan is per-record BOUNDED (round-15 review P2):
+/// `BufRead::lines()` buffers a complete record with no size limit, so a
+/// newline-free or malformed record left in the workload-writable spool
+/// before the container restarted became one String allocation as large as
+/// the whole volume (64 MiB) — before the child even spawned — and on a
+/// constrained app container that is a persistent wrapper OOM/restart loop
+/// while the same spool remains. Records are now read through a capped
+/// reader (MAX_SPOOL_LINE_BYTES) and oversized or incomplete records are
+/// consumed-and-SKIPPED without ever being buffered whole. Skipping is
+/// safe for sequence recovery: only newline-terminated records can ever
+/// have been delivered by the relay (it withholds in-flight fragments),
+/// so an oversized or incomplete record cannot hold a sequence any
+/// connected relay frontier references — and it cannot be a
+/// writer-produced frame at all (those are capped well below the bound).
 fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
     spool
         .seek(SeekFrom::Start(0))
         .map_err(|err| format!("failed to seek log spool for sequence scan: {err}"))?;
+    let read_err = |err: io::Error| format!("failed to read log spool for sequence scan: {err}");
     let mut max_sequence = 0u64;
-    for line in BufReader::new(spool).lines() {
-        let Ok(line) = line else {
+    let mut reader = BufReader::new(&mut *spool);
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        // Bounded per-record read: the take cap is one past
+        // MAX_SPOOL_LINE_BYTES so a record of exactly that many content
+        // bytes plus its newline stays in-bounds.
+        let n = reader
+            .by_ref()
+            .take(MAX_SPOOL_LINE_BYTES + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(read_err)?;
+        if n == 0 {
             break;
-        };
-        if let Ok(frame) = serde_json::from_str::<serde_json::Value>(&line)
+        }
+        if !line.ends_with(b"\n") {
+            if (n as u64) < MAX_SPOOL_LINE_BYTES + 1 {
+                // Incomplete trailing record (writer mid-append when the
+                // previous wrapper exited): skipped like a non-frame line.
+                // It cannot have been delivered by the relay — in-flight
+                // fragments are withheld — so its sequence cannot poison
+                // any frontier and need not steer the resume point.
+                break;
+            }
+            // Oversized record: consume-and-discard the REST of it without
+            // buffering — it cannot be a writer-produced frame. The scan
+            // resumes at the next record.
+            let mut terminated = false;
+            while !terminated {
+                let available = reader.fill_buf().map_err(read_err)?;
+                if available.is_empty() {
+                    break;
+                }
+                match available.iter().position(|&b| b == b'\n') {
+                    Some(i) => {
+                        reader.consume(i + 1);
+                        terminated = true;
+                    }
+                    None => {
+                        let m = available.len();
+                        reader.consume(m);
+                    }
+                }
+            }
+            if !terminated {
+                // EOF mid-oversized-record: incomplete tail, skip.
+                break;
+            }
+            continue;
+        }
+        // Complete record INCLUDING its terminating newline. Strip the
+        // terminators exactly like `BufRead::lines()` did (LF, or CRLF).
+        let mut content = &line[..line.len() - 1];
+        if content.ends_with(b"\r") {
+            content = &content[..content.len() - 1];
+        }
+        if let Ok(frame) =
+            serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(content))
             && let Some(sequence) = frame.get("sequence").and_then(|s| s.as_u64())
             && sequence > max_sequence
         {
@@ -1915,6 +1998,55 @@ mod tests {
             u32::MAX as u64 + 1,
             "resume clamps to the ceiling + 1, never wraps to 0"
         );
+    }
+
+    /// Round-15 review P2: the startup sequence scan must not buffer a
+    /// whole workload-controlled record. The old `BufRead::lines()` scan
+    /// accumulated a complete record with no size limit, so one
+    /// newline-free (or gigantic) record left in the shared spool before
+    /// the container restarted became a single String allocation up to the
+    /// whole 64 MiB volume — before the child spawned — and OOM-looped a
+    /// constrained container while the same spool remained. The scan now
+    /// reads through a capped reader (MAX_SPOOL_LINE_BYTES) and
+    /// consumes-and-SKIPS oversized and incomplete records without
+    /// buffering them; skipping is safe because only newline-terminated
+    /// records can ever have been delivered by the relay (it withholds
+    /// in-flight fragments), so their sequences cannot poison any
+    /// frontier.
+    #[test]
+    fn initial_spool_sequence_skips_oversized_and_incomplete_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        let mut body = Vec::new();
+        // A workload-forged oversized record (well past the scan cap):
+        // newline-terminated garbage, never a writer-produced frame.
+        body.extend(std::iter::repeat_n(
+            b'z',
+            MAX_SPOOL_LINE_BYTES as usize + 4096,
+        ));
+        body.push(b'\n');
+        // A real frame after it — the scan must resume past the skipped
+        // record and still see this one.
+        body.extend_from_slice(frame(42).as_bytes());
+        body.push(b'\n');
+        // A second forged oversized record, then another real frame, then
+        // an in-flight trailing fragment (no newline at EOF).
+        body.extend(std::iter::repeat_n(
+            b'y',
+            MAX_SPOOL_LINE_BYTES as usize + 4096,
+        ));
+        body.push(b'\n');
+        body.extend_from_slice(frame(43).as_bytes());
+        body.push(b'\n');
+        body.extend_from_slice(b"{\"version\":\"enclava-log-frag"); // partial record at EOF
+        std::fs::write(&path, &body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        // Oversized and incomplete records are skipped; both real frames
+        // are seen; the resume point is the highest real sequence + 1.
+        // (Under the old unbounded scan this fixture buffered the forged
+        // records whole.)
+        assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 44);
     }
 
     /// Round-11 review finding (P2): a record whose payload is EXACTLY
