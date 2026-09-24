@@ -206,6 +206,19 @@ fn enforce_with(
             return Err(EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_KBS_URL"));
         }
 
+        // The trustee attestation-verify bearer token must never transit
+        // cleartext. Unlike PLATFORM_SIGNING_SERVICE_URL there is no
+        // cluster-internal http:// carve-out: every deployed overlay
+        // (dev/preprod) fronts the Trustee verify endpoint with https
+        // (enclava-ops-manifests cap-api).
+        if let Some(value) = lookup("TRUSTEE_ATTESTATION_VERIFY_URL")
+            && http_scheme(&value)
+        {
+            return Err(EnvGateError::DebugOnlyFlagInRelease(
+                "TRUSTEE_ATTESTATION_VERIFY_URL",
+            ));
+        }
+
         // The signing-service bearer token must never transit cleartext
         // off-cluster. Scheme comes from the parsed URL (case-insensitive:
         // `HTTP://` must not slip a prefix check). The same loopback /
@@ -424,6 +437,56 @@ mod tests {
             err,
             EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_KBS_URL")
         ));
+    }
+
+    #[test]
+    fn release_rejects_http_trustee_attestation_verify_url() {
+        let mut env = ok_required();
+        env.insert(
+            "TRUSTEE_ATTESTATION_VERIFY_URL",
+            "http://kbs.example.test:8080/kbs/v0/attestation/verify",
+        );
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_ATTESTATION_VERIFY_URL")
+        ));
+    }
+
+    #[test]
+    fn release_rejects_case_insensitive_http_trustee_attestation_verify_url() {
+        // `HTTP://` must not slip a prefix check; the gate parses the URL so
+        // the scheme normalizes to lowercase.
+        let mut env = ok_required();
+        env.insert(
+            "TRUSTEE_ATTESTATION_VERIFY_URL",
+            "HTTP://kbs.example.test:8080/kbs/v0/attestation/verify",
+        );
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::DebugOnlyFlagInRelease("TRUSTEE_ATTESTATION_VERIFY_URL")
+        ));
+    }
+
+    #[test]
+    fn release_allows_https_trustee_attestation_verify_url() {
+        let mut env = ok_required();
+        env.insert(
+            "TRUSTEE_ATTESTATION_VERIFY_URL",
+            "https://kbs-service.trustee-operator-system.svc.cluster.local:8080/kbs/v0/attestation/verify",
+        );
+        run(env, false).unwrap();
+    }
+
+    #[test]
+    fn debug_allows_http_trustee_attestation_verify_url() {
+        let mut env = ok_required();
+        env.insert(
+            "TRUSTEE_ATTESTATION_VERIFY_URL",
+            "http://localhost:8080/kbs/v0/attestation/verify",
+        );
+        run(env, true).unwrap();
     }
 
     #[test]
