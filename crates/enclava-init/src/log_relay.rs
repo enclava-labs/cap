@@ -932,27 +932,60 @@ fn verify_anchor_live(file: &File, anchor: &FollowAnchor) -> io::Result<()> {
     Ok(())
 }
 
-/// One-byte liveness read on the client socket (round-18 review P1).
-/// `true` when the client has gone away: FIN (a read of 0 — the client
-/// closed, or half-closed; a half-close is treated as gone exactly the way
+/// Hard cap on junk drained from the client socket by one liveness probe
+/// (round-18 self-check Critical): a client can write arbitrary pre-FIN
+/// bytes (e.g. an unread request body — `read_request_head` stops at the
+/// header terminator and leaves the rest buffered). Draining one byte per
+/// poll would let a FIN hide behind rcvbuf-worth of junk for
+/// bytes × FOLLOW_POLL_INTERVAL (128 KiB ≈ 18 h), pinning the connection
+/// budget long after the peer is gone. The probe instead drains everything
+/// available up to this cap in ONE poll; the cap keeps a malicious
+/// firehose from monopolizing the handler thread — the residue is simply
+/// drained by later probes, and a FIN always sits behind a FINITE amount
+/// of buffered data, so the client is still reaped in bounded time
+/// (≤ drain cap per 500 ms poll → ~2 MiB/s reap floor for pure junk).
+const CLIENT_PROBE_DRAIN_CAP: usize = 1 << 21; // 2 MiB
+
+/// Liveness read on the client socket (round-18 review P1). `true` when
+/// the client has gone away: FIN (a read of 0 — the client closed, or
+/// half-closed; a half-close is treated as gone exactly the way
 /// mainstream streaming servers treat request-EOF) or a hard socket error
-/// (reset/unconnected). Unexpected stray bytes are drained one per poll
-/// and treated as alive — the follow protocol never reads client data, so
-/// anything sent is junk, but draining matters: a peek-style probe would
-/// see the same buffered byte forever and a later FIN would never become
-/// visible. WouldBlock/TimedOut (the CLIENT_PROBE_TIMEOUT window elapsing
-/// with nothing to read) is the normal quiet-client answer. Interrupted
-/// counts as alive and is retried on the next poll.
+/// (reset/unconnected). Unexpected stray bytes are drained in full (up to
+/// CLIENT_PROBE_DRAIN_CAP per poll) and treated as alive — the follow
+/// protocol never reads client data, so anything sent is junk, but
+/// draining in full matters: a FIN behind buffered junk would otherwise
+/// stay invisible (one-byte-per-poll draining keeps a zombie session for
+/// junk_bytes × poll_interval, and a peek-style probe would see the same
+/// buffered byte forever). WouldBlock/TimedOut (the
+/// CLIENT_PROBE_TIMEOUT window elapsing with nothing to read) is the
+/// normal quiet-client answer. Interrupted counts as alive and is retried
+/// on the next poll.
 fn client_disconnected(stream: &TcpStream) -> bool {
     let mut probe: &TcpStream = stream;
-    let mut buf = [0u8; 1];
-    match probe.read(&mut buf) {
-        Ok(0) => true,
-        Ok(_) => false,
-        Err(err) => !matches!(
-            err.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
-        ),
+    let mut buf = [0u8; 8192];
+    let mut drained: usize = 0;
+    loop {
+        match probe.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(n) => {
+                drained += n;
+                if drained >= CLIENT_PROBE_DRAIN_CAP {
+                    // Cap reached without a FIN: alive (for now). The rest
+                    // of the backlog is drained on subsequent polls — a FIN
+                    // always follows a finite junk prefix, so the reap
+                    // delay stays bounded (see CLIENT_PROBE_DRAIN_CAP).
+                    return false;
+                }
+            }
+            Err(err) => {
+                return !matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                );
+            }
+        }
     }
 }
 
@@ -2663,10 +2696,11 @@ mod tests {
         assert_eq!(slots.active(), 0);
     }
 
-    /// The follow loop's client probe (round-18 review P1): a live silent
-    /// client is not gone, stray bytes are drained and do NOT mask a later
-    /// FIN (the peek-style alternative would see the same buffered byte
-    /// forever), and a departed client reads as gone.
+    /// The follow loop's client probe (round-18 review P1 + self-check
+    /// Critical): a live silent client is not gone, stray bytes are drained
+    /// IN FULL — so a FIN behind a junk burst is seen in the SAME probe
+    /// (the one-byte-per-poll variant would keep the zombie for
+    /// junk_bytes × poll_interval) — and a departed client reads as gone.
     #[test]
     fn client_probe_sees_live_stray_and_departed_clients() {
         use std::io::Write as _;
@@ -2688,6 +2722,10 @@ mod tests {
             !client_disconnected(&server),
             "a stray byte is drained and the client is alive"
         );
+        // Junk burst then immediate close: the FIN trails the burst, and a
+        // single probe must drain the backlog AND see the FIN.
+        let burst: Vec<u8> = (0..64_u32 * 1024).map(|i| (i % 251) as u8).collect();
+        client.write_all(&burst).unwrap();
         drop(client);
         // FIN delivery can trail close() by a hair even on loopback: poll.
         let mut gone = client_disconnected(&server);
@@ -2700,7 +2738,7 @@ mod tests {
         }
         assert!(
             gone,
-            "FIN after the drained byte must read as gone (no peek-style masking)"
+            "FIN behind a 64 KiB junk burst must read as gone in a bounded single-probe drain"
         );
     }
 
