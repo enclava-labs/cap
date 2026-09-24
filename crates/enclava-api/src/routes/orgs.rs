@@ -918,18 +918,25 @@ pub async fn rotate_org_owner(
     // binding is enforced by the authoritative verifier in CAP:
     // - when a rotation creates a new keyring version, signed_at must be
     //   neither in the future (no skew allowance: a pre-creation capture
-    //   must not pass as newer than the version it rotates) nor older than
-    //   the first-use max-age window, both measured against the
-    //   authoritative clock observed after the signing-authority lane is
-    //   acquired (queueing on the lane can outlast any window captured
-    //   before the lock).
+    //   must not pass as newer than the version it rotates) nor older
+    //   than the current keyring version's creation, both measured
+    //   against the authoritative clock observed after the
+    //   signing-authority lane is acquired (queueing on the lane can
+    //   outlast any window captured before the lock).
     // - the signed_at max-age is a first-use bound, enforced only when the
     //   rotation creates a new keyring version: a captured directive is not
     //   a standing bearer token for the (current -> replacement) pair. A
     //   retry of an already-applied rotation must stay idempotent at any
     //   age (response-loss recovery, pre-ledger rotations from before this
     //   deployment) and is instead proven by the byte-identical stored
-    //   keyring content, signatures, and pinned-owner checks below.
+    //   keyring content, signatures, and pinned-owner checks below. The
+    //   bound carries a recovery exception: when the signing service is
+    //   already pinned to this exact replacement owner (upstream
+    //   rotate-owner succeeded, only the CAP transaction rolled back),
+    //   the retry is allowed through at any age -- completing the lost
+    //   CAP rows introduces no new owner key, and the ledger still
+    //   consumes the digest so the exception is single-use per
+    //   directive.
     // - when the rotation creates a new keyring version, signed_at may not
     //   predate the creation of the keyring version whose owner signed it.
     // - each directive accepted on the insert-new-version path is consumed
@@ -1041,17 +1048,49 @@ pub async fn rotate_org_owner(
                 "owner rotation directive signed_at is in the future",
             ));
         }
-        // The first-use max-age bound is enforced after the signing
-        // service's owner status is consulted below: when the service is
-        // already pinned to this replacement owner, the upstream
-        // rotate-owner for this exact (current -> replacement) pair has
-        // already succeeded and only the CAP rows were lost to a
-        // rolled-back transaction. Rejecting that recovery retry on age
-        // alone would strand the reconciliation (PR #185 review), and
-        // completing it cannot introduce any new owner key: the pinned
-        // owner, byte-identical keyring content, and signature checks
-        // above still bind the stored version to exactly what the
-        // upstream already accepted.
+        if body.signed_at < lane_now - chrono::Duration::seconds(MAX_DIRECTIVE_AGE_SECONDS) {
+            // Recovery exception (PR #185 review): when the upstream
+            // rotate-owner already succeeded and only the CAP transaction
+            // rolled back, the signing service is pinned to the
+            // replacement owner while no keyring version or ledger row
+            // exists. Retrying the exact request past the window must
+            // still reconcile that state: consult the service's owner
+            // status and allow the retry through only when it already
+            // holds this exact replacement owner. Completing the insert
+            // then introduces no new owner key -- the pinned-owner,
+            // byte-identical content, and signature checks below still
+            // bind the stored version to exactly what the upstream
+            // already accepted, and the ledger still consumes the digest
+            // so the allowance is single-use. Reaching this code with the
+            // service still on the current owner means the request would
+            // introduce the replacement upstream for the first time, so
+            // the first-use max-age bound applies unchanged.
+            let recovery_service = state.signing_service.as_ref().ok_or((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!(
+                    {"error": "platform signing service is not configured"}
+                )),
+            ))?;
+            let recovery_status = match recovery_service.owner_status(org_id).await {
+                Ok(status) => status,
+                // Unreachable service cannot confirm the recovery state,
+                // and the rotation could not proceed past the authoritative
+                // owner_status check below anyway: reject as too old.
+                Err(_) => {
+                    return Err(bad_request("owner rotation directive signed_at is too old"));
+                }
+            };
+            let recovery_owner = recovery_status
+                .owner_pubkey_hex
+                .as_deref()
+                .and_then(|raw| hex::decode(raw).ok());
+            let service_holds_replacement = recovery_status.org_id == org_id
+                && recovery_status.state == "ready"
+                && recovery_owner.as_deref() == Some(replacement_owner.as_slice());
+            if !service_holds_replacement {
+                return Err(bad_request("owner rotation directive signed_at is too old"));
+            }
+        }
         if body.signed_at < latest.4 {
             return Err(bad_request(
                 "owner rotation directive predates the current keyring version",
@@ -2323,6 +2362,140 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete consumed-conflict user");
+    }
+
+    #[tokio::test]
+    async fn owner_rotation_recovers_when_service_already_holds_replacement() {
+        // Regression (PR #185 review, codex P2): if the upstream
+        // rotate-owner succeeds but the CAP transaction rolls back, the
+        // signing service is pinned to the replacement while no keyring
+        // version or ledger row exists. Retrying the exact request after
+        // the 15-minute first-use window must still reconcile: the
+        // owner_status check observes the pinned replacement and the
+        // max-age bound must not reject the recovery retry on age alone
+        // (completing the insert introduces no new owner key -- the
+        // pinned-owner, byte-identical content, and signature checks
+        // still bind the stored version to what upstream already
+        // accepted). Contrast with
+        // owner_rotation_expired_exact_retry_stays_idempotent, which
+        // covers the already-applied (committed v2) path.
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-service-recovery-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert service-recovery org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Service Recovery Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert service-recovery user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert service-recovery membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(current_key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert service-recovery signing keys");
+
+        // The signing service starts pinned to the replacement owner:
+        // the upstream rotate-owner of the lost first attempt already
+        // succeeded and CAP's transaction rolled back.
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                mock_signing_service_owner_api(org_id, replacement_key.verifying_key().to_bytes())
+                    .await,
+                None,
+            )
+            .expect("build mock signing service client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+        )
+        .await
+        .expect("publish v1 keyring");
+        // Backdate v1 so the 20-minute-old directive below still passes
+        // the "not older than the current version's creation" bound; only
+        // the first-use max-age window is exceeded.
+        sqlx::query("UPDATE org_keyrings SET created_at = $2 WHERE org_id = $1 AND version = 1")
+            .bind(org_id)
+            .bind(Utc::now() - chrono::Duration::minutes(30))
+            .execute(&pool)
+            .await
+            .expect("backdate v1 creation");
+
+        // The recovery retry: same directive the lost attempt used, now
+        // past the 15-minute window. No v2 row, no ledger row exists.
+        let recovery = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            Utc::now() - chrono::Duration::minutes(20),
+            "service-recovery",
+        );
+        let recovered = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(recovery),
+        )
+        .await
+        .expect("recovery retry past the window reconciles the lost rotation");
+        assert_eq!(recovered.keyring_version, 2);
+        assert_eq!(
+            recovered.owner_fingerprint,
+            hex::encode(Sha256::digest(replacement_key.verifying_key().to_bytes()))
+        );
+        let stored_version: i64 = sqlx::query_scalar(
+            "SELECT version FROM org_keyrings WHERE org_id = $1 ORDER BY version DESC LIMIT 1",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read back latest version");
+        assert_eq!(stored_version, 2);
+
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete service-recovery audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete service-recovery org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete service-recovery user");
     }
 
     #[tokio::test]
