@@ -1,7 +1,9 @@
 //! Replicates the `resolve_exec_identity` + chown logic from the legacy
 //! `bootstrap_script.sh` (lines 567-606). The workload may pass either:
+//!   - a numeric `<uid>` or `<uid>:<gid>` pair (parsed directly, no NSS
+//!     lookup — matches runc semantics and keeps numeric identities
+//!     working on minimal hosts without a configured NSS backend)
 //!   - a named user existing in /etc/passwd (resolved via `getpwnam_r`)
-//!   - a numeric `<uid>` or `<uid>:<gid>` pair
 //!
 //! On resolution we recursively chown the seed file (and optionally the
 //! decrypted mount root) to the target identity so the unprivileged app
@@ -25,6 +27,26 @@ pub struct ExecIdentity {
 }
 
 pub fn resolve_exec_identity(target: &str) -> Result<ExecIdentity> {
+    // Numeric identities (`<uid>` or `<uid>:<gid>`) are parsed directly and
+    // must not depend on NSS availability: `getpwnam_r` can fail with
+    // ENOENT on minimal hosts (distroless containers, missing passwd
+    // databases), and the legacy `bootstrap_script.sh` resolve_exec_identity
+    // also falls through to numeric parsing whenever `id` fails for any
+    // reason. Match runc semantics: an all-numeric spec is a UID, not a
+    // username lookup.
+    let (uid_part, gid_part) = match target.split_once(':') {
+        Some((u, g)) => (u, g),
+        None => (target, target),
+    };
+
+    if let (Ok(uid), Ok(gid)) = (uid_part.parse::<u32>(), gid_part.parse::<u32>()) {
+        return Ok(ExecIdentity {
+            uid,
+            gid,
+            kind: IdentityKind::Numeric,
+        });
+    }
+
     if let Some((uid, gid)) = lookup_user(target)? {
         return Ok(ExecIdentity {
             uid,
@@ -33,23 +55,9 @@ pub fn resolve_exec_identity(target: &str) -> Result<ExecIdentity> {
         });
     }
 
-    let (uid_part, gid_part) = match target.split_once(':') {
-        Some((u, g)) => (u, g),
-        None => (target, target),
-    };
-
-    let uid = uid_part
-        .parse::<u32>()
-        .map_err(|_| InitError::Config(format!("invalid exec identity: {target}")))?;
-    let gid = gid_part
-        .parse::<u32>()
-        .map_err(|_| InitError::Config(format!("invalid exec identity: {target}")))?;
-
-    Ok(ExecIdentity {
-        uid,
-        gid,
-        kind: IdentityKind::Numeric,
-    })
+    Err(InitError::Config(format!(
+        "invalid exec identity: {target}"
+    )))
 }
 
 fn lookup_user(name: &str) -> Result<Option<(u32, u32)>> {
@@ -61,12 +69,17 @@ fn lookup_user(name: &str) -> Result<Option<(u32, u32)>> {
     }
 }
 
+/// Change ownership of `path` without following symlinks (lchown
+/// semantics, #137). A symlink planted at a state path is owned as a
+/// symlink instead of redirecting the chown at its target.
 pub fn chown(path: &Path, ident: ExecIdentity) -> Result<()> {
-    use nix::unistd::{Gid, Uid, chown};
-    chown(
+    use nix::unistd::{Gid, Uid, fchownat};
+    fchownat(
+        None,
         path,
         Some(Uid::from_raw(ident.uid)),
         Some(Gid::from_raw(ident.gid)),
+        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
     )
     .map_err(|e| InitError::Config(format!("chown: {e}")))?;
     Ok(())
@@ -113,6 +126,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_numeric_takes_precedence_over_lookup() {
+        // All-numeric specs are UIDs (runc semantics), never passed through
+        // NSS — this holds even if a user literally named "0" existed.
+        let id = resolve_exec_identity("0").unwrap();
+        assert_eq!(id.kind, IdentityKind::Numeric);
+        assert_eq!((id.uid, id.gid), (0, 0));
+    }
+
+    #[test]
+    fn resolve_named_user_when_lookup_succeeds() {
+        // Root exists on any POSIX test host with a passwd database.
+        let id = resolve_exec_identity("root").unwrap();
+        assert_eq!(id.uid, 0);
+        assert_eq!(id.kind, IdentityKind::Named);
+    }
+
+    #[test]
     fn chown_recursive_skips_symlinks() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("target");
@@ -127,5 +157,45 @@ mod tests {
             kind: IdentityKind::Numeric,
         };
         chown_recursive(dir.path(), id).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_on_symlink_does_not_follow_the_link() {
+        use std::os::unix::fs::MetadataExt;
+
+        let current = ExecIdentity {
+            uid: nix::unistd::Uid::current().as_raw(),
+            gid: nix::unistd::Gid::current().as_raw(),
+            kind: IdentityKind::Numeric,
+        };
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::write(&target, b"secret").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // ctime granularity: give the filesystem a moment so a chown of the
+        // wrong inode is always observable as a changed ctime.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        let target_ctime_before = std::fs::metadata(&target).unwrap().ctime();
+        let link_ctime_before = std::fs::symlink_metadata(&link).unwrap().ctime();
+
+        chown(&link, current).unwrap();
+
+        // The referent must be untouched: a following chown would have
+        // updated its ctime (chown to the current ids still bumps ctime).
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().ctime(),
+            target_ctime_before,
+            "chown followed the symlink: target inode was modified"
+        );
+        // The link inode itself must have been re-owned.
+        assert_ne!(
+            std::fs::symlink_metadata(&link).unwrap().ctime(),
+            link_ctime_before,
+            "symlink inode was not re-owned (lchown did not take effect)"
+        );
     }
 }

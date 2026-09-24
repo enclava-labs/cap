@@ -1884,7 +1884,16 @@ pub async fn logs(args: LogsArgs) -> Result<(), Box<dyn std::error::Error>> {
             print_decrypted_log_frame(&private_key, &line)?;
         }
     } else {
-        let body = resp.text().await?;
+        // Non-follow mode: bound the buffered read so a hostile API cannot
+        // stream an unbounded "logs" body into CLI memory (the follow-mode
+        // stream below is line-at-a-time and inherently bounded by the
+        // client timeout instead).
+        let bytes = enclava_cli::api_client::read_bounded_body(
+            resp,
+            enclava_cli::api_client::MAX_API_RESPONSE_BODY_BYTES,
+        )
+        .await?;
+        let body = String::from_utf8_lossy(&bytes);
         for line in body.lines().filter(|line| !line.trim().is_empty()) {
             print_decrypted_log_frame(&private_key, line)?;
         }

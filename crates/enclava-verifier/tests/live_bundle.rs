@@ -312,9 +312,33 @@ fn independently_selected_policy_and_channel_context_fail_closed() {
         "/transport/require_tls_channel_spki",
         serde_json::json!(true),
     );
+    // The appraiser cannot observe the live TLS channel
+    // (observed_channel_spki_sha256: None), so the
+    // transport.tls_channel_spki check is Skipped. A policy that demands it
+    // — via the transport flag or an explicit required_checks entry — must
+    // fail closed (#127), not degrade to Inconclusive.
+    let skipped_required = verify(&bundle, &require_channel, context());
+    assert_eq!(skipped_required.verdict, Verdict::Fail);
+    assert!(
+        skipped_required
+            .checks
+            .iter()
+            .any(|check| check.id == "transport.tls_channel_spki"
+                && check.outcome == CheckOutcome::Skipped
+                && check.reason_code == "CHANNEL_SPKI_UNAVAILABLE")
+    );
+    let listed_required = {
+        let mut policy: serde_json::Value = serde_json::from_slice(&require_channel).unwrap();
+        policy["transport"]["require_tls_channel_spki"] = serde_json::json!(false);
+        policy["required_checks"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("transport.tls_channel_spki"));
+        serde_json::to_vec(&policy).unwrap()
+    };
     assert_eq!(
-        verify(&bundle, &require_channel, context()).verdict,
-        Verdict::Inconclusive
+        verify(&bundle, &listed_required, context()).verdict,
+        Verdict::Fail
     );
     let mut mismatched_channel = context();
     mismatched_channel.observed_channel_spki_sha256 = Some([0; 32]);

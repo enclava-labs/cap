@@ -8,7 +8,7 @@ use enclava_common::image::ImageRef;
 use enclava_common::types::{Durability, ResourceLimits, UnlockMode};
 use enclava_engine::types::{
     AttestationConfig, BindMount, ConfidentialApp, Container, DomainSpec, StorageSpec, VolumeSpec,
-    WorkloadSecurityProfile,
+    WorkloadArtifactBinding, WorkloadSecurityProfile,
 };
 
 #[test]
@@ -672,4 +672,105 @@ fn confidential_app_for_descriptor(descriptor: &DeploymentDescriptor) -> Confide
         workload_artifact_binding: None,
         generated_agent_policy: None,
     }
+}
+
+fn log_encryption_config() -> enclava_engine::types::LogEncryptionConfig {
+    enclava_engine::types::LogEncryptionConfig {
+        algorithm: enclava_common::log_encryption::LOG_ENCRYPTION_ALGORITHM.to_string(),
+        key_id: "logs-prod".to_string(),
+        public_key_base64url: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        public_key_sha256: "sha256:Zmh6rfhivXdsj8GLjp-OIAiXFIVu4jOzkCpZHQ1fKSU".to_string(),
+    }
+}
+
+fn pinned_app_for_descriptor(descriptor: &DeploymentDescriptor) -> ConfidentialApp {
+    let mut app = confidential_app_for_descriptor(descriptor);
+    app.log_encryption = Some(log_encryption_config());
+    app.workload_artifact_binding = Some(WorkloadArtifactBinding {
+        descriptor_core_hash: [1; 32],
+        descriptor_signing_pubkey: [2; 32],
+        org_keyring_fingerprint: [3; 32],
+        omit_log_encryption_claim: false,
+    });
+    app
+}
+
+fn artifacts_with_expected_hash(
+    descriptor: &DeploymentDescriptor,
+    expected_hash: [u8; 32],
+) -> DeploymentSigningArtifacts {
+    let mut artifacts = signing_artifacts(descriptor.clone());
+    artifacts.descriptor.expected_cc_init_data_hash = expected_hash;
+    artifacts
+}
+
+#[test]
+fn modern_render_match_clears_the_legacy_pin() {
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    app.workload_artifact_binding
+        .as_mut()
+        .unwrap()
+        .omit_log_encryption_claim = true;
+    let (_, modern_hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app);
+    let artifacts = artifacts_with_expected_hash(
+        &descriptor,
+        hex::decode(modern_hash).unwrap().try_into().unwrap(),
+    );
+    artifacts
+        .validate_and_pin_cc_init_data_render(&mut app)
+        .expect("modern render must validate");
+    assert!(
+        !app.workload_artifact_binding
+            .as_ref()
+            .unwrap()
+            .omit_log_encryption_claim,
+        "a modern match must explicitly clear a stale legacy pin"
+    );
+}
+
+#[test]
+fn legacy_render_match_pins_the_binding() {
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    let mut legacy_app = app.clone();
+    legacy_app
+        .workload_artifact_binding
+        .as_mut()
+        .unwrap()
+        .omit_log_encryption_claim = true;
+    let (_, legacy_hash) =
+        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&legacy_app);
+    let artifacts = artifacts_with_expected_hash(
+        &descriptor,
+        hex::decode(legacy_hash).unwrap().try_into().unwrap(),
+    );
+    artifacts
+        .validate_and_pin_cc_init_data_render(&mut app)
+        .expect("legacy render must validate");
+    assert!(
+        app.workload_artifact_binding
+            .as_ref()
+            .unwrap()
+            .omit_log_encryption_claim,
+        "a legacy-only match must pin the binding to the legacy render"
+    );
+}
+
+#[test]
+fn render_mismatch_resets_the_pin_and_errors() {
+    let descriptor = descriptor();
+    let mut app = pinned_app_for_descriptor(&descriptor);
+    let artifacts = artifacts_with_expected_hash(&descriptor, [0xaa; 32]);
+    let err = artifacts
+        .validate_and_pin_cc_init_data_render(&mut app)
+        .expect_err("neither render matches");
+    assert!(matches!(err, SigningServiceError::Mismatch(_)));
+    assert!(
+        !app.workload_artifact_binding
+            .as_ref()
+            .unwrap()
+            .omit_log_encryption_claim,
+        "a failed validation must not leave the legacy pin set"
+    );
 }

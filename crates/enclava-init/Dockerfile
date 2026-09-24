@@ -1,4 +1,4 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 
 ARG BUILD_PROFILE=release
 
@@ -21,7 +21,7 @@ COPY crates ./crates
 RUN if [ "${BUILD_PROFILE}" = "release" ]; then \
       cargo build --locked --release -p enclava-init --features prod-strict --bin enclava-init && \
       cargo build --locked --release -p enclava-init --features prod-strict --bin enclava-log-relay && \
-      cargo build --locked --release -p enclava-wait-exec --target x86_64-unknown-linux-musl && \
+      cargo build --locked --release -p enclava-wait-exec --features prod-strict --target x86_64-unknown-linux-musl && \
       mkdir -p /out && \
       cp target/release/enclava-init /out/enclava-init && \
       cp target/release/enclava-log-relay /out/enclava-log-relay && \
@@ -39,7 +39,7 @@ RUN if [ "${BUILD_PROFILE}" = "release" ]; then \
       exit 1; \
     fi
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \

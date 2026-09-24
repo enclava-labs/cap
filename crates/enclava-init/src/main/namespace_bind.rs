@@ -137,7 +137,7 @@ pub(super) fn expected_identity(cfg: &Config, name: &str) -> ExpectedIdentity {
     }
 }
 
-fn read_sentinel_pid(
+pub(super) fn read_sentinel_pid(
     path: &Path,
     proc_root: &Path,
     expected_name: &str,
@@ -157,8 +157,19 @@ fn read_sentinel_pid(
             expected.uid
         ));
     }
-    if metadata.permissions().mode() & 0o002 != 0 {
-        return Err(anyhow!("sentinel must not be world-writable"));
+    if metadata.gid() != expected.gid {
+        return Err(anyhow!(
+            "sentinel owner gid {} does not match expected gid {}",
+            metadata.gid(),
+            expected.gid
+        ));
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 {
+        return Err(anyhow!(
+            "sentinel must not be group- or world-writable (mode {:o})",
+            mode & 0o777
+        ));
     }
     let text = std::fs::read_to_string(path)?;
     let record = parse_sentinel_record(&text)?;
@@ -366,10 +377,11 @@ pub(super) fn validate_sentinel_name(name: &str) -> Result<String> {
     let path = Path::new(name);
     if path.components().count() == 1
         && matches!(path.components().next(), Some(Component::Normal(_)))
+        && !name.bytes().any(|b| b.is_ascii_control() || b == b'=')
     {
         Ok(name.to_string())
     } else {
-        Err(anyhow!("invalid container sentinel name: {name}"))
+        Err(anyhow!("invalid container sentinel name: {name:?}"))
     }
 }
 

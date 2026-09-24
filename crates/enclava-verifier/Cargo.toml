@@ -26,3 +26,6 @@ x509-cert = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }
+# Cross-checked against the audited `rsa` crate for PSS interop tests only;
+# the verifier itself keeps its dependency-minimal hand-rolled implementation.
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }

@@ -13,7 +13,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 
 use enclava_cli::{
-    api_client::{ApiClient, ApiError},
+    api_client::{ApiClient, ApiError, read_bounded_body},
     api_types::{
         AppResponse, CreateAppRequest, CreateTemplateInstanceRequest, DeploymentEntry,
         HostedTemplate, HostedTemplateConfigKey, ServiceSpec, SshCommandResponse,
@@ -1384,6 +1384,9 @@ async fn wait_for_template_bootstrap_endpoint(
 fn should_retry_template_bootstrap_endpoint_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(error) => should_retry_api_transport_error(error),
+        // A body that fails to decode or breaches the size cap will not
+        // improve on retry: the API response itself is bad.
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => false,
         ApiError::Api { status, code, .. } => match (*status, code.as_deref()) {
             (409, Some("cap_app_sync_pending")) => true,
             (
@@ -2222,6 +2225,8 @@ fn template_config_next_locked_since(
 fn should_retry_template_config_sync_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
+        // A malformed or oversized body will not improve on retry.
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => false,
         ApiError::Api { status, .. } => matches!(*status, 408 | 409 | 425 | 429) || *status >= 500,
         ApiError::NotAuthenticated => false,
     }
@@ -2897,6 +2902,8 @@ fn template_deployment_failure_message(
 fn should_retry_template_deployment_status_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(error) => should_retry_api_transport_error(error),
+        // A malformed or oversized body will not improve on retry.
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => false,
         ApiError::Api { status, code, .. } => {
             if matches!(
                 code.as_deref(),
@@ -2983,19 +2990,17 @@ async fn fetch_direct_ssh_command(
     if !response.status().is_success() {
         return Ok(None);
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_SSH_COMMAND_BYTES as u64)
-    {
-        return Err("stable SSH endpoint command response is too large".into());
-    }
-    let body = match response.bytes().await {
+    // Bounded read: the declared content-length alone is not trustworthy
+    // (a hostile relay can stream chunked bodies without one), so every
+    // chunk is checked against the cap, mirroring the API client's
+    // `read_bounded_body`.
+    let body = match read_bounded_body(response, MAX_SSH_COMMAND_BYTES).await {
         Ok(body) => body,
+        Err(ApiError::ResponseTooLarge(_)) => {
+            return Err("stable SSH endpoint command response is too large".into());
+        }
         Err(_) => return Ok(None),
     };
-    if body.len() > MAX_SSH_COMMAND_BYTES {
-        return Err("stable SSH endpoint command response is too large".into());
-    }
     let body = std::str::from_utf8(&body)
         .map_err(|_| "stable SSH endpoint command response is not UTF-8")?;
     let command = ssh_command_body_line(body)
@@ -3237,6 +3242,8 @@ fn normalize_paas_ssh_command_app_url(app_url: &str) -> Result<String, Box<dyn s
 fn should_retry_paas_ssh_command_error(error: &ApiError) -> bool {
     match error {
         ApiError::Http(_) => true,
+        // A malformed or oversized body will not improve on retry.
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => false,
         ApiError::Api { status, code, .. } => {
             if matches!(
                 code.as_deref(),
@@ -4642,7 +4649,10 @@ mod tests {
             .get_unlock_endpoint("shell")
             .await
             .unwrap_err();
-        assert!(matches!(&error, ApiError::Http(error) if error.is_decode()));
+        // Decode failures surface as the dedicated ApiError::Decode variant
+        // (bounded-body read + serde decode) rather than a raw reqwest
+        // transport error.
+        assert!(matches!(&error, ApiError::Decode(_)));
         assert!(!should_retry_template_bootstrap_endpoint_error(&error));
         assert!(!should_retry_template_deployment_status_error(&error));
     }
@@ -5400,6 +5410,50 @@ mod tests {
         );
         assert_eq!(ready.endpoint.as_deref(), Some("relay.enclava.me:20051"));
         assert_eq!(ready.app_url.as_deref(), Some(app_url.as_str()));
+    }
+
+    #[tokio::test]
+    async fn chunked_oversized_ssh_txt_body_is_rejected_without_waiting_for_the_stream_to_end() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind chunked ssh command fixture");
+        let addr = listener.local_addr().expect("chunked ssh command addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept chunked ssh command request");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            // No content-length: a chunked body that exceeds the cap and
+            // never terminates. The per-chunk bound check must reject it as
+            // too large instead of buffering until the request timeout.
+            let mut response =
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n"
+                    .to_string();
+            for _ in 0..6 {
+                response.push_str("64\r\n");
+                response.push_str(&"x".repeat(0x64));
+                response.push_str("\r\n");
+            }
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write chunked ssh command response");
+            // Hold the connection open: no terminal zero-length chunk.
+            let _ = stream.read(&mut [0_u8; 1]).await;
+        });
+
+        let err = fetch_direct_ssh_command(&format!("http://{addr}/ssh.txt"))
+            .await
+            .expect_err("oversized chunked body must be rejected, not treated as a fallback");
+        assert!(
+            err.to_string()
+                .contains("stable SSH endpoint command response is too large"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

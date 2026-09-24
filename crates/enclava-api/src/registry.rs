@@ -29,13 +29,20 @@ pub async fn resolve_tag_to_digest(
 ) -> Result<String, RegistryError> {
     let base_url = registry_base_url(registry)?;
 
-    // HEAD request for the manifest, accepting OCI and Docker media types
+    // Resolve by GET and hash the returned manifest bytes ourselves instead
+    // of trusting the Docker-Content-Digest header: a compromised or
+    // MITM-positioned registry could serve one manifest body while claiming
+    // a different (e.g. already-deployed and verified) digest, poisoning the
+    // audit trail that later verification steps anchor on. A GET response
+    // also still carries Docker-Content-Digest, so a mismatch between the
+    // self-computed and advertised digests additionally proves the registry
+    // is dishonest and is rejected outright (defense in depth, issue #140).
     let url = format!("{base_url}/v2/{repository}/manifests/{tag}");
     client.check_url(&url)?;
 
     let response = client
         .inner()
-        .head(&url)
+        .get(&url)
         .header(
             "Accept",
             "application/vnd.oci.image.index.v1+json, \
@@ -59,17 +66,65 @@ pub async fn resolve_tag_to_digest(
         )));
     }
 
-    // The digest is in the Docker-Content-Digest header
-    let digest = response
+    let advertised_digest = response
         .headers()
         .get("Docker-Content-Digest")
         .or_else(|| response.headers().get("docker-content-digest"))
         .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
         .ok_or_else(|| {
             RegistryError::ResolveFailed("no Docker-Content-Digest header in response".to_string())
         })?;
 
-    Ok(digest.to_string())
+    // Cap the manifest read like every other registry body: an allowlisted
+    // but hostile registry must not be able to OOM the API pod with an
+    // oversized "manifest". The cap is enforced against the bytes actually
+    // received (chunked read), not just an advertised or absent
+    // Content-Length, so an unbounded stream is cut off at the limit
+    // instead of being buffered first.
+    let limit = client.body_limit();
+    let manifest = crate::clients::read_body_capped(response, limit)
+        .await
+        .map_err(RegistryError::Client)?;
+    verify_advertised_digest(&advertised_digest, &manifest, registry, repository, tag)
+}
+
+/// Cross-check the registry-advertised digest against the digest computed
+/// from the manifest bytes we actually received. Returns the verified digest.
+fn verify_advertised_digest(
+    advertised: &str,
+    manifest: &[u8],
+    registry: &str,
+    repository: &str,
+    tag: &str,
+) -> Result<String, RegistryError> {
+    let computed = compute_manifest_digest(manifest);
+    if advertised != computed {
+        return Err(RegistryError::ResolveFailed(format!(
+            "registry header digest {advertised} does not match hashed manifest \
+             {computed} for {registry}/{repository}:{tag}"
+        )));
+    }
+    Ok(computed)
+}
+
+/// Canonical, algorithm-prefixed digest of raw manifest bytes.
+fn compute_manifest_digest(manifest: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{}", hex_encode(&Sha256::digest(manifest)))
+}
+
+/// Lowercase hex without pulling in the `hex` crate for one call site.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Map registry hostname to base URL.
@@ -146,5 +201,52 @@ mod tests {
             digest,
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    #[test]
+    fn manifest_digest_hashing_matches_registry_content_addressing() {
+        // Bytes of a real (trivial) manifest body; the digest must be the
+        // plain sha256 over exactly the bytes received.
+        let manifest = b"{\"schemaVersion\":2,\"mediaType\":\"application/vnd.docker.distribution.manifest.v2+json\"}";
+        let expected = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(manifest);
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            compute_manifest_digest(manifest),
+            format!("sha256:{expected}")
+        );
+    }
+
+    #[test]
+    fn advertised_digest_mismatch_is_rejected() {
+        // A registry that serves manifest X while claiming a different
+        // Docker-Content-Digest must not be trusted (issue #140).
+        let manifest = b"manifest-bytes";
+        let honest = compute_manifest_digest(manifest);
+        let liar = "sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let ok = verify_advertised_digest(&honest, manifest, "ghcr.io", "org/app", "v1").unwrap();
+        assert_eq!(ok, honest);
+
+        let err = verify_advertised_digest(liar, manifest, "ghcr.io", "org/app", "v1").unwrap_err();
+        assert!(
+            err.to_string().contains("does not match hashed manifest"),
+            "mismatch must name the disagreement: {err}"
+        );
+        assert!(
+            err.to_string().contains("ghcr.io/org/app:v1"),
+            "mismatch must name the image: {err}"
+        );
+    }
+
+    #[test]
+    fn hex_encoding_is_lowercase_and_dense() {
+        assert_eq!(hex_encode(&[0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+        assert_eq!(hex_encode(&[]), "");
     }
 }

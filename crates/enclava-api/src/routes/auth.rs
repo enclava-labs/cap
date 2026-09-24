@@ -1,8 +1,9 @@
 use axum::{Json, extract::State, http::StatusCode};
 use chrono::{DateTime, Duration, Utc};
+use hmac::{Hmac, Mac};
 use rand::{Rng, RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::api_key;
@@ -35,14 +36,27 @@ pub struct AuthResponse {
 }
 
 const DEVICE_LOGIN_TTL_MINUTES: i64 = 10;
+
+/// Post-expiry retention for the purge reaper. Sessions become unusable at
+/// `DEVICE_LOGIN_TTL_MINUTES`; this window keeps the rows around for
+/// audit/debug visibility before the reaper deletes them. Keep the two
+/// horizons discoverable together.
+const DEVICE_LOGIN_PURGE_RETENTION_HOURS: i64 = 24;
 const DEVICE_LOGIN_POLL_INTERVAL_SECONDS: i64 = 5;
+// FLAT tuples: sqlx 0.8's FromRow for tuples calls try_get once per
+// top-level element, so a nested tuple (Vec<u8>, (String, ...)) would try
+// to decode the second element as a single Postgres RECORD and fail with a
+// 500 at request time (the build still compiles). Keep every column as a
+// top-level tuple element.
 type DeviceLoginPollRow = (
+    Vec<u8>,
     String,
     DateTime<Utc>,
     Option<DateTime<Utc>>,
     Option<Uuid>,
     Option<Uuid>,
 );
+type DeviceLoginApproveRow = (Vec<u8>, String, DateTime<Utc>, Option<String>);
 
 async fn fetch_org_name(
     db: &sqlx::PgPool,
@@ -241,8 +255,91 @@ fn normalize_user_code(code: &str) -> String {
         .collect()
 }
 
-fn code_hash(code: &str) -> Vec<u8> {
+/// Keyed hash for device-login codes (HMAC-SHA256, domain-separated).
+///
+/// The user code is only ~40 bits of entropy, so an unsalted SHA-256 of it
+/// stored in the database is trivially brute-forceable offline. Keying the
+/// hash with the server's session HMAC key makes the stored value
+/// unforgeable without server compromise. Distinct labels keep device codes
+/// and user codes from colliding across domains.
+fn code_mac(label: &str, code: &str, hmac_key: &[u8; 32]) -> Vec<u8> {
+    let mut mac =
+        <Hmac<sha2::Sha256> as Mac>::new_from_slice(hmac_key).expect("HMAC accepts any key length");
+    mac.update(label.as_bytes());
+    mac.update(code.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// HMAC label for the high-entropy device code (issued to the CLI).
+#[doc(hidden)]
+pub fn device_code_hash(code: &str, hmac_key: &[u8; 32]) -> Vec<u8> {
+    code_mac("cap:device_login:device_code:v1", code, hmac_key)
+}
+
+/// HMAC label for the low-entropy user code (typed by a human at approval).
+#[doc(hidden)]
+pub fn user_code_hash(code: &str, hmac_key: &[u8; 32]) -> Vec<u8> {
+    code_mac("cap:device_login:user_code:v1", code, hmac_key)
+}
+
+/// Legacy pre-HMAC digest (plain SHA-256) used by the previous binary for
+/// device-login codes. Kept only for the rollout transition: sessions live
+/// at most 10 minutes (TTL), so lookups against this format can be dropped
+/// once every pre-upgrade session has expired.
+fn legacy_code_hash(code: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
     Sha256::digest(code.as_bytes()).to_vec()
+}
+
+/// Delete device-login sessions that expired more than a day ago. Sessions
+/// expire after 10 minutes, so a 24-hour retention window preserves ample
+/// audit/debug visibility while bounding table growth on hosts that get
+/// unauthenticated `/auth/device/start` traffic.
+///
+/// Deletes in bounded batches (see `PURGE_BATCH`) so a large backlog after
+/// an outage or a flood cannot turn into one huge DELETE transaction; the
+/// reaper loop picks up remaining batches on subsequent ticks, and each
+/// batch uses the `device_login_sessions_expires_purge` index.
+pub async fn purge_expired_device_login_sessions(db: &PgPool) -> Result<u64, sqlx::Error> {
+    const PURGE_BATCH: i64 = 5_000;
+    let mut total = 0u64;
+    loop {
+        let result = sqlx::query(
+            "DELETE FROM device_login_sessions
+             WHERE id IN (
+                 SELECT id FROM device_login_sessions
+                 WHERE expires_at < now() - make_interval(hours => $2::int)
+                 LIMIT $1
+             )",
+        )
+        .bind(PURGE_BATCH)
+        .bind(DEVICE_LOGIN_PURGE_RETENTION_HOURS)
+        .execute(db)
+        .await?;
+        let affected = result.rows_affected();
+        total += affected;
+        if (affected as i64) < PURGE_BATCH {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// Hourly reaper for expired device-login sessions (see
+/// `purge_expired_device_login_sessions`).
+pub fn spawn_device_login_reaper(db: PgPool) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            match purge_expired_device_login_sessions(&db).await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(purged = n, "purged expired device login sessions"),
+                Err(e) => tracing::warn!(error = %e, "device login session purge failed"),
+            }
+        }
+    });
 }
 
 fn seconds_until(expires_at: DateTime<Utc>) -> i64 {
@@ -262,6 +359,9 @@ pub async fn start_device_login(
         state.device_login_base_url().trim_end_matches('/')
     );
     let verification_uri_complete = format!("{verification_uri}?user_code={user_code}");
+    // The persisted URI must not carry the plaintext user code: the row is
+    // written before any authentication and the code is a bearer secret.
+    let persisted_verification_uri_complete = format!("{verification_uri}?user_code=redacted");
     let expires_at = Utc::now() + Duration::minutes(DEVICE_LOGIN_TTL_MINUTES);
     let id = Uuid::new_v4();
 
@@ -273,10 +373,10 @@ pub async fn start_device_login(
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(id)
-    .bind(code_hash(&device_code))
-    .bind(code_hash(&normalized_user_code))
+    .bind(device_code_hash(&device_code, &state.hmac_key))
+    .bind(user_code_hash(&normalized_user_code, &state.hmac_key))
     .bind(&verification_uri)
-    .bind(&verification_uri_complete)
+    .bind(&persisted_verification_uri_complete)
     .bind(body.org.as_deref())
     .bind(expires_at)
     .execute(&state.db)
@@ -303,13 +403,19 @@ pub async fn poll_device_login(
     State(state): State<AppState>,
     Json(body): Json<DeviceLoginPollRequest>,
 ) -> Result<Json<DeviceLoginPollResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let hash = code_hash(&body.device_code);
+    // Accept both the keyed HMAC digest and the legacy plain-SHA-256 digest
+    // so device logins started just before the hash upgrade remain
+    // pollable until they expire (10-minute TTL). `stored_hash` is the
+    // digest the row was actually found by, used for the follow-up UPDATEs.
+    let hash = device_code_hash(&body.device_code, &state.hmac_key);
+    let legacy_hash = legacy_code_hash(&body.device_code);
     let row: Option<DeviceLoginPollRow> = sqlx::query_as(
-        "SELECT status, expires_at, last_polled_at, approved_user_id, approved_org_id
+        "SELECT device_code_hash, status, expires_at, last_polled_at, approved_user_id, approved_org_id
          FROM device_login_sessions
-         WHERE device_code_hash = $1",
+         WHERE device_code_hash = $1 OR device_code_hash = $2",
     )
     .bind(&hash)
+    .bind(&legacy_hash)
     .fetch_optional(&state.db)
     .await
     .map_err(|_| {
@@ -319,7 +425,9 @@ pub async fn poll_device_login(
         )
     })?;
 
-    let Some((status, expires_at, last_polled_at, approved_user_id, approved_org_id)) = row else {
+    let Some((stored_hash, status, expires_at, last_polled_at, approved_user_id, approved_org_id)) =
+        row
+    else {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid device_code"})),
@@ -332,7 +440,7 @@ pub async fn poll_device_login(
              SET status = 'expired'
              WHERE device_code_hash = $1 AND status IN ('pending', 'approved')",
         )
-        .bind(&hash)
+        .bind(&stored_hash)
         .execute(&state.db)
         .await;
         return Ok(Json(DeviceLoginPollResponse {
@@ -363,7 +471,7 @@ pub async fn poll_device_login(
              SET last_polled_at = now()
              WHERE device_code_hash = $1",
         )
-        .bind(&hash)
+        .bind(&stored_hash)
         .execute(&state.db)
         .await;
         return Ok(Json(DeviceLoginPollResponse {
@@ -384,7 +492,7 @@ pub async fn poll_device_login(
                AND status = 'approved'
                AND expires_at > now()",
         )
-        .bind(&hash)
+        .bind(&stored_hash)
         .execute(&state.db)
         .await
         .map_err(|_| {
@@ -532,14 +640,19 @@ pub async fn approve_device_login(
             Json(serde_json::json!({"error": "user_code must contain 8 letters/digits"})),
         ));
     }
-    let hash = code_hash(&normalized_user_code);
+    // Accept both the keyed HMAC digest and the legacy plain-SHA-256 digest
+    // (rollout transition for sessions created by the previous binary; see
+    // legacy_code_hash). `stored_hash` is the digest the row was found by.
+    let hash = user_code_hash(&normalized_user_code, &state.hmac_key);
+    let legacy_hash = legacy_code_hash(&normalized_user_code);
 
-    let row: Option<(String, DateTime<Utc>, Option<String>)> = sqlx::query_as(
-        "SELECT status, expires_at, requested_org_name
+    let row: Option<DeviceLoginApproveRow> = sqlx::query_as(
+        "SELECT user_code_hash, status, expires_at, requested_org_name
          FROM device_login_sessions
-         WHERE user_code_hash = $1",
+         WHERE user_code_hash = $1 OR user_code_hash = $2",
     )
     .bind(&hash)
+    .bind(&legacy_hash)
     .fetch_optional(&state.db)
     .await
     .map_err(|_| {
@@ -549,7 +662,7 @@ pub async fn approve_device_login(
         )
     })?;
 
-    let Some((status, expires_at, requested_org_name)) = row else {
+    let Some((stored_hash, status, expires_at, requested_org_name)) = row else {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "invalid user_code"})),
@@ -567,7 +680,7 @@ pub async fn approve_device_login(
              SET status = 'expired'
              WHERE user_code_hash = $1 AND status = 'pending'",
         )
-        .bind(&hash)
+        .bind(&stored_hash)
         .execute(&state.db)
         .await;
         return Err((
@@ -582,7 +695,7 @@ pub async fn approve_device_login(
              SET status = 'denied', denied_at = now()
              WHERE user_code_hash = $1 AND status = 'pending'",
         )
-        .bind(&hash)
+        .bind(&stored_hash)
         .execute(&state.db)
         .await
         .map_err(|_| {
@@ -614,7 +727,7 @@ pub async fn approve_device_login(
              approved_at = now()
          WHERE user_code_hash = $1 AND status = 'pending'",
     )
-    .bind(&hash)
+    .bind(&stored_hash)
     .bind(auth.user_id)
     .bind(org_id)
     .execute(&state.db)

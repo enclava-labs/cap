@@ -7,11 +7,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use enclava_init::chown::{self, ExecIdentity, IdentityKind};
-use enclava_init::config::{Config, Mode, VolumeConfig};
+use enclava_init::config::{
+    Config, LogEncryptionHandoff, LogEncryptionHandoffFile, Mode, VolumeConfig,
+};
 use enclava_init::safe_diagnostics::SafeBootstrapDiagnostic;
 use enclava_init::secrets::{DerivedSeed, OwnerSeed, Password};
 use enclava_init::{
-    dev_no_luks_override, kbs_fetch, log_relay, luks, seeds, socket, tls_certificate,
+    dev_no_luks_override, env_override, kbs_fetch, log_relay, luks, seeds, socket, tls_certificate,
     trustee_verify, unlock, writes,
 };
 use serde::Deserialize;
@@ -66,7 +68,12 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             report_failure(&e);
-            if stay_alive_enabled() {
+            // Prod-strict fails fast: an indefinitely-alive failed sidecar
+            // masks the failure from orchestration (no restart, no backoff).
+            // Dev builds keep the diagnostics-readable stay-alive.
+            // NOTE: the exact condition string below is load-bearing —
+            // lib.rs::prod_strict_gates_host_mutable_env_overrides pins it.
+            if stay_alive_enabled() && !cfg!(feature = "prod-strict") {
                 tracing::error!(
                     "enclava-init failed; keeping sidecar alive so diagnostics remain readable"
                 );
@@ -106,9 +113,20 @@ fn run() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/etc/enclava-init/config.toml"));
     let cfg = Config::load(&cfg_path).with_context(|| format!("loading {}", cfg_path.display()))?;
-    let _log_relay = start_log_relay_if_configured().context("starting encrypted log relay")?;
     record_stage("validating signed config").ok();
-    validate_configmap_transport_against_signed_cc_init_data(&cfg)?;
+    // Read the projected cc_init_data ConfigMap exactly once per boot and use
+    // this single byte snapshot for BOTH the ConfigMap transport cross-check
+    // and the later in-TEE hash/signature verification. Re-reading the file
+    // between those steps would let a malicious host swap in different bytes
+    // after the cross-check (e.g. an attacker-controlled log_encryption_json)
+    // but before the forward-chain hash check pins the authentic bytes again.
+    let cc_init_data = read_cc_init_data(&cfg)?;
+    let log_encryption_handoff =
+        validate_configmap_transport_against_signed_cc_init_data(&cfg, cc_init_data.as_deref())?;
+    // The relay starts only after the signed-config check passes: it serves
+    // an unauthenticated log-tail endpoint keyed off host-visible env, so
+    // it must not come up while the transport is still unverified.
+    let _log_relay = start_log_relay_if_configured().context("starting encrypted log relay")?;
     let stay_alive = stay_alive_enabled();
     let ready_file = ready_file_path();
     if stay_alive {
@@ -134,7 +152,7 @@ fn run() -> Result<()> {
     // Fail-closed: any verification gap (missing inputs, missing policy-read
     // availability) returns Err and aborts before seed release.
     let phase = stats.elapsed_ms();
-    run_in_tee_verification(&cfg)?;
+    run_in_tee_verification(&cfg, cc_init_data.as_deref())?;
     stats.record_tee_verify(phase);
 
     record_stage("provisioning static tls certificate").ok();
@@ -142,6 +160,7 @@ fn run() -> Result<()> {
     record_stage("writing component seeds").ok();
     let phase = stats.elapsed_ms();
     write_per_component_seeds(&cfg, &owner)?;
+    write_log_encryption_handoff(&cfg, &log_encryption_handoff)?;
     stats.record_component_seeds(phase);
 
     if stay_alive {
@@ -187,7 +206,9 @@ fn stay_alive_enabled() -> bool {
 }
 
 fn start_log_relay_if_configured() -> Result<Option<std::thread::JoinHandle<()>>> {
-    let Some(config) = log_relay::LogRelayConfig::from_env_optional() else {
+    let Some(config) = log_relay::LogRelayConfig::from_env_optional()
+        .context("resolving encrypted log relay configuration")?
+    else {
         return Ok(None);
     };
     tracing::info!(
@@ -200,33 +221,90 @@ fn start_log_relay_if_configured() -> Result<Option<std::thread::JoinHandle<()>>
 }
 
 fn ready_file_path() -> PathBuf {
-    std::env::var("ENCLAVA_INIT_READY_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_READY_FILE))
+    init_surface_path("ENCLAVA_INIT_READY_FILE", DEFAULT_READY_FILE)
 }
 
 fn error_file_path() -> PathBuf {
-    std::env::var("ENCLAVA_INIT_ERROR_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ERROR_FILE))
+    init_surface_path("ENCLAVA_INIT_ERROR_FILE", DEFAULT_ERROR_FILE)
 }
 
 fn acme_cooldown_file_path() -> PathBuf {
-    std::env::var("ENCLAVA_INIT_ACME_COOLDOWN_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_ACME_COOLDOWN_FILE))
+    init_surface_path(
+        "ENCLAVA_INIT_ACME_COOLDOWN_FILE",
+        DEFAULT_ACME_COOLDOWN_FILE,
+    )
 }
 
 fn stage_file_path() -> PathBuf {
-    std::env::var("ENCLAVA_INIT_STAGE_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_STAGE_FILE))
+    init_surface_path("ENCLAVA_INIT_STAGE_FILE", DEFAULT_STAGE_FILE)
 }
 
 fn started_dir_path() -> PathBuf {
-    std::env::var("ENCLAVA_INIT_STARTED_DIR")
+    init_surface_path("ENCLAVA_INIT_STARTED_DIR", "/run/enclava/containers")
+}
+
+/// Resolve the path of an init output surface (ready/error/stage/started/
+/// termination/cooldown files).
+///
+/// Prod-strict builds bind these surfaces to the compiled defaults only:
+/// [`env_override`] returns `None`, so the host-controlled pod environment
+/// can never redirect them. Test builds (cfg(test) — compiled exclusively
+/// for the test harness, never into release binaries) additionally consult
+/// an in-process override map so the failure-path tests can redirect the
+/// surfaces into a temp directory even under `--features prod-strict`,
+/// without reopening the env bypass those tests would otherwise need.
+fn init_surface_path(name: &str, default: &str) -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = test_surface_paths::get(name) {
+        return path;
+    }
+    env_override(name)
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/run/enclava/containers"))
+        .unwrap_or_else(|| PathBuf::from(default))
+}
+
+#[cfg(test)]
+mod test_surface_paths {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    static OVERRIDES: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
+
+    fn lock() -> MutexGuard<'static, Option<HashMap<String, PathBuf>>> {
+        // A poisoned lock only means some earlier test panicked while
+        // holding it; the map itself is still structurally valid.
+        OVERRIDES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn get(name: &str) -> Option<PathBuf> {
+        lock().as_ref().and_then(|map| map.get(name).cloned())
+    }
+
+    /// Install path overrides for the named init surfaces, returning a
+    /// guard that restores the previous state on drop. Installed values
+    /// take precedence over the environment in test builds only. The
+    /// snapshot/restore semantics keep an inner guard's drop from
+    /// un-redirecting an outer guard's surfaces.
+    pub fn install(entries: &[(&'static str, PathBuf)]) -> Guard {
+        let mut slot = lock();
+        let previous = slot.take();
+        let map = slot.get_or_insert_with(HashMap::new);
+        for (name, path) in entries {
+            map.insert((*name).to_string(), path.clone());
+        }
+        Guard { previous }
+    }
+
+    pub struct Guard {
+        previous: Option<HashMap<String, PathBuf>>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *lock() = self.previous.take();
+        }
+    }
 }
 
 #[path = "main/init_stats.rs"]
@@ -238,7 +316,7 @@ use namespace_bind::{
     ExpectedIdentity, MountSourceStrategy, SentinelRecord, WorkloadNamespace,
     bind_mount_plan_for_workload, expected_identity, find_workload_pid_by_env,
     mount_source_strategy, namespace_source, parse_sentinel_record, paths_resolve_to_same_object,
-    validate_sentinel_name, validate_sentinel_record, workload_proc_root_path,
+    read_sentinel_pid, validate_sentinel_name, validate_sentinel_record, workload_proc_root_path,
     workload_target_path,
 };
 use namespace_bind::{
@@ -271,9 +349,8 @@ fn record_failure_file(safe_json: &str) {
     if let Err(err) = writes::atomic_write(&path, body.as_bytes(), 0o644) {
         eprintln!("enclava-init: failed to write init error file: {err}");
     }
-    let termination_path = std::env::var("ENCLAVA_INIT_TERMINATION_LOG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/dev/termination-log"));
+    let termination_path =
+        init_surface_path("ENCLAVA_INIT_TERMINATION_LOG", "/dev/termination-log");
     if let Err(err) = write_termination_log_in_place(&termination_path, body.as_bytes()) {
         eprintln!("enclava-init: failed to write termination log: {err}");
     }
@@ -407,7 +484,11 @@ fn acquire_owner_seed_password(cfg: &Config) -> Result<OwnerSeed> {
     }
 }
 
-fn validate_configmap_transport_against_signed_cc_init_data(cfg: &Config) -> Result<()> {
+/// Read the projected cc_init_data ConfigMap once so the exact same byte
+/// snapshot feeds both the transport cross-check and the in-TEE hash /
+/// signature verification (TOCTOU hardening against a host that rewrites the
+/// file between the two reads).
+fn read_cc_init_data(cfg: &Config) -> Result<Option<Vec<u8>>> {
     if !cfg.trustee_policy_read_available {
         if cfg!(feature = "prod-strict") {
             anyhow::bail!(
@@ -415,16 +496,35 @@ fn validate_configmap_transport_against_signed_cc_init_data(cfg: &Config) -> Res
             );
         }
         if cfg.cc_init_data_path.is_none() {
-            return Ok(());
+            return Ok(None);
         }
     }
     let cc_path = cfg
         .cc_init_data_path
         .as_deref()
         .ok_or_else(|| anyhow!("verification requires cc_init_data_path"))?;
-    let cc_toml = std::fs::read_to_string(cc_path).with_context(|| format!("reading {cc_path}"))?;
-    let parsed: toml::Value =
-        toml::from_str(&cc_toml).with_context(|| format!("parsing {cc_path}"))?;
+    let bytes = std::fs::read(cc_path).with_context(|| format!("reading {cc_path}"))?;
+    Ok(Some(bytes))
+}
+
+fn validate_configmap_transport_against_signed_cc_init_data(
+    cfg: &Config,
+    cc_init_data: Option<&[u8]>,
+) -> Result<LogEncryptionHandoffFile> {
+    if !cfg.trustee_policy_read_available {
+        if cfg!(feature = "prod-strict") {
+            anyhow::bail!(
+                "prod-strict refuses trustee_policy_read_available=false; signed cc_init_data verification cannot be skipped"
+            );
+        }
+        if cc_init_data.is_none() {
+            return Ok(LogEncryptionHandoffFile::Unconfigured);
+        }
+    }
+    let cc_bytes =
+        cc_init_data.ok_or_else(|| anyhow!("verification requires cc_init_data bytes"))?;
+    let cc_toml = std::str::from_utf8(cc_bytes).context("parsing cc_init_data as utf-8")?;
+    let parsed: toml::Value = toml::from_str(cc_toml).context("parsing cc_init_data")?;
     let data = parsed
         .get("data")
         .and_then(toml::Value::as_table)
@@ -586,8 +686,89 @@ fn validate_configmap_transport_against_signed_cc_init_data(cfg: &Config) -> Res
             "signing-service-pubkey-hex",
         )?;
     }
+    let handoff = signed_log_encryption_handoff(data, cfg)?;
 
-    Ok(())
+    Ok(handoff)
+}
+
+/// Bind the `[log-encryption]` ConfigMap section to the signed
+/// `log_encryption_json` cc_init_data claim and return the authoritative
+/// handoff for re-publication.
+///
+/// The recipient public key decides who can decrypt workload log plaintext,
+/// so the signed claim is authoritative and the host-controlled ConfigMap
+/// copy is only a cross-check: every field present in the section must match
+/// the claim, and any mismatch fails closed. A section with no signed claim
+/// is likewise rejected (the host must not be able to introduce log
+/// encryption where the signed data has none). A claim without a section is
+/// tolerated in dev builds but refused in prod-strict, where the section is
+/// expected to ride along; the handoff itself is written from the claim
+/// either way, so a tampered section can never redirect it.
+fn signed_log_encryption_handoff(
+    data: &toml::map::Map<String, toml::Value>,
+    cfg: &Config,
+) -> Result<LogEncryptionHandoffFile> {
+    let signed = data
+        .get("log_encryption_json")
+        .and_then(toml::Value::as_str);
+    match (signed, cfg.log_encryption.as_ref()) {
+        (None, None) => Ok(LogEncryptionHandoffFile::Unconfigured),
+        // Init-first rollout compatibility: during the transition window where
+        // the new init binary is live but the old API still renders manifests,
+        // the ConfigMap may have [log-encryption] while cc_init_data lacks the
+        // new log_encryption_json claim (the same shape occurs on every later
+        // restart of a pre-claim signed artifact pinned to the legacy render).
+        // We tolerate this but the trust binding is DOWNGRADED: encrypted logs
+        // stay off until the app is re-signed because we cannot verify the key
+        // material came from a trusted manifest source (it's purely
+        // host-controlled ConfigMap at this point), and an explicit disabled
+        // marker is published so prod-strict wait-exec treats encryption as
+        // off instead of failing on a handoff that can never exist. The relay
+        // discards log frames rather than emitting them in plaintext; key
+        // material is never taken from env or ConfigMap.
+        (None, Some(_)) => {
+            tracing::warn!(
+                "ConfigMap has [log-encryption] but signed cc_init_data lacks \
+                 log_encryption_json claim (legacy API manifest or pre-claim \
+                 signed artifact): encrypted logging stays DISABLED until the \
+                 app is re-signed; log frames are discarded, not emitted in \
+                 plaintext."
+            );
+            Ok(LogEncryptionHandoffFile::DisabledMarker)
+        }
+        (Some(signed), section) => {
+            let handoff: LogEncryptionHandoff = serde_json::from_str(signed)
+                .with_context(|| "parsing signed log_encryption_json claim")?;
+            if let Some(section) = section {
+                let mismatches = [
+                    ("algorithm", (&section.algorithm, &handoff.algorithm)),
+                    ("key-id", (&section.key_id, &handoff.key_id)),
+                    (
+                        "public-key-base64url",
+                        (&section.public_key_base64url, &handoff.public_key_base64url),
+                    ),
+                    (
+                        "public-key-sha256",
+                        (&section.public_key_sha256, &handoff.public_key_sha256),
+                    ),
+                ];
+                for (field, (section_value, claim_value)) in mismatches {
+                    if let Some(section_value) = section_value
+                        && section_value != claim_value
+                    {
+                        anyhow::bail!(
+                            "ConfigMap log-encryption {field} does not match signed cc_init_data claim log_encryption_json"
+                        );
+                    }
+                }
+            } else if cfg!(feature = "prod-strict") {
+                anyhow::bail!(
+                    "signed cc_init_data carries log_encryption_json but the ConfigMap has no [log-encryption] section"
+                );
+            }
+            Ok(LogEncryptionHandoffFile::Enabled(handoff))
+        }
+    }
 }
 
 fn require_signed_u32_match(
@@ -1274,7 +1455,7 @@ fn derive_volume_key(owner: &OwnerSeed, info: &str) -> Result<DerivedSeed> {
     Ok(derived)
 }
 
-fn run_in_tee_verification(cfg: &Config) -> Result<()> {
+fn run_in_tee_verification(cfg: &Config, cc_init_data: Option<&[u8]>) -> Result<()> {
     if !cfg.trustee_policy_read_available {
         return Ok(trustee_verify::verify_chain_required(None)?);
     }
@@ -1286,13 +1467,13 @@ fn run_in_tee_verification(cfg: &Config) -> Result<()> {
         .trustee_policy_url
         .as_deref()
         .ok_or_else(|| anyhow!("trustee_policy_read_available=true requires trustee_policy_url"))?;
-    let cc_path = cfg
-        .cc_init_data_path
-        .as_deref()
-        .ok_or_else(|| anyhow!("verification requires cc_init_data_path"))?;
+    // Reuse the byte snapshot read before the ConfigMap transport cross-check:
+    // the forward-chain expected_cc_init_data_hash must pin the exact bytes
+    // that produced the log-encryption handoff, not a fresh host-controlled
+    // read of the projected ConfigMap.
     let cc_bytes =
-        std::fs::read(cc_path).with_context(|| format!("reading cc_init_data from {cc_path}"))?;
-    let cc_claims = parse_cc_init_data_claims(&cc_bytes)?;
+        cc_init_data.ok_or_else(|| anyhow!("verification requires cc_init_data bytes"))?;
+    let cc_claims = parse_cc_init_data_claims(cc_bytes)?;
     let signer_pk = cfg
         .platform_trustee_policy_pubkey_hex
         .as_deref()
@@ -1305,7 +1486,7 @@ fn run_in_tee_verification(cfg: &Config) -> Result<()> {
         .transpose()?;
 
     let token = trustee_verify::resolve_kbs_attestation_token(
-        std::env::var("KBS_ATTESTATION_TOKEN").ok().as_deref(),
+        enclava_init::env_override("KBS_ATTESTATION_TOKEN").as_deref(),
         &cfg.kbs_attestation_token_url,
         std::time::Duration::from_secs(15),
     )
@@ -1321,7 +1502,7 @@ fn run_in_tee_verification(cfg: &Config) -> Result<()> {
         policy_envelope: &envelope,
         artifacts: &bundle,
         cc_init_data_claims: &cc_claims,
-        local_cc_init_data_toml: &cc_bytes,
+        local_cc_init_data_toml: cc_bytes,
         platform_trustee_policy_pubkey: signer_pk.as_ref(),
         signing_service_pubkey: signing_pk.as_ref(),
     };
@@ -1374,6 +1555,60 @@ fn write_per_component_seeds(cfg: &Config, owner: &OwnerSeed) -> Result<()> {
     chown::chown(&app_path, numeric_identity(cfg.app_uid, cfg.app_gid))
         .with_context(|| format!("chown {}", app_path.display()))?;
 
+    Ok(())
+}
+
+/// Publish the trusted encrypted-log recipient handoff for wait-exec.
+///
+/// The recipient metadata comes from the signed `log_encryption_json`
+/// cc_init_data claim, extracted during
+/// [`validate_configmap_transport_against_signed_cc_init_data`] (which also
+/// cross-checks the host-controlled ConfigMap section against it). It is
+/// published onto the decrypted state volume — the only path the host
+/// cannot write (it only ever sees LUKS ciphertext) — so prod-strict
+/// enclava-wait-exec resolves the recipient (and the rollback-stable frame
+/// labels) from this file instead of the host-controlled pod environment.
+/// The file carries the key material plus org_id/app_name and is written
+/// after unlock and strictly before the ready file flips, so consumers
+/// never see readiness without it. When the ConfigMap has a
+/// `[log-encryption]` section but no signed claim exists (init-first
+/// rollout transition window), an explicit `{"disabled": true}` marker is
+/// written instead so wait-exec disables encrypted logging rather than
+/// failing on a handoff that can never exist.
+fn write_log_encryption_handoff(cfg: &Config, outcome: &LogEncryptionHandoffFile) -> Result<()> {
+    let path = Path::new(&cfg.state_root).join("app/log-encryption.json");
+    let body = match outcome {
+        // No log encryption configured anywhere this boot: make sure no
+        // handoff from an earlier boot survives — the file is init's
+        // decision for THIS boot, and a stale one must not be readable
+        // as an enabled handoff after readiness. Removal, not rewrite,
+        // keeps "absent" unambiguous. (Defense in depth: honest renders
+        // set no activation hint in this case either.)
+        LogEncryptionHandoffFile::Unconfigured => {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(anyhow!(err).context(format!(
+                        "removing stale log-encryption handoff {}",
+                        path.display()
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        LogEncryptionHandoffFile::DisabledMarker => {
+            serde_json::to_vec_pretty(&serde_json::json!({ "disabled": true }))
+                .context("serializing log-encryption disabled marker")?
+        }
+        LogEncryptionHandoffFile::Enabled(handoff) => {
+            serde_json::to_vec_pretty(handoff).context("serializing log-encryption handoff")?
+        }
+    };
+    writes::atomic_write(&path, &body, 0o640)
+        .with_context(|| format!("writing log-encryption handoff {}", path.display()))?;
+    chown::chown(&path, numeric_identity(cfg.app_uid, cfg.app_gid))
+        .with_context(|| format!("chown {}", path.display()))?;
     Ok(())
 }
 

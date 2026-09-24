@@ -922,9 +922,12 @@ pub async fn create_app(
     crate::entitlements::lock_org_entitlement_lane(&mut tx, auth.org_id)
         .await
         .map_err(|_| internal_server_error())?;
-    let current_role =
-        crate::auth::scopes::active_membership_role_in_tx(&mut tx, auth.org_id, auth.user_id)
-            .await?;
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut tx,
+        auth.org_id,
+        auth.user_id,
+    )
+    .await?;
     crate::auth::scopes::require_admin_role(current_role)?;
     crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
         .await
@@ -1357,9 +1360,12 @@ pub(crate) async fn delete_app_before(
     crate::signing_service::lock_org_signing_authority_lane(&mut phase_tx, auth.org_id)
         .await
         .map_err(|_| internal_server_error())?;
-    let current_role =
-        crate::auth::scopes::active_membership_role_in_tx(&mut phase_tx, auth.org_id, auth.user_id)
-            .await?;
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut phase_tx,
+        auth.org_id,
+        auth.user_id,
+    )
+    .await?;
     crate::auth::scopes::require_admin_role(current_role)?;
     crate::deploy::lock_app_deployment_lane(&mut phase_tx, app.id)
         .await
@@ -1915,9 +1921,12 @@ pub async fn issue_signer_rotation_token_route(
     crate::deploy::lock_app_deployment_lane(&mut tx, app_lookup.id)
         .await
         .map_err(|_| internal_server_error())?;
-    let current_role =
-        crate::auth::scopes::active_membership_role_in_tx(&mut tx, auth.org_id, auth.user_id)
-            .await?;
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut tx,
+        auth.org_id,
+        auth.user_id,
+    )
+    .await?;
     crate::auth::scopes::require_owner_role(current_role)?;
     let app: App = sqlx::query_as(
         "SELECT * FROM apps
@@ -2060,9 +2069,12 @@ pub async fn rotate_signer(
     crate::deploy::lock_app_deployment_lane(&mut tx, app_lookup.id)
         .await
         .map_err(|_| internal_server_error())?;
-    let current_role =
-        crate::auth::scopes::active_membership_role_in_tx(&mut tx, auth.org_id, auth.user_id)
-            .await?;
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut tx,
+        auth.org_id,
+        auth.user_id,
+    )
+    .await?;
     crate::auth::scopes::require_owner_role(current_role)?;
     let app: App = sqlx::query_as(
         "SELECT * FROM apps

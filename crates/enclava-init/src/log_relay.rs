@@ -16,6 +16,7 @@ const O_NOFOLLOW: i32 = 0o400000;
 
 const DEFAULT_BIND: &str = "127.0.0.1:8082";
 const DEFAULT_SPOOL_PATH: &str = "/run/enclava-logs/app.jsonl";
+const SPOOL_DIR: &str = "/run/enclava-logs";
 const DEFAULT_CONTAINER: &str = "app";
 const DEFAULT_TAIL_LINES: usize = 100;
 const MAX_TAIL_LINES: usize = 1_000;
@@ -31,42 +32,112 @@ const FOLLOW_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug)]
 pub struct LogRelayConfig {
-    pub bind: String,
+    pub bind: std::net::SocketAddr,
     pub spool_path: PathBuf,
     pub container: String,
 }
 
 impl LogRelayConfig {
-    pub fn from_env_defaults() -> Self {
-        Self {
-            bind: std::env::var("ENCLAVA_LOG_RELAY_BIND")
-                .unwrap_or_else(|_| DEFAULT_BIND.to_string()),
-            spool_path: std::env::var_os("ENCLAVA_LOG_RELAY_SPOOL_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_SPOOL_PATH)),
+    pub fn from_env_defaults() -> io::Result<Self> {
+        Ok(Self {
+            bind: require_loopback_bind(
+                &std::env::var("ENCLAVA_LOG_RELAY_BIND")
+                    .unwrap_or_else(|_| DEFAULT_BIND.to_string()),
+            )?,
+            spool_path: require_spool_under_log_dir(
+                &std::env::var_os("ENCLAVA_LOG_RELAY_SPOOL_PATH")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(DEFAULT_SPOOL_PATH)),
+            )?,
             container: std::env::var("ENCLAVA_LOG_RELAY_CONTAINER")
                 .unwrap_or_else(|_| DEFAULT_CONTAINER.to_string()),
-        }
+        })
     }
 
-    pub fn from_env_optional() -> Option<Self> {
-        std::env::var_os("ENCLAVA_LOG_RELAY_SPOOL_PATH")?;
-        Some(Self::from_env_defaults())
+    pub fn from_env_optional() -> io::Result<Option<Self>> {
+        if std::env::var_os("ENCLAVA_LOG_RELAY_SPOOL_PATH").is_none() {
+            return Ok(None);
+        }
+        Some(Self::from_env_defaults()).transpose()
     }
+}
+
+/// The relay serves unauthenticated tenant log tails, so only a loopback
+/// bind is ever allowed. A host-controlled `ENCLAVA_LOG_RELAY_BIND` pointing
+/// off-loopback (including wildcard 0.0.0.0/::) must fail closed instead of
+/// exposing the relay pod-wide.
+///
+/// Resolves the bind string once and returns the validated `SocketAddr`:
+/// callers bind that exact address. Returning the original string (and
+/// letting `TcpListener::bind` resolve it again) would let a host
+/// controlling DNS answer validation with a loopback address and binding
+/// with a pod-reachable one (TOCTOU re-resolution).
+fn require_loopback_bind(bind: &str) -> io::Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("log relay bind {bind:?} must be loopback"),
+        )
+    };
+    let addr = bind
+        .to_socket_addrs()
+        .map_err(|_| invalid())?
+        .next()
+        .ok_or_else(invalid)?;
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_loopback() => Ok(addr),
+        std::net::IpAddr::V6(ip) if ip.is_loopback() => Ok(addr),
+        _ => Err(invalid()),
+    }
+}
+
+/// The relay spool must live directly under the dedicated log spool
+/// directory (`/run/enclava-logs`, a k8s volume mount that is a real
+/// directory in the guest). `O_NOFOLLOW` only rejects a symlinked final
+/// component; a host-controlled `ENCLAVA_LOG_RELAY_SPOOL_PATH` pointing
+/// directly at some other regular sensitive file (for example a mounted
+/// TLS key) would otherwise be streamed through the unauthenticated
+/// relay endpoint. Fail closed on any path that is not an absolute
+/// `<log-spool-dir>/<single-component>` path.
+fn require_spool_under_log_dir(path: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+    let spool_dir = Path::new(SPOOL_DIR);
+    let invalid = |reason: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("log relay spool {path:?} must live directly under {SPOOL_DIR}: {reason}"),
+        )
+    };
+    if !path.is_absolute() {
+        return Err(invalid("must be an absolute path"));
+    }
+    if path
+        .components()
+        .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(invalid(
+            "must not contain traversal or CurDir/ParentDir components",
+        ));
+    }
+    if path.parent() != Some(spool_dir) {
+        return Err(invalid("parent directory must be the log spool dir"));
+    }
+    Ok(path.to_path_buf())
 }
 
 pub fn run_from_env() -> io::Result<()> {
-    run(LogRelayConfig::from_env_defaults())
+    run(LogRelayConfig::from_env_defaults()?)
 }
 
 pub fn spawn(config: LogRelayConfig) -> io::Result<thread::JoinHandle<()>> {
-    let listener = TcpListener::bind(&config.bind)?;
+    let listener = TcpListener::bind(config.bind)?;
     eprintln!("enclava-log-relay: listening on {}", config.bind);
     Ok(thread::spawn(move || serve(listener, config)))
 }
 
 pub fn run(config: LogRelayConfig) -> io::Result<()> {
-    let listener = TcpListener::bind(&config.bind)?;
+    let listener = TcpListener::bind(config.bind)?;
     eprintln!("enclava-log-relay: listening on {}", config.bind);
     serve(listener, config);
     Ok(())
@@ -1461,5 +1532,61 @@ mod tests {
         let _ = client.set_read_timeout(Some(Duration::from_millis(100)));
         let mut sink = Vec::new();
         let _ = client.read_to_end(&mut sink);
+    }
+
+    #[test]
+    fn loopback_binds_are_accepted() {
+        for bind in ["127.0.0.1:8082", "localhost:8082", "[::1]:9000"] {
+            let addr = require_loopback_bind(bind).unwrap();
+            assert!(addr.ip().is_loopback(), "{bind}: {addr}");
+            // The validated address is what gets bound: no string
+            // re-resolution at TcpListener::bind time.
+            assert_eq!(addr.port().to_string(), bind.rsplit(':').next().unwrap());
+        }
+    }
+
+    #[test]
+    fn off_loopback_binds_are_rejected() {
+        for bind in [
+            "0.0.0.0:8082",
+            "[::]:8082",
+            "10.0.0.5:8082",
+            "192.168.1.10:9443",
+            "example.com:80",
+            "not-a-bind",
+        ] {
+            let err = require_loopback_bind(bind).expect_err("off-loopback bind must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{bind}: {err}");
+            assert!(
+                err.to_string().contains("must be loopback"),
+                "{bind}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn spool_paths_outside_the_log_dir_are_rejected() {
+        for spool in [
+            "/state/tls-state/tenant-ingress/certificates/tls.key",
+            "/run/enclava-logs/nested/app.jsonl",
+            "/run/enclava-logs/../app.jsonl",
+            "run/enclava-logs/app.jsonl",
+            "/etc/passwd",
+            "/run/enclava-logs",
+        ] {
+            let err = require_spool_under_log_dir(Path::new(spool))
+                .expect_err("off-spool-dir spool path must be rejected");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{spool}: {err}");
+        }
+    }
+
+    #[test]
+    fn spool_paths_directly_under_the_log_dir_are_accepted() {
+        for spool in ["/run/enclava-logs/app.jsonl", "/run/enclava-logs/web.jsonl"] {
+            assert_eq!(
+                require_spool_under_log_dir(Path::new(spool)).unwrap(),
+                PathBuf::from(spool)
+            );
+        }
     }
 }

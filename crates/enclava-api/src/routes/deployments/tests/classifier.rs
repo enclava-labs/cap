@@ -482,7 +482,7 @@ fn signed_deploy_validation_precedes_atomic_candidate_commit() {
     for validation in [
         "validate_deployment_inputs",
         "resolve_signed_policy_artifact",
-        "validate_rendered_cc_init_data_hash",
+        "validate_and_pin_cc_init_data_render",
     ] {
         assert!(
             deploy_body

@@ -1028,27 +1028,24 @@ async fn deploy_app_candidate(
             enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
         let expected_cc_init_data_hash =
             hex::encode(artifacts.descriptor.expected_cc_init_data_hash);
+        // Pre-check only; validate_and_pin_cc_init_data_render below accepts
+        // either the modern render (with the log_encryption_json claim) or
+        // the legacy pre-claim render, so a mismatch here is NOT yet an
+        // error for artifacts signed before the claim existed. Log at debug
+        // to avoid flagging every legacy-artifact deploy as a hash failure.
         if expected_cc_init_data_hash != cc_init_data_hash {
-            tracing::warn!(
+            tracing::debug!(
                 expected_cc_init_data_hash = %expected_cc_init_data_hash,
-                actual_cc_init_data_hash = %cc_init_data_hash,
+                actual_modern_cc_init_data_hash = %cc_init_data_hash,
                 namespace = %app_spec.namespace,
-                service_account = %app_spec.service_account,
-                platform_domain = %app_spec.domain.platform_domain,
-                custom_domain = ?app_spec.domain.custom_domain,
-                attestation_proxy_image = ?app_spec.attestation.proxy_image,
-                caddy_image = ?app_spec.attestation.caddy_image,
-                caddy_tls_mode = ?app_spec.attestation.caddy_tls_mode,
-                tls_certificate_broker_url = ?app_spec.attestation.tls_certificate_broker_url,
-                local_workload_artifacts = app_spec.attestation.local_workload_artifacts_json.is_some(),
-                local_trustee_policy = app_spec.attestation.local_trustee_policy_json.is_some(),
-                generated_agent_policy_sha256 = %hex::encode(app_spec.generated_agent_policy.as_ref().map(|policy| policy.policy_sha256).unwrap_or([0; 32])),
-                descriptor_core_hash = %hex::encode(binding.descriptor_core_hash),
-                "signed deployment cc_init_data hash mismatch"
+                "signed deployment cc_init_data does not match the modern render; trying legacy render"
             );
         }
+        // Accept either the modern render (with the log_encryption_json claim)
+        // or, for artifacts signed before the claim existed, the legacy render
+        // without it; a legacy match pins the app to the legacy byte layout.
         artifacts
-            .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
+            .validate_and_pin_cc_init_data_render(&mut app_spec)
             .map_err(signing_error_response)?;
         signed_policy_artifact = Some(signed);
     }
@@ -1140,9 +1137,12 @@ async fn deploy_app_candidate(
             .await
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     }
-    let current_role =
-        crate::auth::scopes::active_membership_role_in_tx(&mut tx, auth.org_id, auth.user_id)
-            .await?;
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut tx,
+        auth.org_id,
+        auth.user_id,
+    )
+    .await?;
     crate::auth::scopes::require_admin_role(current_role)?;
     crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
         .await
@@ -1834,10 +1834,11 @@ mod tests {
             crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
                 .await
                 .expect("lock acceptance signing lane");
-            let authority =
-                crate::auth::scopes::active_membership_role_in_tx(&mut tx, org_id, user_id)
-                    .await
-                    .and_then(crate::auth::scopes::require_admin_role);
+            let authority = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+                &mut tx, org_id, user_id,
+            )
+            .await
+            .and_then(crate::auth::scopes::require_admin_role);
             if authority.is_ok() {
                 crate::deploy::lock_app_deployment_lane(&mut tx, app_id)
                     .await

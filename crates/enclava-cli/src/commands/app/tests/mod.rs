@@ -253,6 +253,7 @@ fn signed_cc_hash_app_uses_local_artifact_urls_like_live_apply() {
                     descriptor_core_hash: [1; 32],
                     descriptor_signing_pubkey: [2; 32],
                     org_keyring_fingerprint: [3; 32],
+                    omit_log_encryption_claim: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),
@@ -319,6 +320,7 @@ fn signed_cc_hash_app_uses_api_deployment_context_without_env_exports() {
                     descriptor_core_hash: [1; 32],
                     descriptor_signing_pubkey: [2; 32],
                     org_keyring_fingerprint: [3; 32],
+                    omit_log_encryption_claim: false,
                 },
                 generated_agent_policy: GeneratedAgentPolicy {
                     policy_text: "package agent_policy\n".to_string(),
