@@ -1143,8 +1143,17 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
     // Pin the install to the unsigned-only state: desired_generation = 0.
     // The singleton is process-wide shared state, so snapshot it and restore
     // it in cleanup instead of leaving the wipe behind.
-    let singleton_before: (i64, i64, i64) = sqlx::query_as(
-        "SELECT desired_generation, configmap_generation, applied_generation
+    let singleton_before: (
+        i64,
+        i64,
+        i64,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT desired_generation, configmap_generation, applied_generation,
+                configmap_policy_sha256, applied_policy_sha256,
+                configmap_resource_version
            FROM kbs_signed_policy_reconciliation WHERE singleton",
     )
     .fetch_one(&pool)
@@ -1163,15 +1172,42 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
     .execute(&pool)
     .await
     .expect("reset reconciliation state to unsigned");
-    // The helper also bumps when any workload_artifacts row exists; pin that
-    // this app contributes none.
-    let app_artifacts: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM workload_artifacts WHERE app_id = $1")
-            .bind(app_id)
-            .fetch_one(&pool)
+    // The helper bumps when ANY workload_artifacts row exists (table-wide,
+    // not per-app). Skip this regression when a shared database carries
+    // leftover fixtures from other tests.
+    let total_artifacts: i64 = sqlx::query_scalar("SELECT count(*) FROM workload_artifacts")
+        .fetch_one(&pool)
+        .await
+        .expect("count workload artifacts");
+    if total_artifacts != 0 {
+        // Restore before skipping so the singleton wipe is not left behind.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = $1,
+                    configmap_generation = $2,
+                    applied_generation = $3,
+                    configmap_policy_sha256 = $4,
+                    applied_policy_sha256 = $5,
+                    configmap_resource_version = $6
+              WHERE singleton",
+        )
+        .bind(singleton_before.0)
+        .bind(singleton_before.1)
+        .bind(singleton_before.2)
+        .bind(&singleton_before.3)
+        .bind(&singleton_before.4)
+        .bind(&singleton_before.5)
+        .execute(&pool)
+        .await
+        .expect("restore reconciliation singleton before skipping");
+        eprintln!("skipping: shared database has {total_artifacts} workload artifacts");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
             .await
-            .expect("count this app's artifacts");
-    assert_eq!(app_artifacts, 0, "unsigned fixture must have no artifacts");
+            .expect("delete skipped unsigned rotation fixture");
+        return;
+    }
 
     let mut state = crate::test_support::lazy_state();
     state.db = pool.clone();
@@ -1185,6 +1221,7 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
         management_origin: crate::auth::middleware::ManagementOrigin::Public,
     };
     let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
 
     let token = crate::auth::jwt::issue_signer_rotation_token(
         &hmac_key,
@@ -1195,7 +1232,7 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
             previous_subject: previous_subject.to_string(),
             previous_issuer: previous_issuer.to_string(),
             new_subject: new_subject.to_string(),
-            new_issuer: previous_issuer.to_string(),
+            new_issuer: new_issuer.to_string(),
         },
         chrono::Duration::seconds(600),
     )
@@ -1213,7 +1250,7 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
         Path(app_name),
         Json(RotateSignerRequest {
             subject: new_subject.to_string(),
-            issuer: previous_issuer.to_string(),
+            issuer: new_issuer.to_string(),
             email_confirmation_token: Some(token),
         }),
     )
@@ -1226,17 +1263,23 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
 
     // The legacy binding must carry the new identity into the next Rego
     // render.
-    let binding_subject: Option<String> = sqlx::query_scalar(
-        "SELECT signer_identity_subject FROM kbs_tls_bindings WHERE app_id = $1",
+    let (binding_subject, binding_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
     )
     .bind(app_id)
     .fetch_one(&pool)
     .await
-    .expect("load tls binding subject after rotation");
+    .expect("load tls binding identity after rotation");
     assert_eq!(
         binding_subject.as_deref(),
         Some(new_subject),
-        "rotation must update the legacy Rego binding signer"
+        "rotation must update the legacy Rego binding signer subject"
+    );
+    assert_eq!(
+        binding_issuer.as_deref(),
+        Some(new_issuer),
+        "rotation must update the legacy Rego binding signer issuer"
     );
 
     // The install must still be unsigned: rotation never enters signed mode.
@@ -1251,17 +1294,24 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
         "rotation on an unsigned-only install must not enter signed mode"
     );
 
-    // Restore the shared singleton exactly as it was found.
+    // Restore the shared singleton exactly as it was found (all columns the
+    // test wiped, hashes included, so 0041's CHECKs keep holding).
     sqlx::query(
         "UPDATE kbs_signed_policy_reconciliation
             SET desired_generation = $1,
                 configmap_generation = $2,
-                applied_generation = $3
+                applied_generation = $3,
+                configmap_policy_sha256 = $4,
+                applied_policy_sha256 = $5,
+                configmap_resource_version = $6
           WHERE singleton",
     )
     .bind(singleton_before.0)
     .bind(singleton_before.1)
     .bind(singleton_before.2)
+    .bind(singleton_before.3.clone())
+    .bind(singleton_before.4.clone())
+    .bind(singleton_before.5.clone())
     .execute(&pool)
     .await
     .expect("restore reconciliation singleton");

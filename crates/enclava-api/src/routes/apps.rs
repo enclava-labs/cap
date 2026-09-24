@@ -1838,6 +1838,19 @@ pub(crate) async fn delete_app_before(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Best-effort fence release on a failed publish: nothing retries inside
+/// this request anymore, so do not leave the KBS fence claimed for the lease
+/// quarantine window.
+async fn release_finished_lease(lease: crate::mutation_leases::ResourceMutationLease) {
+    if let Err(error) = lease.finish().await {
+        tracing::warn!(
+            error = %error,
+            error_code = "kbs_policy_lease_finish_failed",
+            "failed to release the KBS policy fence after a failed publish"
+        );
+    }
+}
+
 /// Record that every retained workload artifact whose signed descriptor
 /// still carries the rotated-out signer identity is withdrawn from KBS
 /// policy. The signed-policy selector
@@ -2317,14 +2330,15 @@ pub async fn rotate_signer(
     // The rotation is committed; converge the live KBS policy before
     // reporting success, under the same fence app deletion uses. In signed
     // mode reconcile_policy converges the enqueued withdrawal generation
-    // (revoking the previous signer's artifacts); in legacy mode it
-    // re-renders Rego from the updated kbs_tls_bindings so the new identity
-    // is the one admitted. A failure here is a committed rotation whose
-    // policy publication did not converge: surface it as 500 with a stable
-    // error code (the durable intent is retained; note this route holds the
-    // KBS fence until its lease expires, so the background reconciler's
-    // retry can lag by up to the lease quarantine window). Success is only
-    // reported when reconcile returned Ok on both layers.
+    // (revoking the previous signer's artifacts; the background reconciler
+    // keeps retrying that durable generation if this publish fails). In
+    // legacy mode it re-renders Rego from the updated kbs_tls_bindings so
+    // the new identity is the one admitted; nothing retries a failed legacy
+    // render automatically — the next unsigned deploy re-renders it — so a
+    // failure here surfaces as 500 with a stable error code and the fence
+    // is released (not held for the quarantine window) to unblock that
+    // follow-up writer. Success is only reported when reconcile returned Ok
+    // on both layers.
     if !is_initial_set && state.kbs_policy.is_some() {
         let lease = match crate::mutation_leases::claim_resources(
             &state,
@@ -2359,6 +2373,7 @@ pub async fn rotate_signer(
                     error_code = "kbs_policy_fence_unavailable",
                     "signer rotation committed but lost the KBS policy fence during reconciliation"
                 );
+                release_finished_lease(lease).await;
                 return Err(internal_server_error());
             }
             Ok(Err(error)) => {
@@ -2368,6 +2383,7 @@ pub async fn rotate_signer(
                     error_code = "kbs_policy_reconciliation_failed",
                     "signer rotation committed but KBS policy reconciliation failed"
                 );
+                release_finished_lease(lease).await;
                 return Err(internal_server_error());
             }
             Ok(Ok(())) => {}
