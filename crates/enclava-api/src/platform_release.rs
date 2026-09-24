@@ -312,39 +312,55 @@ fn lexical_absolute(path: &Path) -> PathBuf {
     normalized
 }
 
-/// Canonicalize the nearest existing ancestor of `path`: walk up until a
-/// component exists, `canonicalize` it (resolving symlinks), then re-append
-/// the missing tail. Returns the fully canonical form when `path` itself
-/// exists. Returns `None` when no ancestor can be resolved (or a non-NotFound
-/// IO error occurs) — callers treat that as "no information", same as before.
+/// Resolve `path` the way the kernel will traverse it at commit time: walk
+/// the components in filesystem order and canonicalize each accumulated
+/// prefix, so symlinks — and `..` THROUGH symlinked directories — resolve
+/// exactly as path traversal does (`/base/link/..` with `/base/link` →
+/// `/real/dir` lands in `/real`, not `/base`). Only once a component does not
+/// exist yet does the remainder become an unresolved suffix (a nonexistent
+/// directory cannot contain symlinks), normalized lexically. Returns the
+/// fully canonical form when `path` itself exists. Returns `None` when a
+/// non-NotFound IO error occurs (permissions, symlink loop, …) — callers
+/// treat that as "no information" and let the lexical checks stand.
 ///
-/// Codex P2 (cap#165): `canonicalize` alone returns `NotFound` for the
-/// not-yet-created state file, so a symlink in a PARENT directory (state at
-/// `/link/release.accepted` with `/link` → `/real`, override at
-/// `/real/release.accepted.tmp`) hid the alias between the state's derived
-/// `.tmp` sibling and the override envelope.
-fn canonicalize_nearest_existing(path: &Path) -> Option<PathBuf> {
-    let mut current = lexical_absolute(path);
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    loop {
-        match std::fs::canonicalize(&current) {
-            Ok(resolved) => {
-                let mut result = resolved;
-                for component in tail.iter().rev() {
-                    result.push(component);
-                }
-                return Some(result);
+/// Codex P2 (cap#165): the previous normalization collapsed `..` BEFORE any
+/// symlink was resolved, so a state spelled `/base/link/../release.accepted`
+/// (with `/base/link` → `/real/dir`) was checked as `/base/release.accepted`
+/// while the commit's traversal writes `/real/release.accepted` — its derived
+/// `.tmp` sibling aliased an override at `/real/release.accepted.tmp` and the
+/// guard missed it, letting the commit truncate and rename away the signed
+/// envelope.
+fn resolve_in_filesystem_order(path: &Path) -> Option<PathBuf> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut resolved = PathBuf::new();
+    for component in joined.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                // `..` at the root stays at the root; elsewhere it pops the
+                // RESOLVED prefix — kernel semantics apply `..` after the
+                // preceding component's symlinks have been followed.
+                resolved.pop();
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                tail.push(current.file_name()?.to_os_string());
-                current = current.parent()?.to_path_buf();
-            }
+            other => resolved.push(other),
+        }
+        match std::fs::canonicalize(&resolved) {
+            Ok(canonical) => resolved = canonical,
+            // Not there (yet): the rest of the path is a plain lexical tail.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             // A non-NotFound error (permissions, loop, …): resolving anyway
             // could hide an alias, so report "unresolvable" and let the
             // lexical checks stand.
             Err(_) => return None,
         }
     }
+    Some(resolved)
 }
 
 /// Resolve the high-water-mark state lane.
@@ -374,13 +390,15 @@ fn resolve_high_water_state(
             // state path, which would atomically destroy the signed
             // envelope and brick every subsequent restart. Compare
             // lexically-normalized absolute paths (catches `./release.json`
-            // vs `release.json` and `a/../b` forms) and canonicalized paths
-            // resolved through the nearest EXISTING ancestor (catches
-            // symlinks on the files themselves and in parent directories,
-            // even when the state file does not exist yet — Codex P2,
-            // cap#165). This can over-equate through symlinked `..`
-            // components; rejecting a suspicious config is the safe
-            // direction for this guard.
+            // vs `release.json` and `a/../b` forms) and paths resolved in
+            // FILESYSTEM ORDER (catches symlinks on the files themselves and
+            // in parent directories — including `..` THROUGH a symlinked
+            // parent, which lexical `..` collapse mis-resolves — even when
+            // the state file does not exist yet — Codex P2, cap#165). The
+            // derived siblings are spelled from the RAW state string, exactly
+            // as `with_state_lock` and the persist path build them. This can
+            // over-equate through symlinked `..` components; rejecting a
+            // suspicious config is the safe direction for this guard.
             let norm_override = lexical_absolute(Path::new(override_path));
             let norm_state = lexical_absolute(Path::new(&state));
             let derived: [PathBuf; 2] = {
@@ -391,11 +409,21 @@ fn resolve_high_water_state(
                 };
                 [suffix(".tmp"), suffix(".lock")]
             };
-            let resolved_override = canonicalize_nearest_existing(Path::new(override_path));
-            let resolved_state = canonicalize_nearest_existing(Path::new(&state));
+            // The commit/lock paths suffix the RAW state string, so alias
+            // detection must resolve those exact spellings.
+            let raw_derived: [PathBuf; 2] = {
+                let suffix = |sfx: &str| {
+                    let mut os = std::path::PathBuf::from(&state).into_os_string();
+                    os.push(sfx);
+                    PathBuf::from(os)
+                };
+                [suffix(".tmp"), suffix(".lock")]
+            };
+            let resolved_override = resolve_in_filesystem_order(Path::new(override_path));
+            let resolved_state = resolve_in_filesystem_order(Path::new(&state));
             let resolved_derived: [Option<PathBuf>; 2] = [
-                canonicalize_nearest_existing(&derived[0]),
-                canonicalize_nearest_existing(&derived[1]),
+                resolve_in_filesystem_order(&raw_derived[0]),
+                resolve_in_filesystem_order(&raw_derived[1]),
             ];
             let aliasing = norm_override == norm_state
                 || derived.contains(&norm_override)
@@ -1648,6 +1676,67 @@ mod tests {
         assert!(
             matches!(result, Err(PlatformReleaseError::InvalidField { field, .. }) if field == "ENCLAVA_PLATFORM_RELEASE_STATE"),
             "symlinked state alias must be rejected"
+        );
+        #[cfg(not(unix))]
+        let _ = result;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn override_lane_rejects_symlinked_parent_dotdot_alias() {
+        // Codex P2 (cap#165, round 7): lexical `..` collapse ran BEFORE any
+        // symlink was resolved, so a state spelled `<base>/link/../release.accepted`
+        // (with `<base>/link` → `<real>/inner`) was checked as
+        // `<base>/release.accepted` while the kernel traversal the commit
+        // performs writes `<real>/release.accepted` — its derived
+        // `<state>.tmp` / `<state>.lock` siblings then alias the override
+        // envelope at `<real>/release.accepted.tmp`, and the guard missed it.
+        let dir = std::env::temp_dir().join(format!(
+            "cap165-alias-dotdot-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let base = dir.join("base");
+        let real_inner = dir.join("real").join("inner");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&real_inner).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_inner, base.join("link")).unwrap();
+
+        // Kernel resolution of `<base>/link/../release.accepted` lands in
+        // `<real>/release.accepted` (the symlink target's parent), so the
+        // derived siblings and the state file itself live under `<real>`.
+        let state = base.join("link").join("..").join("release.accepted");
+        for sibling in ["release.accepted.tmp", "release.accepted.lock"] {
+            let override_path = dir.join("real").join(sibling);
+            std::fs::write(&override_path, b"{}").unwrap();
+            let result = resolve_high_water_state(
+                Some(override_path.to_str().unwrap()),
+                Some(state.to_str().unwrap().to_string()),
+            );
+            #[cfg(unix)]
+            assert!(
+                matches!(result, Err(PlatformReleaseError::InvalidField { field, .. }) if field == "ENCLAVA_PLATFORM_RELEASE_STATE"),
+                "derived sibling alias through symlinked `..` must be rejected for {sibling:?}"
+            );
+            #[cfg(not(unix))]
+            let _ = result;
+            std::fs::remove_file(&override_path).ok();
+        }
+        // The state file itself aliasing the override through the same
+        // symlinked `..` spelling must be rejected too.
+        let override_path = dir.join("real").join("release.accepted");
+        std::fs::write(&override_path, b"{}").unwrap();
+        let result = resolve_high_water_state(
+            Some(override_path.to_str().unwrap()),
+            Some(state.to_str().unwrap().to_string()),
+        );
+        #[cfg(unix)]
+        assert!(
+            matches!(result, Err(PlatformReleaseError::InvalidField { field, .. }) if field == "ENCLAVA_PLATFORM_RELEASE_STATE"),
+            "state alias through symlinked `..` must be rejected"
         );
         #[cfg(not(unix))]
         let _ = result;
