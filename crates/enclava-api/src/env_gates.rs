@@ -35,7 +35,7 @@ const DEBUG_ONLY_FLAGS: &[&str] = &[
     "LEGACY_BOOTSTRAP_SCRIPT",
 ];
 
-fn flag_is_truthy(value: &str) -> bool {
+pub(crate) fn flag_is_truthy(value: &str) -> bool {
     matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES")
 }
 
@@ -164,6 +164,16 @@ fn enforce_with(
                 "PLATFORM_SIGNING_SERVICE_URL",
             ));
         }
+    }
+
+    // Surface the armed opt-out at startup, before the first internal host
+    // is accepted: the per-host audit log only fires on tenant submissions.
+    if lookup(CAP_EGRESS_ALLOW_INTERNAL_HOSTS).is_some_and(|value| flag_is_truthy(&value)) {
+        tracing::warn!(
+            flag = CAP_EGRESS_ALLOW_INTERNAL_HOSTS,
+            production_ack = CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS,
+            "tenant egress to internal endpoints is ENABLED for this process"
+        );
     }
 
     Ok(())
@@ -420,6 +430,33 @@ mod tests {
         env.insert("CAP_EGRESS_ALLOW_INTERNAL_HOSTS", "0");
         env.insert("CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS", "false");
         run(env, false).expect("falsy flags should not trip the gate");
+    }
+
+    #[test]
+    fn release_non_truthy_internal_egress_acks_are_rejected() {
+        for ack in ["false", "0", "no", "", "True", "off"] {
+            let mut env = ok_required();
+            env.insert("CAP_EGRESS_ALLOW_INTERNAL_HOSTS", "true");
+            env.insert("CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS", ack);
+            let err = run(env.clone(), false).unwrap_err();
+            assert!(
+                matches!(err, EnvGateError::InternalEgressWithoutExplicitAllow(_)),
+                "ack {ack:?} must not satisfy the production gate"
+            );
+        }
+    }
+
+    #[test]
+    fn release_truthy_internal_egress_acks_are_accepted() {
+        // The same truthy spellings `internal_egress_allowlist_enabled` accepts
+        // via the shared `flag_is_truthy` helper; drift between the two would
+        // arm internal egress without tripping the startup gate.
+        for ack in ["1", "true", "TRUE", "yes", "YES", " true "] {
+            let mut env = ok_required();
+            env.insert("CAP_EGRESS_ALLOW_INTERNAL_HOSTS", "true");
+            env.insert("CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS", ack);
+            run(env, false).unwrap_or_else(|e| panic!("ack {ack:?} must pass: {e:?}"));
+        }
     }
 
     #[test]
