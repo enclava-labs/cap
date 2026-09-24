@@ -2611,17 +2611,22 @@ owner_resource_bindings := {}
         }));
 
         // Signer rotation withdraws every artifact signed under the previous
-        // identity (issue #119): the row lands in withdrawn_signer_artifacts
-        // and the selector must refuse the hash on every path.
+        // identity (issue #119): the withdrawal is recorded by the runtime
+        // helper's predicate (descriptor signer_identity equality) and the
+        // selector must refuse the hash on every path.
+        let mut tx = pool.begin().await.expect("begin withdrawal tx");
         sqlx::query(
             "INSERT INTO withdrawn_signer_artifacts (descriptor_core_hash, app_id)
-             VALUES ($1, $2)",
+             SELECT descriptor_core_hash, app_id
+               FROM workload_artifacts
+              WHERE descriptor_core_hash = $1
+              ON CONFLICT DO NOTHING",
         )
         .bind(hex::decode(&current_artifact.metadata.descriptor_core_hash).unwrap())
-        .bind(app_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .expect("withdraw rotated-out artifact");
+        tx.commit().await.expect("commit withdrawal");
 
         let candidates = load_signed_policy_candidates(&pool, 2)
             .await

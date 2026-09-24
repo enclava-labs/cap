@@ -2154,6 +2154,9 @@ pub async fn rotate_signer(
     // Claims of the verified rotation token; present for every non-initial
     // rotation (consumed atomically below, issue #119).
     let mut signer_rotation_claims = None;
+    // True when this rotation changed the signed-policy candidate set and a
+    // reconciliation must converge before the route returns success.
+    let mut kbs_policy_write_pending = false;
 
     if !is_initial_set {
         let expected = SignerRotationTokenInput {
@@ -2235,9 +2238,11 @@ pub async fn rotate_signer(
         }
 
         // Withdraw KBS trust from every retained artifact signed under the
-        // rotated-out identity and durably re-render the policy, so the live
-        // Trustee config no longer admits the previous signer (issue #119).
-        let rotated_artifacts = withdraw_signer_rotated_out_artifacts(
+        // rotated-out identity (issue #119). Note this is revocation, not a
+        // re-render: signed artifacts are immutable, so the app leaves the
+        // signed-policy set (fail-closed on the previous signer) until the
+        // next deployment commits an artifact for the new identity.
+        withdraw_signer_rotated_out_artifacts(
             &mut tx,
             app.id,
             &previous_subject.clone().unwrap_or_default(),
@@ -2245,16 +2250,20 @@ pub async fn rotate_signer(
         )
         .await
         .map_err(|_| internal_server_error())?;
-        if rotated_artifacts > 0 {
-            crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
-                .await
-                .map_err(|_| internal_server_error())?;
-        }
+        // The candidate set may change even when no new withdrawal row was
+        // inserted (e.g. a later rotation of an already-withdrawn artifact),
+        // so bump unconditionally: the durable generation is what makes the
+        // reconciler publish the withdrawal instead of reporting a
+        // same-generation content conflict.
+        crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
+            .await
+            .map_err(|_| internal_server_error())?;
+        kbs_policy_write_pending = true;
     }
 
-    // Audit. The rotated signer identity is reflected in the live KBS policy
-    // by withdrawing rotated-out artifacts above; a deployment under the new
-    // identity commits a fresh artifact in the same lane.
+    // Audit. Rotation withdraws the previous signer's artifacts from KBS
+    // policy (fail-closed); the new identity itself only becomes live in
+    // policy when the next deployment commits an artifact signed under it.
     let action = if is_initial_set {
         "app.signer.set"
     } else {
@@ -2284,6 +2293,31 @@ pub async fn rotate_signer(
         .await
         .map_err(|_| internal_server_error())?;
     tx.commit().await.map_err(|_| internal_server_error())?;
+
+    // The withdrawal is durable, but the live Trustee policy only reflects
+    // it once the reconciler converges the enqueued generation. Converge
+    // under the KBS fence before reporting success, like app deletion; a
+    // KBS-side failure surfaces as 503 with the durable intent retained
+    // (the background reconciler keeps retrying).
+    if kbs_policy_write_pending && state.kbs_policy.is_some() {
+        let lease = crate::mutation_leases::claim_resources(
+            &state,
+            "kbs_signer_rotation_policy",
+            Uuid::new_v4(),
+            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+        )
+        .await
+        .map_err(|_| internal_server_error())?;
+        lease
+            .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
+                &state.db,
+                state.kbs_policy.as_ref(),
+            ))
+            .await
+            .map_err(|_| internal_server_error())?
+            .map_err(|_| internal_server_error())?;
+        lease.finish().await.map_err(|_| internal_server_error())?;
+    }
 
     Ok(Json(app.into()))
 }

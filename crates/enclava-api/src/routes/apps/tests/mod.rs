@@ -800,8 +800,6 @@ async fn signer_rotation_token_is_single_use_and_withdraws_rotated_out_artifacts
     .execute(&pool)
     .await
     .expect("insert signer rotation membership");
-    // memberships has no removed_at column in some revisions; fall back to a
-    // plain owner membership when the above conflicts are impossible.
     sqlx::query(
         "INSERT INTO apps (
              id, org_id, name, namespace, instance_id, tenant_id,
@@ -883,6 +881,13 @@ async fn signer_rotation_token_is_single_use_and_withdraws_rotated_out_artifacts
     let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
     let new_issuer = "https://token.actions.githubusercontent.com";
 
+    let desired_before: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read desired generation before any rotation");
+
     let token = crate::auth::jwt::issue_signer_rotation_token(
         &hmac_key,
         &SignerRotationTokenInput {
@@ -935,14 +940,18 @@ async fn signer_rotation_token_is_single_use_and_withdraws_rotated_out_artifacts
         withdrawn, 1,
         "rotation must withdraw the old-signer artifact"
     );
-    // And a signed-policy generation was enqueued durably.
+    // And a signed-policy generation was enqueued durably: every rotation
+    // must advance the generation.
     let desired: i64 = sqlx::query_scalar(
         "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
     )
     .fetch_one(&pool)
     .await
-    .expect("read desired generation");
-    assert!(desired > 0, "rotation must enqueue policy reconciliation");
+    .expect("read desired generation after rotation");
+    assert!(
+        desired > desired_before,
+        "rotation must enqueue policy reconciliation"
+    );
 
     // Rotate back to the previous identity so the original token's claims
     // (previous=old, new=new) match again, then replay it: it must be
@@ -961,6 +970,12 @@ async fn signer_rotation_token_is_single_use_and_withdraws_rotated_out_artifacts
         chrono::Duration::seconds(600),
     )
     .expect("issue rotate-back token");
+    let desired_mid: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read desired generation before rotate-back");
     let Json(_) = rotate_signer(
         clone_auth(&auth),
         State(state.clone()),
@@ -973,6 +988,16 @@ async fn signer_rotation_token_is_single_use_and_withdraws_rotated_out_artifacts
     )
     .await
     .expect("rotate back succeeds");
+    let desired_after: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read desired generation after rotate-back");
+    assert!(
+        desired_after > desired_mid,
+        "rotating an already-withdrawn artifact must still bump the generation"
+    );
 
     let replay = rotate_signer(
         clone_auth(&auth),
@@ -990,6 +1015,18 @@ async fn signer_rotation_token_is_single_use_and_withdraws_rotated_out_artifacts
         Err(err) => err,
     };
     assert_eq!(err.0, StatusCode::FORBIDDEN);
+    // The rejected replay must not have committed any part of the rotation.
+    let replayed_subject: Option<String> =
+        sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app subject after rejected replay");
+    assert_eq!(
+        replayed_subject.as_deref(),
+        Some(previous_subject),
+        "rejected replay must roll back the signer update"
+    );
 
     sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
         .bind(org_id)
