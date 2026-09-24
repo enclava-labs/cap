@@ -511,13 +511,13 @@ async fn enqueue_signed_policy_bootstrap_if_idle(
 }
 
 /// Consume the deferred candidate-selector generation bump marked by
-/// migration 0049 and perform the real increment here.
+/// migration 0050 and perform the real increment here.
 ///
-/// Only the post-0049 implementation -- the one filtering signed-policy
+/// Only the post-0050 implementation -- the one filtering signed-policy
 /// candidates by current keyring membership -- may interpret the marker.
 /// `deploy/api/deployment.yaml` runs the API with
 /// `DATABASE_MIGRATION_MODE=verify`, so the migration step can precede the
-/// new binary by minutes while a pre-0049 replica keeps reconciling every 30
+/// new binary by minutes while a pre-0050 replica keeps reconciling every 30
 /// seconds: a generation bumped at migration time would be consumed by that
 /// replica's unfiltered candidate query and published as the old policy body
 /// at the new generation, after which this build would crash-loop on
@@ -525,12 +525,12 @@ async fn enqueue_signed_policy_bootstrap_if_idle(
 /// recover.  Performing the increment here instead means it happens at the
 /// start of a reconciliation run that holds the global KBS mutation fence
 /// and converges the filtered candidate set within that same fenced run, so
-/// a pre-0049 reconciler can never observe the owed generation as a raw
+/// a pre-0050 reconciler can never observe the owed generation as a raw
 /// desired generation.
 ///
 /// Consumption is a single guarded `UPDATE`, so concurrent replicas consume
 /// the marker exactly once and every later call is a no-op.  The marker is
-/// only ever set where `desired_generation > 0` (migration 0049's own WHERE
+/// only ever set where `desired_generation > 0` (migration 0050's own WHERE
 /// clause, mirroring [`enqueue_signed_policy_reconciliation_if_active`]);
 /// if a stray marker ever lands on an unsigned-only row it is cleared
 /// without bumping so the install cannot be pushed into signed-policy mode.
@@ -617,7 +617,7 @@ async fn load_signed_policy_candidates(
         ),
         -- The cast is safe at two levels: org_keyrings rows are written only
         -- by the put/rotate handlers, which serialize validated JSON, and the
-        -- org_keyrings_payload_wellformed CHECK constraint (migration 0049)
+        -- org_keyrings_payload_wellformed CHECK constraint (migration 0050)
         -- rejects any non-JSON or non-object payload or a non-array members
         -- entry at INSERT time, so a malformed row from a backfill script or
         -- manual psql fix can never take down candidate loading for every
@@ -900,9 +900,9 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
     expected_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
     client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
-    // Perform any deferred selector generation bump (migration 0049) before
+    // Perform any deferred selector generation bump (migration 0050) before
     // the candidate set is computed below: the filtered candidates must be
-    // published as a new generation within this fenced run, so a pre-0049
+    // published as a new generation within this fenced run, so a pre-0050
     // reconciler can never consume the owed bump with its unfiltered query.
     consume_deferred_selector_bump(db).await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
@@ -2841,10 +2841,10 @@ owner_resource_bindings := {}
         crate::test_support::drop_isolated_database("cap130_rotation_enqueue", pool).await;
     }
 
-    /// Migration 0049 marks its owed selector generation bump instead of
-    /// performing it, so a pre-0049 replica still reconciling during the
+    /// Migration 0050 marks its owed selector generation bump instead of
+    /// performing it, so a pre-0050 replica still reconciling during the
     /// rollout cannot consume the bump with its unfiltered candidate query.
-    /// Only the post-0049 reconciler interprets the marker, exactly once, and
+    /// Only the post-0050 reconciler interprets the marker, exactly once, and
     /// never on behalf of an unsigned-only install -- what this test pins
     /// down.  Runs against its own per-process database: like the rotation
     /// test, it asserts exact singleton state that another test process could
@@ -2866,7 +2866,7 @@ owner_resource_bindings := {}
         // Nothing marked: consuming is a no-op.
         assert_eq!(consume_deferred_selector_bump(&pool).await.unwrap(), None);
 
-        // Migration 0049 marks signed-mode installs; consumption performs the
+        // Migration 0050 marks signed-mode installs; consumption performs the
         // bump exactly once and clears the marker.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
