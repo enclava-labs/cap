@@ -114,10 +114,12 @@ pub struct VerifyInputs<'a> {
     pub artifacts: &'a ArtifactsBundle,
     pub cc_init_data_claims: &'a CcInitDataClaims,
     pub local_cc_init_data_toml: &'a [u8],
-    /// Preferred policy producer keys. When a signing-service key is pinned in
-    /// signed cc_init_data it is authoritative; descriptor-key policy signing is
-    /// only a legacy fallback for older releases with no configured platform
-    /// policy key.
+    /// Policy producer keys. The platform trustee policy key is the
+    /// authoritative in-TEE policy authority when pinned in signed
+    /// cc_init_data (cap#118: it is a dedicated trust domain, distinct from
+    /// the off-cluster signing service). The signing-service key and
+    /// descriptor-key policy signing are legacy fallbacks for older
+    /// releases with no configured platform policy key.
     pub platform_trustee_policy_pubkey: Option<&'a VerifyingKey>,
     pub signing_service_pubkey: Option<&'a VerifyingKey>,
 }
@@ -502,18 +504,23 @@ fn verify_policy_envelope_signature(
     let msg = ce_v1_policy_envelope_message(env)?;
     let sig = Signature::from_bytes(&env.signature);
 
-    if let Some(signing_service_key) = signing_service_pubkey {
-        return signing_service_key.verify(&msg, &sig).map_err(|_| {
-            InitError::TrusteePolicy(
-                "policy envelope sig did not verify with signing service key".into(),
-            )
-        });
-    }
-
+    // cap#118: the platform trustee policy key is the dedicated in-TEE
+    // policy authority. When it is pinned, a signature made with any other
+    // key — including the signing-service key — must NOT authorize the
+    // policy: the two are distinct trust domains, and accepting the
+    // signing-service key here would collapse them.
     if let Some(platform_key) = platform_trustee_policy_pubkey {
         return platform_key.verify(&msg, &sig).map_err(|_| {
             InitError::TrusteePolicy(
                 "policy envelope sig did not verify with platform trustee policy key".into(),
+            )
+        });
+    }
+
+    if let Some(signing_service_key) = signing_service_pubkey {
+        return signing_service_key.verify(&msg, &sig).map_err(|_| {
+            InitError::TrusteePolicy(
+                "policy envelope sig did not verify with signing service key".into(),
             )
         });
     }

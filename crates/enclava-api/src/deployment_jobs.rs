@@ -2761,18 +2761,24 @@ async fn validate_apply_artifacts(
     {
         return Err(DeploymentJobError::Artifact);
     }
-    let signing_service_pubkey_hex = state
-        .attestation
-        .as_ref()
-        .and_then(|config| config.signing_service_pubkey_hex.as_deref())
-        .ok_or(DeploymentJobError::Artifact)?;
+    let signing_service_pubkey_hex = crate::signing_service::resolve_policy_authority_pubkey_hex(
+        state
+            .attestation
+            .as_ref()
+            .and_then(|config| config.platform_trustee_policy_pubkey_hex.as_deref()),
+        state
+            .attestation
+            .as_ref()
+            .and_then(|config| config.signing_service_pubkey_hex.as_deref()),
+    )
+    .ok_or(DeploymentJobError::Artifact)?;
     loaded
         .validate_stored_authority(
             &state.db,
             &payload.app,
             primary_image_digest,
             &payload.api_signing_pubkey,
-            signing_service_pubkey_hex,
+            &signing_service_pubkey_hex,
             &crate::signing_service::descriptor_platform_binding_for(
                 state,
                 &payload.snapshot.resources.memory_limit,

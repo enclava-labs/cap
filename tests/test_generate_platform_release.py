@@ -411,3 +411,19 @@ def test_release_generator_rejects_missing_trustee_policy_key():
 
     with pytest.raises(KeyError):
         generate_platform_release.validate_payload(payload)
+
+
+def test_dev_fixture_trustee_pubkey_is_derived_not_the_seed():
+    import hashlib  # noqa: F401  (documenting no-hash intent)
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    seed = bytes.fromhex(generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_SEED_HEX)
+    derived = (
+        Ed25519PrivateKey.from_private_bytes(seed)
+        .public_key()
+        .public_bytes_raw()
+        .hex()
+    )
+    pinned = generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX
+    assert pinned == derived, "fixture trustee constant must be the derived pubkey, not the seed"
+    assert pinned != generate_platform_release.DEV_FIXTURE_TRUSTEE_POLICY_SEED_HEX

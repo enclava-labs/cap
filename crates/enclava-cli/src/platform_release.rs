@@ -396,7 +396,10 @@ fn hex32(field: &'static str, value: &str) -> Result<[u8; 32], PlatformReleaseEr
         })
 }
 
-fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformReleaseError> {
+/// Validates a release payload's semantic invariants (key shape, key
+/// distinctness, URL schemes, digest pinning). Public so the offline
+/// ceremony example can reject an invalid payload BEFORE signing it.
+pub fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformReleaseError> {
     if release.schema_version != "v1" {
         return Err(PlatformReleaseError::InvalidField {
             field: "schema_version",

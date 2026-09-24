@@ -272,10 +272,20 @@ pub(crate) async fn resolve_signed_policy_artifact(
         .validate_customer_authority(&state.db)
         .await
         .map_err(signing_error_response)?;
-    let signing_service_pubkey_hex = signing_service_pubkey_hex.ok_or((
+    // cap#118: the platform trustee policy key is the dedicated policy
+    // authority when configured; the signing-service key is only a legacy
+    // fallback for configurations without a trustee key.
+    let policy_authority_pubkey_hex = crate::signing_service::resolve_policy_authority_pubkey_hex(
+        state
+            .attestation
+            .as_ref()
+            .and_then(|cfg| cfg.platform_trustee_policy_pubkey_hex.as_deref()),
+        signing_service_pubkey_hex,
+    )
+    .ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
-            "error": "platform signing-service pubkey required for signed_policy_artifact verification"
+            "error": "platform policy authority pubkey required for signed_policy_artifact verification"
         })),
     ))?;
     let signing_service = state.signing_service.as_ref().ok_or((
@@ -303,7 +313,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
                     )
                 })?;
         if artifacts
-            .validate_signed_artifact(&artifact, signing_service_pubkey_hex)
+            .validate_signed_artifact(&artifact, &policy_authority_pubkey_hex)
             .is_ok()
         {
             artifacts
@@ -322,7 +332,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
         .await
         .map_err(signing_error_response)?;
     artifacts
-        .validate_signed_artifact(&artifact, signing_service_pubkey_hex)
+        .validate_signed_artifact(&artifact, &policy_authority_pubkey_hex)
         .map_err(signing_error_response)?;
     artifacts
         .validate_canonical_agent_policy(&artifact, &generated)
@@ -1499,18 +1509,25 @@ async fn deploy_app_candidate(
                 crate::signing_service::SigningServiceError::ArtifactWithoutBlobs,
             )
         })?;
-        let signing_service_pubkey_hex = state
-            .attestation
-            .as_ref()
-            .and_then(|config| config.signing_service_pubkey_hex.as_deref())
+        let policy_authority_pubkey_hex =
+            crate::signing_service::resolve_policy_authority_pubkey_hex(
+                state
+                    .attestation
+                    .as_ref()
+                    .and_then(|config| config.platform_trustee_policy_pubkey_hex.as_deref()),
+                state
+                    .attestation
+                    .as_ref()
+                    .and_then(|config| config.signing_service_pubkey_hex.as_deref()),
+            )
             .ok_or_else(|| {
                 json_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "platform signing-service pubkey required for signed deployment verification",
+                    "platform policy authority pubkey required for signed deployment verification",
                 )
             })?;
         artifacts
-            .validate_signed_artifact(signed, signing_service_pubkey_hex)
+            .validate_signed_artifact(signed, &policy_authority_pubkey_hex)
             .map_err(signing_error_response)?;
     }
     if let Some(expected) = existing_authority_snapshot.as_ref()

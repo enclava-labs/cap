@@ -415,9 +415,10 @@ fn release_env_value(
 }
 
 /// Loads the two policy-authority pubkeys, each from its own signed release
-/// field (or matching env override). The platform trustee policy key and the
-/// signing-service key are distinct trust domains: collapsing them into one
-/// key is an error, not a fallback (cap#118).
+/// field (env values must match the signed field exactly). The platform
+/// trustee policy key and the signing-service key are distinct trust
+/// domains: collapsing them into one key is an error, not a fallback
+/// (cap#118).
 fn load_policy_authority_pubkeys(
     platform_release: Option<&PlatformRelease>,
 ) -> anyhow::Result<(Option<String>, Option<String>)> {
@@ -442,11 +443,14 @@ fn load_policy_authority_pubkeys(
     if let (Some(trustee_key), Some(signing_key)) = (
         &platform_trustee_policy_pubkey_hex,
         &signing_service_pubkey_hex,
-    ) && trustee_key == signing_key
-    {
-        anyhow::bail!(
-            "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX and SIGNING_SERVICE_PUBKEY_HEX must be distinct keys (in-TEE policy authority vs signing service); collapsing them is not allowed"
-        );
+    ) {
+        // Nested if (not a let chain): let chains need Rust 1.88, workspace
+        // MSRV is 1.85.
+        if trustee_key == signing_key {
+            anyhow::bail!(
+                "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX and SIGNING_SERVICE_PUBKEY_HEX must be distinct keys (in-TEE policy authority vs signing service); collapsing them is not allowed"
+            );
+        }
     }
     Ok((
         platform_trustee_policy_pubkey_hex,
@@ -1049,6 +1053,23 @@ mod tests {
         }
     }
 
+    /// Serializes tests that read or mutate the POLICY_*PUBKEY_HEX process
+    /// env (tests run in parallel threads; an env-mutating test racing an
+    /// env-reading one produces flaky conflicts).
+    static POLICY_ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores both env vars on drop so a panic mid-test cannot leak them
+    /// into other tests in this binary.
+    struct EnvGuard;
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX");
+                std::env::remove_var("SIGNING_SERVICE_PUBKEY_HEX");
+            }
+        }
+    }
+
     #[test]
     fn policy_authority_pubkeys_reject_collapse_to_one_key() {
         // cap#118: the platform trustee policy key and the signing-service
@@ -1056,6 +1077,8 @@ mod tests {
         // from env; an operator (or legacy config) that sets both to the
         // same hex must fail startup instead of silently collapsing the
         // domains.
+        let _env_mutex = POLICY_ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard;
         let key = "11".repeat(32);
         unsafe {
             std::env::set_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX", &key);
@@ -1063,10 +1086,56 @@ mod tests {
         }
         let err = load_policy_authority_pubkeys(None).unwrap_err();
         assert!(err.to_string().contains("must be distinct keys"));
+
+        // Case variants of the same key must not sneak past the check.
         unsafe {
-            std::env::remove_var("PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX");
-            std::env::remove_var("SIGNING_SERVICE_PUBKEY_HEX");
+            std::env::set_var(
+                "PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX",
+                key.to_ascii_uppercase(),
+            );
         }
+        let err = load_policy_authority_pubkeys(None).unwrap_err();
+        assert!(err.to_string().contains("must be distinct keys"));
+    }
+
+    #[test]
+    fn policy_authority_pubkeys_load_distinct_release_fields() {
+        // The original bug: both slots were filled from
+        // release.signing_service_pubkey_hex. A release with the new signed
+        // field must supply each slot from its own field (the bundled
+        // envelope's own distinct keys are proven in the lib tests).
+        let _env_mutex = POLICY_ENV_TEST_MUTEX.lock().unwrap();
+        let release = PlatformRelease {
+            schema_version: "v1".into(),
+            platform_release_version: "test".into(),
+            signing_service_url: "https://signing.example".into(),
+            signing_service_pubkey_hex: "11".repeat(32),
+            platform_trustee_policy_pubkey_hex: "33".repeat(32),
+            policy_template_id: "t".into(),
+            policy_template_sha256: "00".repeat(32),
+            policy_template_text: String::new(),
+            attestation_proxy_image: "img".into(),
+            caddy_ingress_image: "img".into(),
+            trustee_kbs_url: "https://kbs.example".into(),
+            trustee_kbs_ca_cert_pem: String::new(),
+            tenant_caddy_tls_mode: "acme".into(),
+            tenant_caddy_acme_ca: "https://acme.example".into(),
+            expected_firmware_measurement: "00".repeat(32),
+            expected_runtime_class: "kata-qemu-snp".into(),
+            genpolicy_version: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let (trustee, signing) =
+            load_policy_authority_pubkeys(Some(&release)).expect("distinct keys load");
+        assert_eq!(
+            trustee.as_deref(),
+            Some(release.platform_trustee_policy_pubkey_hex.as_str())
+        );
+        assert_eq!(
+            signing.as_deref(),
+            Some(release.signing_service_pubkey_hex.as_str())
+        );
+        assert_ne!(trustee, signing);
     }
 
     #[test]

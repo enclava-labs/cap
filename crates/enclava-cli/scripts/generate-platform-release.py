@@ -26,7 +26,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 DEV_FIXTURE_SIGNING_KEY_HEX = "c0" * 32
-DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX = "c1" * 32
+DEV_FIXTURE_TRUSTEE_POLICY_SEED_HEX = "c1" * 32
+# Public key of the dev-fixture trustee seed (Ed25519 seed -> pubkey, derived
+# once and pinned so the fixture envelope stays byte-stable).
+DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX = "acdcc8494d458f44a7aaac1d6a84ec624daee88436db2ae26e67ba645a106228"
 DEFAULT_RELEASE_PATH = Path(__file__).resolve().parents[1] / "platform-release.json"
 GHCR_DIGEST_RE = re.compile(
     r"^ghcr\.io/enclava-labs/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$"
@@ -421,6 +424,9 @@ def generate(args: argparse.Namespace) -> str:
     base = json.loads(args.input.read_text())
     payload = base["payload"]
     if args.dev_fixture_key and not payload.get("platform_trustee_policy_pubkey_hex"):
+        # PUBKEY of the dev-fixture trustee seed, not the seed itself: this
+        # field pins a verification key; writing the seed here would publish
+        # the fixture private key as the pinned authority.
         payload["platform_trustee_policy_pubkey_hex"] = DEV_FIXTURE_TRUSTEE_POLICY_KEY_HEX
     payload = env_overlay(payload)
     validate_payload(payload, allow_dev_internal_tls=args.dev_fixture_key)

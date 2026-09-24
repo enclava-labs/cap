@@ -85,7 +85,8 @@ For production deploys with policy-read mode enabled:
 | `TRUSTEE_ATTESTATION_VERIFY_URL` | Trustee callback endpoint used by CAP workload artifact and TLS broker routes. Must be an `https://` URL: release builds reject `http://` verify URLs at startup (the verify bearer token must never transit cleartext), and the trustee client refuses cleartext requests in all builds. |
 | `TRUSTEE_ATTESTATION_VERIFY_BEARER_TOKEN` | Bearer token CAP sends to the Trustee verification endpoint. Required when `TRUSTEE_ATTESTATION_VERIFY_URL` is set. |
 | `PLATFORM_SIGNING_SERVICE_URL` | Policy signing service endpoint, unless supplied by the platform release. |
-| `SIGNING_SERVICE_PUBKEY_HEX` or `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX` | Ed25519 public key used to verify signed policy artifacts, unless supplied by the platform release. |
+| `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX` | Ed25519 public key of the platform trustee policy authority (in-TEE policy verification), unless supplied by the platform release. |
+| `SIGNING_SERVICE_PUBKEY_HEX` | Ed25519 public key of the off-cluster signing service, unless supplied by the platform release. Distinct from `PLATFORM_TRUSTEE_POLICY_PUBKEY_HEX`: they are two trust domains, and setting both to the same key fails startup. When a trustee policy key is configured it is the authoritative policy-artifact verification key; the signing-service key is only a legacy fallback. |
 
 ## Optional Integrations
 
@@ -166,6 +167,9 @@ The API and CLI load the bundled
 Release verification checks:
 
 - envelope signature against `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`;
+- `platform_trustee_policy_pubkey_hex` is present and distinct from
+  `signing_service_pubkey_hex` (the in-TEE policy authority and the
+  off-cluster signing service are separate trust domains);
 - digest pins for platform sidecar images;
 - HTTPS Trustee KBS URL;
 - HTTPS tenant Caddy ACME CA URL;
@@ -198,14 +202,21 @@ together:
 1. Generate the production root offline:
    `openssl genpkey -algorithm ed25519 -out root.pem`
    (`openssl pkey -in root.pem -noout -text` shows the seed and pubkey hex.)
-2. Sign the payload with the repository's canonical encoding. Keep the seed
+2. Prepare `payload.json`: a copy of the current release payload with the
+   fields you are rotating. It MUST include a `platform_trustee_policy_pubkey_hex`
+   distinct from `signing_service_pubkey_hex` — releases that omit the field or
+   collapse the two keys onto one key are rejected (the in-TEE policy authority
+   and the signing service are separate trust domains). Generate the trustee
+   policy keypair with its own offline seed, never reused as the signing-service
+   or root key.
+3. Sign the payload with the repository's canonical encoding. Keep the seed
    in a protected file and redirect it into the helper — it never appears in
    argv or shell history:
    `cargo run --locked -p enclava-cli --example platform-release -- sign \
    payload.json < root-seed.hex > platform-release.json`
-3. Sanity-check it: `cargo run --locked -p enclava-cli --example \
+4. Sanity-check it: `cargo run --locked -p enclava-cli --example \
    platform-release -- verify platform-release.json <root-pubkey-hex>`
-4. Set both repository secrets in one sitting:
+5. Set both repository secrets in one sitting:
    `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX` (pubkey hex) and
    `ENCLAVA_PLATFORM_RELEASE_ENVELOPE_JSON` (the signed envelope contents).
 

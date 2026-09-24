@@ -459,14 +459,21 @@ pub async fn rollback(
     )
     .await?;
     if let Some(artifacts) = rollback_artifacts.as_ref() {
-        let signing_service_pubkey_hex = state
-            .attestation
-            .as_ref()
-            .and_then(|config| config.signing_service_pubkey_hex.as_deref())
+        let signing_service_pubkey_hex =
+            crate::signing_service::resolve_policy_authority_pubkey_hex(
+                state
+                    .attestation
+                    .as_ref()
+                    .and_then(|config| config.platform_trustee_policy_pubkey_hex.as_deref()),
+                state
+                    .attestation
+                    .as_ref()
+                    .and_then(|config| config.signing_service_pubkey_hex.as_deref()),
+            )
             .ok_or_else(|| {
                 json_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "platform signing-service pubkey required for rollback verification",
+                    "platform policy authority pubkey required for rollback verification",
                 )
             })?;
         artifacts
@@ -475,7 +482,7 @@ pub async fn rollback(
                 &app,
                 &image_digest,
                 &crate::auth::jwt::public_key_base64(&state.signing_key),
-                signing_service_pubkey_hex,
+                &signing_service_pubkey_hex,
                 &crate::signing_service::descriptor_platform_binding_for(
                     &state,
                     &target_resources.memory_limit,

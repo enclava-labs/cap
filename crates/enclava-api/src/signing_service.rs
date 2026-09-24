@@ -730,10 +730,16 @@ impl DeploymentSigningArtifacts {
         ))
     }
 
+    /// `policy_authority_pubkey_hex` is the key policy artifacts must be
+    /// signed with. Policy artifacts come from `/sign`, so the acceptance
+    /// authority is the signing-service key (a response signed with any other
+    /// key is rejected). The platform trustee policy key (cap#118) is a
+    /// separate, in-TEE trust domain and must never be loaded into the
+    /// signing service.
     pub fn validate_signed_artifact(
         &self,
         artifact: &SignedPolicyArtifact,
-        signing_service_pubkey_hex: &str,
+        policy_authority_pubkey_hex: &str,
     ) -> Result<(), SigningServiceError> {
         // Field caps, then the platform signature over the canonical blob,
         // then semantic payload compares (#128). Hashing rego_text to build
@@ -741,7 +747,7 @@ impl DeploymentSigningArtifacts {
         // mismatch diagnostic is gated behind a valid platform signature.
         validate_signed_artifact_field_caps(artifact)?;
         let rego_hash: [u8; 32] = Sha256::digest(artifact.rego_text.as_bytes()).into();
-        verify_signed_policy_artifact(artifact, &rego_hash, signing_service_pubkey_hex)?;
+        verify_signed_policy_artifact(artifact, &rego_hash, policy_authority_pubkey_hex)?;
         self.validate_signed_artifact_common(artifact, &rego_hash)?;
         Ok(())
     }
@@ -1296,6 +1302,21 @@ pub(crate) fn validate_signed_artifact_field_caps(
         }
     }
     Ok(())
+}
+
+/// Resolves the pubkey policy artifacts must be signed with (cap#118): the
+/// platform trustee policy key when configured — it is the dedicated in-TEE
+/// policy authority, a distinct trust domain from the off-cluster signing
+/// service — otherwise the signing-service key as a legacy fallback for
+/// configurations that predate the dedicated trustee key.
+pub fn resolve_policy_authority_pubkey_hex(
+    platform_trustee_policy_pubkey_hex: Option<&str>,
+    signing_service_pubkey_hex: Option<&str>,
+) -> Option<String> {
+    platform_trustee_policy_pubkey_hex
+        .or(signing_service_pubkey_hex)
+        .map(str::to_string)
+}
 }
 
 fn verify_signed_policy_artifact(
