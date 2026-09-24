@@ -496,6 +496,11 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
 /// post-restart frames whose reset sequences land at or below its retained
 /// frontier). The spool is bounded by the rotation threshold, so one
 /// startup scan is cheap; lines that do not parse as frames are skipped.
+/// The spool directory is workload-writable, so the scan is over
+/// attacker-influenced content: a forged `{"sequence":u64::MAX}` line must
+/// not wrap the resumed counter to 0 (round-14 self-check Critical), so
+/// the resume point is clamped to a ceiling that still leaves headroom
+/// for a long-lived workload (u32::MAX frames ≈ years at kilo-frame/s).
 fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
     spool
         .seek(SeekFrom::Start(0))
@@ -512,7 +517,11 @@ fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
             max_sequence = sequence;
         }
     }
-    Ok(max_sequence + 1)
+    // Clamp before +1: a forged sequence must not wrap the counter to 0,
+    // which would make every post-restart frame replay-suppressed (the
+    // old frontier dedup) or duplicate earlier sequence numbers.
+    const SEQUENCE_RESUME_CEILING: u64 = u32::MAX as u64;
+    Ok(max_sequence.min(SEQUENCE_RESUME_CEILING) + 1)
 }
 
 fn spawn_log_forwarder<R>(
@@ -1884,6 +1893,28 @@ mod tests {
         std::fs::write(&path, "not-json\nalso not json\n").unwrap();
         let mut spool = open_log_spool(&path).unwrap();
         assert_eq!(initial_spool_sequence(&mut spool).unwrap(), 1);
+    }
+
+    /// Round-14 self-check Critical: the spool directory is
+    /// workload-writable, so a forged `{"sequence":u64::MAX}` line must
+    /// not wrap the resumed counter to 0 — that would make every
+    /// post-restart frame land at/below the relay's dedup state and be
+    /// silently dropped. The resume point is clamped before +1.
+    #[test]
+    fn initial_spool_sequence_does_not_wrap_on_forged_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        // A poisoned spool: one real frame plus the forged u64::MAX line.
+        let body = format!("{}\n{}\n", frame(417), frame(u64::MAX));
+        std::fs::write(&path, body).unwrap();
+        let mut spool = open_log_spool(&path).unwrap();
+        let resumed = initial_spool_sequence(&mut spool).unwrap();
+        assert_eq!(
+            resumed,
+            u32::MAX as u64 + 1,
+            "resume clamps to the ceiling + 1, never wraps to 0"
+        );
     }
 
     /// Round-11 review finding (P2): a record whose payload is EXACTLY

@@ -218,11 +218,11 @@ fn handle_connection(
     // already guards against inside follow_spool.
     drop(spool_file);
     write_response_head(&mut stream, 200, "application/x-ndjson", None)?;
-    let mut last_seq: Option<u64> = None;
+    let mut delivered = DeliveredSequences::new();
     for line in &lines {
         stream.write_all(line.as_bytes())?;
         stream.write_all(b"\n")?;
-        advance_last_sequence(line.as_bytes(), &mut last_seq);
+        remember_delivered_line(line.as_bytes(), &mut delivered);
     }
     stream.flush()?;
     if query.follow {
@@ -236,17 +236,17 @@ fn handle_connection(
         // memory limit) and OOM-kill the privileged sidecar. Everything
         // follow_spool needs (`offset`, `last_seq`) is an extracted copy.
         drop(lines);
-        // `last_seq` was seeded while streaming the initial tail above, so
+        // `delivered` was seeded while streaming the initial tail above, so
         // the follower never replays frames the client just received. The
         // tail's File handle was dropped before the writes (see above), so
         // the follower starts with NO held handle: the first poll takes the
         // rotation-resync path, adopts the CURRENT inode fresh, re-reads
-        // from offset 0, and dedups against the seeded `last_seq`. That is
+        // from offset 0, and dedups against the seeded set. That is
         // sound even when a rotation lands mid-tail-write: offsets never
         // cross the swap undetected, because the first poll trusts no
         // offset computed against a (possibly replaced) older inode.
         let mut held = None;
-        follow_spool(&mut stream, spool_path, &mut offset, &mut held, last_seq)?;
+        follow_spool(&mut stream, spool_path, &mut offset, &mut held, delivered)?;
     }
     Ok(())
 }
@@ -313,19 +313,71 @@ fn frame_sequence(line: &str) -> Option<u64> {
         .as_u64()
 }
 
-/// Update `last_seq` from every complete (newline-terminated) line in
-/// `bytes`. Sequences are monotonic per spool (one atomic counter shared
-/// by all forwarders), so the maximum seen is the delivery frontier.
-fn advance_last_sequence(bytes: &[u8], last_seq: &mut Option<u64>) {
-    for line in bytes.split(|&b| b == b'\n') {
-        if line.is_empty() {
-            continue;
+/// Cap on the per-follower delivered-sequence set. Rotation retains the
+/// last LOG_SPOOL_KEEP_BYTES (8 MiB) of frames and real encrypted frames
+/// are hundreds of bytes, so a retained window holds at most a few tens
+/// of thousands of frames — this cap covers it with >2x margin. The set
+/// grows lazily with frames actually delivered, so an idle follower that
+/// received little holds a near-empty one.
+const DELIVERED_SET_CAP: usize = 65_536;
+
+/// Sequences already SENT to this follower (round-14 self-check
+/// Critical): rotation dedup is SET MEMBERSHIP, not a `<= last_seq`
+/// frontier. The spool directory is workload-writable, so any line's
+/// `sequence` field is attacker-controlled — the old frontier latched
+/// from a single forged `{"sequence":u64::MAX}` line and permanently
+/// suppressed every later legitimate frame for that client (and for
+/// every NEW follower, whose held=None resync re-read the poison from
+/// offset 0). Membership is poison-resistant: a forged line occupies
+/// only its own sequence slot; every other sequence still delivers.
+/// Documented residual: the workload can pre-burn sequence numbers it
+/// predicts (the writer's counter is monotonic), suppressing future
+/// frames of its OWN workload carrying those exact numbers — one forged
+/// line can no longer suppress the whole stream, and no other
+/// workload's spool is affected.
+/// Bounded: past DELIVERED_SET_CAP the oldest-inserted sequences are
+/// evicted (FIFO). Only a deliberately poisoned spool (millions of
+/// forged micro-frames) can reach the cap, and the cost is replaying
+/// some duplicate lines to that one client — bounded per-follower
+/// memory is the harder guarantee (round-13 P1).
+#[derive(Debug)]
+struct DeliveredSequences {
+    set: std::collections::HashSet<u64>,
+    insertion_order: std::collections::VecDeque<u64>,
+}
+
+impl DeliveredSequences {
+    fn new() -> Self {
+        Self {
+            set: std::collections::HashSet::new(),
+            insertion_order: std::collections::VecDeque::new(),
         }
-        if let Some(sequence) = frame_sequence(&String::from_utf8_lossy(line))
-            && sequence > last_seq.unwrap_or(0)
-        {
-            *last_seq = Some(sequence);
+    }
+
+    fn contains(&self, sequence: u64) -> bool {
+        self.set.contains(&sequence)
+    }
+
+    fn insert(&mut self, sequence: u64) {
+        if self.set.insert(sequence) {
+            self.insertion_order.push_back(sequence);
+            if self.set.len() > DELIVERED_SET_CAP {
+                if let Some(evicted) = self.insertion_order.pop_front() {
+                    self.set.remove(&evicted);
+                }
+            }
         }
+    }
+}
+
+/// Remember the sequences of every complete line sent to the client, so a
+/// post-rotation resync can skip retained-window replays. Sequences come
+/// from spool content — attacker-influenced — which is exactly why dedup
+/// is set membership over what this client was actually sent, never a
+/// max-frontier (see `DeliveredSequences`).
+fn remember_delivered_line(bytes: &[u8], delivered: &mut DeliveredSequences) {
+    if let Some(sequence) = frame_sequence(&String::from_utf8_lossy(bytes)) {
+        delivered.insert(sequence);
     }
 }
 
@@ -478,16 +530,22 @@ fn follow_spool<W: Write>(
     path: &Path,
     offset: &mut u64,
     held: &mut Option<FollowAnchor>,
-    initial_last_seq: Option<u64>,
+    initial_delivered: DeliveredSequences,
 ) -> io::Result<()> {
-    // Highest frame sequence already delivered to this client. On rotation
-    // the spool is replaced by a new inode whose retained window re-contains
-    // frames the client already received; byte offsets do not survive the
-    // rewrite, but frame sequence numbers do (they are monotonic across the
-    // rotation), so the follower skips retained frames with sequence <= this
-    // frontier instead of replaying them. Unparseable lines are passed
-    // through unchanged (historical behavior for anything not a frame).
-    let mut last_seq: Option<u64> = initial_last_seq;
+    // Sequences already SENT to this client. On rotation the spool is
+    // replaced by a new inode whose retained window re-contains frames
+    // the client already received; byte offsets do not survive the
+    // rewrite, so the follower skips retained frames whose sequence is
+    // IN THIS SET. Dedup is set membership over what this client was
+    // actually sent — NOT a `<= last_seq` frontier: the spool directory
+    // is workload-writable, so a `sequence` field is attacker-controlled
+    // and a frontier latched from one forged
+    // `{"sequence":18446744073709551615}` line would permanently
+    // suppress every later legitimate frame (round-14 self-check
+    // Critical). Membership poisoning costs only the forged slot.
+    // Unparseable lines are passed through unchanged (historical
+    // behavior for anything not a frame).
+    let mut delivered = initial_delivered;
     loop {
         thread::sleep(FOLLOW_POLL_INTERVAL);
         // The spool fd is opened fresh each poll and dropped before ANY
@@ -537,7 +595,7 @@ fn follow_spool<W: Write>(
             continue;
         }
         let from = if same_as_held { *offset } else { 0 };
-        let plan = plan_delivery(&mut file, from, &mut last_seq)?;
+        let plan = plan_delivery(&mut file, from, &mut delivered)?;
         // Resume at the END OF THE LAST ACCOUNTED LINE (plan.offset): an
         // in-flight trailing fragment (writer mid-append) or a
         // budget-stopped line is withheld from the client, so the next
@@ -564,7 +622,8 @@ fn follow_spool<W: Write>(
 
 /// Bounded streaming delivery plan (round-13 review P1): scan the spool
 /// from `from` line-by-line with a bounded reader and collect whole frames
-/// whose sequence is above the `last_seq` frontier into a send buffer that
+/// whose sequence is NOT in the `delivered` set (sequences this client
+/// was actually sent) into a send buffer that
 /// never outgrows `MAX_TAIL_BYTES` (a single line is always kept whole —
 /// the bounded scan caps lines at `MAX_TAIL_BYTES` + 1). When the buffer
 /// is full the scan STOPS before the next never-delivered line: the
@@ -609,7 +668,7 @@ struct DeliveryPlan {
 fn plan_delivery(
     file: &mut File,
     from: u64,
-    last_seq: &mut Option<u64>,
+    delivered: &mut DeliveredSequences,
 ) -> io::Result<DeliveryPlan> {
     file.seek(SeekFrom::Start(from))?;
     let cap = MAX_TAIL_BYTES as usize;
@@ -687,10 +746,13 @@ fn plan_delivery(
             if !content.is_empty() {
                 let text = String::from_utf8_lossy(content);
                 let sequence = frame_sequence(&text);
-                if sequence.is_some_and(|sequence| Some(sequence) <= *last_seq) {
-                    // Already delivered (rotation replay): skip WITHOUT
-                    // consuming send budget — the frontier is unchanged
-                    // but the boundary advances past the replay.
+                if sequence.is_some_and(|sequence| delivered.contains(sequence)) {
+                    // Already delivered to THIS client (rotation replay):
+                    // skip WITHOUT consuming send budget — membership is
+                    // unchanged but the boundary advances past the replay.
+                    // Membership — not a `<= frontier` — so a forged
+                    // sequence can only suppress its own slot
+                    // (round-14 self-check Critical).
                     scanned_end += n as u64;
                     continue;
                 }
@@ -704,7 +766,7 @@ fn plan_delivery(
                     break;
                 }
                 if let Some(sequence) = sequence {
-                    *last_seq = Some(sequence);
+                    delivered.insert(sequence);
                 }
                 out.extend_from_slice(content);
                 out.push(b'\n');
@@ -817,12 +879,106 @@ fn write_response_head(
 mod tests {
     use super::*;
 
+    /// Test helper: a DeliveredSequences seeded with the given sequences.
+    fn delivered_of(seqs: &[u64]) -> DeliveredSequences {
+        let mut d = DeliveredSequences::new();
+        for s in seqs {
+            d.insert(*s);
+        }
+        d
+    }
+
     #[test]
     fn frame_sequence_reads_plain_envelope_field() {
         let line = r#"{"version":"enclava-log-frame-v1","sequence":42,"stream":"stdout"}"#;
         assert_eq!(frame_sequence(line), Some(42));
         assert_eq!(frame_sequence("not json"), None);
         assert_eq!(frame_sequence(r#"{"sequence":"x"}"#), None);
+    }
+
+    /// Round-14 self-check Critical: the spool directory is
+    /// workload-writable, so a `sequence` field is attacker-controlled.
+    /// The OLD dedup kept a `<= last_seq` frontier: one forged
+    /// `{"sequence":u64::MAX}` line latched the frontier and permanently
+    /// suppressed every later legitimate frame for that client — and for
+    /// every NEW follower, whose held=None resync re-read the poison from
+    /// offset 0. Set-membership dedup must be immune: the forged line
+    /// occupies only its own slot and every legit sequence still
+    /// delivers.
+    #[test]
+    fn forged_max_sequence_does_not_suppress_later_frames() {
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(frame(7).as_bytes());
+        bytes.push(b'\n');
+        // The poison: a workload-written line claiming u64::MAX.
+        bytes.extend_from_slice(frame(u64::MAX).as_bytes());
+        bytes.push(b'\n');
+        bytes.extend_from_slice(frame(8).as_bytes());
+        bytes.push(b'\n');
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut delivered = delivered_of(&[7]);
+        let plan = plan_delivery(&mut file, 0, &mut delivered).unwrap();
+        let sent = String::from_utf8(plan.out.clone()).unwrap();
+        assert_eq!(
+            sent,
+            format!("{}\n{}\n", frame(u64::MAX), frame(8)),
+            "the forged line itself is forwarded (pass-through), and frame 8 \
+             is NOT suppressed by the forged sequence"
+        );
+        assert!(delivered.contains(8));
+    }
+
+    /// Round-14 self-check Critical (new-client variant): a brand-new
+    /// follower (empty delivered set, held=None resync from offset 0)
+    /// must not be blinded by a forged high sequence either.
+    #[test]
+    fn forged_max_sequence_does_not_blind_new_followers() {
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(frame(u64::MAX).as_bytes());
+        bytes.push(b'\n');
+        bytes.extend_from_slice(frame(1).as_bytes());
+        bytes.push(b'\n');
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut delivered = DeliveredSequences::new();
+        let plan = plan_delivery(&mut file, 0, &mut delivered).unwrap();
+        let sent = String::from_utf8(plan.out.clone()).unwrap();
+        assert_eq!(
+            sent,
+            format!("{}\n{}\n", frame(u64::MAX), frame(1)),
+            "a new follower receives both lines: the poison suppresses nothing"
+        );
+    }
+
+    /// The delivered set is bounded: past DELIVERED_SET_CAP the
+    /// oldest-inserted sequences are evicted. Only reachable with a
+    /// deliberately poisoned spool; the cost is duplicate replay to that
+    /// one client, never unbounded memory.
+    #[test]
+    fn delivered_sequences_set_is_bounded() {
+        let mut delivered = DeliveredSequences::new();
+        for seq in 0..DELIVERED_SET_CAP as u64 {
+            delivered.insert(seq);
+        }
+        assert!(delivered.contains(0));
+        assert!(delivered.contains(DELIVERED_SET_CAP as u64 - 1));
+        delivered.insert(DELIVERED_SET_CAP as u64);
+        assert!(
+            delivered.contains(DELIVERED_SET_CAP as u64),
+            "new insert lands"
+        );
+        assert!(
+            !delivered.contains(0),
+            "oldest-inserted sequence was evicted"
+        );
+        assert!(delivered.contains(1));
     }
 
     /// Round-5 review finding: after a rotation resync, the retained window
@@ -845,15 +1001,18 @@ mod tests {
         let path = dir.path().join("spool.jsonl");
         std::fs::write(&path, &bytes).unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
-        let mut last_seq = Some(3u64);
-        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        let mut delivered = delivered_of(&[1, 2, 3]);
+        let plan = plan_delivery(&mut file, 0, &mut delivered).unwrap();
         let sent = String::from_utf8(plan.out.clone()).unwrap();
         assert_eq!(
             sent,
             format!("{}\n{}\n{}\n", frame(4), frame(5), frame(6)),
             "sequences <= 3 must be dropped, 4-6 forwarded once each"
         );
-        assert_eq!(last_seq, Some(6));
+        assert!(
+            delivered.contains(6),
+            "sequence 6 must be in the delivered set"
+        );
         // Offset ends at the last accounted-for line (skipped replays
         // advance it too — they are never re-scanned).
         assert_eq!(plan.offset, bytes.len() as u64);
@@ -876,13 +1035,16 @@ mod tests {
         let path = dir.path().join("spool.jsonl");
         std::fs::write(&path, &bytes).unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
-        let mut last_seq = Some(6u64);
-        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        let mut delivered = delivered_of(&[6]);
+        let plan = plan_delivery(&mut file, 0, &mut delivered).unwrap();
         let sent = String::from_utf8(plan.out.clone()).unwrap();
         assert_eq!(sent, format!("{}\n", frame(7)));
         // The partial tail carries no parseable sequence: the frontier
         // reflects only the complete frame 7 forwarded above it.
-        assert_eq!(last_seq, Some(7));
+        assert!(
+            delivered.contains(7),
+            "sequence 7 must be in the delivered set"
+        );
         // Offset stops at the end of the last ACCOUNTED-FOR line — the
         // fragment is re-read (and delivered) whole by the next poll.
         assert_eq!(plan.offset, (frame(7).len() + 1) as u64);
@@ -895,10 +1057,13 @@ mod tests {
         let path = dir.path().join("spool.jsonl");
         std::fs::write(&path, b"garbage line\n{\"sequence\":9}\n").unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
-        let mut last_seq = Some(5u64);
-        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        let mut delivered = delivered_of(&[5]);
+        let plan = plan_delivery(&mut file, 0, &mut delivered).unwrap();
         assert_eq!(plan.out, b"garbage line\n{\"sequence\":9}\n");
-        assert_eq!(last_seq, Some(9));
+        assert!(
+            delivered.contains(9),
+            "sequence 9 must be in the delivered set"
+        );
         assert_eq!(plan.offset, "garbage line\n{\"sequence\":9}\n".len() as u64);
     }
     /// Round-13 review P1: the delivery planner must not buffer the whole
@@ -933,10 +1098,10 @@ mod tests {
         let path = dir.path().join("spool.jsonl");
         std::fs::write(&path, &bytes).unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
-        let mut last_seq: Option<u64> = None;
+        let mut delivered = DeliveredSequences::new();
 
         // Poll 1: frame 1 alone — frame 2 does not fit the bound.
-        let plan1 = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        let plan1 = plan_delivery(&mut file, 0, &mut delivered).unwrap();
         assert_eq!(plan1.out, line(1).as_bytes());
         assert!(
             plan1.out.len() < MAX_TAIL_BYTES as usize,
@@ -944,23 +1109,28 @@ mod tests {
             plan1.out.len()
         );
         assert_eq!(plan1.offset, line(1).len() as u64);
-        assert_eq!(
-            last_seq,
-            Some(1),
-            "the frontier only advances through delivered frames"
+        assert!(
+            delivered.contains(1),
+            "only delivered frames enter the delivered set"
         );
 
         // Poll 2 resumes at exactly the stopped boundary: frame 2 alone.
-        let plan2 = plan_delivery(&mut file, plan1.offset, &mut last_seq).unwrap();
+        let plan2 = plan_delivery(&mut file, plan1.offset, &mut delivered).unwrap();
         assert_eq!(plan2.out, line(2).as_bytes());
         assert_eq!(plan2.offset, (line(1).len() + line(2).len()) as u64);
-        assert_eq!(last_seq, Some(2));
+        assert!(
+            delivered.contains(2),
+            "sequence 2 must be in the delivered set"
+        );
 
         // Poll 3: frame 3 and EOF.
-        let plan3 = plan_delivery(&mut file, plan2.offset, &mut last_seq).unwrap();
+        let plan3 = plan_delivery(&mut file, plan2.offset, &mut delivered).unwrap();
         assert_eq!(plan3.out, line(3).as_bytes());
         assert_eq!(plan3.offset, bytes.len() as u64);
-        assert_eq!(last_seq, Some(3));
+        assert!(
+            delivered.contains(3),
+            "sequence 3 must be in the delivered set"
+        );
 
         // Lossless: the three quanta concatenated are the entire file.
         let mut delivered = plan1.out.clone();
@@ -986,14 +1156,17 @@ mod tests {
         let path = dir.path().join("spool.jsonl");
         std::fs::write(&path, &bytes).unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
-        let mut last_seq = Some(4u64);
-        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        let mut delivered = delivered_of(&[4]);
+        let plan = plan_delivery(&mut file, 0, &mut delivered).unwrap();
         // The mega-line is gone; the real frame after it is forwarded.
         assert_eq!(
             plan.out,
             b"{\"version\":\"enclava-log-frame-v1\",\"sequence\":5}\n"
         );
-        assert_eq!(last_seq, Some(5));
+        assert!(
+            delivered.contains(5),
+            "sequence 5 must be in the delivered set"
+        );
         // The boundary advanced past the dropped line AND the frame.
         assert_eq!(plan.offset, bytes.len() as u64);
     }
@@ -1009,8 +1182,8 @@ mod tests {
         let path = dir.path().join("spool.jsonl");
         std::fs::write(&path, &bytes).unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
-        let mut last_seq = Some(4u64);
-        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        let mut delivered = delivered_of(&[4]);
+        let plan = plan_delivery(&mut file, 0, &mut delivered).unwrap();
         assert!(plan.out.is_empty());
         assert_eq!(plan.offset, 0, "in-flight fragment is withheld");
     }
@@ -1027,8 +1200,8 @@ mod tests {
         let path = dir.path().join("spool.jsonl");
         std::fs::write(&path, &bytes).unwrap();
         let mut file = std::fs::File::open(&path).unwrap();
-        let mut last_seq = Some(4u64);
-        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        let mut delivered = delivered_of(&[4]);
+        let plan = plan_delivery(&mut file, 0, &mut delivered).unwrap();
         assert_eq!(plan.offset, 0);
         assert_eq!(plan.fp_pos, 0);
         let fp_len = plan.fp_len as usize;
@@ -1123,13 +1296,16 @@ mod tests {
                 .unwrap();
             writer.write_all(second.as_bytes()).unwrap();
         }
-        let mut last_seq = Some(0u64);
-        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        let mut delivered = delivered_of(&[0]);
+        let plan = plan_delivery(&mut file, 0, &mut delivered).unwrap();
         // The scan SAW both lines: both delivered once and the boundary is
         // their combined end (the scanned boundary, not the stale length).
         assert_eq!(plan.out, format!("{first}{second}").as_bytes());
         assert_eq!(plan.offset, (first.len() + second.len()) as u64);
-        assert_eq!(last_seq, Some(2));
+        assert!(
+            delivered.contains(2),
+            "sequence 2 must be in the delivered set"
+        );
 
         // A line landing AFTER the scan is not skipped: the next poll from
         // the scanned boundary picks it up.
@@ -1142,7 +1318,7 @@ mod tests {
                 .unwrap();
             writer.write_all(third.as_bytes()).unwrap();
         }
-        let plan = plan_delivery(&mut file, plan.offset, &mut last_seq).unwrap();
+        let plan = plan_delivery(&mut file, plan.offset, &mut delivered).unwrap();
         assert_eq!(plan.out, third.as_bytes());
         assert_eq!(
             plan.offset,
@@ -1252,8 +1428,8 @@ mod tests {
         std::fs::rename(&rotated, &path).unwrap();
 
         let mut sink = FailingWriter;
-        let last_seq = Some(2u64);
-        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, last_seq);
+        let delivered = delivered_of(&[2]);
+        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, delivered);
         assert!(result.is_err(), "failing writer must unwind the follower");
         // The follower may hold an ANCHOR (identity + probe byte, no fd)
         // across the blocking write — never a descriptor — and the anchor
@@ -1312,8 +1488,8 @@ mod tests {
         let mut offset = 100u64; // stale, points past the current file
         let mut held = None; // handle_connection drops the tail fd pre-write
         let mut sink = FailingFlushWriter { sink: Vec::new() };
-        let last_seq = Some(2u64);
-        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, last_seq);
+        let delivered = delivered_of(&[2]);
+        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, delivered);
         assert!(result.is_err(), "failing flush must unwind the loop");
         // Sequence 2 was already delivered in the tail: it must NOT be
         // replayed by the held=None resync; sequence 3 is forwarded once.
@@ -1396,7 +1572,7 @@ mod tests {
         });
 
         let mut sink = FailingFlushWriter { sink: Vec::new() };
-        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, Some(2));
+        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, delivered_of(&[2]));
         assert!(result.is_err(), "failing flush must unwind the loop");
         // The probe failed → resync: sequence dedup against frontier 2
         // dropped nothing bogus, and the client received the frames of the
@@ -1439,7 +1615,7 @@ mod tests {
         drop(append);
 
         let mut sink = FailingWriter;
-        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, Some(1));
+        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, delivered_of(&[1]));
         assert!(result.is_err(), "failing writer must unwind the follower");
         // The delivered boundary was committed BEFORE the write: offset
         // spans both frames and the anchor probes the new last byte on the
