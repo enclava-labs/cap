@@ -846,6 +846,12 @@ async fn load_signed_policy_candidates(
                       AND current_artifact.deploy_id = artifact_deployment_id
                       AND current_artifact.descriptor_core_hash
                           = artifact_descriptor_core_hash
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM withdrawn_signer_artifacts AS withdrawn
+                           WHERE withdrawn.descriptor_core_hash
+                              = current_artifact.descriptor_core_hash
+                      )
                )
             UNION ALL
             -- Keep the prior healthy authority required while admitting the
@@ -866,6 +872,12 @@ async fn load_signed_policy_candidates(
                       AND running_artifact.deploy_id = running.artifact_deployment_id
                       AND running_artifact.descriptor_core_hash
                           = running.artifact_descriptor_core_hash
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM withdrawn_signer_artifacts AS withdrawn
+                           WHERE withdrawn.descriptor_core_hash
+                              = running_artifact.descriptor_core_hash
+                      )
                )
                AND NOT EXISTS (
                    SELECT 1
@@ -929,6 +941,12 @@ async fn load_signed_policy_candidates(
              AND artifact.deploy_id = historical.artifact_deployment_id
              AND artifact.descriptor_core_hash
                  = historical.artifact_descriptor_core_hash
+             AND NOT EXISTS (
+                 SELECT 1
+                   FROM withdrawn_signer_artifacts AS withdrawn
+                  WHERE withdrawn.descriptor_core_hash
+                      = artifact.descriptor_core_hash
+             )
             ORDER BY
                 current.app_id,
                 artifact.descriptor_core_hash,
@@ -1004,6 +1022,12 @@ async fn load_signed_policy_candidates(
                       AND legacy.workload_teardown_completed_at IS NULL)
               )
               AND legacy.deployment_status = 'healthy'
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM withdrawn_signer_artifacts AS withdrawn
+                   WHERE withdrawn.descriptor_core_hash
+                       = artifact.descriptor_core_hash
+              )
         ),
         selected AS (
             -- Required artifacts are immune to retention pruning: during a
@@ -3647,6 +3671,63 @@ resource_bindings := {
             .execute(&pool)
             .await
             .expect("delete KBS hold fixture");
+    }
+
+    #[tokio::test]
+    async fn selector_drops_artifacts_withdrawn_by_signer_rotation() {
+        let pool = crate::test_support::database_test_pool().await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let current = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, current, "healthy", now).await;
+        // A per-run hash byte avoids PK collisions with leftover fixtures on
+        // the shared regression database.
+        let hash_byte = format!("{:02x}", app_id.as_bytes()[0]);
+        let current_artifact = insert_test_artifact(&pool, app_id, current, &hash_byte).await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            current,
+            current,
+            Some((current, &current_artifact)),
+        )
+        .await;
+
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select pre-rotation candidates");
+        assert!(candidates.iter().any(|candidate| {
+            candidate.artifact.metadata.descriptor_core_hash
+                == current_artifact.metadata.descriptor_core_hash
+        }));
+
+        // Signer rotation withdraws every artifact signed under the previous
+        // identity (issue #119): the row lands in withdrawn_signer_artifacts
+        // and the selector must refuse the hash on every path.
+        sqlx::query(
+            "INSERT INTO withdrawn_signer_artifacts (descriptor_core_hash, app_id)
+             VALUES ($1, $2)",
+        )
+        .bind(hex::decode(&current_artifact.metadata.descriptor_core_hash).unwrap())
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .expect("withdraw rotated-out artifact");
+
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select post-rotation candidates");
+        assert!(candidates.iter().all(|candidate| {
+            candidate.artifact.metadata.descriptor_core_hash
+                != current_artifact.metadata.descriptor_core_hash
+        }));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete signer rotation fixture");
     }
 
     fn required(
