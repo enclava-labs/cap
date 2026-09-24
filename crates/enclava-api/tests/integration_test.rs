@@ -1118,8 +1118,10 @@ async fn email_auth_does_not_disclose_account_existence() {
         .await;
     assert_eq!(ok.status_code(), StatusCode::OK);
 
-    // Org invite for an unknown email must not 404 "user not found"; it
-    // returns the same 200 "invited" response as a real invite.
+    // Org invite: unknown email must not 404 "user not found". It gets the
+    // same generic 403 "invite not permitted" as a disallowed privileged
+    // invite of a known user — and an owner inviting a KNOWN email as
+    // member still succeeds, so the endpoint remains usable.
     let (session_token, _org_id) = signup_owner(&server, "invite-oracle").await;
     // Look up the owner's org name via /users/me.
     let me = server
@@ -1140,11 +1142,60 @@ async fn email_auth_does_not_disclose_account_existence() {
         .await;
     assert_eq!(
         invite_unknown.status_code(),
-        StatusCode::OK,
-        "unknown-email invite must return the same 200 as a real invite, not 404"
+        StatusCode::FORBIDDEN,
+        "unknown-email invite must not leak existence (no 404, no fake 200)"
     );
     let invite_body: Value = invite_unknown.json();
-    assert_eq!(invite_body["status"].as_str().unwrap(), "invited");
+    assert_eq!(
+        invite_body["error"].as_str().unwrap(),
+        "invite not permitted"
+    );
+
+    // A real (known) invitee for comparison: sign up directly so the
+    // email address is known to the test.
+    let invitee_suffix = Uuid::new_v4().simple().to_string();
+    let invitee_email = format!("invitee-real-{invitee_suffix}@example.test");
+    let invitee_signup = server
+        .post("/auth/signup")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({
+            "provider": "email",
+            "email": invitee_email,
+            "password": "correct horse battery staple",
+        }))
+        .await;
+    invitee_signup.assert_status(StatusCode::CREATED);
+
+    // The role validation must fire identically for known and unknown
+    // emails (before any account lookup branching).
+    let bad_role_unknown = server
+        .post(format!("/orgs/{org_name}/invite").as_str())
+        .add_header("authorization", format!("Bearer {session_token}"))
+        .json(&serde_json::json!({ "email": unknown, "role": "not-a-role" }))
+        .await;
+    let bad_role_known = server
+        .post(format!("/orgs/{org_name}/invite").as_str())
+        .add_header("authorization", format!("Bearer {session_token}"))
+        .json(&serde_json::json!({ "email": invitee_email, "role": "not-a-role" }))
+        .await;
+    assert_eq!(
+        bad_role_unknown.status_code(),
+        bad_role_known.status_code(),
+        "invalid role must fail identically for unknown and known emails"
+    );
+    assert_eq!(bad_role_unknown.status_code(), StatusCode::BAD_REQUEST);
+
+    // Owner inviting a known user as member still works.
+    let invite_known_ok = server
+        .post(format!("/orgs/{org_name}/invite").as_str())
+        .add_header("authorization", format!("Bearer {session_token}"))
+        .json(&serde_json::json!({ "email": invitee_email, "role": "member" }))
+        .await;
+    assert_eq!(
+        invite_known_ok.status_code(),
+        StatusCode::OK,
+        "owner inviting a known user as member must keep working"
+    );
 }
 
 #[tokio::test]

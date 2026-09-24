@@ -22,8 +22,11 @@ pub enum EmailAuthError {
     EmailRequired,
     #[error("password is required")]
     PasswordRequired,
-    /// Generic signup failure used for duplicate emails so the response does
-    /// not disclose whether the address is already registered (issue #121).
+    /// Duplicate-email signup failure. The message is generic so the error
+    /// body alone does not spell out "email already registered" (issue #121),
+    /// but note the HTTP responses still differ observably (400 vs 201
+    /// Created): fully closing the signup oracle needs out-of-band email
+    /// verification, which is a product change tracked outside this fix.
     #[error("signup failed")]
     SignupFailed,
     #[error("invalid email or password")]
@@ -74,10 +77,12 @@ pub async fn signup(
     .fetch_one(pool)
     .await?;
 
-    // Anti-enumeration (issue #121): hash the password BEFORE the conflict
-    // check so that a duplicate-email signup costs the same Argon2 work as
-    // a fresh one, and keep the error message identical to a failed signup
-    // ("signup failed") instead of "email already registered".
+    // Anti-enumeration (issue #121): hash the password on BOTH branches
+    // (before the conflict decision) so a duplicate-email signup costs the
+    // same Argon2 work as a fresh one, and use a generic error message.
+    // The EXISTS check sits outside the transaction; a concurrent
+    // duplicate insert can still surface as a unique-violation DB error,
+    // which is mapped to the same generic SignupFailed below.
     let credential_hash = hash_password(password)?;
 
     if exists {
@@ -116,7 +121,20 @@ pub async fn signup(
     .bind(email)
     .bind(&credential_hash)
     .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(|e| {
+        // The unique constraint on (provider, identifier) can fire when a
+        // concurrent signup registered the same email between the EXISTS
+        // check and this insert. Map it to the same generic SignupFailed
+        // so the constraint race does not leak a distinct error body
+        // (which could echo the conflicting identifier).
+        if let sqlx::Error::Database(ref db) = e
+            && db.constraint() == Some("user_identities_provider_identifier_key")
+        {
+            return EmailAuthError::SignupFailed;
+        }
+        EmailAuthError::Db(e)
+    })?;
 
     crate::db::orgs::insert_org_conn(&mut tx, org_id, &org_name, Some(name), true).await?;
 
@@ -156,10 +174,15 @@ pub async fn login(
     // Anti-enumeration: when the email is unknown, verify the submitted
     // password against the fixed decoy hash so this path performs the same
     // Argon2 work (and returns the same InvalidCredentials error) as a
-    // wrong password for a known account (issue #121).
+    // wrong password for a known account (issue #121). A NULL/garbage
+    // stored hash is treated as a wrong password (after the decoy work on
+    // the missing-row side) so error bodies cannot distinguish accounts
+    // with unusable credentials.
     let password_ok = match row.as_ref() {
-        Some((_user_id, hash_str, _display_name)) => verify_password(password, hash_str)?,
-        None => verify_password(password, DUMMY_CREDENTIAL_HASH)?,
+        Some((_user_id, hash_str, _display_name)) => {
+            verify_password(password, hash_str).unwrap_or(false)
+        }
+        None => verify_password(password, DUMMY_CREDENTIAL_HASH).unwrap_or(false),
     };
 
     if !password_ok {
@@ -194,40 +217,65 @@ mod tests {
 
     #[test]
     fn login_missing_email_performs_full_argon2_work() {
-        // Regression test for issue #121: the unknown-email login path must
-        // do real Argon2 verification work (comparable duration to the
-        // known-email wrong-password path), not return instantly.
-        let dummy_hash = hash_password("some real hash material").unwrap();
-        let iterations = 3;
-        let mut missing_row_elapsed = std::time::Duration::ZERO;
-        for _ in 0..iterations {
-            let start = std::time::Instant::now();
-            let _ = verify_password("attacker guess", DUMMY_CREDENTIAL_HASH).unwrap();
-            missing_row_elapsed += start.elapsed();
-        }
-        let mut hit_elapsed = std::time::Duration::ZERO;
-        for _ in 0..iterations {
-            let start = std::time::Instant::now();
-            let _ = verify_password("attacker guess", &dummy_hash).unwrap();
-            hit_elapsed += start.elapsed();
-        }
-        assert!(
-            missing_row_elapsed.as_nanos() > 50_000,
-            "missing-row path must do real Argon2 work, took {missing_row_elapsed:?}"
+        // Regression test for issue #121: the unknown-email login path
+        // verifies against DUMMY_CREDENTIAL_HASH, which must use exactly
+        // the same PHC parameters as hash_password()/Argon2::default(),
+        // or the timing gap re-opens. Pin the parameters structurally
+        // (not by wall-clock ratio, which flakes and misses slow drift).
+        let fresh = hash_password("some real hash material").unwrap();
+        let params = |phc: &str| -> (String, u32, argon2::password_hash::ParamsString) {
+            let parsed = PasswordHash::new(phc).expect("parse PHC string");
+            (
+                parsed.algorithm.as_str().to_string(),
+                parsed
+                    .version
+                    .expect("explicit argon2 version in PHC string"),
+                parsed.params.clone(),
+            )
+        };
+        assert_eq!(
+            params(DUMMY_CREDENTIAL_HASH),
+            params(&fresh),
+            "DUMMY_CREDENTIAL_HASH must match hash_password()'s argon2 parameters exactly"
         );
-        // Same order of magnitude as the hit path (within 10x — Argon2 runs
-        // are ~tens of ms with default params, network jitter excluded).
-        let ratio = missing_row_elapsed.as_secs_f64() / hit_elapsed.as_secs_f64().max(1e-9);
-        assert!(
-            ratio > 0.1 && ratio < 10.0,
-            "missing-row and hit-path Argon2 work must be comparable: ratio {ratio:.3}"
-        );
+        // And both must be the argon2 crate defaults (argon2id v19,
+        // m=19456 KiB, t=2, p=1).
+        let (algo, version, parameters) = params(&fresh);
+        assert_eq!(algo.as_str(), "argon2id");
+        assert_eq!(version, 19);
+        let m = parameters
+            .get("m")
+            .expect("memory param")
+            .decimal()
+            .expect("m decimal");
+        let t = parameters
+            .get("t")
+            .expect("iterations param")
+            .decimal()
+            .expect("t decimal");
+        let p = parameters
+            .get("p")
+            .expect("parallelism param")
+            .decimal()
+            .expect("p decimal");
+        let defaults = argon2::Params::DEFAULT;
+        assert_eq!(m, defaults.m_cost());
+        assert_eq!(t, defaults.t_cost());
+        assert_eq!(p, defaults.p_cost());
     }
 
     #[test]
     fn signup_error_messages_do_not_disclose_account_existence() {
         // The duplicate-email signup error must be the generic SignupFailed
-        // message, not "email already registered".
+        // message, not "email already registered". (The signup endpoint
+        // still reveals existence via 201-vs-400 status; closing that needs
+        // out-of-band email verification — documented in the PR.)
         assert_eq!(EmailAuthError::SignupFailed.to_string(), "signup failed");
+        // The string must never regress to an explicit disclosure.
+        let msg = EmailAuthError::SignupFailed.to_string();
+        assert!(
+            !msg.contains("registered"),
+            "message must stay generic: {msg}"
+        );
     }
 }
