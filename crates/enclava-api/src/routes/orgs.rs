@@ -608,12 +608,19 @@ pub async fn put_keyring(
     tx.commit().await.map_err(|_| db_error())?;
 
     let fingerprint = hex::encode(Sha256::digest(&canonical_bytes));
+    // #128 review follow-up (P2): return the normalized typed keyring, not
+    // the raw request JSON — the stored bytes are what GET serves and what
+    // the strict deny_unknown_fields envelope parse accepts, so a client
+    // building an org_keyring_blob from this 200 response must see the same
+    // normalized form to stay immediately deployable.
+    let normalized_keyring_payload: serde_json::Value =
+        serde_json::from_slice(&keyring_payload_bytes).map_err(|_| db_error())?;
     Ok((
         StatusCode::OK,
         Json(OrgKeyringResponse {
             org_id,
             version: body.version,
-            keyring_payload: body.keyring_payload,
+            keyring_payload: normalized_keyring_payload,
             signature: body.signature,
             signing_pubkey: body.signing_pubkey,
             fingerprint,
@@ -1763,6 +1770,95 @@ mod tests {
         .await
         .expect("count rejected keyring authority rows");
         assert_eq!(authority_rows, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn put_keyring_response_returns_normalized_deployable_keyring() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-normalize-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert keyring normalization org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring normalization owner");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring normalization membership");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert keyring normalization signing key");
+
+        let mut request = signed_keyring_request(org_id, user_id, &key, 1, 1);
+        // An otherwise-valid extra field: the typed parse ignores it, but the
+        // 200 response must echo the normalized stored form, not the raw
+        // request JSON, so the response is immediately deployable as an
+        // org_keyring_blob under the strict envelope parser (#128 P2).
+        request.keyring_payload["future_extension"] = serde_json::json!("must-not-echo");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        let (status, put_response) = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(request),
+        )
+        .await
+        .expect("publish keyring carrying an extra field");
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            put_response
+                .keyring_payload
+                .get("future_extension")
+                .is_none(),
+            "PUT response must not echo unknown request fields verbatim"
+        );
+
+        let stored_payload: Vec<u8> = sqlx::query_scalar(
+            "SELECT keyring_payload FROM org_keyrings WHERE org_id = $1 AND version = 1",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load stored normalized keyring payload");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&stored_payload).expect("decode stored keyring payload");
+        assert_eq!(
+            put_response.keyring_payload, stored,
+            "PUT response payload must match the stored normalized bytes"
+        );
+
+        let get_response = get_keyring(auth, State(state), Path(org_name))
+            .await
+            .expect("GET keyring after PUT");
+        assert_eq!(
+            put_response.keyring_payload, get_response.keyring_payload,
+            "PUT and GET responses must serve the identical normalized keyring"
+        );
+        assert_eq!(put_response.fingerprint, get_response.fingerprint);
+        assert_eq!(put_response.signature, get_response.signature);
     }
 
     #[tokio::test]
