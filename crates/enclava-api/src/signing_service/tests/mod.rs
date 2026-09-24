@@ -659,6 +659,91 @@ fn valid_keyring_blob() -> String {
 }
 
 #[test]
+fn rego_cap_accounts_for_json_escaping() {
+    // #128 review follow-up (P2): the per-field caps must measure the
+    // JSON-escaped length — the form trustee_policy_json actually charges.
+    // A rego text of raw quotes at the old raw-length cap would serialize to
+    // ~2x and blow the 49,152-byte budget even though the raw length passed.
+    let signing_key = SigningKey::from_bytes(&[0x33; 32]);
+    let artifacts = signing_artifacts(descriptor());
+    let mut artifact = signed_policy_artifact(&artifacts, &signing_key);
+    // 12 KiB of raw quote chars: raw length well under the 24 KiB cap, but
+    // the escaped form is ~24 KiB + overhead — at the cap boundary. Push it
+    // decisively over: raw 20 KiB of quotes escapes to ~40 KiB > 24 KiB cap.
+    artifact.rego_text = "\"".repeat(20 * 1024);
+    let configured_pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
+    let err = artifacts
+        .validate_signed_artifact(&artifact, &configured_pubkey_hex)
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("artifact.rego_text")),
+        "escaped-length rego over cap must be rejected, got: {err:?}"
+    );
+
+    // Sanity: the same raw length of a non-escaping char is accepted by the
+    // cap (then fails later signature checks, which is fine).
+    let mut artifact = signed_policy_artifact(&artifacts, &signing_key);
+    artifact.rego_text = "r".repeat(20 * 1024);
+    let err = artifacts
+        .validate_signed_artifact(&artifact, &configured_pubkey_hex)
+        .unwrap_err();
+    assert!(
+        !matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("artifact.rego_text")),
+        "raw 20 KiB rego must pass the escaped-length cap, got: {err:?}"
+    );
+}
+
+#[test]
+fn max_legal_escaped_compose_under_trustee_budget() {
+    // #128 review follow-up (P2): the worst legal escaped payload must still
+    // fit the trustee budget: rego at the cap composed entirely of a char
+    // that doubles when escaped.
+    let artifacts = signing_artifacts(descriptor());
+    let mut artifact = signed_policy_artifact(&artifacts, &SigningKey::from_bytes(&[0x11; 32]));
+    // MAX_REGO_TEXT_BYTES measured in escaped form; use backslashes (escape
+    // to double) so the raw text is half the cap.
+    artifact.rego_text = "\\".repeat(MAX_REGO_TEXT_BYTES / 2);
+    artifacts.attach_customer_authority(&mut artifact).unwrap();
+    let trustee = trustee_policy_json(&artifact).unwrap();
+    assert!(
+        trustee.len() <= MAX_TRUSTEE_POLICY_JSON_BYTES,
+        "escaped-rego compose produced trustee_policy_json of {} bytes (budget {})",
+        trustee.len(),
+        MAX_TRUSTEE_POLICY_JSON_BYTES
+    );
+    validate_proof_bundle_budget(&artifacts, &artifact).unwrap();
+}
+
+#[test]
+fn org_keyring_registration_budget_rejects_oversized_envelopes() {
+    // #128 review follow-up (P1): a bare keyring_payload accepted by
+    // put_keyring/rotate must fit the enveloped org_keyring_blob budget the
+    // deploy path enforces, so accepted authority stays deployable.
+    let signature = [0xcc; 64];
+    let signing_pubkey = [0xdd; 32];
+    // A minimal typed keyring is comfortably inside.
+    let small = serde_json::to_vec(&OrgKeyring {
+        org_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+        version: 1,
+        members: vec![],
+        updated_at: "2026-04-01T00:00:00Z".parse().unwrap(),
+    })
+    .unwrap();
+    assert!(
+        validate_org_keyring_registration_budget(small.len(), &signature, &signing_pubkey).is_ok()
+    );
+
+    // A keyring whose envelope exceeds 16 KiB is rejected at registration.
+    let big = "x".repeat(MAX_ORG_KEYRING_BLOB_BYTES);
+    let err = validate_org_keyring_registration_budget(big.len(), &signature, &signing_pubkey)
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("org keyring envelope")),
+        "oversized envelope must be rejected, got: {err:?}"
+    );
+}
+
+#[test]
 fn rejects_unknown_fields_in_signing_envelopes() {
     // #128: envelopes must not accept unbounded JSON padding via unknown
     // fields; only the exact envelope schema is accepted.

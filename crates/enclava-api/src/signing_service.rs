@@ -888,7 +888,11 @@ fn app_unlock_mode(mode: crate::models::UnlockMode) -> &'static str {
 /// Even though the request body limit bounds total size, each policy field is
 /// capped independently so a signed-or-unsigned artifact cannot carry
 /// multi-megabyte policy text into hashing, storage, or in-enclave parsing.
-/// rego_text must fit alone inside the 49_152-byte trustee_policy_json
+/// Caps are enforced on the JSON-ESCAPED length (see json_escaped_len): the
+/// composed proof-bundle budgets charge the escaped form, and quotes,
+/// backslashes, or control characters can inflate a field up to 6x its raw
+/// byte length. rego_text must fit alone inside the 49,152-byte
+/// trustee_policy_json
 /// proof-bundle field (it also carries metadata, signature, and the attached
 /// keyring envelope); 24 KiB leaves headroom for those. agent_policy_text is
 /// capped at 48 KiB: together with a 32 KiB descriptor, 16 KiB keyring, 24 KiB
@@ -899,6 +903,52 @@ pub(crate) const MAX_POLICY_TEXT_BYTES: usize = 48 * 1024;
 pub(crate) const MAX_REGO_TEXT_BYTES: usize = 24 * 1024;
 pub(crate) const MAX_POLICY_METADATA_FIELD_BYTES: usize = 256;
 pub(crate) const MAX_POLICY_SIGNATURE_FIELD_BYTES: usize = 128;
+
+/// Length a string occupies inside a serde_json-serialized value (quotes,
+/// backslashes, and control characters escaped). #128 review follow-up: this
+/// is the length the composed proof-bundle budgets actually charge, so the
+/// per-field caps above must be checked in escaped form.
+fn json_escaped_len(value: &str) -> usize {
+    // serde_json::to_string yields "escaped" including the surrounding quote
+    // pair; drop it so the cap measures the escaped CONTENT — escape
+    // inflation (quotes/backslashes/control chars, up to 6x) is what matters
+    // against the budgets, and fixed 2-byte overhead would make a legal
+    // 128-hex-char signature measure 130 against a 128 cap.
+    serde_json::to_string(value)
+        .map(|escaped| escaped.len().saturating_sub(2))
+        .unwrap_or(usize::MAX)
+}
+
+/// #128 review follow-up (P1): enforce the enveloped `org_keyring_blob`
+/// budget at registration time (put_keyring / rotate_org_owner), not only at
+/// deploy time. A registered keyring that the CLI later wraps into an
+/// envelope larger than MAX_ORG_KEYRING_BLOB_BYTES would make every signed
+/// deployment fail decode_optional_blobs even though CAP already made that
+/// keyring authoritative. The check composes the exact envelope the CLI
+/// builds from a GET /orgs/{name}/keyring response (typed keyring payload,
+/// hex signature, hex signing pubkey) so accepted authority stays deployable.
+pub(crate) fn validate_org_keyring_registration_budget(
+    keyring_json_len: usize,
+    signature: &[u8],
+    signing_pubkey: &[u8],
+) -> Result<(), SigningServiceError> {
+    // serde_json::to_string of the CLI envelope:
+    // {"keyring":<keyring_json>,"signature":"<128 hex>","signing_pubkey":"<64 hex>"}
+    let envelope_len = keyring_json_len
+        .saturating_add("{\"keyring\":".len())
+        .saturating_add(",\"signature\":\"".len())
+        .saturating_add(signature.len() * 2)
+        .saturating_add("\",\"signing_pubkey\":\"".len())
+        .saturating_add(signing_pubkey.len() * 2)
+        .saturating_add("\"}".len());
+    if envelope_len > MAX_ORG_KEYRING_BLOB_BYTES {
+        return Err(SigningServiceError::Blob(format!(
+            "org keyring envelope exceeds {MAX_ORG_KEYRING_BLOB_BYTES}-byte deploy-time budget \
+             (enveloped size {envelope_len} bytes); reduce keyring members"
+        )));
+    }
+    Ok(())
+}
 
 /// Proof-bundle field budgets mirrored from deploy.rs build_verification_material
 /// and enclava-verifier bundle.rs; the ingress caps above are derived from them.
@@ -938,11 +988,16 @@ pub(crate) fn validate_proof_bundle_budget(
 pub(crate) fn validate_signed_artifact_field_caps(
     artifact: &SignedPolicyArtifact,
 ) -> Result<(), SigningServiceError> {
+    // #128 review follow-up: caps measure the JSON-escaped length — the form
+    // the composed proof-bundle budgets actually see. A rego/agent-policy
+    // text made of quotes, backslashes, or control characters serializes up
+    // to 6x its raw byte length, so a raw-length cap could accept a field
+    // whose escaped form blows the trustee_policy_json budget.
     fn cap(name: &'static str, value: &str, max: usize) -> Result<(), SigningServiceError> {
-        if value.len() > max {
+        let escaped = json_escaped_len(value);
+        if escaped > max {
             return Err(SigningServiceError::Blob(format!(
-                "{name} exceeds {max} bytes (got {})",
-                value.len()
+                "{name} exceeds {max} bytes (JSON-escaped length {escaped})"
             )));
         }
         Ok(())

@@ -475,6 +475,16 @@ pub async fn put_keyring(
             Json(serde_json::json!({"error": "serialization error"})),
         )
     })?;
+    // #128 review follow-up (P1): reject keyrings whose CLI envelope would
+    // exceed the deploy-time org_keyring_blob cap, so accepted authority
+    // stays deployable instead of failing every signed deployment at
+    // decode_optional_blobs.
+    crate::signing_service::validate_org_keyring_registration_budget(
+        keyring_payload_bytes.len(),
+        &signature,
+        &signing_pubkey,
+    )
+    .map_err(crate::routes::deployments::signing_error_response)?;
 
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
     crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
@@ -935,7 +945,21 @@ pub async fn rotate_org_owner(
         .verify(&directive, &Signature::from_bytes(&rotation_signature))
         .map_err(|_| bad_request("owner rotation signature verification failed"))?;
 
-    let payload_bytes = serde_json::to_vec(&body.keyring_payload).map_err(|_| db_error())?;
+    // #128 review follow-up: store the normalized typed keyring, not the raw
+    // request JSON — mirrors put_keyring so a rotation carrying extra fields
+    // cannot be persisted verbatim and later break the strict envelope
+    // parse at deploy time. Signatures cover the canonical bytes, which are
+    // computed from the typed keyring either way.
+    let payload_bytes = serde_json::to_vec(&replacement_keyring).map_err(|_| db_error())?;
+    // #128 review follow-up (P1): the registered keyring must stay inside the
+    // deploy-time org_keyring_blob envelope budget, or every later signed
+    // deployment would fail decode_optional_blobs.
+    crate::signing_service::validate_org_keyring_registration_budget(
+        payload_bytes.len(),
+        &keyring_signature,
+        &replacement_owner,
+    )
+    .map_err(crate::routes::deployments::signing_error_response)?;
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
     crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
         .await
