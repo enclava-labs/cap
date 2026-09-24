@@ -932,17 +932,26 @@ pub async fn rotate_org_owner(
     //   keyring content, signatures, and pinned-owner checks below. The
     //   bound carries a recovery exception bound to a durable
     //   presentation record (org_rotation_intents, migration 0053):
-    //   before any upstream rotate-owner effect, CAP commits the exact
-    //   (directive digest, keyring payload digest) pair on its own
-    //   connection. If the upstream rotation succeeded but the CAP
-    //   transaction rolled back (service pinned to the replacement, no
-    //   keyring version or ledger row), retrying that exact request is
-    //   allowed through at any age -- the committed intent row matches
-    //   the retry byte-for-byte, completing the lost CAP rows
-    //   introduces no new owner key, rotate_owner is not re-issued (the
-    //   service already holds the replacement), and the ledger still
-    //   consumes the digest (single use). A different directive or
-    //   keyring over the same pair gets no waiver.
+    //   every authenticated, signature-verified presentation commits
+    //   the exact (directive digest, keyring payload digest) pair with
+    //   its first-presentation timestamp on its own connection BEFORE
+    //   this handler opens the signing-authority lane transaction. If
+    //   the upstream rotation succeeded but the CAP transaction rolled
+    //   back (service pinned to the replacement, no keyring version or
+    //   ledger row), retrying that exact request is allowed through at
+    //   any age only when the committed record proves this directive
+    //   caused the drift: it was first presented while still fresh,
+    //   that presentation preceded the service's current owner (the
+    //   owner snapshot's last_changed_at), and no other directive was
+    //   presented in between -- an intent row alone proves a request
+    //   reached this handler, not that its rotate_owner succeeded (PR
+    //   #185 review). Under the waiver the upstream rotation already
+    //   happened, so rotate_owner is not re-issued (the service already
+    //   holds the replacement), the pinned-owner, content, and
+    //   signature checks still bind the stored version to the
+    //   replacement owner, and the ledger still consumes the digest
+    //   (single use). A different directive or keyring over the same
+    //   pair gets no waiver.
     // - when the rotation creates a new keyring version, signed_at may not
     //   predate the creation of the keyring version whose owner signed it.
     // - each directive accepted on the insert-new-version path is consumed
@@ -950,6 +959,12 @@ pub async fn rotate_org_owner(
     //   for any valid directive over the same completed rotation (see the
     //   else branch) and consumes nothing.
     const MAX_DIRECTIVE_AGE_SECONDS: i64 = 900;
+    /// Skew allowance when comparing the intent row's created_at (CAP's
+    /// database clock) against the signing service's owner snapshot
+    /// last_changed_at (an independent service clock). Only the
+    /// presentation-preceded-rotation bound uses it; every other freshness
+    /// comparison stays on a single clock.
+    const OWNER_SNAPSHOT_SKEW_SECONDS: i64 = 30;
     let directive = owner_rotation_directive_bytes(
         org_id,
         &current_owner,
@@ -962,6 +977,67 @@ pub async fn rotate_org_owner(
         .map_err(|_| bad_request("owner rotation signature verification failed"))?;
 
     let payload_bytes = serde_json::to_vec(&body.keyring_payload).map_err(|_| db_error())?;
+    let directive_digest = Sha256::digest(&directive);
+
+    // Snapshot the signing-service owner authority and durably record this
+    // presentation BEFORE opening the signing-authority lane transaction
+    // (PR #185 review, codex P2): this handler must never wait on a second
+    // pool connection while holding the lane transaction's connection --
+    // with the pool capped, N concurrent rotations holding their lane
+    // connections could all block here waiting for an (N+1)th connection
+    // and time out as a cluster. Pre-lane is also the correct observation
+    // point: the max-age waiver compares the intent row's presentation
+    // timestamp against the service owner's last_changed_at, and both are
+    // only comparable while no competing rotation can slip between them
+    // under the lane -- the read precedes the write's lane segment, and
+    // no upstream effect can happen before the lane is taken, so moving
+    // the snapshot earlier does not reorder any side effect.
+    let signing_service = state.signing_service.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "platform signing service is not configured"})),
+    ))?;
+    let owner_status = signing_service
+        .owner_status(org_id)
+        .await
+        .map_err(crate::routes::deployments::signing_error_response)?;
+    let service_owner = owner_status
+        .owner_pubkey_hex
+        .as_deref()
+        .and_then(|raw| hex::decode(raw).ok());
+    if owner_status.org_id != org_id || owner_status.state != "ready" {
+        return Err(crate::routes::deployments::signing_error_response(
+            crate::signing_service::SigningServiceError::AuthorityStatus(
+                "owner status does not match requested authority".to_string(),
+            ),
+        ));
+    }
+
+    // Durable presentation record (migration 0053), committed on its own
+    // short-lived pool connection BEFORE this handler opens the
+    // signing-authority lane transaction and thus before any upstream
+    // rotate-owner effect can happen. Every authenticated,
+    // signature-verified presentation of a new-version rotation directive
+    // lands here with its first-presentation timestamp -- including
+    // presentations that later fail the freshness bounds or the ledger:
+    // the row is a presentation record, not an approval. If the upstream
+    // rotation succeeds but this handler's transaction rolls back, this
+    // committed row is what later authorizes the max-age waiver for
+    // retrying this exact (directive, keyring) pair. Idempotent:
+    // re-presenting the same request rewrites nothing (the first
+    // presentation timestamp is what the waiver checks).
+    let intent_digest = Sha256::digest(&payload_bytes);
+    sqlx::query(
+        "INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256)
+         VALUES ($1, $2, $3)
+         ON CONFLICT ON CONSTRAINT org_rotation_intents_pkey DO NOTHING",
+    )
+    .bind(org_id)
+    .bind(directive_digest.as_slice())
+    .bind(intent_digest.as_slice())
+    .execute(&state.db)
+    .await
+    .map_err(|_| db_error())?;
+
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
     // The signing-authority lane is a blocking advisory lock and this
     // handler performs signing-service requests while holding it, so
@@ -1031,29 +1107,6 @@ pub async fn rotate_org_owner(
             "rotation signer does not match the current pinned owner",
         ));
     }
-    // Single signing-service owner snapshot for the whole request (PR #185
-    // review): the max-age waiver below and the rotate-owner dispatch below
-    // must observe one consistent state of the service, not two reads that
-    // a replica lag could make disagree.
-    let signing_service = state.signing_service.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({"error": "platform signing service is not configured"})),
-    ))?;
-    let owner_status = signing_service
-        .owner_status(org_id)
-        .await
-        .map_err(crate::routes::deployments::signing_error_response)?;
-    let service_owner = owner_status
-        .owner_pubkey_hex
-        .as_deref()
-        .and_then(|raw| hex::decode(raw).ok());
-    if owner_status.org_id != org_id || owner_status.state != "ready" {
-        return Err(crate::routes::deployments::signing_error_response(
-            crate::signing_service::SigningServiceError::AuthorityStatus(
-                "owner status does not match requested authority".to_string(),
-            ),
-        ));
-    }
     // Consume-once + version binding for the rotation directive (issue #120).
     // A directive that creates a new keyring version must be younger than the
     // version it rotates (no skew allowance: a pre-creation capture must fail),
@@ -1070,7 +1123,6 @@ pub async fn rotate_org_owner(
     // instead of the ledger, so retries of rotations performed before this
     // ledger existed (or whose response was lost and retried past the
     // window) stay idempotent at any age.
-    let directive_digest = Sha256::digest(&directive);
     if insert_new_version {
         if body.signed_at > lane_now {
             return Err(bad_request(
@@ -1078,39 +1130,66 @@ pub async fn rotate_org_owner(
             ));
         }
         if body.signed_at < lane_now - chrono::Duration::seconds(MAX_DIRECTIVE_AGE_SECONDS) {
-            // Recovery exception (PR #185 review, codex P2): when the
+            // Recovery exception (PR #185 review, codex P1): when the
             // upstream rotate-owner already succeeded and only the CAP
             // transaction rolled back, the signing service is pinned to
             // the replacement owner while no keyring version or ledger
             // row exists. The exact lost request can be retried past the
-            // window -- but only when a committed presentation record
-            // (org_rotation_intents, migration 0053) matches this
-            // request byte-for-byte: same directive digest AND same
-            // keyring payload digest. A different directive or keyring
-            // over the same (current -> replacement) pair gets no
-            // waiver, so a captured directive cannot mint a version in
-            // the drift state. Under the waiver the upstream rotation
-            // already happened, so rotate_owner is never re-issued; the
-            // pinned-owner, content, and signature checks still bind
-            // the stored version to exactly what the upstream accepted,
-            // and the ledger still consumes the digest (single use).
-            let intent_digest = Sha256::digest(&payload_bytes);
-            let intent_seen: bool = sqlx::query_scalar(
-                "SELECT EXISTS (
-                     SELECT 1 FROM org_rotation_intents
-                      WHERE org_id = $1
-                        AND directive_sha256 = $2
-                        AND keyring_sha256 = $3)",
+            // window -- but only when the committed presentation record
+            // (org_rotation_intents, migration 0053) proves THIS
+            // directive caused the drift, not merely that it was
+            // presented at some point:
+            // 1. same directive digest AND keyring payload digest (a
+            //    different directive or keyring over the same
+            //    (current -> replacement) pair gets no waiver);
+            // 2. first presented while still inside the freshness
+            //    window (created_at - signed_at <= MAX_DIRECTIVE_AGE):
+            //    a directive first presented already-expired cannot
+            //    mint its own waiver evidence in the drift state;
+            // 3. that presentation preceded the service's current owner
+            //    (intent created_at <= owner snapshot's last_changed_at
+            //    + a small skew allowance for independent clocks);
+            // 4. no OTHER directive was presented for this org between
+            //    this one and the rotation that pinned the service (no
+            //    other row's created_at falls in (this row's created_at,
+            //    last_changed_at + skew]). Without this, an earlier
+            //    failed presentation D1 whose rotate_owner never
+            //    succeeded could be replayed after a later D2 over the
+            //    same owner pair rotated upstream and CAP rolled back --
+            //    D1's intent row would match a drift it did not cause.
+            //    Presentations after the rotation are excluded: they
+            //    cannot have caused it and must not wedge recovery.
+            let waiver: Option<DateTime<Utc>> = sqlx::query_scalar(
+                "SELECT i.created_at FROM org_rotation_intents i
+                  WHERE i.org_id = $1
+                    AND i.directive_sha256 = $2
+                    AND i.keyring_sha256 = $3
+                    AND i.created_at <= $4::timestamptz + make_interval(secs => $5)
+                    AND ($6::timestamptz IS NULL
+                         OR i.created_at <= $6::timestamptz + make_interval(secs => $7))
+                    AND NOT EXISTS (
+                        SELECT 1 FROM org_rotation_intents o
+                         WHERE o.org_id = i.org_id
+                           AND (o.directive_sha256, o.keyring_sha256)
+                               <> (i.directive_sha256, i.keyring_sha256)
+                           AND o.created_at > i.created_at
+                           AND ($6::timestamptz IS NULL
+                                OR o.created_at
+                                   <= $6::timestamptz + make_interval(secs => $7)))",
             )
             .bind(org_id)
             .bind(directive_digest.as_slice())
             .bind(intent_digest.as_slice())
-            .fetch_one(&mut *tx)
+            .bind(body.signed_at)
+            .bind(MAX_DIRECTIVE_AGE_SECONDS as f64)
+            .bind(owner_status.last_changed_at)
+            .bind(OWNER_SNAPSHOT_SKEW_SECONDS as f64)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|_| db_error())?;
             let service_holds_replacement =
                 service_owner.as_deref() == Some(replacement_owner.as_slice());
-            if !(intent_seen && service_holds_replacement) {
+            if !(waiver.is_some() && service_holds_replacement) {
                 return Err(bad_request("owner rotation directive signed_at is too old"));
             }
         }
@@ -1182,29 +1261,6 @@ pub async fn rotate_org_owner(
     .await
     .map_err(|_| db_error())?
     .ok_or_else(|| bad_request("replacement owner key is not registered for this user"))?;
-
-    if insert_new_version {
-        // Durable presentation record (migration 0053), committed on its
-        // own connection BEFORE any upstream rotate-owner effect: if the
-        // signing service rotates but this handler's transaction rolls
-        // back, this committed intent row is what later authorizes the
-        // max-age waiver for retrying this exact (directive, keyring)
-        // pair. The signing-authority lane held by `tx` serializes
-        // competing rotations for this org, so the row is uniquely ours.
-        // Idempotent: re-presenting the same request rewrites nothing.
-        let intent_digest = Sha256::digest(&payload_bytes);
-        sqlx::query(
-            "INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256)
-             VALUES ($1, $2, $3)
-             ON CONFLICT ON CONSTRAINT org_rotation_intents_pkey DO NOTHING",
-        )
-        .bind(org_id)
-        .bind(directive_digest.as_slice())
-        .bind(intent_digest.as_slice())
-        .execute(&state.db)
-        .await
-        .map_err(|_| db_error())?;
-    }
 
     if service_owner.as_deref() == Some(current_owner.as_slice()) {
         let rotated = signing_service
@@ -1761,20 +1817,32 @@ mod tests {
     /// Minimal in-process stand-in for the platform signing service's owner
     /// authority surface: `GET /orgs/{id}/owner` and `POST /rotate-owner`.
     async fn mock_signing_service_owner_api(org_id: Uuid, initial_owner: [u8; 32]) -> String {
-        let owner = Arc::new(std::sync::Mutex::new(initial_owner));
+        mock_signing_service_owner_api_with_changed_at(org_id, initial_owner, Utc::now()).await
+    }
+
+    /// Variant whose owner status reports a fixed initial `last_changed_at`,
+    /// standing in for a rotation that happened at a specific past instant
+    /// (the max-age recovery waiver compares presentation records against
+    /// that timestamp).
+    async fn mock_signing_service_owner_api_with_changed_at(
+        org_id: Uuid,
+        initial_owner: [u8; 32],
+        initial_changed_at: DateTime<Utc>,
+    ) -> String {
+        let owner = Arc::new(std::sync::Mutex::new((initial_owner, initial_changed_at)));
         let status_owner = owner.clone();
         let rotate_owner = owner;
         let app = axum::Router::new()
             .route(
                 &format!("/orgs/{org_id}/owner"),
                 axum::routing::get(move || async move {
-                    let current = *status_owner.lock().expect("mock owner lock");
+                    let (current, changed_at) = *status_owner.lock().expect("mock owner lock");
                     axum::Json(serde_json::json!({
                         "org_id": org_id,
                         "state": "ready",
                         "version": 1,
                         "owner_pubkey_hex": hex::encode(current),
-                        "last_changed_at": Utc::now(),
+                        "last_changed_at": changed_at,
                     }))
                 }),
             )
@@ -1787,7 +1855,7 @@ mod tests {
                             .expect("mock replacement owner decodes")
                             .try_into()
                             .expect("mock replacement owner is 32 bytes");
-                        *rotate_owner.lock().expect("mock owner lock") = replacement;
+                        *rotate_owner.lock().expect("mock owner lock") = (replacement, Utc::now());
                         axum::Json(serde_json::json!({
                             "org_id": req["org_id"].clone(),
                             "version": 1,
@@ -2393,7 +2461,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_rotation_recovers_when_service_already_holds_replacement() {
-        // Regression (PR #185 review, codex P2): if the upstream
+        // Regression (PR #185 review, codex P1/P2): if the upstream
         // rotate-owner succeeds but the CAP transaction rolls back, the
         // signing service is pinned to the replacement while no keyring
         // version or ledger row exists. Retrying the exact request after
@@ -2406,6 +2474,12 @@ mod tests {
         // accepted). Contrast with
         // owner_rotation_expired_exact_retry_stays_idempotent, which
         // covers the already-applied (committed v2) path.
+        //
+        // The waiver is granted only when the committed presentation
+        // record proves THIS directive caused the drift: first presented
+        // while fresh, before the service's current owner was pinned,
+        // with no other directive presented in between. The negative
+        // cases below cover each leg of that proof.
         let pool = database_test_pool().await;
         let org_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
@@ -2435,15 +2509,30 @@ mod tests {
             .await
             .expect("insert service-recovery signing keys");
 
-        // The signing service starts pinned to the replacement owner:
-        // the upstream rotate-owner of the lost first attempt already
-        // succeeded and CAP's transaction rolled back.
+        // Drift timeline (PR #185 review, codex P1): the lost attempt
+        // presented D2 while fresh; the upstream rotation that pinned the
+        // service happened after that presentation. An earlier failed
+        // directive D1 (whose rotate_owner never succeeded) was presented
+        // before D2. All sub-cases below share this clock.
+        let presented_d1_at = Utc::now() - chrono::Duration::minutes(25);
+        let signed_d1_at = Utc::now() - chrono::Duration::minutes(26);
+        let presented_d2_at = Utc::now() - chrono::Duration::minutes(20);
+        let drift_at = Utc::now() - chrono::Duration::minutes(19);
+
+        // The signing service starts pinned to the replacement owner with
+        // last_changed_at = drift_at: the upstream rotate-owner of the
+        // lost first attempt already succeeded and CAP's transaction
+        // rolled back.
         let mut state = crate::test_support::lazy_state();
         state.db = pool.clone();
         state.signing_service = Some(
             crate::signing_service::SigningServiceClient::new(
-                mock_signing_service_owner_api(org_id, replacement_key.verifying_key().to_bytes())
-                    .await,
+                mock_signing_service_owner_api_with_changed_at(
+                    org_id,
+                    replacement_key.verifying_key().to_bytes(),
+                    drift_at,
+                )
+                .await,
                 None,
             )
             .expect("build mock signing service client"),
@@ -2474,11 +2563,14 @@ mod tests {
             .await
             .expect("backdate v1 creation");
 
-        // Negative case (grok-4.7 self-check): a DIFFERENT directive over
-        // the same (current -> replacement) pair -- here a different
-        // reason, equally expired -- gets no waiver: no committed intent
-        // row matches it, so the drift state must not let a captured
-        // directive mint a version past the window.
+        // Negative case 1 (a different directive over the same pair gets
+        // no waiver): a DIFFERENT directive over the same
+        // (current -> replacement) pair -- here a different reason,
+        // equally expired. Its presentation lands in org_rotation_intents
+        // (created_at = now, long past the drift), but that cannot satisfy
+        // the waiver: it was not presented while fresh, and it postdates
+        // the rotation that pinned the service. The drift state must not
+        // let a captured directive mint a version past the window.
         let imposter = rotation_request(
             org_id,
             user_id,
@@ -2503,11 +2595,15 @@ mod tests {
             "owner rotation directive signed_at is too old"
         );
 
-        // The recovery retry: same directive the lost attempt used, now
-        // past the 15-minute window. No v2 row, no ledger row exists --
-        // but the lost attempt's separately-committed intent row does
-        // (the handler records it on its own connection before any
-        // upstream effect).
+        // The recovery retry: the same directive D2 the lost attempt used,
+        // now past the 15-minute window. No v2 row, no ledger row exists --
+        // but the lost attempt's separately-committed intent row does,
+        // first presented (presented_d2_at) while the directive was fresh
+        // and before the service rotation (drift_at) that pinned the
+        // replacement. An earlier failed directive D1 (reason
+        // "service-recovery-lost-first", signed at signed_d1_at, presented
+        // at presented_d1_at, whose upstream rotate_owner never succeeded)
+        // also has a committed row -- it must NOT be enough for D1 itself.
         let recovery_signed_at = Utc::now() - chrono::Duration::minutes(20);
         let recovery = rotation_request(
             org_id,
@@ -2526,21 +2622,79 @@ mod tests {
             recovery_signed_at,
             "service-recovery",
         );
-        sqlx::query(
-            "INSERT INTO org_rotation_intents (org_id, directive_sha256, keyring_sha256)
-             VALUES ($1, $2, $3)",
+        let d1 = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            signed_d1_at,
+            "service-recovery-lost-first",
+        );
+        let d1_directive = owner_rotation_directive_bytes(
+            org_id,
+            &current_key.verifying_key().to_bytes(),
+            &replacement_key.verifying_key().to_bytes(),
+            signed_d1_at,
+            "service-recovery-lost-first",
+        );
+        let seed_row = |directive: &[u8],
+                        payload: serde_json::Value,
+                        presented_at: DateTime<Utc>| {
+            let pool = pool.clone();
+            let directive = Sha256::digest(directive);
+            let keyring = Sha256::digest(serde_json::to_vec(&payload).expect("serialize payload"));
+            async move {
+                sqlx::query(
+                    "INSERT INTO org_rotation_intents
+                         (org_id, directive_sha256, keyring_sha256, created_at)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT ON CONSTRAINT org_rotation_intents_pkey DO NOTHING",
+                )
+                .bind(org_id)
+                .bind(directive.as_slice())
+                .bind(keyring.as_slice())
+                .bind(presented_at)
+                .execute(&pool)
+                .await
+                .expect("seed committed intent row");
+            }
+        };
+        seed_row(&d1_directive, d1.keyring_payload.clone(), presented_d1_at).await;
+        seed_row(
+            &recovery_directive,
+            recovery.keyring_payload.clone(),
+            presented_d2_at,
         )
-        .bind(org_id)
-        .bind(Sha256::digest(&recovery_directive).as_slice())
-        .bind(
-            Sha256::digest(
-                serde_json::to_vec(&recovery.keyring_payload).expect("serialize recovery payload"),
-            )
-            .as_slice(),
+        .await;
+
+        // Negative case 2 (codex P1, D1 did not cause the drift): D1 was
+        // presented while fresh and before the rotation that pinned the
+        // service, and its own rotate_owner never succeeded (the drift was
+        // caused by the later D2 attempt). Replaying expired D1 must NOT
+        // mint D1's keyring version: another directive (D2) was presented
+        // between D1's presentation and the rotation, so D1's row does not
+        // prove its rotation put the service into the drift state.
+        let rejected_d1 = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(d1),
         )
-        .execute(&pool)
         .await
-        .expect("seed the lost attempt's committed intent row");
+        .expect_err("earlier failed directive must not inherit the drift");
+        assert_eq!(rejected_d1.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected_d1.1.0["error"],
+            "owner rotation directive signed_at is too old"
+        );
+
+        // Note: negative case 1 also proves the waiver cannot be
+        // self-seeded -- the imposter's own presentation records an intent
+        // row before the check runs, and the check still rejects it (first
+        // presentation not fresh, postdates the rotation).
+
         let recovered = rotate_org_owner(
             auth.clone(),
             State(state.clone()),
