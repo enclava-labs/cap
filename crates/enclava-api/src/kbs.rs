@@ -993,7 +993,7 @@ async fn load_signed_policy_candidates(
         ),
         -- The cast is safe at two levels: org_keyrings rows are written only
         -- by the put/rotate handlers, which serialize validated JSON, and the
-        -- org_keyrings_payload_wellformed CHECK constraint (migration 0049)
+        -- org_keyrings_payload_wellformed CHECK constraint (migration 0050)
         -- rejects any non-JSON or non-object payload or a non-array members
         -- entry at INSERT time, so a malformed row from a backfill script or
         -- manual psql fix can never take down candidate loading for every
@@ -4162,10 +4162,10 @@ resource_bindings := {
     /// its own state clobbered by this test's final reset.  The process-local
     /// `SIGNED_POLICY_SINGLETON_LOCK` cannot fence across processes.
 
-    /// Migration 0049 marks its owed selector generation bump instead of
-    /// performing it, so a pre-0049 replica still reconciling during the
+    /// Migration 0050 marks its owed selector generation bump instead of
+    /// performing it, so a pre-0050 replica still reconciling during the
     /// rollout cannot consume the bump with its unfiltered candidate query.
-    /// Only the post-0049 reconciler interprets the marker, exactly once, and
+    /// Only the post-0050 reconciler interprets the marker, exactly once, and
     /// never on behalf of an unsigned-only install -- what this test pins
     /// down.  Runs against its own per-process database: like the rotation
     /// test, it asserts exact singleton state that another test process could
@@ -4187,7 +4187,7 @@ resource_bindings := {
         // Nothing marked: consuming is a no-op.
         assert_eq!(consume_deferred_selector_bump(&pool).await.unwrap(), None);
 
-        // Migration 0049 marks signed-mode installs; consumption performs the
+        // Migration 0050 marks signed-mode installs; consumption performs the
         // bump exactly once and clears the marker.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
