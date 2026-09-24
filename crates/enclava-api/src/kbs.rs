@@ -202,7 +202,7 @@ struct SignedPolicyReconciliationRow {
     desired_generation: i64,
     configmap_generation: i64,
     applied_generation: i64,
-    selector_bump_pending: bool,
+    selector_bumps_owed: i64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -475,11 +475,10 @@ pub async fn enqueue_signed_policy_revocation_if_active(
 }
 
 /// Enqueue a signed-policy recomputation only when CAP has already entered
-/// signed-policy mode.  Keyring rotation changes which retained artifacts are
-/// still authorized (#130); without a generation bump the reconciler would
-/// treat the changed candidate set at an unchanged generation as a conflict
-/// and keep the stale policy body live in Trustee.  Unsigned-only installs
-/// stay untouched.
+/// signed-policy mode.  Keyring writes no longer call this: migration
+/// 0050's `org_keyrings` INSERT trigger owes the bump inside the writer's
+/// own transaction (see [`consume_deferred_selector_bumps`]), which fences
+/// pre-0050 replicas too.  Unsigned-only installs stay untouched.
 pub async fn enqueue_signed_policy_reconciliation_if_active(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<Option<i64>, KbsPolicyError> {
@@ -511,23 +510,23 @@ async fn enqueue_signed_policy_bootstrap_if_idle(
     Ok(result.rows_affected() == 1)
 }
 
-/// Clear a stray deferred-selector marker from an unsigned-only row.
+/// Clear a stray deferred-selector debt from an unsigned-only row.
 ///
-/// Migration 0050 marks the owed selector generation bump only where
-/// `desired_generation > 0` (its own WHERE clause, mirroring
-/// [`enqueue_signed_policy_reconciliation_if_active`]), so the marker
-/// invariant is `selector_bump_pending => desired_generation > 0`.  If a
-/// stray marker ever lands on an unsigned-only row (manual psql, a future
+/// Migration 0050's trigger owes selector generation bumps only where
+/// `desired_generation > 0` (mirroring
+/// [`enqueue_signed_policy_reconciliation_if_active`]), so the debt
+/// invariant is `selector_bumps_owed > 0 => desired_generation > 0`.  If a
+/// stray debt ever lands on an unsigned-only row (manual psql, a future
 /// backfill), it is cleared here without bumping so the install cannot be
-/// pushed into signed-policy mode.  This touches only the marker column, so
+/// pushed into signed-policy mode.  This touches only the debt column, so
 /// it is invisible to pre-0050 replicas and safe at any point in a run.
-async fn clear_stray_selector_bump(db: &PgPool) -> Result<(), KbsPolicyError> {
+async fn clear_stray_selector_debt(db: &PgPool) -> Result<(), KbsPolicyError> {
     sqlx::query(
         "UPDATE kbs_signed_policy_reconciliation
-            SET selector_bump_pending = false,
+            SET selector_bumps_owed = 0,
                 updated_at = clock_timestamp()
           WHERE singleton
-            AND selector_bump_pending
+            AND selector_bumps_owed > 0
             AND desired_generation = 0",
     )
     .execute(db)
@@ -535,11 +534,11 @@ async fn clear_stray_selector_bump(db: &PgPool) -> Result<(), KbsPolicyError> {
     Ok(())
 }
 
-/// Commit the deferred candidate-selector generation bump marked by migration
+/// Commit the deferred candidate-selector generation bumps owed by migration
 /// 0050 -- and ONLY once the filtered policy body is live in the ConfigMap.
 ///
 /// Only the post-0050 implementation -- the one filtering signed-policy
-/// candidates by current keyring membership -- may interpret the marker.
+/// candidates by current keyring membership -- may interpret the debt.
 /// `deploy/api/deployment.yaml` runs the API with
 /// `DATABASE_MIGRATION_MODE=verify`, so the migration step can precede the
 /// new binary by minutes while a pre-0050 replica keeps reconciling every 30
@@ -549,37 +548,55 @@ async fn clear_stray_selector_bump(db: &PgPool) -> Result<(), KbsPolicyError> {
 /// [`KbsPolicyError::PolicyGenerationConflict`] with no bump left to
 /// recover.
 ///
-/// Publishing first and committing the increment second keeps that failure
-/// unreachable on every crash path.  Until this call, `desired_generation`
-/// stays unchanged and a pre-0050 reconciler keeps finding its unfiltered
-/// hash matching the published body: it stays quiescent.  The filtered
-/// replace annotates the ConfigMap with the owed generation while the durable
-/// desired generation is still behind it, so a pre-0050 reconciler treats it
-/// as [`GenerationDecision::Superseded`] and cannot overwrite; once the
+/// Publishing first and committing second keeps that failure unreachable on
+/// every crash path.  Until this call, `desired_generation` stays unchanged
+/// and a pre-0050 reconciler keeps finding its unfiltered hash matching the
+/// published body: it stays quiescent.  The filtered replace annotates the
+/// ConfigMap with the owed generation while the durable desired generation
+/// is still behind it, so a pre-0050 reconciler treats it as
+/// [`GenerationDecision::Superseded`] and cannot overwrite; once the
 /// increment lands here, the same content-bound annotation turns any late
 /// unfiltered republication into a same-generation conflict.  A failure
-/// before the replace leaves the marker set and the increment uncommitted,
+/// before the replace leaves the debt owed and the increment uncommitted,
 /// so the next run simply republishes.
 ///
-/// Consumption is a single guarded `UPDATE`, so concurrent replicas commit
-/// the marker exactly once and every later call is a no-op.  A marker on an
-/// unsigned-only row is never committed (the `desired_generation > 0` guard);
-/// [`clear_stray_selector_bump`] removes it instead.
-/// Returns the new desired generation when this call performed the bump.
-async fn commit_deferred_selector_bump(db: &PgPool) -> Result<Option<i64>, KbsPolicyError> {
-    let bumped: Option<i64> = sqlx::query_scalar(
+/// The debt is a COUNTER (not a boolean marker) re-armed by migration
+/// 0050's `org_keyrings` INSERT trigger, so it survives keyring writes
+/// committed by a pre-0050 replica during the rollout: `put_keyring` and
+/// `rotate_org_owner` only take the per-org signing-authority lane and the
+/// old binary enqueues nothing, so such a write can land after this run
+/// loaded its candidate set and before the ConfigMap replace.  That is why
+/// consumption is a compare-and-set on the exact
+/// `(desired_generation, selector_bumps_owed)` pair this run published at:
+/// a keyring write landing mid-run changes the pair, the CAS fails, `None`
+/// is returned, and the caller's next loop attempt republishes the
+/// post-write candidate set at the strictly higher generation instead of
+/// recording a stale set as the final state of a generation.  A debt on an
+/// unsigned-only row is never committed (the `desired_generation > 0`
+/// guard); [`clear_stray_selector_debt`] removes it instead.
+/// Returns the new desired generation when this call performed the commit.
+async fn consume_deferred_selector_bumps(
+    db: &PgPool,
+    observed_desired_generation: i64,
+    observed_bumps_owed: i64,
+) -> Result<Option<i64>, KbsPolicyError> {
+    let committed: Option<i64> = sqlx::query_scalar(
         "UPDATE kbs_signed_policy_reconciliation
-            SET desired_generation = desired_generation + 1,
-                selector_bump_pending = false,
+            SET desired_generation = desired_generation + selector_bumps_owed,
+                selector_bumps_owed = 0,
                 updated_at = clock_timestamp()
           WHERE singleton
-            AND selector_bump_pending
+            AND selector_bumps_owed > 0
             AND desired_generation > 0
-        RETURNING desired_generation",
+            AND desired_generation = $1
+            AND selector_bumps_owed = $2
+          RETURNING desired_generation",
     )
+    .bind(observed_desired_generation)
+    .bind(observed_bumps_owed)
     .fetch_optional(db)
     .await?;
-    Ok(bumped)
+    Ok(committed)
 }
 
 async fn load_signed_policy_reconciliation(
@@ -587,7 +604,7 @@ async fn load_signed_policy_reconciliation(
 ) -> Result<SignedPolicyReconciliationRow, KbsPolicyError> {
     Ok(sqlx::query_as(
         "SELECT desired_generation, configmap_generation, applied_generation,
-                selector_bump_pending
+                selector_bumps_owed
            FROM kbs_signed_policy_reconciliation
           WHERE singleton",
     )
@@ -935,13 +952,13 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
     expected_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
     client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
-    // Clear any stray deferred-selector marker on an unsigned-only row (see
-    // clear_stray_selector_bump).  A marker on a signed-mode row is left in
+    // Clear any stray deferred-selector debt on an unsigned-only row (see
+    // clear_stray_selector_debt).  A debt on a signed-mode row is left in
     // place here on purpose: the owed generation bump (migration 0050) is
     // published first and committed only after the filtered ConfigMap replace
-    // succeeded (commit_deferred_selector_bump below), so no failure in this
-    // run can expose a raw bumped generation to a pre-0050 reconciler.
-    clear_stray_selector_bump(db).await?;
+    // succeeded (consume_deferred_selector_bumps below), so no failure in
+    // this run can expose a raw bumped generation to a pre-0050 reconciler.
+    clear_stray_selector_debt(db).await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
         let state = load_signed_policy_reconciliation(db).await?;
@@ -976,12 +993,13 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             }
             return Ok(());
         }
-        // A pending deferred selector bump (migration 0050) publishes the
-        // owed generation as desired_generation + 1 without committing the
-        // increment yet -- commit_deferred_selector_bump does that only after
-        // the filtered replace below.  Pre-0050 replicas reading the same row
-        // keep seeing the unchanged desired_generation and stay quiescent.
-        let generation = state.desired_generation + i64::from(state.selector_bump_pending);
+        // Pending deferred selector bumps (migration 0050) publish the owed
+        // generation as desired_generation + selector_bumps_owed without
+        // committing the increment yet -- consume_deferred_selector_bumps
+        // does that only after the filtered replace below.  Pre-0050
+        // replicas reading the same row keep seeing the unchanged
+        // desired_generation and stay quiescent.
+        let generation = state.desired_generation + state.selector_bumps_owed;
         let reset_bootstrap = state.configmap_generation == 0 && state.applied_generation == 0;
         let previously_applied = state.applied_generation >= generation;
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
@@ -1040,8 +1058,24 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
         // conflict.  Committing before this replace would expose a raw bumped
         // generation that a pre-0050 reconciler could consume with its
         // unfiltered query whenever this run fails before publishing.
-        if state.selector_bump_pending {
-            commit_deferred_selector_bump(db).await?;
+        // The CAS on the observed (desired, owed) pair is what fences OLD
+        // keyring writers: put_keyring / rotate_org_owner from a pre-0050
+        // replica commit no enqueue of their own, but migration 0050's
+        // org_keyrings trigger has already owed them a bump inside their own
+        // transaction.  If such a write landed after this run loaded its
+        // candidate set, owed has moved, the CAS fails, and the loop retries
+        // -- republishing the post-write candidate set at the strictly higher
+        // generation instead of sealing a stale one.
+        if state.selector_bumps_owed > 0
+            && consume_deferred_selector_bumps(
+                db,
+                state.desired_generation,
+                state.selector_bumps_owed,
+            )
+            .await?
+            .is_none()
+        {
+            continue;
         }
         if !reset_bootstrap
             && !record_configmap_generation(db, generation, &policy_sha256, &resource_version)
@@ -2832,18 +2866,23 @@ owner_resource_bindings := {}
     }
 
     /// Regression coverage for the #130 keyring-rotation generation bump.
-    /// Runs against its own uniquely named per-process database (see
-    /// [`crate::test_support::isolated_database_test_pool`]): this test asserts
-    /// exact `kbs_signed_policy_reconciliation` singleton values and resets
-    /// them, and on the shared test database another test process (a sibling
-    /// CI worktree on the same PostgreSQL server) could bump the generation
-    /// between this test's commit and its exact assertion, or have its own
-    /// state clobbered by this test's final reset.  The process-local
+    /// Migration 0050's `org_keyrings` INSERT trigger owes one selector bump
+    /// per keyring write while signed-policy mode is active -- including
+    /// writes committed by a PRE-0050 replica during a rolling upgrade,
+    /// which is the whole point of the trigger (the old binary enqueues
+    /// nothing itself).  Runs against its own uniquely named per-process
+    /// database (see [`crate::test_support::isolated_database_test_pool`]):
+    /// this test asserts exact `kbs_signed_policy_reconciliation` singleton
+    /// values and resets them, and on the shared test database another test
+    /// process (a sibling CI worktree on the same PostgreSQL server) could
+    /// owe bumps between this test's insert and its exact assertion, or have
+    /// its own state clobbered by this test's final reset.  The process-local
     /// `SIGNED_POLICY_SINGLETON_LOCK` cannot fence across processes.
     #[tokio::test]
-    async fn keyring_rotation_enqueues_signed_policy_reconciliation_only_when_active() {
+    async fn keyring_rotation_owes_selector_bump_only_when_active() {
         let (_db_cleanup, pool) =
             crate::test_support::isolated_database_test_pool("cap130_rotation_enqueue").await;
+        let (org_id, _app_id) = insert_test_app(&pool, "running").await;
 
         // Unsigned-only installs must not enter signed-policy mode.
         sqlx::query(
@@ -2859,20 +2898,25 @@ owner_resource_bindings := {}
         .execute(&pool)
         .await
         .unwrap();
-        let mut tx = pool.begin().await.unwrap();
-        assert!(
-            enqueue_signed_policy_reconciliation_if_active(&mut tx)
-                .await
-                .unwrap()
-                .is_none(),
-            "idle installation must not enqueue a signed-policy generation"
+        insert_test_keyring_version(&pool, org_id, 1, &["aa".repeat(32).as_str()]).await;
+        let owed: i64 = sqlx::query_scalar(
+            "SELECT selector_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            owed, 0,
+            "keyring write on an idle installation must owe no selector bump"
         );
-        tx.rollback().await.unwrap();
 
-        // Once signed mode is active, every keyring rotation must bump the
-        // generation so the reconciler withdraws rotated-out artifacts
-        // (#130): the changed candidate set at an unchanged generation would
-        // otherwise be rejected as a content conflict.
+        // Once signed mode is active, every keyring write owes one bump so
+        // the reconciler withdraws rotated-out artifacts (#130): the changed
+        // candidate set at an unchanged generation would otherwise be
+        // rejected as a content conflict.  desired_generation itself must
+        // stay put -- a pre-0050 replica must never see a raw bump.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
                 SET desired_generation = 1
@@ -2881,100 +2925,154 @@ owner_resource_bindings := {}
         .execute(&pool)
         .await
         .unwrap();
-        let mut tx = pool.begin().await.unwrap();
-        let bumped = enqueue_signed_policy_reconciliation_if_active(&mut tx)
-            .await
-            .unwrap()
-            .expect("active installation enqueues a new generation");
-        assert_eq!(bumped, 2);
-        tx.commit().await.unwrap();
-        let desired: i64 = sqlx::query_scalar(
-            "SELECT desired_generation
+        insert_test_keyring_version(&pool, org_id, 2, &["bb".repeat(32).as_str()]).await;
+        insert_test_keyring_version(&pool, org_id, 3, &["cc".repeat(32).as_str()]).await;
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, selector_bumps_owed
                FROM kbs_signed_policy_reconciliation
               WHERE singleton",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(desired, 2);
+        assert_eq!(owed, 2, "each active-mode keyring insert owes one bump");
+        assert_eq!(desired, 1, "the debt must not move desired_generation");
 
         crate::test_support::drop_isolated_database("cap130_rotation_enqueue", pool).await;
     }
 
-    /// Migration 0050 marks its owed selector generation bump instead of
-    /// performing it, so a pre-0050 replica still reconciling during the
+    /// Migration 0050 owes selector generation bumps in a counter instead of
+    /// performing them, so a pre-0050 replica still reconciling during the
     /// rollout cannot consume the bump with its unfiltered candidate query.
-    /// Only the post-0050 reconciler interprets the marker, exactly once --
-    /// and only after the filtered policy body is published
-    /// (commit_deferred_selector_bump) -- and never on behalf of an
-    /// unsigned-only install, which clear_stray_selector_bump disarms without
-    /// bumping.  What this test pins down.  Runs against its own per-process
-    /// database: like the rotation test, it asserts exact singleton state that
-    /// another test process could perturb through the shared server.
+    /// Only the post-0050 reconciler interprets the debt -- exactly once per
+    /// observed (desired, owed) pair, and only after the filtered policy body
+    /// is published (consume_deferred_selector_bumps).  A keyring write
+    /// landing between the reconciler's state read and its consumption
+    /// (exactly the interleaving raised in review: a pre-0050 replica's
+    /// put_keyring committing after candidates were loaded) increments the
+    /// counter, fails the CAS, and forces republication at a strictly higher
+    /// generation -- never a same-generation conflict on a stale candidate
+    /// set.  A stray debt on an unsigned-only install is disarmed by
+    /// clear_stray_selector_debt without entering signed-policy mode.  Runs
+    /// against its own per-process database: it asserts exact singleton state
+    /// that another test process could perturb through the shared server.
     #[tokio::test]
-    async fn deferred_selector_bump_is_committed_once_by_the_filtered_reconciler() {
+    async fn deferred_selector_bumps_are_cas_committed_once_by_the_filtered_reconciler() {
         let (_db_cleanup, pool) =
             crate::test_support::isolated_database_test_pool("cap130_selector_bump").await;
+        let (org_id, _app_id) = insert_test_app(&pool, "running").await;
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
                 SET desired_generation = 0,
-                    selector_bump_pending = false
+                    selector_bumps_owed = 0
               WHERE singleton",
         )
         .execute(&pool)
         .await
         .unwrap();
 
-        // Nothing marked: committing is a no-op.
-        assert_eq!(commit_deferred_selector_bump(&pool).await.unwrap(), None);
+        // Nothing owed: consuming is a no-op.
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 0, 0).await.unwrap(),
+            None
+        );
 
-        // Migration 0050 marks signed-mode installs; the post-publication
-        // commit performs the bump exactly once and clears the marker.
+        // Migration 0050 marks signed-mode installs with one owed bump; the
+        // post-publication commit lands exactly the observed pair.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
                 SET desired_generation = 3,
-                    selector_bump_pending = true
+                    selector_bumps_owed = 1
               WHERE singleton",
         )
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(commit_deferred_selector_bump(&pool).await.unwrap(), Some(4));
-        let (desired, pending): (i64, bool) = sqlx::query_as(
-            "SELECT desired_generation, selector_bump_pending
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 3, 1).await.unwrap(),
+            Some(4)
+        );
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, selector_bumps_owed
                FROM kbs_signed_policy_reconciliation
               WHERE singleton",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!((desired, pending), (4, false));
-        assert_eq!(commit_deferred_selector_bump(&pool).await.unwrap(), None);
+        assert_eq!((desired, owed), (4, 0));
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 4, 0).await.unwrap(),
+            None
+        );
 
-        // A stray marker on an unsigned-only install must never push it into
+        // The review interleaving: the reconciler observed (3, 1) and
+        // published at 4, but a pre-0050 replica's put_keyring committed in
+        // between -- migration 0050's trigger owed that write a bump too.
+        // The stale CAS must fail and leave the debt for the retry, which
+        // republishes at a strictly higher generation.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 3,
+                    selector_bumps_owed = 1
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The old replica's write lands mid-run: debt grows to 2.
+        insert_test_keyring_version(&pool, org_id, 1, &["dd".repeat(32).as_str()]).await;
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 3, 1).await.unwrap(),
+            None,
+            "a mid-run keyring write must fail the CAS and leave the debt"
+        );
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, selector_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (desired, owed),
+            (3, 2),
+            "both bumps remain owed to the retry"
+        );
+        // The retry observes the full debt and lands it in one commit.
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 3, 2).await.unwrap(),
+            Some(5)
+        );
+
+        // A stray debt on an unsigned-only install must never push it into
         // signed-policy mode: the commit refuses to bump it (and leaves the
-        // marker for the stray cleanup), and clear_stray_selector_bump then
+        // debt for the stray cleanup), and clear_stray_selector_debt then
         // disarms it without touching desired_generation.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
                 SET desired_generation = 0,
-                    selector_bump_pending = true
+                    selector_bumps_owed = 2
               WHERE singleton",
         )
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(commit_deferred_selector_bump(&pool).await.unwrap(), None);
-        clear_stray_selector_bump(&pool).await.unwrap();
-        let (desired, pending): (i64, bool) = sqlx::query_as(
-            "SELECT desired_generation, selector_bump_pending
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 0, 2).await.unwrap(),
+            None
+        );
+        clear_stray_selector_debt(&pool).await.unwrap();
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, selector_bumps_owed
                FROM kbs_signed_policy_reconciliation
               WHERE singleton",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!((desired, pending), (0, false));
+        assert_eq!((desired, owed), (0, 0));
 
         crate::test_support::drop_isolated_database("cap130_selector_bump", pool).await;
     }
