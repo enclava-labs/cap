@@ -73,6 +73,21 @@ ALTER TABLE org_keyrings
 -- unreachable.  Unsigned-only installs (desired_generation = 0) are never
 -- owed anything -- the trigger mirrors that predicate -- and the debt
 -- invariant is selector_bumps_owed > 0 => desired_generation > 0.
+--
+-- Scope note, honestly stated: this trigger fences KEYRING writers, the
+-- #130 revocation channel.  The other desired_generation writers (signed
+-- deploy accept, unlock, rollback, app delete) still bump desired_generation
+-- directly in both binaries, and a pre-0050 replica committing one of those
+-- AFTER the post-0050 reconciler consumed its debt could publish an
+-- unfiltered set at the bumped generation and wedge the new binary.  That
+-- sequence requires two API binaries alive at once after the new reconciler
+-- ran; deploy/api/deployment.yaml uses strategy Recreate and
+-- runbooks/paas-config-token-idempotency.md requires draining old API pods
+-- before the new binary, so the overlap window is the migration step alone --
+-- inside which the migration's own debt (owed >= 1) is still unconsumed and
+-- forces the new reconciler's first publication strictly ahead of anything
+-- the old replica wrote.  The drain contract, not this trigger, is the
+-- fence for those writers.
 ALTER TABLE kbs_signed_policy_reconciliation
     ADD COLUMN selector_bumps_owed bigint NOT NULL DEFAULT 0
         CHECK (selector_bumps_owed >= 0);
