@@ -706,11 +706,10 @@ pub async fn enqueue_signed_policy_revocation_if_active(
 }
 
 /// Enqueue a signed-policy recomputation only when CAP has already entered
-/// signed-policy mode.  Keyring rotation changes which retained artifacts are
-/// still authorized (#130); without a generation bump the reconciler would
-/// treat the changed candidate set at an unchanged generation as a conflict
-/// and keep the stale policy body live in Trustee.  Unsigned-only installs
-/// stay untouched.
+/// signed-policy mode.  Keyring writes no longer call this: migration
+/// 0050's `org_keyrings` INSERT trigger owes the bump inside the writer's
+/// own transaction (see [`consume_deferred_selector_bumps`]), which fences
+/// pre-0050 replicas too.  Unsigned-only installs stay untouched.
 pub async fn enqueue_signed_policy_reconciliation_if_active(
     tx: &mut Transaction<'_, Postgres>,
 ) -> Result<Option<i64>, KbsPolicyError> {
@@ -4187,8 +4186,8 @@ resource_bindings := {
     /// its own state clobbered by this test's final reset.  The process-local
     /// `SIGNED_POLICY_SINGLETON_LOCK` cannot fence across processes.
 
-    /// Migration 0050 marks its owed selector generation bump instead of
-    /// performing it, so a pre-0050 replica still reconciling during the
+    /// Migration 0050 owes selector generation bumps in a counter instead of
+    /// performing them, so a pre-0050 replica still reconciling during the
     /// rollout cannot consume the bump with its unfiltered candidate query.
     /// Only the post-0050 reconciler interprets the marker, exactly once, and
     /// never on behalf of an unsigned-only install -- what this test pins
