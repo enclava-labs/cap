@@ -215,12 +215,8 @@ struct SignedPolicyReconciliationRow {
     desired_generation: i64,
     configmap_generation: i64,
     applied_generation: i64,
-<<<<<<< HEAD
     withdrawal_bumps_owed: i64,
     selector_bumps_owed: i64,
-=======
-    selector_bump_pending: bool,
->>>>>>> 616e2743 (fix(api): publish deferred selector bump before committing its generation)
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -746,7 +742,6 @@ async fn enqueue_signed_policy_bootstrap_if_idle(
     Ok(result.rows_affected() == 1)
 }
 
-<<<<<<< HEAD
 /// Stray debts must not promote a legacy unsigned install into signed mode,
 /// where an empty artifact set would deny every workload.
 async fn clear_stray_policy_debts(db: &PgPool) -> Result<(), KbsPolicyError> {
@@ -758,73 +753,6 @@ async fn clear_stray_policy_debts(db: &PgPool) -> Result<(), KbsPolicyError> {
           WHERE singleton
             AND desired_generation = 0
             AND (selector_bumps_owed > 0 OR withdrawal_bumps_owed > 0)",
-=======
-/// Clear a stray deferred-selector marker from an unsigned-only row.
-///
-/// Migration 0050 marks the owed selector generation bump only where
-/// `desired_generation > 0` (its own WHERE clause, mirroring
-/// [`enqueue_signed_policy_reconciliation_if_active`]), so the marker
-/// invariant is `selector_bump_pending => desired_generation > 0`.  If a
-/// stray marker ever lands on an unsigned-only row (manual psql, a future
-/// backfill), it is cleared here without bumping so the install cannot be
-/// pushed into signed-policy mode.  This touches only the marker column, so
-/// it is invisible to pre-0050 replicas and safe at any point in a run.
-async fn clear_stray_selector_bump(db: &PgPool) -> Result<(), KbsPolicyError> {
-    sqlx::query(
-        "UPDATE kbs_signed_policy_reconciliation
-            SET selector_bump_pending = false,
-                updated_at = clock_timestamp()
-          WHERE singleton
-            AND selector_bump_pending
-            AND desired_generation = 0",
-    )
-    .execute(db)
-    .await?;
-    Ok(())
-}
-
-/// Commit the deferred candidate-selector generation bump marked by migration
-/// 0050 -- and ONLY once the filtered policy body is live in the ConfigMap.
-///
-/// Only the post-0050 implementation -- the one filtering signed-policy
-/// candidates by current keyring membership -- may interpret the marker.
-/// `deploy/api/deployment.yaml` runs the API with
-/// `DATABASE_MIGRATION_MODE=verify`, so the migration step can precede the
-/// new binary by minutes while a pre-0050 replica keeps reconciling every 30
-/// seconds: a generation bumped at migration time would be consumed by that
-/// replica's unfiltered candidate query and published as the old policy body
-/// at the new generation, after which this build would crash-loop on
-/// [`KbsPolicyError::PolicyGenerationConflict`] with no bump left to
-/// recover.
-///
-/// Publishing first and committing the increment second keeps that failure
-/// unreachable on every crash path.  Until this call, `desired_generation`
-/// stays unchanged and a pre-0050 reconciler keeps finding its unfiltered
-/// hash matching the published body: it stays quiescent.  The filtered
-/// replace annotates the ConfigMap with the owed generation while the durable
-/// desired generation is still behind it, so a pre-0050 reconciler treats it
-/// as [`GenerationDecision::Superseded`] and cannot overwrite; once the
-/// increment lands here, the same content-bound annotation turns any late
-/// unfiltered republication into a same-generation conflict.  A failure
-/// before the replace leaves the marker set and the increment uncommitted,
-/// so the next run simply republishes.
-///
-/// Consumption is a single guarded `UPDATE`, so concurrent replicas commit
-/// the marker exactly once and every later call is a no-op.  A marker on an
-/// unsigned-only row is never committed (the `desired_generation > 0` guard);
-/// [`clear_stray_selector_bump`] removes it instead.
-/// Returns the new desired generation when this call performed the bump.
-async fn commit_deferred_selector_bump(db: &PgPool) -> Result<Option<i64>, KbsPolicyError> {
-    let bumped: Option<i64> = sqlx::query_scalar(
-        "UPDATE kbs_signed_policy_reconciliation
-            SET desired_generation = desired_generation + 1,
-                selector_bump_pending = false,
-                updated_at = clock_timestamp()
-          WHERE singleton
-            AND selector_bump_pending
-            AND desired_generation > 0
-        RETURNING desired_generation",
->>>>>>> 616e2743 (fix(api): publish deferred selector bump before committing its generation)
     )
     .execute(db)
     .await?;
@@ -877,11 +805,7 @@ async fn consume_deferred_policy_debts(
     .bind(observed_withdrawal_bumps_owed)
     .fetch_optional(db)
     .await?;
-<<<<<<< HEAD
     Ok(committed)
-=======
-    Ok(bumped)
->>>>>>> 616e2743 (fix(api): publish deferred selector bump before committing its generation)
 }
 
 async fn load_signed_policy_reconciliation(
@@ -889,12 +813,8 @@ async fn load_signed_policy_reconciliation(
 ) -> Result<SignedPolicyReconciliationRow, KbsPolicyError> {
     Ok(sqlx::query_as(
         "SELECT desired_generation, configmap_generation, applied_generation,
-<<<<<<< HEAD
                 withdrawal_bumps_owed,
                 selector_bumps_owed
-=======
-                selector_bump_pending
->>>>>>> 616e2743 (fix(api): publish deferred selector bump before committing its generation)
            FROM kbs_signed_policy_reconciliation
           WHERE singleton",
     )
@@ -1088,13 +1008,6 @@ async fn load_signed_policy_candidates(
                    ORDER BY org_id, version DESC
               ) AS latest,
               jsonb_array_elements(latest.keyring->'members') AS member
-            -- Mirror the verifier's deploy-authority predicate
-            -- (enclava-verifier artifacts.rs: only owner/admin/deployer
-            -- members may sign policy).  A member without a string role
-            -- matches neither side and is excluded here, exactly as
-            -- verification would reject its artifacts -- fail closed if a
-            -- non-deploy role is ever added to keyring payloads.
-            WHERE (member.value->>'role') IN ('owner', 'admin', 'deployer')
         ),
         eligible_current_job_operations AS (
             SELECT *
@@ -1621,18 +1534,8 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
     expected_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
     client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
-<<<<<<< HEAD
     // Do not let stray debt opt an unsigned installation into signed mode.
     clear_stray_policy_debts(db).await?;
-=======
-    // Clear any stray deferred-selector marker on an unsigned-only row (see
-    // clear_stray_selector_bump).  A marker on a signed-mode row is left in
-    // place here on purpose: the owed generation bump (migration 0050) is
-    // published first and committed only after the filtered ConfigMap replace
-    // succeeded (commit_deferred_selector_bump below), so no failure in this
-    // run can expose a raw bumped generation to a pre-0050 reconciler.
-    clear_stray_selector_bump(db).await?;
->>>>>>> 616e2743 (fix(api): publish deferred selector bump before committing its generation)
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
         let state = load_signed_policy_reconciliation(db).await?;
@@ -1677,18 +1580,9 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             // recursive, so one edge needs indirection.
             return Box::pin(reconcile_legacy_rego_policy_with_client(db, config, client)).await;
         }
-<<<<<<< HEAD
         // Keep the owed generation private until the filtered body is published.
         let generation =
             state.desired_generation + state.selector_bumps_owed + state.withdrawal_bumps_owed;
-=======
-        // A pending deferred selector bump (migration 0050) publishes the
-        // owed generation as desired_generation + 1 without committing the
-        // increment yet -- commit_deferred_selector_bump does that only after
-        // the filtered replace below.  Pre-0050 replicas reading the same row
-        // keep seeing the unchanged desired_generation and stay quiescent.
-        let generation = state.desired_generation + i64::from(state.selector_bump_pending);
->>>>>>> 616e2743 (fix(api): publish deferred selector bump before committing its generation)
         let reset_bootstrap = state.configmap_generation == 0 && state.applied_generation == 0;
         let previously_applied = state.applied_generation >= generation;
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
@@ -1768,7 +1662,6 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             } => (true, resource_version, publication_token),
             ConfigMapConvergence::Superseded => continue,
         };
-<<<<<<< HEAD
         // Commit both debts after publication. A concurrent revocation changes
         // the observed triple, so retry with fresh candidates instead of sealing
         // a stale policy generation.
@@ -1783,19 +1676,6 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             .is_none()
         {
             continue;
-=======
-        // The filtered body is now live at `generation` with its content-bound
-        // generation annotation, and only now is the owed increment (migration
-        // 0050) safe to commit: while `desired_generation` was still behind,
-        // a pre-0050 reconciler saw the annotated generation as Superseded and
-        // could not overwrite; after the increment lands, the same annotation
-        // turns any late unfiltered republication into a same-generation
-        // conflict.  Committing before this replace would expose a raw bumped
-        // generation that a pre-0050 reconciler could consume with its
-        // unfiltered query whenever this run fails before publishing.
-        if state.selector_bump_pending {
-            commit_deferred_selector_bump(db).await?;
->>>>>>> 616e2743 (fix(api): publish deferred selector bump before committing its generation)
         }
         if !reset_bootstrap
             && !record_configmap_generation(db, generation, &policy_sha256, &resource_version)
@@ -4285,15 +4165,13 @@ resource_bindings := {
     /// Migration 0050 marks its owed selector generation bump instead of
     /// performing it, so a pre-0050 replica still reconciling during the
     /// rollout cannot consume the bump with its unfiltered candidate query.
-    /// Only the post-0050 reconciler interprets the marker, exactly once --
-    /// and only after the filtered policy body is published
-    /// (commit_deferred_selector_bump) -- and never on behalf of an
-    /// unsigned-only install, which clear_stray_selector_bump disarms without
-    /// bumping.  What this test pins down.  Runs against its own per-process
-    /// database: like the rotation test, it asserts exact singleton state that
-    /// another test process could perturb through the shared server.
+    /// Only the post-0050 reconciler interprets the marker, exactly once, and
+    /// never on behalf of an unsigned-only install -- what this test pins
+    /// down.  Runs against its own per-process database: like the rotation
+    /// test, it asserts exact singleton state that another test process could
+    /// perturb through the shared server.
     #[tokio::test]
-    async fn deferred_selector_bump_is_committed_once_by_the_filtered_reconciler() {
+    async fn deferred_selector_bump_is_consumed_once_by_the_filtered_reconciler() {
         let (_db_cleanup, pool) =
             crate::test_support::isolated_database_test_pool("cap130_selector_bump").await;
         sqlx::query(
@@ -4306,11 +4184,11 @@ resource_bindings := {
         .await
         .unwrap();
 
-        // Nothing marked: committing is a no-op.
-        assert_eq!(commit_deferred_selector_bump(&pool).await.unwrap(), None);
+        // Nothing marked: consuming is a no-op.
+        assert_eq!(consume_deferred_selector_bump(&pool).await.unwrap(), None);
 
-        // Migration 0050 marks signed-mode installs; the post-publication
-        // commit performs the bump exactly once and clears the marker.
+        // Migration 0050 marks signed-mode installs; consumption performs the
+        // bump exactly once and clears the marker.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
                 SET desired_generation = 3,
@@ -4320,7 +4198,10 @@ resource_bindings := {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(commit_deferred_selector_bump(&pool).await.unwrap(), Some(4));
+        assert_eq!(
+            consume_deferred_selector_bump(&pool).await.unwrap(),
+            Some(4)
+        );
         let (desired, pending): (i64, bool) = sqlx::query_as(
             "SELECT desired_generation, selector_bump_pending
                FROM kbs_signed_policy_reconciliation
@@ -4330,12 +4211,10 @@ resource_bindings := {
         .await
         .unwrap();
         assert_eq!((desired, pending), (4, false));
-        assert_eq!(commit_deferred_selector_bump(&pool).await.unwrap(), None);
+        assert_eq!(consume_deferred_selector_bump(&pool).await.unwrap(), None);
 
         // A stray marker on an unsigned-only install must never push it into
-        // signed-policy mode: the commit refuses to bump it (and leaves the
-        // marker for the stray cleanup), and clear_stray_selector_bump then
-        // disarms it without touching desired_generation.
+        // signed-policy mode: the marker is cleared without bumping.
         sqlx::query(
             "UPDATE kbs_signed_policy_reconciliation
                 SET desired_generation = 0,
@@ -4345,8 +4224,7 @@ resource_bindings := {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(commit_deferred_selector_bump(&pool).await.unwrap(), None);
-        clear_stray_selector_bump(&pool).await.unwrap();
+        assert_eq!(consume_deferred_selector_bump(&pool).await.unwrap(), None);
         let (desired, pending): (i64, bool) = sqlx::query_as(
             "SELECT desired_generation, selector_bump_pending
                FROM kbs_signed_policy_reconciliation
@@ -4511,7 +4389,6 @@ resource_bindings := {
         crate::test_support::drop_isolated_database("cap130_selector_rotation", pool).await;
     }
 
-<<<<<<< HEAD
     #[tokio::test]
     async fn duplicate_keyring_members_authorize_each_legacy_artifact_once() {
         let (_db_cleanup, pool) =
@@ -4558,8 +4435,6 @@ resource_bindings := {
         crate::test_support::drop_isolated_database("cap_pr187_duplicate_members", pool).await;
     }
 
-=======
->>>>>>> 616e2743 (fix(api): publish deferred selector bump before committing its generation)
     /// Fail closed for #130: an org with retained artifacts but no keyring row
     /// at all must contribute no authorization -- the INNER JOIN drops it, and
     /// the deferred selector bump publishes exactly that withdrawal on upgrade.
@@ -4592,7 +4467,6 @@ resource_bindings := {
             "artifacts of an org without any keyring row must contribute no authority"
         );
         crate::test_support::drop_isolated_database("cap130_selector_fail_closed", pool).await;
-<<<<<<< HEAD
     }
 
     #[tokio::test]
@@ -5541,8 +5415,6 @@ resource_bindings := {
         );
 
         crate::test_support::drop_isolated_database("cap187_dedup_member_keys", pool).await;
-=======
->>>>>>> 616e2743 (fix(api): publish deferred selector bump before committing its generation)
     }
 
     #[tokio::test]
