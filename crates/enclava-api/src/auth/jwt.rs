@@ -143,7 +143,9 @@ fn config_validator() -> Validation {
 fn signer_rotation_validator() -> Validation {
     let mut validation = Validation::new(Algorithm::HS256);
     // Rotation tokens live 10 minutes; a 60 s default leeway would be 10% of
-    // their lifetime.
+    // their lifetime. The exact same second-truncated clock is used at issue
+    // time (see issue_signer_rotation_token), so no leeway is needed for
+    // sub-second rounding either.
     validation.leeway = 0;
     validation.set_required_spec_claims(&["sub", "exp", "iat", "iss", "aud"]);
     validation.set_issuer(&[TOKEN_ISSUER]);

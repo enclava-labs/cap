@@ -3,9 +3,11 @@ use super::{
     SignerRotationTokenRequest, WorkloadTeardownDecision, app_delete_failure, create_app,
     delete_tenant_namespace_with_timeouts, derive_identity, egress_allowlist_host_audit_reasons,
     issue_signer_rotation_token_route, list_apps, post_workload_teardown,
-    request_workload_teardown, requires_workload_teardown, validate_egress_allowlist,
-    validate_egress_mode, workload_teardown_http_failure, workload_teardown_instance_id,
+    request_workload_teardown, requires_workload_teardown, rotate_signer,
+    validate_egress_allowlist, validate_egress_mode, workload_teardown_http_failure,
+    workload_teardown_instance_id,
 };
+use crate::auth::jwt::SignerRotationTokenInput;
 use crate::auth::middleware::AuthContext;
 use crate::models::{App, AppStatus, Role, UnlockMode};
 use axum::Json;
@@ -759,4 +761,260 @@ async fn signer_rotation_token_rejects_api_key_before_database_access() {
     };
 
     assert_eq!(err.0, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn signer_rotation_token_is_single_use_and_withdraws_rotated_out_artifacts() {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect signer rotation regression database");
+    crate::db::pool::run_migrations(&pool)
+        .await
+        .expect("migrate signer rotation regression database");
+
+    let org_id = uuid::Uuid::new_v4();
+    let user_id = uuid::Uuid::new_v4();
+    let app_id = uuid::Uuid::new_v4();
+    let suffix = app_id.simple().to_string();
+    sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+        .bind(org_id)
+        .bind(format!("signer-rotation-{suffix}"))
+        .bind(&suffix[..8])
+        .execute(&pool)
+        .await
+        .expect("insert signer rotation organization");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'rotation owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert signer rotation user");
+    sqlx::query(
+        "INSERT INTO memberships (user_id, org_id, role, created_at, removed_at)
+         VALUES ($1, $2, 'owner', now(), NULL)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert signer rotation membership");
+    // memberships has no removed_at column in some revisions; fall back to a
+    // plain owner membership when the above conflicts are impossible.
+    sqlx::query(
+        "INSERT INTO apps (
+             id, org_id, name, namespace, instance_id, tenant_id,
+             service_account, bootstrap_owner_pubkey_hash,
+             tenant_instance_identity_hash, domain, status,
+             signer_identity_subject, signer_identity_issuer
+         ) VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+             'running'::app_status_enum, $11, $12
+         )",
+    )
+    .bind(app_id)
+    .bind(org_id)
+    .bind(format!("app-{}", &suffix[..12]))
+    .bind(format!("cap-{}", &suffix[..12]))
+    .bind(format!("instance-{suffix}"))
+    .bind(&suffix[..8])
+    .bind(format!("cap-{}-sa", &suffix[..12]))
+    .bind("11".repeat(32))
+    .bind("22".repeat(32))
+    .bind(format!("{}.example.test", &suffix[..12]))
+    .bind("https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main")
+    .bind("https://token.actions.githubusercontent.com")
+    .execute(&pool)
+    .await
+    .expect("insert signer rotation app");
+
+    // A retained artifact signed under the previous identity.
+    let deploy_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
+         VALUES ($1, $2, $3, 'healthy'::deploy_status_enum, '{}'::jsonb)",
+    )
+    .bind(deploy_id)
+    .bind(org_id)
+    .bind(app_id)
+    .execute(&pool)
+    .await
+    .expect("insert signer rotation deployment");
+    let descriptor_core_hash: Vec<u8> = (0..32)
+        .map(|i| (app_id.as_bytes()[i % 16] as u16 + i as u16) as u8)
+        .collect();
+    let artifact_json = serde_json::json!({
+        "signer_identity": {
+            "subject": "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main",
+            "issuer": "https://token.actions.githubusercontent.com",
+        }
+    });
+    sqlx::query(
+        "INSERT INTO workload_artifacts (
+             descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+             descriptor_signature, descriptor_signing_key_id,
+             org_keyring_payload, org_keyring_signature, signed_policy_artifact
+         ) VALUES ($1, $2, $3, $4, $5, 'test-key', '{}'::jsonb, $6, '{}'::jsonb)",
+    )
+    .bind(&descriptor_core_hash)
+    .bind(app_id)
+    .bind(deploy_id)
+    .bind(&artifact_json)
+    .bind(vec![1u8; 64])
+    .bind(vec![2u8; 64])
+    .execute(&pool)
+    .await
+    .expect("insert rotated-out workload artifact");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let hmac_key = [7u8; 32];
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "signer-rotation-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://token.actions.githubusercontent.com";
+
+    let token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue signer rotation token");
+
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load app name");
+
+    let Json(rotated) = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name.clone()),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+            email_confirmation_token: Some(token.clone()),
+        }),
+    )
+    .await
+    .expect("first rotation succeeds");
+    assert_eq!(
+        rotated.signer_identity_subject.as_deref(),
+        Some(new_subject)
+    );
+
+    // The rotated-out artifact is withdrawn from KBS policy.
+    let withdrawn: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM withdrawn_signer_artifacts
+          WHERE descriptor_core_hash = $1 AND app_id = $2",
+    )
+    .bind(&descriptor_core_hash)
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count withdrawn artifacts");
+    assert_eq!(
+        withdrawn, 1,
+        "rotation must withdraw the old-signer artifact"
+    );
+    // And a signed-policy generation was enqueued durably.
+    let desired: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read desired generation");
+    assert!(desired > 0, "rotation must enqueue policy reconciliation");
+
+    // Rotate back to the previous identity so the original token's claims
+    // (previous=old, new=new) match again, then replay it: it must be
+    // rejected because its jti was consumed.
+    let rotate_back_token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: new_subject.to_string(),
+            previous_issuer: new_issuer.to_string(),
+            new_subject: previous_subject.to_string(),
+            new_issuer: previous_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue rotate-back token");
+    let Json(_) = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name.clone()),
+        Json(RotateSignerRequest {
+            subject: previous_subject.to_string(),
+            issuer: previous_issuer.to_string(),
+            email_confirmation_token: Some(rotate_back_token),
+        }),
+    )
+    .await
+    .expect("rotate back succeeds");
+
+    let replay = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name.clone()),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+            email_confirmation_token: Some(token),
+        }),
+    )
+    .await;
+    let err = match replay {
+        Ok(_) => panic!("consumed signer rotation token was replayable"),
+        Err(err) => err,
+    };
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete signer rotation audit rows");
+    sqlx::query("DELETE FROM consumed_signer_rotation_tokens WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete signer rotation consumed tokens");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete signer rotation fixture");
+}
+
+fn clone_auth(auth: &AuthContext) -> AuthContext {
+    AuthContext {
+        user_id: auth.user_id,
+        org_id: auth.org_id,
+        org_name: auth.org_name.clone(),
+        role: auth.role,
+        api_key: auth.api_key.clone(),
+        management_origin: auth.management_origin,
+    }
 }

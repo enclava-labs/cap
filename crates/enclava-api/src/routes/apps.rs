@@ -1838,6 +1838,43 @@ pub(crate) async fn delete_app_before(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Record that every retained workload artifact whose signed descriptor
+/// still carries the rotated-out signer identity is withdrawn from KBS
+/// policy. The signed-policy selector
+/// (crate::kbs::load_signed_policy_candidates) refuses withdrawn hashes, so
+/// the live Trustee policy stops admitting the previous signer without
+/// mutating the immutable artifact rows.
+async fn withdraw_signer_rotated_out_artifacts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app_id: Uuid,
+    previous_subject: &str,
+    previous_issuer: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO withdrawn_signer_artifacts (
+             descriptor_core_hash, app_id
+         )
+         SELECT artifact.descriptor_core_hash, artifact.app_id
+           FROM workload_artifacts AS artifact
+          WHERE artifact.app_id = $1
+            AND artifact.descriptor_payload -> 'signer_identity' ->> 'subject' = $2
+            AND artifact.descriptor_payload -> 'signer_identity' ->> 'issuer' = $3
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM withdrawn_signer_artifacts AS existing
+                 WHERE existing.descriptor_core_hash
+                     = artifact.descriptor_core_hash
+            )
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(app_id)
+    .bind(previous_subject)
+    .bind(previous_issuer)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RotateSignerRequest {
     pub subject: String,
@@ -2114,6 +2151,10 @@ pub async fn rotate_signer(
         ));
     }
 
+    // Claims of the verified rotation token; present for every non-initial
+    // rotation (consumed atomically below, issue #119).
+    let mut signer_rotation_claims = None;
+
     if !is_initial_set {
         let expected = SignerRotationTokenInput {
             user_id: auth.user_id,
@@ -2124,7 +2165,10 @@ pub async fn rotate_signer(
             new_subject: subject.clone(),
             new_issuer: issuer.clone(),
         };
-        verify_signer_rotation_token(
+        // Consume the token's jti atomically with the rotation below: a
+        // token that was already used for this exact rotation is rejected
+        // (issue #119).
+        let claims = verify_signer_rotation_token(
             state.hmac_key.as_ref(),
             confirmation_token.expect("checked above"),
             &expected,
@@ -2135,6 +2179,7 @@ pub async fn rotate_signer(
                 Json(serde_json::json!({"error": "invalid email_confirmation_token"})),
             )
         })?;
+        signer_rotation_claims = Some(claims);
     }
 
     sqlx::query(
@@ -2152,9 +2197,64 @@ pub async fn rotate_signer(
     .await
     .map_err(|_| internal_server_error())?;
 
-    // Audit. TODO(phase-2): the rotated signer_identity must be re-rendered
-    // into the KBS Rego policy for this app once the Phase 2 policy
-    // templates land.
+    if !is_initial_set {
+        let claims = signer_rotation_claims
+            .take()
+            .expect("non-initial rotations verify a token above");
+        // Consume the token's jti atomically with the rotation below. A jti
+        // that was already consumed is a replay and aborts the transaction
+        // before any state changes (issue #119).
+        let consumed = sqlx::query(
+            "INSERT INTO consumed_signer_rotation_tokens (
+                 jti, user_id, org_id, app_id, subject, issuer, expires_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))
+             ON CONFLICT (jti) DO NOTHING",
+        )
+        .bind(&claims.jti)
+        .bind(auth.user_id)
+        .bind(auth.org_id)
+        .bind(app.id)
+        .bind(&subject)
+        .bind(&issuer)
+        .bind(claims.exp)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| internal_server_error())?
+        .rows_affected();
+        if consumed == 0 {
+            tracing::warn!(
+                app_id = %app.id,
+                user_id = %auth.user_id,
+                "rejected replayed signer rotation token"
+            );
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "invalid email_confirmation_token"})),
+            ));
+        }
+
+        // Withdraw KBS trust from every retained artifact signed under the
+        // rotated-out identity and durably re-render the policy, so the live
+        // Trustee config no longer admits the previous signer (issue #119).
+        let rotated_artifacts = withdraw_signer_rotated_out_artifacts(
+            &mut tx,
+            app.id,
+            &previous_subject.clone().unwrap_or_default(),
+            &previous_issuer.clone().unwrap_or_default(),
+        )
+        .await
+        .map_err(|_| internal_server_error())?;
+        if rotated_artifacts > 0 {
+            crate::kbs::enqueue_signed_policy_reconciliation(&mut tx)
+                .await
+                .map_err(|_| internal_server_error())?;
+        }
+    }
+
+    // Audit. The rotated signer identity is reflected in the live KBS policy
+    // by withdrawing rotated-out artifacts above; a deployment under the new
+    // identity commits a fresh artifact in the same lane.
     let action = if is_initial_set {
         "app.signer.set"
     } else {
