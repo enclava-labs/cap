@@ -3396,10 +3396,17 @@ mod tests {
         };
         let descriptor_hash = descriptor_core_hash(&descriptor);
         // Decode through the production adapter so the runtime binding uses
-        // the exact CE-v1 keyring fingerprint implementation.
+        // the exact CE-v1 keyring fingerprint implementation. decode_optional_blobs
+        // verifies customer signatures at decode time (#128), so the provisional
+        // descriptor must carry a real signature from the fixture owner key.
         let provisional_descriptor_blob = serde_json::json!({
             "descriptor": descriptor,
-            "signature": "00".repeat(64),
+            "signature": hex::encode(
+                authority
+                    .owner_key
+                    .sign(&descriptor_canonical_bytes(&descriptor))
+                    .to_bytes()
+            ),
             "signing_key_id": "durable-owner",
             "signing_pubkey": hex::encode(authority.owner_key.verifying_key().to_bytes()),
         })

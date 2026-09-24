@@ -237,7 +237,7 @@ pub struct AuthorizedSignerResponse {
 
 type KeyringRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SignedOrgKeyring {
     org_id: Uuid,
     version: u64,
@@ -245,16 +245,23 @@ struct SignedOrgKeyring {
     updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SignedOrgKeyringMember {
     user_id: Uuid,
-    #[serde(deserialize_with = "deserialize_pubkey")]
+    #[serde(
+        deserialize_with = "deserialize_pubkey",
+        serialize_with = "serialize_pubkey"
+    )]
     pubkey: [u8; 32],
     role: SignedOrgKeyringRole,
     added_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+fn serialize_pubkey<S: serde::Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&hex::encode(b))
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SignedOrgKeyringRole {
     Owner,
@@ -457,7 +464,12 @@ pub async fn put_keyring(
         .verify(&canonical_bytes, &signature_obj)
         .map_err(|_| bad_request("keyring signature verification failed"))?;
 
-    let keyring_payload_bytes = serde_json::to_vec(&body.keyring_payload).map_err(|_| {
+    // #128: store the normalized typed keyring, not the raw request JSON, so
+    // unknown fields cannot be registered (200) and then break the strict
+    // deny_unknown_fields parse in verify_matches_latest_cap_keyring at
+    // deploy time (fail-closed 500). Signatures cover the canonical bytes,
+    // which are computed from the typed keyring either way.
+    let keyring_payload_bytes = serde_json::to_vec(&keyring).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "serialization error"})),

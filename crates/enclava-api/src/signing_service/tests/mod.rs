@@ -219,28 +219,49 @@ fn agent_policy_response_for(artifact: &SignedPolicyArtifact) -> AgentPolicyResp
 
 #[test]
 fn decodes_descriptor_and_keyring_blobs() {
+    // #128: decode verifies the customer signatures, so both envelopes are
+    // signed with real keys (descriptor: deployer key, keyring: owner key).
+    let deployer_key = SigningKey::from_bytes(&[0xbb; 32]);
+    let owner_key = SigningKey::from_bytes(&[0xdd; 32]);
     let descriptor = descriptor();
     let descriptor_blob = serde_json::json!({
         "descriptor": descriptor,
-        "signature": "aa".repeat(64),
+        "signature": hex::encode(
+            deployer_key
+                .sign(&enclava_common::descriptor::descriptor_canonical_bytes(&descriptor))
+                .to_bytes()
+        ),
         "signing_key_id": "deployer-key-1",
-        "signing_pubkey": "bb".repeat(32)
+        "signing_pubkey": hex::encode(deployer_key.verifying_key().to_bytes()),
     })
     .to_string();
+    let keyring = OrgKeyring {
+        org_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+        version: 1,
+        members: vec![
+            TestKeyringMember {
+                user_id: Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),
+                pubkey: deployer_key.verifying_key().to_bytes(),
+                role: KeyringRole::Deployer,
+                added_at: "2026-04-01T00:00:00Z".parse().unwrap(),
+            },
+            TestKeyringMember {
+                user_id: Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap(),
+                pubkey: owner_key.verifying_key().to_bytes(),
+                role: KeyringRole::Owner,
+                added_at: "2026-04-01T00:00:00Z".parse().unwrap(),
+            },
+        ],
+        updated_at: "2026-04-01T00:00:00Z".parse().unwrap(),
+    };
     let keyring_blob = serde_json::json!({
-        "keyring": {
-            "org_id": "11111111-1111-1111-1111-111111111111",
-            "version": 1,
-            "members": [{
-                "user_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
-                "pubkey": "bb".repeat(32),
-                "role": "deployer",
-                "added_at": "2026-04-01T00:00:00Z"
-            }],
-            "updated_at": "2026-04-01T00:00:00Z"
-        },
-        "signature": "cc".repeat(64),
-        "signing_pubkey": "dd".repeat(32)
+        "keyring": keyring,
+        "signature": hex::encode(
+            owner_key
+                .sign(&canonical_keyring_bytes(&keyring))
+                .to_bytes()
+        ),
+        "signing_pubkey": hex::encode(owner_key.verifying_key().to_bytes()),
     })
     .to_string();
 
@@ -251,8 +272,10 @@ fn decodes_descriptor_and_keyring_blobs() {
         decoded.descriptor_core_hash,
         descriptor_core_hash(&decoded.descriptor)
     );
-    assert_eq!(decoded.descriptor_signing_pubkey, [0xbb; 32]);
-    assert_eq!(decoded.descriptor_signature, [0xaa; 64]);
+    assert_eq!(
+        decoded.descriptor_signing_pubkey,
+        deployer_key.verifying_key().to_bytes()
+    );
     assert_ne!(decoded.org_keyring_fingerprint, [0; 32]);
 }
 
@@ -373,6 +396,395 @@ fn rejects_partial_blobs() {
 }
 
 #[test]
+fn rejects_oversized_signing_blobs_before_parsing() {
+    // #128: per-blob byte caps must reject oversized payloads before any
+    // base64 decoding or JSON parsing, regardless of content validity.
+    let mut descriptor = descriptor();
+    descriptor.app_name = "x".repeat(300 * 1024);
+    let descriptor_blob = serde_json::json!({
+        "descriptor": descriptor,
+        "signature": "aa".repeat(64),
+        "signing_key_id": "deployer-key-1",
+        "signing_pubkey": "bb".repeat(32)
+    })
+    .to_string();
+    assert!(descriptor_blob.len() > MAX_DESCRIPTOR_BLOB_BYTES);
+
+    let err = decode_optional_blobs(Some(descriptor_blob), Some(valid_keyring_blob())).unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg)
+            if msg.contains("customer_descriptor_blob") && msg.contains("exceeds")),
+        "got: {err:?}"
+    );
+
+    let mut keyring_value: serde_json::Value = serde_json::from_str(&valid_keyring_blob()).unwrap();
+    keyring_value["keyring"].as_object_mut().unwrap().insert(
+        "padding".to_string(),
+        serde_json::json!("e".repeat(300 * 1024)),
+    );
+    let err = decode_optional_blobs(
+        Some(valid_descriptor_blob()),
+        Some(keyring_value.to_string()),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg)
+            if msg.contains("org_keyring_blob") && msg.contains("exceeds")),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn blob_cap_boundary_is_exact() {
+    // #128: a blob at exactly the cap is not rejected as oversized (it then
+    // fails signature checks, which is fine); one byte over is rejected as
+    // oversized before parsing.
+    let mut blob: String = "{".to_string();
+    blob.push_str(&" ".repeat(MAX_ORG_KEYRING_BLOB_BYTES - 2));
+    blob.push('}');
+    assert_eq!(blob.len(), MAX_ORG_KEYRING_BLOB_BYTES);
+    let err = decode_optional_blobs(Some(valid_descriptor_blob()), Some(blob.clone())).unwrap_err();
+    assert!(
+        !matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("exceeds")),
+        "at-cap blob must not be rejected as oversized: {err:?}"
+    );
+    // Grow INSIDE the trimmed region (trailing whitespace is trimmed).
+    blob.insert(blob.len() - 1, ' ');
+    assert!(blob.trim().len() > MAX_ORG_KEYRING_BLOB_BYTES);
+    let err = decode_optional_blobs(Some(valid_descriptor_blob()), Some(blob)).unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("exceeds")),
+        "got: {err:?}"
+    );
+}
+
+fn valid_descriptor_blob() -> String {
+    serde_json::json!({
+        "descriptor": descriptor(),
+        "signature": "aa".repeat(64),
+        "signing_key_id": "deployer-key-1",
+        "signing_pubkey": "bb".repeat(32)
+    })
+    .to_string()
+}
+
+/// Build a fully signed blob pair (descriptor signed by the deployer key,
+/// keyring signed by the owner key) for decode-path tests (#128).
+fn signed_blob_pair() -> (String, String, SigningKey, SigningKey) {
+    let deployer_key = SigningKey::from_bytes(&[0xbb; 32]);
+    let owner_key = SigningKey::from_bytes(&[0xdd; 32]);
+    let descriptor = descriptor();
+    let descriptor_blob = serde_json::json!({
+        "descriptor": descriptor,
+        "signature": hex::encode(
+            deployer_key
+                .sign(&enclava_common::descriptor::descriptor_canonical_bytes(&descriptor))
+                .to_bytes()
+        ),
+        "signing_key_id": "deployer-key-1",
+        "signing_pubkey": hex::encode(deployer_key.verifying_key().to_bytes()),
+    })
+    .to_string();
+    let keyring = OrgKeyring {
+        org_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+        version: 1,
+        members: vec![TestKeyringMember {
+            user_id: Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap(),
+            pubkey: owner_key.verifying_key().to_bytes(),
+            role: TestKeyringRole::Owner,
+            added_at: "2026-04-01T00:00:00Z".parse().unwrap(),
+        }],
+        updated_at: "2026-04-01T00:00:00Z".parse().unwrap(),
+    };
+    let keyring_blob = serde_json::json!({
+        "keyring": keyring,
+        "signature": hex::encode(
+            owner_key
+                .sign(&canonical_keyring_bytes_test(&keyring))
+                .to_bytes()
+        ),
+        "signing_pubkey": hex::encode(owner_key.verifying_key().to_bytes()),
+    })
+    .to_string();
+    (descriptor_blob, keyring_blob, deployer_key, owner_key)
+}
+
+#[test]
+fn decode_rejects_tampered_customer_signatures() {
+    // #128 (review warning 2): the decode-time customer-signature verify
+    // must actually bite — a tampered signature surfaces InvalidSignature
+    // from decode_optional_blobs itself, before any hash/fingerprint work
+    // or caller-side semantic comparison.
+    let (descriptor_blob, keyring_blob, _deployer_key, _owner_key) = signed_blob_pair();
+    // Sanity: the untampered pair decodes.
+    assert!(
+        decode_optional_blobs(Some(descriptor_blob.clone()), Some(keyring_blob.clone()))
+            .unwrap()
+            .is_some()
+    );
+
+    // Tampered descriptor signature.
+    let mut value: serde_json::Value = serde_json::from_str(&descriptor_blob).unwrap();
+    value["signature"] = serde_json::json!(hex::encode([0x99; 64]));
+    let err =
+        decode_optional_blobs(Some(value.to_string()), Some(keyring_blob.clone())).unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::InvalidSignature),
+        "tampered descriptor signature must fail as InvalidSignature, got: {err:?}"
+    );
+
+    // Tampered keyring signature.
+    let mut value: serde_json::Value = serde_json::from_str(&keyring_blob).unwrap();
+    value["signature"] = serde_json::json!(hex::encode([0x99; 64]));
+    let err = decode_optional_blobs(Some(descriptor_blob), Some(value.to_string())).unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::InvalidSignature),
+        "tampered keyring signature must fail as InvalidSignature, got: {err:?}"
+    );
+
+    // Tampered keyring whose embedded signing_pubkey is NOT an owner member
+    // must still surface InvalidSignature (crypto first), not a semantic
+    // Mismatch("org_keyring.signing_pubkey owner member").
+    let stray_key = SigningKey::from_bytes(&[0xee; 32]);
+    let mut keyring_value: serde_json::Value = serde_json::from_str(&keyring_blob).unwrap();
+    keyring_value["signature"] = serde_json::json!(hex::encode(
+        stray_key
+            .sign(&canonical_keyring_bytes_test(&valid_keyring()))
+            .to_bytes()
+    ));
+    keyring_value["signing_pubkey"] =
+        serde_json::json!(hex::encode(stray_key.verifying_key().to_bytes()));
+    let err = decode_optional_blobs(Some(signed_blob_pair().0), Some(keyring_value.to_string()))
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::InvalidSignature),
+        "bad keyring signature under a non-owner pubkey must fail as InvalidSignature, got: {err:?}"
+    );
+}
+
+fn valid_keyring() -> OrgKeyring {
+    OrgKeyring {
+        org_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+        version: 1,
+        members: vec![],
+        updated_at: "2026-04-01T00:00:00Z".parse().unwrap(),
+    }
+}
+
+#[test]
+fn max_legal_caps_compose_under_proof_bundle_budgets() {
+    // #128 (review warning 1): a max-legal combination (rego at
+    // MAX_REGO_TEXT_BYTES, agent policy at MAX_POLICY_TEXT_BYTES) must
+    // produce workload_artifacts_json and trustee_policy_json that both fit
+    // the downstream verifier field budgets, so ingress acceptance implies
+    // launchability.
+    let artifacts = signing_artifacts(descriptor());
+    let mut artifact = signed_policy_artifact(&artifacts, &SigningKey::from_bytes(&[0x11; 32]));
+    artifact.rego_text = "r".repeat(MAX_REGO_TEXT_BYTES);
+    artifact.agent_policy_text = "a".repeat(MAX_POLICY_TEXT_BYTES);
+    // The stored row carries the attached keyring envelope.
+    artifacts.attach_customer_authority(&mut artifact).unwrap();
+
+    let workload = workload_artifacts_json(&artifacts, &artifact).unwrap();
+    assert!(
+        workload.len() <= MAX_WORKLOAD_ARTIFACTS_JSON_BYTES,
+        "max-legal compose produced workload_artifacts_json of {} bytes (budget {})",
+        workload.len(),
+        MAX_WORKLOAD_ARTIFACTS_JSON_BYTES
+    );
+    let trustee = trustee_policy_json(&artifact).unwrap();
+    assert!(
+        trustee.len() <= MAX_TRUSTEE_POLICY_JSON_BYTES,
+        "max-legal compose produced trustee_policy_json of {} bytes (budget {})",
+        trustee.len(),
+        MAX_TRUSTEE_POLICY_JSON_BYTES
+    );
+    // The exact-budget check accepts the max-legal composition.
+    validate_proof_bundle_budget(&artifacts, &artifact).unwrap();
+}
+
+#[test]
+fn over_budget_composition_is_rejected_at_ingress() {
+    // #128: validate_proof_bundle_budget itself must reject compositions
+    // over either proof-bundle budget. The per-field caps are derived so a
+    // capped artifact cannot reach these budgets (asserted above); this test
+    // pins the guard that fires if the caps and budgets ever drift apart
+    // (e.g. someone raises MAX_REGO_TEXT_BYTES without re-deriving).
+    let artifacts = signing_artifacts(descriptor());
+    let mut artifact = signed_policy_artifact(&artifacts, &SigningKey::from_bytes(&[0x11; 32]));
+    // Uncapped rego text that alone exceeds the trustee budget.
+    artifact.rego_text = "r".repeat(MAX_TRUSTEE_POLICY_JSON_BYTES + 1024);
+    artifacts.attach_customer_authority(&mut artifact).unwrap();
+    let err = validate_proof_bundle_budget(&artifacts, &artifact).unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("trustee_policy_json")),
+        "expected trustee budget rejection, got: {err:?}"
+    );
+
+    // Workload-budget rejection: everything within field caps except a
+    // descriptor payload large enough to blow the 196_608-byte composed
+    // budget (descriptor blob cap is per-ingress-blob; the stored payload
+    // path composes descriptor + keyring + policy).
+    let mut artifacts = signing_artifacts(descriptor());
+    let mut padded = descriptor();
+    padded.oci_runtime_spec.env = vec![EnvVar {
+        name: "PAD".to_string(),
+        value: "v".repeat(200 * 1024),
+    }];
+    artifacts.descriptor = padded;
+    let mut artifact = signed_policy_artifact(
+        &signing_artifacts(descriptor()),
+        &SigningKey::from_bytes(&[0x11; 32]),
+    );
+    artifacts.attach_customer_authority(&mut artifact).unwrap();
+    let err = validate_proof_bundle_budget(&artifacts, &artifact).unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("workload_artifacts_json")),
+        "expected workload budget rejection, got: {err:?}"
+    );
+}
+
+fn valid_keyring_blob() -> String {
+    serde_json::json!({
+        "keyring": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "version": 1,
+            "members": [],
+            "updated_at": "2026-04-01T00:00:00Z"
+        },
+        "signature": "cc".repeat(64),
+        "signing_pubkey": "dd".repeat(32)
+    })
+    .to_string()
+}
+
+#[test]
+fn rejects_unknown_fields_in_signing_envelopes() {
+    // #128: envelopes must not accept unbounded JSON padding via unknown
+    // fields; only the exact envelope schema is accepted.
+    let mut descriptor_value = serde_json::json!({
+        "descriptor": descriptor(),
+        "signature": "aa".repeat(64),
+        "signing_key_id": "deployer-key-1",
+        "signing_pubkey": "bb".repeat(32)
+    });
+    descriptor_value
+        .as_object_mut()
+        .unwrap()
+        .insert("padding".to_string(), serde_json::json!("p".repeat(4096)));
+    let err = decode_optional_blobs(
+        Some(descriptor_value.to_string()),
+        Some(
+            serde_json::json!({
+                "keyring": {
+                    "org_id": "11111111-1111-1111-1111-111111111111",
+                    "version": 1,
+                    "members": [],
+                    "updated_at": "2026-04-01T00:00:00Z"
+                },
+                "signature": "cc".repeat(64),
+                "signing_pubkey": "dd".repeat(32)
+            })
+            .to_string(),
+        ),
+    )
+    .unwrap_err();
+    assert!(matches!(err, SigningServiceError::Blob(_)), "got: {err:?}");
+
+    let mut keyring_value = serde_json::json!({
+        "keyring": {
+            "org_id": "11111111-1111-1111-1111-111111111111",
+            "version": 1,
+            "members": [],
+            "updated_at": "2026-04-01T00:00:00Z"
+        },
+        "signature": "cc".repeat(64),
+        "signing_pubkey": "dd".repeat(32)
+    });
+    keyring_value
+        .as_object_mut()
+        .unwrap()
+        .insert("padding".to_string(), serde_json::json!("p".repeat(4096)));
+    let err = decode_optional_blobs(
+        Some(valid_descriptor_blob()),
+        Some(keyring_value.to_string()),
+    )
+    .unwrap_err();
+    assert!(matches!(err, SigningServiceError::Blob(_)), "got: {err:?}");
+}
+
+#[test]
+fn verifies_signature_before_payload_comparisons() {
+    // #128: an artifact with BOTH an invalid signature and mismatched
+    // payload metadata must fail with InvalidSignature, not a semantic
+    // Mismatch — the platform signature over the canonical blob is checked
+    // before any payload parsing/comparison work.
+    let signing_key = SigningKey::from_bytes(&[0x33; 32]);
+    let mut artifacts = signing_artifacts(descriptor());
+    // Point the descriptor signing pubkey at the artifact key so the payload
+    // comparison path would engage on mismatched metadata.
+    artifacts.descriptor_signing_pubkey = signing_key.verifying_key().to_bytes();
+    let mut artifact = signed_policy_artifact(&artifacts, &signing_key);
+    // Tamper: invalid signature AND mismatched payload metadata.
+    artifact.signature = "11".repeat(64);
+    artifact.metadata.app_id = Uuid::new_v4().to_string();
+    let configured_pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
+
+    let err = artifacts
+        .validate_signed_artifact(&artifact, &configured_pubkey_hex)
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::InvalidSignature),
+        "expected InvalidSignature before payload compares, got: {err:?}"
+    );
+
+    // The diagnostic pubkey compare also runs only after the crypto check:
+    // an invalid signature plus a mismatched verify_pubkey_b64 echo must
+    // still surface InvalidSignature, not Mismatch("artifact.verify_pubkey_b64").
+    let mut artifact = signed_policy_artifact(&artifacts, &signing_key);
+    artifact.signature = "11".repeat(64);
+    artifact.verify_pubkey_b64 = B64.encode([0x44; 32]);
+    let err = artifacts
+        .validate_signed_artifact(&artifact, &configured_pubkey_hex)
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::InvalidSignature),
+        "expected InvalidSignature before the diagnostic pubkey compare, got: {err:?}"
+    );
+}
+
+#[test]
+fn rejects_signed_artifact_fields_exceeding_caps() {
+    // #128: per-field byte caps run before signature verification and
+    // before hashing of the oversized text. The mutated fields invalidate
+    // the signature, so this proves ordering (caps before verify), not that
+    // a still-valid signature is rejected.
+    let signing_key = SigningKey::from_bytes(&[0x33; 32]);
+    let artifacts = signing_artifacts(descriptor());
+    let mut artifact = signed_policy_artifact(&artifacts, &signing_key);
+    artifact.metadata.key_id = "k".repeat(MAX_POLICY_METADATA_FIELD_BYTES + 1);
+    let configured_pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
+
+    let err = artifacts
+        .validate_signed_artifact(&artifact, &configured_pubkey_hex)
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("artifact.metadata.key_id")),
+        "got: {err:?}"
+    );
+
+    let mut artifact = signed_policy_artifact(&artifacts, &signing_key);
+    artifact.rego_text = "x".repeat(MAX_POLICY_TEXT_BYTES + 1);
+    let err = artifacts
+        .validate_signed_artifact(&artifact, &configured_pubkey_hex)
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("artifact.rego_text")),
+        "got: {err:?}"
+    );
+}
+
+#[test]
 fn policy_artifact_signing_input_matches_rev14_vector() {
     let metadata = PolicyMetadata {
         app_id: "22222222-2222-2222-2222-222222222222".to_string(),
@@ -443,9 +855,9 @@ fn rejects_descriptor_key_signed_customer_supplied_policy_artifact() {
     let err = artifacts
         .validate_signed_artifact(&artifact, &platform_pubkey_hex)
         .unwrap_err();
-    assert!(
-        matches!(err, SigningServiceError::Mismatch(field) if field == "artifact.verify_pubkey_b64")
-    );
+    // #128: InvalidSignature precedes the diagnostic pubkey compare; the
+    // descriptor key cannot produce a platform-valid signature.
+    assert!(matches!(err, SigningServiceError::InvalidSignature));
 }
 
 #[test]
@@ -493,7 +905,11 @@ fn rejects_customer_supplied_policy_artifact_from_unconfigured_key() {
     let err = artifacts
         .validate_signed_artifact(&artifact, &platform_pubkey_hex)
         .unwrap_err();
-    assert!(matches!(err, SigningServiceError::Mismatch(_)));
+    // #128: the ed25519 check runs before the diagnostic pubkey compare, so
+    // an artifact signed by an unconfigured key surfaces InvalidSignature
+    // (the echoed verify_pubkey_b64 disagreement is only reported for a
+    // properly signed artifact, as Mismatch).
+    assert!(matches!(err, SigningServiceError::InvalidSignature));
 }
 
 #[test]

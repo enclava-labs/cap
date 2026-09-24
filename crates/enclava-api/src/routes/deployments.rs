@@ -199,6 +199,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
     signing_service_pubkey_hex: Option<&str>,
     log_encryption: Option<LogEncryptionConfig>,
 ) -> Result<crate::signing_service::SignedPolicyArtifact, (StatusCode, Json<serde_json::Value>)> {
+    use crate::signing_service::validate_proof_bundle_budget;
     artifacts
         .validate_customer_authority(&state.db)
         .await
@@ -243,6 +244,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
             artifacts
                 .attach_customer_authority(&mut artifact)
                 .map_err(signing_error_response)?;
+            validate_proof_bundle_budget(artifacts, &artifact).map_err(signing_error_response)?;
             return Ok(artifact);
         }
     }
@@ -260,6 +262,7 @@ pub(crate) async fn resolve_signed_policy_artifact(
     artifacts
         .attach_customer_authority(&mut artifact)
         .map_err(signing_error_response)?;
+    validate_proof_bundle_budget(artifacts, &artifact).map_err(signing_error_response)?;
     Ok(artifact)
 }
 

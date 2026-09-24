@@ -1650,22 +1650,55 @@ mod tests {
             "expected_cc_init_data_hash": "06".repeat(32),
             "expected_kbs_policy_hash": "07".repeat(32),
         });
+        // #128: decode_optional_blobs verifies customer signatures, so the
+        // fixture signs both envelopes with a real test key.
+        let deployer_key = ed25519_dalek::SigningKey::from_bytes(&[0x09; 32]);
+        let owner_key = ed25519_dalek::SigningKey::from_bytes(&[0x0b; 32]);
+        let descriptor_typed: enclava_common::descriptor::DeploymentDescriptor =
+            serde_json::from_value(descriptor.clone()).expect("descriptor fixture");
+        let keyring = crate::signing_service::TestOrgKeyring {
+            org_id: app.org_id,
+            version: 1,
+            members: vec![
+                crate::signing_service::TestKeyringMember {
+                    user_id: Uuid::new_v4(),
+                    pubkey: deployer_key.verifying_key().to_bytes(),
+                    role: crate::signing_service::TestKeyringRole::Deployer,
+                    added_at: Utc::now(),
+                },
+                // The keyring envelope must be signed by an Owner member
+                // (#128: decode_optional_blobs verifies signatures at decode
+                // time, including the owner-role check on the signing pubkey).
+                crate::signing_service::TestKeyringMember {
+                    user_id: Uuid::new_v4(),
+                    pubkey: owner_key.verifying_key().to_bytes(),
+                    role: crate::signing_service::TestKeyringRole::Owner,
+                    added_at: Utc::now(),
+                },
+            ],
+            updated_at: Utc::now(),
+        };
         let descriptor_blob = serde_json::json!({
             "descriptor": descriptor,
-            "signature": "08".repeat(64),
+            "signature": hex::encode(
+                deployer_key
+                    .sign(&enclava_common::descriptor::descriptor_canonical_bytes(
+                        &descriptor_typed
+                    ))
+                    .to_bytes()
+            ),
             "signing_key_id": "test-deployer-key",
-            "signing_pubkey": "09".repeat(32),
+            "signing_pubkey": hex::encode(deployer_key.verifying_key().to_bytes()),
         })
         .to_string();
         let keyring_blob = serde_json::json!({
-            "keyring": {
-                "org_id": app.org_id,
-                "version": 1,
-                "members": [],
-                "updated_at": Utc::now(),
-            },
-            "signature": "0a".repeat(64),
-            "signing_pubkey": "0b".repeat(32),
+            "keyring": serde_json::to_value(&keyring).expect("keyring fixture"),
+            "signature": hex::encode(
+                owner_key
+                    .sign(&crate::signing_service::canonical_keyring_bytes_test(&keyring))
+                    .to_bytes()
+            ),
+            "signing_pubkey": hex::encode(owner_key.verifying_key().to_bytes()),
         })
         .to_string();
         let artifacts = crate::signing_service::decode_optional_blobs(
