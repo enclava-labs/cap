@@ -985,6 +985,34 @@ pub(crate) fn validate_proof_bundle_budget(
     Ok(())
 }
 
+/// #128 review follow-up (Codex P2): dispatch forwards the RAW stored
+/// strings — LoadedWorkloadArtifacts::workload_artifacts_json and
+/// ::trustee_policy_json are composed from row.signed_policy_artifact
+/// verbatim — and build_verification_material charges those exact bytes.
+/// validate_proof_bundle_budget alone measures the NORMALIZED artifact
+/// (attach_customer_authority strips unknown-field padding from
+/// artifact.org_keyring), so a legacy row whose raw stored org_keyring
+/// padding blows a budget would pass that check and still fail at apply
+/// time. This checks the exact strings that will be forwarded.
+pub(crate) fn validate_forwarded_proof_bundle_budget(
+    workload_artifacts_json: &str,
+    trustee_policy_json: &str,
+) -> Result<(), SigningServiceError> {
+    if workload_artifacts_json.len() > MAX_WORKLOAD_ARTIFACTS_JSON_BYTES {
+        return Err(SigningServiceError::Blob(format!(
+            "stored workload_artifacts_json exceeds {MAX_WORKLOAD_ARTIFACTS_JSON_BYTES}-byte proof-bundle field budget (got {})",
+            workload_artifacts_json.len()
+        )));
+    }
+    if trustee_policy_json.len() > MAX_TRUSTEE_POLICY_JSON_BYTES {
+        return Err(SigningServiceError::Blob(format!(
+            "stored trustee_policy_json exceeds {MAX_TRUSTEE_POLICY_JSON_BYTES}-byte proof-bundle field budget (got {})",
+            trustee_policy_json.len()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_signed_artifact_field_caps(
     artifact: &SignedPolicyArtifact,
 ) -> Result<(), SigningServiceError> {
@@ -1512,6 +1540,19 @@ impl LoadedWorkloadArtifacts {
         // dispatch with the specific budget error rather than the generic
         // apply-time "verification material field exceeds v1 limit".
         validate_proof_bundle_budget(&self.signing_artifacts, &artifact)?;
+        // #128 review follow-up (Codex P2): the check above measures the
+        // NORMALIZED artifact — attach_customer_authority strips unknown-field
+        // padding from artifact.org_keyring — but dispatch forwards the RAW
+        // stored strings: self.workload_artifacts_json / self.trustee_policy_json
+        // are composed from row.signed_policy_artifact verbatim in
+        // decode_loaded_workload_artifacts, and build_verification_material
+        // charges those exact bytes. A legacy row whose stored org_keyring
+        // padding blows a budget would pass the normalized check and still
+        // fail at apply time, so measure the exact forwarded strings too.
+        validate_forwarded_proof_bundle_budget(
+            &self.workload_artifacts_json,
+            &self.trustee_policy_json,
+        )?;
         Ok(())
     }
 

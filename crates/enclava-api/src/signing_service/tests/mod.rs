@@ -604,6 +604,63 @@ fn max_legal_caps_compose_under_proof_bundle_budgets() {
 }
 
 #[test]
+fn legacy_padded_stored_artifact_is_rejected_at_dispatch() {
+    // #128 review follow-up (Codex P2): a legacy row whose stored
+    // signed_policy_artifact carries unknown-field padding inside
+    // org_keyring normalizes cleanly in attach_customer_authority (so
+    // validate_proof_bundle_budget passes on the normalized clone), but
+    // dispatch forwards the RAW stored strings and
+    // build_verification_material charges those exact bytes at apply time.
+    // The dispatch-time revalidation must therefore reject the raw
+    // forwarded strings too.
+    // Simulate the legacy stored row: the padded envelope (matching
+    // fingerprint/signature/pubkey) plus unknown-field padding that blows
+    // the trustee_policy_json budget only in its raw serialized form. The
+    // fixture's org_keyring_envelope must carry the REAL fingerprint of
+    // artifacts.org_keyring for attach_customer_authority's matches to hold.
+    let mut artifacts = signing_artifacts(descriptor());
+    artifacts.org_keyring_fingerprint = keyring_fingerprint(&artifacts.org_keyring);
+    let signing_key = SigningKey::from_bytes(&[0x11; 32]);
+    let mut artifact = signed_policy_artifact(&artifacts, &signing_key);
+    artifacts.attach_customer_authority(&mut artifact).unwrap();
+    let mut padded_envelope = artifacts.org_keyring_envelope.clone();
+    padded_envelope.as_object_mut().unwrap().insert(
+        "legacy_padding".to_string(),
+        serde_json::json!("p".repeat(MAX_TRUSTEE_POLICY_JSON_BYTES)),
+    );
+    let mut stored_artifact = artifact.clone();
+    stored_artifact.org_keyring = Some(padded_envelope);
+
+    // The normalized compose stays within budget: attach_customer_authority
+    // replaces the padded envelope before validate_proof_bundle_budget.
+    let mut normalized = stored_artifact.clone();
+    artifacts
+        .attach_customer_authority(&mut normalized)
+        .unwrap();
+    validate_proof_bundle_budget(&artifacts, &normalized).unwrap();
+
+    // But the raw stored strings — what decode_loaded_workload_artifacts
+    // composes and forwards — exceed the budget and must be rejected.
+    let raw_workload = workload_artifacts_json(&artifacts, &stored_artifact).unwrap();
+    let raw_trustee = trustee_policy_json(&stored_artifact).unwrap();
+    assert!(
+        raw_trustee.len() > MAX_TRUSTEE_POLICY_JSON_BYTES,
+        "fixture must push the raw trustee string over budget, got {}",
+        raw_trustee.len()
+    );
+    let err = validate_forwarded_proof_bundle_budget(&raw_workload, &raw_trustee).unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Blob(ref msg) if msg.contains("trustee_policy_json")),
+        "expected raw trustee budget rejection, got: {err:?}"
+    );
+
+    // And a legal row (no padding) passes both checks.
+    let workload = workload_artifacts_json(&artifacts, &artifact).unwrap();
+    let trustee = trustee_policy_json(&artifact).unwrap();
+    validate_forwarded_proof_bundle_budget(&workload, &trustee).unwrap();
+}
+
+#[test]
 fn over_budget_composition_is_rejected_at_ingress() {
     // #128: validate_proof_bundle_budget itself must reject compositions
     // over either proof-bundle budget. The per-field caps are derived so a
