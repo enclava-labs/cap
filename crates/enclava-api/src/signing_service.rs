@@ -730,12 +730,12 @@ impl DeploymentSigningArtifacts {
         ))
     }
 
-    /// `policy_authority_pubkey_hex` is the key policy artifacts must be
-    /// signed with. Policy artifacts come from `/sign`, so the acceptance
-    /// authority is the signing-service key (a response signed with any other
-    /// key is rejected). The platform trustee policy key (cap#118) is a
-    /// separate, in-TEE trust domain and must never be loaded into the
-    /// signing service.
+    /// `signing_service_pubkey_hex` is the public key of the off-cluster
+    /// signing service that produced the artifact: policy artifacts come
+    /// from `/sign`, so the acceptance authority is the signing-service key
+    /// (a response signed with any other key is rejected). The platform
+    /// trustee policy key (cap#118) is a separate, in-TEE trust domain and
+    /// must never be loaded into the signing service.
     pub fn validate_signed_artifact(
         &self,
         artifact: &SignedPolicyArtifact,
@@ -1302,21 +1302,6 @@ pub(crate) fn validate_signed_artifact_field_caps(
         }
     }
     Ok(())
-}
-
-/// Resolves the pubkey policy artifacts must be signed with (cap#118): the
-/// platform trustee policy key when configured — it is the dedicated in-TEE
-/// policy authority, a distinct trust domain from the off-cluster signing
-/// service — otherwise the signing-service key as a legacy fallback for
-/// configurations that predate the dedicated trustee key.
-pub fn resolve_policy_authority_pubkey_hex(
-    platform_trustee_policy_pubkey_hex: Option<&str>,
-    signing_service_pubkey_hex: Option<&str>,
-) -> Option<String> {
-    platform_trustee_policy_pubkey_hex
-        .or(signing_service_pubkey_hex)
-        .map(str::to_string)
-}
 }
 
 fn verify_signed_policy_artifact(

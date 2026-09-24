@@ -1342,6 +1342,33 @@ fn validates_signed_policy_artifact_with_configured_key() {
 }
 
 #[test]
+fn sign_response_verifies_against_signing_service_pin_and_not_a_trustee_pin() {
+    // cap#118 producer contract: policy artifacts come from the signing
+    // service's /sign endpoint (verify_pubkey_b64 = the service key's public
+    // half). Acceptance verifies them against SIGNING_SERVICE_PUBKEY_HEX; a
+    // distinct platform trustee policy key is a separate in-TEE authority
+    // and must never be loaded into the signing service, so the same
+    // artifact is rejected when checked against the trustee pin.
+    let artifacts = signing_artifacts(descriptor());
+    let signing_service_key = SigningKey::from_bytes(&[0x33; 32]);
+    let artifact = signed_policy_artifact(&artifacts, &signing_service_key);
+    let service_pubkey_hex = hex::encode(signing_service_key.verifying_key().to_bytes());
+    artifacts
+        .validate_signed_artifact(&artifact, &service_pubkey_hex)
+        .expect("/sign output verifies against the signing-service pin");
+
+    let trustee_key = SigningKey::from_bytes(&[0x44; 32]);
+    let trustee_pubkey_hex = hex::encode(trustee_key.verifying_key().to_bytes());
+    let err = artifacts
+        .validate_signed_artifact(&artifact, &trustee_pubkey_hex)
+        .unwrap_err();
+    assert!(
+        matches!(err, SigningServiceError::Mismatch(ref field) if field == "artifact.verify_pubkey_b64"),
+        "/sign output must not verify against a different pin, got: {err:?}"
+    );
+}
+
+#[test]
 fn validates_customer_supplied_policy_artifact_with_platform_key() {
     let artifacts = signing_artifacts(descriptor());
     let platform_key = SigningKey::from_bytes(&[0x33; 32]);

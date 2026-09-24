@@ -390,6 +390,9 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
             "(literal lowercase 'https://' prefix, no newlines/spaces/tabs/"
             "quotes/braces/semicolons, ASCII-only)"
         )
+    for field in ["platform_trustee_policy_pubkey_hex", "signing_service_pubkey_hex"]:
+        if field not in payload:
+            raise ValueError(f"{field} is required (two trust domains, cap#118)")
     trustee_key = hex32_bytes(
         "platform_trustee_policy_pubkey_hex", payload["platform_trustee_policy_pubkey_hex"]
     )

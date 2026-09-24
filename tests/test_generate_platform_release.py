@@ -409,7 +409,7 @@ def test_release_generator_rejects_missing_trustee_policy_key():
     payload = base_payload()
     del payload["platform_trustee_policy_pubkey_hex"]
 
-    with pytest.raises(KeyError):
+    with pytest.raises(ValueError, match="platform_trustee_policy_pubkey_hex is required"):
         generate_platform_release.validate_payload(payload)
 
 

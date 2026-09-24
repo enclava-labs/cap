@@ -436,7 +436,12 @@ fn end_to_end_chain_passes_for_customer_signed_artifact_without_fallback() {
 }
 
 #[test]
-fn end_to_end_chain_accepts_platform_signed_artifact_with_signing_service_key() {
+fn end_to_end_chain_accepts_platform_signed_artifact_with_legacy_equal_pin() {
+    // Legacy shape: the same key fills both platform slots (pre-cap#118
+    // releases collapsed them). The signing-service slot is authoritative,
+    // so its signature verifies. cap#118 rejects this collapse at release
+    // validation; the TEE keeps accepting equal pins only so pinned equal
+    // legacy cc_init_data still verifies.
     let signing = SigningKey::generate(&mut OsRng);
     let deployer = SigningKey::generate(&mut OsRng);
     let descriptor = descriptor_json();
@@ -478,12 +483,9 @@ fn end_to_end_chain_rejects_descriptor_signed_artifact_when_signing_service_key_
         signing_service_pubkey: Some(&signer_pk),
     };
     let err = verify_chain(&inputs).unwrap_err();
-    // cap#118: with a pinned platform policy key (the trustee slot), the
-    // descriptor-key-signed policy fails against the trustee key; the
-    // signing-service slot is not consulted when a trustee key is pinned.
-    assert!(
-        matches!(err, InitError::TrusteePolicy(ref s) if s.contains("platform trustee policy key"))
-    );
+    // Policy artifacts are signing-service products; a descriptor-key-signed
+    // policy fails against the pinned signing-service key.
+    assert!(matches!(err, InitError::TrusteePolicy(ref s) if s.contains("signing service key")));
 }
 
 #[test]
@@ -624,12 +626,11 @@ fn end_to_end_chain_rejects_policy_pubkey_mismatch() {
 }
 
 #[test]
-fn pinned_trustee_key_rejects_policy_signed_only_by_signing_service_key() {
-    // cap#118: the platform trustee policy key is the dedicated in-TEE policy
-    // authority. Once it is pinned in signed cc_init_data, a policy envelope
-    // signed by the signing-service key (a different trust domain) must NOT
-    // verify — otherwise compromising the signing service still forges
-    // policies the TEE accepts.
+fn trustee_only_pin_uses_trustee_key_and_rejects_signing_service_signatures() {
+    // cap#118: when ONLY a platform trustee policy key is configured (no
+    // signing-service key — the dedicated-authority rollout), the trustee
+    // key authorizes and a signing-service-key signature does not verify
+    // against it: the two are distinct trust domains.
     let signing_service = SigningKey::generate(&mut OsRng);
     let trustee = SigningKey::generate(&mut OsRng);
     let deployer = SigningKey::generate(&mut OsRng);
@@ -637,36 +638,11 @@ fn pinned_trustee_key_rejects_policy_signed_only_by_signing_service_key() {
     let keyring = keyring_json(&deployer, "deployer");
     let rego = "package enclava\ndefault allow := false\n";
     let cc_toml = b"placeholder cc_init_data";
-    // Policy envelope signed by the SIGNING-SERVICE key.
-    let (bundle, env, cc, signing_pk, _) = build_inputs(
-        &descriptor,
-        keyring,
-        rego,
-        &signing_service,
-        &deployer,
-        cc_toml,
-    );
-    let trustee_pk = trustee.verifying_key();
 
-    let inputs = VerifyInputs {
-        policy_envelope: &env,
-        artifacts: &bundle,
-        cc_init_data_claims: &cc,
-        local_cc_init_data_toml: cc_toml,
-        platform_trustee_policy_pubkey: Some(&trustee_pk),
-        signing_service_pubkey: Some(&signing_pk),
-    };
-    let err = verify_chain(&inputs).unwrap_err();
-    assert!(
-        matches!(err, InitError::TrusteePolicy(ref s) if s.contains("platform trustee policy key")),
-        "signing-service-signed policy must not verify against a pinned trustee key, got: {err:?}"
-    );
-
-    // The same envelope signed by the TRUSTEE key verifies when the trustee
-    // key is pinned (the signing-service key is simply not consulted).
+    // Trustee-signed policy verifies with a trustee-only pin.
     let (bundle, env, cc, trustee_pk, _) = build_inputs(
         &descriptor,
-        keyring_json(&deployer, "deployer"),
+        keyring.clone(),
         rego,
         &trustee,
         &deployer,
@@ -678,9 +654,110 @@ fn pinned_trustee_key_rejects_policy_signed_only_by_signing_service_key() {
         cc_init_data_claims: &cc,
         local_cc_init_data_toml: cc_toml,
         platform_trustee_policy_pubkey: Some(&trustee_pk),
-        signing_service_pubkey: Some(&signing_service.verifying_key()),
+        signing_service_pubkey: None,
     };
-    verify_chain(&inputs).expect("trustee-signed policy must verify with trustee key pinned");
+    verify_chain(&inputs).expect("trustee-signed policy verifies with trustee-only pin");
+
+    // Signing-service-signed policy does NOT verify against a trustee-only pin.
+    let (bundle, env, cc, _, _) = build_inputs(
+        &descriptor,
+        keyring,
+        rego,
+        &signing_service,
+        &deployer,
+        cc_toml,
+    );
+    let inputs = VerifyInputs {
+        policy_envelope: &env,
+        artifacts: &bundle,
+        cc_init_data_claims: &cc,
+        local_cc_init_data_toml: cc_toml,
+        platform_trustee_policy_pubkey: Some(&trustee_pk),
+        signing_service_pubkey: None,
+    };
+    let err = verify_chain(&inputs).unwrap_err();
+    assert!(
+        matches!(err, InitError::TrusteePolicy(ref s) if s.contains("platform trustee policy key")),
+        "signing-service-signed policy must not verify against a trustee-only pin, got: {err:?}"
+    );
+}
+
+#[test]
+fn signing_service_key_alone_authorizes_policy_when_trustee_key_is_absent() {
+    // Legacy fallback shape (trustee key absent): the signing-service key
+    // alone authorizes the policy envelope.
+    let signing = SigningKey::generate(&mut OsRng);
+    let deployer = SigningKey::generate(&mut OsRng);
+    let descriptor = descriptor_json();
+    let keyring = keyring_json(&deployer, "deployer");
+    let rego = "package enclava\ndefault allow := false\n";
+    let cc_toml = b"placeholder cc_init_data";
+    let (bundle, env, cc, signing_pk, _) =
+        build_inputs(&descriptor, keyring, rego, &signing, &deployer, cc_toml);
+
+    let inputs = VerifyInputs {
+        policy_envelope: &env,
+        artifacts: &bundle,
+        cc_init_data_claims: &cc,
+        local_cc_init_data_toml: cc_toml,
+        platform_trustee_policy_pubkey: None,
+        signing_service_pubkey: Some(&signing_pk),
+    };
+    verify_chain(&inputs).expect("signing-service key alone authorizes the policy");
+}
+
+#[test]
+fn both_keys_pinned_signing_service_key_is_the_policy_authority() {
+    // cap#118 producer contract: policy artifacts come from the signing
+    // service's /sign endpoint, so when both keys are pinned (the
+    // signed-release shape) the signing-service key is the policy
+    // authority. Its output verifies even though a distinct trustee key is
+    // pinned, and a policy signed by any third key fails.
+    let signing_service = SigningKey::generate(&mut OsRng);
+    let trustee = SigningKey::generate(&mut OsRng);
+    let other = SigningKey::generate(&mut OsRng);
+    let deployer = SigningKey::generate(&mut OsRng);
+    let descriptor = descriptor_json();
+    let keyring = keyring_json(&deployer, "deployer");
+    let rego = "package enclava\ndefault allow := false\n";
+    let cc_toml = b"placeholder cc_init_data";
+
+    // Producer contract: /sign output verifies with both keys pinned.
+    let (bundle, env, cc, signing_pk, _) = build_inputs(
+        &descriptor,
+        keyring.clone(),
+        rego,
+        &signing_service,
+        &deployer,
+        cc_toml,
+    );
+    let trustee_pk_ref = trustee.verifying_key();
+    let inputs = VerifyInputs {
+        policy_envelope: &env,
+        artifacts: &bundle,
+        cc_init_data_claims: &cc,
+        local_cc_init_data_toml: cc_toml,
+        platform_trustee_policy_pubkey: Some(&trustee_pk_ref),
+        signing_service_pubkey: Some(&signing_pk),
+    };
+    verify_chain(&inputs).expect("signing-service /sign output verifies with both keys pinned");
+
+    // A policy signed by a third key fails against the signing-service key.
+    let (bundle, env, cc, _, _) =
+        build_inputs(&descriptor, keyring, rego, &other, &deployer, cc_toml);
+    let inputs = VerifyInputs {
+        policy_envelope: &env,
+        artifacts: &bundle,
+        cc_init_data_claims: &cc,
+        local_cc_init_data_toml: cc_toml,
+        platform_trustee_policy_pubkey: Some(&trustee_pk_ref),
+        signing_service_pubkey: Some(&signing_pk),
+    };
+    let err = verify_chain(&inputs).unwrap_err();
+    assert!(
+        matches!(err, InitError::TrusteePolicy(ref s) if s.contains("signing service key")),
+        "third-key policy must fail with both keys pinned, got: {err:?}"
+    );
 }
 
 #[test]

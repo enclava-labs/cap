@@ -19,6 +19,25 @@ const BUNDLED_PLATFORM_RELEASE: &str = include_str!("../platform-release.json");
 const FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str =
     "5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd";
 
+/// Public half of the dev-fixture trustee policy seed (c1*32) committed with
+/// crates/enclava-cli/scripts/generate-platform-release.py. Rejected for any
+/// release not signed by the dev fixture root (see verify_envelope).
+const DEV_FIXTURE_TRUSTEE_POLICY_PUBKEY_HEX: &str =
+    "acdcc8494d458f44a7aaac1d6a84ec624daee88436db2ae26e67ba645a106228";
+
+fn fixture_trustee_policy_pubkey() -> Vec<u8> {
+    hex::decode(DEV_FIXTURE_TRUSTEE_POLICY_PUBKEY_HEX).expect("static hex decodes")
+}
+
+/// Decoded dev-fixture release root (pubkey 5b9437ad...): releases signed by
+/// it may pin the fixture trustee key; production roots may not.
+fn fixture_root_pubkey() -> [u8; 32] {
+    hex::decode("5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd")
+        .expect("static hex decodes")
+        .try_into()
+        .expect("32 bytes")
+}
+
 #[cfg(test)]
 const TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX: &str = FORBIDDEN_FIXTURE_RELEASE_ROOT_PUBKEY_HEX;
 
@@ -315,6 +334,20 @@ pub fn verify_envelope_with_root(
     ));
     if actual_template_hash != envelope.payload.policy_template_sha256 {
         return Err(PlatformReleaseError::TemplateHashMismatch);
+    }
+    // cap#118: the dev-fixture trustee policy key's seed is public (c1*32,
+    // committed with the generator). A non-fixture root must never sign a
+    // release that pins it: anyone with the repo could then forge policy
+    // envelopes the TEE accepts.
+    if signing != fixture_root_pubkey()
+        && hex::decode(&envelope.payload.platform_trustee_policy_pubkey_hex)?
+            == fixture_trustee_policy_pubkey()
+    {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "platform_trustee_policy_pubkey_hex",
+            message: "dev-fixture trustee policy key is only allowed under the dev fixture root"
+                .to_string(),
+        });
     }
     validate_release_payload(&envelope.payload)?;
     Ok(envelope.payload)
@@ -855,6 +888,33 @@ mod tests {
             4
         );
         assert!(workflow.contains("--example platform-release -- verify"));
+    }
+
+    #[test]
+    fn fixture_trustee_policy_key_is_rejected_under_a_non_fixture_root() {
+        // cap#118: the dev-fixture trustee seed is public (c1*32). A
+        // production root signing a release that still pins the fixture
+        // trustee key would let anyone with the repo forge policy envelopes.
+        // Take the bundled (fixture-signed) envelope, re-sign it with a
+        // NON-fixture production root, and confirm the gate rejects it.
+        use ed25519_dalek::Signer;
+        let mut envelope: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        assert_eq!(
+            envelope.payload.platform_trustee_policy_pubkey_hex,
+            DEV_FIXTURE_TRUSTEE_POLICY_PUBKEY_HEX
+        );
+        let prod_root = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let canonical =
+            canonical_platform_release_bytes(&envelope.payload).expect("canonical bytes");
+        envelope.signature = hex::encode(prod_root.sign(&canonical).to_bytes());
+        envelope.signing_pubkey = hex::encode(prod_root.verifying_key().as_bytes());
+        let root_hex = hex::encode(prod_root.verifying_key().as_bytes());
+        let err = verify_envelope_with_root(envelope, &root_hex).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "platform_trustee_policy_pubkey_hex"),
+            "expected fixture-trustee rejection, got: {err:?}"
+        );
     }
 
     #[test]

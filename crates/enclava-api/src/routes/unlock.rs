@@ -883,24 +883,17 @@ async fn commit_unlock_mode_transition(
             .validate_customer_authority_in_tx(&mut tx)
             .await
             .map_err(crate::routes::deployments::signing_error_response)?;
-        // cap#118: prefer the platform trustee policy key (the dedicated
-        // in-TEE policy authority) when configured; the request-supplied
-        // signing-service key is the legacy fallback path.
-        let policy_authority_pubkey_hex =
-            crate::signing_service::resolve_policy_authority_pubkey_hex(
-                request
-                    .attestation_config
-                    .and_then(|cfg| cfg.platform_trustee_policy_pubkey_hex.as_deref()),
-                request.signing_service_pubkey_hex,
-            )
-            .ok_or((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "platform policy authority pubkey required for signed deployment verification"
-                })),
-            ))?;
+        // Policy artifacts are produced by the off-cluster signing service,
+        // so its key is the acceptance authority (cap#118 note: the trustee
+        // policy key is a separate in-TEE authority, not a /sign producer).
+        let policy_authority_pubkey_hex = request.signing_service_pubkey_hex.ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "platform signing-service pubkey required for signed deployment verification"
+            })),
+        ))?;
         artifacts
-            .validate_signed_artifact(signed_policy_artifact, &policy_authority_pubkey_hex)
+            .validate_signed_artifact(signed_policy_artifact, policy_authority_pubkey_hex)
             .map_err(crate::routes::deployments::signing_error_response)?;
 
         let locked_profile = locked_primary
@@ -1533,11 +1526,7 @@ pub async fn update_unlock_mode(
                 "error": "signed deployment artifacts require attestation runtime configuration"
             })),
         ))?;
-        let signing_service_pubkey_hex =
-            crate::signing_service::resolve_policy_authority_pubkey_hex(
-                attestation.platform_trustee_policy_pubkey_hex.as_deref(),
-                attestation.signing_service_pubkey_hex.as_deref(),
-            );
+        let signing_service_pubkey_hex = attestation.signing_service_pubkey_hex.as_deref();
         let mut app_spec = crate::deploy::build_confidential_app(
             &state.db,
             &signed_app,
@@ -1562,7 +1551,7 @@ pub async fn update_unlock_mode(
             &state,
             artifacts,
             body.signed_policy_artifact.clone(),
-            signing_service_pubkey_hex.as_deref(),
+            signing_service_pubkey_hex,
             log_encryption.clone(),
         )
         .await?;
@@ -1636,18 +1625,10 @@ pub async fn update_unlock_mode(
             api_signing_pubkey: &api_signing_pubkey,
             api_url: &state.api_url,
             attestation_config: state.attestation.as_ref(),
-            signing_service_pubkey_hex:
-                crate::signing_service::resolve_policy_authority_pubkey_hex(
-                    state
-                        .attestation
-                        .as_ref()
-                        .and_then(|config| config.platform_trustee_policy_pubkey_hex.as_deref()),
-                    state
-                        .attestation
-                        .as_ref()
-                        .and_then(|config| config.signing_service_pubkey_hex.as_deref()),
-                )
-                .as_deref(),
+            signing_service_pubkey_hex: state
+                .attestation
+                .as_ref()
+                .and_then(|config| config.signing_service_pubkey_hex.as_deref()),
             signed_required,
             fresh_volume_claims,
         },
