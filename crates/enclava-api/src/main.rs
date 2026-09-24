@@ -1268,7 +1268,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn management_mode_resolves_documented_values_and_rejects_typos() {
         assert_eq!(
             load_management_mode_with_env(|name| match name {
