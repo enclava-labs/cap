@@ -1143,14 +1143,15 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
     // Pin the install to the unsigned-only state: desired_generation = 0.
     // The singleton is process-wide shared state, so snapshot it and restore
     // it in cleanup instead of leaving the wipe behind.
-    let singleton_before: (
+    type ReconciliationSingleton = (
         i64,
         i64,
         i64,
         Option<Vec<u8>>,
         Option<Vec<u8>>,
         Option<String>,
-    ) = sqlx::query_as(
+    );
+    let singleton_before: ReconciliationSingleton = sqlx::query_as(
         "SELECT desired_generation, configmap_generation, applied_generation,
                 configmap_policy_sha256, applied_policy_sha256,
                 configmap_resource_version
