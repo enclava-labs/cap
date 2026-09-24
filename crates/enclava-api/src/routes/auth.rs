@@ -14,6 +14,19 @@ use crate::auth::nostr;
 use crate::auth::scopes;
 use crate::state::AppState;
 
+/// Map a NIP-98 verification failure to an HTTP error response.
+/// Verification failures (bad signature, expired event, tag mismatch,
+/// replay) are authentication problems → 401. A database error while
+/// claiming the event id is a server fault → 500, not a credential
+/// rejection.
+fn nip98_error_response(e: nostr::NostrAuthError) -> (StatusCode, Json<serde_json::Value>) {
+    let status = match &e {
+        nostr::NostrAuthError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::UNAUTHORIZED,
+    };
+    (status, Json(serde_json::json!({ "error": e.to_string() })))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SignupRequest {
     pub provider: String,
@@ -123,12 +136,10 @@ pub async fn signup(
             ))?;
 
             let url = format!("{}/auth/signup", state.api_url);
-            let identity = nostr::verify_nip98_event(event_json, &url, "POST").map_err(|e| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-            })?;
+            let identity =
+                nostr::verify_and_consume_nip98_event(&state.db, event_json, &url, "POST")
+                    .await
+                    .map_err(nip98_error_response)?;
 
             let (user_id, org_id, _is_new) = nostr::signup_or_login(&state.db, &identity)
                 .await
@@ -826,12 +837,10 @@ pub async fn login(
             ))?;
 
             let url = format!("{}/auth/login", state.api_url);
-            let identity = nostr::verify_nip98_event(event_json, &url, "POST").map_err(|e| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({"error": e.to_string()})),
-                )
-            })?;
+            let identity =
+                nostr::verify_and_consume_nip98_event(&state.db, event_json, &url, "POST")
+                    .await
+                    .map_err(nip98_error_response)?;
 
             let (user_id, org_id, _) =
                 nostr::signup_or_login(&state.db, &identity)
@@ -949,6 +958,26 @@ mod authorization_tests {
     use super::*;
     use crate::models::Role;
     use axum::extract::State;
+
+    #[test]
+    fn nip98_db_errors_map_to_500_not_401() {
+        let db_err = nostr::NostrAuthError::Db(sqlx::Error::PoolTimedOut);
+        let (status, _) = nip98_error_response(db_err);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn nip98_verification_failures_map_to_401() {
+        for err in [
+            nostr::NostrAuthError::ReplayDetected,
+            nostr::NostrAuthError::Expired,
+            nostr::NostrAuthError::InvalidSignature,
+        ] {
+            let label = format!("{err:?}");
+            let (status, _) = nip98_error_response(err);
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{label}");
+        }
+    }
 
     #[tokio::test]
     async fn create_api_key_rejects_member_before_database_access() {
