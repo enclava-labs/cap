@@ -3,6 +3,8 @@ use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -27,8 +29,45 @@ const FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// spool inode it holds open) forever: on expiry the connection errors out,
 /// the follower handle is dropped, and the unlinked old inode is finally
 /// released. Generous enough that a slow-but-alive client on a cold
-/// connection is never cut off mid-stream.
+/// connection is never cut off mid-stream. NOTE: this timeout only bounds
+/// I/O that actually happens — a quiet follower performs no socket writes,
+/// so an idle session is NOT reaped here. Idle sessions are bounded by
+/// MAX_CONCURRENT_CONNECTIONS and reaped on client disconnect
+/// (`client_disconnected`) instead.
 const FOLLOW_IO_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Hard ceiling on concurrent relay connections (round-18 review P1). The
+/// ingress template exposes `/.well-known/confidential/logs` via a direct
+/// reverse proxy (`crates/enclava-engine/src/manifest/ingress.rs`), so the
+/// connection count is attacker-controlled and must be budgeted: every
+/// `follow=true` session retains its WithheldContent set (up to
+/// WITHHELD_SET_CAP hashes) plus its delivered-sequence set and a thread
+/// for the whole session, and an idle follower on an unchanged spool does
+/// no socket I/O, so no timeout ever reaps it. A few thousand clients at
+/// ~256 KiB+ of retained state each exhaust enclava-init's 512 MiB limit
+/// and OOM-kill the privileged sidecar. Sizing: worst-case transient per
+/// connection is ~6 MiB (2 MiB tail buffer + up to 2 MiB scan/send buffers
+/// plus withheld and delivered sets at their caps), so 32 × 6 MiB ≈ 192 MiB —
+/// bounded under the 512 MiB sidecar limit even if every connection is
+/// simultaneously hostile; an honest idle follower retains ~0.5 MiB. The
+/// failure mode at the cap is a retriable 503 for NEW connections (never
+/// an OOM, never a dropped frame for sessions already streaming), and
+/// honest use (a handful of operator/CI follow sessions per workload) never
+/// approaches the budget.
+const MAX_CONCURRENT_CONNECTIONS: usize = 32;
+
+/// Read timeout used ONLY by the follow loop's client-liveness probe (a
+/// one-byte read; see `client_disconnected`). Follow streaming never reads
+/// from the client, so tightening the socket's read timeout for the probe
+/// affects nothing else, and the tiny bound keeps the probe from delaying
+/// a poll when the client is (as expected) silent.
+const CLIENT_PROBE_TIMEOUT: Duration = Duration::from_millis(10);
+
+/// Write bound for the over-budget 503 response. The body is a few hundred
+/// bytes — far below any socket send buffer — so the write completes even
+/// for a peer that never reads; the timeout is belt-and-braces so the
+/// accept loop can never be pinned by a reject.
+const REJECT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct LogRelayConfig {
@@ -143,23 +182,126 @@ pub fn run(config: LogRelayConfig) -> io::Result<()> {
     Ok(())
 }
 
+/// Global connection budget (round-18 review P1): an atomic count of live
+/// handler connections against a hard cap. The relay is reachable by ANY
+/// client through the ingress template's direct reverse proxy, so without
+/// a budget one client can pin unbounded per-session state (threads,
+/// `WithheldContent`, delivered-sequence sets) and OOM the 512 MiB
+/// enclava-init sidecar. See `MAX_CONCURRENT_CONNECTIONS` for the sizing
+/// math.
+struct ConnectionSlots {
+    active: AtomicUsize,
+    cap: usize,
+}
+
+/// RAII connection slot: held by the handler thread from accept to unwind,
+/// so every exit path (return, error, panic) releases the budget.
+struct ConnectionSlot {
+    slots: Arc<ConnectionSlots>,
+}
+
+impl ConnectionSlots {
+    fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            active: AtomicUsize::new(0),
+            cap,
+        })
+    }
+
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+impl ConnectionSlot {
+    /// Take a slot, or `None` when the budget is exhausted (the caller
+    /// rejects the connection). CAS-loop acquire so concurrent accepts can
+    /// never overshoot the cap.
+    fn try_acquire(slots: &Arc<ConnectionSlots>) -> Option<Self> {
+        let mut current = slots.active.load(Ordering::Acquire);
+        loop {
+            if current >= slots.cap {
+                return None;
+            }
+            match slots.active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(Self {
+                        slots: Arc::clone(slots),
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.slots.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn serve(listener: TcpListener, config: LogRelayConfig) {
+    serve_with_slots(
+        listener,
+        config,
+        ConnectionSlots::new(MAX_CONCURRENT_CONNECTIONS),
+        FOLLOW_IO_TIMEOUT,
+    );
+}
+
+/// The accept loop with injectable budget and IO timeout (tests use small
+/// values). Every accepted connection holds a slot for its whole handler
+/// lifetime; over-budget connections are answered inline with 503 and
+/// never reach a thread — the reject path must not itself be an allocation
+/// vector.
+fn serve_with_slots(
+    listener: TcpListener,
+    config: LogRelayConfig,
+    slots: Arc<ConnectionSlots>,
+    io_timeout: Duration,
+) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let Some(slot) = ConnectionSlot::try_acquire(&slots) else {
+                    reject_over_capacity(stream);
+                    continue;
+                };
                 let spool_path = config.spool_path.clone();
                 let container = config.container.clone();
-                thread::spawn(move || {
-                    if let Err(err) =
-                        handle_connection(stream, &spool_path, &container, FOLLOW_IO_TIMEOUT)
+                let spawned = thread::Builder::new().spawn(move || {
+                    // Held until the handler returns or unwinds.
+                    let _slot = slot;
+                    if let Err(err) = handle_connection(stream, &spool_path, &container, io_timeout)
                     {
                         eprintln!("enclava-log-relay: request failed: {err}");
                     }
                 });
+                if let Err(err) = spawned {
+                    // The failed spawn consumed (and dropped) the closure
+                    // and its slot, so the budget self-heals.
+                    eprintln!("enclava-log-relay: connection thread spawn failed: {err}");
+                }
             }
             Err(err) => eprintln!("enclava-log-relay: accept failed: {err}"),
         }
     }
+}
+
+/// Over budget: answer 503 WITHOUT reading the request and WITHOUT
+/// spawning a thread. The response is a fixed tiny body, well below any
+/// socket send buffer, so it cannot be pinned by a peer that never reads.
+fn reject_over_capacity(mut stream: TcpStream) {
+    let _ = stream.set_write_timeout(Some(REJECT_WRITE_TIMEOUT));
+    let _ = write_json_error(&mut stream, 503, "too_many_connections");
+    let _ = stream.flush();
 }
 
 fn handle_connection(
@@ -178,7 +320,10 @@ fn handle_connection(
     // thread. The read timeout bounds `read_request_head`: a client that
     // connects and never sends its request would otherwise pin the thread
     // forever. Follow polling is strictly write-driven once the head
-    // arrives, so neither timeout fires for a healthy client.
+    // arrives, so neither timeout fires for a healthy client; idle and
+    // VANISHED clients are instead bounded at the accept loop
+    // (MAX_CONCURRENT_CONNECTIONS) and reaped by the follow loop's client
+    // liveness probe (round-18 review P1).
     stream.set_write_timeout(Some(io_timeout))?;
     stream.set_read_timeout(Some(io_timeout))?;
     let request = read_request_head(&mut stream)?;
@@ -267,6 +412,16 @@ fn handle_connection(
         // unsent sequence), and pre-tail history is withheld by CONTENT
         // identity — sound even when a rotation lands mid-tail-write.
         let mut held = follow_anchor;
+        // Client liveness probe (round-18 review P1): follow streaming
+        // never reads from the client, so a client that disconnects while
+        // the spool is quiet would otherwise leave this session (thread +
+        // withheld state + connection budget slot) resident forever — no
+        // socket timeout ever fires without I/O. The probe is a duplicated
+        // fd over the SAME socket (it pins nothing on the spool side), and
+        // the shared read timeout is tightened to the probe bound: reads
+        // only ever happen inside the probe.
+        let client_probe = stream.try_clone().ok();
+        stream.set_read_timeout(Some(CLIENT_PROBE_TIMEOUT))?;
         follow_spool(
             &mut stream,
             spool_path,
@@ -274,6 +429,7 @@ fn handle_connection(
             &mut held,
             &withheld,
             delivered,
+            client_probe.as_ref(),
         )?;
     }
     Ok(())
@@ -435,7 +591,10 @@ fn remember_delivered_line(bytes: &[u8], delivered: &mut DeliveredSequences) {
 /// follower never writes, so its socket timeout never fires — and the cap
 /// × ~32 B/hash bounds one follower's withheld state to a few hundred KiB
 /// instead of the multi-MiB footprint a full 8 MiB window of tiny lines
-/// would otherwise pin against enclava-init's 512 MiB limit. A window
+/// would otherwise pin against enclava-init's 512 MiB limit. The TOTAL is
+/// bounded too (round-18 review P1): at most MAX_CONCURRENT_CONNECTIONS
+/// sessions exist at once and a vanished client is reaped by the follow
+/// loop's liveness probe. A window
 /// with more distinct lines than the cap (tiny lines, or deliberate
 /// poisoning) evicts the oldest hashes: the cost is bounded REPLAY of
 /// those pre-tail lines to that one client after a rotation — never
@@ -773,6 +932,30 @@ fn verify_anchor_live(file: &File, anchor: &FollowAnchor) -> io::Result<()> {
     Ok(())
 }
 
+/// One-byte liveness read on the client socket (round-18 review P1).
+/// `true` when the client has gone away: FIN (a read of 0 — the client
+/// closed, or half-closed; a half-close is treated as gone exactly the way
+/// mainstream streaming servers treat request-EOF) or a hard socket error
+/// (reset/unconnected). Unexpected stray bytes are drained one per poll
+/// and treated as alive — the follow protocol never reads client data, so
+/// anything sent is junk, but draining matters: a peek-style probe would
+/// see the same buffered byte forever and a later FIN would never become
+/// visible. WouldBlock/TimedOut (the CLIENT_PROBE_TIMEOUT window elapsing
+/// with nothing to read) is the normal quiet-client answer. Interrupted
+/// counts as alive and is retried on the next poll.
+fn client_disconnected(stream: &TcpStream) -> bool {
+    let mut probe: &TcpStream = stream;
+    let mut buf = [0u8; 1];
+    match probe.read(&mut buf) {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(err) => !matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+        ),
+    }
+}
+
 fn follow_spool<W: Write>(
     stream: &mut W,
     path: &Path,
@@ -780,6 +963,7 @@ fn follow_spool<W: Write>(
     held: &mut Option<FollowAnchor>,
     withheld: &WithheldContent,
     initial_delivered: DeliveredSequences,
+    client_probe: Option<&TcpStream>,
 ) -> io::Result<()> {
     // Sequences already SENT to this client. On rotation the spool is
     // replaced by a new inode whose retained window re-contains frames
@@ -796,6 +980,14 @@ fn follow_spool<W: Write>(
     // behavior for anything not a frame).
     let mut delivered = initial_delivered;
     loop {
+        // Client liveness (round-18 review P1): an idle follower performs
+        // no socket writes, so a disconnected client is otherwise never
+        // noticed and would hold its session state (and its connection
+        // budget slot) forever. Probe once per poll; a vanished client
+        // ends the session cleanly so the slot is released.
+        if client_probe.is_some_and(client_disconnected) {
+            return Ok(());
+        }
         // The spool fd is opened fresh each poll and dropped before ANY
         // client write below: no descriptor survives across blocking socket
         // I/O, so a stalled client cannot pin a rotation generation for the
@@ -1172,6 +1364,7 @@ fn write_response_head(
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     write!(
@@ -1745,6 +1938,7 @@ mod tests {
             &mut held,
             &WithheldContent::new(),
             delivered,
+            None,
         );
         assert!(result.is_err(), "failing writer must unwind the follower");
         // The follower may hold an ANCHOR (identity + probe byte, no fd)
@@ -1812,6 +2006,7 @@ mod tests {
             &mut held,
             &WithheldContent::new(),
             delivered,
+            None,
         );
         assert!(result.is_err(), "failing flush must unwind the loop");
         // Sequence 2 was already delivered in the tail: it must NOT be
@@ -1904,6 +2099,7 @@ mod tests {
             &mut held,
             &WithheldContent::new(),
             delivered,
+            None,
         );
         assert!(result.is_err(), "failing flush must unwind the loop");
         // ONLY the post-tail frame is streamed: the pre-tail history
@@ -2049,6 +2245,7 @@ mod tests {
             &mut held,
             &withheld,
             delivered,
+            None,
         );
         assert!(result.is_err(), "failing flush must unwind the loop");
         // Only the genuinely new frame: pre-tail history (1-4) stays
@@ -2133,6 +2330,7 @@ mod tests {
             &mut held,
             &withheld,
             delivered,
+            None,
         );
         assert!(result.is_err(), "failing flush must unwind the loop");
         // Append path (no rotation): the real frame must be delivered even
@@ -2198,6 +2396,7 @@ mod tests {
             &mut held,
             &withheld,
             delivered,
+            None,
         );
         assert!(result.is_err(), "failing flush must unwind the loop");
         // The forged line and padding are withheld by CONTENT (byte-
@@ -2280,6 +2479,7 @@ mod tests {
             &mut held,
             &WithheldContent::new(),
             delivered_of(&[2]),
+            None,
         );
         assert!(result.is_err(), "failing flush must unwind the loop");
         // The probe failed → resync: sequence dedup against frontier 2
@@ -2330,6 +2530,7 @@ mod tests {
             &mut held,
             &WithheldContent::new(),
             delivered_of(&[1]),
+            None,
         );
         assert!(result.is_err(), "failing writer must unwind the follower");
         // The delivered boundary was committed BEFORE the write: offset
@@ -2423,6 +2624,151 @@ mod tests {
         let _ = client.set_read_timeout(Some(Duration::from_millis(100)));
         let mut sink = Vec::new();
         let _ = client.read_to_end(&mut sink);
+    }
+
+    /// The connection budget is hard and self-releasing: the cap rejects
+    /// the overflow connection, and every handler exit path (including a
+    /// panicked handler) returns its slot.
+    #[test]
+    fn connection_slots_bound_concurrency_and_release_on_drop() {
+        let slots = ConnectionSlots::new(2);
+        let first = ConnectionSlot::try_acquire(&slots).expect("first slot");
+        let second = ConnectionSlot::try_acquire(&slots).expect("second slot");
+        assert!(
+            ConnectionSlot::try_acquire(&slots).is_none(),
+            "the third connection must exceed the cap of 2"
+        );
+        assert_eq!(slots.active(), 2);
+        drop(first);
+        assert_eq!(slots.active(), 1, "drop must release the slot");
+        let third = ConnectionSlot::try_acquire(&slots).expect("released slot is reusable");
+        assert_eq!(slots.active(), 2);
+        drop(second);
+        drop(third);
+        assert_eq!(slots.active(), 0);
+    }
+
+    /// The follow loop's client probe (round-18 review P1): a live silent
+    /// client is not gone, stray bytes are drained and do NOT mask a later
+    /// FIN (the peek-style alternative would see the same buffered byte
+    /// forever), and a departed client reads as gone.
+    #[test]
+    fn client_probe_sees_live_stray_and_departed_clients() {
+        use std::io::Write as _;
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
+        assert!(
+            !client_disconnected(&server),
+            "a live, silent client is not gone"
+        );
+        client.write_all(b"x").unwrap();
+        assert!(
+            !client_disconnected(&server),
+            "a stray byte is drained and the client is alive"
+        );
+        drop(client);
+        // FIN delivery can trail close() by a hair even on loopback: poll.
+        let mut gone = client_disconnected(&server);
+        for _ in 0..40 {
+            if gone {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+            gone = client_disconnected(&server);
+        }
+        assert!(
+            gone,
+            "FIN after the drained byte must read as gone (no peek-style masking)"
+        );
+    }
+
+    /// Round-18 review P1 end-to-end: with the budget exhausted an extra
+    /// connection is rejected with 503 without ever being read, and when a
+    /// quiet follower vanishes the liveness probe reaps its idle session
+    /// and releases the slot — new connections are then served again.
+    #[test]
+    fn over_capacity_gets_503_and_vanished_clients_release_slots() {
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+
+        let dir = tempfile::tempdir().unwrap();
+        let spool_path = dir.path().join("spool.jsonl");
+        std::fs::write(&spool_path, "{\"sequence\":1}\n").unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let slots = ConnectionSlots::new(1);
+        let serve_slots = Arc::clone(&slots);
+        let spool = spool_path.clone();
+        let _server = thread::spawn(move || {
+            serve_with_slots(
+                listener,
+                LogRelayConfig {
+                    bind: addr,
+                    spool_path: spool,
+                    container: "app".to_string(),
+                },
+                serve_slots,
+                Duration::from_millis(200),
+            )
+        });
+
+        // Occupy the single slot with a follow session on an UNCHANGED
+        // spool — the pure-idle case from the review, where no socket I/O
+        // happens after the initial tail.
+        let mut held_client = TcpStream::connect(addr).unwrap();
+        held_client
+            .write_all(
+                b"GET /.well-known/confidential/logs?follow=true&container=app HTTP/1.1\r\n\
+                  Host: x\r\n\r\n",
+            )
+            .unwrap();
+
+        // Over budget: rejected at accept — the request is never read.
+        let mut rejected = TcpStream::connect(addr).unwrap();
+        rejected
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut response = String::new();
+        rejected.read_to_string(&mut response).unwrap();
+        assert!(
+            response.contains("503") && response.contains("too_many_connections"),
+            "over-budget connection must get 503 too_many_connections: {response}"
+        );
+
+        // Vanish silently: only the liveness probe can reap this session.
+        drop(held_client);
+        let mut served = String::new();
+        for _ in 0..40 {
+            thread::sleep(Duration::from_millis(50));
+            let mut attempt = TcpStream::connect(addr).unwrap();
+            attempt
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            attempt
+                .write_all(
+                    b"GET /.well-known/confidential/logs?container=app HTTP/1.1\r\n\
+                      Host: x\r\n\r\n",
+                )
+                .unwrap();
+            let mut body = String::new();
+            attempt.read_to_string(&mut body).unwrap();
+            if body.contains("200") {
+                served = body;
+                break;
+            }
+        }
+        assert!(
+            served.contains("\"sequence\":1"),
+            "a freed slot must serve new connections again (dead-client reap); got: {served:?}"
+        );
     }
 
     #[test]
