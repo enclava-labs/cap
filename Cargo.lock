@@ -1501,6 +1501,7 @@ dependencies = [
  "jsonwebtoken",
  "k8s-openapi",
  "kube",
+ "matchit",
  "nostr",
  "oci-client",
  "rand 0.8.6",
@@ -1675,6 +1676,7 @@ dependencies = [
  "p256",
  "p384",
  "pkcs1",
+ "rsa",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1702,6 +1704,7 @@ dependencies = [
  "chrono",
  "enclava-common",
  "nix",
+ "serde",
  "serde_json",
 ]
 
@@ -4685,6 +4688,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core 0.6.4",
+ "sha2 0.10.9",
  "signature",
  "spki",
  "subtle",

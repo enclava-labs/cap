@@ -5,6 +5,17 @@ metadata:
   namespace: enclava-platform
   annotations:
     cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # NOTE on header injection: there is NO per-Ingress proxy-set-headers
+    # annotation in ingress-nginx — `proxy-set-headers` is a key on the
+    # CONTROLLER ConfigMap only (verified against the official annotations
+    # index, which lists only auth-proxy-set-headers and configuration-
+    # snippet). The x-enclava-proxy-secret header is injected controller-
+    # globally via that ConfigMap; see runbook §3c for why that is safe
+    # (trust requires CIDR membership AND the secret, and §3b narrows the
+    # CIDRs to controller addresses only).
+    # No rate-limit annotation here on purpose: it would throttle every
+    # route under the / prefix. The 1 r/s limit lives on the exact-path
+    # enclava-api-device-start Ingress below.
 spec:
   ingressClassName: nginx
   tls:
@@ -17,6 +28,46 @@ spec:
       paths:
       - path: /
         pathType: Prefix
+        backend:
+          service:
+            name: enclava-api
+            port:
+              number: 80
+---
+# Separate Ingress for the tight device-start rate limit. ingress-nginx
+# applies annotations to the Ingress's path prefix, so a single / would
+# throttle login polling, approvals, and unrelated API traffic. This exact-
+# path Ingress isolates the 1 r/s burst-10 limit to only /auth/device/start.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: enclava-api-device-start
+  namespace: enclava-platform
+  annotations:
+    # Header injection note: see enclava-api above — the secret is injected
+    # via the controller ConfigMap, not a per-Ingress annotation.
+    nginx.ingress.kubernetes.io/limit-rps: "1"
+    # ingress-nginx computes the effective burst as limit-rps ×
+    # limit-burst-multiplier (documented default 5). Without this annotation
+    # the ingress would allow only burst 5 and reject the 6th+ concurrent CLI
+    # login behind one NAT (503) before it reaches CAP's intended burst-10
+    # governor; 1 × 10 keeps the ingress aligned with the in-process budget.
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "10"
+    # Both annotations are per ingress controller replica; with N replicas
+    # the effective limit is N r/s. Size accordingly or use a cluster-wide
+    # store if the target cluster runs multiple ingress-nginx controllers.
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - api.enclava.dev
+    secretName: api-tls
+  rules:
+  - host: api.enclava.dev
+    http:
+      paths:
+      - path: /auth/device/start
+        pathType: Exact
         backend:
           service:
             name: enclava-api

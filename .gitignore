@@ -7,6 +7,7 @@
 /runbooks/audits
 /runbooks/*
 !/runbooks/paas-config-token-idempotency.md
+!/runbooks/cap-api-network-policy-rollout.md
 /design-proposals/*
 # Agent scratch (never commit)
 .claude/
@@ -35,3 +36,4 @@ to-delete
 
 .planning/debug/
 .planning/
+reply-body.txt

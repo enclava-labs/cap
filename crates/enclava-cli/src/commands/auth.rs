@@ -477,14 +477,23 @@ fn device_login_scopes(approve_logs: bool) -> Vec<String> {
 fn browser_safe_device_url(url: &str) -> bool {
     // Scheme decided on the parsed host (an exact-loopback http URL is the
     // only non-https exception): a string-prefix test would accept
-    // `http://localhost.evil.example` / `http://localhost@evil.example`.
+    // `http://localhost.evil.example` / `http://***@evil.example`.
     if !(url.starts_with("https://") || enclava_cli::api_client::loopback_http_url(url)) {
         return false;
     }
+    // Denylist rather than allowlist: cmd.exe treats `&`, `^`, `|`, `%`, and
+    // `(` `)` specially even inside double quotes, while `'`, `` ` ``, `;`,
+    // and `$` are shell metacharacters on the unix launchers and inside
+    // cmd's unquoted contexts. The URL is passed as a single argv element
+    // (no string shell), so this is defense in depth against argument
+    // re-parsing by the spawned program itself.
     !url.chars().any(|c| {
         c.is_whitespace()
             || c.is_control()
-            || matches!(c, '&' | '^' | '|' | '%' | '"' | '<' | '>' | '!' | '(' | ')')
+            || matches!(
+                c,
+                '&' | '^' | '|' | '%' | '"' | '<' | '>' | '!' | '(' | ')' | ';' | '\'' | '`' | '$'
+            )
     })
 }
 
@@ -815,5 +824,16 @@ mod tests {
         assert!(!browser_safe_device_url("https://evil.example/a|b"));
         assert!(!browser_safe_device_url("https://evil.example/a^b"));
         assert!(!browser_safe_device_url("https://evil.example/a b"));
+    }
+
+    #[test]
+    fn rejects_semicolon_quote_backtick_and_dollar() {
+        // `;`, `'`, `` ` ``, and `$` are shell metacharacters on the unix
+        // launchers and inside cmd.exe's unquoted contexts; a hostile API
+        // must not be able to smuggle them into a browser launch.
+        assert!(!browser_safe_device_url("https://evil.example/a;calc.exe"));
+        assert!(!browser_safe_device_url("https://evil.example/a'calc"));
+        assert!(!browser_safe_device_url("https://evil.example/a`calc`"));
+        assert!(!browser_safe_device_url("https://evil.example/a$(calc)"));
     }
 }

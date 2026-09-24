@@ -80,6 +80,7 @@ fn verify_input(
     policy: &[u8],
     context_json: &str,
 ) -> Result<enclava_verifier::AppraisalResult, JsError> {
+    install_panic_hook();
     let context: ContextInput = serde_json::from_str(context_json)?;
     let challenge_nonce = decode_32(&context.challenge_nonce, "challenge_nonce")
         .map_err(|error| JsError::new(&error))?;
@@ -89,16 +90,44 @@ fn verify_input(
         .map(|value| decode_32(value, "observed_channel_spki_sha256"))
         .transpose()
         .map_err(|error| JsError::new(&error))?;
-    Ok(enclava_verifier::verify(
-        bundle,
-        policy,
-        enclava_verifier::VerificationContext {
-            challenge_nonce,
-            expected_target_origin: context.expected_target_origin,
-            now_unix_seconds: context.now_unix_seconds,
-            observed_channel_spki_sha256,
-        },
-    ))
+    // Panic isolation (cap#141): the wasm module runs inside the relying
+    // party's page. Panic behavior depends on the target: on unwind-capable
+    // targets (the native test build) catch_unwind converts the panic into
+    // the JsError below. On the browser target (wasm32-unknown-unknown,
+    // panic=abort — `-C panic=unwind` does not build against the distributed
+    // std for that target) the panic traps after the panic hook runs: JS
+    // observes a *catchable* WebAssembly.RuntimeError and the instance
+    // remains usable for later calls (verified by web/verifier/panic-test.html
+    // in CI, built with the debug-panic-probe feature). The panic hook
+    // installed in verify_input logs the payload to the JS console either
+    // way, so a hostile bundle that trips a latent panic stays diagnosable.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        enclava_verifier::verify(
+            bundle,
+            policy,
+            enclava_verifier::VerificationContext {
+                challenge_nonce,
+                expected_target_origin: context.expected_target_origin.clone(),
+                now_unix_seconds: context.now_unix_seconds,
+                observed_channel_spki_sha256,
+            },
+        )
+    }))
+    .map_err(|panic| {
+        // Downcast the panic payload when possible so a hostile bundle
+        // that trips a latent panic is diagnosable from the JS console
+        // instead of surfacing as an opaque generic error (cap#141 review).
+        let reason = panic
+            .downcast_ref::<&str>()
+            .map(|message| format!("verification panicked: {message}"))
+            .or_else(|| {
+                panic
+                    .downcast_ref::<String>()
+                    .map(|message| format!("verification panicked: {message}"))
+            })
+            .unwrap_or_else(|| "verification panicked on the supplied bundle".to_string());
+        JsError::new(&reason)
+    })
 }
 
 fn decode_32(value: &str, name: &str) -> Result<[u8; 32], String> {
@@ -109,6 +138,66 @@ fn decode_32(value: &str, name: &str) -> Result<[u8; 32], String> {
         .ok_or_else(|| format!("{name} must be 32-byte lowercase hex"))
 }
 
+#[wasm_bindgen]
+extern "C" {
+    /// `console.error(message)`, bound directly so the shipped module
+    /// needs no extra JS-facing dependency.
+    #[wasm_bindgen(js_namespace = console)]
+    fn error(message: String);
+}
+
+/// Route Rust panics to the JS console (cap#141 review). On the browser
+/// target (panic=abort) the hook is the only code that runs before the
+/// trap, so it is what makes a panic diagnosable from the relying party's
+/// page; on unwind-capable targets it complements the catch_unwind path.
+/// Installed lazily and idempotently — entry points may be called many
+/// times per page.
+fn install_panic_hook() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let reason = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|message| message.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic payload".to_string());
+        error(format!(
+            "enclava-verifier-wasm panicked: {reason} (at {})",
+            info.location().map(|l| l.to_string()).unwrap_or_default()
+        ));
+        previous(info);
+    }));
+}
+
+/// Test-only probe (cap#141 review): deliberately panic inside the panic
+/// hook / catch_unwind boundary so the browser-side test
+/// (web/verifier/panic-test.html) can assert on the real wasm target that
+/// a panic is catchable from JS and does not poison later calls.
+#[cfg(feature = "debug-panic-probe")]
+#[wasm_bindgen]
+pub fn debug_panic_probe() {
+    install_panic_hook();
+    panic!("debug-panic-probe: intentional panic for the browser panic-isolation test");
+}
+
+/// Test-only non-panicking counterpart to `debug_panic_probe`: a normal
+/// export that must return successfully *after* the probe has trapped. A
+/// poisoned instance traps on every call, so a successful round-trip here
+/// is what actually substantiates post-panic usability (cap#168 review).
+#[cfg(feature = "debug-panic-probe")]
+#[wasm_bindgen]
+pub fn debug_ping_probe(value: u32) -> u32 {
+    value.wrapping_add(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +206,69 @@ mod tests {
     fn rejects_malformed_context_before_verification() {
         assert!(decode_32("00", "challenge_nonce").is_err());
         assert!(decode_32(&"AA".repeat(32), "challenge_nonce").is_err());
+    }
+
+    #[test]
+    fn mutated_bundles_never_panic_the_wasm_entry_point() {
+        // Panic isolation (cap#141): push truncations and byte flips of
+        // the live fixture through the same entry point the browser
+        // calls. verify() must return a result (or a JsError) for every
+        // input — an abort here would poison the whole JS context.
+        let encoded: Vec<u8> = include_str!(
+            "../../../crates/enclava-verifier/tests/fixtures/prove-it-live.bundle.b64"
+        )
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+        let bundle = base64_decode_for_test(&encoded);
+        let policy = include_bytes!(
+            "../../../crates/enclava-verifier/tests/fixtures/prove-it-live.policy.json"
+        );
+        let context = serde_json::json!({
+            "challenge_nonce": "01".repeat(32),
+            "expected_target_origin":
+                "https://prove-it-independent-dev.e72a13df.dev.enclava.work",
+            "now_unix_seconds": 1_785_844_800_u64,
+        })
+        .to_string();
+        let mut mutations: Vec<Vec<u8>> = Vec::new();
+        for len in (0..bundle.len()).step_by(bundle.len() / 64 + 1) {
+            mutations.push(bundle[..len].to_vec());
+        }
+        for offset in (0..bundle.len()).step_by(bundle.len() / 64 + 1) {
+            let mut flipped = bundle.clone();
+            flipped[offset] ^= 0xff;
+            mutations.push(flipped);
+        }
+        for mutation in mutations {
+            // Every mutation must produce a Result — the call itself must
+            // not panic. unwrap both arms to that effect.
+            let outcome = verify_input(&mutation, policy, &context);
+            let _ = outcome.map(|_| ()).map_err(|_| ());
+        }
+    }
+
+    fn base64_decode_for_test(encoded: &[u8]) -> Vec<u8> {
+        // wasm crate has no base64 dependency; decode inline (standard
+        // alphabet, padded) just for the fixture.
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut bits = 0u32;
+        let mut count = 0u32;
+        let mut out = Vec::new();
+        for &byte in encoded {
+            let value = TABLE
+                .iter()
+                .position(|&c| c == byte)
+                .expect("fixture base64 is standard alphabet") as u32;
+            bits = (bits << 6) | value;
+            count += 6;
+            if count >= 8 {
+                count -= 8;
+                out.push((bits >> count) as u8);
+            }
+        }
+        out
     }
 
     #[test]

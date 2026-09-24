@@ -324,9 +324,12 @@ pub async fn rollback(
             .await
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     }
-    let current_role =
-        crate::auth::scopes::active_membership_role_in_tx(&mut tx, auth.org_id, auth.user_id)
-            .await?;
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut tx,
+        auth.org_id,
+        auth.user_id,
+    )
+    .await?;
     crate::auth::scopes::require_admin_role(current_role)?;
     crate::deploy::lock_app_deployment_lane(&mut tx, app.id)
         .await
@@ -640,10 +643,11 @@ pub async fn rollback(
                 .genpolicy_version_pin
                 .clone(),
         });
-        let (_encoded, cc_init_data_hash) =
-            enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+        // Accept either the modern render (with the log_encryption_json claim)
+        // or, for artifacts signed before the claim existed, the legacy render
+        // without it; a legacy match pins the app to the legacy byte layout.
         artifacts
-            .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
+            .validate_and_pin_cc_init_data_render(&mut app_spec)
             .map_err(signing_error_response)?;
     }
     crate::deployment_jobs::insert_ready_job(

@@ -35,13 +35,14 @@ jobs:
       RUSTFLAGS: ${{ matrix.crt-static }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       # Full build (not check) so linking and all target triples are exercised
       # before a tag starts the release workflow. Mirrors the release targets,
@@ -63,7 +64,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
         env:
           POSTGRES_USER: test
           POSTGRES_PASSWORD: test
@@ -77,18 +78,19 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libcryptsetup-dev clang libclang-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/
@@ -119,6 +121,19 @@ jobs:
         # that the cfg string exists in source. Needs no DATABASE_URL.
         run: cargo test --locked -p enclava-init --lib --features prod-strict -- --test-threads=1
 
+      - name: Run enclava-init prod-strict binary tests
+        # Failure-path tests redirect init surfaces through the cfg(test)-only
+        # override map (env vars are compiled out under prod-strict), so the
+        # full binary suite must pass under prod-strict too.
+        run: cargo test --locked -p enclava-init --bins --features prod-strict -- --test-threads=1
+
+      - name: Run enclava-wait-exec prod-strict tests
+        # Proves the readiness/started-dir env gates are compiled out of the
+        # prod-strict wait-exec build (readiness handoff pinned to the
+        # compiled defaults, mirroring enclava-init). Bin unit tests only:
+        # the integration tests exercise the dev-build env-override behavior.
+        run: cargo test --locked -p enclava-wait-exec --bins --features prod-strict -- --test-threads=1
+
       - name: Run doctests
         run: cargo test --doc
 
@@ -138,39 +153,61 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
 
       - name: Install cargo audit and cargo deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
           tool: cargo-audit,cargo-deny
 
+      - name: Check audit/deny ignore lockstep
+        # deny.toml is the single source of truth; this fails if the ci.yml
+        # cargo audit ignores ever diverge from it.
+        run: bash scripts/check-audit-lockstep.sh
+
       - name: Run cargo audit
-        # RUSTSEC-2023-0071 is transitive through sigstore/openidconnect and has
-        # no fixed upstream path. cargo-deny records the same exception with
-        # rationale in deny.toml.
-        run: cargo audit --ignore RUSTSEC-2023-0071
+        # Ignore list is generated from deny.toml [advisories] so the two
+        # dependency gates can never diverge on which advisories are
+        # accepted (lockstep enforced by the step above).
+        run: cargo audit $(bash scripts/cargo-audit-args.sh)
 
       - name: Run cargo deny
         run: cargo deny check advisories sources
+
+  supply-chain:
+    name: Supply-chain hygiene (issue #140)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Verify vendored rdrand delta against the reviewed patch
+        run: bash scripts/verify-vendored-rdrand.sh
+
+      - name: Verify bundled sigstore trust root pin
+        run: bash scripts/verify-sigstore-trust-root.sh
 
   build:
     name: Build all crates
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install native build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libcryptsetup-dev clang libclang-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/
@@ -267,10 +304,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
 
       - name: Install matching wasm-bindgen CLI
@@ -308,3 +346,21 @@ jobs:
               > "/tmp/enclava-verifier-${field}-dom.html"
             grep -E '<pre id="result">PASS [0-9a-f]{64}</pre>' "/tmp/enclava-verifier-${field}-dom.html"
           done
+
+      - name: Assert panic isolation on the real wasm target
+        # cap#141 review: wasm32-unknown-unknown uses the abort panic
+        # strategy, so catch_unwind alone cannot convert a panic into a
+        # JsError in the shipped module. Prove on the real target that a
+        # panic traps into a catchable JS exception and the instance stays
+        # usable — using a test-only probe feature, never in the release
+        # build.
+        run: |
+          rustup run stable cargo build -p enclava-verifier-wasm --release --target wasm32-unknown-unknown \
+            --features debug-panic-probe
+          wasm-bindgen --target web --out-dir web/verifier/pkg \
+            target/wasm32-unknown-unknown/release/enclava_verifier_wasm.wasm
+          google-chrome --headless --no-sandbox --disable-gpu --virtual-time-budget=30000 \
+            --dump-dom http://127.0.0.1:8000/web/verifier/panic-test.html \
+            > /tmp/enclava-verifier-panic-dom.html
+          cat /tmp/enclava-verifier-panic-dom.html
+          grep -E '<pre id="result">PASS panic-isolated</pre>' /tmp/enclava-verifier-panic-dom.html

@@ -176,6 +176,8 @@ fn parse_image_parts(image_ref: &str) -> Result<(String, String), CosignError> {
 /// Build a sigstore trust root, preferring a bundled TUF snapshot when
 /// `SIGSTORE_TUF_ROOT_PATH` is set.
 async fn load_trust_root() -> Result<Arc<SigstoreTrustRoot>, CosignError> {
+    // Note: an EMPTY SIGSTORE_TUF_ROOT_PATH fails closed below (read error),
+    // which is deliberate — do not "helpfully" treat empty as unset.
     if let Ok(path) = std::env::var("SIGSTORE_TUF_ROOT_PATH") {
         let data = std::fs::read(&path).map_err(|e| {
             CosignError::TrustRoot(format!("failed to read SIGSTORE_TUF_ROOT_PATH {path}: {e}"))
@@ -184,6 +186,23 @@ async fn load_trust_root() -> Result<Arc<SigstoreTrustRoot>, CosignError> {
             CosignError::TrustRoot(format!("invalid bundled trusted_root.json: {e}"))
         })?;
         return Ok(Arc::new(root));
+    }
+
+    // Release builds must not bootstrap sigstore trust from the network at
+    // runtime: a MITM'd first TUF fetch would anchor all subsequent cosign
+    // verification (issue #140). Production deployments ship a pinned
+    // trusted_root.json and set SIGSTORE_TUF_ROOT_PATH; the network fallback
+    // remains available for debug/dev builds only. Both signals are checked:
+    // debug_assertions (off in standard release profiles) and the prod-strict
+    // feature (the explicit release-hardening contract used by release image
+    // builds), so a custom profile with debug assertions cannot silently
+    // re-enable the fallback in a production binary.
+    if cfg!(any(not(debug_assertions), feature = "prod-strict",)) {
+        return Err(CosignError::TrustRoot(
+            "SIGSTORE_TUF_ROOT_PATH is not set; release builds must pin a bundled \
+             trusted_root.json instead of fetching the sigstore TUF root from the network"
+                .to_string(),
+        ));
     }
 
     let root = SigstoreTrustRoot::new(None)

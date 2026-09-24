@@ -150,6 +150,18 @@ fi
 [[ "$(grep -cF 'COPY scripts/require-platform-release-root.sh' "$DOCKERFILE")" -eq 2 ]] \
   || fail "API Dockerfile must copy the root gate into both builder stages"
 
+# The release image must ship the pinned sigstore trust root and point
+# SIGSTORE_TUF_ROOT_PATH at it (cosign.rs fails closed in release builds
+# without a file-backed root).
+grep -Fq -- "COPY crates/enclava-api/trust-roots/sigstore-public-good-1.root.json /etc/enclava/sigstore/trusted_root.json" "$DOCKERFILE" \
+  || fail "API Dockerfile release stage must bake in the pinned sigstore trust root"
+grep -Fq -- "ENV SIGSTORE_TUF_ROOT_PATH=/etc/enclava/sigstore/trusted_root.json" "$DOCKERFILE" \
+  || fail "API Dockerfile release stage must set SIGSTORE_TUF_ROOT_PATH"
+grep -Fq -- "6494e21ea73fa7ee769f85f57d5a3e6a08725eae1e38c755fc3517c9e6bc0b66" "$DOCKERFILE" \
+  || fail "API Dockerfile builder stages must sha256-gate the bundled trust root"
+grep -Fq -- "value: /etc/enclava/sigstore/trusted_root.json" "$DEPLOYMENT" \
+  || fail "deployment must restate SIGSTORE_TUF_ROOT_PATH explicitly"
+
 grep -Fq -- "Local-compose-only well-known fixture; must never be a Dockerfile default." "$COMPOSE" \
   || fail "compose must label the fixture as local-compose-only"
 grep -Fq -- "ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX: 5b9437adeaffbe8f41b13d96ed49d2f51cd6c266cd8ecc284b0552ec4912b8dd" "$COMPOSE" \

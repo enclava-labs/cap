@@ -2135,9 +2135,10 @@ async fn validate_apply_artifacts(
         )
         .await
         .map_err(|_| DeploymentJobError::Artifact)?;
-    validate_signed_render(job, payload, &loaded)?;
+    let mut binding = loaded.binding.clone();
+    validate_signed_render(job, payload, &loaded, &mut binding)?;
     Ok(ValidatedApplyArtifacts {
-        workload_artifact_binding: Some(loaded.binding),
+        workload_artifact_binding: Some(binding),
         signed_policy_artifact: Some(loaded.signed_policy_artifact),
         local_workload_artifacts_json: Some(loaded.workload_artifacts_json),
         local_trustee_policy_json: Some(loaded.trustee_policy_json),
@@ -2244,6 +2245,7 @@ fn validate_signed_render(
     job: &ClaimedJob,
     payload: &DeploymentApplyJobPayload,
     loaded: &crate::signing_service::LoadedWorkloadArtifacts,
+    binding: &mut enclava_engine::types::WorkloadArtifactBinding,
 ) -> Result<(), DeploymentJobError> {
     let attestation = payload
         .attestation_config
@@ -2275,11 +2277,18 @@ fn validate_signed_render(
             .genpolicy_version_pin
             .clone(),
     });
-    let (_encoded, cc_init_data_hash) =
-        enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+    // Accept either the modern render (with the log_encryption_json claim) or,
+    // for artifacts signed before the claim existed, the legacy render without
+    // it; a legacy match pins the binding carried into the apply request, so
+    // the job worker renders the exact bytes the artifact was signed over.
     loaded
-        .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
-        .map_err(|_| DeploymentJobError::Artifact)
+        .validate_and_pin_cc_init_data_render(&mut app_spec)
+        .map_err(|_| DeploymentJobError::Artifact)?;
+    *binding = app_spec
+        .workload_artifact_binding
+        .take()
+        .expect("binding was set above");
+    Ok(())
 }
 
 async fn deployment_is_terminal(
@@ -3421,6 +3430,7 @@ mod tests {
             descriptor_core_hash: binding.descriptor_core_hash,
             descriptor_signing_pubkey: binding.descriptor_signing_pubkey,
             org_keyring_fingerprint: binding.org_keyring_fingerprint,
+            omit_log_encryption_claim: false,
         });
         crate::routes::deployments::select_local_signed_artifact_delivery(
             &mut app_spec.attestation,
