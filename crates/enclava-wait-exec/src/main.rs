@@ -43,20 +43,24 @@ const LOG_SPOOL_KEEP_BYTES: u64 = 8 * 1024 * 1024;
 /// rotation headroom below the 64 MiB volume cap. 256 KiB of plaintext
 /// encodes to well under 512 KiB of framed output.
 const MAX_LOG_RECORD_BYTES: usize = 256 * 1024;
-/// Cap on one spool line during the startup sequence scan. A
-/// writer-produced frame line is `MAX_LOG_RECORD_BYTES` of plaintext
-/// "encoded to well under 512 KiB of framed output" (see
-/// `MAX_LOG_RECORD_BYTES`) — base64url of the ciphertext plus a small
-/// JSON envelope. A "line" claiming more than this therefore cannot be a
-/// writer-produced frame, and the spool is workload-influenced content
-/// (the shared `logs` emptyDir), so the scan must never buffer such a
-/// record whole (round-15 review P2: `BufRead::lines()` turned one
+/// Cap on one spool line during the startup sequence scan. This MUST
+/// equal the relay's `MAX_TAIL_BYTES` line cap (`enclava-init`
+/// `log_relay.rs`): the scan has to SEE every line the relay can forward
+/// and remember in a follower's delivered set. A smaller scan cap would
+/// let one workload-forged line just above it (but below the relay cap)
+/// be remembered by a connected follower while staying invisible to the
+/// resume scan — after a restart the writer would resume below the
+/// forged sequence and the next rotation resync would drop the
+/// legitimate frame that reuses it (round-15 self-check P2). Lines above
+/// this bound are discarded by the relay too and can stay skipped on
+/// both sides. The bound is what keeps the scan's allocation fixed: a
+/// writer-produced frame is `MAX_LOG_RECORD_BYTES` of plaintext "encoded
+/// to well under 512 KiB of framed output" (see `MAX_LOG_RECORD_BYTES`),
+/// and the round-15 review P2 hazard was `BufRead::lines()` turning one
 /// newline-free record — up to the whole 64 MiB volume — into a single
 /// String allocation before the child spawned, OOM-looping a constrained
-/// container while the same spool remained). Below the relay's 2 MiB
-/// `MAX_TAIL_BYTES` line cap, so anything this scan accepts as a frame is
-/// also a line the relay will forward.
-const MAX_SPOOL_LINE_BYTES: u64 = 2 * MAX_LOG_RECORD_BYTES as u64;
+/// container while the same spool remained.
+const MAX_SPOOL_LINE_BYTES: u64 = 2 * 1024 * 1024;
 const TERMINATION_SIGNALS: [Signal; 4] = [
     Signal::SIGHUP,
     Signal::SIGINT,

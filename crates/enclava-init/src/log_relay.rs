@@ -202,7 +202,7 @@ fn handle_connection(
     {
         return write_json_error(&mut stream, 404, "container_not_available");
     }
-    let (lines, mut offset, spool_file) = match tail_lines(spool_path, query.tail_lines) {
+    let (lines, mut offset, mut spool_file) = match tail_lines(spool_path, query.tail_lines) {
         Ok(value) => value,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return write_json_error(&mut stream, 409, "logs_not_ready");
@@ -223,9 +223,18 @@ fn handle_connection(
     } else {
         None
     };
+    // Account for every complete line BEFORE the tail cursor (round-15
+    // self-check P2): the tail deliberately withholds the pre-tail
+    // history, but a rotation between here and the first follow poll
+    // takes the resync path, which must not stream that history after
+    // the tail. Bounded streaming scan of sequences only — no send, no
+    // spool copy — while the tail fd is open and before any client write.
+    let mut delivered = DeliveredSequences::new();
+    if query.follow {
+        remember_pre_cursor_sequences(&mut spool_file, offset, &mut delivered)?;
+    }
     drop(spool_file);
     write_response_head(&mut stream, 200, "application/x-ndjson", None)?;
-    let mut delivered = DeliveredSequences::new();
     for line in &lines {
         stream.write_all(line.as_bytes())?;
         stream.write_all(b"\n")?;
@@ -333,8 +342,11 @@ fn frame_sequence(line: &str) -> Option<u64> {
 /// received little holds a near-empty one.
 const DELIVERED_SET_CAP: usize = 65_536;
 
-/// Sequences already SENT to this follower (round-14 self-check
-/// Critical): rotation dedup is SET MEMBERSHIP, not a `<= last_seq`
+/// Sequences already ACCOUNTED-FOR to this follower — sent (the tail and
+/// the follow stream) or deliberately withheld behind the requested tail
+/// window (pre-cursor history, remembered by
+/// `remember_pre_cursor_sequences` so a rotation resync cannot replay it).
+/// Rotation dedup is SET MEMBERSHIP, not a `<= last_seq`
 /// frontier. The spool directory is workload-writable, so any line's
 /// `sequence` field is attacker-controlled — the old frontier latched
 /// from a single forged `{"sequence":u64::MAX}` line and permanently
@@ -391,6 +403,84 @@ fn remember_delivered_line(bytes: &[u8], delivered: &mut DeliveredSequences) {
     if let Some(sequence) = frame_sequence(&String::from_utf8_lossy(bytes)) {
         delivered.insert(sequence);
     }
+}
+
+/// Stream the complete lines BEFORE the tail cursor and remember their
+/// sequences WITHOUT sending them (round-15 self-check P2). The delivered
+/// set seeds from the lines actually written to the client (the requested
+/// tail, default 100 lines), but a rotation between the tail read and the
+/// first follow poll — including during the tail write, which can block
+/// for up to FOLLOW_IO_TIMEOUT — takes the resync path, which would
+/// otherwise stream the whole retained window minus those few lines: the
+/// pre-tail history the tail limit deliberately left out would replay
+/// after the tail. Every complete pre-cursor line is therefore
+/// ACCOUNTED-FOR at connect time (delivered, or deliberately withheld
+/// behind the tail window): only lines arriving after the cursor ever
+/// stream to the client, rotation or not.
+///
+/// Memory is bounded exactly like `plan_delivery`: one capped line of
+/// scan state (MAX_TAIL_BYTES + 1), never a copy of the spool — the
+/// ingress template exposes this endpoint directly. The scan uses the
+/// SAME line cap and skip policy as `plan_delivery`, so the remembered
+/// set here matches exactly what a later resync would consider
+/// replayable. Sequences are still set membership over accounted-for
+/// lines (round-14: never a max-frontier, a forged line costs only its
+/// own slot), and the FIFO cap evicts these oldest pre-cursor sequences
+/// first under deliberate poisoning — the cost is bounded replay to one
+/// client, never unbounded memory.
+fn remember_pre_cursor_sequences(
+    file: &mut File,
+    boundary: u64,
+    delivered: &mut DeliveredSequences,
+) -> io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    {
+        let mut reader = BufReader::with_capacity(64 * 1024, (&mut *file).take(boundary));
+        let mut line: Vec<u8> = Vec::new();
+        loop {
+            line.clear();
+            let n = reader
+                .by_ref()
+                .take(MAX_TAIL_BYTES + 1)
+                .read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            if !line.ends_with(b"\n") {
+                if (n as u64) < MAX_TAIL_BYTES + 1 {
+                    // In-flight fragment at the cursor: withheld from the
+                    // client too (the cursor parks before it), so nothing
+                    // to remember.
+                    break;
+                }
+                // Oversized line: consume-and-discard like plan_delivery
+                // (never a remembered frame there either).
+                let mut terminated = false;
+                while !terminated {
+                    let available = reader.fill_buf()?;
+                    if available.is_empty() {
+                        break;
+                    }
+                    match available.iter().position(|&b| b == b'\n') {
+                        Some(i) => {
+                            reader.consume(i + 1);
+                            terminated = true;
+                        }
+                        None => {
+                            let m = available.len();
+                            reader.consume(m);
+                        }
+                    }
+                }
+                if !terminated {
+                    break;
+                }
+                continue;
+            }
+            remember_delivered_line(&line[..line.len() - 1], delivered);
+        }
+    }
+    Ok(())
 }
 
 /// Open the spool for reading without following a final-component symlink
@@ -541,9 +631,7 @@ fn probe_matches(file: &mut File, anchor: &FollowAnchor) -> io::Result<bool> {
 /// (still-open) spool file: the inode identity the boundary was computed
 /// against plus the exact fingerprint window `plan_delivery` maintains —
 /// the up-to-16 bytes ENDING at the boundary, or the head of the file for
-/// a boundary of 0 (matching `anchor_for`; a short read just yields a
-/// shorter window, which the next probe treats as a mismatch if the bytes
-/// changed).
+/// a boundary of 0 (matching `anchor_for`).
 ///
 /// This SEEDS a follower's first poll (round-15 review P2): the tail
 /// cursor computed by `tail_lines` must survive into follow mode, or the
@@ -555,6 +643,17 @@ fn probe_matches(file: &mut File, anchor: &FollowAnchor) -> io::Result<bool> {
 /// the tail read and the first poll fails the identity/fingerprint probe
 /// and funnels into the genuine resync path, where the cursor is never
 /// trusted against replaced content.
+///
+/// Fail closed on a short read past the boundary (round-15 self-check
+/// P2): `probe_matches` treats a zero-length window as a PASS, so a file
+/// truncated below the boundary between `tail_lines` and this seed (the
+/// writer's `set_len` rollback) would otherwise yield a vacuous anchor —
+/// and once the file regrew past the stale cursor the next poll would
+/// seek that cursor into rewritten content, skipping gap frames and
+/// forwarding partial lines. A boundary > 0 therefore REQUIRES the whole
+/// fingerprint window to exist; only the boundary-0 (empty/small head)
+/// case may return a shorter — or, for a completely empty spool, the
+/// documented identity-only zero-length — window.
 fn anchor_from_file(file: &File, boundary: u64) -> io::Result<FollowAnchor> {
     let identity = spool_identity(file)?;
     let mut fingerprint = [0u8; ANCHOR_FINGERPRINT_BYTES];
@@ -565,7 +664,10 @@ fn anchor_from_file(file: &File, boundary: u64) -> io::Result<FollowAnchor> {
         while n < len {
             let read = file.read_at(&mut fingerprint[n..len], pos + n as u64)?;
             if read == 0 {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "spool truncated below the tail cursor before the follow anchor was seeded",
+                ));
             }
             n += read;
         }
@@ -1671,6 +1773,101 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let anchor = anchor_from_file(&file, 0).unwrap();
         assert_eq!(anchor.fp_len, 0);
+    }
+
+    /// Round-15 self-check P2: a short read past the tail cursor must NOT
+    /// produce an anchor. `probe_matches` treats a zero-length window as a
+    /// pass, so a file truncated below the cursor between `tail_lines` and
+    /// the seed (the writer's `set_len` rollback) would yield a vacuous
+    /// anchor — and once the file regrew past the stale cursor the next
+    /// poll would seek it into rewritten content (skipping gap frames,
+    /// forwarding partial lines). Fail closed instead.
+    #[test]
+    fn anchor_from_file_short_read_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, b"0123456789abcdefHELLO").unwrap(); // 21 bytes
+        let file = std::fs::File::open(&path).unwrap();
+        // Fingerprint window entirely past EOF.
+        let err = anchor_from_file(&file, 200).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // Truncated INTO the window: a partial fingerprint must not
+        // anchor either (fp_len < intended is a weaker probe).
+        let err = anchor_from_file(&file, 30).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // A fully-present window still anchors and probes.
+        let anchor = anchor_from_file(&file, 21).unwrap();
+        assert_eq!(anchor.fp_len as usize, ANCHOR_FINGERPRINT_BYTES);
+        let mut file = file;
+        assert!(probe_matches(&mut file, &anchor).unwrap());
+    }
+
+    /// Round-15 self-check P2: a rotation between the tail read and the
+    /// first follow poll must not replay the pre-tail window either. The
+    /// delivered set seeds from the lines actually sent (the requested
+    /// tail), so the resync path would stream the retained window minus
+    /// those — including the pre-tail history the tail limit deliberately
+    /// left out. The connect path accounts for every pre-cursor line
+    /// (`remember_pre_cursor_sequences`), so a resync forwards only what
+    /// is genuinely new. (Rotation-during-follow repro: tail of 2 over
+    /// frames 1-6, then a rename to a new inode containing 1-7 — only
+    /// frame 7 may go out.)
+    #[test]
+    fn rotation_before_first_poll_does_not_replay_pre_tail_history() {
+        // Succeeds the write, fails the flush: follow_spool unwinds after
+        // exactly one poll.
+        struct FailingFlushWriter {
+            sink: Vec<u8>,
+        }
+        impl std::io::Write for FailingFlushWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.sink.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::other("stop after first poll"))
+            }
+        }
+
+        let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        let mut body = String::new();
+        for seq in 1..=6u64 {
+            body.push_str(&format!("{}\n", frame(seq)));
+        }
+        std::fs::write(&path, &body).unwrap();
+
+        // The connect path exactly as handle_connection runs it.
+        let (lines, mut offset, mut tail_file) = tail_lines(&path, 2).unwrap();
+        assert_eq!(lines, vec![frame(5), frame(6)]);
+        let mut held = Some(anchor_from_file(&tail_file, offset).unwrap());
+        let mut delivered = DeliveredSequences::new();
+        remember_pre_cursor_sequences(&mut tail_file, offset, &mut delivered).unwrap();
+        drop(tail_file);
+        for line in &lines {
+            remember_delivered_line(line.as_bytes(), &mut delivered);
+        }
+
+        // Rotation lands before the first poll: the retained window
+        // re-contains all six frames (well under 8 MiB) plus one new one.
+        let rotated = dir.path().join("spool.jsonl.rotate");
+        let mut retained = body.clone();
+        retained.push_str(&format!("{}\n", frame(7)));
+        std::fs::write(&rotated, &retained).unwrap();
+        std::fs::rename(&rotated, &path).unwrap();
+
+        let mut sink = FailingFlushWriter { sink: Vec::new() };
+        let result = follow_spool(&mut sink, &path, &mut offset, &mut held, delivered);
+        assert!(result.is_err(), "failing flush must unwind the loop");
+        // Only the genuinely new frame: pre-tail history (1-4) stays
+        // withheld behind the tail semantics and 5-6 were already sent.
+        let sent = String::from_utf8(sink.sink).unwrap();
+        assert_eq!(
+            sent,
+            format!("{}\n", frame(7)),
+            "pre-tail frames must not replay after the rotation; got {sent:?}"
+        );
     }
 
     /// Round-11 review finding (P1): in the SAME-INODE append branch no
