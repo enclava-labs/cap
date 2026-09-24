@@ -389,12 +389,13 @@ fn run_with_encrypted_logs(
     // container restart without replacing the Pod — and so do the frames
     // the previous wrapper process wrote. Sequence numbers must therefore
     // stay monotonic across the restart, not restart at 1: the relay's
-    // rotation dedup keeps the highest delivered sequence as its frontier
-    // and would silently drop every post-restart frame whose reset
-    // sequence lands at or below it. Scan the surviving spool tail (the
-    // rotation-retained window is the only part that matters for the
-    // frontier a connected relay can hold) for the highest frame sequence
-    // and resume from it. Non-frame lines are skipped; a spool with no
+    // rotation dedup is the SET of sequences it actually sent (round-14 —
+    // never a max frontier), and a reset sequence that collides with a set
+    // member is silently suppressed as an apparent rotation replay. Scan
+    // the surviving spool tail (the rotation-retained window is the only
+    // part whose sequences a connected relay can still hold in its dedup
+    // set) for the highest frame sequence and resume from it. Non-frame
+    // lines are skipped; a spool with no
     // parseable frame sequences resumes at 1.
     let sequence_start = initial_spool_sequence(&mut spool)?;
     let spool = Arc::new(Mutex::new(spool));
@@ -535,7 +536,7 @@ fn open_log_spool(path: &Path) -> Result<File, String> {
 /// safe for sequence recovery: only newline-terminated records can ever
 /// have been delivered by the relay (it withholds in-flight fragments),
 /// so an oversized or incomplete record cannot hold a sequence any
-/// connected relay frontier references — and it cannot be a
+/// connected relay dedup set references — and it cannot be a
 /// writer-produced frame at all (those are capped well below the bound).
 fn initial_spool_sequence(spool: &mut File) -> Result<u64, String> {
     spool
@@ -640,6 +641,37 @@ where
     thread::spawn(move || forward_encrypted_logs(reader, stream, &logs, &spool, &sequence))
 }
 
+/// Allocate the next log-frame sequence without ever WRAPPING (round-18
+/// self-check Warning). `AtomicU64::fetch_add` wraps to 0 at the top of the
+/// sequence space: with a forged `{"sequence":u64::MAX}` line in the
+/// workload-writable spool the wrap-reserved resume point sits 65,537
+/// frames below the top, and the old allocator would then wrap and
+/// re-issue numbers the relay's dedup set can still hold (silently
+/// suppressing real frames) or that collide with pre-restart frames
+/// (duplicates). Saturation makes exhaustion an EXPLICIT logged drop — the
+/// same policy as a spool write failure — and the caller keeps draining
+/// the child pipe. The top value `u64::MAX` is deliberately never issued:
+/// it is the forgery sentinel and has no room for a monotonic successor. A
+/// legitimate writer cannot approach the top (~584 billion years at 1,000
+/// frames/s), so the only path to exhaustion is self-inflicted forgery.
+fn next_sequence(counter: &AtomicU64) -> Option<u64> {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current == u64::MAX {
+            return None;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(previous) => return Some(previous),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 fn forward_encrypted_logs<R>(
     reader: R,
     stream: &'static str,
@@ -653,6 +685,7 @@ where
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
     let mut dropped_frames: u64 = 0;
+    let mut exhausted_frames: u64 = 0;
     // Round-12: carries a lone `\r` peeked at the cap boundary whose `\n`
     // had not yet arrived (pipes may split the CRLF terminator across
     // writes) — see `read_capped_record`.
@@ -699,10 +732,23 @@ where
         let mut spool = spool
             .lock()
             .map_err(|_| "encrypted log spool lock poisoned".to_string())?;
+        // Sequence exhaustion (round-18 self-check Warning): drop the frame
+        // EXPLICITLY rather than let the allocator wrap to 0 and re-issue
+        // sequences — counted and logged like a spool write failure below.
+        let Some(sequence_number) = next_sequence(sequence) else {
+            exhausted_frames += 1;
+            if exhausted_frames == 1 || exhausted_frames % 1000 == 0 {
+                eprintln!(
+                    "enclava-wait-exec: encrypted log sequence space exhausted, dropping \
+                     {stream} frame ({exhausted_frames} frames dropped so far)"
+                );
+            }
+            continue;
+        };
         let frame = encrypt_log_frame(
             &logs.recipient,
             &logs.context,
-            sequence.fetch_add(1, Ordering::Relaxed),
+            sequence_number,
             stream,
             &logs.container,
             Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -1719,8 +1765,30 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().ino(), inode_before);
     }
 
-    /// Round-6 review finding: the relay's rotation dedup treats the max
-    /// delivered sequence as a contiguous frontier, which is only sound when
+    /// Round-18 self-check Warning: the sequence allocator must saturate,
+    /// not wrap. `AtomicU64::fetch_add` wraps to 0 at the top of the space,
+    /// so a forged `{"sequence":u64::MAX}` line (workload-writable spool)
+    /// plus 65,537 real frames would re-issue sequences the relay's dedup
+    /// set can still hold — silently suppressing real frames — and
+    /// duplicate pre-restart numbers. Exhaustion now drops frames
+    /// explicitly instead. The top value `u64::MAX` is deliberately never
+    /// issued: it is the forgery sentinel and has no room for a successor.
+    #[test]
+    fn sequence_allocation_saturates_instead_of_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_sequence(&counter), Some(u64::MAX - 1));
+        assert_eq!(next_sequence(&counter), None);
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            u64::MAX,
+            "the counter parks at the top instead of wrapping to 0"
+        );
+        assert_eq!(next_sequence(&counter), None, "exhaustion is sticky");
+    }
+
+    /// Round-6 review finding: the relay's rotation dedup is set membership
+    /// over sequences actually sent (round-14 — never a max frontier), and
+    /// set membership only matches replayed lines to their originals when
     /// spool file order is monotonic in sequence order. The sequence must
     /// therefore be allocated (and the frame encrypted) while HOLDING the
     /// spool mutex — previously `fetch_add` ran before the lock, so a

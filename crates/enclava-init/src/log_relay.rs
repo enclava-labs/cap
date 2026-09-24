@@ -980,14 +980,6 @@ fn follow_spool<W: Write>(
     // behavior for anything not a frame).
     let mut delivered = initial_delivered;
     loop {
-        // Client liveness (round-18 review P1): an idle follower performs
-        // no socket writes, so a disconnected client is otherwise never
-        // noticed and would hold its session state (and its connection
-        // budget slot) forever. Probe once per poll; a vanished client
-        // ends the session cleanly so the slot is released.
-        if client_probe.is_some_and(client_disconnected) {
-            return Ok(());
-        }
         // The spool fd is opened fresh each poll and dropped before ANY
         // client write below: no descriptor survives across blocking socket
         // I/O, so a stalled client cannot pin a rotation generation for the
@@ -995,7 +987,11 @@ fn follow_spool<W: Write>(
         // detected from the remembered FollowAnchor instead.
         let Ok(mut file) = open_spool_for_read(path) else {
             // Missing, replaced, or planted-symlink spool: retry at the
-            // poll cadence instead of spinning.
+            // poll cadence instead of spinning. About to idle: reap a
+            // vanished client first (see `reap_vanished_client`).
+            if reap_vanished_client(client_probe) {
+                return Ok(());
+            }
             thread::sleep(FOLLOW_POLL_INTERVAL);
             continue;
         };
@@ -1038,7 +1034,12 @@ fn follow_spool<W: Write>(
         // never reached — the poll pacing below keeps that lag bounded).
         if same_as_held && len == *offset {
             // Caught up (nothing past the delivered boundary): pace the
-            // poll loop.
+            // poll loop. About to idle: reap a vanished client first —
+            // an idle follower does no socket writes, so nothing else can
+            // ever notice a dead peer and release its session.
+            if reap_vanished_client(client_probe) {
+                return Ok(());
+            }
             thread::sleep(FOLLOW_POLL_INTERVAL);
             continue;
         }
@@ -1088,9 +1089,23 @@ fn follow_spool<W: Write>(
         // trailing fragment still unterminated) paces like an idle poll
         // instead of spinning.
         if should_pace_poll(from, plan.offset, len) {
+            if reap_vanished_client(client_probe) {
+                return Ok(());
+            }
             thread::sleep(FOLLOW_POLL_INTERVAL);
         }
     }
+}
+
+/// Probe-at-idle gate (round-18 self-check suggestion): the liveness probe
+/// runs only when the follower is about to SLEEP, never mid catch-up — an
+/// unpaced poll already performs socket writes (which error out for a
+/// vanished client), and the probe's bounded read must not tax the
+/// catch-up quanta (round-16: pacing a catch-up lets a rotation delete the
+/// gap before it was sent). A vanished client is reaped at the next idling
+/// poll; its connection budget slot is released with the session.
+fn reap_vanished_client(client_probe: Option<&TcpStream>) -> bool {
+    client_probe.is_some_and(client_disconnected)
 }
 
 /// Poll pacing decision (round-16 self-check P2): pace (sleep) whenever the
