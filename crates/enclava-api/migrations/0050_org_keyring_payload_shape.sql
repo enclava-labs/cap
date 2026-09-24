@@ -42,17 +42,21 @@ ALTER TABLE org_keyrings
 -- with no bump left to recover.
 --
 -- Instead record the owed bump as a pending marker that only the post-0050
--- implementation interprets: consume_deferred_selector_bump
--- (crates/enclava-api/src/kbs.rs) performs the actual desired_generation
--- increment at the start of a reconciliation run held under the global KBS
--- mutation fence and converges the filtered candidate set within that same
--- fenced run.  A pre-0050 reconciler therefore never sees the owed
--- generation as a raw desired generation: it keeps finding an unchanged
+-- implementation interprets, and publish before incrementing: the reconciler
+-- publishes the filtered candidate set as generation desired_generation + 1
+-- while leaving desired_generation itself untouched, and only after that
+-- replace succeeded does commit_deferred_selector_bump
+-- (crates/enclava-api/src/kbs.rs) perform the increment and clear the marker.
+-- A pre-0050 reconciler therefore never sees the owed generation as a raw
+-- desired generation.  Before the replace it keeps finding an unchanged
 -- generation whose unfiltered hash matches the published body and stays
--- quiescent, and once the bumped generation is published its content-bound
--- generation annotation turns any late unfiltered republication into a
--- same-generation conflict.  Unsigned-only installs (desired_generation = 0)
--- are not marked, matching enqueue_signed_policy_reconciliation_if_active;
+-- quiescent; between the replace and the increment it finds an annotated
+-- generation ahead of its own and treats it as superseded; and after the
+-- increment the same content-bound generation annotation turns any late
+-- unfiltered republication into a same-generation conflict.  Every crash
+-- window lands in one of those three states, so the failure mode above is
+-- unreachable.  Unsigned-only installs (desired_generation = 0) are not
+-- marked, matching enqueue_signed_policy_reconciliation_if_active;
 -- the marker invariant is selector_bump_pending => desired_generation > 0.
 ALTER TABLE kbs_signed_policy_reconciliation
     ADD COLUMN selector_bump_pending boolean NOT NULL DEFAULT false;
