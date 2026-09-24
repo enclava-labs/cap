@@ -2154,9 +2154,6 @@ pub async fn rotate_signer(
     // Claims of the verified rotation token; present for every non-initial
     // rotation (consumed atomically below, issue #119).
     let mut signer_rotation_claims = None;
-    // True when this rotation changed the signed-policy candidate set and a
-    // reconciliation must converge before the route returns success.
-    let mut kbs_policy_write_pending = false;
 
     if !is_initial_set {
         let expected = SignerRotationTokenInput {
@@ -2239,6 +2236,23 @@ pub async fn rotate_signer(
             ));
         }
 
+        // Legacy (unsigned) installs render the allowed signer identities in
+        // the live Rego policy from kbs_tls_bindings, so rotation must carry
+        // the new identity into that binding too (issue #119).
+        sqlx::query(
+            "UPDATE kbs_tls_bindings
+                SET signer_identity_subject = $1,
+                    signer_identity_issuer  = $2,
+                    updated_at              = now()
+              WHERE app_id = $3",
+        )
+        .bind(&subject)
+        .bind(&issuer)
+        .bind(app.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+
         // Withdraw KBS trust from every retained artifact signed under the
         // rotated-out identity (issue #119). Note this is revocation, not a
         // re-render: signed artifacts are immutable, so the app leaves the
@@ -2260,15 +2274,16 @@ pub async fn rotate_signer(
         // conflict. revocation_if_active no-ops on an unsigned-only install
         // so rotation never flips such an install into signed mode (where an
         // empty artifact set would deny every workload).
-        kbs_policy_write_pending = crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
             .await
-            .map_err(|_| internal_server_error())?
-            .is_some();
+            .map_err(|_| internal_server_error())?;
     }
 
-    // Audit. Rotation withdraws the previous signer's artifacts from KBS
-    // policy (fail-closed); the new identity itself only becomes live in
-    // policy when the next deployment commits an artifact signed under it.
+    // Audit. In signed mode rotation withdraws the previous signer's
+    // artifacts from KBS policy (fail-closed; the new identity becomes live
+    // when the next deployment commits an artifact signed under it). In
+    // legacy mode the updated kbs_tls_bindings carry the new identity into
+    // the re-rendered Rego policy directly.
     let action = if is_initial_set {
         "app.signer.set"
     } else {
@@ -2299,14 +2314,18 @@ pub async fn rotate_signer(
         .map_err(|_| internal_server_error())?;
     tx.commit().await.map_err(|_| internal_server_error())?;
 
-    // The withdrawal is durable, but the live Trustee policy only reflects
-    // it once the reconciler converges the enqueued generation. Converge
-    // under the KBS fence before reporting success, like app deletion. The
-    // rotation itself is already committed at this point: a KBS-side
-    // failure surfaces as 500 (the durable intent is retained, but this
-    // route holds the KBS fence until its lease expires, so the background
-    // reconciler's retry can lag by up to the lease quarantine window).
-    if kbs_policy_write_pending && state.kbs_policy.is_some() {
+    // The rotation is committed; converge the live KBS policy before
+    // reporting success, under the same fence app deletion uses. In signed
+    // mode reconcile_policy converges the enqueued withdrawal generation
+    // (revoking the previous signer's artifacts); in legacy mode it
+    // re-renders Rego from the updated kbs_tls_bindings so the new identity
+    // is the one admitted. A failure here is a committed rotation whose
+    // policy publication did not converge: surface it as 500 with a stable
+    // error code (the durable intent is retained; note this route holds the
+    // KBS fence until its lease expires, so the background reconciler's
+    // retry can lag by up to the lease quarantine window). Success is only
+    // reported when reconcile returned Ok on both layers.
+    if !is_initial_set && state.kbs_policy.is_some() {
         let lease = match crate::mutation_leases::claim_resources(
             &state,
             "kbs_signer_rotation_policy",
@@ -2326,22 +2345,42 @@ pub async fn rotate_signer(
                 return Err(internal_server_error());
             }
         };
-        if let Err(error) = lease
-            .guard_provider(crate::kbs::reconcile_pending_signed_policy_artifacts(
+        match lease
+            .guard_provider(crate::kbs::reconcile_policy(
                 &state.db,
                 state.kbs_policy.as_ref(),
             ))
             .await
         {
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    error = %error,
+                    error_code = "kbs_policy_fence_unavailable",
+                    "signer rotation committed but lost the KBS policy fence during reconciliation"
+                );
+                return Err(internal_server_error());
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    error = %error,
+                    error_code = "kbs_policy_reconciliation_failed",
+                    "signer rotation committed but KBS policy reconciliation failed"
+                );
+                return Err(internal_server_error());
+            }
+            Ok(Ok(())) => {}
+        }
+        if let Err(error) = lease.finish().await {
             tracing::warn!(
                 app_id = %app.id,
                 error = %error,
-                error_code = "kbs_policy_reconciliation_failed",
-                "signer rotation committed but KBS policy reconciliation failed"
+                error_code = "kbs_policy_lease_finish_failed",
+                "signer rotation reconciled KBS policy but failed to release the fence cleanly"
             );
             return Err(internal_server_error());
         }
-        lease.finish().await.map_err(|_| internal_server_error())?;
     }
 
     Ok(Json(app.into()))

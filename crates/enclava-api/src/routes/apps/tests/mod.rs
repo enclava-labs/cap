@@ -1117,7 +1117,39 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
     .await
     .expect("insert unsigned rotation app");
 
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+
+    // A legacy binding row so rotation must carry the new identity into it.
+    sqlx::query(
+        "INSERT INTO kbs_tls_bindings (
+             app_id, binding_key, repository, tag, namespace, service_account,
+             tenant_instance_identity_hash, signer_identity_subject,
+             signer_identity_issuer
+         ) VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5, $6, $7)
+         ON CONFLICT (app_id) DO NOTHING",
+    )
+    .bind(app_id)
+    .bind(format!("tls-{}", &suffix[..12]))
+    .bind(format!("cap-{}", &suffix[..12]))
+    .bind(format!("cap-{}-sa", &suffix[..12]))
+    .bind("22".repeat(32))
+    .bind(previous_subject)
+    .bind(previous_issuer)
+    .execute(&pool)
+    .await
+    .expect("insert legacy tls binding");
+
     // Pin the install to the unsigned-only state: desired_generation = 0.
+    // The singleton is process-wide shared state, so snapshot it and restore
+    // it in cleanup instead of leaving the wipe behind.
+    let singleton_before: (i64, i64, i64) = sqlx::query_as(
+        "SELECT desired_generation, configmap_generation, applied_generation
+           FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot reconciliation singleton");
     sqlx::query(
         "UPDATE kbs_signed_policy_reconciliation
             SET desired_generation = 0,
@@ -1131,6 +1163,15 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
     .execute(&pool)
     .await
     .expect("reset reconciliation state to unsigned");
+    // The helper also bumps when any workload_artifacts row exists; pin that
+    // this app contributes none.
+    let app_artifacts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM workload_artifacts WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count this app's artifacts");
+    assert_eq!(app_artifacts, 0, "unsigned fixture must have no artifacts");
 
     let mut state = crate::test_support::lazy_state();
     state.db = pool.clone();
@@ -1143,8 +1184,6 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
         api_key: None,
         management_origin: crate::auth::middleware::ManagementOrigin::Public,
     };
-    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
-    let previous_issuer = "https://token.actions.githubusercontent.com";
     let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
 
     let token = crate::auth::jwt::issue_signer_rotation_token(
@@ -1185,6 +1224,21 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
         Some(new_subject)
     );
 
+    // The legacy binding must carry the new identity into the next Rego
+    // render.
+    let binding_subject: Option<String> = sqlx::query_scalar(
+        "SELECT signer_identity_subject FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load tls binding subject after rotation");
+    assert_eq!(
+        binding_subject.as_deref(),
+        Some(new_subject),
+        "rotation must update the legacy Rego binding signer"
+    );
+
     // The install must still be unsigned: rotation never enters signed mode.
     let desired: i64 = sqlx::query_scalar(
         "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
@@ -1197,6 +1251,20 @@ async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
         "rotation on an unsigned-only install must not enter signed mode"
     );
 
+    // Restore the shared singleton exactly as it was found.
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = $1,
+                configmap_generation = $2,
+                applied_generation = $3
+          WHERE singleton",
+    )
+    .bind(singleton_before.0)
+    .bind(singleton_before.1)
+    .bind(singleton_before.2)
+    .execute(&pool)
+    .await
+    .expect("restore reconciliation singleton");
     sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
         .bind(org_id)
         .execute(&pool)
