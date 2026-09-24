@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -329,20 +329,6 @@ fn tail_lines(path: &Path, count: usize) -> io::Result<(Vec<String>, u64, File)>
     Ok((lines, follow_from, file))
 }
 
-/// Read from the file's current cursor to end-of-file, returning the bytes
-/// read together with the ACTUAL cursor position after the read. The writer
-/// is a separate process, so the file can grow during the read; callers must
-/// adopt the returned position (not a pre-read metadata length) as the
-/// delivered boundary, or frames appended mid-read get replayed on the next
-/// poll.
-fn drain_from(file: &mut File, expected_start: u64) -> io::Result<(Vec<u8>, u64)> {
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let delivered = file.stream_position()?;
-    debug_assert_eq!(delivered, expected_start + bytes.len() as u64);
-    Ok((bytes, delivered))
-}
-
 /// Anchor for rotation detection that does NOT require holding a spool fd
 /// across (potentially blocking) client writes. `identity` is the dev/ino of
 /// the inode the follower's `offset` was computed against, plus a content
@@ -383,6 +369,9 @@ const ANCHOR_FINGERPRINT_BYTES: usize = 16;
 /// window is the up-to-16 bytes ending at the boundary; for a boundary of 0
 /// (nothing delivered yet — an empty or fragment-only file) it is the head
 /// of the file instead, which is equally stable under append-only growth.
+// Test-only helper: production follow state is built inline by
+// `plan_delivery` from the plan's fingerprint fields.
+#[cfg(test)]
 fn anchor_for(bytes: &[u8], boundary: usize, identity: SpoolIdentity) -> FollowAnchor {
     let window: &[u8] = if boundary >= ANCHOR_FINGERPRINT_BYTES {
         &bytes[boundary - ANCHOR_FINGERPRINT_BYTES..boundary]
@@ -455,129 +444,243 @@ fn follow_spool<W: Write>(
             }
             _ => false,
         };
-        if !same_as_held {
-            // The spool was rotated (atomic rename → new inode), truncated
-            // by the writer's rollback path, or replaced under a recycled
-            // inode number: re-read the current file from the start,
-            // filtering out already-delivered frames by sequence. Never seek
-            // a stale byte offset into rewritten content.
-            *offset = 0;
-            file.seek(SeekFrom::Start(0))?;
-            let (bytes, _delivered) = drain_from(&mut file, 0)?;
-            // Resume at the END OF THE LAST COMPLETE LINE delivered by
-            // write_deduped_after_rotation, NOT the drain cursor: an
-            // in-flight trailing fragment (writer mid-append) is withheld
-            // from the client, so the next poll must re-read it from its
-            // first byte and deliver the completed line whole. Resuming at
-            // the drain cursor would emit only the fragment's suffix as a
-            // bogus NDJSON line. Re-reading the fragment is by design: the
-            // writer appends frame+newline atomically, so the re-read
-            // returns the prefix plus its completion as one line.
-            let mut delivered_end = 0usize;
-            while let Some(idx) = bytes[delivered_end..].iter().position(|&b| b == b'\n') {
-                delivered_end += idx + 1;
-            }
-            *offset = delivered_end as u64;
-            // Anchor the new inode and drop the spool fd BEFORE the
-            // (potentially blocking) client write + flush: a stalled client
-            // can block write_deduped_after_rotation for up to
-            // FOLLOW_IO_TIMEOUT — during that window no fd may pin the
-            // unlinked previous generation (~32 MiB against the emptyDir
-            // cap). The anchor carries no descriptor.
-            *held = Some(anchor_for(&bytes, delivered_end, current_identity));
-            drop(file);
-            write_deduped_after_rotation(stream, &bytes, &mut last_seq)?;
-            stream.flush()?;
+        // Re-derive the follow state against the CURRENT file on every
+        // poll that has work to do — from offset 0 when the anchor's
+        // probe failed (rotation via atomic rename, the writer's rollback
+        // truncation, or a replaced/recycled inode: never seek a stale
+        // byte offset into rewritten content) or from the delivered
+        // boundary on a same-inode append. Idle followers (nothing past
+        // the delivered boundary) skip the scan entirely.
+        //
+        // Round-13 review P1: BOTH paths use the same STREAMING planner
+        // with a bounded send buffer (~MAX_TAIL_BYTES) instead of
+        // buffering the whole spool / whole undelivered tail in a
+        // per-follower Vec — the ingress template exposes this endpoint
+        // directly, and ~16 synchronized followers could allocate past
+        // enclava-init's 512 MiB limit and OOM the privileged sidecar. A
+        // catch-up larger than the bound is delivered in bounded quanta
+        // across polls: the scan stops before the next never-delivered
+        // line and the next poll resumes exactly there — nothing dropped,
+        // nothing replayed.
+        if same_as_held && len == *offset {
             continue;
         }
-        if len == *offset {
-            continue;
+        let from = if same_as_held { *offset } else { 0 };
+        let plan = plan_delivery(&mut file, from, &mut last_seq)?;
+        // Resume at the END OF THE LAST ACCOUNTED LINE (plan.offset): an
+        // in-flight trailing fragment (writer mid-append) or a
+        // budget-stopped line is withheld from the client, so the next
+        // poll re-reads it from its first byte and delivers it whole.
+        *offset = plan.offset;
+        // Anchor the delivered boundary and drop the spool fd BEFORE the
+        // (potentially blocking) client write + flush: a stalled client
+        // can block write_all for up to FOLLOW_IO_TIMEOUT — during that
+        // window no fd may pin an unlinked previous generation (~32 MiB
+        // against the emptyDir cap). The anchor carries no descriptor.
+        *held = Some(FollowAnchor {
+            identity: current_identity,
+            fp_pos: plan.fp_pos,
+            fp_len: plan.fp_len,
+            fingerprint: plan.fingerprint,
+        });
+        drop(file);
+        if !plan.out.is_empty() {
+            stream.write_all(&plan.out)?;
         }
-        file.seek(SeekFrom::Start(*offset))?;
-        let (bytes, _delivered) = drain_from(&mut file, *offset)?;
-        // Line-buffered delivery: emit only newline-terminated lines and
-        // leave `*offset` at the first byte of any trailing fragment (it is
-        // NOT counted as delivered). The fragment is re-read on the next
-        // poll and joined with its completion. This is also what makes the
-        // follower robust against the writer's rollback path: on a partial
-        // write the writer truncates back to its pre-write length, and a
-        // follower that had buffered the retracted prefix would emit a
-        // corrupted line once the file regrew past its stale offset. By
-        // never advancing past an uncommitted fragment, the follower always
-        // re-reads whatever bytes actually exist at that offset now.
-        let mut complete_end = 0usize;
-        while let Some(idx) = bytes[complete_end..].iter().position(|&b| b == b'\n') {
-            complete_end += idx + 1;
-        }
-        if complete_end > 0 {
-            let complete = &bytes[..complete_end];
-            advance_last_sequence(complete, &mut last_seq);
-            // Advance the offset and anchor the delivered boundary, then
-            // drop the spool fd BEFORE the blocking write + flush (round-11
-            // review P1): this same-inode append branch previously kept
-            // both the local fd and the held fd open across network I/O, so
-            // a concurrent rotation left BOTH pinning the now-unlinked
-            // ~32 MiB inode until the socket write returned.
-            *offset += complete_end as u64;
-            // Anchor from the file itself, not the poll's read buffer: the
-            // fingerprint window (16 bytes ending at the new delivered
-            // boundary) can straddle the poll boundary, so it is read
-            // directly from the still-open fd before the write drops it.
-            let boundary = *offset as usize;
-            let fp_start = boundary.saturating_sub(ANCHOR_FINGERPRINT_BYTES);
-            let mut window = [0u8; ANCHOR_FINGERPRINT_BYTES];
-            let mut window_len = 0;
-            if boundary > fp_start {
-                file.seek(SeekFrom::Start(fp_start as u64))?;
-                file.read_exact(&mut window[..boundary - fp_start])?;
-                window_len = boundary - fp_start;
-            }
-            *held = Some(FollowAnchor {
-                identity: current_identity,
-                fp_pos: fp_start as u64,
-                fp_len: window_len as u8,
-                fingerprint: window,
-            });
-            drop(file);
-            stream.write_all(complete)?;
-            stream.flush()?;
-        }
+        stream.flush()?;
     }
 }
 
-/// Re-send spool bytes after a rotation resync, dropping complete frames
-/// whose sequence number was already delivered (`<= last_seq`). A trailing
-/// segment without a newline is an in-flight frame (writer mid-append) and
-/// is NOT forwarded: emitting a fragment risks the client concatenating it
-/// with the next complete frame into one invalid NDJSON line, and the
-/// completed frame will be re-read whole from the new inode on the next
-/// poll (it sits at the end of the file past `*offset`). Lines that do not
-/// parse as frames are forwarded unchanged (historical pass-through).
-fn write_deduped_after_rotation<W: Write>(
-    stream: &mut W,
-    bytes: &[u8],
+/// Bounded streaming delivery plan (round-13 review P1): scan the spool
+/// from `from` line-by-line with a bounded reader and collect whole frames
+/// whose sequence is above the `last_seq` frontier into a send buffer that
+/// never outgrows `MAX_TAIL_BYTES` (a single line is always kept whole —
+/// the bounded scan caps lines at `MAX_TAIL_BYTES` + 1). When the buffer
+/// is full the scan STOPS before the next never-delivered line: the
+/// remaining catch-up is delivered by later polls in bounded quanta, with
+/// NOTHING dropped and NOTHING replayed — the pipeline contract is "same
+/// stream, consecutive sequence numbers, order preserved, no data
+/// dropped", so a drop-oldest variant (loss for latency, client-visible
+/// sequence gaps) is not acceptable here. Both follow branches plan
+/// through this one function: the rotation-resync branch scans from 0
+/// with sequence dedup, the same-inode append branch from the delivered
+/// boundary (dedup is then a no-op by writer sequence monotonicity and
+/// doubles as defense in depth against a rewritten tail).
+///
+/// Memory per follower is bounded (~MAX_TAIL_BYTES of send buffer plus
+/// one line of scan state): previously the resync buffered the ENTIRE
+/// spool and the append branch everything past the delivered boundary in
+/// a per-follower Vec — the ingress template exposes this endpoint
+/// directly, so ~16 synchronized followers could allocate past
+/// enclava-init's 512 MiB limit and OOM the privileged sidecar (round-13
+/// review P1). The scan itself is bounded too: a "line" longer than
+/// `MAX_TAIL_BYTES` cannot be a writer-produced frame (records are capped
+/// at `MAX_LOG_RECORD_BYTES`) and the spool directory is
+/// workload-writable, so oversized lines are consumed and DISCARDED
+/// without ever being buffered whole. Blank lines cannot be
+/// writer-produced frames either and are dropped. A trailing segment
+/// without a newline is an in-flight frame (writer mid-append) and is NOT
+/// forwarded: the completed frame is re-read whole from this inode on the
+/// next poll. (≤ `MAX_TAIL_BYTES`-long) lines that do not parse as frames
+/// are forwarded unchanged (historical pass-through). `offset` ends at
+/// the last ACCOUNTED-FOR line (delivered, dedup-skipped, or discarded) —
+/// never past an undelivered line or an in-flight fragment — and the
+/// fingerprint anchors that boundary for the next poll's same-inode
+/// probe.
+struct DeliveryPlan {
+    out: Vec<u8>,
+    offset: u64,
+    fp_pos: u64,
+    fp_len: u8,
+    fingerprint: [u8; ANCHOR_FINGERPRINT_BYTES],
+}
+
+fn plan_delivery(
+    file: &mut File,
+    from: u64,
     last_seq: &mut Option<u64>,
-) -> io::Result<()> {
-    let mut start = 0usize;
-    while let Some(idx) = bytes[start..].iter().position(|&b| b == b'\n') {
-        let line = &bytes[start..start + idx];
-        start += idx + 1;
-        if line.is_empty() {
-            continue;
+) -> io::Result<DeliveryPlan> {
+    file.seek(SeekFrom::Start(from))?;
+    let cap = MAX_TAIL_BYTES as usize;
+    let mut out: Vec<u8> = Vec::new();
+    // File position of the end of the last accounted-for line.
+    let mut scanned_end = from;
+    {
+        let mut reader = BufReader::with_capacity(64 * 1024, &mut *file);
+        let mut line: Vec<u8> = Vec::new();
+        loop {
+            line.clear();
+            // Bounded per-line scan: spool lines are writer-capped frames
+            // (records are capped at MAX_LOG_RECORD_BYTES in
+            // enclava-wait-exec, far below MAX_TAIL_BYTES), so a "line"
+            // claiming more than MAX_TAIL_BYTES cannot be a
+            // writer-produced frame — and the spool directory is
+            // workload-writable, so a hostile mega-line must not be
+            // buffered whole per follower either (that would re-open the
+            // exact multi-follower OOM this function closes). The take
+            // cap is one past MAX_TAIL_BYTES so a frame of exactly
+            // MAX_TAIL_BYTES content bytes plus its newline stays
+            // in-bounds.
+            let n = reader
+                .by_ref()
+                .take(MAX_TAIL_BYTES + 1)
+                .read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            if !line.ends_with(b"\n") {
+                if (n as u64) < MAX_TAIL_BYTES + 1 {
+                    // In-flight trailing fragment (writer mid-append):
+                    // withhold it — do not emit, do not advance the
+                    // boundary past its first byte. The completed frame is
+                    // re-read whole on the next poll.
+                    break;
+                }
+                // Oversized line (the bounded read filled without ever
+                // seeing a newline): consume-and-discard the rest of it
+                // WITHOUT buffering — never split it into the send
+                // stream, since it is not a writer-produced frame. The
+                // boundary advances past it only once its newline arrives
+                // (below), so a still-growing mega-line stays an
+                // in-flight fragment and is re-scanned whole next poll.
+                let mut skipped: u64 = 0;
+                let mut terminated = false;
+                while !terminated {
+                    let available = reader.fill_buf()?;
+                    if available.is_empty() {
+                        break;
+                    }
+                    match available.iter().position(|&b| b == b'\n') {
+                        Some(i) => {
+                            reader.consume(i + 1);
+                            skipped += (i + 1) as u64;
+                            terminated = true;
+                        }
+                        None => {
+                            let m = available.len();
+                            reader.consume(m);
+                            skipped += m as u64;
+                        }
+                    }
+                }
+                if !terminated {
+                    // EOF mid-mega-line: the whole segment is an
+                    // in-flight fragment — withhold it like any other.
+                    break;
+                }
+                scanned_end += n as u64 + skipped;
+                continue;
+            }
+            // Complete line INCLUDING its terminating newline.
+            let content = &line[..line.len() - 1];
+            if !content.is_empty() {
+                let text = String::from_utf8_lossy(content);
+                let sequence = frame_sequence(&text);
+                if sequence.is_some_and(|sequence| Some(sequence) <= *last_seq) {
+                    // Already delivered (rotation replay): skip WITHOUT
+                    // consuming send budget — the frontier is unchanged
+                    // but the boundary advances past the replay.
+                    scanned_end += n as u64;
+                    continue;
+                }
+                // Bounded send buffer (round-13 P1): stop BEFORE this
+                // never-delivered line once it would not fit — the next
+                // poll delivers it whole (the first line always fits: the
+                // scan caps lines at MAX_TAIL_BYTES + 1, so every poll
+                // makes progress). Frames are never split across quanta
+                // and never dropped.
+                if !out.is_empty() && out.len() + n > cap {
+                    break;
+                }
+                if let Some(sequence) = sequence {
+                    *last_seq = Some(sequence);
+                }
+                out.extend_from_slice(content);
+                out.push(b'\n');
+            }
+            // Blank lines cannot be writer-produced frames: dropped from
+            // the send stream, but the boundary still advances past them.
+            scanned_end += n as u64;
         }
-        let text = String::from_utf8_lossy(line);
-        let sequence = frame_sequence(&text);
-        if sequence.is_some_and(|sequence| Some(sequence) <= *last_seq) {
-            // Already delivered before the rotation: skip the replay.
-            continue;
-        }
-        if let Some(sequence) = sequence {
-            *last_seq = Some(sequence);
-        }
-        stream.write_all(line)?;
-        stream.write_all(b"\n")?;
     }
-    Ok(())
+    let mut plan = DeliveryPlan {
+        out,
+        offset: scanned_end,
+        fp_pos: 0,
+        fp_len: 0,
+        fingerprint: [0u8; ANCHOR_FINGERPRINT_BYTES],
+    };
+    // Fingerprint the delivered boundary directly from the file (the same
+    // construction `anchor_for` documents): the 16 bytes ENDING at the
+    // boundary, so the next poll's probe catches a rewritten file at a
+    // recycled inode number. For a boundary of 0 (empty or fragment-only
+    // file) fingerprint the HEAD of the file instead — it is equally
+    // stable under append-only growth (the fragment completes by
+    // appending past it), matching `anchor_for` exactly; only a completely
+    // EMPTY spool has no bytes to fingerprint (identity-only residual).
+    let boundary = plan.offset as usize;
+    let fp_start = boundary.saturating_sub(ANCHOR_FINGERPRINT_BYTES);
+    if boundary > fp_start {
+        let mut window = [0u8; ANCHOR_FINGERPRINT_BYTES];
+        file.seek(SeekFrom::Start(fp_start as u64))?;
+        file.read_exact(&mut window[..boundary - fp_start])?;
+        plan.fingerprint[..boundary - fp_start].copy_from_slice(&window[..boundary - fp_start]);
+        plan.fp_pos = fp_start as u64;
+        plan.fp_len = (boundary - fp_start) as u8;
+    } else {
+        file.seek(SeekFrom::Start(0))?;
+        let mut n = 0usize;
+        while n < ANCHOR_FINGERPRINT_BYTES {
+            let read = file.read(&mut plan.fingerprint[n..])?;
+            if read == 0 {
+                break;
+            }
+            n += read;
+        }
+        plan.fp_pos = 0;
+        plan.fp_len = n as u8;
+    }
+    Ok(plan)
 }
 
 fn read_request_head(stream: &mut TcpStream) -> io::Result<String> {
@@ -654,57 +757,217 @@ mod tests {
     /// Round-5 review finding: after a rotation resync, the retained window
     /// re-contains frames the follower already received. The resync re-send
     /// must drop those by sequence number instead of replaying them, and
-    /// must forward newer frames exactly once.
+    /// must forward newer frames exactly once. (Round-13: re-targeted at
+    /// the streaming `plan_delivery`, which must preserve the exact dedup
+    /// semantics of the old whole-buffer implementation.)
     #[test]
     fn rotation_resync_dedups_already_delivered_sequences() {
-        // Follower already received sequences 1-3; rotation retained 2-4
-        // plus two new frames (5, 6) appended after the swap.
+        // Follower already received sequences 1-3; the current file
+        // retains 2-4 plus two new frames (5, 6) appended after the swap.
         let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
         let mut bytes = Vec::new();
         for seq in [2u64, 3, 4, 5, 6] {
             bytes.extend_from_slice(frame(seq).as_bytes());
             bytes.push(b'\n');
         }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
         let mut last_seq = Some(3u64);
-        let mut sink = Vec::new();
-        write_deduped_after_rotation(&mut sink, &bytes, &mut last_seq).unwrap();
-        let sent = String::from_utf8(sink).unwrap();
+        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        let sent = String::from_utf8(plan.out.clone()).unwrap();
         assert_eq!(
             sent,
             format!("{}\n{}\n{}\n", frame(4), frame(5), frame(6)),
             "sequences <= 3 must be dropped, 4-6 forwarded once each"
         );
         assert_eq!(last_seq, Some(6));
+        // Offset ends at the last accounted-for line (skipped replays
+        // advance it too — they are never re-scanned).
+        assert_eq!(plan.offset, bytes.len() as u64);
+        // Fingerprint anchors that boundary: the last 16 bytes of the file.
+        let fp_len = plan.fp_len as usize;
+        assert_eq!(plan.fp_pos + plan.fp_len as u64, plan.offset);
+        assert_eq!(plan.fingerprint[..fp_len], bytes[bytes.len() - fp_len..]);
     }
 
     /// An in-flight trailing fragment (writer mid-append) must NOT be
-    /// forwarded during a rotation resync: emitting a partial NDJSON line
-    /// risks the client concatenating it with the next complete frame.
-    /// The completed frame is re-delivered whole from the new inode.
+    /// forwarded during a resync: emitting a partial NDJSON line risks
+    /// the client concatenating it with the next complete frame. The
+    /// completed frame is re-delivered whole on the next poll.
     #[test]
     fn rotation_resync_drops_incomplete_tail() {
         let frame = |seq: u64| format!(r#"{{"version":"enclava-log-frame-v1","sequence":{seq}}}"#);
         let mut bytes = format!("{}\n", frame(7)).into_bytes();
         bytes.extend_from_slice(b"{\"version\":\"enclava-log-fra"); // partial
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
         let mut last_seq = Some(6u64);
-        let mut sink = Vec::new();
-        write_deduped_after_rotation(&mut sink, &bytes, &mut last_seq).unwrap();
-        let sent = String::from_utf8(sink).unwrap();
+        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        let sent = String::from_utf8(plan.out.clone()).unwrap();
         assert_eq!(sent, format!("{}\n", frame(7)));
         // The partial tail carries no parseable sequence: the frontier
         // reflects only the complete frame 7 forwarded above it.
         assert_eq!(last_seq, Some(7));
+        // Offset stops at the end of the last ACCOUNTED-FOR line — the
+        // fragment is re-read (and delivered) whole by the next poll.
+        assert_eq!(plan.offset, (frame(7).len() + 1) as u64);
     }
 
     /// Non-frame lines pass through the resync filter unchanged.
     #[test]
     fn rotation_resync_passes_through_non_frame_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, b"garbage line\n{\"sequence\":9}\n").unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
         let mut last_seq = Some(5u64);
-        let mut sink = Vec::new();
-        let bytes = b"garbage line\n{\"sequence\":9}\n";
-        write_deduped_after_rotation(&mut sink, bytes, &mut last_seq).unwrap();
-        assert_eq!(sink, b"garbage line\n{\"sequence\":9}\n");
+        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        assert_eq!(plan.out, b"garbage line\n{\"sequence\":9}\n");
         assert_eq!(last_seq, Some(9));
+        assert_eq!(plan.offset, "garbage line\n{\"sequence\":9}\n".len() as u64);
+    }
+    /// Round-13 review P1: the delivery planner must not buffer the whole
+    /// spool (or the whole undelivered tail) per follower. A catch-up
+    /// larger than the bounded send buffer is delivered in QUANTA across
+    /// polls: the scan stops before the next never-delivered line and the
+    /// next poll resumes at exactly that boundary — bounded memory with NO
+    /// frame loss and no replay (the pipeline contract is "same stream,
+    /// consecutive sequence numbers, order preserved, no data dropped"; a
+    /// drop-oldest variant would trade loss for latency and leave
+    /// client-visible sequence gaps).
+    #[test]
+    fn delivery_stops_at_buffer_bound_and_resumes_losslessly() {
+        // 3 frames of ~1 MiB each: any two consecutive frames exceed the
+        // MAX_TAIL_BYTES send buffer, so each poll delivers exactly one.
+        let frame = |seq: u64| {
+            format!(
+                r#"{{"version":"enclava-log-frame-v1","sequence":{seq},"pad":"{}"}}"#,
+                "x".repeat(1024 * 1024 + 4096)
+            )
+        };
+        let line = |seq: u64| format!("{}\n", frame(seq));
+        let mut bytes = Vec::new();
+        for seq in [1u64, 2, 3] {
+            bytes.extend_from_slice(line(seq).as_bytes());
+        }
+        assert!(
+            line(1).len() + line(2).len() > MAX_TAIL_BYTES as usize,
+            "fixture: any two frames must outgrow one send quantum"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut last_seq: Option<u64> = None;
+
+        // Poll 1: frame 1 alone — frame 2 does not fit the bound.
+        let plan1 = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        assert_eq!(plan1.out, line(1).as_bytes());
+        assert!(
+            plan1.out.len() < MAX_TAIL_BYTES as usize,
+            "send buffer stays bounded, got {}",
+            plan1.out.len()
+        );
+        assert_eq!(plan1.offset, line(1).len() as u64);
+        assert_eq!(
+            last_seq,
+            Some(1),
+            "the frontier only advances through delivered frames"
+        );
+
+        // Poll 2 resumes at exactly the stopped boundary: frame 2 alone.
+        let plan2 = plan_delivery(&mut file, plan1.offset, &mut last_seq).unwrap();
+        assert_eq!(plan2.out, line(2).as_bytes());
+        assert_eq!(plan2.offset, (line(1).len() + line(2).len()) as u64);
+        assert_eq!(last_seq, Some(2));
+
+        // Poll 3: frame 3 and EOF.
+        let plan3 = plan_delivery(&mut file, plan2.offset, &mut last_seq).unwrap();
+        assert_eq!(plan3.out, line(3).as_bytes());
+        assert_eq!(plan3.offset, bytes.len() as u64);
+        assert_eq!(last_seq, Some(3));
+
+        // Lossless: the three quanta concatenated are the entire file.
+        let mut delivered = plan1.out.clone();
+        delivered.extend_from_slice(&plan2.out);
+        delivered.extend_from_slice(&plan3.out);
+        assert_eq!(delivered, bytes, "bounded quanta must lose nothing");
+    }
+
+    /// Round-13 review P1 hardening: the spool directory is
+    /// workload-writable and the writer caps records at
+    /// MAX_LOG_RECORD_BYTES, so a "line" longer than MAX_TAIL_BYTES is
+    /// never a writer-produced frame — a hostile mega-line must not be
+    /// buffered whole per follower either (that re-opens the exact
+    /// multi-follower OOM this fix closes). Oversized lines are consumed
+    /// and DISCARDED without buffering; the delivered boundary advances
+    /// past one only once its newline arrives.
+    #[test]
+    fn rotation_resync_drops_oversized_line_without_buffering() {
+        let mut bytes = vec![b'z'; MAX_TAIL_BYTES as usize + 4096];
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"{\"version\":\"enclava-log-frame-v1\",\"sequence\":5}\n");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut last_seq = Some(4u64);
+        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        // The mega-line is gone; the real frame after it is forwarded.
+        assert_eq!(
+            plan.out,
+            b"{\"version\":\"enclava-log-frame-v1\",\"sequence\":5}\n"
+        );
+        assert_eq!(last_seq, Some(5));
+        // The boundary advanced past the dropped line AND the frame.
+        assert_eq!(plan.offset, bytes.len() as u64);
+    }
+
+    /// An oversized segment with NO newline yet is an in-flight fragment
+    /// like any other: nothing is forwarded and the boundary does not
+    /// advance past its first byte — the completed segment is re-scanned
+    /// (and dropped) once its newline arrives.
+    #[test]
+    fn rotation_resync_withholds_oversized_fragment() {
+        let bytes = vec![b'z'; MAX_TAIL_BYTES as usize + 4096]; // no newline
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut last_seq = Some(4u64);
+        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        assert!(plan.out.is_empty());
+        assert_eq!(plan.offset, 0, "in-flight fragment is withheld");
+    }
+
+    /// The boundary-0 anchor (empty or fragment-only file) fingerprints
+    /// the HEAD of the file — the construction `anchor_for` documents —
+    /// so the next poll's probe catches a rewritten file even when
+    /// nothing has been delivered from this generation yet. Only a
+    /// completely EMPTY spool stays identity-only.
+    #[test]
+    fn rotation_resync_zero_boundary_fingerprints_head() {
+        let bytes = b"{\"version\":\"enclava-log-frag".to_vec(); // fragment only
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spool.jsonl");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut last_seq = Some(4u64);
+        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        assert_eq!(plan.offset, 0);
+        assert_eq!(plan.fp_pos, 0);
+        let fp_len = plan.fp_len as usize;
+        assert_eq!(fp_len, bytes.len().min(ANCHOR_FINGERPRINT_BYTES));
+        assert_eq!(plan.fingerprint[..fp_len], bytes[..fp_len]);
+        // Cross-check against the anchor_for construction tests build.
+        let anchor = anchor_for(&bytes, 0, SpoolIdentity { dev: 0, ino: 0 });
+        assert_eq!(plan.fp_pos, anchor.fp_pos);
+        assert_eq!(plan.fp_len, anchor.fp_len);
+        assert_eq!(plan.fingerprint, anchor.fingerprint);
     }
 
     /// The relay runs as root and the spool directory is group-writable by
@@ -763,41 +1026,57 @@ mod tests {
         assert_eq!(offset, "one\ntwo\nthree\n".len() as u64);
     }
 
-    /// Round-6 review finding: the delivered boundary after a drain must be
-    /// the file's actual cursor, not a pre-read metadata length — the writer
-    /// is a separate process and can append mid-read; those bytes are
-    /// delivered in the same response and must not be replayed next poll.
+    /// Round-6 review finding, re-pinned at the delivery planner: the
+    /// delivered boundary must reflect the lines actually SCANNED, never a
+    /// pre-read metadata length — the writer is a separate process and can
+    /// append concurrently. Lines the scan observed are delivered exactly
+    /// once (not replayed next poll even though the pre-scan length was
+    /// stale) and lines landing after the scan stay for the next poll
+    /// (not skipped).
     #[test]
-    fn drain_from_reports_cursor_position_not_preread_length() {
+    fn delivery_offset_tracks_scanned_lines_not_prestale_length() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("spool.jsonl");
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .unwrap();
-        use std::io::Write;
-        file.write_all(b"frame-1\n").unwrap();
-        file.flush().unwrap();
-        drop(file);
+        let first = "{\"sequence\":1}\n";
+        let second = "{\"sequence\":2}\n";
+        std::fs::write(&path, first).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
 
-        // Simulate a mid-read append: seed the spool with the pre-read
-        // state, then grow it BEFORE draining, as an interleaved writer
-        // process would. The pre-read length (7) is stale by drain time.
-        let mut reader = std::fs::File::open(&path).unwrap();
-        reader.seek(std::io::SeekFrom::Start(0)).unwrap();
+        // The "pre-read" length is stale immediately: frame 2 lands before
+        // the scan runs, as an interleaved writer would.
         {
+            use std::io::Write as _;
             let mut writer = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
                 .unwrap();
-            writer.write_all(b"frame-2\n").unwrap();
+            writer.write_all(second.as_bytes()).unwrap();
         }
-        let (bytes, delivered) = drain_from(&mut reader, 0).unwrap();
-        assert_eq!(bytes, b"frame-1\nframe-2\n");
-        // The cursor (14), not the stale pre-read length (7), is the
-        // delivered boundary — frame-2 is not replayed on the next poll.
-        assert_eq!(delivered, "frame-1\nframe-2\n".len() as u64);
+        let mut last_seq = Some(0u64);
+        let plan = plan_delivery(&mut file, 0, &mut last_seq).unwrap();
+        // The scan SAW both lines: both delivered once and the boundary is
+        // their combined end (the scanned boundary, not the stale length).
+        assert_eq!(plan.out, format!("{first}{second}").as_bytes());
+        assert_eq!(plan.offset, (first.len() + second.len()) as u64);
+        assert_eq!(last_seq, Some(2));
+
+        // A line landing AFTER the scan is not skipped: the next poll from
+        // the scanned boundary picks it up.
+        let third = "{\"sequence\":3}\n";
+        {
+            use std::io::Write as _;
+            let mut writer = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writer.write_all(third.as_bytes()).unwrap();
+        }
+        let plan = plan_delivery(&mut file, plan.offset, &mut last_seq).unwrap();
+        assert_eq!(plan.out, third.as_bytes());
+        assert_eq!(
+            plan.offset,
+            (first.len() + second.len() + third.len()) as u64
+        );
     }
 
     /// A rename-based rotation swaps the inode: the follower must detect the
@@ -857,7 +1136,7 @@ mod tests {
 
     /// Round-9 review finding (P1): the OLD held fd must be dropped BEFORE
     /// the post-rotation client write, not only after adopting the new one.
-    /// A stalled client can block write_deduped_after_rotation for up to
+    /// A stalled client can block the post-rotation client write for up to
     /// FOLLOW_IO_TIMEOUT while the unlinked old inode (~32 MiB) stays
     /// pinned; staggered stalled followers could each pin a different
     /// rotation generation past the 64 MiB emptyDir cap. Deterministic pin:

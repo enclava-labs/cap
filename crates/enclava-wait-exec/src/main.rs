@@ -559,6 +559,26 @@ fn read_capped_record<R: BufRead>(
                     match peek.first() {
                         Some(b'\n') => {
                             reader.consume(1);
+                            // Round-13 review P2: a CRLF-terminated record
+                            // with exactly cap-1 payload bytes fills the
+                            // buffer with the terminator's `\r` (the `\n`
+                            // sits just past the cap window). The buffered
+                            // `\r` plus this consumed `\n` IS the two-byte
+                            // terminator — pop exactly that one byte,
+                            // matching what the short-record path's strip
+                            // does at every other record length. A content
+                            // `\r` ADJACENT to the terminator's CR (a
+                            // buffered `\r\r` before this LF) keeps its
+                            // content byte: only the terminator's CR goes,
+                            // the same content-preservation policy the
+                            // consume-`\r\n` arm below applies to a
+                            // payload-ending CR (round-5/round-12).
+                            // (`\rX` content is untouched — that case
+                            // never reaches this arm: the `\r` would be
+                            // followed by `X`, not `\n`.)
+                            if buf.last() == Some(&b'\r') {
+                                buf.pop();
+                            }
                         }
                         Some(b'\r') if peek.get(1) == Some(&b'\n') => {
                             reader.consume(2);
@@ -1497,6 +1517,73 @@ mod tests {
         reassembled.extend_from_slice(&second);
         reassembled.extend_from_slice(&third);
         assert_eq!(reassembled, input.as_bytes());
+    }
+
+    /// Round-13 review P2: a CRLF-terminated record with exactly
+    /// cap-1 payload bytes fills the capped buffer with the terminator's
+    /// `\r` and leaves the `\n` just past the cap window. The buffered
+    /// `\r` plus the consumed `\n` are the two-byte terminator: the `\r`
+    /// must be popped, matching what the short-record strip does at every
+    /// other record length (previously the `\r` was encrypted as record
+    /// content, so CLI output differed for the same record at cap-1).
+    #[test]
+    fn read_capped_record_strips_crlf_when_cr_fills_last_cap_byte() {
+        let payload = "a".repeat(MAX_LOG_RECORD_BYTES - 1);
+        let input = format!("{payload}\r\nnext\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut pending_cr = false;
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        // The buffer held cap bytes (payload + the terminator's CR) and
+        // the pop removed the CR: the record is the cap-1 payload bytes.
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES - 1);
+        // The chunk stays `capped` (do-not-strip by the caller) — the
+        // terminator was already removed by read_capped_record itself.
+        assert!(r1.capped);
+        assert_eq!(first.as_slice(), payload.as_bytes());
+        assert_eq!(first.last(), Some(&b'a'), "the terminator CR is stripped");
+
+        // The next record is `next` — no orphaned terminator bytes.
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        assert_eq!(second.as_slice(), b"next\n");
+        assert!(!r2.capped);
+
+        // EOF.
+        let mut third = Vec::new();
+        let r3 = read_capped_record(&mut reader, &mut third, &mut pending_cr).unwrap();
+        assert_eq!(r3.len, 0);
+    }
+
+    /// The boundary-LF pop removes exactly ONE buffered byte — the
+    /// terminator's CR. A record whose CONTENT ends in a CR right before a
+    /// CRLF terminator landing at the boundary keeps that content CR, the
+    /// same content-preservation policy the consume-`\r\n`-at-boundary arm
+    /// pins (round-12): the terminator's own CR is consumed, everything
+    /// before it is record content.
+    #[test]
+    fn read_capped_record_keeps_content_cr_before_boundary_lf() {
+        // Content is cap-1 bytes ending in `\r`; the terminator CRLF
+        // straddles the cap window: its `\r` is the buffer's last byte,
+        // its `\n` is the boundary peek.
+        let payload = format!("{}\r", "a".repeat(MAX_LOG_RECORD_BYTES - 2));
+        let input = format!("{payload}\r\nnext\n");
+        let mut reader = std::io::BufReader::new(input.as_bytes());
+        let mut pending_cr = false;
+        let mut first = Vec::new();
+        let r1 = read_capped_record(&mut reader, &mut first, &mut pending_cr).unwrap();
+        assert_eq!(r1.len, MAX_LOG_RECORD_BYTES - 1);
+        assert!(r1.capped);
+        assert_eq!(
+            first.as_slice(),
+            payload.as_bytes(),
+            "the terminator's CR is popped, the content CR survives"
+        );
+
+        let mut second = Vec::new();
+        let r2 = read_capped_record(&mut reader, &mut second, &mut pending_cr).unwrap();
+        assert_eq!(second.as_slice(), b"next\n");
+        assert!(!r2.capped);
     }
 
     /// CR/LF terminators are still stripped from records that ended at a
