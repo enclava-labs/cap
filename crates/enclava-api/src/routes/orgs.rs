@@ -932,9 +932,10 @@ pub async fn rotate_org_owner(
     //   keyring content, signatures, and pinned-owner checks below.
     // - when the rotation creates a new keyring version, signed_at may not
     //   predate the creation of the keyring version whose owner signed it.
-    // - each accepted directive is consumed exactly once (ledger below);
-    //   only a retry of the byte-identical, already-applied rotation stays
-    //   idempotent.
+    // - each directive accepted on the insert-new-version path is consumed
+    //   exactly once (ledger below). The already-applied path is idempotent
+    //   for any valid directive over the same completed rotation (see the
+    //   else branch) and consumes nothing.
     const MAX_DIRECTIVE_AGE_SECONDS: i64 = 900;
     let directive = owner_rotation_directive_bytes(
         org_id,
@@ -1040,9 +1041,17 @@ pub async fn rotate_org_owner(
                 "owner rotation directive signed_at is in the future",
             ));
         }
-        if body.signed_at < lane_now - chrono::Duration::seconds(MAX_DIRECTIVE_AGE_SECONDS) {
-            return Err(bad_request("owner rotation directive signed_at is too old"));
-        }
+        // The first-use max-age bound is enforced after the signing
+        // service's owner status is consulted below: when the service is
+        // already pinned to this replacement owner, the upstream
+        // rotate-owner for this exact (current -> replacement) pair has
+        // already succeeded and only the CAP rows were lost to a
+        // rolled-back transaction. Rejecting that recovery retry on age
+        // alone would strand the reconciliation (PR #185 review), and
+        // completing it cannot introduce any new owner key: the pinned
+        // owner, byte-identical keyring content, and signature checks
+        // above still bind the stored version to exactly what the
+        // upstream already accepted.
         if body.signed_at < latest.4 {
             return Err(bad_request(
                 "owner rotation directive predates the current keyring version",
@@ -1071,8 +1080,16 @@ pub async fn rotate_org_owner(
         // Already-applied rotation: the byte-identical stored version
         // content, the verified keyring and directive signatures, and the
         // pinned-owner checks above prove this is a retry of the completed
-        // rotation (main's pre-ledger idempotency contract). Nothing is
-        // mutated on this path, so no ledger consult is required.
+        // rotation (main's pre-ledger idempotency contract). Any valid
+        // directive over the same completed (current -> replacement) pair
+        // passes here, not only the consumed one; that stays safe because
+        // nothing is consumed on this path (such a directive can never
+        // authorize a later insert, which independently enforces the time
+        // bounds and the ledger) and no CAP rows are mutated. The signing
+        // service may still receive the pre-existing rotate-owner recovery
+        // call when it still holds the directive's signer, but the
+        // replacement is pinned by the stored keyring, so no new owner key
+        // can be introduced (residual exposure tracked in #188).
     }
     let current_keyring: SignedOrgKeyring =
         serde_json::from_slice(&base_payload).map_err(|_| db_error())?;
@@ -2180,6 +2197,132 @@ mod tests {
             .execute(&pool)
             .await
             .expect("delete future-dated user");
+    }
+
+    #[tokio::test]
+    async fn owner_rotation_consumed_directive_conflict_is_rejected() {
+        // Coverage (grok-4.7 self-check of the PR #185 follow-up): the
+        // rows_affected == 0 branch of the ledger insert is the only
+        // backstop for an already-consumed directive whose signed_at still
+        // clears the time bounds (the #188 scenario once the directive has
+        // been used). Seed the digest directly, keep signed_at inside the
+        // window and not before the current version's created_at, and
+        // expect 409 "already used" rather than any time-bound rejection.
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-consumed-conflict-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert consumed-conflict org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Consumed Conflict Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert consumed-conflict user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert consumed-conflict membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2), ($1, $3)")
+            .bind(user_id)
+            .bind(current_key.verifying_key().to_bytes().to_vec())
+            .bind(replacement_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert consumed-conflict signing keys");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes())
+                    .await,
+                None,
+            )
+            .expect("build mock signing service client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+        )
+        .await
+        .expect("publish v1 keyring");
+
+        // A directive that is otherwise perfectly valid on the
+        // insert-new-version path: fresh, not future-dated, not before
+        // v1's created_at -- but its digest was already consumed.
+        let signed_at = Utc::now();
+        let request = rotation_request(
+            org_id,
+            user_id,
+            &current_key,
+            &replacement_key,
+            2,
+            2,
+            signed_at,
+            "consumed-conflict",
+        );
+        let directive = owner_rotation_directive_bytes(
+            org_id,
+            &current_key.verifying_key().to_bytes(),
+            &replacement_key.verifying_key().to_bytes(),
+            signed_at,
+            "consumed-conflict",
+        );
+        sqlx::query(
+            "INSERT INTO org_rotation_directives (org_id, directive_sha256) VALUES ($1, $2)",
+        )
+        .bind(org_id)
+        .bind(Sha256::digest(&directive).as_slice())
+        .execute(&pool)
+        .await
+        .expect("pre-consume directive digest");
+
+        let rejected = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(request),
+        )
+        .await
+        .expect_err("already-consumed directive must be rejected");
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+        assert_eq!(
+            rejected.1.0["error"],
+            "owner rotation directive was already used"
+        );
+
+        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete consumed-conflict audit rows");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete consumed-conflict org");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("delete consumed-conflict user");
     }
 
     #[tokio::test]
