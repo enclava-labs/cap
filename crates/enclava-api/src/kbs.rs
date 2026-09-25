@@ -558,7 +558,13 @@ async fn load_signed_policy_candidates(
                       AND current_artifact.deploy_id = artifact_deployment_id
                       AND current_artifact.descriptor_core_hash
                           = artifact_descriptor_core_hash
-               )
+                      AND NOT EXISTS (
+                          SELECT 1
+                            FROM withdrawn_signer_artifacts AS withdrawn
+                           WHERE withdrawn.descriptor_core_hash
+                              = current_artifact.descriptor_core_hash
+                      )
+                )
         ),
         job_artifact_candidates AS (
             SELECT DISTINCT ON (current.app_id, artifact.descriptor_core_hash)
@@ -585,6 +591,12 @@ async fn load_signed_policy_candidates(
              AND artifact.deploy_id = historical.artifact_deployment_id
              AND artifact.descriptor_core_hash
                  = historical.artifact_descriptor_core_hash
+             AND NOT EXISTS (
+                 SELECT 1
+                   FROM withdrawn_signer_artifacts AS withdrawn
+                  WHERE withdrawn.descriptor_core_hash
+                      = artifact.descriptor_core_hash
+             )
             ORDER BY
                 current.app_id,
                 artifact.descriptor_core_hash,
@@ -640,6 +652,12 @@ async fn load_signed_policy_candidates(
             WHERE legacy.current_operation_rank = 1
               AND legacy.app_status IN ('creating', 'running')
               AND legacy.deployment_status = 'healthy'
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM withdrawn_signer_artifacts AS withdrawn
+                   WHERE withdrawn.descriptor_core_hash
+                       = artifact.descriptor_core_hash
+              )
         ),
         selected AS (
             SELECT *
@@ -2561,6 +2579,69 @@ owner_resource_bindings := {}
                 .await
                 .expect("delete KBS selector fixture");
         }
+    }
+
+    #[tokio::test]
+    async fn selector_drops_artifacts_withdrawn_by_signer_rotation() {
+        let pool = database_test_pool().await;
+        let now = Utc::now();
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let current = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, current, "healthy", now).await;
+        // A per-run hash byte avoids PK collisions with leftover fixtures on
+        // the shared regression database.
+        let hash_byte = format!("{:02x}", app_id.as_bytes()[0]);
+        let current_artifact = insert_test_artifact(&pool, app_id, current, &hash_byte).await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            current,
+            current,
+            Some((current, &current_artifact)),
+        )
+        .await;
+
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select pre-rotation candidates");
+        assert!(candidates.iter().any(|candidate| {
+            candidate.artifact.metadata.descriptor_core_hash
+                == current_artifact.metadata.descriptor_core_hash
+        }));
+
+        // Signer rotation withdraws every artifact signed under the previous
+        // identity (issue #119): the withdrawal row is recorded and the
+        // selector must refuse the hash on every path. (The runtime
+        // subject/issuer predicate itself is exercised end-to-end by the
+        // rotate_signer route test.)
+        let mut tx = pool.begin().await.expect("begin withdrawal tx");
+        sqlx::query(
+            "INSERT INTO withdrawn_signer_artifacts (descriptor_core_hash, app_id)
+             SELECT descriptor_core_hash, app_id
+               FROM workload_artifacts
+              WHERE descriptor_core_hash = $1
+              ON CONFLICT DO NOTHING",
+        )
+        .bind(hex::decode(&current_artifact.metadata.descriptor_core_hash).unwrap())
+        .execute(&mut *tx)
+        .await
+        .expect("withdraw rotated-out artifact");
+        tx.commit().await.expect("commit withdrawal");
+
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select post-rotation candidates");
+        assert!(candidates.iter().all(|candidate| {
+            candidate.artifact.metadata.descriptor_core_hash
+                != current_artifact.metadata.descriptor_core_hash
+        }));
+
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete signer rotation fixture");
     }
 
     #[tokio::test]

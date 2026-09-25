@@ -3,9 +3,11 @@ use super::{
     SignerRotationTokenRequest, WorkloadTeardownDecision, app_delete_failure, create_app,
     delete_tenant_namespace_with_timeouts, derive_identity, egress_allowlist_host_audit_reasons,
     issue_signer_rotation_token_route, list_apps, post_workload_teardown,
-    request_workload_teardown, requires_workload_teardown, validate_egress_allowlist,
-    validate_egress_mode, workload_teardown_http_failure, workload_teardown_instance_id,
+    request_workload_teardown, requires_workload_teardown, rotate_signer,
+    validate_egress_allowlist, validate_egress_mode, workload_teardown_http_failure,
+    workload_teardown_instance_id,
 };
+use crate::auth::jwt::SignerRotationTokenInput;
 use crate::auth::middleware::AuthContext;
 use crate::models::{App, AppStatus, Role, UnlockMode};
 use axum::Json;
@@ -759,4 +761,585 @@ async fn signer_rotation_token_rejects_api_key_before_database_access() {
     };
 
     assert_eq!(err.0, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn signer_rotation_token_is_single_use_and_withdraws_rotated_out_artifacts() {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect signer rotation regression database");
+    crate::db::pool::run_migrations(&pool)
+        .await
+        .expect("migrate signer rotation regression database");
+
+    let org_id = uuid::Uuid::new_v4();
+    let user_id = uuid::Uuid::new_v4();
+    let app_id = uuid::Uuid::new_v4();
+    let suffix = app_id.simple().to_string();
+    sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+        .bind(org_id)
+        .bind(format!("signer-rotation-{suffix}"))
+        .bind(&suffix[..8])
+        .execute(&pool)
+        .await
+        .expect("insert signer rotation organization");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'rotation owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert signer rotation user");
+    sqlx::query(
+        "INSERT INTO memberships (user_id, org_id, role, created_at, removed_at)
+         VALUES ($1, $2, 'owner', now(), NULL)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert signer rotation membership");
+    sqlx::query(
+        "INSERT INTO apps (
+             id, org_id, name, namespace, instance_id, tenant_id,
+             service_account, bootstrap_owner_pubkey_hash,
+             tenant_instance_identity_hash, domain, status,
+             signer_identity_subject, signer_identity_issuer
+         ) VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+             'running'::app_status_enum, $11, $12
+         )",
+    )
+    .bind(app_id)
+    .bind(org_id)
+    .bind(format!("app-{}", &suffix[..12]))
+    .bind(format!("cap-{}", &suffix[..12]))
+    .bind(format!("instance-{suffix}"))
+    .bind(&suffix[..8])
+    .bind(format!("cap-{}-sa", &suffix[..12]))
+    .bind("11".repeat(32))
+    .bind("22".repeat(32))
+    .bind(format!("{}.example.test", &suffix[..12]))
+    .bind("https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main")
+    .bind("https://token.actions.githubusercontent.com")
+    .execute(&pool)
+    .await
+    .expect("insert signer rotation app");
+
+    // A retained artifact signed under the previous identity.
+    let deploy_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO deployments (id, org_id, app_id, status, spec_snapshot)
+         VALUES ($1, $2, $3, 'healthy'::deploy_status_enum, '{}'::jsonb)",
+    )
+    .bind(deploy_id)
+    .bind(org_id)
+    .bind(app_id)
+    .execute(&pool)
+    .await
+    .expect("insert signer rotation deployment");
+    let descriptor_core_hash: Vec<u8> = (0..32)
+        .map(|i| (app_id.as_bytes()[i % 16] as u16 + i as u16) as u8)
+        .collect();
+    let artifact_json = serde_json::json!({
+        "signer_identity": {
+            "subject": "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main",
+            "issuer": "https://token.actions.githubusercontent.com",
+        }
+    });
+    sqlx::query(
+        "INSERT INTO workload_artifacts (
+             descriptor_core_hash, app_id, deploy_id, descriptor_payload,
+             descriptor_signature, descriptor_signing_key_id,
+             org_keyring_payload, org_keyring_signature, signed_policy_artifact
+         ) VALUES ($1, $2, $3, $4, $5, 'test-key', '{}'::jsonb, $6, '{}'::jsonb)",
+    )
+    .bind(&descriptor_core_hash)
+    .bind(app_id)
+    .bind(deploy_id)
+    .bind(&artifact_json)
+    .bind(vec![1u8; 64])
+    .bind(vec![2u8; 64])
+    .execute(&pool)
+    .await
+    .expect("insert rotated-out workload artifact");
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let hmac_key = [7u8; 32];
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "signer-rotation-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://token.actions.githubusercontent.com";
+
+    let desired_before: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read desired generation before any rotation");
+
+    let token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue signer rotation token");
+
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load app name");
+
+    let Json(rotated) = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name.clone()),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+            email_confirmation_token: Some(token.clone()),
+        }),
+    )
+    .await
+    .expect("first rotation succeeds");
+    assert_eq!(
+        rotated.signer_identity_subject.as_deref(),
+        Some(new_subject)
+    );
+
+    // The rotated-out artifact is withdrawn from KBS policy.
+    let withdrawn: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM withdrawn_signer_artifacts
+          WHERE descriptor_core_hash = $1 AND app_id = $2",
+    )
+    .bind(&descriptor_core_hash)
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count withdrawn artifacts");
+    assert_eq!(
+        withdrawn, 1,
+        "rotation must withdraw the old-signer artifact"
+    );
+    // And a signed-policy generation was enqueued durably: every rotation
+    // must advance the generation.
+    let desired: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read desired generation after rotation");
+    assert!(
+        desired > desired_before,
+        "rotation must enqueue policy reconciliation"
+    );
+    // The consumed jti ledger row is committed with the rotation.
+    let jti_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count consumed jti rows");
+    assert_eq!(jti_rows, 1, "rotation must record the consumed jti");
+
+    // Rotate back to the previous identity so the original token's claims
+    // (previous=old, new=new) match again, then replay it: it must be
+    // rejected because its jti was consumed.
+    let rotate_back_token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: new_subject.to_string(),
+            previous_issuer: new_issuer.to_string(),
+            new_subject: previous_subject.to_string(),
+            new_issuer: previous_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue rotate-back token");
+    let desired_mid: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read desired generation before rotate-back");
+    let Json(_) = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name.clone()),
+        Json(RotateSignerRequest {
+            subject: previous_subject.to_string(),
+            issuer: previous_issuer.to_string(),
+            email_confirmation_token: Some(rotate_back_token),
+        }),
+    )
+    .await
+    .expect("rotate back succeeds");
+    let desired_after: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read desired generation after rotate-back");
+    assert!(
+        desired_after > desired_mid,
+        "rotating an already-withdrawn artifact must still bump the generation"
+    );
+
+    let replay = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name.clone()),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+            email_confirmation_token: Some(token),
+        }),
+    )
+    .await;
+    let err = match replay {
+        Ok(_) => panic!("consumed signer rotation token was replayable"),
+        Err(err) => err,
+    };
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+    // The rejected replay must not have committed any part of the rotation.
+    let replayed_subject: Option<String> =
+        sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app subject after rejected replay");
+    assert_eq!(
+        replayed_subject.as_deref(),
+        Some(previous_subject),
+        "rejected replay must roll back the signer update"
+    );
+
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete signer rotation audit rows");
+    sqlx::query("DELETE FROM consumed_signer_rotation_tokens WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete signer rotation consumed tokens");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete signer rotation fixture");
+}
+
+#[tokio::test]
+async fn signer_rotation_never_flips_an_unsigned_install_into_signed_mode() {
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect unsigned rotation regression database");
+    crate::db::pool::run_migrations(&pool)
+        .await
+        .expect("migrate unsigned rotation regression database");
+
+    let org_id = uuid::Uuid::new_v4();
+    let user_id = uuid::Uuid::new_v4();
+    let app_id = uuid::Uuid::new_v4();
+    let suffix = app_id.simple().to_string();
+    sqlx::query("INSERT INTO organizations (id, name, cust_slug) VALUES ($1, $2, $3)")
+        .bind(org_id)
+        .bind(format!("unsigned-rotation-{suffix}"))
+        .bind(&suffix[..8])
+        .execute(&pool)
+        .await
+        .expect("insert unsigned rotation organization");
+    sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'unsigned owner')")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("insert unsigned rotation user");
+    sqlx::query(
+        "INSERT INTO memberships (user_id, org_id, role, created_at, removed_at)
+         VALUES ($1, $2, 'owner', now(), NULL)",
+    )
+    .bind(user_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("insert unsigned rotation membership");
+    sqlx::query(
+        "INSERT INTO apps (
+             id, org_id, name, namespace, instance_id, tenant_id,
+             service_account, bootstrap_owner_pubkey_hash,
+             tenant_instance_identity_hash, domain, status,
+             signer_identity_subject, signer_identity_issuer
+         ) VALUES (
+             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+             'running'::app_status_enum, $11, $12
+         )",
+    )
+    .bind(app_id)
+    .bind(org_id)
+    .bind(format!("app-{}", &suffix[..12]))
+    .bind(format!("cap-{}", &suffix[..12]))
+    .bind(format!("instance-{suffix}"))
+    .bind(&suffix[..8])
+    .bind(format!("cap-{}-sa", &suffix[..12]))
+    .bind("11".repeat(32))
+    .bind("22".repeat(32))
+    .bind(format!("{}.example.test", &suffix[..12]))
+    .bind("https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main")
+    .bind("https://token.actions.githubusercontent.com")
+    .execute(&pool)
+    .await
+    .expect("insert unsigned rotation app");
+
+    let previous_subject = "https://github.com/acme/old/.github/workflows/ci.yaml@refs/heads/main";
+    let previous_issuer = "https://token.actions.githubusercontent.com";
+
+    // A legacy binding row so rotation must carry the new identity into it.
+    sqlx::query(
+        "INSERT INTO kbs_tls_bindings (
+             app_id, binding_key, repository, tag, namespace, service_account,
+             tenant_instance_identity_hash, signer_identity_subject,
+             signer_identity_issuer
+         ) VALUES ($1, $2, 'default', 'workload-secret-seed', $3, $4, $5, $6, $7)
+         ON CONFLICT (app_id) DO NOTHING",
+    )
+    .bind(app_id)
+    .bind(format!("tls-{}", &suffix[..12]))
+    .bind(format!("cap-{}", &suffix[..12]))
+    .bind(format!("cap-{}-sa", &suffix[..12]))
+    .bind("22".repeat(32))
+    .bind(previous_subject)
+    .bind(previous_issuer)
+    .execute(&pool)
+    .await
+    .expect("insert legacy tls binding");
+
+    // Pin the install to the unsigned-only state: desired_generation = 0.
+    // The singleton is process-wide shared state, so snapshot it and restore
+    // it in cleanup instead of leaving the wipe behind.
+    type ReconciliationSingleton = (
+        i64,
+        i64,
+        i64,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<String>,
+    );
+    let singleton_before: ReconciliationSingleton = sqlx::query_as(
+        "SELECT desired_generation, configmap_generation, applied_generation,
+                configmap_policy_sha256, applied_policy_sha256,
+                configmap_resource_version
+           FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("snapshot reconciliation singleton");
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = 0,
+                configmap_generation = 0,
+                applied_generation = 0,
+                configmap_policy_sha256 = NULL,
+                applied_policy_sha256 = NULL,
+                configmap_resource_version = NULL
+          WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("reset reconciliation state to unsigned");
+    // The helper bumps when ANY workload_artifacts row exists (table-wide,
+    // not per-app). Skip this regression when a shared database carries
+    // leftover fixtures from other tests.
+    let total_artifacts: i64 = sqlx::query_scalar("SELECT count(*) FROM workload_artifacts")
+        .fetch_one(&pool)
+        .await
+        .expect("count workload artifacts");
+    if total_artifacts != 0 {
+        // Restore before skipping so the singleton wipe is not left behind.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = $1,
+                    configmap_generation = $2,
+                    applied_generation = $3,
+                    configmap_policy_sha256 = $4,
+                    applied_policy_sha256 = $5,
+                    configmap_resource_version = $6
+              WHERE singleton",
+        )
+        .bind(singleton_before.0)
+        .bind(singleton_before.1)
+        .bind(singleton_before.2)
+        .bind(&singleton_before.3)
+        .bind(&singleton_before.4)
+        .bind(&singleton_before.5)
+        .execute(&pool)
+        .await
+        .expect("restore reconciliation singleton before skipping");
+        eprintln!("skipping: shared database has {total_artifacts} workload artifacts");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("delete skipped unsigned rotation fixture");
+        return;
+    }
+
+    let mut state = crate::test_support::lazy_state();
+    state.db = pool.clone();
+    let hmac_key = [7u8; 32];
+    let auth = AuthContext {
+        user_id,
+        org_id,
+        org_name: "unsigned-rotation-test".to_string(),
+        role: Role::Owner,
+        api_key: None,
+        management_origin: crate::auth::middleware::ManagementOrigin::Public,
+    };
+    let new_subject = "https://github.com/acme/new/.github/workflows/ci.yaml@refs/heads/main";
+    let new_issuer = "https://new-issuer.example.test";
+
+    let token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue unsigned rotation token");
+
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load unsigned app name");
+
+    let Json(rotated) = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+            email_confirmation_token: Some(token),
+        }),
+    )
+    .await
+    .expect("unsigned rotation succeeds");
+    assert_eq!(
+        rotated.signer_identity_subject.as_deref(),
+        Some(new_subject)
+    );
+
+    // The legacy binding must carry the new identity into the next Rego
+    // render.
+    let (binding_subject, binding_issuer): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT signer_identity_subject, signer_identity_issuer
+           FROM kbs_tls_bindings WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load tls binding identity after rotation");
+    assert_eq!(
+        binding_subject.as_deref(),
+        Some(new_subject),
+        "rotation must update the legacy Rego binding signer subject"
+    );
+    assert_eq!(
+        binding_issuer.as_deref(),
+        Some(new_issuer),
+        "rotation must update the legacy Rego binding signer issuer"
+    );
+
+    // The install must still be unsigned: rotation never enters signed mode.
+    let desired: i64 = sqlx::query_scalar(
+        "SELECT desired_generation FROM kbs_signed_policy_reconciliation WHERE singleton",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read desired generation after unsigned rotation");
+    assert_eq!(
+        desired, 0,
+        "rotation on an unsigned-only install must not enter signed mode"
+    );
+
+    // Restore the shared singleton exactly as it was found (all columns the
+    // test wiped, hashes included, so 0041's CHECKs keep holding).
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = $1,
+                configmap_generation = $2,
+                applied_generation = $3,
+                configmap_policy_sha256 = $4,
+                applied_policy_sha256 = $5,
+                configmap_resource_version = $6
+          WHERE singleton",
+    )
+    .bind(singleton_before.0)
+    .bind(singleton_before.1)
+    .bind(singleton_before.2)
+    .bind(singleton_before.3.clone())
+    .bind(singleton_before.4.clone())
+    .bind(singleton_before.5.clone())
+    .execute(&pool)
+    .await
+    .expect("restore reconciliation singleton");
+    sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete unsigned rotation audit rows");
+    sqlx::query("DELETE FROM consumed_signer_rotation_tokens WHERE org_id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete unsigned rotation consumed tokens");
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("delete unsigned rotation fixture");
+}
+
+fn clone_auth(auth: &AuthContext) -> AuthContext {
+    AuthContext {
+        user_id: auth.user_id,
+        org_id: auth.org_id,
+        org_name: auth.org_name.clone(),
+        role: auth.role,
+        api_key: auth.api_key.clone(),
+        management_origin: auth.management_origin,
+    }
 }

@@ -1838,6 +1838,56 @@ pub(crate) async fn delete_app_before(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Best-effort fence release on a failed publish: nothing retries inside
+/// this request anymore, so do not leave the KBS fence claimed for the lease
+/// quarantine window.
+async fn release_finished_lease(lease: crate::mutation_leases::ResourceMutationLease) {
+    if let Err(error) = lease.finish().await {
+        tracing::warn!(
+            error = %error,
+            error_code = "kbs_policy_lease_finish_failed",
+            "failed to release the KBS policy fence after a failed publish"
+        );
+    }
+}
+
+/// Record that every retained workload artifact whose signed descriptor
+/// still carries the rotated-out signer identity is withdrawn from KBS
+/// policy. The signed-policy selector
+/// (crate::kbs::load_signed_policy_candidates) refuses withdrawn hashes, so
+/// the live Trustee policy stops admitting the previous signer without
+/// mutating the immutable artifact rows.
+async fn withdraw_signer_rotated_out_artifacts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    app_id: Uuid,
+    previous_subject: &str,
+    previous_issuer: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO withdrawn_signer_artifacts (
+             descriptor_core_hash, app_id
+         )
+         SELECT artifact.descriptor_core_hash, artifact.app_id
+           FROM workload_artifacts AS artifact
+          WHERE artifact.app_id = $1
+            AND artifact.descriptor_payload -> 'signer_identity' ->> 'subject' = $2
+            AND artifact.descriptor_payload -> 'signer_identity' ->> 'issuer' = $3
+            AND NOT EXISTS (
+                SELECT 1
+                  FROM withdrawn_signer_artifacts AS existing
+                 WHERE existing.descriptor_core_hash
+                     = artifact.descriptor_core_hash
+            )
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(app_id)
+    .bind(previous_subject)
+    .bind(previous_issuer)
+    .execute(&mut **tx)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RotateSignerRequest {
     pub subject: String,
@@ -2114,6 +2164,10 @@ pub async fn rotate_signer(
         ));
     }
 
+    // Claims of the verified rotation token; present for every non-initial
+    // rotation (consumed atomically below, issue #119).
+    let mut signer_rotation_claims = None;
+
     if !is_initial_set {
         let expected = SignerRotationTokenInput {
             user_id: auth.user_id,
@@ -2124,7 +2178,10 @@ pub async fn rotate_signer(
             new_subject: subject.clone(),
             new_issuer: issuer.clone(),
         };
-        verify_signer_rotation_token(
+        // Consume the token's jti atomically with the rotation below: a
+        // token that was already used for this exact rotation is rejected
+        // (issue #119).
+        let claims = verify_signer_rotation_token(
             state.hmac_key.as_ref(),
             confirmation_token.expect("checked above"),
             &expected,
@@ -2135,6 +2192,7 @@ pub async fn rotate_signer(
                 Json(serde_json::json!({"error": "invalid email_confirmation_token"})),
             )
         })?;
+        signer_rotation_claims = Some(claims);
     }
 
     sqlx::query(
@@ -2152,9 +2210,93 @@ pub async fn rotate_signer(
     .await
     .map_err(|_| internal_server_error())?;
 
-    // Audit. TODO(phase-2): the rotated signer_identity must be re-rendered
-    // into the KBS Rego policy for this app once the Phase 2 policy
-    // templates land.
+    if !is_initial_set {
+        let claims = signer_rotation_claims
+            .take()
+            .expect("non-initial rotations verify a token above");
+        // Consume the token's jti atomically with the rotation below. A jti
+        // that was already consumed is a replay: roll back this transaction
+        // (the signer UPDATE above has not committed) and refuse (issue
+        // #119).
+        let consumed = sqlx::query(
+            "INSERT INTO consumed_signer_rotation_tokens (
+                 jti, user_id, org_id, app_id, subject, issuer, expires_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6, to_timestamp($7))
+             ON CONFLICT (jti) DO NOTHING",
+        )
+        .bind(&claims.jti)
+        .bind(auth.user_id)
+        .bind(auth.org_id)
+        .bind(app.id)
+        .bind(&subject)
+        .bind(&issuer)
+        .bind(claims.exp)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| internal_server_error())?
+        .rows_affected();
+        if consumed == 0 {
+            tracing::warn!(
+                app_id = %app.id,
+                user_id = %auth.user_id,
+                "rejected replayed signer rotation token"
+            );
+            tx.rollback().await.map_err(|_| internal_server_error())?;
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "invalid email_confirmation_token"})),
+            ));
+        }
+
+        // Legacy (unsigned) installs render the allowed signer identities in
+        // the live Rego policy from kbs_tls_bindings, so rotation must carry
+        // the new identity into that binding too (issue #119).
+        sqlx::query(
+            "UPDATE kbs_tls_bindings
+                SET signer_identity_subject = $1,
+                    signer_identity_issuer  = $2,
+                    updated_at              = now()
+              WHERE app_id = $3",
+        )
+        .bind(&subject)
+        .bind(&issuer)
+        .bind(app.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| internal_server_error())?;
+
+        // Withdraw KBS trust from every retained artifact signed under the
+        // rotated-out identity (issue #119). Note this is revocation, not a
+        // re-render: signed artifacts are immutable, so the app leaves the
+        // signed-policy set (fail-closed on the previous signer) until the
+        // next deployment commits an artifact for the new identity.
+        withdraw_signer_rotated_out_artifacts(
+            &mut tx,
+            app.id,
+            &previous_subject.clone().unwrap_or_default(),
+            &previous_issuer.clone().unwrap_or_default(),
+        )
+        .await
+        .map_err(|_| internal_server_error())?;
+        // The candidate set may change even when no new withdrawal row was
+        // inserted (e.g. a later rotation of an already-withdrawn artifact),
+        // so bump on every rotation that is already in signed mode: the
+        // durable generation is what makes the reconciler publish the
+        // withdrawal instead of reporting a same-generation content
+        // conflict. revocation_if_active no-ops on an unsigned-only install
+        // so rotation never flips such an install into signed mode (where an
+        // empty artifact set would deny every workload).
+        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
+            .await
+            .map_err(|_| internal_server_error())?;
+    }
+
+    // Audit. In signed mode rotation withdraws the previous signer's
+    // artifacts from KBS policy (fail-closed; the new identity becomes live
+    // when the next deployment commits an artifact signed under it). In
+    // legacy mode the updated kbs_tls_bindings carry the new identity into
+    // the re-rendered Rego policy directly.
     let action = if is_initial_set {
         "app.signer.set"
     } else {
@@ -2184,6 +2326,78 @@ pub async fn rotate_signer(
         .await
         .map_err(|_| internal_server_error())?;
     tx.commit().await.map_err(|_| internal_server_error())?;
+
+    // The rotation is committed; converge the live KBS policy before
+    // reporting success, under the same fence app deletion uses. In signed
+    // mode reconcile_policy converges the enqueued withdrawal generation
+    // (revoking the previous signer's artifacts; the background reconciler
+    // keeps retrying that durable generation if this publish fails). In
+    // legacy mode it re-renders Rego from the updated kbs_tls_bindings so
+    // the new identity is the one admitted; nothing retries a failed legacy
+    // render automatically — the next unsigned deploy re-renders it — so a
+    // failure here surfaces as 500 with a stable error code and the fence
+    // is released (not held for the quarantine window) to unblock that
+    // follow-up writer. Success is only reported when reconcile returned Ok
+    // on both layers.
+    if !is_initial_set && state.kbs_policy.is_some() {
+        let lease = match crate::mutation_leases::claim_resources(
+            &state,
+            "kbs_signer_rotation_policy",
+            Uuid::new_v4(),
+            vec![crate::mutation_leases::ResourceFence::kbs_policy()],
+        )
+        .await
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    error = %error,
+                    error_code = "kbs_policy_fence_unavailable",
+                    "signer rotation committed but KBS policy reconciliation fence was unavailable"
+                );
+                return Err(internal_server_error());
+            }
+        };
+        match lease
+            .guard_provider(crate::kbs::reconcile_policy(
+                &state.db,
+                state.kbs_policy.as_ref(),
+            ))
+            .await
+        {
+            Err(error) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    error = %error,
+                    error_code = "kbs_policy_fence_unavailable",
+                    "signer rotation committed but lost the KBS policy fence during reconciliation"
+                );
+                release_finished_lease(lease).await;
+                return Err(internal_server_error());
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    app_id = %app.id,
+                    error = %error,
+                    error_code = "kbs_policy_reconciliation_failed",
+                    "signer rotation committed but KBS policy reconciliation failed"
+                );
+                release_finished_lease(lease).await;
+                return Err(internal_server_error());
+            }
+            Ok(Ok(())) => {}
+        }
+        if let Err(error) = lease.finish().await {
+            tracing::warn!(
+                app_id = %app.id,
+                error = %error,
+                error_code = "kbs_policy_lease_finish_failed",
+                "signer rotation reconciled KBS policy but failed to release the fence cleanly"
+            );
+            return Err(internal_server_error());
+        }
+    }
 
     Ok(Json(app.into()))
 }
