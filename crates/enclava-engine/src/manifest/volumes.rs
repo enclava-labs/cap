@@ -20,6 +20,20 @@ use crate::types::ConfidentialApp;
 
 const GUEST_MEMORY_LAYOUT_MARKER: &str = "# enclava-cap-volume-layout: guest-memory-v1\n";
 
+/// Names of the StatefulSet volumeClaimTemplates CAP renders. PVCs created
+/// from them are named `<vct>-<statefulset>-<ordinal>`; cleanup identifies
+/// CAP-owned PVCs by these name shapes because VCT metadata is immutable in
+/// Kubernetes (labels cannot be added to an existing StatefulSet's VCTs).
+pub const CAP_VCT_NAMES: [&str; 2] = ["state", "tls-state"];
+
+/// Disk-backed bound for the workload log spool emptyDir. The relay tails at
+/// most MAX_TAIL_BYTES per container (2 MiB today), so 64 MiB leaves generous
+/// headroom while bounding node-disk exhaustion from a runaway writer.
+/// enclava-wait-exec additionally rotates its spool at 32 MiB (retaining the
+/// newest 8 MiB), so a chatty workload cannot hit the volume cap and die by
+/// ENOSPC/SIGPIPE — the sizeLimit is the outer fence, rotation the inner one.
+const LOGS_EMPTY_DIR_SIZE_LIMIT: &str = "64Mi";
+
 pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
     let legacy = legacy_bootstrap_enabled();
     // The signer binds this exact prefix into the policy hash/signature.
@@ -36,13 +50,21 @@ pub fn build_volumes(app: &ConfidentialApp) -> Vec<Volume> {
                 size_limit: Some(Quantity(size.to_string())),
             }
         } else {
-            EmptyDirVolumeSource::default()
+            // Disk-backed with an explicit node-side bound: the sizes below
+            // are hard caps on node disk usage, not just guest hints.
+            EmptyDirVolumeSource {
+                medium: None,
+                size_limit: Some(Quantity(size.to_string())),
+            }
         }
     };
     let mut v = vec![
         Volume {
             name: "logs".to_string(),
-            empty_dir: Some(EmptyDirVolumeSource::default()),
+            empty_dir: Some(EmptyDirVolumeSource {
+                medium: None,
+                size_limit: Some(Quantity(LOGS_EMPTY_DIR_SIZE_LIMIT.to_string())),
+            }),
             ..Default::default()
         },
         Volume {
@@ -171,6 +193,12 @@ pub fn build_volume_claim_templates(app: &ConfidentialApp) -> Vec<PersistentVolu
 fn build_vct(name: &str, size: &str) -> PersistentVolumeClaim {
     let mut requests = BTreeMap::new();
     requests.insert("storage".to_string(), Quantity(size.to_string()));
+
+    // NOTE: no labels here. spec.volumeClaimTemplates is immutable in
+    // Kubernetes (KEP-4650 only makes it mutable-alpha in 1.35+): adding or
+    // changing VCT metadata makes every redeploy of an existing StatefulSet
+    // fail with 422. Cleanup therefore identifies CAP-owned PVCs by the VCT
+    // name shape (CAP_VCT_NAMES) instead of labels.
 
     PersistentVolumeClaim {
         metadata: ObjectMeta {

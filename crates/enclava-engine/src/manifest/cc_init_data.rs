@@ -324,7 +324,6 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
     toml.push('\n');
 
     // policy.rego
-    toml.push_str("\"policy.rego\" = '''\n");
     if let Some(agent_policy) = &app.generated_agent_policy {
         let actual_hash: [u8; 32] = Sha256::digest(agent_policy.policy_text.as_bytes()).into();
         assert_eq!(
@@ -335,47 +334,45 @@ pub fn build_toml_with_options(app: &ConfidentialApp, options: &CcInitDataOption
             "generated_agent_policy.genpolicy_version_pin",
             &agent_policy.genpolicy_version_pin,
         );
-        toml.push_str(&agent_policy.policy_text);
-        if !agent_policy.policy_text.ends_with('\n') {
-            toml.push('\n');
-        }
+        push_toml_multiline_string(&mut toml, "\"policy.rego\"", &agent_policy.policy_text);
     } else {
-        toml.push_str(&build_agent_policy(
-            &image_digest,
-            &app.namespace,
-            &app.service_account,
-            &app.name,
-        ));
+        push_toml_multiline_string(
+            &mut toml,
+            "\"policy.rego\"",
+            &build_agent_policy(
+                &image_digest,
+                &app.namespace,
+                &app.service_account,
+                &app.name,
+            ),
+        );
     }
-    toml.push_str("'''\n");
     toml.push('\n');
 
     // aa.toml
-    toml.push_str("\"aa.toml\" = '''\n");
-    toml.push_str("[token_configs]\n");
-    toml.push_str("[token_configs.kbs]\n");
-    push_toml_string(&mut toml, "url", &kbs_url);
+    let mut aa_toml = String::new();
+    aa_toml.push_str("[token_configs]\n");
+    aa_toml.push_str("[token_configs.kbs]\n");
+    push_toml_string(&mut aa_toml, "url", &kbs_url);
     if let Some(cert) = &kbs_ca_cert_pem {
-        push_toml_string(&mut toml, "cert", cert.trim());
+        push_toml_string(&mut aa_toml, "cert", cert.trim());
     }
-    toml.push_str("'''\n");
+    push_toml_multiline_string(&mut toml, "\"aa.toml\"", &aa_toml);
     toml.push('\n');
 
     // cdh.toml
-    toml.push_str("\"cdh.toml\" = '''\n");
-    toml.push_str("[kbc]\n");
-    toml.push_str("name = \"cc_kbc\"\n");
-    push_toml_string(&mut toml, "url", &kbs_url);
+    let mut cdh_toml = String::new();
+    cdh_toml.push_str("[kbc]\n");
+    cdh_toml.push_str("name = \"cc_kbc\"\n");
+    push_toml_string(&mut cdh_toml, "url", &kbs_url);
     if let Some(cert) = &kbs_ca_cert_pem {
-        push_toml_string(&mut toml, "kbs_cert", cert.trim());
+        push_toml_string(&mut cdh_toml, "kbs_cert", cert.trim());
     }
-    toml.push_str("'''\n");
+    push_toml_multiline_string(&mut toml, "\"cdh.toml\"", &cdh_toml);
 
     // identity.toml (always present per OID-1)
     toml.push('\n');
-    toml.push_str("\"identity.toml\" = '''\n");
-    toml.push_str(&identity_toml);
-    toml.push_str("'''\n");
+    push_toml_multiline_string(&mut toml, "\"identity.toml\"", &identity_toml);
 
     let sidecar_digests = serde_json::json!({
         "attestation_proxy": app.attestation.proxy_image.digest(),
@@ -586,6 +583,60 @@ fn rego_string(value: &str) -> String {
     serde_json::to_string(value).expect("string serialization is infallible")
 }
 
+/// Append `key = '''…'''` with `body` embedded as a TOML multi-line literal
+/// string.
+///
+/// The signed `generated_agent_policy.policy_text` flows in here, so the
+/// embedding must not be breakable by file content: if the body contains a
+/// `'''` terminator sequence, fall back to a single-line basic string (JSON
+/// encoding is a valid TOML basic string body) instead of a literal block the
+/// content could escape from. Benign bodies keep the historical byte layout
+/// because descriptor signatures commit to the SHA256 of the exact TOML.
+fn push_toml_multiline_string(toml: &mut String, key: &str, body: &str) {
+    toml.push_str(key);
+    toml.push_str(" = ");
+    // Literal blocks forbid raw control characters (C0 except tab/LF) and
+    // DEL (0x7F), and ''' would terminate the block early. A raw CR is also
+    // excluded: TOML multi-line strings normalize CRLF to LF, so a body
+    // containing CR cannot round-trip to the signed bytes on the literal
+    // path (and a lone CR is invalid TOML outright). Any of these forces
+    // the escaped basic-string fallback.
+    let needs_escaping = body.contains("'''")
+        || body
+            .bytes()
+            .any(|b| b == b'\r' || b == 0x7F || (b < 0x20 && b != b'\t' && b != b'\n'));
+    if needs_escaping {
+        // Basic-string fallback. Emit a TOML basic string with full control
+        // character escaping: JSON escaping (serde_json) leaves raw DEL
+        // (0x7F) unescaped, which TOML basic strings forbid, so escape
+        // explicitly via toml::Value (which serializes bare strings when
+        // given a table containing the value).
+        let mut table = toml::map::Map::new();
+        table.insert("v".to_string(), toml::Value::from(body));
+        let encoded = toml::to_string(&table).expect("TOML string serialization is infallible");
+        // to_string yields `v = "<escaped>"\n`; keep only the value part.
+        let value = encoded
+            .strip_prefix("v = ")
+            .and_then(|rest| rest.strip_suffix('\n'))
+            .expect("serialized table has the expected shape");
+        toml.push_str(value);
+        toml.push('\n');
+    } else {
+        toml.push_str("'''\n");
+        toml.push_str(body);
+        // Byte-exact round-trip (round-19 review P2): TOML trims only the
+        // first newline AFTER the opening delimiter — nothing before the
+        // closing one. A body ending in '\n' therefore keeps its own LF
+        // with the delimiter on the next line, and a body with NO final LF
+        // gets the delimiter DIRECTLY after it. The historical layout
+        // inserted an LF before the delimiter, so `data.policy.rego`
+        // parsed back as policy_text + "\n" — not the exact signed bytes,
+        // failing enclava-init's sha256 trustee verification of
+        // no-final-newline Rego (which is valid without one).
+        toml.push_str("'''\n");
+    }
+}
+
 /// Build the identity.toml content.
 fn build_identity_toml(
     tenant_id: &str,
@@ -669,5 +720,35 @@ pub fn verify_runtime_class_binding(
             "rendered Pod runtimeClassName is `{other}`, expected `{expected}`"
         )),
         None => Err("rendered Pod has no runtimeClassName".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod round19_tests {
+    use super::push_toml_multiline_string;
+
+    /// Byte-exactness invariant of the literal-block path (round-19 review
+    /// P2): whatever the caller's final byte, parsing the emitted TOML must
+    /// yield EXACTLY the input body — descriptor signatures commit to the
+    /// sha256 of these bytes and enclava-init verifies that hash.
+    #[test]
+    fn multiline_literal_round_trips_with_and_without_final_newline() {
+        for body in [
+            "package enclava\n\ndefault allow := false\n",
+            "package enclava\n\ndefault allow := false", // no final LF
+            "x",                                         // single line, no LF
+            "a\r\nb\r\n",                                // CRLF forces fallback
+            "contains ''' delimiter",                    // forces fallback
+        ] {
+            let mut toml = String::new();
+            push_toml_multiline_string(&mut toml, "\"policy.rego\"", body);
+            let parsed: std::collections::BTreeMap<String, String> =
+                toml::from_str(&toml).expect("emitted TOML must parse");
+            assert_eq!(
+                parsed.get("policy.rego").map(String::as_str),
+                Some(body),
+                "round-trip must be byte-exact for {body:?}; emitted: {toml:?}"
+            );
+        }
     }
 }
