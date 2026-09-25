@@ -213,6 +213,37 @@ fn egress_allowlist_internal_hosts_still_validate_public_hosts() {
 }
 
 #[test]
+fn internal_egress_release_mode_requires_production_ack() {
+    use crate::routes::apps::internal_egress_enabled_from;
+    // Release: flag alone must stay disarmed; both flags arm it.
+    assert!(!internal_egress_enabled_from(true, false, false));
+    assert!(internal_egress_enabled_from(true, true, false));
+    assert!(!internal_egress_enabled_from(false, true, false));
+    assert!(!internal_egress_enabled_from(false, false, false));
+}
+
+#[test]
+fn internal_egress_debug_mode_ignores_production_ack() {
+    use crate::routes::apps::internal_egress_enabled_from;
+    assert!(internal_egress_enabled_from(true, false, true));
+    assert!(!internal_egress_enabled_from(false, true, true));
+}
+
+#[test]
+fn internal_egress_truthy_parsing_matches_env_gates_helper() {
+    // The runtime path parses both env vars with env_gates::flag_is_truthy;
+    // drift between that set and any other parser would arm internal egress
+    // without tripping the startup gate.
+    use crate::env_gates::flag_is_truthy;
+    for truthy in ["1", "true", "TRUE", "yes", "YES", " true "] {
+        assert!(flag_is_truthy(truthy), "{truthy:?} must parse truthy");
+    }
+    for falsy in ["", "0", "false", "FALSE", "no", "off", "True", "yes please"] {
+        assert!(!flag_is_truthy(falsy), "{falsy:?} must parse falsy");
+    }
+}
+
+#[test]
 fn initial_set_call_omits_token() {
     let body: RotateSignerRequest = serde_json::from_value(serde_json::json!({
         "subject": "repo:me/app:ref:refs/heads/main",

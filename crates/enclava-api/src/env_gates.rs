@@ -13,9 +13,15 @@ pub enum EnvGateError {
         "ACME directory `{0}` points at production Let's Encrypt; set CAP_ALLOW_PRODUCTION_ACME=true only for production CAP"
     )]
     ProductionAcmeWithoutExplicitAllow(&'static str),
+    #[error(
+        "env var `{0}` is set; widening tenant egress to internal endpoints in a release build requires the explicit production opt-in CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS=true"
+    )]
+    InternalEgressWithoutExplicitAllow(&'static str),
 }
 
 const CAP_ALLOW_PRODUCTION_ACME: &str = "CAP_ALLOW_PRODUCTION_ACME";
+const CAP_EGRESS_ALLOW_INTERNAL_HOSTS: &str = "CAP_EGRESS_ALLOW_INTERNAL_HOSTS";
+const CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS: &str = "CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS";
 const LETS_ENCRYPT_PRODUCTION_DIRECTORY_URL: &str =
     "https://acme-v02.api.letsencrypt.org/directory";
 
@@ -29,7 +35,7 @@ const DEBUG_ONLY_FLAGS: &[&str] = &[
     "LEGACY_BOOTSTRAP_SCRIPT",
 ];
 
-fn flag_is_truthy(value: &str) -> bool {
+pub(crate) fn flag_is_truthy(value: &str) -> bool {
     matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES")
 }
 
@@ -100,6 +106,20 @@ fn enforce_with(
             ));
         }
 
+        // Widening tenant egress to internal endpoints is a deliberate,
+        // audited operator opt-out (M-4), but it must never ride into a
+        // release build implicitly: it requires a second explicit production
+        // acknowledgment, mirroring CAP_ALLOW_PRODUCTION_ACME.
+        let production_internal_egress_allowed = lookup(CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS)
+            .is_some_and(|value| flag_is_truthy(&value));
+        if lookup(CAP_EGRESS_ALLOW_INTERNAL_HOSTS).is_some_and(|value| flag_is_truthy(&value))
+            && !production_internal_egress_allowed
+        {
+            return Err(EnvGateError::InternalEgressWithoutExplicitAllow(
+                CAP_EGRESS_ALLOW_INTERNAL_HOSTS,
+            ));
+        }
+
         let production_acme_allowed =
             lookup(CAP_ALLOW_PRODUCTION_ACME).is_some_and(|value| flag_is_truthy(&value));
         for acme_source_name in ["ACME_DIRECTORY_URL", "TENANT_CADDY_ACME_CA"] {
@@ -144,6 +164,18 @@ fn enforce_with(
                 "PLATFORM_SIGNING_SERVICE_URL",
             ));
         }
+    }
+
+    // Surface the armed opt-out at startup, before the first internal host
+    // is accepted: the per-host audit log only fires on tenant submissions.
+    if lookup(CAP_EGRESS_ALLOW_INTERNAL_HOSTS).is_some_and(|value| flag_is_truthy(&value)) {
+        let production_ack_armed = lookup(CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS)
+            .is_some_and(|value| flag_is_truthy(&value));
+        tracing::warn!(
+            flag = CAP_EGRESS_ALLOW_INTERNAL_HOSTS,
+            production_ack = production_ack_armed,
+            "tenant egress to internal endpoints is ENABLED for this process"
+        );
     }
 
     Ok(())
@@ -373,6 +405,67 @@ mod tests {
             "https://signing.example.test",
         );
         assert!(run(env, false).is_ok());
+    }
+
+    #[test]
+    fn release_rejects_internal_egress_flag_without_explicit_allow() {
+        let mut env = ok_required();
+        env.insert("CAP_EGRESS_ALLOW_INTERNAL_HOSTS", "true");
+        let err = run(env, false).unwrap_err();
+        assert!(matches!(
+            err,
+            EnvGateError::InternalEgressWithoutExplicitAllow("CAP_EGRESS_ALLOW_INTERNAL_HOSTS")
+        ));
+    }
+
+    #[test]
+    fn release_allows_internal_egress_flag_with_explicit_allow() {
+        let mut env = ok_required();
+        env.insert("CAP_EGRESS_ALLOW_INTERNAL_HOSTS", "true");
+        env.insert("CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS", "true");
+        run(env, false).expect("explicit production opt-in should pass the gate");
+    }
+
+    #[test]
+    fn falsy_internal_egress_flag_needs_no_allow() {
+        let mut env = ok_required();
+        env.insert("CAP_EGRESS_ALLOW_INTERNAL_HOSTS", "0");
+        env.insert("CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS", "false");
+        run(env, false).expect("falsy flags should not trip the gate");
+    }
+
+    #[test]
+    fn release_non_truthy_internal_egress_acks_are_rejected() {
+        for ack in ["false", "0", "no", "", "True", "off"] {
+            let mut env = ok_required();
+            env.insert("CAP_EGRESS_ALLOW_INTERNAL_HOSTS", "true");
+            env.insert("CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS", ack);
+            let err = run(env.clone(), false).unwrap_err();
+            assert!(
+                matches!(err, EnvGateError::InternalEgressWithoutExplicitAllow(_)),
+                "ack {ack:?} must not satisfy the production gate"
+            );
+        }
+    }
+
+    #[test]
+    fn release_truthy_internal_egress_acks_are_accepted() {
+        // The same truthy spellings `internal_egress_allowlist_enabled` accepts
+        // via the shared `flag_is_truthy` helper; drift between the two would
+        // arm internal egress without tripping the startup gate.
+        for ack in ["1", "true", "TRUE", "yes", "YES", " true "] {
+            let mut env = ok_required();
+            env.insert("CAP_EGRESS_ALLOW_INTERNAL_HOSTS", "true");
+            env.insert("CAP_ALLOW_PRODUCTION_INTERNAL_EGRESS", ack);
+            run(env, false).unwrap_or_else(|e| panic!("ack {ack:?} must pass: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn debug_allows_internal_egress_flag_without_allow() {
+        let mut env = ok_required();
+        env.insert("CAP_EGRESS_ALLOW_INTERNAL_HOSTS", "true");
+        run(env, true).expect("debug build should permit the internal-egress opt-out");
     }
 
     #[test]
