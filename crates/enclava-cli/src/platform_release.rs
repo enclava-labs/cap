@@ -173,10 +173,12 @@ impl PlatformRelease {
 
 impl PlatformReleaseEnvelope {
     pub fn load_verified() -> Result<Self, PlatformReleaseError> {
-        let override_active = matches!(std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH"), Ok(path) if !path.trim().is_empty());
-        let raw = match std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH") {
-            Ok(path) if !path.trim().is_empty() => std::fs::read_to_string(Path::new(&path))?,
-            _ => BUNDLED_PLATFORM_RELEASE.to_string(),
+        let override_path = std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH")
+            .ok()
+            .filter(|path| !path.trim().is_empty());
+        let raw = match &override_path {
+            Some(path) => std::fs::read_to_string(Path::new(path))?,
+            None => BUNDLED_PLATFORM_RELEASE.to_string(),
         };
         let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
         verify_envelope(envelope.clone())?;
@@ -184,7 +186,7 @@ impl PlatformReleaseEnvelope {
         // the release compiled into this binary. A validly-signed stale
         // release (pinned to old measurements/sidecar digests) is exactly
         // what a file-swap or env-var attack serves.
-        if override_active {
+        if override_path.is_some() {
             enforce_release_not_older_than_bundled(&envelope.payload)?;
         }
         Ok(envelope)
@@ -200,10 +202,9 @@ impl PlatformReleaseEnvelope {
 pub fn enforce_release_not_older_than_bundled(
     release: &PlatformRelease,
 ) -> Result<(), PlatformReleaseError> {
-    let Ok(bundled) = serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
-    else {
-        return Ok(());
-    };
+    // Parity with the API twin: a malformed bundled baseline fails closed
+    // (Json error) rather than silently disabling the downgrade gate.
+    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
     if release_is_older(release, &bundled.payload)? {
         return Err(PlatformReleaseError::DowngradeRefused {
             override_version: release.platform_release_version.clone(),
@@ -456,12 +457,32 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: "internal mode is only allowed for dev fixtures/local tests".to_string(),
         });
     }
-    reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
+    let acme_url = reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
         PlatformReleaseError::InvalidField {
             field: "tenant_caddy_acme_ca",
             message: err.to_string(),
         }
     })?;
+    // Cleartext ACME directory URLs would leak ACME account credentials;
+    // same rule as the KBS URL.
+    if acme_url.scheme() != "https" {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_acme_ca",
+            message: "scheme must be https".to_string(),
+        });
+    }
+    // Codex P1 (cap#165): parity with the API validator — apply the
+    // enclava-engine Caddyfile renderer's EXACT predicate (not just a
+    // scheme or prefix check), so a release whose ACME URL would fail
+    // rendering is refused before it is ever offered or accepted.
+    if let Err(err) =
+        enclava_engine::manifest::ingress::validate_https_url(release.tenant_caddy_acme_ca.trim())
+    {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_acme_ca",
+            message: format!("must be renderable into the tenant Caddyfile ({err})"),
+        });
+    }
     if release.genpolicy_version.trim().is_empty()
         || release.genpolicy_version.contains("unconfigured")
         || release.genpolicy_version.contains("unpinned")
@@ -668,6 +689,59 @@ mod tests {
             assert!(image.starts_with("ghcr.io/enclava-labs/"));
             assert!(image.contains("@sha256:"));
             assert!(!image.contains("ttl.sh/"));
+        }
+    }
+
+    #[test]
+    fn release_payload_rejects_http_acme_ca() {
+        let mut payload = serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+            .unwrap()
+            .payload;
+        payload.tenant_caddy_acme_ca =
+            "http://acme-staging-v02.api.letsencrypt.org/directory".into();
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_uppercase_scheme_acme_ca() {
+        // Codex P1 (cap#165): HTTPS:// parses as scheme https but the
+        // Caddyfile renderer requires the literal lowercase prefix; the
+        // CLI validator must reject before an override is even offered.
+        let mut payload = serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+            .unwrap()
+            .payload;
+        payload.tenant_caddy_acme_ca = "HTTPS://acme.example.test/directory".into();
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca"),
+            "uppercase-scheme ACME CA must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_url_parseable_but_unrenderable_acme_ca() {
+        // Codex P1 (cap#165, reviewer follow-up): values that pass
+        // Url::parse as https but fail the shared Caddyfile renderer
+        // predicate must be refused before the release is offered.
+        let base = serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+            .unwrap()
+            .payload;
+        for bad in [
+            "https://acme.example.test/directory;extra",
+            "https://acme.example.test/dir{x}",
+            "https://acme.example.test/directory\tx",
+            "https://exämple.test/directory",
+        ] {
+            let mut payload = base.clone();
+            payload.tenant_caddy_acme_ca = bad.into();
+            let err = validate_release_payload(&payload);
+            assert!(
+                matches!(err, Err(PlatformReleaseError::InvalidField { field, .. }) if field == "tenant_caddy_acme_ca"),
+                "unrenderable ACME CA {bad:?} must be rejected"
+            );
         }
     }
 

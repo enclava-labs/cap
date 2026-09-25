@@ -81,6 +81,14 @@ spec:
               key: database-url
         - name: DATABASE_MIGRATION_MODE
           value: verify
+        # The platform-release override lane (ENCLAVA_PLATFORM_RELEASE_PATH)
+        # is NOT active in this base deployment, so it wires no durable
+        # high-water-mark state: a mandatory RWX PVC would leave pods
+        # unschedulable on clusters whose default StorageClass is
+        # ReadWriteOnce. Environments that activate the override lane add
+        # deploy/api/components/platform-release-state (or replicate its
+        # wiring) to mount writable state for ENCLAVA_PLATFORM_RELEASE_
+        # STATE.
         # Keep false through migration, clean-cut proof, provider convergence,
         # and smoke tests. Enable only in a later activation rollout.
         - name: CAP_DEPLOYMENT_DISPATCH_ENABLED

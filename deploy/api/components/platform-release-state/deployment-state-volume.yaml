@@ -1,0 +1,32 @@
+# Adds the durable high-water-mark volume, its mount, and the
+# ENCLAVA_PLATFORM_RELEASE_STATE env to the base API deployment. Strategic
+# merge: volumeMounts/env merge by name with the base lists.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enclava-api
+spec:
+  template:
+    spec:
+      containers:
+      - name: api
+        env:
+        # Durable, pod-replacement-surviving home for the platform-release
+        # override high-water mark. The override envelope itself is a
+        # read-only configmap mount, so the anti-rollback mark must live on
+        # a writable volume — otherwise a pod replacement resets it and
+        # re-admits a stale (T0 < T1 < T2) signed release. Point this at
+        # separately-protected storage if the override lane is used in
+        # anger; an attacker who can delete this file can reset the floor.
+        - name: ENCLAVA_PLATFORM_RELEASE_STATE
+          value: /var/lib/enclava/platform-release.accepted
+        volumeMounts:
+        - name: platform-release-state
+          mountPath: /var/lib/enclava
+      volumes:
+      # ReadWriteMany (see the PVC in this component) because multi-replica
+      # deployments must serialize on the same mark + flock; scale-to-one
+      # deployments may relax the claim to RWO.
+      - name: platform-release-state
+        persistentVolumeClaim:
+          claimName: cap-api-platform-release-state

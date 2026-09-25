@@ -299,6 +299,24 @@ jobs:
             exit 1
           fi
 
+  generator-tests:
+    name: Run platform-release generator tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install generator dependencies
+        run: pip install -r crates/enclava-cli/scripts/requirements.txt pytest
+
+      - name: Run generator tests
+        run: python -m pytest tests/test_generate_platform_release.py -v
+
   browser-verifier:
     name: Test verifier in headless browser
     runs-on: ubuntu-latest

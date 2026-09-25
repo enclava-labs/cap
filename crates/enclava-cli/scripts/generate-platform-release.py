@@ -4,17 +4,22 @@
 Production releases must pass ENCLAVA_PLATFORM_RELEASE_SIGNING_KEY_HEX as a
 32-byte Ed25519 seed. The --dev-fixture-key option is only for the checked-in
 development artifact verified by enclava-cli's fallback fixture root.
+
+Python dependencies (cryptography, idna) are declared in requirements.txt
+next to this script: pip install -r requirements.txt
 """
 
 
 import argparse
 import copy
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -126,13 +131,222 @@ def env_overlay(payload: dict[str, str]) -> dict[str, str]:
     return out
 
 
+# WHATWG forbidden domain code points that Python's urlparse does NOT treat
+# as delimiters (it only splits on / ? #): everything in this set (plus
+# control/0x7F chars) makes the url crate reject the host, so the generator
+# must reject it too rather than sign an unloadable envelope.
+_FORBIDDEN_HOST_CHARS = set(" #%<>@[\\]^|`{}")
+
+
+def _label_looks_numeric(label: str) -> bool:
+    # WHATWG treats a host whose last label is a (decimal or 0x-hex) number
+    # as an IPv4 address and runs the full IPv4 parser on it; Python's
+    # urlparse happily leaves `1.2.3.4.5` or `999.1.1.1` in .hostname.
+    if label.isdigit():
+        return True
+    # A bare `0x` (empty hex payload) counts too: WHATWG parses it as the
+    # number 0, so a multi-label host ending in `0x` (e.g. `foo.0x`) runs
+    # the full IPv4 parser and is rejected by the url crate — it must be
+    # gated here (Codex P2, cap#165).
+    return len(label) >= 2 and label.lower().startswith("0x") and all(
+        ch in "0123456789abcdef" for ch in label[2:].lower()
+    )
+
+
+def _idna_normalize(host: str) -> str | None:
+    # All hosts — ASCII and non-ASCII alike — go through the same
+    # UTS46/IDNA2008 processing the url crate performs (stdlib
+    # .encode("idna") is IDNA2003 and accepts inputs like a non-breaking
+    # space that the url crate rejects, so it cannot be used here). ASCII
+    # hosts are NOT exempt: an invalid ACE label like `xn--` (empty
+    # Punycode payload) or `xn--a` passes urlparse and the character
+    # denylist but is rejected by the url crate's IDNA processing, so
+    # signing it would produce an unloadable envelope (Codex P2, cap#165).
+    # ASCII inputs that contain no `xn--` label and no non-ASCII codepoint
+    # can only differ from UTS46 output by case-mapping, which every
+    # consumer downcases anyway — those are validated without requiring
+    # the idna package; any host with a Punycode label or non-ASCII
+    # codepoint requires it (fail closed when unavailable).
+    def _has_punycode_label(value: str) -> bool:
+        return any(
+            label.lower().startswith("xn--") for label in value.split(".")
+        )
+
+    if host.isascii() and not _has_punycode_label(host):
+        return host
+    try:
+        import idna  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    try:
+        normalized = idna.encode(host, uts46=True).decode("ascii")
+    except (idna.IDNAError, UnicodeError, ValueError):
+        return None
+    return normalized
+
+
+def _host_ok(host: str) -> bool:
+    # Bracketed hosts (netloc `[...]`): WHATWG only allows brackets for
+    # literal IPv6 addresses — IPvFuture forms like `[v1.fe80]` pass
+    # urlparse (hostname `v1.fe80`) but the url crate rejects them
+    # ("invalid IPv6 address"), so validate the bracket content as strict
+    # IPv6. A zone index (`[fe80::1%25eth0]`) is also rejected: the url
+    # crate rejects it for https, and a release URL must never carry one.
+    if host.startswith("[") and host.endswith("]"):
+        inner = host[1:-1]
+        if "%" in inner:
+            return False
+        try:
+            ipaddress.IPv6Address(inner)
+        except ValueError:
+            return False
+        return True
+    # Bracket-stripped IPv6 literals (urlparse's `.hostname` removes the
+    # `[...]`): a valid IPv6 host — including IPv4-mapped forms like
+    # `::ffff:192.0.2.128` whose dotted tail would otherwise trip the
+    # WHATWG IPv4-ending rule below, even though the url crate (WHATWG
+    # parser) accepts and normalizes it. `_authority_ok` already validated
+    # the bracketed netloc shape; here any `:`-bearing host must parse as
+    # strict IPv6 or be rejected (whatwg, Codex P2 cap#165).
+    if ":" in host:
+        if "%" in host:
+            return False
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return False
+        return True
+    if any(
+        ord(ch) < 0x20 or ord(ch) == 0x7F or ch in _FORBIDDEN_HOST_CHARS
+        for ch in host
+    ):
+        return False
+    normalized = _idna_normalize(host)
+    if normalized is None:
+        return False
+    # WHATWG IPv4 ending rule (see _label_looks_numeric): when the last
+    # label is numeric the whole host must be a valid IPv4 address or the
+    # url crate rejects it. IPv4Address is stricter than WHATWG for exotic
+    # forms (pure-integer `12345`, hex/octal octets) — rejecting those is
+    # generator-stricter, which is the safe direction. Apply to the UTS46-
+    # normalized host to catch fullwidth forms like０ｘ１００.
+    bare = normalized.rstrip(".")
+    if bare:
+        last_label = bare.rsplit(".", 1)[-1]
+        if _label_looks_numeric(last_label):
+            try:
+                ipaddress.IPv4Address(bare)
+            except ValueError:
+                return False
+    return True
+
+
+def _authority_ok(netloc: str) -> bool:
+    # Bracketed hosts: WHATWG only allows brackets for literal IPv6.
+    # urlparse's `.hostname` STRIPS the brackets, so IPvFuture forms like
+    # `[v1.fe80]` reach host checks as `v1.fe80` (a plausible hostname),
+    # while the url crate rejects the whole URL ("invalid IPv6 address").
+    # Validate the bracket content here, on the raw netloc. A zone index
+    # (`[fe80::1%25eth0]`) is rejected too — the url crate rejects it for
+    # special schemes, and a release URL must never carry one.
+    host_part = netloc.rsplit("@", 1)[-1]
+    if host_part.startswith("["):
+        end = host_part.find("]")
+        if end == -1:
+            return False
+        inner = host_part[1:end]
+        if "%" in inner:
+            return False
+        try:
+            ipaddress.IPv6Address(inner)
+        except ValueError:
+            return False
+        # Nothing but an optional :port may follow the bracket.
+        if host_part[end + 1 :] and not host_part[end + 1 :].startswith(":"):
+            return False
+    # Python's urlparse and the WHATWG parser disagree on netloc structure:
+    # urlparse splits userinfo at the LAST "@" and treats "\" as an ordinary
+    # character, while WHATWG ends the authority at the first "\" (special
+    # schemes) and first "@". A URL like
+    #   http://evil.example\@signing.release.svc
+    # therefore has hostname `signing.release.svc` in Python but host
+    # `evil.example` in the url crate — the cleartext-host gate would check
+    # the wrong host. No legitimate release URL carries userinfo or a
+    # backslash, so reject both outright in the authority.
+    return "@" not in netloc and "\\" not in netloc
+
+
+def _is_https(value: str) -> bool:
+    # urlparse lowercases the scheme, so `HTTPS://` is accepted exactly as
+    # the Rust validators (parsed-URL scheme) accept it. The authority is
+    # checked with the same semantics the Rust consumers (url crate)
+    # enforce, so a release ceremony cannot sign metadata the API/CLI would
+    # refuse to load:
+    #   * a non-empty host is required (url crate rejects hostless values
+    #     like `https://` or `https:` with EmptyHost),
+    #   * reading `.port` raises ValueError for non-numeric or
+    #     out-of-range ports (`https://kbs.example:bad/`, `:99999`),
+    #   * forbidden domain code points in the host are rejected (see
+    #     _FORBIDDEN_HOST_CHARS).
+    try:
+        parsed = urlparse(value)
+        parsed.port  # noqa: B018 — property access raises for malformed ports
+        host = parsed.hostname
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or not host:
+        return False
+    if not _authority_ok(parsed.netloc):
+        return False
+    return _host_ok(host)
+
+
+def _plain_http_host_allowed(host: str) -> bool:
+    # Mirror of enclava_common::hostnames::plain_http_host_allowed: cleartext
+    # is only for loopback or cluster-internal signing services.
+    if host.lower() == "localhost":
+        return True
+    bare = host.strip("[]")
+    try:
+        return ipaddress.ip_address(bare).is_loopback
+    except ValueError:
+        return bare.lower().endswith((".svc", ".svc.cluster.local"))
+
+
+def _is_valid_signing_service_url(value: str) -> bool:
+    # Mirror of the Rust validate_release_payload rule for
+    # signing_service_url: parseable URL, scheme http or https, and http is
+    # only allowed for loopback/cluster-internal hosts (the bearer token
+    # must not transit cleartext off-cluster).
+    try:
+        parsed = urlparse(value)
+        parsed.port  # noqa: B018 — property access raises for malformed ports
+        host = parsed.hostname
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not host:
+        return False
+    if not _authority_ok(parsed.netloc):
+        return False
+    if not _host_ok(host):
+        return False
+    if parsed.scheme == "http":
+        return _plain_http_host_allowed(host)
+    return True
+
+
 def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = False) -> None:
     if payload["schema_version"] != "v1":
         raise ValueError("schema_version must be v1")
+    if not _is_valid_signing_service_url(payload["signing_service_url"]):
+        raise ValueError(
+            "signing_service_url must be a valid http(s) URL "
+            "(http only for loopback/cluster-internal hosts)"
+        )
     for field in ["attestation_proxy_image", "caddy_ingress_image"]:
         if not GHCR_DIGEST_RE.fullmatch(payload[field]):
             raise ValueError(f"{field} must be a ghcr.io/enclava-labs digest-pinned ref")
-    if not payload["trustee_kbs_url"].startswith("https://"):
+    if not _is_https(payload["trustee_kbs_url"]):
         raise ValueError("trustee_kbs_url must be https")
     if payload["tenant_caddy_tls_mode"] not in ("acme", "dns01-broker", "internal"):
         raise ValueError("tenant_caddy_tls_mode must be acme, dns01-broker, or internal")
@@ -140,8 +354,31 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
         raise ValueError(
             "tenant_caddy_tls_mode=internal is only allowed with --dev-fixture-key"
         )
-    if not payload["tenant_caddy_acme_ca"].startswith(("http://", "https://")):
-        raise ValueError("tenant_caddy_acme_ca must be http or https")
+    if not _is_https(payload["tenant_caddy_acme_ca"]):
+        raise ValueError("tenant_caddy_acme_ca must be https")
+    # Codex P1 (cap#165): the ACME CA URL is interpolated verbatim into the
+    # tenant Caddyfile, and enclava-engine's renderer applies an exact
+    # predicate: literal lowercase `https://` prefix after trim, no
+    # \n \r space \t NUL backtick " ' { } ; bytes anywhere, ASCII-only.
+    # Url-parse-level checks (scheme https, valid host) do NOT cover this —
+    # signing a value the renderer rejects would let the API accept and
+    # advance the high-water mark, after which every ACME-mode Caddyfile
+    # render fails with the older working override no longer restorable.
+    # Mirror of enclava_engine::manifest::ingress::validate_https_url.
+    # (trustee_kbs_url keeps parsed-scheme semantics: consumed via
+    # Url::parse only.)
+    acme = payload["tenant_caddy_acme_ca"].strip()
+    _CADDY_FORBIDDEN = "\n\r \t\x00`\"'{};"
+    if (
+        not acme.startswith("https://")
+        or any(ch in acme for ch in _CADDY_FORBIDDEN)
+        or not acme.isascii()
+    ):
+        raise ValueError(
+            "tenant_caddy_acme_ca must be renderable into the tenant Caddyfile "
+            "(literal lowercase 'https://' prefix, no newlines/spaces/tabs/"
+            "quotes/braces/semicolons, ASCII-only)"
+        )
     hex32_bytes("signing_service_pubkey_hex", payload["signing_service_pubkey_hex"])
     hex32_bytes("policy_template_sha256", payload["policy_template_sha256"])
     hex32_bytes(

@@ -1,0 +1,10 @@
+# Python dependencies for generate-platform-release.py (release ceremony).
+# Install with: pip install -r crates/enclava-cli/scripts/requirements.txt
+#
+# idna: UTS46/IDNA2008 validation of Unicode release hosts, matching the
+# url crate's processing (stdlib .encode("idna") is IDNA2003 and accepts
+# inputs the Rust consumer rejects). Without it the generator fail-closed
+# rejects every non-ASCII host rather than risk signing an unloadable
+# envelope.
+cryptography>=41
+idna>=3.6

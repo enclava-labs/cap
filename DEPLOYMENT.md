@@ -164,12 +164,59 @@ Release verification checks:
 - envelope signature against `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`;
 - digest pins for platform sidecar images;
 - HTTPS Trustee KBS URL;
+- HTTPS tenant Caddy ACME CA URL;
 - genpolicy version;
 - policy template hash;
-- runtime class expected by the engine.
+- runtime class expected by the engine;
+- when `ENCLAVA_PLATFORM_RELEASE_PATH` overrides the bundle: the override
+  is not older than the bundled release (downgrade refused), not older than
+  the newest release ever accepted on this override lane (persisted
+  high-water mark, downgrade refused), and not a same-`{version, created_at}`
+  envelope with different signed content (the mark pins the canonical
+  payload digest). The mark's read-compare-persist runs under an exclusive
+  flock so concurrent API replicas cannot interleave their updates.
 
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.
+
+The high-water mark lives at `ENCLAVA_PLATFORM_RELEASE_STATE`, which is
+REQUIRED whenever `ENCLAVA_PLATFORM_RELEASE_PATH` is set: the API refuses to
+start on the override lane without it (a derived default such as
+`<override-path>.accepted` would leave the mark undiscoverable once the
+override var is removed — silently re-enabling the rollback the gate exists
+to refuse). It must point at durable writable storage — the
+override envelope itself is typically a read-only configmap mount, and an
+`emptyDir` would reset the anti-rollback floor on every pod replacement. The
+base deployment does not wire this state (the override lane is inactive there
+and a mandatory RWX claim would block scheduling on RWO-only clusters);
+environments that activate the override lane compose the opt-in component
+`deploy/api/components/platform-release-state` onto the base — it creates the
+`cap-api-platform-release-state` PVC (ReadWriteMany), mounts it at
+`/var/lib/enclava`, and sets
+`ENCLAVA_PLATFORM_RELEASE_STATE=/var/lib/enclava/platform-release.accepted` —
+or replicate that wiring in their own overlay (single-replica deployments may
+relax the claim to ReadWriteOnce; the mark advances only after startup
+validation accepts the release, so a signed-but-incompatible override cannot
+strand the deployment). Multi-replica deployments: the gate serializes on an
+flock over the state volume — this is only real if the StorageClass provides
+cross-node flock and directory fsync; several RWX CSI drivers (NFS with
+local_lock, some FUSE drivers) silently no-op node-local locks, which would
+reopen the two-replica race. Do not treat "an RWX PVC exists" as the control:
+verify the provisioner's lock semantics, or run this lane single-replica (RWO)
+until verified. An operator who can delete the state file
+can reset the floor; the mark itself is unsigned, so an operator who can
+*write* the state file can equally lower the floor to any timestamp at or
+above the bundled release — "file still present" does not mean the floor is
+intact. For the full threat model, point the state path at
+separately-protected storage. Intentional rollbacks require clearing the
+state file (after operator verification), which the refusal message names.
+Removing `ENCLAVA_PLATFORM_RELEASE_PATH` while `ENCLAVA_PLATFORM_RELEASE_STATE`
+stays wired does not bypass the gate: the bundled release is then compared
+against the persisted mark as well (no state file yet → fresh install,
+untouched). Because the state path is now mandatory on the override lane,
+every deployment that ever wired the override lane keeps the removal guard:
+there is no default-path configuration whose guard could be lost by removing
+the override var.
 
 ### Rotating the production root
 

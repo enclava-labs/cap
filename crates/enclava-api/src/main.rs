@@ -356,6 +356,14 @@ fn platform_release_enabled(trustee_policy_read_available: bool) -> bool {
     trustee_policy_read_available
         || env_flag("ENCLAVA_USE_PLATFORM_RELEASE")
         || env_nonempty("ENCLAVA_PLATFORM_RELEASE_PATH").is_some()
+    // NOTE: ENCLAVA_PLATFORM_RELEASE_STATE alone must NOT enable the release
+    // lane (Codex P2, cap#165): loading the bundled release imposes
+    // release-derived env requirements (TRUSTEE_KBS_URL, TENANT_CADDY_*,
+    // bundled CA) on fresh debug installs that merely pre-wire the state
+    // var with no mark yet. The anti-rollback protection a state-only
+    // wiring needs — a previously accepted override flooring the bundled
+    // release — runs via enforce_state_only_removal_guard below, without
+    // adopting the release as a configuration source.
 }
 
 fn validate_platform_release_runtime_class(
@@ -373,18 +381,18 @@ fn validate_platform_release_runtime_class(
 fn load_platform_release(
     enabled: bool,
     effective_runtime_class: &str,
-) -> anyhow::Result<Option<PlatformReleaseEnvelope>> {
+) -> anyhow::Result<Option<enclava_api::platform_release::LoadedPlatformRelease>> {
     if !enabled {
         return Ok(None);
     }
-    let envelope = PlatformReleaseEnvelope::load_verified()
+    let loaded = PlatformReleaseEnvelope::load_verified_with_pending_state()
         .map_err(|e| anyhow::anyhow!("failed to load signed platform release: {e}"))?;
-    let release = &envelope.payload;
+    let release = &loaded.envelope.payload;
     validate_platform_release_runtime_class(
         &release.expected_runtime_class,
         effective_runtime_class,
     )?;
-    Ok(Some(envelope))
+    Ok(Some(loaded))
 }
 
 fn release_env_value(
@@ -670,7 +678,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let platform_release_envelope = match load_platform_release(
+    let platform_release_loaded = match load_platform_release(
         platform_release_enabled(trustee_policy_read_available),
         &effective_runtime_class,
     ) {
@@ -679,6 +687,30 @@ async fn main() {
             eprintln!("startup refused: {e}");
             std::process::exit(1);
         }
+    };
+    // State-only lane (Codex P2, cap#165): when no release lane is active
+    // but ENCLAVA_PLATFORM_RELEASE_STATE is wired, a previously accepted
+    // override must still floor the bundled release (removal guard) —
+    // without adopting the release as a configuration source. The guard
+    // hands back the resolved state path so the running-replica watchdog
+    // below covers this lane too (Codex P2, cap#165 round 8).
+    let state_only_revalidation_state = if platform_release_loaded.is_none() {
+        match enclava_api::platform_release::enforce_state_only_removal_guard() {
+            Ok(state) => state,
+            Err(e) => {
+                eprintln!("startup refused: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let platform_release_envelope = platform_release_loaded
+        .as_ref()
+        .map(|loaded| loaded.envelope.clone());
+    let (pending_high_water, revalidation_state) = match platform_release_loaded {
+        Some(loaded) => (loaded.pending_high_water, loaded.revalidation_state),
+        None => (None, state_only_revalidation_state),
     };
     if let Some(envelope) = &platform_release_envelope {
         let release = &envelope.payload;
@@ -703,15 +735,26 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        if !release.trustee_kbs_ca_cert_pem.trim().is_empty()
-            && let Err(e) = require_env_matches_release(
+        if !release.trustee_kbs_ca_cert_pem.trim().is_empty() {
+            if let Err(e) = require_env_matches_release(
                 "TRUSTEE_KBS_CA_CERT_PEM",
                 &release.trustee_kbs_ca_cert_pem,
                 true,
-            )
-        {
-            eprintln!("startup refused: {e}");
-            std::process::exit(1);
+            ) {
+                eprintln!("startup refused: {e}");
+                std::process::exit(1);
+            }
+            // Codex P1 (cap#165): parse the PEM before the high-water mark
+            // is advanced — build_trustee_http_client (which parses it
+            // again) runs after the commit, and a signed release with an
+            // unloadable CA must not raise the floor and strand startup.
+            let cert_pem = release.trustee_kbs_ca_cert_pem.replace("\\n", "\n");
+            if let Err(e) = reqwest::Certificate::from_pem(cert_pem.as_bytes()) {
+                eprintln!(
+                    "startup refused: signed platform release carries an invalid TRUSTEE_KBS_CA_CERT_PEM: {e}"
+                );
+                std::process::exit(1);
+            }
         }
     }
 
@@ -764,7 +807,19 @@ async fn main() {
             eprintln!("startup refused: invalid sidecar pin configuration: {e}");
             std::process::exit(1);
         }
-    }
+    };
+
+    // The platform release's sidecar pins have cleared startup validation;
+    // the persisted high-water mark is NOT advanced yet — further fallible
+    // release-derived configuration follows below (attestation config with
+    // its pubkey and env-match checks, ACME, the platform signing-service
+    // URL/client), and a release that fails any of them must not raise the
+    // floor (Codex P1, cap#165). Deferring the persist past all of them
+    // means a signed-but-incompatible override can pass the load-time
+    // checks and still fail startup WITHOUT raising the floor — restoring
+    // the last working override stays possible (Devin review, cap#165).
+    // The commit re-runs the comparison under the flock, so a concurrent
+    // replica that accepted something newer in the meantime still wins.
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
@@ -831,6 +886,98 @@ async fn main() {
         )
         .expect("failed to configure platform signing service client")
     });
+
+    // The platform release has now cleared EVERY fallible startup
+    // validation derived from it — runtime class, env-match on the early
+    // lane, sidecar pins, attestation config (image refs, ACME CA, TLS
+    // mode, policy/signing pubkeys), ACME broker config, and the platform
+    // signing-service URL/client: advance the persisted high-water mark.
+    // A signed-but-incompatible override (e.g. a T2 that changes
+    // `signing_service_url` while the deployment env still names the T1
+    // value) can pass the earlier checks and still fail startup WITHOUT
+    // raising the floor — restoring the last working override stays
+    // possible (Devin review + Codex P1, cap#165). The commit re-runs the
+    // comparison under the flock, so a concurrent replica that accepted
+    // something newer in the meantime still wins.
+    if let (Some(state_path), Some(envelope)) = (&pending_high_water, &platform_release_envelope)
+        && let Err(e) =
+            enclava_api::platform_release::commit_override_acceptance(state_path, &envelope.payload)
+    {
+        eprintln!("startup refused: {e}");
+        std::process::exit(1);
+    }
+    // Codex P1 (cap#165): the flock serializes each commit, but older-first
+    // ordering across replicas is still legal — a T1 replica that committed
+    // first keeps serving stale release metadata after another replica
+    // commits T2. Revalidate the running release against the shared
+    // high-water mark periodically and terminate on refusal so the
+    // orchestrator replaces this pod with one that loads the newer release.
+    // Codex P2 (cap#165 round 8): armed whenever the state var is wired —
+    // including the bundled and state-only lanes, where pending_high_water
+    // is deliberately None (the bundle must never persist a mark). Without
+    // this, a state-only pod serving its bundled T2 keeps serving it
+    // indefinitely after a coexisting override-lane pod accepts T3 during a
+    // non-Recreate rollout: the removal guard only checks at startup.
+    if let Some(state_path) = &revalidation_state {
+        let state_path = state_path.clone();
+        let running_release = platform_release_envelope
+            .as_ref()
+            .map(|e| e.payload.clone());
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let recheck = match &running_release {
+                    Some(release) => enclava_api::platform_release::check_running_release_current(
+                        &state_path,
+                        release,
+                    ),
+                    // State-only lane: no release is served as a
+                    // configuration source, but the binary's bundled
+                    // release is still floored by the accepted mark (the
+                    // startup removal guard) — revalidate that one.
+                    None => {
+                        enclava_api::platform_release::check_bundled_release_current(&state_path)
+                    }
+                };
+                match recheck {
+                    Ok(()) => {}
+                    Err(e) if e.is_running_release_refused() => {
+                        // The shared mark no longer admits the release
+                        // this replica is serving: it advanced past it
+                        // (downgrade refused), or the persisted mark and
+                        // this binary's bundle are unorderable
+                        // (equal-timestamp divergence — startup would
+                        // refuse this replica too). Terminate so the
+                        // orchestrator replaces this pod with one that
+                        // loads the newer release. abort() rather than
+                        // exit(): exit() from a tokio worker can deadlock
+                        // in atexit/stdio while other threads hold the
+                        // allocator or the tracing subscriber (reviewer
+                        // High, cap#165 self-check).
+                        eprintln!(
+                            "terminating: the platform-release high-water mark no longer admits the \
+                             release this replica is serving ({e}); the orchestrator should replace \
+                             this pod so it loads the newer release"
+                        );
+                        std::process::abort();
+                    }
+                    Err(e) => {
+                        // Transient state I/O (ENOSPC, EIO, ESTALE on the
+                        // shared volume, corrupt-but-recoverable state):
+                        // killing the pod here would crash-loop healthy
+                        // replicas and stall the flock for everyone. Log
+                        // and retry on the next tick; startup itself
+                        // already fails closed on unrecoverable state.
+                        eprintln!(
+                            "platform-release watchdog: recheck failed, retrying next tick: {e}"
+                        );
+                    }
+                }
+            }
+        });
+    }
     let require_customer_signed_policy_artifact =
         env_flag("REQUIRE_CUSTOMER_SIGNED_POLICY_ARTIFACT");
     let max_concurrent_applies = std::env::var("CAP_MAX_CONCURRENT_APPLIES")
@@ -1198,6 +1345,54 @@ mod tests {
                 .unwrap(),
                 CapManagementMode::Standalone
             );
+        }
+    }
+
+    #[test]
+    fn state_env_alone_does_not_enable_the_release_lane() {
+        // Codex P2 (cap#165 round 5): ENCLAVA_PLATFORM_RELEASE_STATE alone
+        // must not load the bundled release as a configuration source
+        // (which would impose TRUSTEE_KBS_URL / TENANT_CADDY_* env
+        // requirements on fresh debug installs); the anti-rollback removal
+        // guard runs separately via enforce_state_only_removal_guard.
+        let vars = [
+            "TRUSTEE_POLICY_READ_AVAILABLE",
+            "ENCLAVA_USE_PLATFORM_RELEASE",
+            "ENCLAVA_PLATFORM_RELEASE_PATH",
+            "ENCLAVA_PLATFORM_RELEASE_STATE",
+        ];
+        let saved: Vec<(String, Option<std::ffi::OsString>)> = vars
+            .iter()
+            .map(|name| (name.to_string(), std::env::var_os(name)))
+            .collect();
+        // Env mutation is test-only single-threaded here; no other test in
+        // this binary reads these four vars concurrently.
+        unsafe {
+            for name in vars {
+                std::env::remove_var(name);
+            }
+            // Nothing set: disabled.
+            assert!(!platform_release_enabled(false));
+            // State alone: still disabled (the removal guard runs
+            // separately and does not adopt the release).
+            std::env::set_var("ENCLAVA_PLATFORM_RELEASE_STATE", "/var/lib/enclava/x");
+            assert!(!platform_release_enabled(false));
+            // Each real release-lane trigger enables it (with STATE still
+            // set, matching a fully-wired deployment). The trustee flag is
+            // passed as a parameter (the production caller reads the env
+            // var once), so exercise it via the argument, not the env.
+            assert!(platform_release_enabled(true));
+            std::env::set_var("ENCLAVA_USE_PLATFORM_RELEASE", "true");
+            assert!(platform_release_enabled(false));
+            std::env::remove_var("ENCLAVA_USE_PLATFORM_RELEASE");
+            std::env::set_var("ENCLAVA_PLATFORM_RELEASE_PATH", "/etc/release.json");
+            assert!(platform_release_enabled(false));
+            for (name, value) in saved {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
         }
     }
 }
