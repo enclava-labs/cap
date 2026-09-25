@@ -202,6 +202,7 @@ struct SignedPolicyReconciliationRow {
     desired_generation: i64,
     configmap_generation: i64,
     applied_generation: i64,
+    selector_bumps_owed: i64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -488,11 +489,102 @@ async fn enqueue_signed_policy_bootstrap_if_idle(
     Ok(result.rows_affected() == 1)
 }
 
+/// Clear a stray deferred-selector debt from an unsigned-only row.
+///
+/// Migration 0050's trigger owes selector generation bumps only where
+/// `desired_generation > 0` (mirroring
+/// [`enqueue_signed_policy_revocation_if_active`]'s active-mode guard), so
+/// the debt
+/// invariant is `selector_bumps_owed > 0 => desired_generation > 0`.  If a
+/// stray debt ever lands on an unsigned-only row (manual psql, a future
+/// backfill), it is cleared here without bumping so the install cannot be
+/// pushed into signed-policy mode.  This touches only the debt column, so
+/// it is invisible to pre-0050 replicas and safe at any point in a run.
+async fn clear_stray_selector_debt(db: &PgPool) -> Result<(), KbsPolicyError> {
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET selector_bumps_owed = 0,
+                updated_at = clock_timestamp()
+          WHERE singleton
+            AND selector_bumps_owed > 0
+            AND desired_generation = 0",
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Commit the deferred candidate-selector generation bumps owed by migration
+/// 0050 -- and ONLY once the filtered policy body is live in the ConfigMap.
+///
+/// Only the post-0050 implementation -- the one filtering signed-policy
+/// candidates by current keyring membership -- may interpret the debt.
+/// `deploy/api/deployment.yaml` runs the API with
+/// `DATABASE_MIGRATION_MODE=verify`, so the migration step can precede the
+/// new binary by minutes while a pre-0050 replica keeps reconciling every 30
+/// seconds: a generation bumped at migration time would be consumed by that
+/// replica's unfiltered candidate query and published as the old policy body
+/// at the new generation, after which this build would crash-loop on
+/// [`KbsPolicyError::PolicyGenerationConflict`] with no bump left to
+/// recover.
+///
+/// Publishing first and committing second keeps that failure unreachable on
+/// every crash path.  Until this call, `desired_generation` stays unchanged
+/// and a pre-0050 reconciler keeps finding its unfiltered hash matching the
+/// published body: it stays quiescent.  The filtered replace annotates the
+/// ConfigMap with the owed generation while the durable desired generation
+/// is still behind it, so a pre-0050 reconciler treats it as
+/// [`GenerationDecision::Superseded`] and cannot overwrite; once the
+/// increment lands here, the same content-bound annotation turns any late
+/// unfiltered republication into a same-generation conflict.  A failure
+/// before the replace leaves the debt owed and the increment uncommitted,
+/// so the next run simply republishes.
+///
+/// The debt is a COUNTER (not a boolean marker) re-armed by migration
+/// 0050's `org_keyrings` INSERT trigger, so it survives keyring writes
+/// committed by a pre-0050 replica during the rollout: `put_keyring` and
+/// `rotate_org_owner` only take the per-org signing-authority lane and the
+/// old binary enqueues nothing, so such a write can land after this run
+/// loaded its candidate set and before the ConfigMap replace.  That is why
+/// consumption is a compare-and-set on the exact
+/// `(desired_generation, selector_bumps_owed)` pair this run published at:
+/// a keyring write landing mid-run changes the pair, the CAS fails, `None`
+/// is returned, and the caller's next loop attempt republishes the
+/// post-write candidate set at the strictly higher generation instead of
+/// recording a stale set as the final state of a generation.  A debt on an
+/// unsigned-only row is never committed (the `desired_generation > 0`
+/// guard); [`clear_stray_selector_debt`] removes it instead.
+/// Returns the new desired generation when this call performed the commit.
+async fn consume_deferred_selector_bumps(
+    db: &PgPool,
+    observed_desired_generation: i64,
+    observed_bumps_owed: i64,
+) -> Result<Option<i64>, KbsPolicyError> {
+    let committed: Option<i64> = sqlx::query_scalar(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = desired_generation + selector_bumps_owed,
+                selector_bumps_owed = 0,
+                updated_at = clock_timestamp()
+          WHERE singleton
+            AND selector_bumps_owed > 0
+            AND desired_generation > 0
+            AND desired_generation = $1
+            AND selector_bumps_owed = $2
+          RETURNING desired_generation",
+    )
+    .bind(observed_desired_generation)
+    .bind(observed_bumps_owed)
+    .fetch_optional(db)
+    .await?;
+    Ok(committed)
+}
+
 async fn load_signed_policy_reconciliation(
     db: &PgPool,
 ) -> Result<SignedPolicyReconciliationRow, KbsPolicyError> {
     Ok(sqlx::query_as(
-        "SELECT desired_generation, configmap_generation, applied_generation
+        "SELECT desired_generation, configmap_generation, applied_generation,
+                selector_bumps_owed
            FROM kbs_signed_policy_reconciliation
           WHERE singleton",
     )
@@ -515,6 +607,11 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
 /// its exact source artifact required.  The active operation is authoritative
 /// even while the app row still projects the preceding failed/stopped state.
 /// Failed, unsigned, or deleting latest operations contribute no authorization.
+/// Every candidate must still be signed by a key that is a member of the
+/// org's *current* keyring generation (#130): a retained historical artifact
+/// whose signer was removed by keyring rotation must not keep authorizing KBS
+/// policy while its immutable row survives the retention window.  Candidates
+/// fail closed when the org has no keyring row at all.
 async fn load_signed_policy_candidates(
     db: &PgPool,
     retention: i64,
@@ -525,6 +622,7 @@ async fn load_signed_policy_candidates(
             SELECT
                 job.deployment_id,
                 job.app_id,
+                job.org_id,
                 job.generation,
                 job.artifact_deployment_id,
                 job.artifact_descriptor_core_hash,
@@ -541,6 +639,31 @@ async fn load_signed_policy_candidates(
              AND deployment.app_id = job.app_id
              AND deployment.org_id = job.org_id
             JOIN apps AS app ON app.id = job.app_id
+        ),
+        -- The cast is safe at two levels: org_keyrings rows are written only
+        -- by the put/rotate handlers, which serialize validated JSON, and the
+        -- org_keyrings_payload_wellformed CHECK constraint (migration 0050)
+        -- rejects any non-JSON or non-object payload or a non-array members
+        -- entry at INSERT time, so a malformed row from a backfill script or
+        -- manual psql fix can never take down candidate loading for every
+        -- org at once.
+        current_keyring_members AS (
+            SELECT latest.org_id, member.value->>'pubkey' AS pubkey
+              FROM (
+                  SELECT DISTINCT ON (org_id)
+                      org_id,
+                      convert_from(keyring_payload, 'UTF8')::jsonb AS keyring
+                    FROM org_keyrings
+                   ORDER BY org_id, version DESC
+              ) AS latest,
+              jsonb_array_elements(latest.keyring->'members') AS member
+            -- Mirror the verifier's deploy-authority predicate
+            -- (enclava-verifier artifacts.rs: only owner/admin/deployer
+            -- members may sign policy).  A member without a string role
+            -- matches neither side and is excluded here, exactly as
+            -- verification would reject its artifacts -- fail closed if a
+            -- non-deploy role is ever added to keyring payloads.
+            WHERE (member.value->>'role') IN ('owner', 'admin', 'deployer')
         ),
         eligible_current_job_operations AS (
             SELECT *
@@ -585,6 +708,19 @@ async fn load_signed_policy_candidates(
              AND artifact.deploy_id = historical.artifact_deployment_id
              AND artifact.descriptor_core_hash
                  = historical.artifact_descriptor_core_hash
+            -- Membership is compared case-insensitively on purpose: the
+            -- keyring payload is stored verbatim from the request and
+            -- `hex_bytes32` deserialization is case-insensitive, so an
+            -- uppercase member pubkey hex survives validation and is
+            -- stored as-is.  Artifact pubkeys, by contrast, are enforced
+            -- lowercase at verification.  Do not "simplify" the lower()
+            -- away or uppercase keyrings would silently lose authority.
+            JOIN current_keyring_members AS member
+              ON member.org_id = current.org_id
+             AND lower(member.pubkey) = lower(
+                 artifact.signed_policy_artifact
+                     ->'metadata'->>'descriptor_signing_pubkey'
+             )
             ORDER BY
                 current.app_id,
                 artifact.descriptor_core_hash,
@@ -610,6 +746,7 @@ async fn load_signed_policy_candidates(
             SELECT
                 deployment.id AS deployment_id,
                 deployment.app_id,
+                deployment.org_id,
                 deployment.status::text AS deployment_status,
                 app.status::text AS app_status,
                 deployment.created_at,
@@ -637,6 +774,14 @@ async fn load_signed_policy_candidates(
             JOIN workload_artifacts AS artifact
               ON artifact.app_id = legacy.app_id
              AND artifact.deploy_id = legacy.deployment_id
+            JOIN current_keyring_members AS member
+              -- Case-insensitive membership join: see the comment at the
+              -- job_artifact_candidates join above.
+              ON member.org_id = legacy.org_id
+             AND lower(member.pubkey) = lower(
+                 artifact.signed_policy_artifact
+                     ->'metadata'->>'descriptor_signing_pubkey'
+             )
             WHERE legacy.current_operation_rank = 1
               AND legacy.app_status IN ('creating', 'running')
               AND legacy.deployment_status = 'healthy'
@@ -787,6 +932,13 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
     expected_artifact: Option<&crate::signing_service::SignedPolicyArtifact>,
     client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
+    // Clear any stray deferred-selector debt on an unsigned-only row (see
+    // clear_stray_selector_debt).  A debt on a signed-mode row is left in
+    // place here on purpose: the owed generation bump (migration 0050) is
+    // published first and committed only after the filtered ConfigMap replace
+    // succeeded (consume_deferred_selector_bumps below), so no failure in
+    // this run can expose a raw bumped generation to a pre-0050 reconciler.
+    clear_stray_selector_debt(db).await?;
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
         let state = load_signed_policy_reconciliation(db).await?;
@@ -821,7 +973,13 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             }
             return Ok(());
         }
-        let generation = state.desired_generation;
+        // Pending deferred selector bumps (migration 0050) publish the owed
+        // generation as desired_generation + selector_bumps_owed without
+        // committing the increment yet -- consume_deferred_selector_bumps
+        // does that only after the filtered replace below.  Pre-0050
+        // replicas reading the same row keep seeing the unchanged
+        // desired_generation and stay quiescent.
+        let generation = state.desired_generation + state.selector_bumps_owed;
         let reset_bootstrap = state.configmap_generation == 0 && state.applied_generation == 0;
         let previously_applied = state.applied_generation >= generation;
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
@@ -871,6 +1029,34 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             } => (true, resource_version, publication_token),
             ConfigMapConvergence::Superseded => continue,
         };
+        // The filtered body is now live at `generation` with its content-bound
+        // generation annotation, and only now is the owed increment (migration
+        // 0050) safe to commit: while `desired_generation` was still behind,
+        // a pre-0050 reconciler saw the annotated generation as Superseded and
+        // could not overwrite; after the increment lands, the same annotation
+        // turns any late unfiltered republication into a same-generation
+        // conflict.  Committing before this replace would expose a raw bumped
+        // generation that a pre-0050 reconciler could consume with its
+        // unfiltered query whenever this run fails before publishing.
+        // The CAS on the observed (desired, owed) pair is what fences OLD
+        // keyring writers: put_keyring / rotate_org_owner from a pre-0050
+        // replica commit no enqueue of their own, but migration 0050's
+        // org_keyrings trigger has already owed them a bump inside their own
+        // transaction.  If such a write landed after this run loaded its
+        // candidate set, owed has moved, the CAS fails, and the loop retries
+        // -- republishing the post-write candidate set at the strictly higher
+        // generation instead of sealing a stale one.
+        if state.selector_bumps_owed > 0
+            && consume_deferred_selector_bumps(
+                db,
+                state.desired_generation,
+                state.selector_bumps_owed,
+            )
+            .await?
+            .is_none()
+        {
+            continue;
+        }
         if !reset_bootstrap
             && !record_configmap_generation(db, generation, &policy_sha256, &resource_version)
                 .await?
@@ -2268,9 +2454,23 @@ owner_resource_bindings := {}
         deployment_id: Uuid,
         hash_byte: &str,
     ) -> crate::signing_service::SignedPolicyArtifact {
+        insert_test_artifact_signed_by(pool, app_id, deployment_id, hash_byte, "bb").await
+    }
+
+    /// Like insert_test_artifact, but lets each fixture pick its descriptor
+    /// signer so keyring-rotation tests can distinguish removed and remaining
+    /// members.
+    async fn insert_test_artifact_signed_by(
+        pool: &PgPool,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        hash_byte: &str,
+        signer_hex: &str,
+    ) -> crate::signing_service::SignedPolicyArtifact {
         let mut artifact = test_signed_policy_artifact(hash_byte, 16);
         artifact.metadata.app_id = app_id.to_string();
         artifact.metadata.deploy_id = deployment_id.to_string();
+        artifact.metadata.descriptor_signing_pubkey = signer_hex.repeat(32);
         let descriptor_hash = hex::decode(&artifact.metadata.descriptor_core_hash).unwrap();
         sqlx::query(
             "INSERT INTO workload_artifacts (
@@ -2330,14 +2530,81 @@ owner_resource_bindings := {}
         .expect("insert KBS test apply job");
     }
 
+    /// Insert one append-only org keyring version. The first member is the
+    /// owner; the raw signature bytes are irrelevant to candidate selection.
+    /// Returns the ids of the user and signing key rows it created so callers
+    /// can clean them up without touching other tests' fixtures.
+    async fn insert_test_keyring_version(
+        pool: &PgPool,
+        org_id: Uuid,
+        version: i64,
+        member_pubkeys: &[&str],
+    ) -> (Uuid, Uuid) {
+        let user_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'kbs keyring member')")
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .expect("insert KBS keyring user");
+        let signing_key_id = Uuid::new_v4();
+        sqlx::query("INSERT INTO user_signing_keys (id, user_id, pubkey) VALUES ($1, $2, $3)")
+            .bind(signing_key_id)
+            .bind(user_id)
+            .bind(hex::decode(member_pubkeys[0]).expect("decode owner keyring pubkey"))
+            .execute(pool)
+            .await
+            .expect("insert KBS keyring signing key");
+        let members: Vec<serde_json::Value> = member_pubkeys
+            .iter()
+            .enumerate()
+            .map(|(index, pubkey)| {
+                serde_json::json!({
+                    "user_id": user_id,
+                    "pubkey": pubkey,
+                    "role": if index == 0 { "owner" } else { "deployer" },
+                    "added_at": "2026-01-01T00:00:00Z",
+                })
+            })
+            .collect();
+        let keyring = serde_json::json!({
+            "org_id": org_id,
+            "version": version,
+            "members": members,
+            "updated_at": "2026-01-01T00:00:00Z",
+        });
+        sqlx::query(
+            "INSERT INTO org_keyrings (
+                 org_id, version, keyring_payload, signature, signing_key_id
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(org_id)
+        .bind(version)
+        .bind(serde_json::to_vec(&keyring).expect("serialize test keyring"))
+        .bind(vec![9u8; 64])
+        .bind(signing_key_id)
+        .execute(pool)
+        .await
+        .expect("insert KBS test keyring version");
+        (user_id, signing_key_id)
+    }
+
     #[tokio::test]
     async fn selector_uses_current_operation_binding_and_legacy_fallback() {
-        let pool = database_test_pool().await;
+        // Candidate selection reads every org's artifacts, so on the shared
+        // test database foreign fixtures leak into the exact assertions below
+        // (the all(required) check would break on another test's retained
+        // historical row).  Run against a per-process database.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap130_selector_ops").await;
         let now = Utc::now();
+        // test_signed_policy_artifact signs every fixture with this pubkey.
+        let signer = "bb".repeat(32);
 
         // A rollback operation points to an older exact artifact. It must rank
         // ahead of a newer historical artifact for the same app.
         let (rollback_org, rollback_app) = insert_test_app(&pool, "running").await;
+        let mut fixture_users = Vec::new();
+        fixture_users.push(insert_test_keyring_version(&pool, rollback_org, 1, &[&signer]).await);
         let source = Uuid::new_v4();
         insert_test_deployment(&pool, rollback_org, rollback_app, source, "healthy", now).await;
         let source_artifact = insert_test_artifact(&pool, rollback_app, source, "aa").await;
@@ -2392,6 +2659,7 @@ owner_resource_bindings := {}
 
         // A pre-0038 healthy signed deployment has no job but remains current.
         let (legacy_org, legacy_app) = insert_test_app(&pool, "running").await;
+        fixture_users.push(insert_test_keyring_version(&pool, legacy_org, 1, &[&signer]).await);
         let legacy = Uuid::new_v4();
         insert_test_deployment(&pool, legacy_org, legacy_app, legacy, "healthy", now).await;
         let legacy_artifact = insert_test_artifact(&pool, legacy_app, legacy, "cc").await;
@@ -2399,6 +2667,7 @@ owner_resource_bindings := {}
         // A retry is current authority even before its stale failed app
         // projection advances to creating.
         let (retry_org, retry_app) = insert_test_app(&pool, "failed").await;
+        fixture_users.push(insert_test_keyring_version(&pool, retry_org, 1, &[&signer]).await);
         let retry = Uuid::new_v4();
         insert_test_deployment(&pool, retry_org, retry_app, retry, "healthy", now).await;
         let retry_artifact = insert_test_artifact(&pool, retry_app, retry, "34").await;
@@ -2561,6 +2830,416 @@ owner_resource_bindings := {}
                 .await
                 .expect("delete KBS selector fixture");
         }
+        for (user_id, signing_key_id) in fixture_users {
+            sqlx::query("DELETE FROM user_signing_keys WHERE id = $1")
+                .bind(signing_key_id)
+                .execute(&pool)
+                .await
+                .expect("delete KBS selector fixture signing key");
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("delete KBS selector fixture user");
+        }
+        crate::test_support::drop_isolated_database("cap130_selector_ops", pool).await;
+    }
+
+    /// Regression coverage for the #130 keyring-rotation generation bump.
+    /// Migration 0050's `org_keyrings` INSERT trigger owes one selector bump
+    /// per keyring write while signed-policy mode is active -- including
+    /// writes committed by a PRE-0050 replica during a rolling upgrade,
+    /// which is the whole point of the trigger (the old binary enqueues
+    /// nothing itself).  Runs against its own uniquely named per-process
+    /// database (see [`crate::test_support::isolated_database_test_pool`]):
+    /// this test asserts exact `kbs_signed_policy_reconciliation` singleton
+    /// values and resets them, and on the shared test database another test
+    /// process (a sibling CI worktree on the same PostgreSQL server) could
+    /// owe bumps between this test's insert and its exact assertion, or have
+    /// its own state clobbered by this test's final reset.  The process-local
+    /// `SIGNED_POLICY_SINGLETON_LOCK` cannot fence across processes.
+    #[tokio::test]
+    async fn keyring_rotation_owes_selector_bump_only_when_active() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap130_rotation_enqueue").await;
+        let (org_id, _app_id) = insert_test_app(&pool, "running").await;
+
+        // Unsigned-only installs must not enter signed-policy mode.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    configmap_generation = 0,
+                    applied_generation = 0,
+                    configmap_policy_sha256 = NULL,
+                    applied_policy_sha256 = NULL,
+                    configmap_resource_version = NULL
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_test_keyring_version(&pool, org_id, 1, &["aa".repeat(32).as_str()]).await;
+        let owed: i64 = sqlx::query_scalar(
+            "SELECT selector_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            owed, 0,
+            "keyring write on an idle installation must owe no selector bump"
+        );
+
+        // Once signed mode is active, every keyring write owes one bump so
+        // the reconciler withdraws rotated-out artifacts (#130): the changed
+        // candidate set at an unchanged generation would otherwise be
+        // rejected as a content conflict.  desired_generation itself must
+        // stay put -- a pre-0050 replica must never see a raw bump.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 1
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        insert_test_keyring_version(&pool, org_id, 2, &["bb".repeat(32).as_str()]).await;
+        insert_test_keyring_version(&pool, org_id, 3, &["cc".repeat(32).as_str()]).await;
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, selector_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(owed, 2, "each active-mode keyring insert owes one bump");
+        assert_eq!(desired, 1, "the debt must not move desired_generation");
+
+        crate::test_support::drop_isolated_database("cap130_rotation_enqueue", pool).await;
+    }
+
+    /// Migration 0050 owes selector generation bumps in a counter instead of
+    /// performing them, so a pre-0050 replica still reconciling during the
+    /// rollout cannot consume the bump with its unfiltered candidate query.
+    /// Only the post-0050 reconciler interprets the debt -- exactly once per
+    /// observed (desired, owed) pair, and only after the filtered policy body
+    /// is published (consume_deferred_selector_bumps).  A keyring write
+    /// landing between the reconciler's state read and its consumption
+    /// (exactly the interleaving raised in review: a pre-0050 replica's
+    /// put_keyring committing after candidates were loaded) increments the
+    /// counter, fails the CAS, and forces republication at a strictly higher
+    /// generation -- never a same-generation conflict on a stale candidate
+    /// set.  A stray debt on an unsigned-only install is disarmed by
+    /// clear_stray_selector_debt without entering signed-policy mode.  Runs
+    /// against its own per-process database: it asserts exact singleton state
+    /// that another test process could perturb through the shared server.
+    #[tokio::test]
+    async fn deferred_selector_bumps_are_cas_committed_once_by_the_filtered_reconciler() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap130_selector_bump").await;
+        let (org_id, _app_id) = insert_test_app(&pool, "running").await;
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    selector_bumps_owed = 0
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Nothing owed: consuming is a no-op.
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 0, 0).await.unwrap(),
+            None
+        );
+
+        // Migration 0050 marks signed-mode installs with one owed bump; the
+        // post-publication commit lands exactly the observed pair.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 3,
+                    selector_bumps_owed = 1
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 3, 1).await.unwrap(),
+            Some(4)
+        );
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, selector_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((desired, owed), (4, 0));
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 4, 0).await.unwrap(),
+            None
+        );
+
+        // The review interleaving: the reconciler observed (3, 1) and
+        // published at 4, but a pre-0050 replica's put_keyring committed in
+        // between -- migration 0050's trigger owed that write a bump too.
+        // The stale CAS must fail and leave the debt for the retry, which
+        // republishes at a strictly higher generation.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 3,
+                    selector_bumps_owed = 1
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The old replica's write lands mid-run: debt grows to 2.
+        insert_test_keyring_version(&pool, org_id, 1, &["dd".repeat(32).as_str()]).await;
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 3, 1).await.unwrap(),
+            None,
+            "a mid-run keyring write must fail the CAS and leave the debt"
+        );
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, selector_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (desired, owed),
+            (3, 2),
+            "both bumps remain owed to the retry"
+        );
+        // The retry observes the full debt and lands it in one commit.
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 3, 2).await.unwrap(),
+            Some(5)
+        );
+
+        // A stray debt on an unsigned-only install must never push it into
+        // signed-policy mode: the commit refuses to bump it (and leaves the
+        // debt for the stray cleanup), and clear_stray_selector_debt then
+        // disarms it without touching desired_generation.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    selector_bumps_owed = 2
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            consume_deferred_selector_bumps(&pool, 0, 2).await.unwrap(),
+            None
+        );
+        clear_stray_selector_debt(&pool).await.unwrap();
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, selector_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((desired, owed), (0, 0));
+
+        crate::test_support::drop_isolated_database("cap130_selector_bump", pool).await;
+    }
+
+    /// Regression for #130: a retained historical artifact must stop
+    /// authorizing KBS policy as soon as its signer is no longer a member of
+    /// the org's current keyring generation, even though the immutable
+    /// workload_artifacts row survives the retention window.
+    #[tokio::test]
+    async fn selector_drops_artifacts_whose_signer_left_the_current_keyring() {
+        // Same isolation as the selector operations test: candidate selection
+        // is global across orgs, and the shared test database would leak other
+        // tests' fixtures into these assertions.
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap130_selector_rotation").await;
+        let now = Utc::now();
+        let signer = "bb".repeat(32);
+        let remaining = "cd".repeat(32);
+        let rotated_owner = "ab".repeat(32);
+
+        // Job-backed app: the current operation binds an artifact signed by a
+        // remaining member, while an older historical artifact (still inside
+        // the retention window) was signed by the since-removed signer.
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let mut fixture_users = Vec::new();
+        fixture_users
+            .push(insert_test_keyring_version(&pool, org_id, 1, &[&remaining, &signer]).await);
+        let historical = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, historical, "healthy", now).await;
+        let stale_artifact =
+            insert_test_artifact_signed_by(&pool, app_id, historical, "9a", "bb").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            historical,
+            historical,
+            Some((historical, &stale_artifact)),
+        )
+        .await;
+        let deployment = Uuid::new_v4();
+        insert_test_deployment(
+            &pool,
+            org_id,
+            app_id,
+            deployment,
+            "healthy",
+            now + chrono::Duration::seconds(1),
+        )
+        .await;
+        let artifact = insert_test_artifact_signed_by(&pool, app_id, deployment, "9b", "cd").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            deployment,
+            deployment,
+            Some((deployment, &artifact)),
+        )
+        .await;
+
+        let selected = |candidates: &Vec<SignedPolicyArtifactCandidate>| {
+            candidates.iter().any(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == artifact.metadata.descriptor_core_hash
+            })
+        };
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select pre-rotation candidates");
+        assert!(
+            selected(&candidates),
+            "artifact signed by a current keyring member must be a candidate"
+        );
+
+        // Keyring rotation removes the signer while the remaining member's
+        // artifact stays live: the stale historical artifact must no longer be
+        // re-admitted into the KBS policy authority set, and the remaining
+        // member's artifact must survive the rotation.
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.artifact.metadata.descriptor_core_hash
+                    == stale_artifact.metadata.descriptor_core_hash),
+            "pre-rotation, the historical artifact inside the retention window is a candidate"
+        );
+        fixture_users.push(
+            insert_test_keyring_version(&pool, org_id, 2, &[&remaining, &rotated_owner]).await,
+        );
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select post-rotation candidates");
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.artifact.metadata.descriptor_core_hash
+                    == stale_artifact.metadata.descriptor_core_hash),
+            "historical artifact whose signer was removed by keyring rotation must not be re-admitted"
+        );
+        assert!(
+            selected(&candidates),
+            "current artifact signed by a remaining member must survive the rotation"
+        );
+
+        // The same fence applies to pre-0038 legacy deployments without jobs.
+        let (legacy_org, legacy_app) = insert_test_app(&pool, "running").await;
+        fixture_users.push(insert_test_keyring_version(&pool, legacy_org, 1, &[&signer]).await);
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, legacy_org, legacy_app, legacy, "healthy", now).await;
+        let legacy_artifact = insert_test_artifact(&pool, legacy_app, legacy, "9c").await;
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select pre-rotation legacy candidates");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.artifact.metadata.descriptor_core_hash
+                    == legacy_artifact.metadata.descriptor_core_hash),
+            "legacy artifact signed by a current keyring member must be a candidate"
+        );
+        fixture_users
+            .push(insert_test_keyring_version(&pool, legacy_org, 2, &[&rotated_owner]).await);
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select post-rotation legacy candidates");
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.artifact.metadata.descriptor_core_hash
+                    == legacy_artifact.metadata.descriptor_core_hash),
+            "legacy artifact whose signer was removed must not be re-admitted"
+        );
+
+        for cleanup_org in [org_id, legacy_org] {
+            sqlx::query("DELETE FROM organizations WHERE id = $1")
+                .bind(cleanup_org)
+                .execute(&pool)
+                .await
+                .expect("delete keyring rotation fixture");
+        }
+        for (user_id, signing_key_id) in fixture_users {
+            sqlx::query("DELETE FROM user_signing_keys WHERE id = $1")
+                .bind(signing_key_id)
+                .execute(&pool)
+                .await
+                .expect("delete keyring rotation fixture signing key");
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("delete keyring rotation fixture user");
+        }
+        crate::test_support::drop_isolated_database("cap130_selector_rotation", pool).await;
+    }
+
+    /// Fail closed for #130: an org with retained artifacts but no keyring row
+    /// at all must contribute no authorization -- the INNER JOIN drops it, and
+    /// the deferred selector bump publishes exactly that withdrawal on upgrade.
+    #[tokio::test]
+    async fn selector_fails_closed_for_orgs_without_a_keyring() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap130_selector_fail_closed").await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let deployment = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, deployment, "healthy", Utc::now()).await;
+        let artifact = insert_test_artifact(&pool, app_id, deployment, "42").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            deployment,
+            deployment,
+            Some((deployment, &artifact)),
+        )
+        .await;
+        // No org_keyrings row is ever inserted for this org.
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select candidates without a keyring");
+        assert!(
+            !candidates.iter().any(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == artifact.metadata.descriptor_core_hash
+            }),
+            "artifacts of an org without any keyring row must contribute no authority"
+        );
+        crate::test_support::drop_isolated_database("cap130_selector_fail_closed", pool).await;
     }
 
     #[tokio::test]
