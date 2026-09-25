@@ -34,11 +34,22 @@ requires the surrounding platform services described in
 
 ## Install
 
+macOS / Linux (musl-static binaries, checksum + cosign verified):
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/enclava-labs/cap/main/scripts/install.sh | bash
 ```
 
-Installs the latest release to `~/.enclava/bin` (checksum + cosign verified). Set `ENCLAVA_VERSION=vX.Y.Z` for a specific release. Windows: download `enclava-windows-x86_64.tar.gz` from the [releases page](https://github.com/enclava-labs/cap/releases).
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/enclava-labs/cap/main/scripts/install.ps1 | iex
+```
+
+Installs the latest release to `~/.enclava/bin` (`%USERPROFILE%\.enclava\bin` on
+Windows) and adds it to your PATH. Set `ENCLAVA_VERSION=vX.Y.Z` for a specific
+release, `ENCLAVA_INSTALL_DIR` to change the destination. Other platforms:
+`cargo install --locked --git https://github.com/enclava-labs/cap enclava-cli`.
 
 ## CLI Flow
 
@@ -162,6 +173,8 @@ See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the current security snapshot.
   - fail-closed Cloudflare mutation recovery.
 - [runbooks/kubernetes-mutation-fence-recovery.md](runbooks/kubernetes-mutation-fence-recovery.md)
   - fail-closed Kubernetes namespace mutation recovery.
+- [runbooks/trustee-policy-audit.sh](runbooks/trustee-policy-audit.sh) - KBS
+  live-policy vs CAP-database binding audit.
 
 ## License
 

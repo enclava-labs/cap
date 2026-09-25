@@ -135,7 +135,7 @@ fn enforce_with(
         // `HTTP://` must not slip a prefix check). The same loopback /
         // cluster-internal `.svc` carve-out as SigningServiceClient applies:
         // preprod legitimately fronts the service with an in-cluster
-        // http://*.svc.cluster.local URL (enclava-ops-manifests cap-api).
+        // http://*.svc.cluster.local URL (ops manifests overlay).
         if let Some(value) = lookup("PLATFORM_SIGNING_SERVICE_URL")
             && http_scheme(&value)
             && !signing_url_http_host_allowed(&value)

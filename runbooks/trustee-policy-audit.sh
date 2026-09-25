@@ -90,10 +90,9 @@ cat > "$OUT_DIR/README.md" <<EOF
 Review:
 
 1. \`cap-binding-key-diff.patch\` must be empty.
-2. Classify every rule in \`non-cap.rego\` using
-   \`cap/runbooks/trustee-policy-audit.md\`.
+2. Classify every rule in \`non-cap.rego\` as an intentional operator-owned
+   baseline (record it) or a leftover (remove it).
 3. Confirm CAP-signed artifacts remain the deploy authority.
-4. Record any operator-owned rule as intentional baseline or remove it.
 EOF
 
 echo "audit artifacts written to $OUT_DIR"

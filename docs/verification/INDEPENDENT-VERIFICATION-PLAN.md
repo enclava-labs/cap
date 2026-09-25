@@ -372,7 +372,7 @@ If current `sev`, `sigstore`, or OpenSSL-dependent paths do not compile, use the
 - assembles canonical bundle bytes without appraising them;
 - serves CORS-safe binary responses with strict limits.
 
-### `enclava-ops-manifests`
+### Ops manifests repository
 
 - pins and rolls out `enclava-init`, attestation-proxy, CAP API, and optional appraiser images;
 - mounts verification material only where required;
@@ -744,7 +744,7 @@ For deterministic inputs, require identical check outcomes, reason codes, and ca
 6. Publish the signed CLI and local HTML/WASM release artifacts only after that test passes.
 7. Deploy the optional appraiser only after local verification works end to end.
 8. Implement and test the PaaS public discovery, bundle, appraisal, and UI integration against the pinned candidate CAP contract. If an existing CAP internal response shape changes, update and test PaaS before deploying that CAP API change.
-9. For Enclava's hosted product, update `enclava-ops-manifests` with the candidate digests and volume mounts, preserving the init-before-API rollout order.
+9. For Enclava's hosted product, update the ops manifests repository with the candidate digests and volume mounts, preserving the init-before-API rollout order.
 10. Deploy or enable the matching PaaS routes and verify readiness against the live CAP internal endpoints.
 11. Run the PaaS integration acceptance test, including byte-preserving relay and CAP-unavailable behavior.
 12. Verify the target reserved route against a live tenant pod and run the independent local-verifier path with PaaS stopped.
