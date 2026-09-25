@@ -382,6 +382,10 @@ pub struct DeployRequest {
     pub workload_security_profile: Option<String>,
     #[serde(default)]
     pub log_encryption: Option<LogEncryptionConfig>,
+    /// When set on a redeploy of an app that already has a TEE domain, DNS
+    /// setup and the workload roll wait until customer config is released.
+    #[serde(default)]
+    pub customer_config_roll_hold_seconds: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -487,7 +491,8 @@ const PUBLIC_DEPLOYMENT_ERROR_MESSAGE: &str = "deployment_error";
 /// arbitrary backend, runtime, or workload-controlled plaintext.
 pub(crate) fn public_deployment_error_message(error_message: Option<&str>) -> Option<String> {
     error_message.map(|error_message| match error_message {
-        crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR => error_message.to_string(),
+        crate::deploy::DEPLOYMENT_SUPERSEDED_ERROR
+        | crate::deployment_jobs::CUSTOMER_CONFIG_HOLD_EXPIRED => error_message.to_string(),
         _ => PUBLIC_DEPLOYMENT_ERROR_MESSAGE.to_string(),
     })
 }
@@ -559,9 +564,17 @@ async fn app_has_incomplete_deployment_setup(
     sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1
-             FROM deployments
-             WHERE app_id = $1
-               AND spec_snapshot ->> 'setup_state' IN ('dns_pending', 'cleanup_pending')
+               FROM deployments AS deployment
+              WHERE deployment.app_id = $1
+                AND deployment.spec_snapshot ->> 'setup_state'
+                    IN ('dns_pending', 'cleanup_pending')
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM deployment_apply_jobs AS job
+                     WHERE job.deployment_id = deployment.id
+                       AND job.customer_config_hold
+                       AND job.customer_config_released_at IS NULL
+                )
          )",
     )
     .bind(app_id)
@@ -656,7 +669,9 @@ pub async fn deploy(
             Json(serde_json::json!({"error": "app not found"})),
         ))?;
 
-    deploy_app_candidate(auth, state, app, body, AppMutation::None).await
+    // The public deploy route has no customer-config release endpoint.
+    // Only the internal generic deployment path may arm a roll hold.
+    deploy_app_candidate(auth, state, app, body, AppMutation::None, false).await
 }
 
 async fn deploy_app_candidate(
@@ -665,6 +680,7 @@ async fn deploy_app_candidate(
     app: App,
     body: DeployRequest,
     app_mutation: AppMutation,
+    honor_customer_config_roll_hold: bool,
 ) -> Result<(StatusCode, Json<DeploymentResponse>), (StatusCode, Json<serde_json::Value>)> {
     if app_mutation != AppMutation::Insert
         && let Some(error) = runtime_reapply_status_error(app.status)
@@ -1188,14 +1204,14 @@ async fn deploy_app_candidate(
             "app deployment inputs changed while deployment was validating; retry the deployment",
         ));
     }
+    let mut live_app_status = app.status;
     if app_mutation != AppMutation::Insert {
-        let current_status: crate::models::AppStatus =
-            sqlx::query_scalar("SELECT status FROM apps WHERE id = $1")
-                .bind(app.id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
-        if let Some(error) = runtime_reapply_status_error(current_status) {
+        live_app_status = sqlx::query_scalar("SELECT status FROM apps WHERE id = $1")
+            .bind(app.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+        if let Some(error) = runtime_reapply_status_error(live_app_status) {
             return Err(json_error(StatusCode::CONFLICT, error));
         }
         if crate::mutation_leases::desired_state_mutation_in_progress(&mut tx, app.id)
@@ -1452,12 +1468,50 @@ async fn deploy_app_candidate(
             .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
     }
 
+    // The requested seconds are the idempotency identity. The accepted
+    // duration depends on the status read in this transaction, and apply
+    // changes that status before a lost-response retry arrives.
+    let customer_config_roll_hold_request = honor_customer_config_roll_hold
+        .then_some(body.customer_config_roll_hold_seconds)
+        .flatten();
+    let customer_config_hold_seconds =
+        crate::deployment_jobs::normalize_customer_config_roll_hold_seconds(
+            customer_config_roll_hold_request,
+            crate::deployment_jobs::customer_config_roll_hold_applies(
+                app_mutation == AppMutation::Insert,
+                matches!(live_app_status, crate::models::AppStatus::Running),
+                app.tee_domain.as_deref(),
+            ),
+        );
+    sqlx::query(
+        "UPDATE deployments
+            SET spec_snapshot = jsonb_set(
+                  jsonb_set(
+                    spec_snapshot,
+                    '{customer_config_roll_hold_seconds}',
+                    COALESCE($2::jsonb, 'null'::jsonb),
+                    true
+                  ),
+                  '{customer_config_roll_hold_requested_seconds}',
+                  COALESCE($3::jsonb, 'null'::jsonb),
+                  true
+                )
+          WHERE id = $1",
+    )
+    .bind(deploy_id)
+    .bind(serde_json::json!(customer_config_hold_seconds))
+    .bind(serde_json::json!(customer_config_roll_hold_request))
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
+
     let setup_job = crate::deployment_jobs::insert_setup_job(
         &mut tx,
         deploy_id,
         deploy_id,
         &apply_payload,
         signed_required,
+        customer_config_hold_seconds,
     )
     .await
     .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
@@ -1488,22 +1542,26 @@ async fn deploy_app_candidate(
         .await
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?;
 
-    match crate::deployment_jobs::process_setup_job(&state, setup_job).await {
-        Ok(()) => {}
-        Err(crate::deployment_jobs::DeploymentJobError::Dns(error)) => {
-            return Err(dns_error_response(error));
-        }
-        Err(error) => {
-            tracing::error!(
-                app_id = %app.id,
-                deployment_id = %deploy_id,
-                error_code = error.code(),
-                "durable deployment setup did not complete"
-            );
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "database error",
-            ));
+    // A redeploy hold keeps the current TEE serving until the CLI releases
+    // the handshake. Starting setup here would race that write.
+    if customer_config_hold_seconds.is_none() {
+        match crate::deployment_jobs::process_setup_job(&state, setup_job).await {
+            Ok(()) => {}
+            Err(crate::deployment_jobs::DeploymentJobError::Dns(error)) => {
+                return Err(dns_error_response(error));
+            }
+            Err(error) => {
+                tracing::error!(
+                    app_id = %app.id,
+                    deployment_id = %deploy_id,
+                    error_code = error.code(),
+                    "durable deployment setup did not complete"
+                );
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "database error",
+                ));
+            }
         }
     }
 
@@ -2047,6 +2105,7 @@ mod tests {
             deployment_id,
             &payload,
             false,
+            None,
         )
         .await
         .expect("persist accepted setup job");

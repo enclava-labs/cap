@@ -421,7 +421,7 @@ async fn deploy_with_timings(
 
     let bootstrap_pubkey_hash =
         template_bootstrap_pubkey_hash(api, &ctx.paths, template, &instance_name).await?;
-    let app = ensure_template_app(
+    let (app, app_already_existed) = ensure_template_app(
         api,
         template,
         &instance_name,
@@ -465,6 +465,8 @@ async fn deploy_with_timings(
     pb.set_position(2);
     pb.set_message("Creating template instance...");
 
+    let roll_hold_seconds =
+        app_already_existed.then(|| customer_config_roll_hold_seconds(args.ssh_timeout_seconds));
     let response = match timings
         .run(
             DeployPhase::DeployRequest,
@@ -476,6 +478,7 @@ async fn deploy_with_timings(
                 customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
                 org_keyring_blob: Some(signed_blobs.org_keyring_blob),
                 signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
+                customer_config_roll_hold_seconds: roll_hold_seconds,
             }),
         )
         .await
@@ -487,12 +490,34 @@ async fn deploy_with_timings(
         &response,
         explicit_stable_endpoint.as_deref(),
     )?;
+    let customer_config_hold = response.customer_config_hold;
     let deployment_id = response
         .deployment
         .cap_deployment_id
         .as_deref()
         .unwrap_or("pending")
         .to_string();
+    if customer_config_hold && deployment_id == "pending" {
+        return Err("PaaS held the workload roll but did not return a deployment id".into());
+    }
+    // The server armed the hold during the create call, which started after
+    // deploy_started. Stopping this far before that deadline leaves room for
+    // the release round trip and keeps request timeouts inside the hold.
+    let pre_release_deadline = if customer_config_hold {
+        roll_hold_seconds.map(|seconds| hold_deadline(deploy_started, seconds))
+    } else {
+        None
+    };
+    let phase_budget =
+        |requested: u64| bounded_phase(pre_release_deadline, Duration::from_secs(requested));
+    if customer_config_hold
+        && pre_release_deadline.is_some_and(|deadline| deadline <= Instant::now())
+    {
+        return Err(
+            "customer-config roll hold expired before config delivery started; the running workload was left unchanged"
+                .into(),
+        );
+    }
     pb.set_position(3);
     // The PaaS forwards the signed descriptor unchanged and preserves the
     // returned CAP deployment id, so the trusted expectation is valid only
@@ -507,7 +532,7 @@ async fn deploy_with_timings(
                     api,
                     &instance_name,
                     deployment,
-                    Duration::from_secs(args.ssh_timeout_seconds),
+                    phase_budget(args.ssh_timeout_seconds),
                     Duration::from_secs(3),
                     &pb,
                     timings,
@@ -558,7 +583,7 @@ async fn deploy_with_timings(
                     &instance_name,
                     &template.paas_managed_config_keys,
                     deployment,
-                    Duration::from_secs(args.ssh_timeout_seconds),
+                    phase_budget(args.ssh_timeout_seconds),
                     &pb,
                 ),
             )
@@ -577,13 +602,12 @@ async fn deploy_with_timings(
     let tee_url = template_config_endpoint_url(tee_url)?;
     let mut tee_resolve_ip = token.tee_resolve_ip;
     let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
-    // No aggregate deadline here: the slow-connect attempt cap inside the
-    // retry loop bounds the unreachable-endpoint case without reducing the
-    // 121-attempt coverage fast-failure rollouts rely on.
+    // A held redeploy must stop attestation before CAP expires the hold.
+    // Unheld deploys keep the unbounded retry loop.
     let mut tee = timings
         .run(
             DeployPhase::CustomerConfigAttestation,
-            attest_template_config_tee_with_retry(tee, None),
+            attest_template_config_tee_with_retry(tee, pre_release_deadline),
         )
         .await?;
     let mut tee_url = tee_url;
@@ -591,7 +615,7 @@ async fn deploy_with_timings(
     let mut config_token = token.token.clone();
     let config_pairs = debian_ssh_config_pairs(public_keys);
     pb.set_message(counted_progress("Customer config", 0, config_pairs.len()));
-    timings
+    let delivered = timings
         .run(
             DeployPhase::CustomerConfigWrite,
             deliver_template_config_with_retry(
@@ -600,7 +624,10 @@ async fn deploy_with_timings(
                     instance_name: &instance_name,
                     deployment,
                     password_mode: template.unlock_mode == "password",
-                    owner_wait_budget: Duration::from_secs(args.ssh_timeout_seconds),
+                    owner_wait_budget: bounded_phase(
+                        pre_release_deadline,
+                        Duration::from_secs(args.ssh_timeout_seconds),
+                    ),
                     progress: &pb,
                     timings_mode: args.timings,
                 },
@@ -611,7 +638,28 @@ async fn deploy_with_timings(
                 &config_pairs,
             ),
         )
-        .await?;
+        .await;
+    if let Err(error) = delivered {
+        let values_stored = error
+            .downcast_ref::<TemplateConfigStoredSyncFailed>()
+            .is_some();
+        if customer_config_hold && values_stored {
+            pb.set_message("Customer config stored; releasing workload roll...");
+            release_customer_config_roll_with_retry(api, &instance_name, &deployment_id).await?;
+            return Err(error);
+        }
+        if customer_config_hold {
+            return Err(format!(
+                "{error}\nThe workload roll was not released, so this deployment will not replace the running workload."
+            )
+            .into());
+        }
+        return Err(error);
+    }
+    if customer_config_hold {
+        pb.set_message("Customer config stored; releasing workload roll...");
+        release_customer_config_roll_with_retry(api, &instance_name, &deployment_id).await?;
+    }
     pb.set_message(counted_progress(
         "Customer config",
         config_pairs.len(),
@@ -857,14 +905,89 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+const CUSTOMER_CONFIG_ROLL_HOLD_MIN_SECONDS: u64 = 30;
+const CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS: u64 = 7_200;
+/// Work that happens after CAP arms the hold and before the release call:
+/// the PaaS config-token handoff (240s), untimed TEE attestation retries
+/// (121 attempts * 2s), and a release round trip. The two ssh-timeout waits
+/// cover managed-config delivery and the password-mode owner wait.
+const CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS: u64 = 240 + (121 * 2) + 60;
+
+/// Cover the managed-config wait and the customer-config delivery, each of
+/// which can consume the deploy's ssh timeout, plus the work that starts
+/// after CAP arms the hold. CAP clamps the same window.
+fn hold_deadline(deploy_started: Instant, hold_seconds: u32) -> Instant {
+    deploy_started + Duration::from_secs(u64::from(hold_seconds)) - Duration::from_secs(30)
+}
+
+/// Cap a pre-release wait at the hold deadline. Unheld deploys keep the
+/// requested budget.
+fn bounded_phase(deadline: Option<Instant>, requested: Duration) -> Duration {
+    match deadline {
+        Some(deadline) => requested.min(deadline.saturating_duration_since(Instant::now())),
+        None => requested,
+    }
+}
+
+fn release_outcome_is_unknown(error: &ApiError) -> bool {
+    match error {
+        ApiError::Http(error) => error.is_timeout() || error.is_connect() || error.is_request(),
+        ApiError::Api { status, .. } => *status >= 500,
+        ApiError::NotAuthenticated => false,
+    }
+}
+
+async fn release_customer_config_roll_with_retry(
+    api: &ApiClient,
+    instance_name: &str,
+    deployment_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut attempt = 0u8;
+    loop {
+        attempt += 1;
+        match api
+            .release_template_customer_config_roll(instance_name, deployment_id)
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if release_outcome_is_unknown(&error) && attempt < 3 => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) if release_outcome_is_unknown(&error) => {
+                return Err(format!(
+                    "customer config was stored, but the roll-release result is unknown after {attempt} attempts: {error}. The roll may already be released; check `enclava status --app {instance_name}` before assuming the running workload is unchanged."
+                )
+                .into());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "customer config was stored, but the workload roll was not released: {error}. The running workload was left unchanged."
+                )
+                .into());
+            }
+        }
+    }
+}
+
+fn customer_config_roll_hold_seconds(ssh_timeout_seconds: u64) -> u32 {
+    let budget = ssh_timeout_seconds
+        .saturating_mul(2)
+        .saturating_add(CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS)
+        .clamp(
+            CUSTOMER_CONFIG_ROLL_HOLD_MIN_SECONDS,
+            CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS,
+        );
+    u32::try_from(budget).unwrap_or(u32::MAX)
+}
+
 async fn ensure_template_app(
     api: &ApiClient,
     template: &HostedTemplate,
     instance_name: &str,
     bootstrap_pubkey_hash: Option<&str>,
-) -> Result<AppResponse, Box<dyn std::error::Error>> {
+) -> Result<(AppResponse, bool), Box<dyn std::error::Error>> {
     match api.get_app(instance_name).await {
-        Ok(app) => return Ok(app),
+        Ok(app) => return Ok((app, true)),
         Err(ApiError::Api { status: 404, .. }) => {}
         Err(error) => return Err(error.into()),
     }
@@ -877,8 +1000,10 @@ async fn ensure_template_app(
         )?)
         .await
     {
-        Ok(app) => Ok(app),
-        Err(ApiError::Api { status: 409, .. }) => Ok(api.get_app(instance_name).await?),
+        Ok(app) => Ok((app, false)),
+        // A concurrent create won. The app already exists, so a following
+        // deploy is a redeploy and may hold the roll.
+        Err(ApiError::Api { status: 409, .. }) => Ok((api.get_app(instance_name).await?, true)),
         Err(error) => Err(error.into()),
     }
 }
@@ -1479,11 +1604,11 @@ async fn deliver_template_config_with_retry(
         {
             // Distinct failure class from an undelivered value: the value is
             // in the TEE store; only the platform's key metadata lags.
-            return Err(format!(
-                "config value delivered to the TEE store, but the platform key sync failed \\
-                 for {key}: {error}. The platform may not report this key as managed until a \\
+            return Err(TemplateConfigStoredSyncFailed(format!(
+                "config value delivered to the TEE store, but the platform key sync failed \
+                 for {key}: {error}. The platform may not report this key as managed until a \
                  later sync succeeds."
-            )
+            ))
             .into());
         }
     }
@@ -1496,6 +1621,17 @@ async fn deliver_template_config_with_retry(
 /// The unlock prescription is reserved for an owner-blocked (persistent
 /// password-mode lock) failure; other causes get the plain re-delivery path
 /// so the reported error stays the actionable signal.
+#[derive(Debug)]
+struct TemplateConfigStoredSyncFailed(String);
+
+impl std::fmt::Display for TemplateConfigStoredSyncFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TemplateConfigStoredSyncFailed {}
+
 fn undelivered_template_config_error(
     instance_name: &str,
     undelivered: &[(&'static str, String)],
@@ -4416,6 +4552,7 @@ mod tests {
             cap: serde_json::json!({
                 "app_domain": "shell.enclava.dev"
             }),
+            customer_config_hold: false,
         }
     }
 
@@ -4520,6 +4657,12 @@ mod tests {
         let config = body
             .find("deliver_template_config_with_retry")
             .expect("template deploy writes customer config");
+        let release = body
+            .find("release_customer_config_roll_with_retry")
+            .expect("template redeploy releases the workload roll after customer config");
+        let ssh_wait = body
+            .find("wait_for_paas_ssh_command")
+            .expect("template deploy waits for the stable SSH command");
 
         assert!(
             !body.contains("enable_steady_tick"),
@@ -4534,9 +4677,18 @@ mod tests {
                 && wait_claim < claim
                 && claim < managed_config
                 && managed_config < wait_managed_config
-                && wait_managed_config < config,
-            "template deploy must prepare tenant log encryption before deployment, then make the config store writable before writing customer config"
+                && wait_managed_config < config
+                && config < release
+                && release < ssh_wait,
+            "template deploy must prepare tenant log encryption before deployment, write customer config before releasing a held roll, and only then wait for SSH"
         );
+    }
+
+    #[test]
+    fn customer_config_roll_hold_covers_both_wait_budgets() {
+        assert_eq!(customer_config_roll_hold_seconds(1_800), 4_142);
+        assert_eq!(customer_config_roll_hold_seconds(10), 562);
+        assert_eq!(customer_config_roll_hold_seconds(10_000), 7_200);
     }
 
     #[test]
@@ -6148,15 +6300,18 @@ mod tests {
         // The owner-wait is caller-supplied deploy metadata (unlock mode + the
         // shared ssh-timeout budget), never a lookup from inside the wait,
         // and the delivery loop must consult it on both retry arms.
-        let source = include_str!("template.rs");
+        // Windows checkouts carry CRLF; the multi-line needle below embeds LF.
+        let source = include_str!("template.rs").replace("\r\n", "\n");
 
         assert!(
             source.contains("password_mode: template.unlock_mode == \"password\""),
             "the deploy call site must pass the detected unlock mode"
         );
         assert!(
-            source.contains("owner_wait_budget: Duration::from_secs(args.ssh_timeout_seconds)"),
-            "the owner-wait budget must ride the shared ssh-timeout knob"
+            source.contains(
+                "owner_wait_budget: bounded_phase(\n                        pre_release_deadline,\n                        Duration::from_secs(args.ssh_timeout_seconds),"
+            ),
+            "the owner-wait budget must ride the shared ssh-timeout knob and the roll-hold deadline"
         );
 
         let fn_start = source.find("async fn set_key").expect("set_key exists");

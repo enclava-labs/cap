@@ -541,6 +541,13 @@ async fn load_signed_policy_candidates(
              AND deployment.app_id = job.app_id
              AND deployment.org_id = job.org_id
             JOIN apps AS app ON app.id = job.app_id
+            -- An unreleased customer-config hold has not replaced the running
+            -- workload. Leaving it as the newest operation would drop that
+            -- workload's signed policy, including after the hold expires failed.
+            WHERE NOT (
+                job.customer_config_hold
+                AND job.customer_config_released_at IS NULL
+            )
         ),
         eligible_current_job_operations AS (
             SELECT *

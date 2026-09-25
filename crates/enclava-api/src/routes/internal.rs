@@ -4561,6 +4561,7 @@ pub async fn deploy_paas_app(
             signed_policy_artifact: body.signed_policy_artifact,
             workload_security_profile: body.workload_security_profile,
             log_encryption: body.log_encryption,
+            customer_config_roll_hold_seconds: None,
         };
         let (status, Json(response)) = crate::routes::deployments::deploy(
             auth,
@@ -5270,6 +5271,41 @@ pub async fn get_paas_generic_deployment(
         crate::routes::deployments::get_generic_deployment(auth, State(state), Path(deployment_id))
             .await?;
     Ok(Json(to_value(response)?))
+}
+
+pub async fn release_paas_customer_config_roll(
+    _auth: InternalAuth,
+    State(state): State<AppState>,
+    Path((paas_org_id, deployment_id)): Path<(String, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_external_id(&paas_org_id, "paas_org_id")?;
+    let auth = internal_actor_context(&state, &paas_org_id, &headers).await?;
+    crate::auth::scopes::require_app_write(&auth)?;
+    match crate::deployment_jobs::release_customer_config_hold(
+        &state.db,
+        auth.org_id,
+        deployment_id,
+    )
+    .await
+    .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "database error"))?
+    {
+        crate::deployment_jobs::CustomerConfigHoldRelease::Released => {
+            Ok(Json(serde_json::json!({"status": "released"})))
+        }
+        crate::deployment_jobs::CustomerConfigHoldRelease::AlreadyReleased => {
+            Ok(Json(serde_json::json!({"status": "already_released"})))
+        }
+        crate::deployment_jobs::CustomerConfigHoldRelease::NotHeld => {
+            Ok(Json(serde_json::json!({"status": "not_held"})))
+        }
+        crate::deployment_jobs::CustomerConfigHoldRelease::NotFound => {
+            Err(json_error(StatusCode::NOT_FOUND, "deployment not found"))
+        }
+        crate::deployment_jobs::CustomerConfigHoldRelease::Unavailable(message) => {
+            Err(json_error(StatusCode::CONFLICT, message))
+        }
+    }
 }
 
 pub async fn issue_paas_generic_config_token(

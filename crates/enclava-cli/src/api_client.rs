@@ -444,6 +444,26 @@ impl ApiClient {
         read_bounded_json(resp).await
     }
 
+    pub async fn release_template_customer_config_roll(
+        &self,
+        app_name: &str,
+        deployment_id: &str,
+    ) -> Result<(), ApiError> {
+        let app_name = path_segment(app_name);
+        let deployment_id = path_segment(deployment_id);
+        let resp = self
+            .http
+            .post(self.url(&format!(
+                "/apps/{app_name}/deployments/{deployment_id}/customer-config-released"
+            )))
+            .headers(self.auth_headers()?)
+            .json(&serde_json::json!({}))
+            .send()
+            .await?;
+        self.check_response(resp).await?;
+        Ok(())
+    }
+
     pub async fn deliver_managed_template_config(
         &self,
         app_name: &str,
@@ -935,7 +955,7 @@ fn path_segment(value: &str) -> String {
 }
 
 fn template_instance_idempotency_key(req: &CreateTemplateInstanceRequest) -> String {
-    let body = serde_json::to_vec(&serde_json::json!({
+    let mut value = serde_json::json!({
         "template_slug": req.template_slug,
         "instance_name": req.instance_name,
         "config": req.config,
@@ -943,17 +963,23 @@ fn template_instance_idempotency_key(req: &CreateTemplateInstanceRequest) -> Str
         "customer_descriptor_blob_sha256": optional_sha256_hex(req.customer_descriptor_blob.as_deref()),
         "org_keyring_blob_sha256": optional_sha256_hex(req.org_keyring_blob.as_deref()),
         "signed_policy_artifact_sha256": optional_sha256_hex(req.signed_policy_artifact.as_deref()),
-    }))
-    .unwrap_or_else(|_| {
+    });
+    if let Some(seconds) = req.customer_config_roll_hold_seconds {
+        value["customer_config_roll_hold_seconds"] = serde_json::json!(seconds);
+    }
+    let body = serde_json::to_vec(&value).unwrap_or_else(|_| {
         format!(
-            "{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}",
             req.template_slug,
             req.instance_name,
             req.config,
             req.bootstrap_pubkey_hash.as_deref().unwrap_or(""),
             optional_sha256_hex(req.customer_descriptor_blob.as_deref()).unwrap_or_default(),
             optional_sha256_hex(req.org_keyring_blob.as_deref()).unwrap_or_default(),
-            optional_sha256_hex(req.signed_policy_artifact.as_deref()).unwrap_or_default()
+            optional_sha256_hex(req.signed_policy_artifact.as_deref()).unwrap_or_default(),
+            req.customer_config_roll_hold_seconds
+                .map(|seconds| seconds.to_string())
+                .unwrap_or_default()
         )
         .into_bytes()
     });
@@ -985,6 +1011,7 @@ mod tests {
             customer_descriptor_blob: None,
             org_keyring_blob: None,
             signed_policy_artifact: None,
+            customer_config_roll_hold_seconds: None,
         }
     }
 
@@ -1020,6 +1047,7 @@ mod tests {
             customer_descriptor_blob: first.customer_descriptor_blob.clone(),
             org_keyring_blob: first.org_keyring_blob.clone(),
             signed_policy_artifact: first.signed_policy_artifact.clone(),
+            customer_config_roll_hold_seconds: first.customer_config_roll_hold_seconds,
         };
         let mut changed_descriptor = CreateTemplateInstanceRequest {
             template_slug: first.template_slug.clone(),
@@ -1029,6 +1057,7 @@ mod tests {
             customer_descriptor_blob: first.customer_descriptor_blob.clone(),
             org_keyring_blob: first.org_keyring_blob.clone(),
             signed_policy_artifact: first.signed_policy_artifact.clone(),
+            customer_config_roll_hold_seconds: first.customer_config_roll_hold_seconds,
         };
         changed_descriptor.customer_descriptor_blob = Some("descriptor-b".to_string());
 
