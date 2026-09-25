@@ -22,9 +22,9 @@ use uuid::Uuid;
 use crate::models::App;
 
 const DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS: u64 = 120;
-const ORG_SIGNING_AUTHORITY_LANE_DOMAIN: i32 = 0x5349_474e;
+pub(crate) const ORG_SIGNING_AUTHORITY_LANE_DOMAIN: i32 = 0x5349_474e;
 
-fn org_signing_advisory_key(id: Uuid) -> i32 {
+pub(crate) fn org_signing_advisory_key(id: Uuid) -> i32 {
     let bytes = id.as_bytes();
     let a = u32::from_be_bytes(bytes[0..4].try_into().expect("UUID word"));
     let b = u32::from_be_bytes(bytes[4..8].try_into().expect("UUID word"));
@@ -47,6 +47,28 @@ pub async fn lock_org_signing_authority_lane(
         .execute(&mut **tx)
         .await?;
     Ok(())
+}
+
+/// Acquire the signing-authority lane and return the authoritative
+/// "now" observed strictly after the lock is held.
+///
+/// The lane is a blocking advisory lock: callers can queue behind other
+/// signing-authority writers (which perform signing-service requests while
+/// holding it) for longer than any freshness window. A reference time
+/// captured before locking therefore describes the past, not the moment
+/// the caller's own checks run. This reads clock_timestamp() from the
+/// already-locked transaction so freshness bounds use the post-acquisition
+/// instant on the same clock that witnesses org_keyrings.created_at
+/// (migration 0051).
+pub async fn lock_org_signing_authority_lane_now(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: Uuid,
+) -> Result<DateTime<Utc>, sqlx::Error> {
+    lock_org_signing_authority_lane(tx, org_id).await?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(now)
 }
 
 #[derive(Debug, thiserror::Error)]
