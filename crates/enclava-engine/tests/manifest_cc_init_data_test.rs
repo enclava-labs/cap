@@ -206,10 +206,10 @@ fn data_claims_include_required_rego_descriptor_anchors() {
         "/run/enclava-unlock/unlock-attempts"
     );
     assert_eq!(data["state_root"].as_str().unwrap(), "/state");
-    assert_eq!(data["app_uid"].as_integer(), Some(10001));
-    assert_eq!(data["app_gid"].as_integer(), Some(10001));
-    assert_eq!(data["caddy_uid"].as_integer(), Some(10002));
-    assert_eq!(data["caddy_gid"].as_integer(), Some(10002));
+    assert_eq!(data["app_uid"].as_str(), Some("10001"));
+    assert_eq!(data["app_gid"].as_str(), Some("10001"));
+    assert_eq!(data["caddy_uid"].as_str(), Some("10002"));
+    assert_eq!(data["caddy_gid"].as_str(), Some("10002"));
     assert!(data.get("managed_config_gid").is_none());
     assert!(data.get("managed_config_dir_mode").is_none());
     assert_eq!(
@@ -270,10 +270,10 @@ fn data_claims_bind_root_workload_identity_and_trustee_flag() {
     let value: toml::Value = toml::from_str(&toml).unwrap();
     let data = value.get("data").and_then(toml::Value::as_table).unwrap();
 
-    assert_eq!(data["app_uid"].as_integer(), Some(0));
-    assert_eq!(data["app_gid"].as_integer(), Some(0));
-    assert_eq!(data["managed_config_gid"].as_integer(), Some(0));
-    assert_eq!(data["managed_config_dir_mode"].as_integer(), Some(448));
+    assert_eq!(data["app_uid"].as_str(), Some("0"));
+    assert_eq!(data["app_gid"].as_str(), Some("0"));
+    assert_eq!(data["managed_config_gid"].as_str(), Some("0"));
+    assert_eq!(data["managed_config_dir_mode"].as_str(), Some("448"));
     assert_eq!(
         data["trustee_policy_read_available"].as_str().unwrap(),
         "true"
