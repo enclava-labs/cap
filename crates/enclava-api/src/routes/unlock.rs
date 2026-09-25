@@ -340,6 +340,7 @@ struct UnlockModeCommitRequest<'a> {
     signed_storage_paths: Option<&'a Vec<String>>,
     signing_artifacts: Option<&'a crate::signing_service::DeploymentSigningArtifacts>,
     signed_policy_artifact: Option<&'a crate::signing_service::SignedPolicyArtifact>,
+    descriptor_platform_binding: &'a crate::signing_service::DescriptorPlatformBinding,
     log_encryption: Option<&'a LogEncryptionConfig>,
     api_signing_pubkey: &'a str,
     api_url: &'a str,
@@ -546,6 +547,7 @@ async fn commit_unlock_mode_transition(
                 &signed_locked_app,
                 image_digest,
                 request.api_signing_pubkey,
+                request.descriptor_platform_binding,
             )
             .map_err(crate::routes::deployments::signing_error_response)?;
         artifacts
@@ -1139,7 +1141,16 @@ pub async fn update_unlock_mode(
             })),
         ))?;
         artifacts
-            .validate_deployment_inputs(&signed_app, image_digest_ref, &api_signing_pubkey)
+            .validate_deployment_inputs(
+                &signed_app,
+                image_digest_ref,
+                &api_signing_pubkey,
+                &crate::signing_service::descriptor_platform_binding_for(
+                    &state,
+                    &observed_resources.memory_limit,
+                )
+                .map_err(crate::routes::deployments::signing_error_response)?,
+            )
             .map_err(crate::routes::deployments::signing_error_response)?;
         let workload_command = artifacts.descriptor.oci_runtime_spec.args.clone();
         signed_workload_command = crate::deploy::serialize_workload_command(&workload_command)
@@ -1205,6 +1216,11 @@ pub async fn update_unlock_mode(
         signed_policy_artifact = Some(signed);
     }
 
+    let descriptor_platform_binding = crate::signing_service::descriptor_platform_binding_for(
+        &state,
+        &observed_resources.memory_limit,
+    )
+    .map_err(crate::routes::deployments::signing_error_response)?;
     let receipt_json = serde_json::to_value(receipt).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1231,6 +1247,7 @@ pub async fn update_unlock_mode(
             signed_storage_paths: signed_storage_paths.as_ref(),
             signing_artifacts: signing_artifacts.as_ref(),
             signed_policy_artifact: signed_policy_artifact.as_ref(),
+            descriptor_platform_binding: &descriptor_platform_binding,
             log_encryption: log_encryption.as_ref(),
             api_signing_pubkey: &api_signing_pubkey,
             api_url: &state.api_url,
@@ -1260,6 +1277,11 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
+
+    /// Tests run without a platform release or attestation sidecar config, so
+    /// the descriptor platform binding enforces only the canonical KBS path.
+    static EMPTY_PLATFORM_BINDING: crate::signing_service::DescriptorPlatformBinding =
+        crate::signing_service::DescriptorPlatformBinding::EMPTY;
 
     use super::{
         ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode, SignedReceiptResponse,
@@ -1641,7 +1663,10 @@ mod tests {
             "api_signing_pubkey": api_signing_pubkey,
             "expected_firmware_measurement": "03".repeat(32),
             "expected_runtime_class": "kata-qemu-snp",
-            "kbs_resource_path": format!("default/{}-owner", app.name),
+            "kbs_resource_path": format!(
+                "default/{}-{}-owner/seed-encrypted",
+                app.namespace, app.name
+            ),
             "unlock_mode": "auto",
             "policy_template_id": "enclava-kbs-policy-v1",
             "policy_template_sha256": "04".repeat(32),
@@ -1918,6 +1943,7 @@ mod tests {
                 signed_storage_paths: Some(&new_storage_paths),
                 signing_artifacts: None,
                 signed_policy_artifact: None,
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
                 log_encryption: None,
                 api_signing_pubkey: "unused-without-signing-artifacts",
                 api_url: "https://api.example.test",
@@ -2054,6 +2080,7 @@ mod tests {
                 signed_storage_paths: None,
                 signing_artifacts: None,
                 signed_policy_artifact: None,
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
                 log_encryption: None,
                 api_signing_pubkey: "unused-without-signing-artifacts",
                 api_url: "https://api.example.test",
@@ -2172,6 +2199,7 @@ mod tests {
                 signed_storage_paths: None,
                 signing_artifacts: None,
                 signed_policy_artifact: None,
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
                 log_encryption: None,
                 api_signing_pubkey: "unused-without-signing-artifacts",
                 api_url: "https://api.example.test",
@@ -2294,6 +2322,7 @@ mod tests {
                 signed_storage_paths: None,
                 signing_artifacts: Some(&artifacts),
                 signed_policy_artifact: Some(&signed),
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
                 log_encryption: None,
                 api_signing_pubkey,
                 api_url: "https://api.example.test",
@@ -2408,6 +2437,7 @@ mod tests {
                 signed_storage_paths: None,
                 signing_artifacts: None,
                 signed_policy_artifact: None,
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
                 log_encryption: None,
                 api_signing_pubkey: "unused-without-signing-artifacts",
                 api_url: "https://api.example.test",
@@ -2436,6 +2466,7 @@ mod tests {
                 signed_storage_paths: None,
                 signing_artifacts: None,
                 signed_policy_artifact: None,
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
                 log_encryption: None,
                 api_signing_pubkey: "unused-without-signing-artifacts",
                 api_url: "https://api.example.test",
@@ -2589,6 +2620,7 @@ mod tests {
                 signed_storage_paths: None,
                 signing_artifacts: None,
                 signed_policy_artifact: None,
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
                 log_encryption: None,
                 api_signing_pubkey: "unused-without-signing-artifacts",
                 api_url: "https://api.example.test",
@@ -2635,6 +2667,7 @@ mod tests {
                 signed_storage_paths: None,
                 signing_artifacts: None,
                 signed_policy_artifact: None,
+                descriptor_platform_binding: &EMPTY_PLATFORM_BINDING,
                 log_encryption: None,
                 api_signing_pubkey: "unused-without-signing-artifacts",
                 api_url: "https://api.example.test",

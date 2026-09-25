@@ -20,9 +20,103 @@ use sqlx::{Executor, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::models::App;
+use crate::platform_release::PlatformRelease;
+use enclava_engine::manifest::shape::runtime_class_for;
+use enclava_engine::types::AttestationConfig;
+
+/// Platform-authoritative values a signed descriptor must agree with.
+///
+/// `validate_deployment_inputs` binds the descriptor to the app row; this
+/// binding pins the platform-derived descriptor fields to what this API
+/// instance actually runs: the loaded signed platform release (version,
+/// policy template, firmware measurement expectation, default runtime class)
+/// and the attestation sidecar digests (proxy / caddy ingress). `None` fields
+/// have no configured source of truth in this deployment mode and are
+/// skipped; every field is cross-checked whenever its source of truth exists.
+#[derive(Debug, Clone, Default)]
+pub struct DescriptorPlatformBinding {
+    pub platform_release_version: Option<String>,
+    pub policy_template_id: Option<String>,
+    pub policy_template_sha256: Option<[u8; 32]>,
+    pub expected_firmware_measurement: Option<[u8; 32]>,
+    pub expected_runtime_class: Option<String>,
+    pub attestation_proxy_digest: Option<String>,
+    pub caddy_digest: Option<String>,
+}
+
+impl DescriptorPlatformBinding {
+    /// A binding with no configured sources of truth: every platform-field
+    /// cross-check is skipped except the canonical `kbs_resource_path` shape,
+    /// which is always derived from the app row's namespace/name (never the
+    /// descriptor's own copies of those fields).
+    pub const EMPTY: Self = Self {
+        platform_release_version: None,
+        policy_template_id: None,
+        policy_template_sha256: None,
+        expected_firmware_measurement: None,
+        expected_runtime_class: None,
+        attestation_proxy_digest: None,
+        caddy_digest: None,
+    };
+
+    /// Derive the binding from the API runtime: the verified platform release
+    /// (when enabled) plus the attestation sidecar configuration. The expected
+    /// runtime class is resolved from the app's memory limit the same way the
+    /// manifest renderer resolves it for the pod.
+    pub fn from_runtime(
+        release: Option<&PlatformRelease>,
+        attestation: Option<&AttestationConfig>,
+        memory_limit: &str,
+    ) -> Result<Self, SigningServiceError> {
+        let decode = |field: &'static str, value: Result<[u8; 32], _>| {
+            value.map_err(|err| SigningServiceError::Blob(format!("{field}: {err}")))
+        };
+        Ok(Self {
+            platform_release_version: release
+                .map(|release| release.platform_release_version.clone()),
+            policy_template_id: release.map(|release| release.policy_template_id.clone()),
+            policy_template_sha256: match release {
+                Some(release) => Some(decode(
+                    "platform_release.policy_template_sha256",
+                    release.policy_template_sha256_bytes(),
+                )?),
+                None => None,
+            },
+            expected_firmware_measurement: match release {
+                Some(release) => Some(decode(
+                    "platform_release.expected_firmware_measurement",
+                    release.expected_firmware_measurement_bytes(),
+                )?),
+                None => None,
+            },
+            expected_runtime_class: release
+                .map(|release| runtime_class_for(memory_limit, &release.expected_runtime_class)),
+            attestation_proxy_digest: attestation
+                .map(|config| config.proxy_image.digest().to_string()),
+            caddy_digest: attestation.map(|config| config.caddy_image.digest().to_string()),
+        })
+    }
+}
 
 const DEFAULT_SIGNING_SERVICE_TIMEOUT_SECONDS: u64 = 120;
 const ORG_SIGNING_AUTHORITY_LANE_DOMAIN: i32 = 0x5349_474e;
+
+/// Build the platform binding for descriptor validation from the API runtime
+/// state and the app's persisted memory limit (which selects the small vs
+/// standard runtime class exactly like the manifest renderer).
+pub fn descriptor_platform_binding_for(
+    state: &crate::state::AppState,
+    memory_limit: &str,
+) -> Result<DescriptorPlatformBinding, SigningServiceError> {
+    DescriptorPlatformBinding::from_runtime(
+        state
+            .platform_release_envelope
+            .as_ref()
+            .map(|envelope| &envelope.payload),
+        state.attestation.as_ref(),
+        memory_limit,
+    )
+}
 
 fn org_signing_advisory_key(id: Uuid) -> i32 {
     let bytes = id.as_bytes();
@@ -413,6 +507,7 @@ impl DeploymentSigningArtifacts {
         app: &App,
         image_digest: &str,
         api_signing_pubkey: &str,
+        platform: &DescriptorPlatformBinding,
     ) -> Result<(), SigningServiceError> {
         self.validate_workload_runtime_spec()?;
         if self.descriptor.org_id != app.org_id {
@@ -437,6 +532,10 @@ impl DeploymentSigningArtifacts {
             != app.tee_domain.clone().unwrap_or_else(|| app.domain.clone())
         {
             return Err(SigningServiceError::Mismatch("tee_domain".into()));
+        }
+        let app_custom_domains: Vec<&str> = app.custom_domain.as_deref().into_iter().collect();
+        if self.descriptor.custom_domains != app_custom_domains {
+            return Err(SigningServiceError::Mismatch("custom_domains".into()));
         }
         if self.descriptor.identity_hash
             != decode_hex32(
@@ -478,6 +577,68 @@ impl DeploymentSigningArtifacts {
         }
         if self.org_keyring.org_id != app.org_id {
             return Err(SigningServiceError::Mismatch("org_keyring.org_id".into()));
+        }
+        self.validate_platform_binding(app, platform)?;
+        Ok(())
+    }
+
+    /// Cross-check the platform-derived descriptor fields against the values
+    /// this API instance actually runs (issue #129): the descriptor's
+    /// customer-signed platform fields must match the loaded signed platform
+    /// release and the configured attestation sidecar digests, and the KBS
+    /// owner resource path must match the canonical path derived from the
+    /// app row itself so a descriptor cannot self-authorize access to
+    /// another app's owner resources.
+    fn validate_platform_binding(
+        &self,
+        app: &App,
+        platform: &DescriptorPlatformBinding,
+    ) -> Result<(), SigningServiceError> {
+        let mismatch = |field: &'static str| SigningServiceError::Mismatch(field.into());
+        if let Some(expected) = platform.platform_release_version.as_deref()
+            && self.descriptor.platform_release_version != expected
+        {
+            return Err(mismatch("platform_release_version"));
+        }
+        if let Some(expected) = platform.policy_template_id.as_deref()
+            && self.descriptor.policy_template_id != expected
+        {
+            return Err(mismatch("policy_template_id"));
+        }
+        if let Some(expected) = platform.policy_template_sha256
+            && self.descriptor.policy_template_sha256 != expected
+        {
+            return Err(mismatch("policy_template_sha256"));
+        }
+        if let Some(expected) = platform.expected_firmware_measurement
+            && self.descriptor.expected_firmware_measurement.as_bytes() != expected.as_slice()
+        {
+            return Err(mismatch("expected_firmware_measurement"));
+        }
+        if let Some(expected) = platform.expected_runtime_class.as_deref()
+            && self.descriptor.expected_runtime_class != expected
+        {
+            return Err(mismatch("expected_runtime_class"));
+        }
+        if let Some(expected) = platform.attestation_proxy_digest.as_deref()
+            && self.descriptor.sidecars.attestation_proxy_digest != expected
+        {
+            return Err(mismatch("sidecars.attestation_proxy_digest"));
+        }
+        if let Some(expected) = platform.caddy_digest.as_deref()
+            && self.descriptor.sidecars.caddy_digest != expected
+        {
+            return Err(mismatch("sidecars.caddy_digest"));
+        }
+        // Derived from the app row, not the descriptor's own copy of the
+        // same fields: this stays a cross-check even if the descriptor
+        // equality checks above are ever relaxed or reordered.
+        let expected_kbs_resource_path = format!(
+            "default/{}-{}-owner/seed-encrypted",
+            app.namespace, app.name
+        );
+        if self.descriptor.kbs_resource_path != expected_kbs_resource_path {
+            return Err(mismatch("kbs_resource_path"));
         }
         Ok(())
     }
@@ -1205,9 +1366,14 @@ impl LoadedWorkloadArtifacts {
         image_digest: &str,
         api_signing_pubkey: &str,
         signing_service_pubkey_hex: &str,
+        platform: &DescriptorPlatformBinding,
     ) -> Result<(), SigningServiceError> {
-        self.signing_artifacts
-            .validate_deployment_inputs(app, image_digest, api_signing_pubkey)?;
+        self.signing_artifacts.validate_deployment_inputs(
+            app,
+            image_digest,
+            api_signing_pubkey,
+            platform,
+        )?;
         self.signing_artifacts
             .validate_customer_authority(pool)
             .await?;

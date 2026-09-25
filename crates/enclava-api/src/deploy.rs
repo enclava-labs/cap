@@ -1443,7 +1443,8 @@ mod tests {
             independent_verification: true,
             expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
-            kbs_resource_path: "default/cap-demo-org-customer-app-owner".to_string(),
+            kbs_resource_path: "default/cap-demo-org-customer-app-customer-app-owner/seed-encrypted"
+                .to_string(),
             unlock_mode: "password".to_string(),
             policy_template_id: "enclava-kbs-policy-v1".to_string(),
             policy_template_sha256: [4; 32],

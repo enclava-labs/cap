@@ -302,7 +302,7 @@ fn deployment_descriptor_for_security_profile_tests()
         independent_verification: true,
         expected_firmware_measurement: [3; 32].into(),
         expected_runtime_class: "kata-qemu-snp".to_string(),
-        kbs_resource_path: "default/cap-org-app-tls-owner".to_string(),
+        kbs_resource_path: "default/cap-org-app-app-owner/seed-encrypted".to_string(),
         unlock_mode: "password".to_string(),
         policy_template_id: "kbs-release-policy-v3".to_string(),
         policy_template_sha256: [4; 32],

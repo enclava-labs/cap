@@ -2132,6 +2132,11 @@ async fn validate_apply_artifacts(
             primary_image_digest,
             &payload.api_signing_pubkey,
             signing_service_pubkey_hex,
+            &crate::signing_service::descriptor_platform_binding_for(
+                state,
+                &payload.snapshot.resources.memory_limit,
+            )
+            .map_err(|_| DeploymentJobError::Artifact)?,
         )
         .await
         .map_err(|_| DeploymentJobError::Artifact)?;
@@ -3385,7 +3390,10 @@ mod tests {
             independent_verification: true,
             expected_firmware_measurement: [3; 32].into(),
             expected_runtime_class: "kata-qemu-snp".to_string(),
-            kbs_resource_path: format!("default/{}-owner", payload.app.namespace),
+            kbs_resource_path: format!(
+                "default/{}-{}-owner/seed-encrypted",
+                payload.app.namespace, payload.app.name
+            ),
             unlock_mode: "auto".to_string(),
             policy_template_id: "enclava-kbs-policy-v1".to_string(),
             policy_template_sha256: [4; 32],
