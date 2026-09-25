@@ -1,11 +1,6 @@
 # Enclava CAP
 
-### This is still under heavy development and not advisable to run in production 
-
-Enclava CAP is the open-source control plane core for running OCI images as
-confidential workloads on Kubernetes. It targets Kata confidential containers
-with AMD SEV-SNP and combines a user CLI, an API service, Kubernetes manifest
-generation, and an in-TEE init sidecar.
+Enclava CAP is the open-source control plane core for running OCI images as confidential workloads on Kubernetes. It targets Kata confidential containers with AMD SEV-SNP and combines a user CLI, an API service, Kubernetes manifest generation, and an in-TEE init sidecar.
 
 
 ## What Is Included
@@ -23,8 +18,7 @@ generation, and an in-TEE init sidecar.
 
 ## How It Works
 
-CAP deploys immutable OCI images by digest and validates the deployment before
-it reaches Kubernetes:
+CAP deploys immutable OCI images by digest and validates the deployment before it reaches Kubernetes:
 
 - the CLI creates or reads local app config and signs a deployment descriptor;
 - CAP validates the descriptor, image digest, signer identity, org keyring, and
