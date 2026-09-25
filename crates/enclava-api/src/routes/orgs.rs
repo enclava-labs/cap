@@ -1142,11 +1142,30 @@ pub async fn invite_member(
     .await
     .map_err(|_| db_error())?;
 
-    let (invitee_id,) = invitee.ok_or((
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error": "user not found"})),
-    ))?;
-
+    // Anti-enumeration (issue #121): a bad role fails identically for
+    // known and unknown emails (the lookup result is only consumed after
+    // parse_role), and the unknown-invitee path performs the same reads
+    // up to the membership SELECT (lane locks, caller role read, invitee
+    // membership read). It must not return a success-shaped response: a
+    // fake 200 would both lie to the caller (CLI prints "Invited ...")
+    // and re-open the oracle via GET /orgs/{name}/members, where a real
+    // invite adds a visible row and this one would not.
+    //
+    // RESIDUAL RISKS (accepted, like the signup 201-vs-400 split; fully
+    // closing them needs a pending-invite model — invite token emailed
+    // to the address, membership only on accept — a product change with
+    // a new table, out of scope for this fix):
+    // - status split: a successful invite returns 200 while an unknown
+    //   email returns the generic 403 "invite not permitted" below;
+    // - body split for admin callers: an admin inviting role "member"
+    //   gets "invite not permitted" for an unknown email, but the
+    //   owner-gate 403 ("only owners can grant, change, or remove admin
+    //   and owner roles") when the target is an existing admin/owner;
+    // - sole-owner demotion of a KNOWN owner can return 400 ("organization
+    //   must retain at least one owner"), which an unknown email never
+    //   triggers;
+    // - timing is not uniform: the unknown path ends in a rollback while
+    //   a real invite INSERTs and commits.
     let requested_role = scopes::parse_role(body.role.as_deref().unwrap_or("member"))?;
 
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
@@ -1160,6 +1179,11 @@ pub async fn invite_member(
         scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_admin_role(current_caller_role)?;
 
+    // Both paths read the membership row for the invitee id (the nil UUID
+    // for an unknown email matches no row), so the reads up to this point
+    // are the same; a real invite additionally INSERTs and commits while
+    // the unknown path rolls back (see the residual-risk note above).
+    let invitee_id = invitee.map(|(id,)| id).unwrap_or_else(Uuid::nil);
     let existing_role: Option<Role> = sqlx::query_scalar(
         "SELECT role as \"role: _\"
          FROM memberships
@@ -1182,6 +1206,16 @@ pub async fn invite_member(
     if existing_role == Some(Role::Owner) && requested_role != Role::Owner {
         scopes::ensure_last_owner_invariant(&mut tx, org_id, invitee_id, Some(requested_role))
             .await?;
+    }
+
+    // Unknown email: generic 403 (see residual-risk note above for what
+    // this still reveals).
+    if invitee.is_none() {
+        tx.rollback().await.map_err(|_| db_error())?;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "invite not permitted"})),
+        ));
     }
 
     sqlx::query(

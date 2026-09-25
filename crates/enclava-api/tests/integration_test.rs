@@ -1024,6 +1024,202 @@ async fn device_login_poll_and_approve_are_not_in_start_rate_limit_bucket() {
 }
 
 #[tokio::test]
+async fn email_auth_enumeration_hardening() {
+    // Regression test for issue #121. Login is fully closed: the
+    // unknown-email path runs the same Argon2 decoy work and returns the
+    // exact same 401 body as a wrong password. Signup and org invite are
+    // PARTIALLY hardened: their duplicate/unknown paths no longer state
+    // the reason ("email already registered" / "user not found"), but the
+    // HTTP status still differs (201-vs-400, 200-vs-403) — an accepted
+    // residual documented in the code; fully closing them needs
+    // out-of-band email verification / a pending-invite model.
+    let (state, _pool) = setup_test_state().await;
+    let app = test_router(state);
+    let server = axum_test::TestServer::builder().http_transport().build(app);
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let known = format!("known-{suffix}@example.test");
+    let unknown = format!("unknown-{suffix}@example.test");
+
+    // Sign up the known account.
+    let signup = server
+        .post("/auth/signup")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({
+            "provider": "email",
+            "email": known,
+            "password": "correct horse battery staple",
+        }))
+        .await;
+    signup.assert_status(StatusCode::CREATED);
+
+    // Duplicate signup (existing email) must not say "email already
+    // registered"; it returns the generic "signup failed" message.
+    let dup = server
+        .post("/auth/signup")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({
+            "provider": "email",
+            "email": known,
+            "password": "some other password",
+        }))
+        .await;
+    assert_eq!(dup.status_code(), StatusCode::BAD_REQUEST);
+    let dup_body: Value = dup.json();
+    assert_eq!(dup_body["error"].as_str().unwrap(), "signup failed");
+
+    // Login with wrong password (known email) vs login with any password
+    // (unknown email): same status, same body, AND comparable server-side
+    // work — the unknown-email path must perform a real Argon2
+    // verification (issue #121 timing oracle), which takes tens of
+    // milliseconds with default parameters vs well under 1 ms when
+    // skipped.
+    let wrong_pw_start = std::time::Instant::now();
+    let wrong_pw = server
+        .post("/auth/login")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({
+            "provider": "email",
+            "email": known,
+            "password": "wrong password",
+        }))
+        .await;
+    let wrong_pw_elapsed = wrong_pw_start.elapsed();
+    assert_eq!(wrong_pw.status_code(), StatusCode::UNAUTHORIZED);
+    let wrong_pw_body: Value = wrong_pw.json();
+
+    let unknown_email_start = std::time::Instant::now();
+    let unknown_email = server
+        .post("/auth/login")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({
+            "provider": "email",
+            "email": unknown,
+            "password": "wrong password",
+        }))
+        .await;
+    let unknown_email_elapsed = unknown_email_start.elapsed();
+    assert_eq!(unknown_email.status_code(), StatusCode::UNAUTHORIZED);
+    let unknown_body: Value = unknown_email.json();
+
+    assert_eq!(
+        wrong_pw_body, unknown_body,
+        "login responses for known-wrong-password and unknown-email must be identical"
+    );
+    assert!(
+        unknown_email_elapsed.as_millis() >= 5,
+        "unknown-email login must perform real Argon2 work (took {unknown_email_elapsed:?}, \
+         known-email wrong-password took {wrong_pw_elapsed:?}) — timing oracle is back"
+    );
+    assert!(
+        wrong_pw_elapsed.as_millis() >= 5,
+        "known-email wrong-password login must also perform Argon2 work (took {wrong_pw_elapsed:?})"
+    );
+    // The unknown-email path must cost the same order of Argon2 work as the
+    // known-email wrong-password path (both ~tens of ms; allow a wide 10x
+    // band for scheduler noise, but catch a skipped/degraded decoy verify).
+    let ratio = unknown_email_elapsed.as_secs_f64() / wrong_pw_elapsed.as_secs_f64().max(1e-9);
+    assert!(
+        ratio > 0.1,
+        "unknown-email login was {ratio:.3}x the cost of a known-email wrong-password \
+         login — the decoy Argon2 verify is missing or degraded"
+    );
+
+    // Correct login still works for the known account.
+    let ok = server
+        .post("/auth/login")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({
+            "provider": "email",
+            "email": known,
+            "password": "correct horse battery staple",
+        }))
+        .await;
+    assert_eq!(ok.status_code(), StatusCode::OK);
+
+    // Org invite: unknown email must not 404 "user not found". It gets a
+    // generic 403 "invite not permitted" (distinct from the owner-gate
+    // 403 a disallowed privileged invite of a known user returns — an
+    // accepted residual, see the comment in routes/orgs.rs). An owner
+    // inviting a KNOWN email as member still succeeds, so the endpoint
+    // remains usable.
+    let (session_token, _org_id) = signup_owner(&server, "invite-oracle").await;
+    // Look up the owner's org name via /users/me.
+    let me = server
+        .get("/users/me")
+        .add_header("authorization", format!("Bearer {session_token}"))
+        .await;
+    me.assert_status_ok();
+    let me_body: Value = me.json();
+    let org_name = me_body["orgs"][0]["name"]
+        .as_str()
+        .expect("org name")
+        .to_string();
+
+    let invite_unknown = server
+        .post(format!("/orgs/{org_name}/invite").as_str())
+        .add_header("authorization", format!("Bearer {session_token}"))
+        .json(&serde_json::json!({ "email": unknown, "role": "member" }))
+        .await;
+    assert_eq!(
+        invite_unknown.status_code(),
+        StatusCode::FORBIDDEN,
+        "unknown-email invite must not leak existence (no 404, no fake 200)"
+    );
+    let invite_body: Value = invite_unknown.json();
+    assert_eq!(
+        invite_body["error"].as_str().unwrap(),
+        "invite not permitted"
+    );
+
+    // A real (known) invitee for comparison: sign up directly so the
+    // email address is known to the test.
+    let invitee_suffix = Uuid::new_v4().simple().to_string();
+    let invitee_email = format!("invitee-real-{invitee_suffix}@example.test");
+    let invitee_signup = server
+        .post("/auth/signup")
+        .add_header("x-forwarded-for", "127.0.0.1")
+        .json(&serde_json::json!({
+            "provider": "email",
+            "email": invitee_email,
+            "password": "correct horse battery staple",
+        }))
+        .await;
+    invitee_signup.assert_status(StatusCode::CREATED);
+
+    // The role validation must fire identically for known and unknown
+    // emails (before any account lookup branching).
+    let bad_role_unknown = server
+        .post(format!("/orgs/{org_name}/invite").as_str())
+        .add_header("authorization", format!("Bearer {session_token}"))
+        .json(&serde_json::json!({ "email": unknown, "role": "not-a-role" }))
+        .await;
+    let bad_role_known = server
+        .post(format!("/orgs/{org_name}/invite").as_str())
+        .add_header("authorization", format!("Bearer {session_token}"))
+        .json(&serde_json::json!({ "email": invitee_email, "role": "not-a-role" }))
+        .await;
+    assert_eq!(
+        bad_role_unknown.status_code(),
+        bad_role_known.status_code(),
+        "invalid role must fail identically for unknown and known emails"
+    );
+    assert_eq!(bad_role_unknown.status_code(), StatusCode::BAD_REQUEST);
+
+    // Owner inviting a known user as member still works.
+    let invite_known_ok = server
+        .post(format!("/orgs/{org_name}/invite").as_str())
+        .add_header("authorization", format!("Bearer {session_token}"))
+        .json(&serde_json::json!({ "email": invitee_email, "role": "member" }))
+        .await;
+    assert_eq!(
+        invite_known_ok.status_code(),
+        StatusCode::OK,
+        "owner inviting a known user as member must keep working"
+    );
+}
+
+#[tokio::test]
 async fn purge_expired_device_login_sessions_removes_only_long_expired_rows() {
     let (state, pool) = setup_test_state().await;
     let app = test_router(state);
