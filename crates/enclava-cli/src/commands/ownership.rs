@@ -748,7 +748,12 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                 .await?;
             let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
             let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
-            let (transition_attestation, tee) = tee.attest_receipt_key().await?;
+            let (mut transition_attestation, tee) = tee.attest_receipt_key().await?;
+            // CRL collateral is transition-specific: fetch it here, not in
+            // the shared attestation path, so ordinary TEE operations keep
+            // working through a KDS outage.
+            tee.complete_transition_quote_crl(&mut transition_attestation)
+                .await?;
 
             println!("Enabling auto-unlock for {app_name}...");
             tee.enable_auto_unlock(&password).await?;
@@ -823,7 +828,12 @@ pub async fn auto_unlock(cmd: AutoUnlockCommand) -> Result<(), Box<dyn std::erro
                 .await?;
             let endpoint = resolve_tee_endpoint(&api, &app_name).await?;
             let tee = TeeClient::new_with_resolve_ip(&endpoint.tee_url, endpoint.tee_resolve_ip);
-            let (transition_attestation, tee) = tee.attest_receipt_key().await?;
+            let (mut transition_attestation, tee) = tee.attest_receipt_key().await?;
+            // CRL collateral is transition-specific: fetch it here, not in
+            // the shared attestation path, so ordinary TEE operations keep
+            // working through a KDS outage.
+            tee.complete_transition_quote_crl(&mut transition_attestation)
+                .await?;
 
             println!("Disabling auto-unlock for {app_name}...");
             tee.disable_auto_unlock(&password).await?;

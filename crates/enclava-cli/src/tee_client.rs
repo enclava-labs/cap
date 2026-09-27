@@ -719,6 +719,29 @@ impl TeeClient {
         Ok(())
     }
 
+    /// Fetch the ARK-signed product CRL for the attested generation and
+    /// attach it to the transition quote. Called only on the unlock-mode
+    /// transition path, right before `sign_unlock_mode_transition`, so a
+    /// KDS outage degrades exactly the CRL-gated flow and never ordinary
+    /// TEE operations that already verified against the embedded chain.
+    pub async fn complete_transition_quote_crl(
+        &self,
+        attestation: &mut TransitionReceiptAttestation,
+    ) -> Result<(), TeeError> {
+        let Some(quote) = attestation.quote.as_mut() else {
+            // Quote-less development evidence carries no AMD chain at all;
+            // there is no CRL collateral to attach and the API rejects the
+            // transition regardless.
+            return Ok(());
+        };
+        let report_bytes = B64_STANDARD
+            .decode(quote.report_b64.as_bytes())
+            .map_err(|_| TeeError::Attestation("SNP quote report is not base64".to_string()))?;
+        let crl_der = fetch_snp_product_crl_der(&report_bytes).await?;
+        quote.crl_der_b64 = B64_STANDARD.encode(&crl_der);
+        Ok(())
+    }
+
     /// Sign an unlock-mode transition receipt with the in-TEE receipt key.
     pub async fn sign_unlock_mode_transition(
         &self,
@@ -1140,15 +1163,14 @@ async fn verify_evidence_report_data_with_json_fallback(
                 "SNP report_data does not bind nonce, TLS leaf SPKI, and receipt key".to_string(),
             ));
         }
-        // The API's revocation gate requires the ARK-signed product CRL as
-        // part of the submitted quote; without it the transition fails
-        // closed server-side. Fetch it from the same KDS authority the VCEK
-        // came from (a relay via ENCLAVA_AMD_KDS_BASE_URL keeps offline
-        // operation working).
-        let crl_der = fetch_snp_product_crl_der(&snp_report_bytes).await?;
-        // HOST_DATA and the firmware measurement were verified together with
-        // the same AMD chain that authenticated report_data: preserve both as
-        // the launch identity of exactly this endpoint.
+        // The ARK-signed product CRL required by the API's revocation gate
+        // is NOT fetched here: this shared attestation path also serves
+        // ordinary TEE operations (unlock, password change, config
+        // delivery), and a KDS outage must not block those when the
+        // evidence already carries a valid embedded chain. Only the
+        // unlock-mode transition submission needs the CRL; callers attach
+        // it via `TeeClient::complete_transition_quote_crl` at the
+        // transition site.
         return Ok((
             Some(VerifiedSnpLaunchIdentity {
                 host_data: report.host_data,
@@ -1159,7 +1181,7 @@ async fn verify_evidence_report_data_with_json_fallback(
                 ark_der_b64: B64_STANDARD.encode(&chain.ark_der),
                 ask_der_b64: B64_STANDARD.encode(&chain.ask_der),
                 vcek_der_b64: B64_STANDARD.encode(&chain.vcek_der),
-                crl_der_b64: B64_STANDARD.encode(&crl_der),
+                crl_der_b64: String::new(),
             }),
         ));
     }
@@ -1269,11 +1291,17 @@ async fn fetch_snp_product_crl_der(snp_report_bytes: &[u8]) -> Result<Vec<u8>, T
         sev::firmware::guest::AttestationReport::from_bytes(snp_report_bytes).map_err(|_| {
             TeeError::Attestation("attestation evidence SNP report is malformed".to_string())
         })?;
-    let crl_url = amd_kds_product_crl_url(&report, &amd_kds_base_url())?;
-    let client = reqwest::Client::builder()
-        .https_only(true)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let base_url = amd_kds_base_url();
+    let crl_url = amd_kds_product_crl_url(&report, &base_url)?;
+    // Production always speaks HTTPS to KDS (or an HTTPS relay). The
+    // cfg!(test) hole exists only so unit tests can drive this exact path
+    // through plain-HTTP local servers; it is compiled out of every
+    // non-test build.
+    let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30));
+    if !cfg!(test) {
+        builder = builder.https_only(true);
+    }
+    let client = builder.build()?;
     Ok(fetch_amd_kds_crl_der(&client, &crl_url)
         .await?
         .as_ref()
@@ -1423,6 +1451,15 @@ struct CachedCrl {
     cached_at: Instant,
 }
 
+static CRL_CACHE: OnceLock<Mutex<HashMap<String, CachedCrl>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn crl_cache_clear_for_tests() {
+    if let Some(cache) = CRL_CACHE.get() {
+        cache.lock().map(|mut guard| guard.clear()).ok();
+    }
+}
+
 /// Fetch the ARK-signed AMD product CRL from KDS
 /// (`{base}/vcek/v1/{product}/crl`). The product CRL is shared by every
 /// machine of a generation and changes only when AMD revokes something, so
@@ -1434,7 +1471,6 @@ async fn fetch_amd_kds_crl_der(
     client: &reqwest::Client,
     crl_url: &str,
 ) -> Result<Arc<Vec<u8>>, TeeError> {
-    static CRL_CACHE: OnceLock<Mutex<HashMap<String, CachedCrl>>> = OnceLock::new();
     const CRL_CACHE_TTL: Duration = Duration::from_secs(600);
     let cache = CRL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = {

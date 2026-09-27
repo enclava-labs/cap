@@ -443,6 +443,21 @@ fn transition_receipt_is_fresh(receipt_timestamp: DateTime<Utc>, now: DateTime<U
         .contains(&age_seconds)
 }
 
+/// Standard base64 of at most `max_der_bytes` bytes is exactly
+/// `4 * ceil(max/3)` characters (padding included), so a longer string can
+/// never decode to an in-bounds value. Checking the string length first
+/// bounds the decode allocation: `base64::decode` allocates output
+/// proportional to its input, and oversized caller-submitted quote fields
+/// must be rejected by a length comparison, not by allocating for them
+/// first.
+fn decode_bounded_quote_b64(field: &str, max_der_bytes: usize) -> Option<Vec<u8>> {
+    let max_b64_len = max_der_bytes.div_ceil(3) * 4;
+    if field.len() > max_b64_len {
+        return None;
+    }
+    B64.decode(field).ok()
+}
+
 /// Independently verify the raw AMD SNP quote bound to an unlock-mode
 /// transition:
 ///
@@ -480,9 +495,14 @@ fn verify_transition_snp_quote(
         .quote
         .as_ref()
         .ok_or(TransitionQuoteError::Missing)?;
-    let report_bytes = B64
-        .decode(&quote.report_b64)
-        .map_err(|_| TransitionQuoteError::Malformed)?;
+    // Pre-decode length gate: base64 decoding allocates proportionally to
+    // the submitted string, so bound the string length BEFORE decoding.
+    // This keeps a repeated oversized submission from consuming memory and
+    // CPU ahead of its inevitable rejection. The exact DER/report length
+    // bounds are still enforced after decoding, below.
+    let report_bytes =
+        decode_bounded_quote_b64(&quote.report_b64, enclava_verifier::SNP_REPORT_BYTES)
+            .ok_or(TransitionQuoteError::Malformed)?;
     if report_bytes.len() != enclava_verifier::SNP_REPORT_BYTES {
         return Err(TransitionQuoteError::Malformed);
     }
@@ -505,9 +525,10 @@ fn verify_transition_snp_quote(
     }
 
     let decode_cert = |field: &String| -> Result<Vec<u8>, TransitionQuoteError> {
-        let der = B64
-            .decode(field)
-            .map_err(|_| TransitionQuoteError::Malformed)?;
+        // Same pre-decode bound as the report: cap the b64 string length
+        // before allocating decode output for it.
+        let der = decode_bounded_quote_b64(field, MAX_QUOTE_CERTIFICATE_DER_BYTES)
+            .ok_or(TransitionQuoteError::Malformed)?;
         if der.is_empty() || der.len() > MAX_QUOTE_CERTIFICATE_DER_BYTES {
             return Err(TransitionQuoteError::Malformed);
         }
@@ -533,9 +554,8 @@ fn verify_transition_snp_quote(
     // `now_unix_seconds`, verifies the CRL signature and this/nextUpdate
     // window, and walks the revoked serials for the exact ASK and VCEK
     // under verification. Missing or stale collateral fails closed.
-    let crl_der = B64
-        .decode(&quote.crl_der_b64)
-        .map_err(|_| TransitionQuoteError::Malformed)?;
+    let crl_der = decode_bounded_quote_b64(&quote.crl_der_b64, MAX_QUOTE_CRL_DER_BYTES)
+        .ok_or(TransitionQuoteError::Malformed)?;
     if crl_der.is_empty() || crl_der.len() > MAX_QUOTE_CRL_DER_BYTES {
         return Err(TransitionQuoteError::Malformed);
     }
@@ -2515,6 +2535,49 @@ mod tests {
             verify_transition_snp_quote(&attestation, &receipt, PAST_NEXT_UPDATE).unwrap_err(),
             TransitionQuoteError::RevocationRejected
         );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_with_oversized_fields_before_decoding() {
+        // Base64 decoding allocates proportionally to the submitted string:
+        // an oversized field must be rejected by a length comparison before
+        // any decode allocation, not by allocating for it first.
+        let fixture = live_quote_fixture();
+        let receipt = live_quote_receipt(&fixture);
+        // A multi-megabyte base64 blob: without the pre-decode length gate
+        // this allocates the full decoded buffer before rejection.
+        let oversized_b64 = "A".repeat(8 * 1024 * 1024);
+        for oversized in [
+            TransitionSnpQuote {
+                report_b64: oversized_b64.clone(),
+                ..live_quote_attestation(&fixture)
+                    .quote
+                    .clone()
+                    .expect("quote present")
+            },
+            TransitionSnpQuote {
+                ark_der_b64: oversized_b64.clone(),
+                ..live_quote_attestation(&fixture)
+                    .quote
+                    .clone()
+                    .expect("quote present")
+            },
+            TransitionSnpQuote {
+                crl_der_b64: oversized_b64,
+                ..live_quote_attestation(&fixture)
+                    .quote
+                    .clone()
+                    .expect("quote present")
+            },
+        ] {
+            let mut attestation = live_quote_attestation(&fixture);
+            attestation.quote = Some(oversized);
+            assert_eq!(
+                verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                    .unwrap_err(),
+                TransitionQuoteError::Malformed
+            );
+        }
     }
 
     #[test]
