@@ -75,3 +75,11 @@ tower = { version = "0.5", features = ["util"] }
 # Re-verify matcher semantics on ANY bump (patch included) — see the
 # classifier invariant comment in src/lib.rs.
 matchit = "=0.8.4"
+# Test-only anchor sync guard: the unlock transition quote gate pins the
+# builtin AMD ARK roots as SHA-256 constants. This dev-dependency lets a
+# test assert the pins stay byte-identical to the sev crate's builtin
+# roots (the same source the CLI's ark_is_pinned_to_builtin_root reads
+# live), so a sev bump that rotates a root fails CI instead of silently
+# rejecting every unlock transition. Features must match enclava-cli's
+# sev dependency so the vendored OpenSSL build unifies.
+sev = { version = "7.1.0", default-features = false, features = ["snp", "openssl", "serde"] }

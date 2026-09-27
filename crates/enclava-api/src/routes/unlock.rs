@@ -126,9 +126,9 @@ const BUILTIN_AMD_ARK_SHA256_PINS: [[u8; 32]; 3] = [
     ],
     // sev 7.1.0 builtin turin ARK
     [
-        0x1f, 0x08, 0x41, 0x61, 0xa4, 0x4b, 0xb6, 0xd9, 0x37, 0x78, 0xa9, 0x08, 0x87, 0x7d, 0x48,
-        0x19, 0xca, 0xfa, 0xd0, 0x5e, 0xf4, 0x19, 0x3b, 0x2d, 0xed, 0x9d, 0xd9, 0xc7, 0x3d, 0xd3,
-        0xf6, 0x0a,
+        0x1f, 0x08, 0x41, 0x61, 0xa4, 0x4b, 0xb6, 0xd9, 0x37, 0x78, 0xa9, 0x04, 0x87, 0x7d, 0x48,
+        0x19, 0xca, 0xfa, 0x5d, 0x05, 0xef, 0x41, 0x93, 0xb2, 0xde, 0xd9, 0xdd, 0x9c, 0x73, 0xdd,
+        0x3f, 0x6a,
     ],
 ];
 
@@ -348,6 +348,10 @@ enum TransitionQuoteError {
     UntrustedAnchor,
     /// Report signature / VCEK binding / report_data binding failed.
     InvalidEvidence,
+    /// The quote does not match the evidence hash the receipt signed.
+    EvidenceMismatch,
+    /// The report's guest policy allows debug: not a confidential workload.
+    DebugPolicy,
 }
 
 impl TransitionQuoteError {
@@ -359,18 +363,63 @@ impl TransitionQuoteError {
                 "transition_attestation.quote chain is not anchored to a trusted AMD root"
             }
             Self::InvalidEvidence => "transition_attestation.quote failed SNP verification",
+            Self::EvidenceMismatch => {
+                "transition_attestation.quote does not match the receipt-signed evidence hash"
+            }
+            Self::DebugPolicy => {
+                "transition_attestation.quote guest policy allows debug; not a confidential workload"
+            }
         }
     }
+}
+
+/// SNP guest policy bit 19 (DEBUG): when set, debugging the guest is
+/// allowed and the PSP exposes the guest's memory-encryption keys to the
+/// debugger. A guest launched with this bit is never confidential,
+/// regardless of how valid its attestation chain is.
+const SNP_GUEST_POLICY_DEBUG_BIT: u64 = 1 << 19;
+
+/// Mirrors the CLI's `ensure_snp_report_production_policy`: reports from
+/// debug-enabled guests must not be trusted as TEE-consent evidence.
+fn snp_guest_policy_allows_debug(guest_policy: u64) -> bool {
+    guest_policy & SNP_GUEST_POLICY_DEBUG_BIT != 0
+}
+
+/// A transition receipt older than this is rejected. Without a window,
+/// quote/receipt replay is bounded only by per-app receipt-timestamp
+/// monotonicity and the unique receipt index, both of which permit a
+/// first reuse of captured evidence.
+const TRANSITION_RECEIPT_MAX_AGE_SECONDS: i64 = 15 * 60;
+
+/// Tolerance for clock skew between the signing TEE and the API on
+/// future-dated receipt timestamps.
+const TRANSITION_RECEIPT_MAX_FUTURE_SKEW_SECONDS: i64 = 5 * 60;
+
+/// Server-side freshness window for a transition receipt: the receipt must
+/// have been signed within [`TRANSITION_RECEIPT_MAX_AGE_SECONDS`] of now
+/// (and not be dated further ahead than the allowed skew).
+fn transition_receipt_is_fresh(receipt_timestamp: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    // age = now - ts: a recent receipt has a small positive age; a slightly
+    // future-dated one (clock skew) has a small negative age.
+    let age_seconds = now.signed_duration_since(receipt_timestamp).num_seconds();
+    (-TRANSITION_RECEIPT_MAX_FUTURE_SKEW_SECONDS..=TRANSITION_RECEIPT_MAX_AGE_SECONDS)
+        .contains(&age_seconds)
 }
 
 /// Independently verify the raw AMD SNP quote bound to an unlock-mode
 /// transition:
 ///
+/// - the SHA-256 of the submitted report bytes equals the
+///   `attestation_quote_sha256` the receipt signature covers, so the API
+///   verifies exactly the evidence the receipt identified,
 /// - the ARK/ASK/VCEK chain is internally consistent and anchored to one of
 ///   the pinned builtin AMD roots (the same anchor set the platform CLI
 ///   uses),
+/// - the report's guest policy disables debug (a debug-enabled guest is
+///   not confidential, mirroring the CLI's
+///   `ensure_snp_report_production_policy`),
 /// - the report is signed by the VCEK and the VCEK binds to the report's
-///   chip ID and reported TCB, and
+///   chipID and reported TCB, and
 /// - the guest-committed `report_data` binds the TEE domain, the caller
 ///   nonce, the observed TLS leaf SPKI, and the TEE receipt key -- the same
 ///   values `verify_transition_receipt`/`verify_transition_attestation`
@@ -395,6 +444,24 @@ fn verify_transition_snp_quote(
     if report_bytes.len() != enclava_verifier::SNP_REPORT_BYTES {
         return Err(TransitionQuoteError::Malformed);
     }
+    // Bind the submitted quote bytes to the evidence hash the receipt
+    // signed. The receipt's signature covers attestation_quote_sha256, so
+    // this closes the gap where the caller submits evidence hash X in the
+    // receipt while the API verifies an unrelated (genuine but different)
+    // quote.
+    let signed_evidence_hash = parse_hex32(
+        "transition_receipt.payload.attestation_quote_sha256",
+        receipt
+            .payload
+            .attestation_quote_sha256
+            .as_deref()
+            .unwrap_or(""),
+    )
+    .map_err(|_| TransitionQuoteError::Malformed)?;
+    if Sha256::digest(&report_bytes).as_slice() != signed_evidence_hash.as_slice() {
+        return Err(TransitionQuoteError::EvidenceMismatch);
+    }
+
     let decode_cert = |field: &String| -> Result<Vec<u8>, TransitionQuoteError> {
         let der = B64
             .decode(field)
@@ -417,6 +484,11 @@ fn verify_transition_snp_quote(
         .map_err(|_| TransitionQuoteError::InvalidEvidence)?;
 
     let report = parse_snp_report(&report_bytes).map_err(|_| TransitionQuoteError::Malformed)?;
+    // A debug-enabled guest is not confidential (the PSP hands its keys to a
+    // debugger), so its receipt key is untrusted even with a valid chain.
+    if snp_guest_policy_allows_debug(report.guest_policy) {
+        return Err(TransitionQuoteError::DebugPolicy);
+    }
     verify_snp_signature(&report, &vcek_der).map_err(|_| TransitionQuoteError::InvalidEvidence)?;
     verify_vcek_report_binding(&report, &vcek_der)
         .map_err(|_| TransitionQuoteError::InvalidEvidence)?;
@@ -1181,6 +1253,19 @@ pub async fn update_unlock_mode(
             })),
         )
     })?;
+    // Server-side freshness window: without it, captured quote/receipt
+    // pairs can be replayed once (monotonicity and the unique receipt
+    // index only block reuse after the first consumption).
+    if !transition_receipt_is_fresh(verified_receipt.receipt_timestamp, Utc::now()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid transition_receipt",
+                "field": "transition_receipt.payload.timestamp",
+                "reason": "transition receipt outside freshness window",
+            })),
+        ));
+    }
 
     let signing_artifacts = crate::signing_service::decode_optional_blobs(
         body.customer_descriptor_blob.clone(),
@@ -1439,9 +1524,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode, SignedReceiptResponse,
-        TransitionQuoteError, TransitionReceiptAttestation, TransitionSnpQuote,
-        UnlockModeCommitRequest, commit_unlock_mode_transition, validate_transition,
+        BUILTIN_AMD_ARK_SHA256_PINS, ReceiptEnvelope, ReceiptPayloadView, RequestedUnlockMode,
+        SignedReceiptResponse, TransitionQuoteError, TransitionReceiptAttestation,
+        TransitionSnpQuote, UnlockModeCommitRequest, commit_unlock_mode_transition,
+        snp_guest_policy_allows_debug, transition_receipt_is_fresh, validate_transition,
         verify_transition_attestation, verify_transition_receipt, verify_transition_snp_quote,
     };
     use crate::models::{App, AppContainer, AppStatus, UnlockMode};
@@ -2137,20 +2223,135 @@ mod tests {
             .expect("live VCEK-signed SNP quote with matching binding verifies");
     }
 
+    /// Combined check against a fully valid signed receipt: the route's
+    /// ordering (receipt signature first, then the SNP quote gate) applied
+    /// to a receipt that passes `verify_transition_receipt` and a quote
+    /// that fails only the quote gate. A positive end-to-end pass of both
+    /// the signed-receipt and quote checks is impossible with the
+    /// prove-it-live fixture: the fixture deliberately contains only the
+    /// TEE receipt key's public half, so no signature valid under
+    /// `verify_transition_receipt` can also bind the fixture quote's
+    /// report_data (which commits that same public key). This test pins
+    /// the next-best thing: a receipt that clears every signed check and a
+    /// live VCEK-signed quote, rejected solely by the quote binding.
+    #[test]
+    fn signed_receipt_with_foreign_quote_is_rejected_by_quote_gate() {
+        let fixture = live_quote_fixture();
+        let attestation = live_quote_attestation(&fixture);
+        // A genuine, correctly signed transition receipt under an
+        // unrelated Ed25519 key: passes verify_transition_receipt when
+        // paired with a matching attestation, but its key is not the key
+        // the live quote commits, so the quote gate must reject.
+        let signing_key = SigningKey::from_bytes(&[0x2a; 32]);
+        let quote_hash = hex::encode(Sha256::digest(&fixture.report));
+        let receipt = signed_transition_receipt("password", "auto", &quote_hash, &signing_key);
+        verify_transition_receipt(
+            &receipt,
+            &test_app(),
+            RequestedUnlockMode::Password,
+            RequestedUnlockMode::Auto,
+        )
+        .expect("receipt passes every signature/payload check on its own");
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt).unwrap_err(),
+            TransitionQuoteError::InvalidEvidence
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_that_differs_from_receipt_signed_evidence_hash() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let mut receipt = live_quote_receipt(&fixture);
+        // Receipt signs evidence hash X (here: SHA256 of the TLS leaf),
+        // while a genuinely valid quote of the report bytes verifies --
+        // previously accepted, now must fail closed.
+        let foreign_hash = hex::encode(fixture.leaf_spki_sha256);
+        receipt.payload.attestation_quote_sha256 = Some(foreign_hash.clone());
+        attestation.attestation_evidence_sha256 = foreign_hash;
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt).unwrap_err(),
+            TransitionQuoteError::EvidenceMismatch
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_from_debug_enabled_guest() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let mut receipt = live_quote_receipt(&fixture);
+        // Set the guest policy DEBUG bit (bit 19) in the raw report bytes.
+        // The debug gate runs before VCEK signature verification, so the
+        // rejection is deterministically DebugPolicy even though the
+        // tampered bytes would also break the signature.
+        let mut report = fixture.report.clone();
+        let policy = u64::from_le_bytes(report[0x08..0x10].try_into().unwrap());
+        assert!(
+            !snp_guest_policy_allows_debug(policy),
+            "fixture policy must not have debug set"
+        );
+        report[0x0a] |= 0x08; // set bit 19 of the LE u64 policy
+        let tampered_policy = u64::from_le_bytes(report[0x08..0x10].try_into().unwrap());
+        assert!(snp_guest_policy_allows_debug(tampered_policy));
+        attestation.quote = Some(TransitionSnpQuote {
+            report_b64: B64.encode(&report),
+            ..attestation.quote.clone().expect("quote present")
+        });
+        // Keep the receipt-signed evidence hash consistent with the
+        // tampered bytes so the earlier hash gate passes and the debug
+        // gate is the rejection reason under test.
+        let tampered_hash = hex::encode(Sha256::digest(&report));
+        receipt.payload.attestation_quote_sha256 = Some(tampered_hash.clone());
+        attestation.attestation_evidence_sha256 = tampered_hash;
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt).unwrap_err(),
+            TransitionQuoteError::DebugPolicy
+        );
+    }
+
+    #[test]
+    fn transition_receipt_freshness_window_bounds_replay() {
+        let now = Utc::now();
+        assert!(transition_receipt_is_fresh(now, now));
+        assert!(transition_receipt_is_fresh(
+            now - chrono::Duration::seconds(14 * 60),
+            now
+        ));
+        // Just inside the future-skew bound.
+        assert!(transition_receipt_is_fresh(
+            now + chrono::Duration::seconds(4 * 60),
+            now
+        ));
+        // Too old and too far in the future are both rejected.
+        assert!(!transition_receipt_is_fresh(
+            now - chrono::Duration::seconds(16 * 60),
+            now
+        ));
+        assert!(!transition_receipt_is_fresh(
+            now + chrono::Duration::seconds(6 * 60),
+            now
+        ));
+    }
+
     #[test]
     fn rejects_transition_snp_quote_when_report_data_is_tampered() {
         let fixture = live_quote_fixture();
         let mut attestation = live_quote_attestation(&fixture);
-        let receipt = live_quote_receipt(&fixture);
+        let mut receipt = live_quote_receipt(&fixture);
         let mut report = fixture.report.clone();
         report[0x50] ^= 1; // flip one report_data byte
         attestation.quote = Some(TransitionSnpQuote {
             report_b64: B64.encode(&report),
             ..attestation.quote.clone().expect("quote present")
         });
-        // The signature no longer covers the mutated bytes, so the quote must
-        // fail closed -- exactly the fabricated-self-consistent-package case
-        // from the issue.
+        // Re-sync the receipt-signed evidence hash to the tampered bytes so
+        // the earlier hash gate passes and the rejection demonstrably comes
+        // from SNP verification itself. The signature no longer covers the
+        // mutated bytes, so the quote must fail closed -- exactly the
+        // fabricated-self-consistent-package case from the issue.
+        let tampered_hash = hex::encode(Sha256::digest(&report));
+        receipt.payload.attestation_quote_sha256 = Some(tampered_hash.clone());
+        attestation.attestation_evidence_sha256 = tampered_hash;
         assert_eq!(
             verify_transition_snp_quote(&attestation, &receipt).unwrap_err(),
             TransitionQuoteError::InvalidEvidence
@@ -2215,6 +2416,41 @@ mod tests {
             "Milan builtin ARK pin must match BUILTIN_AMD_ARK_SHA256_PINS[0]"
         );
         der
+    }
+
+    /// Sync guard against sev root rotation: every ARK the sev crate ships
+    /// as a builtin must be pinned in BUILTIN_AMD_ARK_SHA256_PINS, and the
+    /// pin set must not contain roots sev no longer ships. Without this a
+    /// sev upgrade that rotates a root would leave the API rejecting every
+    /// unlock transition (UntrustedAnchor) while the CLI happily verifies
+    /// the new chain client-side.
+    #[test]
+    fn ark_pin_set_matches_sev_builtin_roots() {
+        let mut sev_roots: Vec<String> = Vec::new();
+        for ark in [
+            sev::certs::snp::builtin::milan::ark(),
+            sev::certs::snp::builtin::genoa::ark(),
+            sev::certs::snp::builtin::turin::ark(),
+        ] {
+            let ark = ark.expect("load sev builtin ARK");
+            let der = ark.to_der().expect("serialize sev builtin ARK to DER");
+            sev_roots.push(hex::encode(Sha256::digest(&der)));
+        }
+        let pinned: Vec<String> = BUILTIN_AMD_ARK_SHA256_PINS
+            .iter()
+            .map(hex::encode)
+            .collect();
+        for root in &sev_roots {
+            assert!(
+                pinned.contains(root),
+                "sev builtin ARK {root} is not pinned; a sev bump rotated the root set"
+            );
+        }
+        assert_eq!(
+            sev_roots.len(),
+            pinned.len(),
+            "pin set and sev builtin root set have drifted"
+        );
     }
 
     #[tokio::test]

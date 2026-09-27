@@ -1510,6 +1510,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sev",
  "sha2 0.10.9",
  "sigstore",
  "sqlx",
