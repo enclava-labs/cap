@@ -30,6 +30,11 @@ const NIP98_REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(15 * 60);
 /// backlog instead of a full-table scan.
 const NIP98_REPLAY_CACHE_REAP_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// Retry delay after a failed purge. A transient database blip must not
+/// stretch the accumulation window: instead of deferring to the next hourly
+/// tick, re-attempt the purge at this cadence until it succeeds.
+const NIP98_REPLAY_CACHE_REAP_RETRY: Duration = Duration::from_secs(60);
+
 #[derive(Debug, thiserror::Error)]
 pub enum NostrAuthError {
     #[error("nostr event is required")]
@@ -257,11 +262,22 @@ pub fn spawn_nip98_replay_cache_reaper(pool: PgPool) {
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            match reap_nip98_replay_cache(&pool).await {
-                Ok(0) => {}
-                Ok(n) => tracing::debug!(purged = n, "purged expired NIP-98 replay cache rows"),
-                Err(e) => {
-                    tracing::warn!(error = %e, "NIP-98 replay cache purge failed")
+            // On failure, re-attempt at the short retry cadence rather than
+            // deferring to the next tick, so a transient DB blip cannot
+            // stretch the accumulation window (back-to-back failures would
+            // otherwise pile up to ~2x the steady-state bound before the
+            // next scheduled purge).
+            loop {
+                match reap_nip98_replay_cache(&pool).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        tracing::debug!(purged = n, "purged expired NIP-98 replay cache rows");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "NIP-98 replay cache purge failed");
+                        tokio::time::sleep(NIP98_REPLAY_CACHE_REAP_RETRY).await;
+                    }
                 }
             }
         }
