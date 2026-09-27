@@ -21,7 +21,7 @@ spec:
       - name: ghcr-login
       containers:
       - name: migrate
-        image: ghcr.io/enclava-labs/enclava-api:latest
+        image: ghcr.io/enclava-labs/enclava-api@sha256:0000000000000000000000000000000000000000000000000000000000000000
         command: ["/usr/local/bin/cap-migrate"]
         securityContext:
           allowPrivilegeEscalation: false
