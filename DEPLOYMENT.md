@@ -187,8 +187,9 @@ state, independent of user profiles. No additional database service, state PVC,
 filesystem lock, or storage environment variable is required.
 
 Apply migration `0050_platform_release_state.sql` before starting the new API
-image, using the normal `cap-migrate` Job and `DATABASE_MIGRATION_MODE=verify`
-startup ordering. The migration seeds a singleton row; a missing row or table,
+image, using the `cap-migrate` Job and `DATABASE_MIGRATION_MODE=verify`
+startup ordering documented under [Kubernetes](#kubernetes). The migration seeds
+a singleton row; a missing row or table,
 corrupt record, or unavailable database refuses startup rather than silently
 resetting the floor. The API advances the row only after all release-derived
 startup configuration validates. Updates use a row lock and synchronous commit.
@@ -267,12 +268,30 @@ Deploy the digest reference from that artifact, not a mutable tag.
 
 ## Kubernetes
 
-The checked-in overlay is intentionally minimal:
+The API uses `DATABASE_MIGRATION_MODE=verify`. On both first installation and
+every upgrade, run migrations from the **same digest-pinned image** before
+applying the API overlay. Provision `api-secrets` (including `database-url`)
+and `ghcr-login` in `enclava-platform` first. The migration Job is deliberately
+excluded from the overlay: applying a Job and Deployment together does not
+order their execution.
+
+Run from the repository root, with the digest from the release artifact:
 
 ```bash
+set -euo pipefail
+CAP_API_IMAGE='ghcr.io/enclava-labs/enclava-api@sha256:<release-digest>'
+(cd deploy/api && kustomize edit set image "ghcr.io/enclava-labs/enclava-api=$CAP_API_IMAGE")
+kubectl apply -f deploy/api/namespace.yaml
+CAP_MIGRATION_JOB=$(kubectl set image --local -f deploy/api/migration.yaml "migrate=$CAP_API_IMAGE" -o yaml |
+  kubectl create -f - -o name)
+kubectl -n enclava-platform wait --for=condition=complete "$CAP_MIGRATION_JOB" --timeout=600s
 kubectl apply -k deploy/api/
 kubectl -n enclava-platform rollout status deploy/enclava-api
 ```
+
+If migration fails or times out, stop before applying the API and inspect
+`kubectl -n enclava-platform logs "$CAP_MIGRATION_JOB"`. Correct the cause before
+retrying; retain the existing API and database state.
 
 Before using it outside local experimentation:
 

@@ -243,6 +243,12 @@ struct AcceptedOverrideMark {
 
 impl AcceptedOverrideMark {
     fn of(release: &PlatformRelease) -> Result<Self, PlatformReleaseError> {
+        if release.platform_release_version.trim().is_empty() {
+            return Err(PlatformReleaseError::InvalidField {
+                field: "platform_release_version",
+                message: "empty release version".into(),
+            });
+        }
         Ok(Self {
             platform_release_version: release.platform_release_version.clone(),
             created_at: release.created_at.clone(),
@@ -1054,6 +1060,35 @@ mod tests {
             PlatformReleaseEnvelope::load_verified_from_raw(raw, true),
             Err(PlatformReleaseError::DowngradeRefused { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn whitespace_release_versions_cannot_advance_the_floor() {
+        let (pool, schema) = state_database().await;
+        let accepted = signed_release("2999-01-01T00:00:00Z");
+        commit_override_acceptance(&pool, &accepted).await.unwrap();
+        for version in ["", " ", "\t", "\r\n", "\u{00a0}", "\u{2003}"] {
+            let raw = resigned_envelope_with("2999-01-02T00:00:00Z", version, None);
+            let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw).unwrap();
+            assert!(matches!(
+                PlatformReleaseEnvelope::load_verified_from_raw(raw, true),
+                Err(PlatformReleaseError::InvalidField {
+                    field: "platform_release_version",
+                    ..
+                })
+            ));
+            assert!(matches!(
+                commit_override_acceptance(&pool, &envelope.payload).await,
+                Err(PlatformReleaseError::InvalidField {
+                    field: "platform_release_version",
+                    ..
+                })
+            ));
+        }
+        check_running_release_current(&pool, &accepted)
+            .await
+            .unwrap();
+        drop_state_database(pool, schema).await;
     }
 
     #[tokio::test]
