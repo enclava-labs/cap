@@ -173,50 +173,57 @@ Release verification checks:
   the newest release ever accepted on this override lane (persisted
   high-water mark, downgrade refused), and not a same-`{version, created_at}`
   envelope with different signed content (the mark pins the canonical
-  payload digest). The mark's read-compare-persist runs under an exclusive
-  flock so concurrent API replicas cannot interleave their updates.
+  payload digest). A PostgreSQL transaction locks the shared row while
+  comparing and advancing it, including the first concurrent acceptance.
 
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.
 
-The high-water mark lives at `ENCLAVA_PLATFORM_RELEASE_STATE`, which is
-REQUIRED whenever `ENCLAVA_PLATFORM_RELEASE_PATH` is set: the API refuses to
-start on the override lane without it (a derived default such as
-`<override-path>.accepted` would leave the mark undiscoverable once the
-override var is removed — silently re-enabling the rollback the gate exists
-to refuse). It must point at durable writable storage — the
-override envelope itself is typically a read-only configmap mount, and an
-`emptyDir` would reset the anti-rollback floor on every pod replacement. The
-base deployment does not wire this state (the override lane is inactive there
-and a mandatory RWX claim would block scheduling on RWO-only clusters);
-environments that activate the override lane compose the opt-in component
-`deploy/api/components/platform-release-state` onto the base — it creates the
-`cap-api-platform-release-state` PVC (ReadWriteMany), mounts it at
-`/var/lib/enclava`, and sets
-`ENCLAVA_PLATFORM_RELEASE_STATE=/var/lib/enclava/platform-release.accepted` —
-or replicate that wiring in their own overlay (single-replica deployments may
-relax the claim to ReadWriteOnce; the mark advances only after startup
-validation accepts the release, so a signed-but-incompatible override cannot
-strand the deployment). Multi-replica deployments: the gate serializes on an
-flock over the state volume — this is only real if the StorageClass provides
-cross-node flock and directory fsync; several RWX CSI drivers (NFS with
-local_lock, some FUSE drivers) silently no-op node-local locks, which would
-reopen the two-replica race. Do not treat "an RWX PVC exists" as the control:
-verify the provisioner's lock semantics, or run this lane single-replica (RWO)
-until verified. An operator who can delete the state file
-can reset the floor; the mark itself is unsigned, so an operator who can
-*write* the state file can equally lower the floor to any timestamp at or
-above the bundled release — "file still present" does not mean the floor is
-intact. For the full threat model, point the state path at
-separately-protected storage. Intentional rollbacks require clearing the
-state file (after operator verification), which the refusal message names.
-Removing `ENCLAVA_PLATFORM_RELEASE_PATH` while `ENCLAVA_PLATFORM_RELEASE_STATE`
-stays wired does not bypass the gate: the bundled release is then compared
-against the persisted mark as well (no state file yet → fresh install,
-untouched). Because the state path is now mandatory on the override lane,
-every deployment that ever wired the override lane keeps the removal guard:
-there is no default-path configuration whose guard could be lost by removing
-the override var.
+The high-water mark lives in `platform_release_state` in CAP's existing
+PostgreSQL database (`DATABASE_URL`), shared by all API replicas in that
+environment. It contains the accepted release version, signed creation time,
+and canonical payload SHA-256, not credentials or user data. It is platform
+state, independent of user profiles. No additional database service, state PVC,
+filesystem lock, or storage environment variable is required.
+
+Apply migration `0050_platform_release_state.sql` before starting the new API
+image, using the normal `cap-migrate` Job and `DATABASE_MIGRATION_MODE=verify`
+startup ordering. The migration seeds a singleton row; a missing row or table,
+corrupt record, or unavailable database refuses startup rather than silently
+resetting the floor. The API advances the row only after all release-derived
+startup configuration validates. Updates use a row lock and synchronous commit.
+A check-only bundled startup never advances the accepted-override mark.
+
+Removing `ENCLAVA_PLATFORM_RELEASE_PATH`, disabling policy-read mode, or
+replacing a pod does not remove this gate. Every startup compares its effective
+release (the compiled bundle when the release lane is disabled) against the
+database floor. Every running replica rechecks it every 60 seconds and stops
+if another replica has accepted a release that makes its own release stale or
+unorderable. Transient database errors during a running recheck are logged and
+retried, matching the former file watchdog; startup itself fails closed.
+
+Treat this row as security state during backup and restore. An older database
+backup can lower the remembered floor. Before resuming CAP, preserve or
+reconcile the highest previously accepted version, timestamp and payload hash
+against trusted signed release history. Do not delete/reseed the row to make a
+rollback boot. Anyone holding CAP's database write credentials, including a
+compromised API pod, can alter or delete this unsigned record. The gate does
+not defend against that access or rollback of the entire database. A stronger
+threat model needs independently protected state.
+
+### Adopting from preview file state
+
+The retired `ENCLAVA_PLATFORM_RELEASE_STATE` setting fails startup with a
+migration message even if the release lane is disabled. If a preview deployment
+already has a file mark, stop all CAP replicas, preserve the file, verify its
+version/timestamp/hash against trusted signed release history, and reconcile
+it with any existing database mark under a transaction locking the singleton
+row. Keep the newest compatible mark; equal-timestamp divergent content must
+be resolved against trusted history, not overwritten. Only after verifying the
+committed database record may the old setting/mount be removed and CAP resumed.
+The optional PVC component has been removed; retain any existing volume until
+its state has been safely adopted. Fresh installations need only the normal
+migration, with no file import.
 
 ### Rotating the production root
 

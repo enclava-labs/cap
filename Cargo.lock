@@ -1490,7 +1490,6 @@ dependencies = [
  "ed25519-dalek",
  "enclava-common",
  "enclava-engine",
- "fd-lock",
  "futures",
  "hex",
  "hickory-resolver",
