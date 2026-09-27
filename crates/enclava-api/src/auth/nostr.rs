@@ -35,6 +35,11 @@ const NIP98_REPLAY_CACHE_REAP_INTERVAL: Duration = Duration::from_secs(3600);
 /// tick, re-attempt the purge at this cadence until it succeeds.
 const NIP98_REPLAY_CACHE_REAP_RETRY: Duration = Duration::from_secs(60);
 
+/// Replay-cache purge batch size. Purges delete in bounded batches (see
+/// `reap_nip98_replay_cache`) so a flood backlog cannot become one huge
+/// DELETE transaction holding row locks across the whole accumulated set.
+const NIP98_REPLAY_CACHE_REAP_BATCH: i64 = 5_000;
+
 #[derive(Debug, thiserror::Error)]
 pub enum NostrAuthError {
     #[error("nostr event is required")]
@@ -234,18 +239,51 @@ pub async fn verify_and_consume_nip98_event(
     Ok(identity)
 }
 
-/// Delete replay-cache rows older than the retention window. Spawned as a
-/// background task at startup; failures are logged and retried on the next
-/// tick.
+/// Delete replay-cache rows older than the retention window, in bounded
+/// batches (mirroring `purge_expired_device_login_sessions`): each batch
+/// commits separately and serves its `first_seen` filter from the purge
+/// index (migration 0051), so a backlog accumulated during an outage or a
+/// login flood cannot turn into one huge DELETE transaction that holds row
+/// locks until completion. Concurrent reapers on other replicas are safe —
+/// a batch that loses the race simply deletes fewer rows. Spawned as a
+/// background task at startup; failures are logged and retried at the short
+/// retry cadence.
 pub async fn reap_nip98_replay_cache(pool: &PgPool) -> Result<u64, NostrAuthError> {
-    let result =
-        sqlx::query("DELETE FROM nip98_replay_cache WHERE first_seen < now() - $1::interval")
-            .bind(format!(
-                "{} seconds",
-                NIP98_REPLAY_CACHE_RETENTION.as_secs()
-            ))
-            .execute(pool)
-            .await?;
+    let mut total = 0u64;
+    loop {
+        let affected = reap_nip98_replay_cache_batch(
+            pool,
+            NIP98_REPLAY_CACHE_RETENTION,
+            NIP98_REPLAY_CACHE_REAP_BATCH,
+        )
+        .await?;
+        total += affected;
+        if affected < NIP98_REPLAY_CACHE_REAP_BATCH as u64 {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// One bounded purge batch: delete at most `batch` expired rows in a single
+/// transaction and report how many were removed.
+async fn reap_nip98_replay_cache_batch(
+    pool: &PgPool,
+    retention: Duration,
+    batch: i64,
+) -> Result<u64, NostrAuthError> {
+    let result = sqlx::query(
+        "DELETE FROM nip98_replay_cache
+         WHERE event_id IN (
+             SELECT event_id FROM nip98_replay_cache
+             WHERE first_seen < now() - $1::interval
+             LIMIT $2
+         )",
+    )
+    .bind(format!("{} seconds", retention.as_secs()))
+    .bind(batch)
+    .execute(pool)
+    .await?;
     Ok(result.rows_affected())
 }
 
@@ -555,43 +593,93 @@ mod tests {
     }
 
     /// The reaper must delete rows older than the retention window so the
-    /// cache table stays bounded.
+    /// cache table stays bounded, and only those rows. Row ids are unique
+    /// per run (the regression database is shared across test runs) and the
+    /// assertions are state-based, so parallel runs and interrupted runs
+    /// cannot flake them via fixed-id collisions or leftover rows.
     #[tokio::test]
     async fn reap_nip98_replay_cache_deletes_only_expired_rows() {
         let pool = nostr_test_pool().await;
-        let stale = "reap-test-stale-event-id";
-        let fresh = "reap-test-fresh-event-id";
+        let stale = format!("reap-test-stale-{}", Uuid::new_v4());
+        let fresh = format!("reap-test-fresh-{}", Uuid::new_v4());
 
         sqlx::query("INSERT INTO nip98_replay_cache (event_id, first_seen) VALUES ($1, now() - interval '1 hour')")
-            .bind(stale)
+            .bind(&stale)
             .execute(&pool)
             .await
             .expect("seed stale replay row");
         sqlx::query("INSERT INTO nip98_replay_cache (event_id, first_seen) VALUES ($1, now())")
-            .bind(fresh)
+            .bind(&fresh)
             .execute(&pool)
             .await
             .expect("seed fresh replay row");
 
-        let purged = reap_nip98_replay_cache(&pool)
+        reap_nip98_replay_cache(&pool)
             .await
             .expect("reap replay cache");
-        assert!(purged >= 1, "at least the stale row must be purged");
 
         let remaining: Vec<(String,)> =
             sqlx::query_as("SELECT event_id FROM nip98_replay_cache WHERE event_id = ANY($1)")
-                .bind(vec![stale.to_string(), fresh.to_string()])
+                .bind(vec![stale.clone(), fresh.clone()])
                 .fetch_all(&pool)
                 .await
                 .expect("read back replay rows");
-        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only the fresh row may survive the purge"
+        );
         assert_eq!(remaining[0].0, fresh);
 
         sqlx::query("DELETE FROM nip98_replay_cache WHERE event_id = $1")
-            .bind(fresh)
+            .bind(&fresh)
             .execute(&pool)
             .await
             .expect("clean up fresh replay row");
+    }
+
+    /// Purge batches must be bounded: `reap_nip98_replay_cache_batch` never
+    /// deletes more than its `batch` limit in one transaction (so a flood
+    /// backlog cannot become one huge DELETE holding row locks), and
+    /// repeated batches drain the backlog completely.
+    #[tokio::test]
+    async fn reap_nip98_replay_cache_batches_are_bounded_and_drain_fully() {
+        let pool = nostr_test_pool().await;
+        let ids: Vec<String> = (0..3)
+            .map(|_| format!("reap-batch-test-{}", Uuid::new_v4()))
+            .collect();
+
+        for id in &ids {
+            sqlx::query("INSERT INTO nip98_replay_cache (event_id, first_seen) VALUES ($1, now() - interval '1 hour')")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect("seed expired replay row");
+        }
+
+        loop {
+            let affected = reap_nip98_replay_cache_batch(&pool, NIP98_REPLAY_CACHE_RETENTION, 2)
+                .await
+                .expect("purge replay cache batch");
+            assert!(
+                affected <= 2,
+                "a batch must never delete more than its bound"
+            );
+            if affected < 2 {
+                break;
+            }
+        }
+
+        let remaining: Vec<(String,)> =
+            sqlx::query_as("SELECT event_id FROM nip98_replay_cache WHERE event_id = ANY($1)")
+                .bind(ids.clone())
+                .fetch_all(&pool)
+                .await
+                .expect("read back replay rows");
+        assert!(
+            remaining.is_empty(),
+            "repeated bounded batches must drain the backlog completely"
+        );
     }
 
     fn signed_http_auth_event_with_payload(
