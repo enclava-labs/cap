@@ -57,9 +57,8 @@ def test_release_generator_scheme_check_is_case_insensitive():
 def test_release_generator_rejects_uppercase_scheme_acme_ca():
     # Codex P1 (cap#165): the ACME CA URL is interpolated verbatim into the
     # tenant Caddyfile, whose renderer (enclava-engine) requires the literal
-    # lowercase `https://` prefix. Signing `HTTPS://…` would let the API
-    # accept and advance the high-water mark, after which every ACME-mode
-    # Caddyfile render fails with no rollback path. trustee_kbs_url (above)
+    # lowercase `https://` prefix. Signing `HTTPS://…` would pass release
+    # validation but fail ACME-mode rendering. trustee_kbs_url (above)
     # keeps parsed-scheme semantics — it is consumed via Url::parse only.
     payload = base_payload()
     payload["tenant_caddy_acme_ca"] = "HTTPS://acme.example.test/directory"

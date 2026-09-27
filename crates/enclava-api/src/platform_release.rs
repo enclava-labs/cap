@@ -6,8 +6,6 @@
 
 use std::path::Path;
 
-use sqlx::PgPool;
-
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use enclava_common::canonical::ce_v1_bytes;
 use serde::{Deserialize, Serialize};
@@ -80,15 +78,6 @@ const _: () = {
 
 #[derive(Debug, Error)]
 pub enum PlatformReleaseError {
-    #[error(
-        "platform release high-water mark {persisted_version} ({persisted_created}) and the bundled release {bundled_version} ({bundled_created}) share created_at but diverge (version or signed payload digest); the two are unorderable, so neither may silently replace the other — reconcile the database record against trusted release history before restarting"
-    )]
-    EqualTimestampDivergentMark {
-        persisted_version: String,
-        persisted_created: String,
-        bundled_version: String,
-        bundled_created: String,
-    },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
@@ -117,19 +106,6 @@ pub enum PlatformReleaseError {
         bundled_version: String,
         bundled_created: String,
     },
-    #[error(
-        "platform release downgrade refused: candidate is {override_version} ({override_created}) but the database floor is {accepted_version} ({accepted_created}); reconcile intentional recovery against trusted release history"
-    )]
-    OverrideDowngradeRefused {
-        override_version: String,
-        override_created: String,
-        accepted_version: String,
-        accepted_created: String,
-    },
-    #[error(
-        "platform release database state is unavailable: {0}; refusing startup without the accepted-release floor"
-    )]
-    Database(#[from] sqlx::Error),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,20 +160,8 @@ impl PlatformRelease {
     }
 }
 
-/// A verified envelope and whether startup owes an accepted-override commit.
-/// Loading does not advance the database floor; main commits only after all
-/// release-derived configuration validates.
-pub struct LoadedPlatformRelease {
-    pub envelope: PlatformReleaseEnvelope,
-    pub override_active: bool,
-}
-
 impl PlatformReleaseEnvelope {
     pub fn load_verified() -> Result<Self, PlatformReleaseError> {
-        Ok(Self::load_verified_for_startup()?.envelope)
-    }
-
-    pub fn load_verified_for_startup() -> Result<LoadedPlatformRelease, PlatformReleaseError> {
         let override_path = std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH")
             .ok()
             .filter(|path| !path.trim().is_empty());
@@ -205,252 +169,20 @@ impl PlatformReleaseEnvelope {
             Some(path) => std::fs::read_to_string(Path::new(path))?,
             None => BUNDLED_PLATFORM_RELEASE.to_string(),
         };
-        Self::load_verified_from_raw(raw, override_path.is_some())
+        Self::load_verified_from_raw(&raw, override_path.is_some())
     }
 
     fn load_verified_from_raw(
-        raw: String,
+        raw: &str,
         override_active: bool,
-    ) -> Result<LoadedPlatformRelease, PlatformReleaseError> {
-        let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
+    ) -> Result<Self, PlatformReleaseError> {
+        let envelope: PlatformReleaseEnvelope = serde_json::from_str(raw)?;
         verify_envelope(envelope.clone())?;
         if override_active {
             enforce_release_not_older_than_bundled(&envelope.payload)?;
         }
-        Ok(LoadedPlatformRelease {
-            envelope,
-            override_active,
-        })
+        Ok(envelope)
     }
-}
-
-/// The state-only lane must enforce the compiled baseline without enabling
-/// release-derived configuration or requiring a separate storage setting.
-pub fn bundled_release_payload() -> Result<PlatformRelease, PlatformReleaseError> {
-    Ok(serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)?.payload)
-}
-
-/// Persisted newest-accepted override. `payload_sha256` digests the exact
-/// canonical bytes the envelope signature covers, so two envelopes that reuse
-/// the same `{version, created_at}` pair with different signed content
-/// (measurements, policy, digests) cannot pass as "the same release".
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct AcceptedOverrideMark {
-    platform_release_version: String,
-    created_at: String,
-    payload_sha256: String,
-}
-
-impl AcceptedOverrideMark {
-    fn of(release: &PlatformRelease) -> Result<Self, PlatformReleaseError> {
-        if release.platform_release_version.trim().is_empty() {
-            return Err(PlatformReleaseError::InvalidField {
-                field: "platform_release_version",
-                message: "empty release version".into(),
-            });
-        }
-        Ok(Self {
-            platform_release_version: release.platform_release_version.clone(),
-            created_at: release.created_at.clone(),
-            payload_sha256: release_payload_sha256(release)?,
-        })
-    }
-}
-
-fn release_payload_sha256(release: &PlatformRelease) -> Result<String, PlatformReleaseError> {
-    // Canonicalization re-validates the hex fields; for an envelope that
-    // already passed verify_envelope this cannot fail, but refuse rather
-    // than persist an empty (match-anything) digest if it ever does.
-    Ok(hex::encode(Sha256::digest(
-        &canonical_platform_release_bytes(release)?,
-    )))
-}
-
-/// The downgrade baseline must never regress below the bundle: a newer API
-/// image can bundle a release newer than a previously accepted override,
-/// and the effective floor is whichever is newer.
-fn newest_mark(
-    persisted: Option<AcceptedOverrideMark>,
-) -> Result<Option<AcceptedOverrideMark>, PlatformReleaseError> {
-    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
-    let bundled_mark = AcceptedOverrideMark::of(&bundled.payload)?;
-    Ok(match persisted {
-        // Strictly older persisted mark: the bundle is the effective floor.
-        Some(p)
-            if matches!(
-                mark_ordering(&p, &bundled_mark)?,
-                MarkOrdering::CandidateOlder
-            ) =>
-        {
-            Some(bundled_mark)
-        }
-        // Equal-timestamp divergence between the persisted mark and the
-        // bundle (e.g. a binary rollback to a differently signed image
-        // whose release reused the timestamp) is UNORDERABLE: silently
-        // preferring either side would let a bundle-identical override
-        // replace a divergent accepted mark (bypassing the equal-
-        // timestamp fail-closed rule) or vice versa. Fail closed.
-        Some(p)
-            if matches!(
-                mark_ordering(&p, &bundled_mark)?,
-                MarkOrdering::EqualTimestampDivergent
-            ) =>
-        {
-            return Err(PlatformReleaseError::EqualTimestampDivergentMark {
-                persisted_version: p.platform_release_version,
-                persisted_created: p.created_at,
-                bundled_version: bundled_mark.platform_release_version,
-                bundled_created: bundled_mark.created_at,
-            });
-        }
-        // Equal or strictly newer persisted mark: it remains the floor.
-        Some(p) => Some(p),
-        None => Some(bundled_mark),
-    })
-}
-
-/// Candidate is stale-or-suspect relative to the baseline: strictly older
-/// timestamp, or an equal timestamp with ANY divergence — different opaque
-/// version OR different signed payload digest. Two envelopes that reuse the
-/// same `{version, created_at}` pair with different measurements, policy, or
-/// image digests are unorderable and fail closed instead of passing as
-/// "the same release".
-enum MarkOrdering {
-    CandidateOlder,
-    CandidateNewer,
-    Equal,
-    EqualTimestampDivergent,
-}
-
-fn mark_ordering(
-    candidate: &AcceptedOverrideMark,
-    baseline: &AcceptedOverrideMark,
-) -> Result<MarkOrdering, PlatformReleaseError> {
-    let candidate_ts = parse_release_timestamp(&candidate.created_at)?;
-    let baseline_ts = parse_release_timestamp(&baseline.created_at)?;
-    Ok(if candidate_ts < baseline_ts {
-        MarkOrdering::CandidateOlder
-    } else if candidate_ts > baseline_ts {
-        MarkOrdering::CandidateNewer
-    } else if candidate.platform_release_version == baseline.platform_release_version
-        && candidate.payload_sha256 == baseline.payload_sha256
-    {
-        MarkOrdering::Equal
-    } else {
-        MarkOrdering::EqualTimestampDivergent
-    })
-}
-
-/// Candidate is stale-or-suspect relative to the baseline: strictly older
-/// timestamp, or an equal timestamp with ANY divergence — different opaque
-/// version OR different signed payload digest. Two envelopes that reuse the
-/// same `{version, created_at}` pair with different measurements, policy, or
-/// image digests are unorderable and fail closed instead of passing as
-/// "the same release".
-fn mark_is_older(
-    candidate: &AcceptedOverrideMark,
-    baseline: &AcceptedOverrideMark,
-) -> Result<bool, PlatformReleaseError> {
-    Ok(matches!(
-        mark_ordering(candidate, baseline)?,
-        MarkOrdering::CandidateOlder | MarkOrdering::EqualTimestampDivergent
-    ))
-}
-
-/// Commit only after release-derived startup validation succeeds. A row lock
-/// covers read, comparison and update, including the first acceptance: the
-/// migration seeds the singleton row before any API process can use it.
-pub async fn commit_override_acceptance(
-    pool: &PgPool,
-    release: &PlatformRelease,
-) -> Result<(), PlatformReleaseError> {
-    enforce_database_floor(pool, release, true).await
-}
-
-/// Used before startup validation, again before serving, and by the watchdog.
-/// Bundled and state-only replicas use their compiled release here too.
-pub async fn check_running_release_current(
-    pool: &PgPool,
-    release: &PlatformRelease,
-) -> Result<(), PlatformReleaseError> {
-    enforce_database_floor(pool, release, false).await
-}
-
-impl PlatformReleaseError {
-    pub fn is_running_release_refused(&self) -> bool {
-        matches!(
-            self,
-            Self::OverrideDowngradeRefused { .. } | Self::EqualTimestampDivergentMark { .. }
-        )
-    }
-}
-
-async fn enforce_database_floor(
-    pool: &PgPool,
-    release: &PlatformRelease,
-    persist: bool,
-) -> Result<(), PlatformReleaseError> {
-    let candidate = AcceptedOverrideMark::of(release)?;
-    let mut tx = pool.begin().await?;
-    // Acceptance must survive a database restart even if the connection's
-    // default was relaxed for ordinary application writes.
-    sqlx::query("SET LOCAL synchronous_commit = on")
-        .execute(&mut *tx)
-        .await?;
-    let (version, created_at, digest): (Option<String>, Option<String>, Option<String>) =
-        sqlx::query_as(
-            "SELECT platform_release_version, created_at, payload_sha256 \
-                        FROM platform_release_state WHERE singleton = TRUE FOR UPDATE",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-    let persisted = match (version, created_at, digest) {
-        (None, None, None) => None, // Only the migration creates this fresh state.
-        (Some(platform_release_version), Some(created_at), Some(payload_sha256)) => {
-            if platform_release_version.trim().is_empty() {
-                return Err(PlatformReleaseError::InvalidField {
-                    field: "platform_release_state",
-                    message: "empty accepted release version".into(),
-                });
-            }
-            parse_release_timestamp(&created_at)?;
-            hex32("accepted payload_sha256", &payload_sha256)?;
-            Some(AcceptedOverrideMark {
-                platform_release_version,
-                created_at,
-                payload_sha256,
-            })
-        }
-        _ => {
-            return Err(PlatformReleaseError::InvalidField {
-                field: "platform_release_state",
-                message: "incomplete accepted release record".into(),
-            });
-        }
-    };
-    if let Some(floor) = newest_mark(persisted.clone())?
-        && mark_is_older(&candidate, &floor)?
-    {
-        return Err(PlatformReleaseError::OverrideDowngradeRefused {
-            override_version: candidate.platform_release_version,
-            override_created: candidate.created_at,
-            accepted_version: floor.platform_release_version,
-            accepted_created: floor.created_at,
-        });
-    }
-    if persist && persisted.as_ref() != Some(&candidate) {
-        sqlx::query(
-            "UPDATE platform_release_state SET platform_release_version = $1, \
-                     created_at = $2, payload_sha256 = $3 WHERE singleton = TRUE",
-        )
-        .bind(&candidate.platform_release_version)
-        .bind(&candidate.created_at)
-        .bind(&candidate.payload_sha256)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await?;
-    Ok(())
 }
 
 /// Reject `release` when it is older than the release compiled into this
@@ -463,9 +195,13 @@ pub fn enforce_release_not_older_than_bundled(
     release: &PlatformRelease,
 ) -> Result<(), PlatformReleaseError> {
     let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
-    let bundled_mark = AcceptedOverrideMark::of(&bundled.payload)?;
-    let candidate_mark = AcceptedOverrideMark::of(release)?;
-    if mark_is_older(&candidate_mark, &bundled_mark)? {
+    let candidate_ts = parse_release_timestamp(&release.created_at)?;
+    let bundled_ts = parse_release_timestamp(&bundled.payload.created_at)?;
+    if candidate_ts < bundled_ts
+        || (candidate_ts == bundled_ts
+            && canonical_platform_release_bytes(release)?
+                != canonical_platform_release_bytes(&bundled.payload)?)
+    {
         return Err(PlatformReleaseError::DowngradeRefused {
             override_version: release.platform_release_version.clone(),
             override_created: release.created_at.clone(),
@@ -691,8 +427,7 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
     // check) are NOT the renderer's predicate — `HTTPS://…`, `;`,
     // `{`/`}`, quotes, tabs/newlines, and non-ASCII all parse as valid
     // https URLs but fail Caddyfile rendering. Apply the engine's exact
-    // validator so the release can never be accepted (and its high-water
-    // mark persisted) if any ACME-mode render would later fail.
+    // validator so a release is rejected if its ACME-mode render would fail.
     if let Err(err) =
         enclava_engine::manifest::ingress::validate_https_url(release.tenant_caddy_acme_ca.trim())
     {
@@ -856,8 +591,7 @@ mod tests {
         // Codex P1 (cap#165): `HTTPS://` parses with scheme https, but the
         // enclava-engine Caddyfile renderer interpolates the value verbatim
         // and requires the literal lowercase `https://` prefix — accepting
-        // it would advance the high-water mark and then fail every
-        // ACME-mode render with no rollback path.
+        // it would pass release validation and then fail ACME-mode rendering.
         let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
         let mut payload = raw.payload;
         payload.tenant_caddy_acme_ca = "HTTPS://acme.example.test/directory".to_string();
@@ -873,8 +607,7 @@ mod tests {
     fn release_payload_rejects_url_parseable_but_unrenderable_acme_ca() {
         // Codex P1 (cap#165, reviewer follow-up): these all pass
         // Url::parse with scheme https yet fail the Caddyfile renderer's
-        // predicate — a prefix-only acceptance check would strand the
-        // deployment above its last working override.
+        // predicate, so a prefix-only acceptance check is insufficient.
         let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
         for bad in [
             "https://acme.example.test/directory;extra",
@@ -901,24 +634,6 @@ mod tests {
                 "unrenderable ACME CA {bad:?} must be rejected: {err:?}"
             );
         }
-    }
-
-    #[test]
-    fn newest_mark_fails_closed_on_equal_timestamp_divergence_with_bundle() {
-        // Codex P1 (cap#165 round 6): a persisted mark sharing created_at
-        // with the bundled release but diverging in version/digest must
-        // NOT be silently discarded in favor of the bundle — the state-only
-        // removal guard would then compare the bundle against itself and
-        // an override identical to the bundle could replace the divergent
-        // accepted mark, bypassing the equal-timestamp fail-closed rule.
-        let bundled = bundled_payload();
-        let mut divergent = AcceptedOverrideMark::of(&bundled).unwrap();
-        divergent.platform_release_version =
-            format!("{}-divergent", divergent.platform_release_version);
-        assert!(matches!(
-            newest_mark(Some(divergent)),
-            Err(PlatformReleaseError::EqualTimestampDivergentMark { .. })
-        ));
     }
 
     fn bundled_payload() -> PlatformRelease {
@@ -974,82 +689,16 @@ mod tests {
     }
 
     fn resigned_envelope_with_created_at(created_at: &str) -> String {
-        resigned_envelope_with(
-            created_at,
-            &format!("dev-stale-{}", created_at).replace(':', ""),
-            None,
-        )
-    }
-
-    fn resigned_envelope_with(
-        created_at: &str,
-        platform_release_version: &str,
-        trustee_kbs_url: Option<&str>,
-    ) -> String {
         use ed25519_dalek::{Signer, SigningKey};
-        // The committed fixture key (DEV_FIXTURE_SIGNING_KEY_HEX in
-        // crates/enclava-cli/scripts/generate-platform-release.py) matches
-        // the test root pinned below, so the re-signed envelope is
-        // "validly signed" for verify_envelope.
         let key = SigningKey::from_bytes(&[0xc0; 32]);
         let mut envelope =
             serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE).unwrap();
         envelope.payload.created_at = created_at.to_string();
-        envelope.payload.platform_release_version = platform_release_version.to_string();
-        if let Some(url) = trustee_kbs_url {
-            envelope.payload.trustee_kbs_url = url.to_string();
-        }
+        envelope.payload.platform_release_version = format!("release-{created_at}");
         let canonical = canonical_platform_release_bytes(&envelope.payload).unwrap();
         envelope.signature = hex::encode(key.sign(&canonical).to_bytes());
         envelope.signing_pubkey = hex::encode(key.verifying_key().as_bytes());
         serde_json::to_string(&envelope).unwrap()
-    }
-
-    // Each case owns a schema in the caller's disposable PostgreSQL database.
-    async fn state_database() -> (PgPool, String) {
-        let url =
-            std::env::var("DATABASE_URL").expect("set DATABASE_URL to a disposable test database");
-        let admin = PgPool::connect(&url).await.unwrap();
-        let schema = format!("release_state_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&admin)
-            .await
-            .unwrap();
-        let options = url
-            .parse::<sqlx::postgres::PgConnectOptions>()
-            .unwrap()
-            .options([("search_path", schema.as_str())]);
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(4)
-            .connect_with(options)
-            .await
-            .unwrap();
-        sqlx::raw_sql(include_str!(
-            "../migrations/0050_platform_release_state.sql"
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
-        admin.close().await;
-        (pool, schema)
-    }
-
-    async fn drop_state_database(pool: PgPool, schema: String) {
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
-    }
-
-    fn signed_release(timestamp: &str) -> PlatformRelease {
-        PlatformReleaseEnvelope::load_verified_from_raw(
-            resigned_envelope_with_created_at(timestamp),
-            true,
-        )
-        .unwrap()
-        .envelope
-        .payload
     }
 
     #[test]
@@ -1057,233 +706,33 @@ mod tests {
         let raw = resigned_envelope_with_created_at("2020-01-01T00:00:00Z");
         verify_envelope(serde_json::from_str(&raw).unwrap()).unwrap();
         assert!(matches!(
-            PlatformReleaseEnvelope::load_verified_from_raw(raw, true),
+            PlatformReleaseEnvelope::load_verified_from_raw(&raw, true),
             Err(PlatformReleaseError::DowngradeRefused { .. })
         ));
     }
 
-    #[tokio::test]
-    async fn whitespace_release_versions_cannot_advance_the_floor() {
-        let (pool, schema) = state_database().await;
-        let accepted = signed_release("2999-01-01T00:00:00Z");
-        commit_override_acceptance(&pool, &accepted).await.unwrap();
-        for version in ["", " ", "\t", "\r\n", "\u{00a0}", "\u{2003}"] {
-            let raw = resigned_envelope_with("2999-01-02T00:00:00Z", version, None);
-            let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw).unwrap();
-            assert!(matches!(
-                PlatformReleaseEnvelope::load_verified_from_raw(raw, true),
-                Err(PlatformReleaseError::InvalidField {
-                    field: "platform_release_version",
-                    ..
-                })
-            ));
-            assert!(matches!(
-                commit_override_acceptance(&pool, &envelope.payload).await,
-                Err(PlatformReleaseError::InvalidField {
-                    field: "platform_release_version",
-                    ..
-                })
-            ));
-        }
-        check_running_release_current(&pool, &accepted)
-            .await
-            .unwrap();
-        drop_state_database(pool, schema).await;
-    }
-
-    #[tokio::test]
-    async fn postgres_floor_survives_reconnect_and_override_removal() {
-        let (pool, schema) = state_database().await;
-        let older = signed_release("2999-01-01T00:00:00Z");
-        let newer = signed_release("2999-01-02T00:00:00Z");
-        // Startup may still fail configuration validation after this read.
-        check_running_release_current(&pool, &newer).await.unwrap();
-        let untouched: Option<String> =
-            sqlx::query_scalar("SELECT platform_release_version FROM platform_release_state")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(
-            untouched.is_none(),
-            "validation alone must not advance the floor"
-        );
-        commit_override_acceptance(&pool, &older).await.unwrap();
-        commit_override_acceptance(&pool, &newer).await.unwrap();
-        let options = (*pool.connect_options()).clone();
-        pool.close().await;
-        let pool = PgPool::connect_with(options).await.unwrap();
-        check_running_release_current(&pool, &newer).await.unwrap();
-        for release in [&older, &bundled_release_payload().unwrap()] {
-            let error = check_running_release_current(&pool, release)
-                .await
-                .unwrap_err();
-            assert!(error.is_running_release_refused());
-            assert!(commit_override_acceptance(&pool, release).await.is_err());
-        }
-        // Removing the override/policy flags uses this same bundled comparison.
-        drop_state_database(pool, schema).await;
-    }
-
-    #[tokio::test]
-    async fn postgres_serializes_first_acceptance_and_rechecks_after_waiting() {
-        let (pool, schema) = state_database().await;
-        let older = signed_release("2999-01-01T00:00:00Z");
-        let newer = signed_release("2999-01-02T00:00:00Z");
-        let (old_result, new_result) = tokio::join!(
-            commit_override_acceptance(&pool, &older),
-            commit_override_acceptance(&pool, &newer),
-        );
-        new_result.unwrap();
-        assert!(old_result.is_ok() || old_result.unwrap_err().is_running_release_refused());
-        check_running_release_current(&pool, &newer).await.unwrap();
-        assert!(
-            check_running_release_current(&pool, &older)
-                .await
-                .unwrap_err()
-                .is_running_release_refused()
-        );
-
-        // Hold the real database row as another replica advances it. A stale
-        // writer must wait and compare the newly committed value, not its old snapshot.
-        let newest = signed_release("2999-01-03T00:00:00Z");
-        let mark = AcceptedOverrideMark::of(&newest).unwrap();
-        let mut tx = pool.begin().await.unwrap();
-        sqlx::query("UPDATE platform_release_state SET platform_release_version=$1, created_at=$2, payload_sha256=$3")
-            .bind(&mark.platform_release_version).bind(&mark.created_at).bind(&mark.payload_sha256)
-            .execute(&mut *tx).await.unwrap();
-        let contender_pool = pool.clone();
-        let mut contender =
-            tokio::spawn(async move { commit_override_acceptance(&contender_pool, &newer).await });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut contender)
-                .await
-                .is_err()
-        );
-        tx.commit().await.unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), contender)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap_err()
-                .is_running_release_refused()
-        );
-        check_running_release_current(&pool, &newest).await.unwrap();
-        drop_state_database(pool, schema).await;
-    }
-
-    #[tokio::test]
-    async fn postgres_refuses_equal_timestamp_divergence_and_corrupt_state() {
-        let (pool, schema) = state_database().await;
-        let accepted = signed_release("2999-01-01T00:00:00Z");
-        commit_override_acceptance(&pool, &accepted).await.unwrap();
-        for (version, url) in [
-            ("different-version", None),
-            (
-                accepted.platform_release_version.as_str(),
-                Some("https://different.example"),
-            ),
+    #[test]
+    fn newer_override_does_not_prevent_restoring_an_older_valid_override_or_bundle() {
+        for timestamp in [
+            "2999-01-01T00:00:00Z",
+            "2999-01-02T00:00:00Z",
+            "2999-01-01T00:00:00Z",
         ] {
-            let release = PlatformReleaseEnvelope::load_verified_from_raw(
-                resigned_envelope_with(&accepted.created_at, version, url),
-                true,
-            )
-            .unwrap()
-            .envelope
-            .payload;
-            assert!(
-                commit_override_acceptance(&pool, &release)
-                    .await
-                    .unwrap_err()
-                    .is_running_release_refused()
-            );
+            let raw = resigned_envelope_with_created_at(timestamp);
+            let loaded = PlatformReleaseEnvelope::load_verified_from_raw(&raw, true).unwrap();
+            assert_eq!(loaded.payload.created_at, timestamp);
         }
-        sqlx::query("UPDATE platform_release_state SET created_at='corrupt'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(matches!(
-            check_running_release_current(&pool, &accepted).await,
-            Err(PlatformReleaseError::InvalidField {
-                field: "created_at",
-                ..
-            })
-        ));
-        sqlx::query("DELETE FROM platform_release_state")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(matches!(
-            commit_override_acceptance(&pool, &accepted).await,
-            Err(PlatformReleaseError::Database(sqlx::Error::RowNotFound))
-        ));
-        sqlx::query("DROP TABLE platform_release_state")
-            .execute(&pool)
-            .await
-            .unwrap();
-        assert!(matches!(
-            check_running_release_current(&pool, &accepted).await,
-            Err(PlatformReleaseError::Database(_))
-        ));
-        let closed_pool = pool.clone();
-        drop_state_database(pool, schema).await;
-        assert!(matches!(
-            check_running_release_current(&closed_pool, &accepted).await,
-            Err(PlatformReleaseError::Database(sqlx::Error::PoolClosed))
-        ));
+        PlatformReleaseEnvelope::load_verified_from_raw(BUNDLED_PLATFORM_RELEASE, false).unwrap();
+        PlatformReleaseEnvelope::load_verified_from_raw(BUNDLED_PLATFORM_RELEASE, true).unwrap();
     }
 
-    #[tokio::test]
-    async fn postgres_preserves_bundle_floor_and_records_matching_override() {
-        let (pool, schema) = state_database().await;
-        let bundled = bundled_payload();
-        check_running_release_current(&pool, &bundled)
-            .await
-            .unwrap();
-        let mark: Option<String> =
-            sqlx::query_scalar("SELECT payload_sha256 FROM platform_release_state")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(
-            mark.is_none(),
-            "bundled checks must not advance the override floor"
-        );
-        commit_override_acceptance(&pool, &bundled).await.unwrap();
-        let digest: String =
-            sqlx::query_scalar("SELECT payload_sha256 FROM platform_release_state")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(digest, release_payload_sha256(&bundled).unwrap());
-        sqlx::query("UPDATE platform_release_state SET platform_release_version='divergent'")
-            .execute(&pool)
-            .await
-            .unwrap();
+    #[test]
+    fn equal_timestamp_divergent_payload_fails_closed() {
+        let mut divergent = bundled_payload();
+        divergent.trustee_kbs_url = "https://different.example".into();
         assert!(matches!(
-            check_running_release_current(&pool, &bundled).await,
-            Err(PlatformReleaseError::EqualTimestampDivergentMark { .. })
+            enforce_release_not_older_than_bundled(&divergent),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
         ));
-        let newer = signed_release("2999-01-01T00:00:00Z");
-        assert!(matches!(
-            commit_override_acceptance(&pool, &newer).await,
-            Err(PlatformReleaseError::EqualTimestampDivergentMark { .. })
-        ));
-        sqlx::query("UPDATE platform_release_state SET created_at='2020-01-01T00:00:00Z'")
-            .execute(&pool)
-            .await
-            .unwrap();
-        check_running_release_current(&pool, &bundled)
-            .await
-            .unwrap();
-        let mut stale = bundled.clone();
-        stale.created_at = "2020-01-02T00:00:00Z".into();
-        assert!(
-            commit_override_acceptance(&pool, &stale)
-                .await
-                .unwrap_err()
-                .is_running_release_refused()
-        );
-        drop_state_database(pool, schema).await;
     }
 }

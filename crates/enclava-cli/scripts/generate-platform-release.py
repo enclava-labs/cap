@@ -361,9 +361,8 @@ def validate_payload(payload: dict[str, str], *, allow_dev_internal_tls: bool = 
     # predicate: literal lowercase `https://` prefix after trim, no
     # \n \r space \t NUL backtick " ' { } ; bytes anywhere, ASCII-only.
     # Url-parse-level checks (scheme https, valid host) do NOT cover this —
-    # signing a value the renderer rejects would let the API accept and
-    # advance the high-water mark, after which every ACME-mode Caddyfile
-    # render fails with the older working override no longer restorable.
+    # signing a value the renderer rejects would pass release validation
+    # but fail ACME-mode Caddyfile rendering.
     # Mirror of enclava_engine::manifest::ingress::validate_https_url.
     # (trustee_kbs_url keeps parsed-scheme semantics: consumed via
     # Url::parse only.)

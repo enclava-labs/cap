@@ -81,8 +81,6 @@ spec:
               key: database-url
         - name: DATABASE_MIGRATION_MODE
           value: verify
-        # Accepted platform releases are recorded in the existing CAP database.
-        # Apply the release's database migrations before starting the API.
         # Keep false through migration, clean-cut proof, provider convergence,
         # and smoke tests. Enable only in a later activation rollout.
         - name: CAP_DEPLOYMENT_DISPATCH_ENABLED

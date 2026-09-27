@@ -373,23 +373,18 @@ fn validate_platform_release_runtime_class(
 fn load_platform_release(
     enabled: bool,
     effective_runtime_class: &str,
-) -> anyhow::Result<Option<enclava_api::platform_release::LoadedPlatformRelease>> {
-    if std::env::var_os("ENCLAVA_PLATFORM_RELEASE_STATE").is_some_and(|v| !v.is_empty()) {
-        anyhow::bail!(
-            "ENCLAVA_PLATFORM_RELEASE_STATE is retired: preserve and migrate any existing file mark into PostgreSQL before removing this setting; see DEPLOYMENT.md"
-        );
-    }
+) -> anyhow::Result<Option<PlatformReleaseEnvelope>> {
     if !enabled {
         return Ok(None);
     }
-    let loaded = PlatformReleaseEnvelope::load_verified_for_startup()
+    let envelope = PlatformReleaseEnvelope::load_verified()
         .map_err(|e| anyhow::anyhow!("failed to load signed platform release: {e}"))?;
-    let release = &loaded.envelope.payload;
+    let release = &envelope.payload;
     validate_platform_release_runtime_class(
         &release.expected_runtime_class,
         effective_runtime_class,
     )?;
-    Ok(Some(loaded))
+    Ok(Some(envelope))
 }
 
 fn release_env_value(
@@ -675,7 +670,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let platform_release_loaded = match load_platform_release(
+    let platform_release_envelope = match load_platform_release(
         platform_release_enabled(trustee_policy_read_available),
         &effective_runtime_class,
     ) {
@@ -685,10 +680,6 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let override_active = platform_release_loaded
-        .as_ref()
-        .is_some_and(|loaded| loaded.override_active);
-    let platform_release_envelope = platform_release_loaded.map(|loaded| loaded.envelope);
     if let Some(envelope) = &platform_release_envelope {
         let release = &envelope.payload;
         tracing::info!(
@@ -712,26 +703,15 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        if !release.trustee_kbs_ca_cert_pem.trim().is_empty() {
-            if let Err(e) = require_env_matches_release(
+        if !release.trustee_kbs_ca_cert_pem.trim().is_empty()
+            && let Err(e) = require_env_matches_release(
                 "TRUSTEE_KBS_CA_CERT_PEM",
                 &release.trustee_kbs_ca_cert_pem,
                 true,
-            ) {
-                eprintln!("startup refused: {e}");
-                std::process::exit(1);
-            }
-            // Codex P1 (cap#165): parse the PEM before the high-water mark
-            // is advanced — build_trustee_http_client (which parses it
-            // again) runs after the commit, and a signed release with an
-            // unloadable CA must not raise the floor and strand startup.
-            let cert_pem = release.trustee_kbs_ca_cert_pem.replace("\\n", "\n");
-            if let Err(e) = reqwest::Certificate::from_pem(cert_pem.as_bytes()) {
-                eprintln!(
-                    "startup refused: signed platform release carries an invalid TRUSTEE_KBS_CA_CERT_PEM: {e}"
-                );
-                std::process::exit(1);
-            }
+            )
+        {
+            eprintln!("startup refused: {e}");
+            std::process::exit(1);
         }
     }
 
@@ -784,7 +764,7 @@ async fn main() {
             eprintln!("startup refused: invalid sidecar pin configuration: {e}");
             std::process::exit(1);
         }
-    };
+    }
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let api_url = std::env::var("API_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
@@ -803,17 +783,6 @@ async fn main() {
     enclava_api::db::pool::prepare_schema(&pool, migration_mode)
         .await
         .expect("database schema is not ready for this binary");
-
-    // Always consult the same durable floor, even when the override and all
-    // release-lane flags have been removed. This read cannot advance it.
-    let running_release = match &platform_release_envelope {
-        Some(envelope) => envelope.payload.clone(),
-        None => enclava_api::platform_release::bundled_release_payload()
-            .expect("startup refused: invalid bundled release"),
-    };
-    enclava_api::platform_release::check_running_release_current(&pool, &running_release)
-        .await
-        .expect("startup refused: platform release database floor");
 
     let signing_key = load_signing_key().expect("failed to load API signing key");
     tracing::info!(
@@ -861,48 +830,6 @@ async fn main() {
             env_nonempty("PLATFORM_SIGNING_SERVICE_TOKEN"),
         )
         .expect("failed to configure platform signing service client")
-    });
-
-    // Release-derived runtime, env, attestation and signing configuration
-    // has now validated. Recheck under the row lock before committing or
-    // serving, since another replica may have advanced the floor meanwhile.
-    let acceptance = if override_active {
-        enclava_api::platform_release::commit_override_acceptance(&pool, &running_release).await
-    } else {
-        enclava_api::platform_release::check_running_release_current(&pool, &running_release).await
-    };
-    if let Err(e) = acceptance {
-        eprintln!("startup refused: {e}");
-        std::process::exit(1);
-    }
-    // All lanes share the database, including replicas using only the bundle.
-    // A running older replica must stop after another accepts a newer release.
-    let release_pool = pool.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            match enclava_api::platform_release::check_running_release_current(
-                &release_pool,
-                &running_release,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(e) if e.is_running_release_refused() => {
-                    eprintln!(
-                        "terminating: the platform-release database floor no longer admits this replica ({e})"
-                    );
-                    std::process::abort();
-                }
-                // Preserve existing runtime behavior for transient storage
-                // trouble; startup itself always fails closed on these errors.
-                Err(e) => {
-                    eprintln!("platform-release watchdog: recheck failed, retrying next tick: {e}")
-                }
-            }
-        }
     });
     let require_customer_signed_policy_artifact =
         env_flag("REQUIRE_CUSTOMER_SIGNED_POLICY_ARTIFACT");
@@ -1271,50 +1198,6 @@ mod tests {
                 .unwrap(),
                 CapManagementMode::Standalone
             );
-        }
-    }
-
-    #[test]
-    fn state_env_alone_does_not_enable_the_release_lane() {
-        // Retired file state must not silently disappear during adoption.
-        let vars = [
-            "TRUSTEE_POLICY_READ_AVAILABLE",
-            "ENCLAVA_USE_PLATFORM_RELEASE",
-            "ENCLAVA_PLATFORM_RELEASE_PATH",
-            "ENCLAVA_PLATFORM_RELEASE_STATE",
-        ];
-        let saved: Vec<(String, Option<std::ffi::OsString>)> = vars
-            .iter()
-            .map(|name| (name.to_string(), std::env::var_os(name)))
-            .collect();
-        // Env mutation is test-only single-threaded here; no other test in
-        // this binary reads these four vars concurrently.
-        unsafe {
-            for name in vars {
-                std::env::remove_var(name);
-            }
-            // Nothing set: disabled.
-            assert!(!platform_release_enabled(false));
-            std::env::set_var("ENCLAVA_PLATFORM_RELEASE_STATE", "/var/lib/enclava/x");
-            assert!(!platform_release_enabled(false));
-            assert!(load_platform_release(false, "kata-qemu-snp").is_err());
-            assert!(load_platform_release(true, "kata-qemu-snp").is_err());
-            // Each real release-lane trigger enables it (with STATE still
-            // set, matching a fully-wired deployment). The trustee flag is
-            // passed as a parameter (the production caller reads the env
-            // var once), so exercise it via the argument, not the env.
-            assert!(platform_release_enabled(true));
-            std::env::set_var("ENCLAVA_USE_PLATFORM_RELEASE", "true");
-            assert!(platform_release_enabled(false));
-            std::env::remove_var("ENCLAVA_USE_PLATFORM_RELEASE");
-            std::env::set_var("ENCLAVA_PLATFORM_RELEASE_PATH", "/etc/release.json");
-            assert!(platform_release_enabled(false));
-            for (name, value) in saved {
-                match value {
-                    Some(v) => std::env::set_var(name, v),
-                    None => std::env::remove_var(name),
-                }
-            }
         }
     }
 }

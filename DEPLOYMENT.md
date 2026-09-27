@@ -168,63 +168,20 @@ Release verification checks:
 - genpolicy version;
 - policy template hash;
 - runtime class expected by the engine;
-- when `ENCLAVA_PLATFORM_RELEASE_PATH` overrides the bundle: the override
-  is not older than the bundled release (downgrade refused), not older than
-  the newest release ever accepted on this override lane (persisted
-  high-water mark, downgrade refused), and not a same-`{version, created_at}`
-  envelope with different signed content (the mark pins the canonical
-  payload digest). A PostgreSQL transaction locks the shared row while
-  comparing and advancing it, including the first concurrent acceptance.
+- API overrides must not predate the binary's bundled release; equal timestamps
+  with different signed payloads are rejected.
+
+The API compares overrides only with its compiled bundle. Accepting a newer
+override does not change that minimum: a previous signed override can be
+restored if it still passes validation and is not older than the bundle.
+Removing the override selects the bundle again. This check adds no database
+migration, persistent release state, or replica-termination watchdog.
+Existing database-schema compatibility and CLI per-API release-history checks
+still apply; this is not a guarantee that any older API image or client will
+accept a rollback.
 
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.
-
-The high-water mark lives in `platform_release_state` in CAP's existing
-PostgreSQL database (`DATABASE_URL`), shared by all API replicas in that
-environment. It contains the accepted release version, signed creation time,
-and canonical payload SHA-256, not credentials or user data. It is platform
-state, independent of user profiles. No additional database service, state PVC,
-filesystem lock, or storage environment variable is required.
-
-Apply migration `0050_platform_release_state.sql` before starting the new API
-image, using the `cap-migrate` Job and `DATABASE_MIGRATION_MODE=verify`
-startup ordering documented under [Kubernetes](#kubernetes). The migration seeds
-a singleton row; a missing row or table,
-corrupt record, or unavailable database refuses startup rather than silently
-resetting the floor. The API advances the row only after all release-derived
-startup configuration validates. Updates use a row lock and synchronous commit.
-A check-only bundled startup never advances the accepted-override mark.
-
-Removing `ENCLAVA_PLATFORM_RELEASE_PATH`, disabling policy-read mode, or
-replacing a pod does not remove this gate. Every startup compares its effective
-release (the compiled bundle when the release lane is disabled) against the
-database floor. Every running replica rechecks it every 60 seconds and stops
-if another replica has accepted a release that makes its own release stale or
-unorderable. Transient database errors during a running recheck are logged and
-retried, matching the former file watchdog; startup itself fails closed.
-
-Treat this row as security state during backup and restore. An older database
-backup can lower the remembered floor. Before resuming CAP, preserve or
-reconcile the highest previously accepted version, timestamp and payload hash
-against trusted signed release history. Do not delete/reseed the row to make a
-rollback boot. Anyone holding CAP's database write credentials, including a
-compromised API pod, can alter or delete this unsigned record. The gate does
-not defend against that access or rollback of the entire database. A stronger
-threat model needs independently protected state.
-
-### Adopting from preview file state
-
-The retired `ENCLAVA_PLATFORM_RELEASE_STATE` setting fails startup with a
-migration message even if the release lane is disabled. If a preview deployment
-already has a file mark, stop all CAP replicas, preserve the file, verify its
-version/timestamp/hash against trusted signed release history, and reconcile
-it with any existing database mark under a transaction locking the singleton
-row. Keep the newest compatible mark; equal-timestamp divergent content must
-be resolved against trusted history, not overwritten. Only after verifying the
-committed database record may the old setting/mount be removed and CAP resumed.
-The optional PVC component has been removed; retain any existing volume until
-its state has been safely adopted. Fresh installations need only the normal
-migration, with no file import.
 
 ### Rotating the production root
 
@@ -268,30 +225,12 @@ Deploy the digest reference from that artifact, not a mutable tag.
 
 ## Kubernetes
 
-The API uses `DATABASE_MIGRATION_MODE=verify`. On both first installation and
-every upgrade, run migrations from the **same digest-pinned image** before
-applying the API overlay. Provision `api-secrets` (including `database-url`)
-and `ghcr-login` in `enclava-platform` first. The migration Job is deliberately
-excluded from the overlay: applying a Job and Deployment together does not
-order their execution.
-
-Run from the repository root, with the digest from the release artifact:
+The checked-in overlay is intentionally minimal:
 
 ```bash
-set -euo pipefail
-CAP_API_IMAGE='ghcr.io/enclava-labs/enclava-api@sha256:<release-digest>'
-(cd deploy/api && kustomize edit set image "ghcr.io/enclava-labs/enclava-api=$CAP_API_IMAGE")
-kubectl apply -f deploy/api/namespace.yaml
-CAP_MIGRATION_JOB=$(kubectl set image --local -f deploy/api/migration.yaml "migrate=$CAP_API_IMAGE" -o yaml |
-  kubectl create -f - -o name)
-kubectl -n enclava-platform wait --for=condition=complete "$CAP_MIGRATION_JOB" --timeout=600s
 kubectl apply -k deploy/api/
 kubectl -n enclava-platform rollout status deploy/enclava-api
 ```
-
-If migration fails or times out, stop before applying the API and inspect
-`kubectl -n enclava-platform logs "$CAP_MIGRATION_JOB"`. Correct the cause before
-retrying; retain the existing API and database state.
 
 Before using it outside local experimentation:
 
