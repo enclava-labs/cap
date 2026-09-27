@@ -1,0 +1,26 @@
+-- no-transaction
+-- Built CONCURRENTLY (and therefore outside a transaction) so applying the
+-- migration against a live table full of accumulated replay rows does not
+-- take a lock that blocks NIP-98 login INSERTs for the duration of the
+-- index build. Note for a zero-downtime rollout: run this via cap_migrate
+-- while at most one API revision is serving; a failed CONCURRENTLY build
+-- leaves an INVALID index that must be dropped before retrying.
+--
+-- Recovery from failed CONCURRENTLY:
+--   1. Drop the invalid index if it exists:
+--      DROP INDEX IF EXISTS nip98_replay_cache_first_seen_purge;
+--   2. Clean up the dirty SQLx ledger entry (the migration runner records
+--      the attempt before executing, so a failure leaves it marked failed):
+--      DELETE FROM _sqlx_migrations WHERE version = 51;
+--   3. Retry the migration: cap_migrate will re-execute from a clean slate.
+--
+-- The NIP-98 replay-cache reaper purges with `WHERE first_seen < now() -
+-- interval`, which cannot use the event_id primary key. Under sustained
+-- unauthenticated Nostr login traffic that made every hourly purge a
+-- full-table scan over the rows accumulated since the previous tick (up to
+-- ~75 minutes of logins: 15-minute retention + up to 60 minutes between
+-- reaper ticks) followed by one large DELETE transaction on each replica.
+--
+-- This first_seen-leading index serves the purge predicate directly.
+CREATE INDEX CONCURRENTLY nip98_replay_cache_first_seen_purge
+    ON nip98_replay_cache (first_seen);

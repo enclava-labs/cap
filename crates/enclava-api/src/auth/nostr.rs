@@ -17,8 +17,18 @@ use uuid::Uuid;
 
 /// Replay cache retention. A cached event id only matters while the event
 /// is inside the 60-second freshness window; 15 minutes comfortably covers
-/// clock skew between API replicas and keeps the table bounded.
+/// clock skew between API replicas.
 const NIP98_REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(15 * 60);
+
+/// Reaper tick interval. An expired row can survive up to
+/// `NIP98_REPLAY_CACHE_RETENTION + NIP98_REPLAY_CACHE_REAP_INTERVAL`
+/// (~75 minutes worst case) before the next purge deletes it, so the table
+/// is bounded by the login-event rate of a ~75-minute window, not 15.
+/// This is a table-size bound only — rows are security-inert once the
+/// event leaves the 60-second freshness window. The `first_seen` purge
+/// index (migration 0051) keeps each hourly DELETE an index scan over that
+/// backlog instead of a full-table scan.
+const NIP98_REPLAY_CACHE_REAP_INTERVAL: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum NostrAuthError {
@@ -234,14 +244,16 @@ pub async fn reap_nip98_replay_cache(pool: &PgPool) -> Result<u64, NostrAuthErro
     Ok(result.rows_affected())
 }
 
-/// Periodically purge expired replay-cache rows so the table stays bounded.
+/// Periodically purge expired replay-cache rows so the table stays bounded
+/// (worst-case accumulation between purges: retention + one tick interval,
+/// see the `NIP98_REPLAY_CACHE_*` constants above).
 pub fn spawn_nip98_replay_cache_reaper(pool: PgPool) {
     use tokio::time::{MissedTickBehavior, interval};
 
     tokio::spawn(async move {
         // First tick fires immediately, which also cleans up any backlog
         // left by a previous instance.
-        let mut interval = interval(Duration::from_secs(3600));
+        let mut interval = interval(NIP98_REPLAY_CACHE_REAP_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
@@ -348,6 +360,33 @@ mod tests {
         JsonUtil::as_json(&event)
     }
 
+    /// Build a signed NIP-98 event pinned to an explicit `created_at` and
+    /// carrying a per-attempt `nonce` tag — the shape enclava-cli produces
+    /// for every login attempt (see `build_nip98_login_event` there).
+    fn signed_http_auth_event_with_nonce(
+        keys: &Keys,
+        url: &str,
+        method: &str,
+        nonce: &str,
+        created_at: Timestamp,
+    ) -> String {
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tag(Tag::parse(["u".to_string(), url.to_string()]).expect("failed to build url tag"))
+            .tag(
+                Tag::parse(["method".to_string(), method.to_string()])
+                    .expect("failed to build method tag"),
+            )
+            .tag(
+                Tag::parse(["nonce".to_string(), nonce.to_string()])
+                    .expect("failed to build nonce tag"),
+            )
+            .custom_created_at(created_at)
+            .sign_with_keys(keys)
+            .expect("failed to sign NIP-98 event");
+
+        JsonUtil::as_json(&event)
+    }
+
     async fn nostr_test_pool() -> PgPool {
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
@@ -449,6 +488,51 @@ mod tests {
         let fresh: Event = Event::from_json(&fresh_json).unwrap();
         sqlx::query("DELETE FROM nip98_replay_cache WHERE event_id = ANY($1)")
             .bind(vec![event.id.to_hex(), fresh.id.to_hex()])
+            .execute(&pool)
+            .await
+            .expect("clean up replay cache test rows");
+    }
+
+    /// The retry path: when a login request reaches the server but its
+    /// response is lost (or a later login step fails), the event id is
+    /// already burned. Re-signing with the same key in the same second
+    /// reproduces the same event id unless the event carries per-attempt
+    /// entropy, so the client adds a fresh `nonce` tag on every attempt (see
+    /// `build_nip98_login_event` in enclava-cli). The replay guard must
+    /// accept that re-signed event: its id is distinct and unclaimed.
+    #[tokio::test]
+    async fn verify_and_consume_accepts_same_second_resign_with_fresh_nonce() {
+        let pool = nostr_test_pool().await;
+        let url = "https://api.example.test/auth/login";
+        let keys = Keys::generate();
+        let created = Timestamp::now();
+        let first_json =
+            signed_http_auth_event_with_nonce(&keys, url, "POST", "attempt-1", created);
+        let retry_json =
+            signed_http_auth_event_with_nonce(&keys, url, "POST", "attempt-2", created);
+
+        let first: Event = Event::from_json(&first_json).unwrap();
+        let retry: Event = Event::from_json(&retry_json).unwrap();
+        assert_eq!(first.created_at, retry.created_at);
+        assert_ne!(
+            first.id, retry.id,
+            "per-attempt nonce must change the event id within the same second"
+        );
+
+        assert!(
+            verify_and_consume_nip98_event(&pool, &first_json, url, "POST")
+                .await
+                .is_ok()
+        );
+        assert!(
+            verify_and_consume_nip98_event(&pool, &retry_json, url, "POST")
+                .await
+                .is_ok(),
+            "a same-second re-sign with a fresh nonce is a fresh attempt, not a replay"
+        );
+
+        sqlx::query("DELETE FROM nip98_replay_cache WHERE event_id = ANY($1)")
+            .bind(vec![first.id.to_hex(), retry.id.to_hex()])
             .execute(&pool)
             .await
             .expect("clean up replay cache test rows");
