@@ -729,10 +729,13 @@ impl TeeClient {
         attestation: &mut TransitionReceiptAttestation,
     ) -> Result<(), TeeError> {
         let Some(quote) = attestation.quote.as_mut() else {
-            // Quote-less development evidence carries no AMD chain at all;
-            // there is no CRL collateral to attach and the API rejects the
-            // transition regardless.
-            return Ok(());
+            // Quote-less development evidence cannot satisfy the API's unlock-mode
+            // transition gate. Fail here rather than let the TEE modification
+            // proceed while the API rejects the subsequent request, leaving
+            // persisted deployment mode inconsistent.
+            return Err(TeeError::Attestation(
+                "unlock-mode transition requires a raw AMD SNP quote".to_string(),
+            ));
         };
         let report_bytes = B64_STANDARD
             .decode(quote.report_b64.as_bytes())
@@ -1473,13 +1476,9 @@ async fn fetch_amd_kds_crl_der(
 ) -> Result<Arc<Vec<u8>>, TeeError> {
     const CRL_CACHE_TTL: Duration = Duration::from_secs(600);
     let cache = CRL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = {
-        // Cache identity is the path only: the authority is fixed per
-        // `ENCLAVA_AMD_KDS_BASE_URL` and must not leak into map keys that
-        // outlive a relay reconfiguration.
-        let path = crl_url.split_once("/vcek/").map(|(_, rest)| rest);
-        path.unwrap_or_default().to_string()
-    };
+    // Key the cache by the complete CRL URL, including the authority, so
+    // switching relays cannot reuse collateral from the previous endpoint.
+    let key = crl_url.to_string();
     if let Ok(guard) = cache.lock()
         && let Some(cached) = guard.get(&key)
         && cached.cached_at.elapsed() < CRL_CACHE_TTL

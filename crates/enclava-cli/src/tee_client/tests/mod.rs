@@ -927,12 +927,20 @@ async fn complete_transition_quote_crl_fetches_and_attaches_crl() {
     );
     assert_eq!(requests.load(Ordering::Relaxed), 1);
 
-    // Quote-less development evidence is a no-op, not an error.
+    // Quote-less development evidence cannot satisfy the API's unlock-mode
+    // transition gate - it must fail here rather than proceeding with a
+    // transition that the API will reject.
     let mut quoteless = attestation.clone();
     quoteless.quote = None;
-    tee.complete_transition_quote_crl(&mut quoteless)
+    let err = tee
+        .complete_transition_quote_crl(&mut quoteless)
         .await
-        .expect("quote-less attestation needs no CRL");
+        .expect_err("quote-less transition must fail");
+    assert!(
+        err.to_string()
+            .contains("unlock-mode transition requires a raw AMD SNP quote"),
+        "error message should mention SNP quote requirement"
+    );
 
     unsafe {
         std::env::remove_var("ENCLAVA_AMD_KDS_BASE_URL");
