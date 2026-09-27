@@ -1155,3 +1155,35 @@ fn recognized_terminal_body_is_parsed_from_bounded_json_slice() {
         "oversized status bodies must be rejected before parsing"
     );
 }
+
+#[test]
+fn transition_evidence_hash_binds_raw_snp_report_not_envelope() {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    use crate::api_types::TransitionSnpQuote;
+
+    let report_bytes = vec![0x5a; 1184];
+    let envelope = br#"{"snp_report":"<base64 of report_bytes>"}"#;
+    let quote = TransitionSnpQuote {
+        report_b64: base64::engine::general_purpose::STANDARD.encode(&report_bytes),
+        ark_der_b64: String::new(),
+        ask_der_b64: String::new(),
+        vcek_der_b64: String::new(),
+    };
+
+    // With a quote the hash must be SHA256(report bytes) — the exact value
+    // the API gate compares against SHA256(quote.report_b64).
+    let hashed = super::transition_attestation_evidence_sha256(Some(&quote), envelope).unwrap();
+    assert_eq!(hashed, hex::encode(Sha256::digest(&report_bytes)));
+    assert_ne!(hashed, hex::encode(Sha256::digest(envelope)));
+
+    // Quote-less development path keeps the envelope hash.
+    let dev_hashed = super::transition_attestation_evidence_sha256(None, envelope).unwrap();
+    assert_eq!(dev_hashed, hex::encode(Sha256::digest(envelope)));
+
+    // A quote whose report decodes to the wrong length is rejected.
+    let mut short = quote;
+    short.report_b64 = base64::engine::general_purpose::STANDARD.encode([0x5a; 16]);
+    assert!(super::transition_attestation_evidence_sha256(Some(&short), envelope).is_err());
+}

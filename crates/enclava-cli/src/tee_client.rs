@@ -839,7 +839,11 @@ impl TeeClient {
             &expected_report_data,
         )
         .await?;
-        let evidence_sha256 = hex::encode(Sha256::digest(&evidence));
+        // The receipt signs this hash and the API compares it against
+        // SHA256(quote.report_b64): when a raw SNP report is available it
+        // must be the hash of exactly those report bytes, not of the JSON
+        // evidence envelope they were extracted from.
+        let evidence_sha256 = transition_attestation_evidence_sha256(quote.as_ref(), &evidence)?;
         let transition_attestation = TransitionReceiptAttestation {
             tee_domain: endpoint.host,
             nonce: nonce_b64,
@@ -1030,6 +1034,34 @@ fn verify_receipt_matches_attestation(
         ));
     }
     Ok(())
+}
+
+/// Compute the hash bound into the transition receipt as
+/// `attestation_quote_sha256` (and mirrored in
+/// `TransitionReceiptAttestation.attestation_evidence_sha256`).
+///
+/// With a raw SNP report the API gate compares this hash against
+/// SHA256(quote.report_b64), so the report bytes must be hashed directly;
+/// hashing the JSON evidence envelope they were extracted from would make
+/// an otherwise valid transition fail with `EvidenceMismatch`. The
+/// quote-less development path has no report to bind, so it keeps the
+/// envelope hash (the API rejects quote-less transitions anyway).
+fn transition_attestation_evidence_sha256(
+    quote: Option<&crate::api_types::TransitionSnpQuote>,
+    evidence: &[u8],
+) -> Result<String, TeeError> {
+    let Some(quote) = quote else {
+        return Ok(hex::encode(Sha256::digest(evidence)));
+    };
+    let report_bytes = B64_STANDARD
+        .decode(quote.report_b64.as_bytes())
+        .map_err(|_| TeeError::Attestation("SNP quote report is not base64".to_string()))?;
+    if report_bytes.len() != enclava_verifier::SNP_REPORT_BYTES {
+        return Err(TeeError::Attestation(
+            "SNP quote report has unexpected length".to_string(),
+        ));
+    }
+    Ok(hex::encode(Sha256::digest(&report_bytes)))
 }
 
 /// Verifies the receipt-key attestation evidence and, when a raw SNP report
