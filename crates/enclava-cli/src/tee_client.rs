@@ -1140,6 +1140,12 @@ async fn verify_evidence_report_data_with_json_fallback(
                 "SNP report_data does not bind nonce, TLS leaf SPKI, and receipt key".to_string(),
             ));
         }
+        // The API's revocation gate requires the ARK-signed product CRL as
+        // part of the submitted quote; without it the transition fails
+        // closed server-side. Fetch it from the same KDS authority the VCEK
+        // came from (a relay via ENCLAVA_AMD_KDS_BASE_URL keeps offline
+        // operation working).
+        let crl_der = fetch_snp_product_crl_der(&snp_report_bytes).await?;
         // HOST_DATA and the firmware measurement were verified together with
         // the same AMD chain that authenticated report_data: preserve both as
         // the launch identity of exactly this endpoint.
@@ -1153,6 +1159,7 @@ async fn verify_evidence_report_data_with_json_fallback(
                 ark_der_b64: B64_STANDARD.encode(&chain.ark_der),
                 ask_der_b64: B64_STANDARD.encode(&chain.ask_der),
                 vcek_der_b64: B64_STANDARD.encode(&chain.vcek_der),
+                crl_der_b64: B64_STANDARD.encode(&crl_der),
             }),
         ));
     }
@@ -1241,6 +1248,36 @@ fn extract_snp_der_chain(value: &serde_json::Value) -> Option<SnpDerChain> {
         ask_der: extract_named_bytes(value, &["ask", "askder", "askcert", "askcertificate"])?,
         vcek_der: extract_named_bytes(value, &["vcek", "vcekder", "vcekcert", "vcekcertificate"])?,
     })
+}
+
+/// Product CRL endpoint for a report's generation, per AMD KDS spec 57230:
+/// `{base}/vcek/v1/{product}/crl`. The CRL is ARK-signed for the whole
+/// product line and verified against the pinned ARK by the API gate.
+fn amd_kds_product_crl_url(
+    report: &sev::firmware::guest::AttestationReport,
+    base_url: &str,
+) -> Result<String, TeeError> {
+    let (generation, _) = snp_report_kds_identity(report)?;
+    let base = base_url.trim_end_matches('/');
+    Ok(format!("{base}/vcek/v1/{}/crl", generation.titlecase()))
+}
+
+/// Fetch the ARK-signed product CRL for the generation of `snp_report_bytes`.
+/// Fails closed: no CRL, no transition quote.
+async fn fetch_snp_product_crl_der(snp_report_bytes: &[u8]) -> Result<Vec<u8>, TeeError> {
+    let report =
+        sev::firmware::guest::AttestationReport::from_bytes(snp_report_bytes).map_err(|_| {
+            TeeError::Attestation("attestation evidence SNP report is malformed".to_string())
+        })?;
+    let crl_url = amd_kds_product_crl_url(&report, &amd_kds_base_url())?;
+    let client = reqwest::Client::builder()
+        .https_only(true)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    Ok(fetch_amd_kds_crl_der(&client, &crl_url)
+        .await?
+        .as_ref()
+        .clone())
 }
 
 async fn fetch_snp_der_chain_from_kds(snp_report_bytes: &[u8]) -> Result<SnpDerChain, TeeError> {
@@ -1378,6 +1415,94 @@ async fn read_vcek_body(mut response: reqwest::Response) -> Result<Vec<u8>, TeeE
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Cached product CRL: shared bytes plus fetch time for TTL eviction.
+struct CachedCrl {
+    der: Arc<Vec<u8>>,
+    cached_at: Instant,
+}
+
+/// Fetch the ARK-signed AMD product CRL from KDS
+/// (`{base}/vcek/v1/{product}/crl`). The product CRL is shared by every
+/// machine of a generation and changes only when AMD revokes something, so
+/// a short in-memory cache avoids a per-transition fetch while staying far
+/// inside the API's revocation-freshness window. The bytes are always
+/// ARK-signature-verified by the receiving API (and by `enclava describe`)
+/// regardless of cache state.
+async fn fetch_amd_kds_crl_der(
+    client: &reqwest::Client,
+    crl_url: &str,
+) -> Result<Arc<Vec<u8>>, TeeError> {
+    static CRL_CACHE: OnceLock<Mutex<HashMap<String, CachedCrl>>> = OnceLock::new();
+    const CRL_CACHE_TTL: Duration = Duration::from_secs(600);
+    let cache = CRL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = {
+        // Cache identity is the path only: the authority is fixed per
+        // `ENCLAVA_AMD_KDS_BASE_URL` and must not leak into map keys that
+        // outlive a relay reconfiguration.
+        let path = crl_url.split_once("/vcek/").map(|(_, rest)| rest);
+        path.unwrap_or_default().to_string()
+    };
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.get(&key)
+        && cached.cached_at.elapsed() < CRL_CACHE_TTL
+    {
+        return Ok(cached.der.clone());
+    }
+
+    let mut last_error = None;
+    for attempt in 0..AMD_KDS_VCEK_MAX_ATTEMPTS {
+        match client.get(crl_url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    let retry_after =
+                        parse_retry_after(resp.headers().get(reqwest::header::RETRY_AFTER));
+                    if amd_kds_vcek_should_retry(status) && attempt + 1 < AMD_KDS_VCEK_MAX_ATTEMPTS
+                    {
+                        tokio::time::sleep(amd_kds_vcek_sleep_duration(attempt, retry_after)).await;
+                        continue;
+                    }
+                    return Err(TeeError::Attestation(format!(
+                        "AMD KDS CRL fetch failed: HTTP status {status}"
+                    )));
+                }
+                let der = Arc::new(read_vcek_body(resp).await.map_err(|_| {
+                    TeeError::Attestation("AMD KDS CRL body read failed".to_string())
+                })?);
+                if let Ok(mut guard) = cache.lock() {
+                    guard.insert(
+                        key,
+                        CachedCrl {
+                            der: der.clone(),
+                            cached_at: Instant::now(),
+                        },
+                    );
+                }
+                return Ok(der);
+            }
+            Err(err) => {
+                let class = if err.is_timeout() {
+                    "timeout"
+                } else {
+                    "transport"
+                };
+                if attempt + 1 < AMD_KDS_VCEK_MAX_ATTEMPTS {
+                    last_error = Some(class);
+                    tokio::time::sleep(amd_kds_vcek_sleep_duration(attempt, None)).await;
+                    continue;
+                }
+                return Err(TeeError::Attestation(format!(
+                    "AMD KDS CRL request failed: {class}"
+                )));
+            }
+        }
+    }
+    Err(TeeError::Attestation(format!(
+        "AMD KDS CRL request failed after retries: {}",
+        last_error.unwrap_or("unknown error")
+    )))
 }
 
 /// Cache key for VCEK collateral: normalized product generation, hardware

@@ -781,7 +781,7 @@ pub struct TransitionReceiptAttestation {
     pub quote: Option<TransitionSnpQuote>,
 }
 
-/// Raw SNP launch evidence for an unlock-mode transition.
+/// Raw AMD SNP launch evidence for an unlock-mode transition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionSnpQuote {
     /// Raw 1184-byte AMD SNP attestation report, standard base64.
@@ -792,6 +792,10 @@ pub struct TransitionSnpQuote {
     pub ask_der_b64: String,
     /// VCEK certificate DER, standard base64.
     pub vcek_der_b64: String,
+    /// ARK-signed AMD product CRL DER, standard base64, fetched fresh from
+    /// AMD KDS. The API's revocation gate requires it: a transition whose
+    /// endorsement chain has no revocation collateral fails closed.
+    pub crl_der_b64: String,
 }
 
 #[derive(Debug)]

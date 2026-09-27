@@ -765,6 +765,56 @@ async fn vcek_fetch_errors_do_not_leak_url_or_hwid() {
 }
 
 #[test]
+fn builds_amd_kds_product_crl_url_from_snp_report() {
+    let mut report = sev::firmware::guest::AttestationReport {
+        version: 3,
+        cpuid_fam_id: Some(25),
+        cpuid_mod_id: Some(160),
+        cpuid_step: Some(2),
+        chip_id: [7; 64],
+        ..Default::default()
+    };
+    report.reported_tcb.bootloader = 10;
+    report.reported_tcb.snp = 24;
+    report.reported_tcb.microcode = 84;
+    let url = super::amd_kds_product_crl_url(&report, "https://kdsintf.amd.com/").unwrap();
+    assert_eq!(url, "https://kdsintf.amd.com/vcek/v1/Genoa/crl");
+    // The relay override applies to the CRL endpoint exactly as to VCEK.
+    let relayed = super::amd_kds_product_crl_url(&report, "https://relay.internal").unwrap();
+    assert_eq!(relayed, "https://relay.internal/vcek/v1/Genoa/crl");
+}
+
+#[tokio::test]
+async fn crl_fetch_caches_per_product_and_fails_closed_on_errors() {
+    let crl = b"fake-crl-der".to_vec();
+    let (address, requests, server) = counting_upstream("200 OK", crl.clone(), None).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/vcek/v1/Genoa/crl");
+    let first = super::fetch_amd_kds_crl_der(&client, &url).await.unwrap();
+    assert_eq!(first.as_slice(), crl.as_slice());
+    // Second fetch is served from the in-memory cache: no new upstream hit.
+    let second = super::fetch_amd_kds_crl_der(&client, &url).await.unwrap();
+    assert_eq!(second.as_slice(), crl.as_slice());
+    assert_eq!(requests.load(Ordering::Relaxed), 1);
+    // A distinct product misses the cache and hits the upstream again.
+    let other = format!("http://{address}/vcek/v1/Milan/crl");
+    assert!(super::fetch_amd_kds_crl_der(&client, &other).await.is_ok());
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    server.abort();
+
+    // Fail closed: an upstream that never succeeds must produce an error,
+    // never an empty CRL. 404 is non-retryable, so this returns promptly.
+    let (address, _requests, server) = counting_upstream("404 Not Found", Vec::new(), None).await;
+    let url = format!("http://{address}/vcek/v1/Turin/crl");
+    let error = super::fetch_amd_kds_crl_der(&client, &url)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("404"));
+    server.abort();
+}
+
+#[test]
 fn kds_retry_delay_honors_bounded_retry_after_and_jitter() {
     assert_eq!(
         super::amd_kds_vcek_sleep_duration(0, Some(Duration::from_secs(7))),
@@ -1170,6 +1220,7 @@ fn transition_evidence_hash_binds_raw_snp_report_not_envelope() {
         ark_der_b64: String::new(),
         ask_der_b64: String::new(),
         vcek_der_b64: String::new(),
+        crl_der_b64: String::new(),
     };
 
     // With a quote the hash must be SHA256(report bytes) — the exact value

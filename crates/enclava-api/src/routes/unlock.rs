@@ -104,6 +104,11 @@ pub struct TransitionSnpQuote {
     pub ask_der_b64: String,
     /// VCEK certificate DER, standard base64.
     pub vcek_der_b64: String,
+    /// ARK-signed AMD product CRL DER, standard base64, fetched from AMD
+    /// KDS by the CLI. The API enforces certificate validity intervals,
+    /// CRL signature/freshness, and the revoked-serial walk against it, so
+    /// a retired ASK or VCEK can no longer certify a transition.
+    pub crl_der_b64: String,
 }
 
 /// SHA-256 pins of the AMD ARK roots compiled into the `sev` crate the
@@ -136,6 +141,14 @@ const BUILTIN_AMD_ARK_SHA256_PINS: [[u8; 32]; 3] = [
 /// ARK/ASK/VCEK certificates are under 2 KiB; anything larger is rejected
 /// before X.509 parsing.
 const MAX_QUOTE_CERTIFICATE_DER_BYTES: usize = 16_384;
+
+/// Maximum accepted AMD product CRL DER, in bytes. Deliberately larger
+/// than the certificate bound: a mass ASK/VCEK revocation event — exactly
+/// when this gate matters most — is the scenario where AMD's product CRL
+/// grows, and rejecting an oversized (but ARK-signed, valid) CRL would
+/// fail every transition platform-wide. Matches the CLI's KDS body-read
+/// bound, so anything the CLI can submit the API can evaluate.
+const MAX_QUOTE_CRL_DER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestedUnlockMode {
@@ -352,6 +365,9 @@ enum TransitionQuoteError {
     EvidenceMismatch,
     /// The report's guest policy allows debug: not a confidential workload.
     DebugPolicy,
+    /// Revocation/validity collateral was missing, malformed, stale, or it
+    /// revoked the ASK/VCEK.
+    RevocationRejected,
 }
 
 impl TransitionQuoteError {
@@ -368,6 +384,9 @@ impl TransitionQuoteError {
             }
             Self::DebugPolicy => {
                 "transition_attestation.quote guest policy allows debug; not a confidential workload"
+            }
+            Self::RevocationRejected => {
+                "transition_attestation.quote failed AMD revocation/validity checking"
             }
         }
     }
@@ -390,6 +409,24 @@ fn snp_guest_policy_allows_debug(guest_policy: u64) -> bool {
 /// monotonicity and the unique receipt index, both of which permit a
 /// first reuse of captured evidence.
 const TRANSITION_RECEIPT_MAX_AGE_SECONDS: i64 = 15 * 60;
+
+/// Maximum accepted age of the submitted AMD product CRL, in seconds.
+/// Matches the appraiser policy bound (`revocation_max_age_seconds`) and
+/// AMD's ~45-day CRL publication cadence; an older (or nextUpdate-lapsed)
+/// CRL fails the transition closed.
+const TRANSITION_REVOCATION_MAX_AGE_SECONDS: u64 = 3_888_000;
+
+/// Trusted time for quote revocation math. Wall-clock now, clamped to a
+/// floor: the CRL freshness window already bounds how old accepted
+/// collateral can be, and a zero/negative reading (clock not yet set on a
+/// freshly booted host) must reject rather than panic in u64 conversions.
+fn quote_verification_now() -> u64 {
+    let now = Utc::now();
+    if now.timestamp() <= 0 {
+        return 1;
+    }
+    now.timestamp() as u64
+}
 
 /// Tolerance for clock skew between the signing TEE and the API on
 /// future-dated receipt timestamps.
@@ -415,6 +452,10 @@ fn transition_receipt_is_fresh(receipt_timestamp: DateTime<Utc>, now: DateTime<U
 /// - the ARK/ASK/VCEK chain is internally consistent and anchored to one of
 ///   the pinned builtin AMD roots (the same anchor set the platform CLI
 ///   uses),
+/// - the certificate validity intervals hold at `now_unix_seconds` and the
+///   submitted ARK-signed product CRL is signature-valid, fresh, and does
+///   not revoke the ASK or VCEK (`verify_amd_revocation`, the same
+///   revocation gate the appraiser applies),
 /// - the report's guest policy disables debug (a debug-enabled guest is
 ///   not confidential, mirroring the CLI's
 ///   `ensure_snp_report_production_policy`),
@@ -428,10 +469,11 @@ fn transition_receipt_is_fresh(receipt_timestamp: DateTime<Utc>, now: DateTime<U
 fn verify_transition_snp_quote(
     attestation: &TransitionReceiptAttestation,
     receipt: &SignedReceiptResponse,
+    now_unix_seconds: u64,
 ) -> Result<(), TransitionQuoteError> {
     use enclava_verifier::{
-        expected_report_data, parse_snp_report, verify_amd_certificate_chain, verify_snp_signature,
-        verify_vcek_report_binding,
+        expected_report_data, parse_snp_report, verify_amd_certificate_chain,
+        verify_amd_revocation, verify_snp_signature, verify_vcek_report_binding,
     };
 
     let quote = attestation
@@ -482,6 +524,31 @@ fn verify_transition_snp_quote(
     }
     verify_amd_certificate_chain(&ark_der, &ask_der, &vcek_der, &ark_sha256)
         .map_err(|_| TransitionQuoteError::InvalidEvidence)?;
+
+    // Revocation/validity gate (#115 follow-up): the chain being
+    // well-signed is not sufficient when AMD has retired an ASK/VCEK or a
+    // certificate has expired. The caller-submitted CRL must itself be
+    // ARK-signed and fresh; `verify_amd_revocation` re-checks the ARK pin
+    // before any RSA math, enforces the ARK/ASK/VCEK validity intervals at
+    // `now_unix_seconds`, verifies the CRL signature and this/nextUpdate
+    // window, and walks the revoked serials for the exact ASK and VCEK
+    // under verification. Missing or stale collateral fails closed.
+    let crl_der = B64
+        .decode(&quote.crl_der_b64)
+        .map_err(|_| TransitionQuoteError::Malformed)?;
+    if crl_der.is_empty() || crl_der.len() > MAX_QUOTE_CRL_DER_BYTES {
+        return Err(TransitionQuoteError::Malformed);
+    }
+    verify_amd_revocation(
+        &ark_der,
+        &ask_der,
+        &vcek_der,
+        &crl_der,
+        now_unix_seconds,
+        TRANSITION_REVOCATION_MAX_AGE_SECONDS,
+        &BUILTIN_AMD_ARK_SHA256_PINS,
+    )
+    .map_err(|_| TransitionQuoteError::RevocationRejected)?;
 
     let report = parse_snp_report(&report_bytes).map_err(|_| TransitionQuoteError::Malformed)?;
     // A debug-enabled guest is not confidential (the PSP hands its keys to a
@@ -1243,16 +1310,17 @@ pub async fn update_unlock_mode(
             )
         },
     )?;
-    verify_transition_snp_quote(transition_attestation, receipt).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "invalid transition_attestation",
-                "field": "transition_attestation.quote",
-                "reason": error.reason(),
-            })),
-        )
-    })?;
+    verify_transition_snp_quote(transition_attestation, receipt, quote_verification_now())
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid transition_attestation",
+                    "field": "transition_attestation.quote",
+                    "reason": error.reason(),
+                })),
+            )
+        })?;
     // Server-side freshness window: without it, captured quote/receipt
     // pairs can be replayed once (monotonicity and the unique receipt
     // index only block reuse after the first consumption).
@@ -2108,6 +2176,7 @@ mod tests {
         ark_der: Vec<u8>,
         ask_der: Vec<u8>,
         vcek_der: Vec<u8>,
+        crl_der: Vec<u8>,
         nonce: [u8; 32],
         leaf_spki_sha256: [u8; 32],
         receipt_pubkey: [u8; 32],
@@ -2155,6 +2224,7 @@ mod tests {
             ark_der: field("ark_der"),
             ask_der: field("ask_der"),
             vcek_der: field("vcek_der"),
+            crl_der: field("crl_der"),
             nonce: records
                 .get("challenge_nonce")
                 .expect("bundle nonce")
@@ -2184,6 +2254,7 @@ mod tests {
                 ark_der_b64: B64.encode(&fixture.ark_der),
                 ask_der_b64: B64.encode(&fixture.ask_der),
                 vcek_der_b64: B64.encode(&fixture.vcek_der),
+                crl_der_b64: B64.encode(&fixture.crl_der),
             }),
         }
     }
@@ -2214,12 +2285,17 @@ mod tests {
         }
     }
 
+    /// Trusted time for the prove-it-live fixture: the capture time
+    /// recorded by `enclava-verifier`'s `live_bundle.rs` (2026-08-04
+    /// 12:00:00 UTC), inside the bundle CRL's this/nextUpdate window.
+    const LIVE_QUOTE_TRUSTED_TIME_UNIX: u64 = 1_785_844_800;
+
     #[test]
     fn verifies_transition_snp_quote_from_live_vcek_signed_report() {
         let fixture = live_quote_fixture();
         let attestation = live_quote_attestation(&fixture);
         let receipt = live_quote_receipt(&fixture);
-        verify_transition_snp_quote(&attestation, &receipt)
+        verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
             .expect("live VCEK-signed SNP quote with matching binding verifies");
     }
 
@@ -2253,7 +2329,8 @@ mod tests {
         )
         .expect("receipt passes every signature/payload check on its own");
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt).unwrap_err(),
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
             TransitionQuoteError::InvalidEvidence
         );
     }
@@ -2270,7 +2347,8 @@ mod tests {
         receipt.payload.attestation_quote_sha256 = Some(foreign_hash.clone());
         attestation.attestation_evidence_sha256 = foreign_hash;
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt).unwrap_err(),
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
             TransitionQuoteError::EvidenceMismatch
         );
     }
@@ -2304,7 +2382,8 @@ mod tests {
         receipt.payload.attestation_quote_sha256 = Some(tampered_hash.clone());
         attestation.attestation_evidence_sha256 = tampered_hash;
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt).unwrap_err(),
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
             TransitionQuoteError::DebugPolicy
         );
     }
@@ -2353,7 +2432,8 @@ mod tests {
         receipt.payload.attestation_quote_sha256 = Some(tampered_hash.clone());
         attestation.attestation_evidence_sha256 = tampered_hash;
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt).unwrap_err(),
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
             TransitionQuoteError::InvalidEvidence
         );
     }
@@ -2365,7 +2445,8 @@ mod tests {
         let receipt = live_quote_receipt(&fixture);
         attestation.tee_domain = "attacker.example".to_string();
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt).unwrap_err(),
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
             TransitionQuoteError::InvalidEvidence
         );
     }
@@ -2383,7 +2464,8 @@ mod tests {
             ..attestation.quote.clone().expect("quote present")
         });
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt).unwrap_err(),
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
             TransitionQuoteError::InvalidEvidence
         );
     }
@@ -2395,8 +2477,64 @@ mod tests {
         let receipt = live_quote_receipt(&fixture);
         attestation.quote = None;
         assert_eq!(
-            verify_transition_snp_quote(&attestation, &receipt).unwrap_err(),
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
             TransitionQuoteError::Missing
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_without_revocation_collateral() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        // Drop the CRL entirely: a chain that internally verifies but has no
+        // revocation collateral must fail closed, not pass on signature
+        // alone.
+        attestation.quote = Some(TransitionSnpQuote {
+            crl_der_b64: String::new(),
+            ..attestation.quote.clone().expect("quote present")
+        });
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::Malformed
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_with_stale_crl() {
+        let fixture = live_quote_fixture();
+        let attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        // Same bundle verified at a time past the CRL's nextUpdate
+        // (2026-09-09): the revocation gate must treat the collateral as
+        // expired. 2027-01-01T00:00:00Z.
+        const PAST_NEXT_UPDATE: u64 = 1_792_761_600;
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, PAST_NEXT_UPDATE).unwrap_err(),
+            TransitionQuoteError::RevocationRejected
+        );
+    }
+
+    #[test]
+    fn rejects_transition_snp_quote_with_tampered_crl() {
+        let fixture = live_quote_fixture();
+        let mut attestation = live_quote_attestation(&fixture);
+        let receipt = live_quote_receipt(&fixture);
+        // Flip one byte of the ARK-signed CRL: the RSA-PSS signature check
+        // must reject the forged revocation list.
+        let mut crl = fixture.crl_der.clone();
+        let last = crl.len() - 1;
+        crl[last] ^= 0xff;
+        attestation.quote = Some(TransitionSnpQuote {
+            crl_der_b64: B64.encode(&crl),
+            ..attestation.quote.clone().expect("quote present")
+        });
+        assert_eq!(
+            verify_transition_snp_quote(&attestation, &receipt, LIVE_QUOTE_TRUSTED_TIME_UNIX)
+                .unwrap_err(),
+            TransitionQuoteError::RevocationRejected
         );
     }
 
