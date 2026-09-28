@@ -1,11 +1,6 @@
 # Enclava CAP
 
-### This is still under heavy development and not advisable to run in production 
-
-Enclava CAP is the open-source control plane core for running OCI images as
-confidential workloads on Kubernetes. It targets Kata confidential containers
-with AMD SEV-SNP and combines a user CLI, an API service, Kubernetes manifest
-generation, and an in-TEE init sidecar.
+Enclava CAP is the open-source control plane core for running OCI images as confidential workloads on Kubernetes. It targets Kata confidential containers with AMD SEV-SNP and combines a user CLI, an API service, Kubernetes manifest generation, and an in-TEE init sidecar.
 
 
 ## What Is Included
@@ -23,8 +18,7 @@ generation, and an in-TEE init sidecar.
 
 ## How It Works
 
-CAP deploys immutable OCI images by digest and validates the deployment before
-it reaches Kubernetes:
+CAP deploys immutable OCI images by digest and validates the deployment before it reaches Kubernetes:
 
 - the CLI creates or reads local app config and signs a deployment descriptor;
 - CAP validates the descriptor, image digest, signer identity, org keyring, and
@@ -37,6 +31,25 @@ This repository is useful for developing the CAP runtime, API contracts, CLI
 flows, and confidential-workload deployment machinery. A real deployment still
 requires the surrounding platform services described in
 [DEPLOYMENT.md](DEPLOYMENT.md).
+
+## Install
+
+macOS / Linux (musl-static binaries, checksum + cosign verified):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/enclava-labs/cap/main/scripts/install.sh | bash
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/enclava-labs/cap/main/scripts/install.ps1 | iex
+```
+
+Installs the latest release to `~/.enclava/bin` (`%USERPROFILE%\.enclava\bin` on
+Windows) and adds it to your PATH. Set `ENCLAVA_VERSION=vX.Y.Z` for a specific
+release, `ENCLAVA_INSTALL_DIR` to change the destination. Other platforms:
+`cargo install --locked --git https://github.com/enclava-labs/cap enclava-cli`.
 
 ## CLI Flow
 
@@ -160,6 +173,8 @@ See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for the current security snapshot.
   - fail-closed Cloudflare mutation recovery.
 - [runbooks/kubernetes-mutation-fence-recovery.md](runbooks/kubernetes-mutation-fence-recovery.md)
   - fail-closed Kubernetes namespace mutation recovery.
+- [runbooks/trustee-policy-audit.sh](runbooks/trustee-policy-audit.sh) - KBS
+  live-policy vs CAP-database binding audit.
 
 ## License
 

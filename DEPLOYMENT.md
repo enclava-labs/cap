@@ -167,9 +167,21 @@ Release verification checks:
 - envelope signature against `ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX`;
 - digest pins for platform sidecar images;
 - HTTPS Trustee KBS URL;
+- HTTPS tenant Caddy ACME CA URL;
 - genpolicy version;
 - policy template hash;
-- runtime class expected by the engine.
+- runtime class expected by the engine;
+- API overrides must not predate the binary's bundled release; equal timestamps
+  with different signed payloads are rejected.
+
+The API compares overrides only with its compiled bundle. Accepting a newer
+override does not change that minimum: a previous signed override can be
+restored if it still passes validation and is not older than the bundle.
+Removing the override selects the bundle again. This check adds no database
+migration, persistent release state, or replica-termination watchdog.
+Existing database-schema compatibility and CLI per-API release-history checks
+still apply; this is not a guarantee that any older API image or client will
+accept a rollback.
 
 When the signed release supplies a value, an explicit environment override must
 match it exactly or startup fails.
@@ -242,8 +254,3 @@ kubectl -n enclava-platform get deploy enclava-api
 kubectl -n enclava-platform exec deploy/enclava-api -- wget -q -O- http://127.0.0.1:3000/health
 ```
 
-For a live app proof that does not require direct cluster access:
-
-```bash
-python3 scripts/cap_hermes_proof.py --help
-```
