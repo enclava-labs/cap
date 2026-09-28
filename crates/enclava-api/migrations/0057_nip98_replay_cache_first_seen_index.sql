@@ -9,10 +9,14 @@
 -- IF NOT EXISTS keeps re-runs safe: the index is not part of any earlier
 -- ledger version, so the only ways it can pre-exist are a manually built
 -- copy or a CONCURRENTLY run whose ledger cleanup (below) already ran.
--- A pre-existing INVALID index is NOT repaired by IF NOT EXISTS — drop it
--- first per the recovery steps below.
+-- A pre-existing INVALID index is NOT repaired by IF NOT EXISTS — startup
+-- fails loudly instead: prepare_schema verifies pg_index.indisvalid for
+-- this index in both Apply and Verify modes (the check lives in Rust
+-- because a CONCURRENTLY statement cannot share a migration batch with
+-- any other statement; Postgres wraps multi-statement batches in an
+-- implicit transaction and rejects the CONCURRENTLY build).
 --
--- Recovery from failed CONCURRENTLY:
+-- Recovery from failed CONCURRENTLY (or a failed validity guard):
 --   1. Drop the invalid index if it exists:
 --      DROP INDEX IF EXISTS nip98_replay_cache_first_seen_purge;
 --   2. Clean up the dirty SQLx ledger entry (the migration runner records
@@ -34,9 +38,8 @@
 --   DELETE FROM _sqlx_migrations WHERE version IN (50, 51);
 --   ...then run cap_migrate, which applies 0056 (CREATE TABLE IF NOT
 --   EXISTS) and 0057 (CREATE INDEX CONCURRENTLY IF NOT EXISTS) as no-ops
---   over the objects already present. Verify the resulting index is valid:
---   SELECT indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
---   WHERE c.relname = 'nip98_replay_cache_first_seen_purge';  -- must be t
+--   over the objects already present. The validity guard below then
+--   confirms the resulting index is usable.
 --
 -- The NIP-98 replay-cache reaper purges with `WHERE first_seen < now() -
 -- interval`, which cannot use the event_id primary key. Under sustained

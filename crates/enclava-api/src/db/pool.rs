@@ -42,6 +42,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateE
 pub async fn prepare_schema(pool: &PgPool, mode: MigrationMode) -> Result<()> {
     if mode == MigrationMode::Apply {
         run_migrations(pool).await?;
+        verify_nip98_purge_index(pool).await?;
         return Ok(());
     }
 
@@ -49,7 +50,35 @@ pub async fn prepare_schema(pool: &PgPool, mode: MigrationMode) -> Result<()> {
         sqlx::query_as("SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version")
             .fetch_all(pool)
             .await?;
-    verify_migration_ledger(&applied, &MIGRATOR)
+    verify_migration_ledger(&applied, &MIGRATOR)?;
+    verify_nip98_purge_index(pool).await
+}
+
+/// Fail startup when the NIP-98 replay-cache purge index is missing or
+/// INVALID. Migration 0057 builds it with `CREATE INDEX CONCURRENTLY`
+/// (no-transaction): a build that fails halfway leaves an index with
+/// `indisvalid = false`, and `IF NOT EXISTS` on retry treats that broken
+/// index as present — which would silently degrade every reaper purge to a
+/// sequential scan. The check lives here rather than in the migration file
+/// because a CONCURRENTLY statement cannot share a migration batch with
+/// any other statement (Postgres would wrap the batch in an implicit
+/// transaction and reject the CONCURRENTLY build).
+async fn verify_nip98_purge_index(pool: &PgPool) -> Result<()> {
+    let index_state: Option<(bool,)> = sqlx::query_as(
+        "SELECT indisvalid FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indexrelid \
+         WHERE c.relname = 'nip98_replay_cache_first_seen_purge'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if !matches!(index_state, Some((true,))) {
+        bail!(
+            "nip98_replay_cache_first_seen_purge is missing or INVALID \
+             (failed CONCURRENTLY build or manual drop); DROP INDEX and clean \
+             the version-57 _sqlx_migrations row, then re-run cap_migrate"
+        );
+    }
+    Ok(())
 }
 
 fn verify_migration_ledger(
@@ -87,6 +116,79 @@ fn verify_migration_ledger(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn schema_test_pool() -> sqlx::PgPool {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://test:***@localhost:5432/test".to_string());
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect schema guard test database");
+        run_migrations(&pool)
+            .await
+            .expect("migrate schema guard test database");
+        pool
+    }
+
+    #[tokio::test]
+    async fn prepare_schema_accepts_a_valid_purge_index() {
+        let pool = schema_test_pool().await;
+        prepare_schema(&pool, MigrationMode::Verify)
+            .await
+            .expect("verify mode must accept a fully migrated database with a valid purge index");
+    }
+
+    #[tokio::test]
+    async fn prepare_schema_rejects_an_invalid_purge_index() {
+        let pool = schema_test_pool().await;
+        sqlx::query(
+            "UPDATE pg_index SET indisvalid = false WHERE indexrelid = \
+                     (SELECT c.oid FROM pg_class c WHERE c.relname = \
+                      'nip98_replay_cache_first_seen_purge')",
+        )
+        .execute(&pool)
+        .await
+        .expect("mark purge index invalid");
+        let err = prepare_schema(&pool, MigrationMode::Verify)
+            .await
+            .expect_err("invalid purge index must fail startup");
+        assert!(
+            err.to_string()
+                .contains("nip98_replay_cache_first_seen_purge")
+        );
+        // restore for sibling tests sharing the database
+        sqlx::query(
+            "UPDATE pg_index SET indisvalid = true WHERE indexrelid = \
+                     (SELECT c.oid FROM pg_class c WHERE c.relname = \
+                      'nip98_replay_cache_first_seen_purge')",
+        )
+        .execute(&pool)
+        .await
+        .expect("restore purge index validity");
+    }
+
+    #[tokio::test]
+    async fn prepare_schema_rejects_a_missing_purge_index() {
+        let pool = schema_test_pool().await;
+        sqlx::query("DROP INDEX IF EXISTS nip98_replay_cache_first_seen_purge")
+            .execute(&pool)
+            .await
+            .expect("drop purge index");
+        let err = prepare_schema(&pool, MigrationMode::Verify)
+            .await
+            .expect_err("missing purge index must fail startup");
+        assert!(
+            err.to_string()
+                .contains("nip98_replay_cache_first_seen_purge")
+        );
+        // restore for sibling tests sharing the database
+        sqlx::query(
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+                     nip98_replay_cache_first_seen_purge ON nip98_replay_cache (first_seen)",
+        )
+        .execute(&pool)
+        .await
+        .expect("restore purge index");
+    }
 
     #[test]
     fn migration_mode_defaults_to_apply_and_accepts_verify() {
