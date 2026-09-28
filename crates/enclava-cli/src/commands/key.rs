@@ -166,13 +166,13 @@ fn parse_pubkey(hex_in: &str) -> Result<VerifyingKey, Box<dyn std::error::Error>
 }
 
 fn keyring_envelope_from_response(
-    response: OrgKeyringResponse,
+    response: &OrgKeyringResponse,
 ) -> Result<OrgKeyringEnvelope, Box<dyn std::error::Error>> {
-    let sig_bytes: [u8; 64] = hex::decode(response.signature)?
+    let sig_bytes: [u8; 64] = hex::decode(&response.signature)?
         .try_into()
         .map_err(|_| "API returned org keyring signature with invalid length")?;
     Ok(OrgKeyringEnvelope {
-        keyring: serde_json::from_value(response.keyring_payload)?,
+        keyring: serde::Deserialize::deserialize(&response.keyring_payload)?,
         signature: Signature::from_bytes(&sig_bytes),
         signing_pubkey: parse_pubkey(&response.signing_pubkey)?,
     })
@@ -210,6 +210,29 @@ async fn upload_keyring(
     Ok(())
 }
 
+/// Re-upload the exact fields the server previously accepted. The typed
+/// envelope round-trip can drop unsigned unknown fields or change
+/// pubkey/timestamp encodings, which the PUT existing-version check then
+/// rejects as a conflict even though the keyring is semantically identical.
+async fn replay_accepted_keyring(
+    api: &ApiClient,
+    org_name: &str,
+    accepted: OrgKeyringResponse,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = api
+        .put_org_keyring(
+            org_name,
+            &PutOrgKeyringRequest {
+                version: accepted.version,
+                keyring_payload: accepted.keyring_payload,
+                signature: accepted.signature,
+                signing_pubkey: accepted.signing_pubkey,
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 fn keyring_has_owner(envelope: &OrgKeyringEnvelope, public: &VerifyingKey) -> bool {
     let public = public.to_bytes();
     envelope
@@ -232,7 +255,7 @@ async fn verify_or_initialize_remote_keyring(
 
     match api.get_org_keyring(&org_name).await {
         Ok(response) => {
-            let envelope = keyring_envelope_from_response(response)?;
+            let envelope = keyring_envelope_from_response(&response)?;
             verify_keyring(&envelope, &envelope.signing_pubkey)?;
             if !keyring_has_owner(&envelope, &owner.public) {
                 return Err(format!(
@@ -784,7 +807,8 @@ async fn rotate_owner(
         seed
     };
     let replacement_owner = keys::derive_org_owner_key(user_id, org_id, &replacement_seed)?;
-    let remote = keyring_envelope_from_response(api.get_org_keyring(&me.active_org.name).await?)?;
+    let remote_response = api.get_org_keyring(&me.active_org.name).await?;
+    let remote = keyring_envelope_from_response(&remote_response)?;
     if current_owner.public == replacement_owner.public {
         verify_keyring(&remote, &current_owner.public)?;
         if !keyring_has_owner(&remote, &current_owner.public) {
@@ -792,7 +816,7 @@ async fn rotate_owner(
                 "remote keyring does not contain the owner derived from this backup".into(),
             );
         }
-        upload_keyring(&api, &me.active_org.name, &remote).await?;
+        replay_accepted_keyring(&api, &me.active_org.name, remote_response).await?;
         println!(
             "The backup and active owner already match; no rotation was needed. Use a new backup path to start another rotation."
         );
@@ -803,7 +827,7 @@ async fn rotate_owner(
         if !keyring_has_owner(&remote, &replacement_owner.public) {
             return Err("remote keyring does not contain the replacement owner".into());
         }
-        upload_keyring(&api, &me.active_org.name, &remote).await?;
+        replay_accepted_keyring(&api, &me.active_org.name, remote_response).await?;
         finalize_local_owner_rotation(
             &paths,
             org_id,
