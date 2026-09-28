@@ -891,6 +891,38 @@ pub async fn bootstrap_signing_service_owner(
     }))
 }
 
+async fn ready_service_owner(
+    state: &AppState,
+    org_id: Uuid,
+) -> Result<
+    (
+        &crate::signing_service::SigningServiceClient,
+        Option<Vec<u8>>,
+    ),
+    (StatusCode, Json<serde_json::Value>),
+> {
+    let signing_service = state.signing_service.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "platform signing service is not configured"})),
+    ))?;
+    let owner_status = signing_service
+        .owner_status(org_id)
+        .await
+        .map_err(crate::routes::deployments::signing_error_response)?;
+    let service_owner = owner_status
+        .owner_pubkey_hex
+        .as_deref()
+        .and_then(|raw| hex::decode(raw).ok());
+    if owner_status.org_id != org_id || owner_status.state != "ready" {
+        return Err(crate::routes::deployments::signing_error_response(
+            crate::signing_service::SigningServiceError::AuthorityStatus(
+                "owner status does not match requested authority".to_string(),
+            ),
+        ));
+    }
+    Ok((signing_service, service_owner))
+}
+
 pub async fn rotate_org_owner(
     auth: AuthContext,
     State(state): State<AppState>,
@@ -1023,11 +1055,17 @@ pub async fn rotate_org_owner(
         .await
         .map_err(|_| db_error())?;
         let Some(previous) = previous else {
-            // Predecessor pruned (e.g. by migration 0058's repair pass)
-            // while the committed rotation itself is intact and matches
-            // this request byte-for-byte: confirm the replay without
-            // re-deriving validations that were enforced at commit time
-            // and without re-driving the signing service.
+            // A pruned predecessor was already validated at commit time. Confirm
+            // exact replay against the current authority without rotating again.
+            let (_, service_owner) = ready_service_owner(&state, org_id).await?;
+            if service_owner.as_deref() != Some(replacement_owner.as_slice()) {
+                return Err(crate::routes::deployments::signing_error_response(
+                    crate::signing_service::SigningServiceError::AuthorityStatus(
+                        "signing service owner does not match the requested replacement owner"
+                            .to_string(),
+                    ),
+                ));
+            }
             return Ok(Json(RotateOrgOwnerResponse {
                 org_id,
                 state: "ready",
@@ -1080,26 +1118,7 @@ pub async fn rotate_org_owner(
     .await
     .map_err(|_| db_error())?
     .ok_or_else(|| bad_request("replacement owner key is not registered for this user"))?;
-
-    let signing_service = state.signing_service.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({"error": "platform signing service is not configured"})),
-    ))?;
-    let owner_status = signing_service
-        .owner_status(org_id)
-        .await
-        .map_err(crate::routes::deployments::signing_error_response)?;
-    let service_owner = owner_status
-        .owner_pubkey_hex
-        .as_deref()
-        .and_then(|raw| hex::decode(raw).ok());
-    if owner_status.org_id != org_id || owner_status.state != "ready" {
-        return Err(crate::routes::deployments::signing_error_response(
-            crate::signing_service::SigningServiceError::AuthorityStatus(
-                "owner status does not match requested authority".to_string(),
-            ),
-        ));
-    }
+    let (signing_service, service_owner) = ready_service_owner(&state, org_id).await?;
     if service_owner.as_deref() == Some(current_owner.as_slice()) {
         let rotated = signing_service
             .rotate_owner(&crate::signing_service::RotateOwnerRequest {
@@ -1955,20 +1974,49 @@ mod tests {
         let address = listener.local_addr().expect("mock signing service address");
         let replacement_hex = hex::encode(replacement_key.verifying_key().to_bytes());
         let org_id_for_mock = org_id;
+        let owner_status_response = std::sync::Arc::new(std::sync::Mutex::new(serde_json::json!({
+            "org_id": org_id_for_mock,
+            "state": "ready",
+            "version": 2,
+            "owner_pubkey_hex": replacement_hex.clone(),
+            "last_changed_at": null,
+        })));
+        let rotate_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let status_for_mock = owner_status_response.clone();
+        let rotate_calls_for_mock = rotate_calls.clone();
         let mock = tokio::spawn(async move {
-            use axum::{Json, routing::get};
-            let app = axum::Router::new().route(
-                "/orgs/{org_id}/owner",
-                get(move || async move {
-                    Json(serde_json::json!({
-                        "org_id": org_id_for_mock,
-                        "state": "ready",
-                        "version": 2,
-                        "owner_pubkey_hex": replacement_hex,
-                        "last_changed_at": null,
-                    }))
-                }),
-            );
+            use axum::{
+                Json,
+                routing::{get, post},
+            };
+            let app = axum::Router::new()
+                .route(
+                    "/orgs/{org_id}/owner",
+                    get(move || {
+                        let body = status_for_mock
+                            .lock()
+                            .expect("owner status mock lock")
+                            .clone();
+                        async move { Json(body) }
+                    }),
+                )
+                .route(
+                    "/rotate-owner",
+                    post(move || {
+                        let calls = rotate_calls_for_mock.clone();
+                        let rotated_org_id = org_id_for_mock;
+                        let fingerprint = replacement_hex.clone();
+                        async move {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Json(serde_json::json!({
+                                "org_id": rotated_org_id,
+                                "version": 2,
+                                "owner_pubkey_fingerprint": fingerprint,
+                                "rotated_at": "2026-01-01T00:00:00Z",
+                            }))
+                        }
+                    }),
+                );
             axum::serve(listener, app).await.expect("serve mock");
         });
         state.signing_service = Some(
@@ -2071,7 +2119,7 @@ mod tests {
             auth.clone(),
             State(state.clone()),
             Path(org_name.clone()),
-            Json(rotation_request),
+            Json(rotation_request.clone()),
         )
         .await
         .expect("replay after predecessor prune must confirm the rotation");
@@ -2087,6 +2135,91 @@ mod tests {
             versions_after_replay, 1,
             "replay must not insert a duplicate row"
         );
+
+        *owner_status_response
+            .lock()
+            .expect("owner status mock lock") = serde_json::json!({
+            "org_id": org_id,
+            "state": "ready",
+            "version": 2,
+            "owner_pubkey_hex": hex::encode(key.verifying_key().to_bytes()),
+            "last_changed_at": null,
+        });
+        let drifted = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(rotation_request.clone()),
+        )
+        .await
+        .expect_err("pruned replay must fail when the service reports a different owner");
+        assert_eq!(drifted.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(drifted.1.0["error"], "signing_authority_status_invalid");
+
+        *owner_status_response
+            .lock()
+            .expect("owner status mock lock") = serde_json::json!({
+            "org_id": org_id,
+            "state": "pending",
+            "version": 2,
+            "owner_pubkey_hex": hex::encode(replacement_key.verifying_key().to_bytes()),
+            "last_changed_at": null,
+        });
+        let not_ready = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(rotation_request.clone()),
+        )
+        .await
+        .expect_err("pruned replay must fail when the service is not ready");
+        assert_eq!(not_ready.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(not_ready.1.0["error"], "signing_authority_status_invalid");
+
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dead signing service address");
+        let dead_address = dead.local_addr().expect("dead signing service address");
+        drop(dead);
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                format!("http://{dead_address}"),
+                None,
+            )
+            .expect("dead signing service client"),
+        );
+        let unavailable = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(rotation_request.clone()),
+        )
+        .await
+        .expect_err("pruned replay must fail when the signing service is unreachable");
+        assert_eq!(unavailable.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(unavailable.1.0["error"], "signing_service_unavailable");
+
+        assert_eq!(
+            rotate_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "pruned replays must never re-drive the signing service rotation"
+        );
+        let rotate_audit_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_log
+              WHERE org_id = $1 AND action = 'org.keyring.owner.rotate'",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count owner-rotation audit rows after replays");
+        assert_eq!(rotate_audit_rows, 1);
+        let versions_after_failures: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count keyring rows after failed replays");
+        assert_eq!(versions_after_failures, 1);
 
         mock.abort();
         sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
