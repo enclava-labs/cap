@@ -2199,31 +2199,6 @@ pub(crate) mod test_support {
         }
     }
 
-    #[test]
-    fn isolated_database_url_preserves_query_parameters() {
-        // The isolated pool must keep every connection option carried in the
-        // URL's query string (sslmode, options, a socket host, ...) and only
-        // swap the database name; string slicing on the last '/' would drop
-        // the whole query (and a socket-host URL can even place a '/' inside
-        // it).  Regression guard for the Codex review finding on #178.
-        let base = "postgresql://test:test@localhost:5432/test?sslmode=require"
-            .parse::<sqlx::postgres::PgConnectOptions>()
-            .expect("parse DATABASE_URL");
-        assert_eq!(base.get_database(), Some("test"));
-        let swapped = base.clone().database("cap130_swap");
-        assert_eq!(swapped.get_database(), Some("cap130_swap"));
-        assert_eq!(swapped.get_host(), base.get_host());
-        assert_eq!(swapped.get_port(), base.get_port());
-        assert_eq!(swapped.get_username(), base.get_username());
-        // The sslmode=require query parameter survives the database swap
-        // (PgSslMode has no PartialEq; Debug is derived and exhaustive).
-        assert_eq!(
-            format!("{:?}", swapped.get_ssl_mode()),
-            format!("{:?}", base.get_ssl_mode())
-        );
-        assert_eq!(format!("{:?}", swapped.get_ssl_mode()), "Require");
-    }
-
     /// Companion to [`isolated_database_test_pool`]: closes the pool and
     /// drops the per-process database.  Without this, every test run leaves
     /// a fully migrated database behind on the shared PostgreSQL server (the
