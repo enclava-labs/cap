@@ -336,22 +336,9 @@ pub async fn soft_delete_tls_binding(
     Ok(())
 }
 
-/// TLS bindings the legacy Rego render may publish.
-///
-/// Withdrawal is durable: a rotated-out signer's artifacts stay revoked and
-/// rolling back to a withdrawn artifact intentionally fails closed. The
-/// legacy render admits identities straight from `kbs_tls_bindings`, so a
-/// rotate-back (A -> B -> A) would otherwise re-admit the exact workload
-/// whose artifacts were burned at the A -> B step -- without any new
-/// deployment -- while the signed selector keeps that workload revoked.
-/// Suppress such a binding until a fresh deployment commits a live
-/// (non-withdrawn) artifact under that identity again: `ensure_tls_binding`
-/// upserts the row at deployment time and the next render converges.
-/// Identities that were never rotated out (the initial set, a first
-/// rotation) still admit immediately, matching the binding-tracking rule
-/// migration 0052's trigger enforces, and unsigned (NULL identity)
-/// bindings never match the artifact predicates below, so they render
-/// exactly as before.
+/// Legacy bindings with withdrawn artifacts require matching live measurements.
+/// Artifact acceptance precedes binding updates, so signer equality alone can
+/// reopen the old workload. The binding's image_digest stores a full image_ref.
 pub(crate) async fn load_legacy_tls_bindings(
     db: &PgPool,
 ) -> Result<Vec<KbsTlsBinding>, KbsPolicyError> {
@@ -381,6 +368,10 @@ pub(crate) async fn load_legacy_tls_bindings(
                            = binding.signer_identity_subject
                        AND artifact.descriptor_payload -> 'signer_identity' ->> 'issuer'
                            = binding.signer_identity_issuer
+                       AND artifact.descriptor_payload ->> 'image_ref'
+                           = binding.image_digest
+                       AND artifact.descriptor_payload ->> 'expected_cc_init_data_hash'
+                           = encode(binding.init_data_hash, 'hex')
                        AND NOT EXISTS (
                            SELECT 1
                              FROM withdrawn_signer_artifacts AS withdrawn
@@ -411,9 +402,6 @@ async fn reconcile_legacy_rego_policy_with_client(
     )
     .fetch_all(db)
     .await?;
-    // Suppressed while a rotated-out signer's artifacts are all withdrawn
-    // and no fresh deployment has committed a live artifact under the
-    // binding's identity (see load_legacy_tls_bindings).
     let tls_bindings = load_legacy_tls_bindings(db).await?;
 
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);

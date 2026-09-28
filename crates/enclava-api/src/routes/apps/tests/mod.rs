@@ -834,7 +834,10 @@ async fn insert_signed_artifact_for_identity_with_hash(
     .execute(pool)
     .await
     .expect("insert signer rotation deployment");
+    let measurement_hex = hex::encode(descriptor_core_hash);
     let descriptor_payload = serde_json::json!({
+        "image_ref": format!("ghcr.io/acme/workload@sha256:{measurement_hex}"),
+        "expected_cc_init_data_hash": measurement_hex,
         "signer_identity": {
             "subject": subject,
             "issuer": issuer,
@@ -1515,16 +1518,35 @@ async fn rotate_back_to_withheld_signer_fails_closed_until_a_fresh_artifact() {
     let issuer_b = "https://new-issuer.example.test";
     let (org_id, _user_id, app_id) =
         insert_signer_rotation_app(&pool, Some(subject_a), Some(issuer_a)).await;
+    let old_measurement: Vec<u8> = (0..32u8).collect();
+    let new_measurement: Vec<u8> = (1..33u8).collect();
+    let old_image = format!(
+        "ghcr.io/acme/workload@sha256:{}",
+        hex::encode(&old_measurement)
+    );
+    let new_image = format!(
+        "ghcr.io/acme/workload@sha256:{}",
+        hex::encode(&new_measurement)
+    );
     insert_signed_artifact_for_identity_with_hash(
         &pool,
         org_id,
         app_id,
         subject_a,
         issuer_a,
-        &(0..32u8).collect::<Vec<u8>>(),
+        &old_measurement,
     )
     .await;
     insert_legacy_tls_binding(&pool, app_id, subject_a, issuer_a).await;
+    sqlx::query(
+        "UPDATE kbs_tls_bindings SET image_digest = $2, init_data_hash = $3 WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .bind(&old_image)
+    .bind(&old_measurement)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // Baseline: the live artifact admits the binding.
     let admitted = crate::kbs::load_legacy_tls_bindings(&pool)
@@ -1586,23 +1608,59 @@ async fn rotate_back_to_withheld_signer_fails_closed_until_a_fresh_artifact() {
         "a rotated-out signer must not regain legacy admission without a fresh artifact, got {admitted:?}"
     );
 
-    // A fresh deployment under A re-admits the binding.
     insert_signed_artifact_for_identity_with_hash(
         &pool,
         org_id,
         app_id,
         subject_a,
         issuer_a,
-        &(1..33u8).collect::<Vec<u8>>(),
+        &new_measurement,
     )
     .await;
+    assert!(
+        crate::kbs::load_legacy_tls_bindings(&pool)
+            .await
+            .unwrap()
+            .is_empty(),
+        "artifact acceptance must not readmit the previous workload's binding"
+    );
+    for (image, init_data_hash) in [
+        (&new_image, &old_measurement),
+        (&old_image, &new_measurement),
+    ] {
+        sqlx::query(
+            "UPDATE kbs_tls_bindings SET image_digest = $2, init_data_hash = $3 WHERE app_id = $1",
+        )
+        .bind(app_id)
+        .bind(image)
+        .bind(init_data_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            crate::kbs::load_legacy_tls_bindings(&pool)
+                .await
+                .unwrap()
+                .is_empty(),
+            "both the image reference and init-data measurement must match live authority"
+        );
+    }
+    sqlx::query(
+        "UPDATE kbs_tls_bindings SET image_digest = $2, init_data_hash = $3 WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .bind(&new_image)
+    .bind(&new_measurement)
+    .execute(&pool)
+    .await
+    .unwrap();
     let admitted = crate::kbs::load_legacy_tls_bindings(&pool)
         .await
         .expect("load admitted legacy tls bindings after the fresh deployment");
     assert_eq!(
         admitted.len(),
         1,
-        "a fresh artifact under the re-instated signer must restore admission"
+        "refreshing both binding measurements to live authority must restore admission"
     );
     assert_eq!(
         admitted[0].signer_identity_subject.as_deref(),
