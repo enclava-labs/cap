@@ -1197,6 +1197,17 @@ pub async fn rotate_org_owner(
                     ),
                 ));
             }
+            // The replay transaction is read-only; release it before the
+            // fenced reconcile (its pool connection must not stay pinned
+            // across the Kubernetes convergence wait).
+            tx.rollback().await.map_err(|_| db_error())?;
+            // Reviewer Critical (#187): this replay is exactly the path a
+            // same-key retry takes after a committed-pending 503 deferral.
+            // Confirming "ready" without reconciling would report success
+            // while the rotation's KBS revocation is still unpublished --
+            // the 30-second reconciler would become the revocation path
+            // again. Converge under the fence first, like the main path.
+            reconcile_kbs_policy_after_keyring_commit(&state, org_id, "rotate_org_owner").await?;
             return Ok(Json(RotateOrgOwnerResponse {
                 org_id,
                 state: "ready",
