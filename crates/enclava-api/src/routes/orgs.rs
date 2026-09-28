@@ -197,7 +197,7 @@ pub struct BootstrapSigningServiceResponse {
     pub owner_pubkey_fingerprint: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RotateOrgOwnerRequest {
     pub version: i64,
     pub keyring_payload: serde_json::Value,
@@ -1003,7 +1003,15 @@ pub async fn rotate_org_owner(
                 })),
             ));
         }
-        let previous: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+        // Replay of an already-committed rotation.  The content equality
+        // checks above already prove this request matches the committed
+        // row byte-for-byte (payload, signature, replacement owner).  The
+        // predecessor row itself may legitimately be gone: migration 0058's
+        // repair pass prunes malformed historical keyring rows (e.g. a
+        // pre-guard payload carrying a `\u0000` in an unknown field) while
+        // keeping the clean current version, and losing the HTTP response
+        // and retrying must still confirm the rotation.
+        let previous: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
             "SELECT ok.keyring_payload, usk.pubkey
                    FROM org_keyrings ok
                    JOIN user_signing_keys usk ON usk.id = ok.signing_key_id
@@ -1013,8 +1021,20 @@ pub async fn rotate_org_owner(
         .bind(body.version - 1)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|_| db_error())?
-        .ok_or_else(|| bad_request("previous keyring authority is unavailable"))?;
+        .map_err(|_| db_error())?;
+        let Some(previous) = previous else {
+            // Predecessor pruned (e.g. by migration 0058's repair pass)
+            // while the committed rotation itself is intact and matches
+            // this request byte-for-byte: confirm the replay without
+            // re-deriving validations that were enforced at commit time
+            // and without re-driving the signing service.
+            return Ok(Json(RotateOrgOwnerResponse {
+                org_id,
+                state: "ready",
+                keyring_version: body.version,
+                owner_fingerprint: hex::encode(Sha256::digest(replacement_owner)),
+            }));
+        };
         (previous.0, previous.1, false)
     } else if body.version == latest.0 + 1 {
         (latest.1, latest.3, true)
@@ -1992,20 +2012,21 @@ mod tests {
             reason,
         );
         let rotation_signature = key.sign(&directive);
+        let rotation_request = RotateOrgOwnerRequest {
+            version: 2,
+            keyring_payload: keyring_payload.clone(),
+            signature: hex::encode(keyring_signature.to_bytes()),
+            replacement_signing_pubkey: hex::encode(replacement_pubkey),
+            current_signing_pubkey: hex::encode(key.verifying_key().to_bytes()),
+            signed_at,
+            reason: reason.to_string(),
+            rotation_signature: hex::encode(rotation_signature.to_bytes()),
+        };
         let rotated = rotate_org_owner(
-            auth,
-            State(state),
+            auth.clone(),
+            State(state.clone()),
             Path(org_name.clone()),
-            Json(RotateOrgOwnerRequest {
-                version: 2,
-                keyring_payload,
-                signature: hex::encode(keyring_signature.to_bytes()),
-                replacement_signing_pubkey: hex::encode(replacement_pubkey),
-                current_signing_pubkey: hex::encode(key.verifying_key().to_bytes()),
-                signed_at,
-                reason: reason.to_string(),
-                rotation_signature: hex::encode(rotation_signature.to_bytes()),
-            }),
+            Json(rotation_request.clone()),
         )
         .await
         .expect("rotate owner enqueues reconciliation");
@@ -2034,6 +2055,38 @@ mod tests {
                 .expect("read latest keyring version");
         assert_eq!(latest_version, 2);
         assert_eq!(rotated.0.state, "ready");
+
+        // Review follow-up (Devin BUG on the repair pass): the v1
+        // predecessor row can be pruned by migration 0058's repair pass
+        // (e.g. a malformed historical payload) while the committed v2
+        // rotation stays intact.  Replaying the identical request after
+        // that prune must still confirm the rotation, not fail with
+        // "previous keyring authority is unavailable".
+        sqlx::query("DELETE FROM org_keyrings WHERE org_id = $1 AND version = 1")
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("prune predecessor keyring row");
+        let replayed = rotate_org_owner(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(rotation_request),
+        )
+        .await
+        .expect("replay after predecessor prune must confirm the rotation");
+        assert_eq!(replayed.0.state, "ready");
+        assert_eq!(replayed.0.keyring_version, 2);
+        let versions_after_replay: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+                .bind(org_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count keyring rows after replay");
+        assert_eq!(
+            versions_after_replay, 1,
+            "replay must not insert a duplicate row"
+        );
 
         mock.abort();
         sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
