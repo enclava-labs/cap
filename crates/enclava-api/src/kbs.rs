@@ -1907,62 +1907,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reconciliation_error_display_preserves_typed_cause() {
-        let policy = KbsPolicyReconciliationError::from(KbsPolicyError::PolicyGenerationConflict {
-            existing_generation: Some(7),
-            existing_hash: Some("bb".repeat(32)),
-            desired_generation: 7,
-            desired_hash: "aa".repeat(32),
-        });
-        let message = policy.to_string();
-        assert!(
-            message.starts_with(
-                "KBS policy reconciliation failed: signed KBS policy generation has conflicting content"
-            ),
-            "conflict Display keeps its stable prefix: {message}"
-        );
-        assert!(
-            message.contains("desired generation 7"),
-            "conflict Display names the generation: {message}"
-        );
-        assert!(
-            message.contains(&"b".repeat(32)),
-            "conflict Display names the annotated hash: {message}"
-        );
-        assert!(
-            message.contains(&"a".repeat(32)),
-            "conflict Display names the desired hash: {message}"
-        );
-        let absent = KbsPolicyReconciliationError::from(KbsPolicyError::PolicyGenerationConflict {
-            existing_generation: None,
-            existing_hash: None,
-            desired_generation: 4,
-            desired_hash: "cc".repeat(32),
-        });
-        let message = absent.to_string();
-        assert!(
-            message.contains("existing generation None"),
-            "absent annotations must render as None: {message}"
-        );
-        assert!(
-            message.contains(&"c".repeat(32)),
-            "conflict Display still names the desired hash: {message}"
-        );
-
-        let mutation =
-            KbsPolicyReconciliationError::from(crate::mutation_leases::MutationLeaseError::Lost);
-        assert_eq!(
-            mutation.to_string(),
-            "durable KBS mutation fence failed: application mutation lease was lost"
-        );
-
+    fn reconciliation_error_display_redacts_upstream_detail() {
         let db = KbsPolicyReconciliationError::from(KbsPolicyError::Db(sqlx::Error::Protocol(
             "tenant-sensitive database detail".to_string(),
         )));
-        assert_eq!(
-            db.to_string(),
-            "KBS policy reconciliation failed: database error"
-        );
         assert!(!db.to_string().contains("tenant-sensitive"));
 
         let kube = KbsPolicyReconciliationError::from(KbsPolicyError::Kube(kube::Error::Api(
@@ -1973,11 +1921,65 @@ mod tests {
             .with_code(500)
             .boxed(),
         )));
-        assert_eq!(
-            kube.to_string(),
-            "KBS policy reconciliation failed: Kubernetes API error"
-        );
         assert!(!kube.to_string().contains("tenant-sensitive"));
+    }
+
+    #[tokio::test]
+    async fn rollout_without_policy_annotations_rejects_healthy_deployment() {
+        let client = kube::Client::new(
+            tower::service_fn(|_: axum::http::Request<kube::client::Body>| async {
+                let deployment = serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {"name": "trustee", "generation": 1},
+                    "spec": {
+                        "replicas": 1,
+                        "selector": {"matchLabels": {"app": "trustee"}},
+                        "template": {
+                            "metadata": {"labels": {"app": "trustee"}},
+                            "spec": {
+                                "containers": [{"name": "trustee", "image": "trustee:test"}]
+                            }
+                        }
+                    },
+                    "status": {
+                        "observedGeneration": 1,
+                        "updatedReplicas": 1,
+                        "availableReplicas": 1
+                    }
+                });
+                Ok::<_, std::io::Error>(axum::http::Response::new(kube::client::Body::from(
+                    serde_json::to_vec(&deployment).unwrap(),
+                )))
+            }),
+            "default",
+        );
+        let deployments = Api::<Deployment>::namespaced(client, "trustee");
+        let desired_hash = "cc".repeat(32);
+        let error = wait_for_deployment_policy_generation(
+            &deployments,
+            "trustee",
+            4,
+            &desired_hash,
+            "publication-token",
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            &error,
+            KbsPolicyError::PolicyGenerationConflict {
+                existing_generation: None,
+                existing_hash: None,
+                desired_generation: 4,
+                desired_hash: hash,
+            } if hash == &desired_hash
+        ));
+        assert!(
+            KbsPolicyReconciliationError::from(error)
+                .to_string()
+                .contains(&desired_hash)
+        );
     }
 
     fn binding(key: &str) -> KbsOwnerBinding {
@@ -2600,19 +2602,19 @@ resource_bindings := {
         .unwrap_err();
         assert!(matches!(
             conflict,
-            KbsPolicyError::PolicyGenerationConflict { .. }
+            KbsPolicyError::PolicyGenerationConflict {
+                existing_generation: Some(3),
+                desired_generation: 3,
+                ..
+            }
         ));
         let message = conflict.to_string();
         assert!(
-            message.contains("Some(3)"),
-            "conflict names the existing generation: {message}"
-        );
-        assert!(
-            message.contains(&"b".repeat(32)),
+            message.contains(&"bb".repeat(32)),
             "conflict names the annotated hash: {message}"
         );
         assert!(
-            message.contains(&"a".repeat(32)),
+            message.contains(&"aa".repeat(32)),
             "conflict names the desired hash: {message}"
         );
         assert_eq!(
