@@ -258,9 +258,14 @@ async fn verify_or_initialize_remote_keyring(
                 )
                 .into());
             }
+            // A committed-but-unpublished keyring (put returned 503
+            // keyring_policy_reconciliation_pending) must not be confirmed
+            // by this retry's GET: replay the same version verbatim so the
+            // server re-drives KBS publication and reports success only
+            // once the generation is live (PR #187 review).
+            upload_keyring(api, &org_name, &envelope, Some(&raw_payload)).await?;
             store_trusted_owner(&org_id, &envelope.signing_pubkey)?;
             store_keyring_envelope(&org_id, &envelope)?;
-            let _ = raw_payload;
             Ok((org_id, org_name, fingerprint(&owner.public)))
         }
         Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {
