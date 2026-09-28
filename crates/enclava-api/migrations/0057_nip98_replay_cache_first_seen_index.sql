@@ -24,22 +24,14 @@
 --      DELETE FROM _sqlx_migrations WHERE version = 57;
 --   3. Retry the migration: cap_migrate will re-execute from a clean slate.
 --
--- Migration version history note (cap#190 review): this migration pair was
--- originally numbered 0050/0051, then renumbered to 0056/0057 because
--- sibling branches in flight (cap#185) landed different migrations as
--- 0050-0055 and both sets must coexist after merge. sqlx records applied
--- versions by number, and both run_migrations and verify mode reject a
--- ledger containing versions the binary does not embed. Any database that
--- ran the earlier 0050/0051 revision of this branch therefore cannot boot
--- against this build as-is. No such database exists in this project's
--- environments (main tops out at 0049, CI databases are ephemeral, and
--- there is no per-PR preview deployment), but if one is ever found, the
--- one-time reconciliation is:
---   DELETE FROM _sqlx_migrations WHERE version IN (50, 51);
---   ...then run cap_migrate, which applies 0056 (CREATE TABLE IF NOT
---   EXISTS) and 0057 (CREATE INDEX CONCURRENTLY IF NOT EXISTS) as no-ops
---   over the objects already present. The validity guard below then
---   confirms the resulting index is usable.
+-- Earlier replay-cache revisions used versions 0050/0051, which also name
+-- unrelated owner-rotation migrations. Never delete those ledger entries
+-- based on version numbers alone. If an earlier revision was applied,
+-- back up the ledger and schema, identify each entry by its historical
+-- checksum, and review a database-specific reconciliation before rollout.
+-- Preserve both replay-cache state and unrelated migration records.
+-- IF NOT EXISTS permits existing compatible cache objects, but does not
+-- resolve ledger/checksum conflicts or establish an environment's history.
 --
 -- The NIP-98 replay-cache reaper purges with `WHERE first_seen < now() -
 -- interval`, which cannot use the event_id primary key. Under sustained
