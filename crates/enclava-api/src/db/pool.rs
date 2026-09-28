@@ -165,7 +165,7 @@ mod tests {
 
     async fn schema_test_pool() -> sqlx::PgPool {
         let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:***@localhost:5432/test".to_string());
+            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
         let pool = sqlx::PgPool::connect(&database_url)
             .await
             .expect("connect schema guard test database");
