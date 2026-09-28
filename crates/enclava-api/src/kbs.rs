@@ -4160,6 +4160,52 @@ resource_bindings := {
         crate::test_support::drop_isolated_database("cap130_selector_rotation", pool).await;
     }
 
+    #[tokio::test]
+    async fn duplicate_keyring_members_authorize_each_legacy_artifact_once() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap_pr187_duplicate_members").await;
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, legacy, "healthy", Utc::now()).await;
+        let artifact = insert_test_artifact(&pool, app_id, legacy, "77").await;
+        let signer = "bb".repeat(32);
+        // The same member key twice: once lowercase, once in the uppercase
+        // spelling validation accepts and stores as-is.
+        insert_test_keyring_version(&pool, org_id, 1, &[&signer, &signer.to_uppercase()]).await;
+
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select candidates with duplicate member keys");
+        let matching: Vec<_> = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == artifact.metadata.descriptor_core_hash
+            })
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "repeated member keys must not duplicate the authorized legacy artifact"
+        );
+        assert!(matching[0].required);
+
+        let single_body_len =
+            signed_policy_artifact_policy_body(std::slice::from_ref(&matching[0].artifact))
+                .unwrap()
+                .len();
+        let selected =
+            select_signed_policy_artifacts_for_policy_body(candidates, single_body_len + 32)
+                .unwrap();
+        assert_eq!(
+            selected.len(),
+            1,
+            "the repeated member key must not spuriously exhaust the serialized policy budget"
+        );
+
+        crate::test_support::drop_isolated_database("cap_pr187_duplicate_members", pool).await;
+    }
+
     /// Fail closed for #130: an org with retained artifacts but no keyring row
     /// at all must contribute no authorization -- the INNER JOIN drops it, and
     /// the deferred selector bump publishes exactly that withdrawal on upgrade.
