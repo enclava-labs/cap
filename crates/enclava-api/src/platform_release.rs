@@ -91,8 +91,10 @@ pub enum PlatformReleaseError {
     },
     #[error("platform release root pubkey is not configured at compile time")]
     MissingRootPubkey,
-    #[error("platform release signature pubkey is not the pinned root")]
-    RootMismatch,
+    #[error(
+        "platform release signature pubkey is not the pinned root: this build pins {pinned}, the release declares {signing}; verify the target platform and, if this is an expected root rotation, update this enclava-api deployment using a trusted build with the expected pin"
+    )]
+    RootMismatch { pinned: String, signing: String },
     #[error("platform release signature verification failed: {0}")]
     BadSignature(String),
     #[error("policy_template_sha256 does not match policy_template_text")]
@@ -235,7 +237,10 @@ pub fn verify_envelope(
     let pinned = hex32("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX", configured_root)?;
     let signing = hex32("signing_pubkey", &envelope.signing_pubkey)?;
     if signing != pinned {
-        return Err(PlatformReleaseError::RootMismatch);
+        return Err(PlatformReleaseError::RootMismatch {
+            pinned: hex::encode(pinned),
+            signing: hex::encode(signing),
+        });
     }
     let verifying_key =
         VerifyingKey::from_bytes(&signing).map_err(|err| PlatformReleaseError::InvalidField {
@@ -467,6 +472,24 @@ fn hex32(field: &'static str, value: &str) -> Result<[u8; 32], PlatformReleaseEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verifier_reports_mismatched_declared_root() {
+        let pinned = option_env!("ENCLAVA_PLATFORM_RELEASE_ROOT_PUBKEY_HEX")
+            .unwrap_or(TEST_FIXTURE_RELEASE_ROOT_PUBKEY_HEX);
+        let mut foreign_root = hex32("test root", pinned).unwrap();
+        foreign_root[0] ^= 1;
+        let declared = hex::encode(foreign_root);
+        let mut envelope: PlatformReleaseEnvelope =
+            serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        envelope.signing_pubkey = declared.clone();
+
+        let error = verify_envelope(envelope).expect_err("a foreign root must fail verification");
+        assert!(matches!(error, PlatformReleaseError::RootMismatch { .. }));
+        let message = error.to_string();
+        assert!(message.contains(&pinned.to_ascii_lowercase()));
+        assert!(message.contains(&declared));
+    }
 
     #[test]
     fn fixture_root_is_detected_case_insensitively() {
