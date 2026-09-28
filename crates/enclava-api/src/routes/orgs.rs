@@ -237,7 +237,7 @@ pub struct AuthorizedSignerResponse {
 
 type KeyringRow = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 struct SignedOrgKeyring {
     org_id: Uuid,
     version: u64,
@@ -245,23 +245,16 @@ struct SignedOrgKeyring {
     updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 struct SignedOrgKeyringMember {
     user_id: Uuid,
-    #[serde(
-        deserialize_with = "deserialize_pubkey",
-        serialize_with = "serialize_pubkey"
-    )]
+    #[serde(deserialize_with = "deserialize_pubkey")]
     pubkey: [u8; 32],
     role: SignedOrgKeyringRole,
     added_at: DateTime<Utc>,
 }
 
-fn serialize_pubkey<S: serde::Serializer>(b: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
-    s.serialize_str(&hex::encode(b))
-}
-
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum SignedOrgKeyringRole {
     Owner,
@@ -333,25 +326,8 @@ fn canonical_keyring_bytes(keyring: &SignedOrgKeyring) -> Vec<u8> {
 fn db_error() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({ "error": "database error" })),
+        Json(serde_json::json!({"error": "database error"})),
     )
-}
-
-// Legacy rows can differ in unsigned fields while carrying identical signed content.
-fn keyring_replay_conflicts(
-    stored_payload: &[u8],
-    stored_signature: &[u8],
-    stored_signing_pubkey: &[u8],
-    canonical_bytes: &[u8],
-    signature: &[u8],
-    signing_pubkey: &[u8],
-) -> bool {
-    let Ok(stored_keyring) = serde_json::from_slice::<SignedOrgKeyring>(stored_payload) else {
-        return true;
-    };
-    canonical_keyring_bytes(&stored_keyring).as_slice() != canonical_bytes
-        || stored_signature != signature
-        || stored_signing_pubkey != signing_pubkey
 }
 
 fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
@@ -359,127 +335,6 @@ fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({"error": message})),
     )
-}
-
-/// The org authority transaction has committed, but fenced KBS convergence
-/// could not be confirmed before responding (Codex P1, #187 / shared #178
-/// source): a keyring generation that removes the signer of retained signed
-/// policy artifacts must revoke that authority from the live Trustee policy
-/// before the caller is told the revocation succeeded.
-///
-/// This is a *committed-pending* outcome, not a failed write: the keyring row,
-/// audit entry, and the trigger-owed selector bump are durable, and the
-/// background signed-policy reconciler keeps retrying the publication.  A
-/// plain 500 here would be dishonest twice over -- it invites an unsafe
-/// client retry of a committed mutation, and the internal PaaS idempotency
-/// ledger would terminalize the intent as outcome-unknown.  The explicit 503
-/// body names the state so wrappers can defer the receipt and the same
-/// idempotency key can retry publication only.
-pub(crate) fn keyring_publication_pending_error(
-    context: &str,
-) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "error": "keyring_publication_pending",
-            "message": "the org keyring change committed but its KBS policy publication \
-                 is still pending; retry with the same parameters to complete publication",
-            "context": context,
-            "committed": true,
-            "retryable": true,
-        })),
-    )
-}
-
-/// Converge the live KBS policy under the global mutation fence after an org
-/// authority transaction commits (put_keyring / rotate_org_owner).  Mirrors
-/// rotate_signer's post-commit reconciliation: claim the kbs_policy resource
-/// fence, run the (signed or legacy) reconciliation to convergence, and
-/// release the fence cleanly.  On any failure the durable debts remain and
-/// the background reconciler retries; the caller reports the explicit
-/// committed-pending 503 above rather than a bare 500.
-///
-/// Returns Ok(()) when KBS policy management is not configured.
-pub(crate) async fn reconcile_kbs_policy_after_keyring_commit(
-    state: &AppState,
-    org_id: Uuid,
-    context: &str,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if state.kbs_policy.is_none() {
-        return Ok(());
-    }
-    let lease = match crate::mutation_leases::claim_resources(
-        state,
-        "kbs_keyring_policy_publication",
-        Uuid::new_v4(),
-        vec![crate::mutation_leases::ResourceFence::kbs_policy()],
-    )
-    .await
-    {
-        Ok(lease) => lease,
-        Err(error) => {
-            tracing::warn!(
-                org_id = %org_id,
-                error = %error,
-                error_code = "kbs_policy_fence_unavailable",
-                context,
-                "org keyring change committed but KBS policy reconciliation fence was unavailable"
-            );
-            return Err(keyring_publication_pending_error(context));
-        }
-    };
-    match lease
-        .guard_provider(crate::kbs::reconcile_policy(
-            &state.db,
-            state.kbs_policy.as_ref(),
-        ))
-        .await
-    {
-        Err(error) => {
-            tracing::warn!(
-                org_id = %org_id,
-                error = %error,
-                error_code = "kbs_policy_fence_unavailable",
-                context,
-                "org keyring change committed but lost the KBS policy fence during reconciliation"
-            );
-            release_finished_lease(lease).await;
-            return Err(keyring_publication_pending_error(context));
-        }
-        Ok(Err(error)) => {
-            tracing::warn!(
-                org_id = %org_id,
-                error = %error,
-                error_code = "kbs_policy_reconciliation_failed",
-                context,
-                "org keyring change committed but KBS policy reconciliation failed"
-            );
-            release_finished_lease(lease).await;
-            return Err(keyring_publication_pending_error(context));
-        }
-        Ok(Ok(())) => {}
-    }
-    if let Err(error) = lease.finish().await {
-        tracing::warn!(
-            org_id = %org_id,
-            error = %error,
-            error_code = "kbs_policy_lease_finish_failed",
-            context,
-            "org keyring change reconciled KBS policy but failed to release the fence cleanly"
-        );
-        return Err(keyring_publication_pending_error(context));
-    }
-    Ok(())
-}
-
-async fn release_finished_lease(lease: crate::mutation_leases::ResourceMutationLease) {
-    if let Err(error) = lease.finish().await {
-        tracing::warn!(
-            error = %error,
-            error_code = "kbs_policy_lease_finish_failed",
-            "failed to release the KBS policy fence after a failed publish"
-        );
-    }
 }
 
 /// keyring payloads are persisted as UTF-8 JSON that PostgreSQL must be able
@@ -657,25 +512,12 @@ pub async fn put_keyring(
         .verify(&canonical_bytes, &signature_obj)
         .map_err(|_| bad_request("keyring signature verification failed"))?;
 
-    // Drop unsigned fields, but preserve the JSON-value encoding used by
-    // existing stored payloads and idempotent requests.
-    let normalized_keyring_payload = serde_json::to_value(&keyring).map_err(|_| db_error())?;
-    let keyring_payload_bytes = serde_json::to_vec(&normalized_keyring_payload).map_err(|_| {
+    let keyring_payload_bytes = serde_json::to_vec(&body.keyring_payload).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "serialization error"})),
         )
     })?;
-    // #128 review follow-up (P1): reject keyrings whose CLI envelope would
-    // exceed the deploy-time org_keyring_blob cap, so accepted authority
-    // stays deployable instead of failing every signed deployment at
-    // decode_optional_blobs.
-    crate::signing_service::validate_org_keyring_registration_budget(
-        keyring_payload_bytes.len(),
-        &signature,
-        &signing_pubkey,
-    )
-    .map_err(crate::routes::deployments::signing_error_response)?;
 
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
     crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
@@ -723,24 +565,36 @@ pub async fn put_keyring(
                 Json(serde_json::json!({"error": "keyring version is stale"})),
             ));
         }
-        if body.version == latest_version
-            && keyring_replay_conflicts(
-                &latest_payload,
-                &latest_signature,
-                &latest_signing_pubkey,
-                &canonical_bytes,
-                &signature,
-                &signing_pubkey,
-            )
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "keyring version already exists with different content"
-                })),
-            ));
-        }
         if body.version == latest_version {
+            // Semantic replay check (PR #187 review): the stored payload may
+            // carry unsigned extra JSON fields (e.g. a client's "memo") that
+            // a typed rebuild drops before resubmitting.  The signature is
+            // over the canonical keyring bytes, so comparing those (plus the
+            // signature and signing key) instead of raw payload bytes keeps
+            // an exact-version replay idempotent for semantically identical
+            // payloads while still rejecting any genuinely different
+            // content.  A stored payload that no longer parses fails closed
+            // as a conflict.
+            let latest_keyring: SignedOrgKeyring = serde_json::from_slice(&latest_payload)
+                .map_err(|_| {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "keyring version already exists with different content"
+                        })),
+                    )
+                })?;
+            if latest_signature != signature
+                || latest_signing_pubkey != signing_pubkey
+                || canonical_keyring_bytes(&latest_keyring) != canonical_bytes
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "keyring version already exists with different content"
+                    })),
+                ));
+            }
             insert_new_version = false;
         }
         let next_version = latest_version
@@ -809,23 +663,13 @@ pub async fn put_keyring(
     tx.commit().await.map_err(|_| db_error())?;
     confirm_keyring_kbs_publication(&state).await?;
 
-    // #130/#187: a committed keyring generation that removes the signer of
-    // retained artifacts must revoke that authority from the live Trustee
-    // policy before success is reported -- the 30-second background
-    // reconciler is the backstop, not the revocation path. Converge under
-    // the same kbs_policy mutation fence rotate_signer uses; a publication
-    // failure returns the explicit committed-pending 503 so the internal
-    // PaaS wrappers can defer the receipt and the same idempotency key
-    // retries publication without repeating keyring/audit writes.
-    reconcile_kbs_policy_after_keyring_commit(&state, org_id, "put_keyring").await?;
-
     let fingerprint = hex::encode(Sha256::digest(&canonical_bytes));
     Ok((
         StatusCode::OK,
         Json(OrgKeyringResponse {
             org_id,
             version: body.version,
-            keyring_payload: normalized_keyring_payload,
+            keyring_payload: body.keyring_payload,
             signature: body.signature,
             signing_pubkey: body.signing_pubkey,
             fingerprint,
@@ -860,15 +704,15 @@ pub async fn get_keyring(
             Json(serde_json::json!({"error": "org keyring not found"})),
         ));
     };
-    let keyring: SignedOrgKeyring =
+    let keyring_payload: serde_json::Value =
         serde_json::from_slice(&payload_bytes).map_err(|_| db_error())?;
+    let keyring: SignedOrgKeyring =
+        serde_json::from_value(keyring_payload.clone()).map_err(|_| db_error())?;
     let fingerprint = hex::encode(Sha256::digest(canonical_keyring_bytes(&keyring)));
-    // Legacy unsigned extensions must not leak into strict deployment envelopes.
-    let normalized_keyring_payload = serde_json::to_value(&keyring).map_err(|_| db_error())?;
     Ok(Json(OrgKeyringResponse {
         org_id,
         version,
-        keyring_payload: normalized_keyring_payload,
+        keyring_payload,
         signature: hex::encode(signature),
         signing_pubkey: hex::encode(signing_pubkey),
         fingerprint,
@@ -1190,18 +1034,7 @@ pub async fn rotate_org_owner(
         .verify(&directive, &Signature::from_bytes(&rotation_signature))
         .map_err(|_| bad_request("owner rotation signature verification failed"))?;
 
-    // Keep normalization compatible with the persisted JSON-value encoding.
-    let normalized_payload = serde_json::to_value(&replacement_keyring).map_err(|_| db_error())?;
-    let payload_bytes = serde_json::to_vec(&normalized_payload).map_err(|_| db_error())?;
-    // #128 review follow-up (P1): the registered keyring must stay inside the
-    // deploy-time org_keyring_blob envelope budget, or every later signed
-    // deployment would fail decode_optional_blobs.
-    crate::signing_service::validate_org_keyring_registration_budget(
-        payload_bytes.len(),
-        &keyring_signature,
-        &replacement_owner,
-    )
-    .map_err(crate::routes::deployments::signing_error_response)?;
+    let payload_bytes = serde_json::to_vec(&body.keyring_payload).map_err(|_| db_error())?;
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
     crate::signing_service::lock_org_signing_authority_lane(&mut tx, org_id)
         .await
@@ -1226,14 +1059,10 @@ pub async fn rotate_org_owner(
     .ok_or_else(|| bad_request("org keyring must be uploaded before owner rotation"))?;
 
     let (base_payload, expected_current_owner, insert_new_version) = if body.version == latest.0 {
-        if keyring_replay_conflicts(
-            &latest.1,
-            &latest.2,
-            &latest.3,
-            &canonical_bytes,
-            &keyring_signature,
-            &replacement_owner,
-        ) {
+        if latest.1 != payload_bytes
+            || latest.2 != keyring_signature
+            || latest.3 != replacement_owner
+        {
             return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -1387,11 +1216,6 @@ pub async fn rotate_org_owner(
     tx.commit().await.map_err(|_| db_error())?;
     confirm_keyring_kbs_publication(&state).await?;
 
-    // #130/#187: same fenced post-commit convergence as put_keyring -- the
-    // owner rotation can remove the signer of retained artifacts, and that
-    // revocation must be live in Trustee before "ready" is reported.
-    reconcile_kbs_policy_after_keyring_commit(&state, org_id, "rotate_org_owner").await?;
-
     Ok(Json(RotateOrgOwnerResponse {
         org_id,
         state: "ready",
@@ -1440,30 +1264,11 @@ pub async fn invite_member(
     .await
     .map_err(|_| db_error())?;
 
-    // Anti-enumeration (issue #121): a bad role fails identically for
-    // known and unknown emails (the lookup result is only consumed after
-    // parse_role), and the unknown-invitee path performs the same reads
-    // up to the membership SELECT (lane locks, caller role read, invitee
-    // membership read). It must not return a success-shaped response: a
-    // fake 200 would both lie to the caller (CLI prints "Invited ...")
-    // and re-open the oracle via GET /orgs/{name}/members, where a real
-    // invite adds a visible row and this one would not.
-    //
-    // RESIDUAL RISKS (accepted, like the signup 201-vs-400 split; fully
-    // closing them needs a pending-invite model — invite token emailed
-    // to the address, membership only on accept — a product change with
-    // a new table, out of scope for this fix):
-    // - status split: a successful invite returns 200 while an unknown
-    //   email returns the generic 403 "invite not permitted" below;
-    // - body split for admin callers: an admin inviting role "member"
-    //   gets "invite not permitted" for an unknown email, but the
-    //   owner-gate 403 ("only owners can grant, change, or remove admin
-    //   and owner roles") when the target is an existing admin/owner;
-    // - sole-owner demotion of a KNOWN owner can return 400 ("organization
-    //   must retain at least one owner"), which an unknown email never
-    //   triggers;
-    // - timing is not uniform: the unknown path ends in a rollback while
-    //   a real invite INSERTs and commits.
+    let (invitee_id,) = invitee.ok_or((
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "user not found"})),
+    ))?;
+
     let requested_role = scopes::parse_role(body.role.as_deref().unwrap_or("member"))?;
 
     let mut tx = state.db.begin().await.map_err(|_| db_error())?;
@@ -1477,11 +1282,6 @@ pub async fn invite_member(
         scopes::lock_and_read_active_membership_role_in_tx(&mut tx, org_id, auth.user_id).await?;
     scopes::require_admin_role(current_caller_role)?;
 
-    // Both paths read the membership row for the invitee id (the nil UUID
-    // for an unknown email matches no row), so the reads up to this point
-    // are the same; a real invite additionally INSERTs and commits while
-    // the unknown path rolls back (see the residual-risk note above).
-    let invitee_id = invitee.map(|(id,)| id).unwrap_or_else(Uuid::nil);
     let existing_role: Option<Role> = sqlx::query_scalar(
         "SELECT role as \"role: _\"
          FROM memberships
@@ -1504,16 +1304,6 @@ pub async fn invite_member(
     if existing_role == Some(Role::Owner) && requested_role != Role::Owner {
         scopes::ensure_last_owner_invariant(&mut tx, org_id, invitee_id, Some(requested_role))
             .await?;
-    }
-
-    // Unknown email: generic 403 (see residual-risk note above for what
-    // this still reveals).
-    if invitee.is_none() {
-        tx.rollback().await.map_err(|_| db_error())?;
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "invite not permitted"})),
-        ));
     }
 
     sqlx::query(
@@ -1684,10 +1474,7 @@ pub async fn remove_member(
 mod tests {
     use super::*;
     use crate::auth::api_key::ValidatedApiKey;
-    use crate::test_support::{
-        KbsPolicyProvider, drop_isolated_database, isolated_database_test_pool,
-        kbs_policy_kube_client,
-    };
+    use crate::test_support::{drop_isolated_database, isolated_database_test_pool};
     use chrono::{TimeZone, Utc};
     use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
@@ -1961,6 +1748,152 @@ mod tests {
         }
     }
 
+    /// Stateful Kubernetes API double behind the fenced KBS reconciler: it
+    /// stores the resource-policy ConfigMap and the Trustee deployment the
+    /// way the API server would, so route regressions observe real
+    /// publication (ConfigMap replace plus rollout confirmation) instead of
+    /// a fabricated success.  `healthy = false` makes provider I/O fail.
+    struct KbsPolicyProvider {
+        healthy: bool,
+        configmap: serde_json::Value,
+        deployment: serde_json::Value,
+        configmap_replaces: usize,
+    }
+
+    impl KbsPolicyProvider {
+        fn new(healthy: bool) -> Self {
+            Self {
+                healthy,
+                configmap: serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "resource-policy",
+                        "namespace": "kbs-test",
+                        "resourceVersion": "1",
+                    },
+                    "data": {
+                        "policy.rego": "package policy\n\n# legacy unsigned policy\n",
+                    },
+                }),
+                deployment: serde_json::json!({
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "metadata": {
+                        "name": "trustee",
+                        "namespace": "kbs-test",
+                        "resourceVersion": "1",
+                        "generation": 1,
+                    },
+                    "spec": {
+                        "replicas": 1,
+                        "template": {
+                            "metadata": {},
+                            "spec": {
+                                "containers": [{"name": "trustee", "image": "trustee"}],
+                            },
+                        },
+                    },
+                    "status": {
+                        "observedGeneration": 1_000_000,
+                        "replicas": 1,
+                        "updatedReplicas": 1,
+                        "readyReplicas": 1,
+                        "availableReplicas": 1,
+                    },
+                }),
+                configmap_replaces: 0,
+            }
+        }
+
+        fn published_generation(&self) -> Option<i64> {
+            self.configmap["metadata"]["annotations"]
+                .as_object()?
+                .get("enclava.dev/cap-policy-generation")?
+                .as_str()?
+                .parse()
+                .ok()
+        }
+    }
+
+    fn kbs_policy_kube_client(
+        provider: std::sync::Arc<tokio::sync::Mutex<KbsPolicyProvider>>,
+    ) -> kube::Client {
+        use axum::http::{Request, Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use tower::service_fn;
+
+        fn respond(
+            status: u16,
+            value: &serde_json::Value,
+        ) -> Result<Response<Body>, std::io::Error> {
+            Ok(Response::builder()
+                .status(status)
+                .body(Body::from(
+                    serde_json::to_vec(value).expect("serialize kube double response"),
+                ))
+                .expect("build kube double response"))
+        }
+
+        kube::Client::new(
+            service_fn(move |request: Request<Body>| {
+                let provider = provider.clone();
+                async move {
+                    let method = request.method().as_str().to_string();
+                    let path = request.uri().path().to_string();
+                    let body = request
+                        .into_body()
+                        .collect()
+                        .await
+                        .expect("read Kubernetes request body")
+                        .to_bytes();
+                    let mut provider = provider.lock().await;
+                    let mut object: serde_json::Value = if method == "PUT" {
+                        serde_json::from_slice(&body)
+                            .expect("kube double PUT requests carry a JSON body")
+                    } else {
+                        serde_json::json!({})
+                    };
+                    if !provider.healthy
+                        || (method != "GET" && method != "PUT")
+                        || (!path.contains("/configmaps/") && !path.contains("/deployments/"))
+                    {
+                        return respond(
+                            404,
+                            &serde_json::json!({
+                                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                                "reason": "NotFound", "message": "unavailable", "code": 404,
+                            }),
+                        );
+                    }
+                    if path.contains("/configmaps/") {
+                        if method == "PUT" {
+                            provider.configmap_replaces += 1;
+                            if let Some(metadata) =
+                                object.get_mut("metadata").and_then(|m| m.as_object_mut())
+                            {
+                                metadata.insert(
+                                    "resourceVersion".to_string(),
+                                    serde_json::json!(
+                                        (provider.configmap_replaces + 1).to_string()
+                                    ),
+                                );
+                            }
+                            provider.configmap = object;
+                        }
+                        return respond(200, &provider.configmap);
+                    }
+                    if method == "PUT" {
+                        provider.deployment = object;
+                    }
+                    respond(200, &provider.deployment)
+                }
+            }),
+            "default",
+        )
+    }
+
     #[tokio::test]
     async fn put_keyring_reports_success_only_after_kbs_publication() {
         let _singleton = keyring_enqueue_guard().await;
@@ -2176,153 +2109,6 @@ mod tests {
             .await
             .expect("delete keyring enqueue user");
         drop_isolated_database("cap130_keyring_enqueue_put", pool).await;
-    }
-
-    /// Codex P1 follow-up (#187, shared #178 source): a committed keyring
-    /// generation that removes the signer of retained artifacts must
-    /// reconcile the live KBS policy before success is reported.  When the
-    /// fenced publication cannot run (here: the global kbs_policy fence is
-    /// already held), the route must return the explicit committed-pending
-    /// 503 `keyring_publication_pending` -- never a bare 500 -- while the
-    /// keyring row, audit entry, and trigger-owed selector bump remain
-    /// durable for the background reconciler / same-key retry.
-    #[tokio::test]
-    async fn put_keyring_reports_committed_pending_503_when_kbs_publication_is_fenced_out() {
-        let _singleton = keyring_enqueue_guard().await;
-        let (_db_cleanup, pool) =
-            isolated_database_test_pool("cap187_keyring_publication_pending").await;
-        let org_id = Uuid::new_v4();
-        let user_id = Uuid::new_v4();
-        let suffix = org_id.simple().to_string();
-        let org_name = format!("keyring-pending-{suffix}");
-        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
-            .await
-            .expect("insert keyring pending org");
-        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Pending')")
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .expect("insert keyring pending user");
-        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
-            .bind(user_id)
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("insert keyring pending membership");
-        let key = SigningKey::generate(&mut OsRng);
-        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
-            .bind(user_id)
-            .bind(key.verifying_key().to_bytes().to_vec())
-            .execute(&pool)
-            .await
-            .expect("insert keyring pending signing key");
-
-        // Signed-policy mode is active so the keyring insert owes a selector
-        // bump (migration 0058's trigger) that only the reconciler consumes.
-        sqlx::query(
-            "UPDATE kbs_signed_policy_reconciliation
-                SET desired_generation = 5
-              WHERE singleton",
-        )
-        .execute(&pool)
-        .await
-        .expect("seed signed-policy generation");
-
-        // Seize the global kbs_policy fence the way a concurrent fenced
-        // publisher would, so the post-commit reconciliation returns Busy.
-        sqlx::query(
-            "UPDATE external_resource_mutation_leases
-                SET owner_token = $1,
-                    locked_until = clock_timestamp() + interval '30 seconds',
-                    reclaim_after = clock_timestamp() + interval '60 seconds',
-                    updated_at = clock_timestamp()
-              WHERE resource_scope = 'kbs_policy' AND resource_key = 'global'",
-        )
-        .bind(Uuid::new_v4())
-        .execute(&pool)
-        .await
-        .expect("seize kbs policy fence");
-
-        let mut state = crate::test_support::lazy_state();
-        state.db = pool.clone();
-        state.side_effect_admission = crate::state::side_effect_admission_for_pool(&pool);
-        state.kbs_policy = Some(crate::kbs::KbsPolicyConfig {
-            namespace: "kbs-test".to_string(),
-            configmap_name: "resource-policy".to_string(),
-            policy_key: "policy.rego".to_string(),
-            deployment_name: "kbs".to_string(),
-            required: true,
-            signed_policy_retention: 2,
-            signed_policy_max_bytes: 65536,
-        });
-        let auth = AuthContext {
-            user_id,
-            org_id,
-            org_name: org_name.clone(),
-            role: Role::Owner,
-            api_key: None,
-            management_origin: crate::auth::middleware::ManagementOrigin::Public,
-        };
-        let pending = put_keyring(
-            auth,
-            State(state),
-            Path(org_name.clone()),
-            Json(signed_keyring_request(org_id, user_id, &key, 1, 1)),
-        )
-        .await
-        .expect_err("fenced-out publication must surface the committed-pending 503");
-        assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(pending.1.0["error"], "keyring_publication_pending");
-        assert_eq!(pending.1.0["committed"], true);
-        assert_eq!(pending.1.0["retryable"], true);
-
-        // The org authority transaction itself is durable: the keyring row,
-        // its audit entry, and the trigger-owed selector bump all landed.
-        let keyring_rows: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM org_keyrings WHERE org_id = $1 AND version = 1",
-        )
-        .bind(org_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count committed keyring rows");
-        assert_eq!(keyring_rows, 1, "the keyring row must be committed");
-        let audit_rows: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM audit_log WHERE org_id = $1 AND action = 'org.keyring.put'",
-        )
-        .bind(org_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count committed audit rows");
-        assert_eq!(audit_rows, 1, "the audit entry must be committed");
-        let (desired, owed): (i64, i64) = sqlx::query_as(
-            "SELECT desired_generation, selector_bumps_owed
-               FROM kbs_signed_policy_reconciliation WHERE singleton",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("read reconciliation state after fenced-out publication");
-        assert_eq!(desired, 5, "the handler must not bump desired_generation");
-        assert_eq!(
-            owed, 1,
-            "the trigger-owed selector bump must remain durable for the reconciler"
-        );
-
-        sqlx::query("DELETE FROM audit_log WHERE org_id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete keyring pending audit rows");
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("delete keyring pending org");
-        sqlx::query("DELETE FROM users WHERE id = $1")
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .expect("delete keyring pending user");
-        drop_isolated_database("cap187_keyring_publication_pending", pool).await;
     }
 
     /// Review follow-up: a `\u0000` escape in an unknown field passes
@@ -2827,6 +2613,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_keyring_replay_ignores_unsigned_extra_payload_fields() {
+        // PR #187 review: a client (e.g. the CLI's owner-recovery retry)
+        // fetches a committed keyring, rebuilds it through the typed
+        // envelope -- dropping unsigned extra JSON fields like "memo" --
+        // and PUTs the same version back. The replay must be idempotent:
+        // the signature is over the canonical keyring bytes, so comparing
+        // those instead of raw payload bytes accepts the semantically
+        // identical payload while still rejecting genuinely different
+        // content. Unsigned-only mode keeps KBS publication out of scope.
+        let (_db_cleanup, pool) = isolated_database_test_pool("cap187_keyring_replay_extra").await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-replay-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert keyring replay org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Replayer')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring replay user");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert keyring replay membership");
+        let key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert keyring replay signing key");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+
+        // Initial put carries an unsigned extra field the typed keyring
+        // does not know about.
+        let mut request = signed_keyring_request(org_id, user_id, &key, 1, 1);
+        request
+            .keyring_payload
+            .as_object_mut()
+            .expect("keyring payload is an object")
+            .insert("memo".to_string(), serde_json::json!("rotation"));
+        let created = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(request),
+        )
+        .await
+        .expect("initial put with an extra field must succeed");
+        assert_eq!(created.1.version, 1);
+
+        // The CLI-style replay drops the extra field before resubmitting
+        // the same version: semantically identical, so idempotent.
+        let stripped = signed_keyring_request(org_id, user_id, &key, 1, 1);
+        let replayed = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(stripped),
+        )
+        .await
+        .expect("typed rebuild replay of the same version must be idempotent");
+        assert_eq!(replayed.1.version, 1);
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM org_keyrings WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count keyring rows after replay");
+        assert_eq!(rows, 1, "the replay must not insert a duplicate row");
+
+        // Genuinely different content at the same version still conflicts:
+        // a different updated_at changes the canonical bytes, and this
+        // payload carries its own valid signature over those bytes.
+        let conflicting = signed_keyring_request(org_id, user_id, &key, 1, 2);
+        let rejected = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(conflicting),
+        )
+        .await
+        .expect_err("same-version replay with different canonical content must conflict");
+        assert_eq!(rejected.0, StatusCode::CONFLICT);
+
+        drop_isolated_database("cap187_keyring_replay_extra", pool).await;
+    }
+
+    #[tokio::test]
     async fn keyring_acceptance_waits_for_membership_removal_and_rejects() {
         let pool = database_test_pool().await;
         let org_id = Uuid::new_v4();
@@ -2946,129 +2834,6 @@ mod tests {
         .await
         .expect("count rejected keyring authority rows");
         assert_eq!(authority_rows, (0, 0));
-    }
-
-    #[tokio::test]
-    async fn put_keyring_response_returns_normalized_deployable_keyring() {
-        let pool = database_test_pool().await;
-        let org_id = Uuid::new_v4();
-        let user_id = Uuid::new_v4();
-        let suffix = org_id.simple().to_string();
-        let org_name = format!("keyring-normalize-{suffix}");
-        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
-            .await
-            .expect("insert keyring normalization org");
-        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Keyring Owner')")
-            .bind(user_id)
-            .execute(&pool)
-            .await
-            .expect("insert keyring normalization owner");
-        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
-            .bind(user_id)
-            .bind(org_id)
-            .execute(&pool)
-            .await
-            .expect("insert keyring normalization membership");
-        let key = SigningKey::generate(&mut OsRng);
-        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
-            .bind(user_id)
-            .bind(key.verifying_key().to_bytes().to_vec())
-            .execute(&pool)
-            .await
-            .expect("insert keyring normalization signing key");
-
-        let mut request = signed_keyring_request(org_id, user_id, &key, 1, 1);
-        // An otherwise-valid extra field: the typed parse ignores it, but the
-        // 200 response must echo the normalized stored form, not the raw
-        // request JSON, so the response is immediately deployable as an
-        // org_keyring_blob under the strict envelope parser (#128 P2).
-        request.keyring_payload["future_extension"] = serde_json::json!("must-not-echo");
-
-        let mut state = crate::test_support::lazy_state();
-        state.db = pool.clone();
-        let auth = AuthContext {
-            user_id,
-            org_id,
-            org_name: org_name.clone(),
-            role: Role::Owner,
-            api_key: None,
-            management_origin: crate::auth::middleware::ManagementOrigin::Public,
-        };
-
-        let (status, put_response) = put_keyring(
-            auth.clone(),
-            State(state.clone()),
-            Path(org_name.clone()),
-            Json(request),
-        )
-        .await
-        .expect("publish keyring carrying an extra field");
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            put_response
-                .keyring_payload
-                .get("future_extension")
-                .is_none(),
-            "PUT response must not echo unknown request fields verbatim"
-        );
-
-        let stored_payload: Vec<u8> = sqlx::query_scalar(
-            "SELECT keyring_payload FROM org_keyrings WHERE org_id = $1 AND version = 1",
-        )
-        .bind(org_id)
-        .fetch_one(&pool)
-        .await
-        .expect("load stored normalized keyring payload");
-        let stored: serde_json::Value =
-            serde_json::from_slice(&stored_payload).expect("decode stored keyring payload");
-        assert_eq!(
-            put_response.keyring_payload, stored,
-            "PUT response payload must match the stored normalized bytes"
-        );
-
-        let get_response = get_keyring(auth.clone(), State(state.clone()), Path(org_name.clone()))
-            .await
-            .expect("GET keyring after PUT");
-        assert_eq!(
-            put_response.keyring_payload, get_response.keyring_payload,
-            "PUT and GET responses must serve the identical normalized keyring"
-        );
-
-        let mut legacy = signed_keyring_request(org_id, user_id, &key, 2, 2);
-        // Seed the verbatim payload written before normalization.
-        legacy.keyring_payload["future_extension"] = serde_json::json!("legacy-extra");
-        sqlx::query(
-            "INSERT INTO org_keyrings
-                 (org_id, version, keyring_payload, signature, signing_key_id)
-             VALUES ($1, 2, $2, $3,
-                     (SELECT id FROM user_signing_keys WHERE user_id = $4 AND pubkey = $5))",
-        )
-        .bind(org_id)
-        .bind(serde_json::to_vec(&legacy.keyring_payload).expect("encode legacy payload"))
-        .bind(hex::decode(&legacy.signature).expect("decode legacy signature"))
-        .bind(user_id)
-        .bind(key.verifying_key().to_bytes().to_vec())
-        .execute(&pool)
-        .await
-        .expect("persist a keyring with the pre-normalization writer");
-        let (status, _) = put_keyring(
-            auth.clone(),
-            State(state.clone()),
-            Path(org_name.clone()),
-            Json(legacy),
-        )
-        .await
-        .expect("normalization must preserve replay of an existing keyring");
-        assert_eq!(status, StatusCode::OK);
-
-        let legacy_get = get_keyring(auth, State(state), Path(org_name))
-            .await
-            .expect("GET keyring after legacy replay");
-        assert_eq!(legacy_get.version, 2);
-        assert!(
-            legacy_get.keyring_payload.get("future_extension").is_none(),
-            "GET must normalize legacy rows so org_keyring_blob wrapping stays deployable"
-        );
     }
 
     #[tokio::test]

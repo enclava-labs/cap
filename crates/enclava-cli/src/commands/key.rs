@@ -165,17 +165,26 @@ fn parse_pubkey(hex_in: &str) -> Result<VerifyingKey, Box<dyn std::error::Error>
     Ok(VerifyingKey::from_bytes(&arr)?)
 }
 
+/// The typed envelope for signature/ownership checks plus the verbatim
+/// server payload. A same-version recovery replay must resubmit the exact
+/// stored JSON: rebuilding through the typed `OrgKeyringEnvelope` drops
+/// unsigned extra fields (e.g. a client-added "memo") and changes the
+/// payload bytes (PR #187 review). Both values are returned so callers can
+/// verify the typed view while replaying the raw one.
 fn keyring_envelope_from_response(
     response: OrgKeyringResponse,
-) -> Result<OrgKeyringEnvelope, Box<dyn std::error::Error>> {
+) -> Result<(OrgKeyringEnvelope, serde_json::Value), Box<dyn std::error::Error>> {
     let sig_bytes: [u8; 64] = hex::decode(response.signature)?
         .try_into()
         .map_err(|_| "API returned org keyring signature with invalid length")?;
-    Ok(OrgKeyringEnvelope {
-        keyring: serde_json::from_value(response.keyring_payload)?,
-        signature: Signature::from_bytes(&sig_bytes),
-        signing_pubkey: parse_pubkey(&response.signing_pubkey)?,
-    })
+    Ok((
+        OrgKeyringEnvelope {
+            keyring: serde_json::from_value(response.keyring_payload.clone())?,
+            signature: Signature::from_bytes(&sig_bytes),
+            signing_pubkey: parse_pubkey(&response.signing_pubkey)?,
+        },
+        response.keyring_payload,
+    ))
 }
 
 async fn register_public_key(
@@ -195,13 +204,21 @@ async fn upload_keyring(
     api: &ApiClient,
     org_name: &str,
     envelope: &OrgKeyringEnvelope,
+    raw_payload: Option<&serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Replay the verbatim server payload when we have it: the typed
+    // envelope re-serialization drops unsigned extra fields and would
+    // break same-version idempotent replays (PR #187 review).
+    let keyring_payload = match raw_payload {
+        Some(value) => value.clone(),
+        None => serde_json::to_value(&envelope.keyring)?,
+    };
     let _ = api
         .put_org_keyring(
             org_name,
             &PutOrgKeyringRequest {
                 version: envelope.keyring.version,
-                keyring_payload: serde_json::to_value(&envelope.keyring)?,
+                keyring_payload,
                 signature: hex::encode(envelope.signature.to_bytes()),
                 signing_pubkey: hex::encode(envelope.signing_pubkey.to_bytes()),
             },
@@ -232,7 +249,7 @@ async fn verify_or_initialize_remote_keyring(
 
     match api.get_org_keyring(&org_name).await {
         Ok(response) => {
-            let envelope = keyring_envelope_from_response(response)?;
+            let (envelope, raw_payload) = keyring_envelope_from_response(response)?;
             verify_keyring(&envelope, &envelope.signing_pubkey)?;
             if !keyring_has_owner(&envelope, &owner.public) {
                 return Err(format!(
@@ -243,6 +260,7 @@ async fn verify_or_initialize_remote_keyring(
             }
             store_trusted_owner(&org_id, &envelope.signing_pubkey)?;
             store_keyring_envelope(&org_id, &envelope)?;
+            let _ = raw_payload;
             Ok((org_id, org_name, fingerprint(&owner.public)))
         }
         Err(enclava_cli::api_client::ApiError::Api { status: 404, .. }) => {
@@ -251,7 +269,7 @@ async fn verify_or_initialize_remote_keyring(
             }
             let keyring = single_member_keyring(org_id, 1, &owner, Role::Owner, chrono::Utc::now());
             let envelope = sign_keyring(&owner, keyring);
-            upload_keyring(api, &org_name, &envelope).await?;
+            upload_keyring(api, &org_name, &envelope, None).await?;
             match api
                 .bootstrap_signing_service_owner(
                     &org_name,
@@ -784,7 +802,8 @@ async fn rotate_owner(
         seed
     };
     let replacement_owner = keys::derive_org_owner_key(user_id, org_id, &replacement_seed)?;
-    let remote = keyring_envelope_from_response(api.get_org_keyring(&me.active_org.name).await?)?;
+    let (remote, remote_raw_payload) =
+        keyring_envelope_from_response(api.get_org_keyring(&me.active_org.name).await?)?;
     if current_owner.public == replacement_owner.public {
         verify_keyring(&remote, &current_owner.public)?;
         if !keyring_has_owner(&remote, &current_owner.public) {
@@ -792,7 +811,13 @@ async fn rotate_owner(
                 "remote keyring does not contain the owner derived from this backup".into(),
             );
         }
-        upload_keyring(&api, &me.active_org.name, &remote).await?;
+        upload_keyring(
+            &api,
+            &me.active_org.name,
+            &remote,
+            Some(&remote_raw_payload),
+        )
+        .await?;
         println!(
             "The backup and active owner already match; no rotation was needed. Use a new backup path to start another rotation."
         );
@@ -803,7 +828,13 @@ async fn rotate_owner(
         if !keyring_has_owner(&remote, &replacement_owner.public) {
             return Err("remote keyring does not contain the replacement owner".into());
         }
-        upload_keyring(&api, &me.active_org.name, &remote).await?;
+        upload_keyring(
+            &api,
+            &me.active_org.name,
+            &remote,
+            Some(&remote_raw_payload),
+        )
+        .await?;
         finalize_local_owner_rotation(
             &paths,
             org_id,
