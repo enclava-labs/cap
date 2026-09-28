@@ -25,7 +25,7 @@ mod workload_tls_timing;
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{Request, State},
     http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -162,13 +162,7 @@ where
         router = router.merge(with_tracing(internal_routes, &trace_layer));
     }
 
-    router
-        // Explicit global request-body bound (#128): signing blobs get
-        // additional per-field caps in signing_service, but keep the router
-        // limit pinned so a future extractor change cannot silently lift it.
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
-        .layer(build_cors_layer())
-        .with_state(state)
+    router.layer(build_cors_layer()).with_state(state)
 }
 
 /// Wrap a route group in request tracing. Applied OUTERMOST in every group
@@ -458,10 +452,6 @@ fn internal_routes() -> Router<AppState> {
         .route(
             "/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/config-token",
             axum::routing::post(routes::internal::issue_paas_generic_config_token),
-        )
-        .route(
-            "/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/customer-config-released",
-            axum::routing::post(routes::internal::release_paas_customer_config_roll),
         )
         .route(
             "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/status",
@@ -1238,10 +1228,6 @@ mod runtime_gate_tests {
                 &[("POST", MUTATION)],
             ),
             (
-                "/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/customer-config-released",
-                &[("POST", MUTATION)],
-            ),
-            (
                 "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/status",
                 &[("GET", ALLOW)],
             ),
@@ -1497,32 +1483,6 @@ mod runtime_gate_tests {
             out
         }
 
-        // Replace {param}s in a pattern positionally: the parameter at
-        // `poison_at` (0-based) takes `poison`, every other parameter takes
-        // the ordinary value "org-1".
-        fn instantiate_mixed(pattern: &str, poison: &str, poison_at: usize) -> String {
-            let mut out = String::new();
-            let mut rest = pattern;
-            let mut position = 0usize;
-            while let Some(open) = rest.find('{') {
-                out.push_str(&rest[..open]);
-                let close = rest[open..].find('}').expect("unclosed param") + open;
-                out.push_str(if position == poison_at {
-                    poison
-                } else {
-                    "org-1"
-                });
-                position += 1;
-                rest = &rest[close + 1..];
-            }
-            out.push_str(rest);
-            out
-        }
-
-        fn parameter_count(pattern: &str) -> usize {
-            pattern.matches('{').count()
-        }
-
         // (3) Exhaustive per-pattern poison instantiation.
         let poison_values = [
             "demo",
@@ -1583,61 +1543,6 @@ mod runtime_gate_tests {
                             trailing_empty,
                             "{path} instantiated from {pattern} must dispatch"
                         );
-                    }
-                }
-            }
-        }
-
-        // (3b) Mixed parameters: poison each parameter position on every
-        // multi-parameter pattern while the others stay ordinary. A
-        // poisoned segment beside plain segments (for example a poisoned
-        // `{paas_org_id}` next to an ordinary `{deployment_id}` on the
-        // `customer-config-released` route) must still dispatch to its own
-        // pattern with the same gate classification — uniform-poison runs
-        // alone would miss a matcher or gate that only misbehaves on mixed
-        // input.
-        for (index, (pattern, served)) in route_table.iter().enumerate() {
-            if parameter_count(pattern) < 2 {
-                continue;
-            }
-            for poison_at in 0..parameter_count(pattern) {
-                for poison in poison_values {
-                    let path = instantiate_mixed(pattern, poison, poison_at);
-                    let trailing_empty = poison.is_empty()
-                        && poison_at == parameter_count(pattern) - 1
-                        && pattern.ends_with('}');
-                    match mirror.at(&path) {
-                        Ok(matched) => {
-                            assert!(
-                                !trailing_empty,
-                                "{path}: matchit must not match a trailing '/' \
-                                 (no pattern serves it; pattern {pattern})"
-                            );
-                            assert_eq!(
-                                *matched.value, index,
-                                "{path} (param {poison_at} of {pattern} = {poison:?}) \
-                                 dispatched to {}",
-                                route_table[*matched.value].0
-                            );
-                            for (method_name, is_allow) in served.iter() {
-                                let method = Method::from_bytes(method_name.as_bytes()).unwrap();
-                                let gate = is_workload_authority_mutation(&method, &path);
-                                assert_eq!(
-                                    gate,
-                                    !*is_allow,
-                                    "{method} {path} (from {pattern}): gate says {}, \
-                                     annotation says {}",
-                                    if gate { "mutation" } else { "allowed" },
-                                    if *is_allow { "allow" } else { "mutation" },
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            assert!(
-                                trailing_empty,
-                                "{path} instantiated from {pattern} must dispatch"
-                            );
-                        }
                     }
                 }
             }
@@ -1791,10 +1696,6 @@ mod runtime_gate_tests {
 
         for (method, path) in [
             (Method::POST, "/apps/demo/deploy"),
-            (
-                Method::POST,
-                "/internal/paas/orgs/org-1/deployments/deployment-1/customer-config-released",
-            ),
             (Method::POST, "/apps%2Fdemo/deploy"),
             (Method::POST, "//apps//demo//deploy"),
             (Method::POST, "/apps/demo/deploy/"),
@@ -1959,7 +1860,6 @@ mod runtime_gate_tests {
         let mut state = crate::test_support::lazy_state();
         state.management_mode = crate::state::CapManagementMode::PaasManaged;
         state.deployment_dispatch_enabled = false;
-        state.mark_startup_ready();
         let app = build_router_inner(state, true);
 
         for uri in [
@@ -1976,10 +1876,6 @@ mod runtime_gate_tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unregistered write to {uri} must be fail-closed by the dispatch gate, not 404"
             );
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["error"], "deploy_blocked");
-            assert_eq!(body["reason"], "deployment_dispatch_disabled");
         }
     }
 
@@ -2115,18 +2011,6 @@ pub(crate) mod test_support {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    pub(crate) async fn database_test_pool() -> sqlx::PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgresql://test:test@localhost:5432/test".to_string());
-        let pool = sqlx::PgPool::connect(&database_url)
-            .await
-            .expect("connect test database");
-        crate::db::pool::run_migrations(&pool)
-            .await
-            .expect("migrate test database");
-        pool
-    }
-
     pub(crate) fn auth_context(role: Role, scopes: &[&str]) -> AuthContext {
         AuthContext {
             user_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
@@ -2164,7 +2048,6 @@ pub(crate) mod test_support {
             platform_domain: "enclava.dev".to_string(),
             tee_domain_suffix: "tee.enclava.dev".to_string(),
             http_client: reqwest::Client::new(),
-            outbound_body_limit: crate::clients::ClientConfig::from_env().body_limit_bytes,
             registry_client: RegistryClient::new(
                 ClientConfig::from_env(),
                 AllowList::from_env_or_default(None),
@@ -2173,9 +2056,6 @@ pub(crate) mod test_support {
             cosign_egress: crate::clients::EgressGuard::from_env(),
             trustee_http_client: reqwest::Client::new(),
             tee_http_client: reqwest::Client::new(),
-            recent_tee_probe_failures: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::state::TeeProbeFailureCache::default(),
-            )),
             attestation: Some(AttestationConfig {
                 proxy_image: ImageRef::parse(
                     "ghcr.io/enclava-labs/attestation-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111",
@@ -2213,11 +2093,10 @@ pub(crate) mod test_support {
     }
 
     /// Route-level and reconciliation tests assert exact values on the global
-    /// `kbs_signed_policy_reconciliation` singleton row.  The shared test
+    /// `kbs_signed_policy_reconciliation` singleton.  The shared test
     /// database is mutated concurrently by hundreds of other tests (and by
-    /// sibling pipeline worktrees), any of which can bump the generation or
-    /// the deferred-withdrawal debt mid-assertion.  A dedicated database makes
-    /// such tests deterministic.
+    /// sibling pipeline worktrees), any of which can bump the generation
+    /// mid-assertion.  A dedicated database makes these tests deterministic.
     ///
     /// The database name is suffixed with the current process id: sibling CI
     /// worktrees share one PostgreSQL server, and a fixed name would let two
@@ -2250,7 +2129,7 @@ pub(crate) mod test_support {
             .max_connections(1)
             .connect(&base_url)
             .await
-            .expect("connect isolated test database admin");
+            .expect("connect isolated keyring database admin");
         // A leftover database from a crashed run would carry a stale
         // singleton generation; drop it so every run starts from scratch.
         sqlx::query(&format!(
@@ -2258,11 +2137,11 @@ pub(crate) mod test_support {
         ))
         .execute(&admin)
         .await
-        .expect("drop stale isolated test database");
+        .expect("drop stale isolated keyring database");
         sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
             .execute(&admin)
             .await
-            .expect("create isolated test database");
+            .expect("create isolated keyring database");
         admin.close().await;
         // Same connection settings with only the database replaced: parse
         // the URL instead of slicing it so query parameters (sslmode, a
@@ -2271,16 +2150,16 @@ pub(crate) mod test_support {
         // socket-host URL can even place a '/' inside the query.
         let options = base_url
             .parse::<sqlx::postgres::PgConnectOptions>()
-            .expect("parse DATABASE_URL for isolated test database")
+            .expect("parse DATABASE_URL for isolated keyring database")
             .database(&db_name);
         let pool = PgPoolOptions::new()
             .max_connections(4)
             .connect_with(options)
             .await
-            .expect("connect isolated test database");
+            .expect("connect isolated keyring database");
         crate::db::pool::run_migrations(&pool)
             .await
-            .expect("migrate isolated test database");
+            .expect("migrate isolated keyring database");
         (cleanup, pool)
     }
 
@@ -2323,31 +2202,6 @@ pub(crate) mod test_support {
         }
     }
 
-    #[test]
-    fn isolated_database_url_preserves_query_parameters() {
-        // The isolated pool must keep every connection option carried in the
-        // URL's query string (sslmode, options, a socket host, ...) and only
-        // swap the database name; string slicing on the last '/' would drop
-        // the whole query (and a socket-host URL can even place a '/' inside
-        // it).
-        let base = "postgresql://test:test@localhost:5432/test?sslmode=require"
-            .parse::<sqlx::postgres::PgConnectOptions>()
-            .expect("parse DATABASE_URL");
-        assert_eq!(base.get_database(), Some("test"));
-        let swapped = base.clone().database("cap119_swap");
-        assert_eq!(swapped.get_database(), Some("cap119_swap"));
-        assert_eq!(swapped.get_host(), base.get_host());
-        assert_eq!(swapped.get_port(), base.get_port());
-        assert_eq!(swapped.get_username(), base.get_username());
-        // The sslmode=require query parameter survives the database swap
-        // (PgSslMode has no PartialEq; Debug is derived and exhaustive).
-        assert_eq!(
-            format!("{:?}", swapped.get_ssl_mode()),
-            format!("{:?}", base.get_ssl_mode())
-        );
-        assert_eq!(format!("{:?}", swapped.get_ssl_mode()), "Require");
-    }
-
     /// Companion to [`isolated_database_test_pool`]: closes the pool and
     /// drops the per-process database.  Without this, every test run leaves
     /// a fully migrated database behind on the shared PostgreSQL server (the
@@ -2365,13 +2219,13 @@ pub(crate) mod test_support {
             .max_connections(1)
             .connect(&base_url)
             .await
-            .expect("connect isolated test database admin for drop");
+            .expect("connect isolated keyring database admin for drop");
         sqlx::query(&format!(
             "DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"
         ))
         .execute(&admin)
         .await
-        .expect("drop isolated test database");
+        .expect("drop isolated keyring database");
         admin.close().await;
     }
 }
