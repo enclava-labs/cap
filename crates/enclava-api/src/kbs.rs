@@ -202,6 +202,7 @@ struct SignedPolicyReconciliationRow {
     desired_generation: i64,
     configmap_generation: i64,
     applied_generation: i64,
+    withdrawal_bumps_owed: i64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -492,7 +493,8 @@ async fn load_signed_policy_reconciliation(
     db: &PgPool,
 ) -> Result<SignedPolicyReconciliationRow, KbsPolicyError> {
     Ok(sqlx::query_as(
-        "SELECT desired_generation, configmap_generation, applied_generation
+        "SELECT desired_generation, configmap_generation, applied_generation,
+                withdrawal_bumps_owed
            FROM kbs_signed_policy_reconciliation
           WHERE singleton",
     )
@@ -508,6 +510,92 @@ async fn signed_policy_mode_active(db: &PgPool) -> Result<bool, KbsPolicyError> 
     )
     .fetch_one(db)
     .await?)
+}
+
+/// Clear a stray deferred-withdrawal debt from an unsigned-only row.
+///
+/// Migration 0052's apps trigger owes withdrawal generation bumps only
+/// where `desired_generation > 0`, so the debt invariant is
+/// `withdrawal_bumps_owed > 0 => desired_generation > 0`.  If a stray debt
+/// ever lands on an unsigned-only row (manual psql, a future backfill), it
+/// is cleared here without bumping so the install cannot be pushed into
+/// signed-policy mode.  This touches only the debt column, so it is
+/// invisible to pre-0052 replicas and safe at any point in a run.
+async fn clear_stray_withdrawal_debt(db: &PgPool) -> Result<(), KbsPolicyError> {
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET withdrawal_bumps_owed = 0,
+                updated_at = clock_timestamp()
+          WHERE singleton
+            AND withdrawal_bumps_owed > 0
+            AND desired_generation = 0",
+    )
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// Commit the deferred signer-withdrawal generation bumps owed by
+/// migration 0052 -- and ONLY once the withdrawal-filtered policy body is
+/// live in the ConfigMap.
+///
+/// Only the post-0052 implementation -- the one refusing withdrawn
+/// hashes in [`load_signed_policy_candidates`] -- may interpret the debt.
+/// `deploy/api/deployment.yaml` runs the API with
+/// `DATABASE_MIGRATION_MODE=verify`, so the migration step can precede the
+/// new binary by minutes while a pre-0052 replica keeps reconciling every
+/// 30 seconds: a generation bumped directly (migration or route) would be
+/// consumed by that replica's unfiltered candidate query and published as
+/// the old policy body at the new generation, after which this build would
+/// crash-loop on [`KbsPolicyError::PolicyGenerationConflict`] with no bump
+/// left to recover.
+///
+/// Publishing first and committing second keeps that failure unreachable on
+/// every crash path.  Until this call, `desired_generation` stays unchanged
+/// and a pre-0052 reconciler keeps finding its unfiltered hash matching the
+/// published body: it stays quiescent.  The filtered replace annotates the
+/// ConfigMap with the owed generation while the durable desired generation
+/// is still behind it, so a pre-0052 reconciler treats it as
+/// [`GenerationDecision::Superseded`] and cannot overwrite; once the
+/// increment lands here, the same content-bound annotation turns any late
+/// unfiltered republication into a same-generation conflict.  A failure
+/// before the replace leaves the debt owed and the increment uncommitted,
+/// so the next run simply republishes.
+///
+/// The debt is a COUNTER (not a boolean marker) re-armed by migration
+/// 0052's apps signer-identity trigger, so it survives rotations committed
+/// by a pre-0052 replica during the rollout (its route enqueues nothing of
+/// its own).  That is why consumption is a compare-and-set on the exact
+/// `(desired_generation, withdrawal_bumps_owed)` pair this run published
+/// at: a rotation landing mid-run changes the pair, the CAS fails, `None`
+/// is returned, and the caller's next loop attempt republishes the
+/// post-rotation candidate set at the strictly higher generation instead of
+/// recording a stale set as the final state of a generation.  A debt on an
+/// unsigned-only row is never committed (the `desired_generation > 0`
+/// guard); [`clear_stray_withdrawal_debt`] removes it instead.
+/// Returns the new desired generation when this call performed the commit.
+async fn consume_deferred_withdrawal_bumps(
+    db: &PgPool,
+    observed_desired_generation: i64,
+    observed_withdrawal_bumps_owed: i64,
+) -> Result<Option<i64>, KbsPolicyError> {
+    let committed: Option<i64> = sqlx::query_scalar(
+        "UPDATE kbs_signed_policy_reconciliation
+            SET desired_generation = desired_generation + withdrawal_bumps_owed,
+                withdrawal_bumps_owed = 0,
+                updated_at = clock_timestamp()
+          WHERE singleton
+            AND withdrawal_bumps_owed > 0
+            AND desired_generation > 0
+            AND desired_generation = $1
+            AND withdrawal_bumps_owed = $2
+          RETURNING desired_generation",
+    )
+    .bind(observed_desired_generation)
+    .bind(observed_withdrawal_bumps_owed)
+    .fetch_optional(db)
+    .await?;
+    Ok(committed)
 }
 
 /// Select policy authority from the latest operation generation, not from the
@@ -806,6 +894,13 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
     client: kube::Client,
 ) -> Result<(), KbsPolicyError> {
     let cm_api: Api<ConfigMap> = Api::namespaced(client.clone(), &config.namespace);
+    // Clear any stray deferred-withdrawal debt on an unsigned-only row (see
+    // clear_stray_withdrawal_debt).  A debt on a signed-mode row is left in
+    // place here on purpose: the owed generation bump (migration 0052) is
+    // published first and committed only after the filtered ConfigMap replace
+    // succeeded (consume_deferred_withdrawal_bumps below), so no failure in
+    // this run can expose a raw bumped generation to a pre-0052 reconciler.
+    clear_stray_withdrawal_debt(db).await?;
     for _ in 0..KUBERNETES_CAS_ATTEMPTS {
         let state = load_signed_policy_reconciliation(db).await?;
         if state.desired_generation == 0 {
@@ -839,7 +934,13 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             }
             return Ok(());
         }
-        let generation = state.desired_generation;
+        // Pending deferred withdrawal bumps (migration 0052) publish the owed
+        // generation as desired_generation + withdrawal_bumps_owed without
+        // committing the increment yet -- consume_deferred_withdrawal_bumps
+        // does that only after the filtered replace below.  Pre-0052
+        // replicas reading the same row keep seeing the unchanged
+        // desired_generation and stay quiescent.
+        let generation = state.desired_generation + state.withdrawal_bumps_owed;
         let reset_bootstrap = state.configmap_generation == 0 && state.applied_generation == 0;
         let previously_applied = state.applied_generation >= generation;
         let candidates = load_signed_policy_candidates(db, config.signed_policy_retention).await?;
@@ -889,6 +990,34 @@ async fn reconcile_pending_signed_policy_artifacts_with_client(
             } => (true, resource_version, publication_token),
             ConfigMapConvergence::Superseded => continue,
         };
+        // The withdrawal-filtered body is now live at `generation` with its
+        // content-bound generation annotation, and only now is the owed
+        // increment (migration 0052) safe to commit: while
+        // `desired_generation` was still behind, a pre-0052 reconciler saw
+        // the annotated generation as Superseded and could not overwrite;
+        // after the increment lands, the same annotation turns any late
+        // unfiltered republication into a same-generation conflict.
+        // Committing before this replace would expose a raw bumped
+        // generation that a pre-0052 reconciler could consume with its
+        // unfiltered query whenever this run fails before publishing.  The
+        // CAS on the observed (desired, owed) pair is what fences OLD
+        // identity writers: a rotation from a pre-0052 replica (or any
+        // binary) owes its bump inside its own transaction through
+        // migration 0052's apps trigger.  If such a write landed after this
+        // run loaded its candidate set, owed has moved, the CAS fails, and
+        // the loop retries -- republishing the post-rotation candidate set
+        // at the strictly higher generation instead of sealing a stale one.
+        if state.withdrawal_bumps_owed > 0
+            && consume_deferred_withdrawal_bumps(
+                db,
+                state.desired_generation,
+                state.withdrawal_bumps_owed,
+            )
+            .await?
+            .is_none()
+        {
+            continue;
+        }
         if !reset_bootstrap
             && !record_configmap_generation(db, generation, &policy_sha256, &resource_version)
                 .await?
@@ -2642,6 +2771,157 @@ owner_resource_bindings := {}
             .execute(&pool)
             .await
             .expect("delete signer rotation fixture");
+    }
+
+    /// Migration 0052 owes signer-withdrawal generation bumps in a counter
+    /// instead of performing them, so a pre-0052 replica still reconciling
+    /// during the rollout cannot consume the bump with its unfiltered
+    /// candidate query.  Only the post-0052 reconciler interprets the debt
+    /// -- exactly once per observed (desired, owed) pair, and only after
+    /// the withdrawal-filtered policy body is published
+    /// (consume_deferred_withdrawal_bumps).  A rotation landing between
+    /// the reconciler's state read and its consumption (the review
+    /// interleaving: a pre-0052 replica's rotate_signer committing after
+    /// candidates were loaded) increments the counter, fails the CAS, and
+    /// forces republication at a strictly higher generation -- never a
+    /// same-generation conflict on a stale candidate set.  A stray debt on
+    /// an unsigned-only install is disarmed by
+    /// clear_stray_withdrawal_debt without entering signed-policy mode.
+    /// Runs against its own per-process database: it asserts exact
+    /// singleton state that another test process could perturb through the
+    /// shared server.
+    #[tokio::test]
+    async fn deferred_withdrawal_bumps_are_cas_committed_once_by_the_withdrawal_aware_reconciler() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap119_withdrawal_bump").await;
+        let (_org_id, app_id) = insert_test_app(&pool, "running").await;
+        // Pin a complete previous identity; the initial (NULL -> identity)
+        // set owes nothing (migration 0052's trigger WHEN guard).
+        sqlx::query(
+            "UPDATE apps
+                SET signer_identity_subject = $1,
+                    signer_identity_issuer  = $2
+              WHERE id = $3",
+        )
+        .bind("old-subject")
+        .bind("old-issuer")
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Nothing owed: consuming is a no-op.
+        assert_eq!(
+            consume_deferred_withdrawal_bumps(&pool, 0, 0).await.unwrap(),
+            None
+        );
+
+        // Migration 0052 marks signed-mode installs with one owed bump; the
+        // post-publication commit lands exactly the observed pair.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 3,
+                    withdrawal_bumps_owed = 1
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            consume_deferred_withdrawal_bumps(&pool, 3, 1).await.unwrap(),
+            Some(4)
+        );
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, withdrawal_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((desired, owed), (4, 0));
+        assert_eq!(
+            consume_deferred_withdrawal_bumps(&pool, 4, 0).await.unwrap(),
+            None
+        );
+
+        // The review interleaving: the reconciler observed (3, 1) and
+        // published at 4, but a pre-0052 replica's rotate_signer committed
+        // in between -- migration 0052's apps trigger owed that write a
+        // bump too.  The stale CAS must fail and leave the debt for the
+        // retry, which republishes at a strictly higher generation.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 3,
+                    withdrawal_bumps_owed = 1
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The old replica's rotation lands mid-run: debt grows to 2.
+        sqlx::query(
+            "UPDATE apps
+                SET signer_identity_subject = 'new-subject'
+              WHERE id = $1",
+        )
+        .bind(app_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            consume_deferred_withdrawal_bumps(&pool, 3, 1).await.unwrap(),
+            None,
+            "a mid-run rotation must fail the CAS and leave the debt"
+        );
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, withdrawal_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            (desired, owed),
+            (3, 2),
+            "both bumps remain owed to the retry"
+        );
+        // The retry observes the full debt and lands it in one commit.
+        assert_eq!(
+            consume_deferred_withdrawal_bumps(&pool, 3, 2).await.unwrap(),
+            Some(5)
+        );
+
+        // A stray debt on an unsigned-only install must never push it into
+        // signed-policy mode: the commit refuses to bump it (and leaves the
+        // debt for the stray cleanup), and clear_stray_withdrawal_debt
+        // then disarms it without touching desired_generation.
+        sqlx::query(
+            "UPDATE kbs_signed_policy_reconciliation
+                SET desired_generation = 0,
+                    withdrawal_bumps_owed = 2
+              WHERE singleton",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            consume_deferred_withdrawal_bumps(&pool, 0, 2).await.unwrap(),
+            None
+        );
+        clear_stray_withdrawal_debt(&pool).await.unwrap();
+        let (desired, owed): (i64, i64) = sqlx::query_as(
+            "SELECT desired_generation, withdrawal_bumps_owed
+               FROM kbs_signed_policy_reconciliation
+              WHERE singleton",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((desired, owed), (0, 0));
+
+        crate::test_support::drop_isolated_database("cap119_withdrawal_bump", pool).await;
     }
 
     #[tokio::test]

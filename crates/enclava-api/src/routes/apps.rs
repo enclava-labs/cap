@@ -1851,43 +1851,6 @@ async fn release_finished_lease(lease: crate::mutation_leases::ResourceMutationL
     }
 }
 
-/// Record that every retained workload artifact whose signed descriptor
-/// still carries the rotated-out signer identity is withdrawn from KBS
-/// policy. The signed-policy selector
-/// (crate::kbs::load_signed_policy_candidates) refuses withdrawn hashes, so
-/// the live Trustee policy stops admitting the previous signer without
-/// mutating the immutable artifact rows.
-async fn withdraw_signer_rotated_out_artifacts(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    app_id: Uuid,
-    previous_subject: &str,
-    previous_issuer: &str,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "INSERT INTO withdrawn_signer_artifacts (
-             descriptor_core_hash, app_id
-         )
-         SELECT artifact.descriptor_core_hash, artifact.app_id
-           FROM workload_artifacts AS artifact
-          WHERE artifact.app_id = $1
-            AND artifact.descriptor_payload -> 'signer_identity' ->> 'subject' = $2
-            AND artifact.descriptor_payload -> 'signer_identity' ->> 'issuer' = $3
-            AND NOT EXISTS (
-                SELECT 1
-                  FROM withdrawn_signer_artifacts AS existing
-                 WHERE existing.descriptor_core_hash
-                     = artifact.descriptor_core_hash
-            )
-         ON CONFLICT DO NOTHING",
-    )
-    .bind(app_id)
-    .bind(previous_subject)
-    .bind(previous_issuer)
-    .execute(&mut **tx)
-    .await?;
-    Ok(result.rows_affected())
-}
-
 #[derive(Debug, Deserialize)]
 pub struct RotateSignerRequest {
     pub subject: String,
@@ -2249,47 +2212,18 @@ pub async fn rotate_signer(
             ));
         }
 
-        // Legacy (unsigned) installs render the allowed signer identities in
-        // the live Rego policy from kbs_tls_bindings, so rotation must carry
-        // the new identity into that binding too (issue #119).
-        sqlx::query(
-            "UPDATE kbs_tls_bindings
-                SET signer_identity_subject = $1,
-                    signer_identity_issuer  = $2,
-                    updated_at              = now()
-              WHERE app_id = $3",
-        )
-        .bind(&subject)
-        .bind(&issuer)
-        .bind(app.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| internal_server_error())?;
-
-        // Withdraw KBS trust from every retained artifact signed under the
-        // rotated-out identity (issue #119). Note this is revocation, not a
-        // re-render: signed artifacts are immutable, so the app leaves the
-        // signed-policy set (fail-closed on the previous signer) until the
-        // next deployment commits an artifact for the new identity.
-        withdraw_signer_rotated_out_artifacts(
-            &mut tx,
-            app.id,
-            &previous_subject.clone().unwrap_or_default(),
-            &previous_issuer.clone().unwrap_or_default(),
-        )
-        .await
-        .map_err(|_| internal_server_error())?;
-        // The candidate set may change even when no new withdrawal row was
-        // inserted (e.g. a later rotation of an already-withdrawn artifact),
-        // so bump on every rotation that is already in signed mode: the
-        // durable generation is what makes the reconciler publish the
-        // withdrawal instead of reporting a same-generation content
-        // conflict. revocation_if_active no-ops on an unsigned-only install
-        // so rotation never flips such an install into signed mode (where an
-        // empty artifact set would deny every workload).
-        crate::kbs::enqueue_signed_policy_revocation_if_active(&mut tx)
-            .await
-            .map_err(|_| internal_server_error())?;
+        // The apps UPDATE above fired migration 0052's
+        // apps_signer_rotation_withdrawal trigger inside this transaction:
+        // it withdrew the retained artifacts signed under the previous
+        // identity, carried the new identity into kbs_tls_bindings (the
+        // legacy Rego render source), and owed one deferred
+        // withdrawal_bumps_owed generation bump while signed-policy mode is
+        // active (issue #119).  The withdrawal/enqueue logic deliberately
+        // lives in the database, not here, so a pre-0052 replica committing
+        // the same UPDATE during the rollout window is fenced identically.
+        // Fail-closed semantics: signed artifacts are immutable, so the app
+        // leaves the signed-policy set until the next deployment commits an
+        // artifact signed under the new identity.
     }
 
     // Audit. In signed mode rotation withdraws the previous signer's
@@ -2329,14 +2263,16 @@ pub async fn rotate_signer(
 
     // The rotation is committed; converge the live KBS policy before
     // reporting success, under the same fence app deletion uses. In signed
-    // mode reconcile_policy converges the enqueued withdrawal generation
+    // mode reconcile_policy publishes the withdrawal-filtered candidate set
+    // at the owed generation (desired_generation + withdrawal_bumps_owed)
+    // and commits the increment only after the ConfigMap replace succeeds
     // (revoking the previous signer's artifacts; the background reconciler
-    // keeps retrying that durable generation if this publish fails). In
-    // legacy mode it re-renders Rego from the updated kbs_tls_bindings so
-    // the new identity is the one admitted; nothing retries a failed legacy
-    // render automatically — the next unsigned deploy re-renders it — so a
-    // failure here surfaces as 500 with a stable error code and the fence
-    // is released (not held for the quarantine window) to unblock that
+    // keeps retrying that durable debt if this publish fails). In legacy
+    // mode it re-renders Rego from the updated kbs_tls_bindings so the new
+    // identity is the one admitted; nothing retries a failed legacy render
+    // automatically — the next unsigned deploy re-renders it — so a failure
+    // here surfaces as 500 with a stable error code and the fence is
+    // released (not held for the quarantine window) to unblock that
     // follow-up writer. Success is only reported when reconcile returned Ok
     // on both layers.
     if !is_initial_set && state.kbs_policy.is_some() {
