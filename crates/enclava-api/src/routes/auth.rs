@@ -17,14 +17,23 @@ use crate::state::AppState;
 /// Map a NIP-98 verification failure to an HTTP error response.
 /// Verification failures (bad signature, expired event, tag mismatch,
 /// replay) are authentication problems → 401. A database error while
-/// claiming the event id is a server fault → 500, not a credential
-/// rejection.
+/// claiming the event id is a server fault → 500 with a fixed message:
+/// the underlying sqlx error (driver diagnostics, statement text) must
+/// not reach an unauthenticated caller, so it is logged server-side only.
 fn nip98_error_response(e: nostr::NostrAuthError) -> (StatusCode, Json<serde_json::Value>) {
-    let status = match &e {
-        nostr::NostrAuthError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        _ => StatusCode::UNAUTHORIZED,
-    };
-    (status, Json(serde_json::json!({ "error": e.to_string() })))
+    match &e {
+        nostr::NostrAuthError::Db(err) => {
+            tracing::error!(error = %err, "NIP-98 replay cache claim failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "database error" })),
+            )
+        }
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        ),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -960,10 +969,16 @@ mod authorization_tests {
     use axum::extract::State;
 
     #[test]
-    fn nip98_db_errors_map_to_500_not_401() {
-        let db_err = nostr::NostrAuthError::Db(sqlx::Error::PoolTimedOut);
-        let (status, _) = nip98_error_response(db_err);
+    fn nip98_db_errors_map_to_500_without_leaking_driver_diagnostics() {
+        let marker = "nip98-private-diagnostic-probe-7f3a91";
+        let db_err = nostr::NostrAuthError::Db(sqlx::Error::ColumnNotFound(marker.to_string()));
+        let (status, Json(body)) = nip98_error_response(db_err);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let serialized = serde_json::to_string(&body).expect("serialize error body");
+        assert!(
+            !serialized.contains(marker),
+            "database error details leaked into response body: {serialized}"
+        );
     }
 
     #[test]
