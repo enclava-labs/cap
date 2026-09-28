@@ -35,4 +35,5 @@ __pycache__/
 to-delete
 
 .planning/debug/
+.planning/
 reply-body.txt

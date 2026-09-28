@@ -1,13 +1,13 @@
 # CAP API NetworkPolicy + trusted-proxy rollout checks
 
-Owner: cap (this repo) + enclava-ops-manifests (live overlays)
+Owner: cap (this repo)
 Scope: PR #172 — device-auth rate limiting and the API ingress NetworkPolicy.
 
 This runbook lists the checks that MUST pass on a target cluster before the
 `cap-api-ingress-only` NetworkPolicy and the `TRUSTED_PROXY_CIDRS` /
 rate-limit keying model are enabled there. The in-repo
-`deploy/api/network-policy.yaml` is the reference; the live overlay in
-enclava-ops-manifests is what actually rolls out — mirror any change to both.
+`deploy/api/network-policy.yaml` is the reference; if your deployment
+overlays these objects, mirror any change to both.
 
 Service coordinates used below: `deploy/api/service.yaml` defines a Service
 named `enclava-api` (namespace `enclava-platform`) on service port 80 →
