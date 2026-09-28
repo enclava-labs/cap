@@ -938,7 +938,7 @@ fn bounded_phase(deadline: Option<Instant>, requested: Duration) -> Duration {
 
 fn release_outcome_is_unknown(error: &ApiError) -> bool {
     match error {
-        ApiError::Http(error) => error.is_timeout() || error.is_connect() || error.is_request(),
+        ApiError::Http(_) => true,
         ApiError::Api { status, .. } => *status >= 500,
         ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => true,
         ApiError::NotAuthenticated => false,
@@ -951,6 +951,7 @@ async fn release_customer_config_roll_with_retry(
     deployment_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut attempt = 0u8;
+    let mut outcome_unknown = false;
     loop {
         attempt += 1;
         match api
@@ -958,20 +959,23 @@ async fn release_customer_config_roll_with_retry(
             .await
         {
             Ok(()) => return Ok(()),
-            Err(error) if release_outcome_is_unknown(&error) && attempt < 3 => {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Err(error) if release_outcome_is_unknown(&error) => {
-                return Err(format!(
-                    "customer config was stored, but the roll-release result is unknown after {attempt} attempts: {error}. The roll may already be released; check `enclava status --app {instance_name}` before assuming the running workload is unchanged."
-                )
-                .into());
-            }
             Err(error) => {
-                return Err(format!(
-                    "customer config was stored, but the workload roll was not released: {error}. The running workload was left unchanged."
-                )
-                .into());
+                let retryable = release_outcome_is_unknown(&error);
+                outcome_unknown |= retryable;
+                if retryable && attempt < 3 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                let message = if outcome_unknown {
+                    format!(
+                        "customer config was stored, but the roll-release result is unknown after {attempt} attempts: {error}. The roll may already be released; check `enclava status --app {instance_name}` before assuming the running workload is unchanged."
+                    )
+                } else {
+                    format!(
+                        "customer config was stored, but the workload roll was not released: {error}. The running workload was left unchanged."
+                    )
+                };
+                return Err(message.into());
             }
         }
     }

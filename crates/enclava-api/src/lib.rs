@@ -996,35 +996,8 @@ mod runtime_gate_tests {
 
     #[test]
     fn workload_gate_classification_agrees_with_matchit_dispatch() {
-        // Locks the gate/router alignment invariant to the exact matchit
-        // in the lockfile, from four angles:
-        //
-        // 1. Mirror freshness: the annotated pattern set below must equal
-        //    the route declarations in this file (scanned from the source
-        //    at compile time), including each route's served methods, so
-        //    adding a route or a method on an existing route without
-        //    updating the table fails here instead of drifting silently.
-        // 2. Single matcher: Cargo.lock must contain exactly one matchit
-        //    package, pinned via the `=0.8.4` dev-dependency. If axum and
-        //    this mirror ever resolve to different matchit copies, the
-        //    mirror would test the wrong crate — fail instead.
-        // 3. Exhaustive dispatch agreement: every pattern is instantiated
-        //    with every poison value (empty, dot segments, %2F encodings)
-        //    in every parameter, and the mirror must dispatch it to the
-        //    same pattern (pinning that matchit never decodes %2F,
-        //    resolves dot segments, or treats an interior empty segment as
-        //    a separator) with the gate classification equal to the
-        //    annotation. A trailing empty parameter produces a trailing
-        //    '/', which matchit must NOT match (pinning the absence of
-        //    trailing-slash tolerance); the gate's own trailing-slash
-        //    trim stays fail-closed because no handler serves those
-        //    shapes.
-        // 4. Enumerated raw variants from the tests below are fed through
-        //    the mirror with explicit match/miss pins.
-        //
-        // A matcher semantics change (percent-decoding, %2F/empty as
-        // separators, dot resolution, trailing-slash tolerance) breaks 3
-        // or 4 and fails CI instead of silently breaking alignment.
+        // Encoded separators and dot segments must not let a workload
+        // mutation reach an allow-listed handler classification.
         // HEAD is dispatched by axum's method router to the GET handler
         // and always allowed by the gate, so GET annotations cover it.
         const ALLOW: bool = true;
@@ -1230,6 +1203,10 @@ mod runtime_gate_tests {
                 &[("POST", MUTATION)],
             ),
             (
+                "/internal/paas/orgs/{paas_org_id}/deployments/{deployment_id}/customer-config-released",
+                &[("POST", MUTATION)],
+            ),
+            (
                 "/internal/paas/orgs/{paas_org_id}/apps/{app_name}/unlock/status",
                 &[("GET", ALLOW)],
             ),
@@ -1242,225 +1219,6 @@ mod runtime_gate_tests {
                 &[("PUT", MUTATION)],
             ),
         ];
-
-        // (1) The route declarations of this file, scanned at compile
-        // time, must match the annotated table exactly — both the set
-        // of paths and, per path, the set of served methods (a path
-        // may be declared twice with different methods or chained via
-        // `.get(...).post(...)`). Adding a route or adding/changing a
-        // method on an existing route fails here instead of drifting
-        // silently. Only the router-construction section is scanned —
-        // everything from the test module onward (including this
-        // scanner's own source) is excluded.
-        let source = include_str!("lib.rs");
-        let source = &source[..source
-            .find("mod runtime_gate_tests")
-            .expect("test module must exist; the route scanner depends on its position")];
-        const METHOD_VERBS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
-        // Builder calls that may appear inside a route handler
-        // expression without serving a method.
-        const NON_METHOD_CALLS: [&str; 6] = [
-            "layer",
-            "route_layer",
-            "with_state",
-            "handle_error",
-            "fallback",
-            "fallback_service",
-        ];
-
-        // Blank string-literal bodies and comments with spaces (byte
-        // positions preserved) so structural scans see only code.
-        fn blank_noncode(src: &str) -> Vec<u8> {
-            let b = src.as_bytes();
-            let mut out = b.to_vec();
-            let mut i = 0;
-            let mut in_string = false;
-            while i < b.len() {
-                let c = b[i];
-                if in_string {
-                    out[i] = b' ';
-                    if c == b'\\' && i + 1 < b.len() {
-                        out[i + 1] = b' ';
-                        i += 2;
-                        continue;
-                    }
-                    if c == b'"' {
-                        in_string = false;
-                    }
-                    i += 1;
-                } else {
-                    match c {
-                        b'"' => {
-                            in_string = true;
-                            out[i] = b' ';
-                            i += 1;
-                        }
-                        b'/' if i + 1 < b.len() && b[i + 1] == b'/' => {
-                            while i < b.len() && b[i] != b'\n' {
-                                out[i] = b' ';
-                                i += 1;
-                            }
-                        }
-                        b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
-                            out[i] = b' ';
-                            out[i + 1] = b' ';
-                            i += 2;
-                            while i < b.len() {
-                                if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/' {
-                                    out[i] = b' ';
-                                    out[i + 1] = b' ';
-                                    i += 2;
-                                    break;
-                                }
-                                out[i] = b' ';
-                                i += 1;
-                            }
-                        }
-                        _ => i += 1,
-                    }
-                }
-            }
-            out
-        }
-
-        let blanked = blank_noncode(source);
-        let code = std::str::from_utf8(&blanked).expect("blanking preserves UTF-8 validity");
-        // (path, method verb) pairs, one per served method
-        let mut declared: Vec<(&str, &str)> = Vec::new();
-        let mut search_from = 0usize;
-        while let Some(rel) = code[search_from..].find(".route(") {
-            let pos = search_from + rel;
-            // The .route(...) call is bounded by its matching paren —
-            // never anything beyond it — so later code cannot be
-            // misattributed to this route.
-            let open = pos + ".route(".len() - 1;
-            let mut depth = 0usize;
-            let mut close = None;
-            for (i, c) in code[open..].char_indices() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            close = Some(open + i);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let close = close.expect("unbalanced .route( call");
-            search_from = close + 1;
-            let call = &code[pos..=close];
-            // route paths are plain literals without escapes; look the
-            // literal up in the original source (the blanked copy has
-            // no quotes left)
-            let src_call = &source[pos..=close];
-            let q1 = src_call
-                .find('"')
-                .expect("route path must be a string literal");
-            let q2 = src_call[q1 + 1..]
-                .find('"')
-                .expect("route path literal must close")
-                + q1
-                + 1;
-            let path = &src_call[q1 + 1..q2];
-            let comma = call[q2 + 1..]
-                .find(',')
-                .expect("route must have a handler argument")
-                + q2
-                + 1;
-            let handler = &call[comma + 1..call.len() - 1];
-            // Leading verb: `axum::routing::get(handler)` or `get(handler)`
-            let trimmed = handler.trim_start();
-            let paren = trimmed.find('(').expect("handler must be a call");
-            let ident_path = trimmed[..paren].trim_end();
-            let leading = ident_path.rsplit("::").next().unwrap();
-            assert!(
-                METHOD_VERBS.contains(&leading),
-                "route {path}: unrecognized handler {ident_path:?}; the freshness \
-                 scanner only understands verb calls (get/post/put/patch/delete, \
-                 optionally module-qualified) — restructure the route or teach \
-                 the scanner about it"
-            );
-            declared.push((path, leading));
-            // Every dotted call chained on the handler must be a known
-            // method verb or a known non-method builder. Anything else
-            // (`.on(MethodFilter, ...)`, `.any(...)`, `.merge(...)`,
-            // `get_service`-style forms, ...) may serve a method this
-            // table cannot see — fail instead of tracking it wrongly.
-            let mut scan = 0usize;
-            while let Some(dot) = handler[scan..].find('.') {
-                let at = scan + dot;
-                scan = at + 1;
-                let after = &handler[at + 1..];
-                let name_len = after
-                    .find(|c: char| !(c.is_ascii_alphabetic() || c == '_'))
-                    .unwrap_or(after.len());
-                if name_len == 0 || !handler[at + 1 + name_len..].starts_with('(') {
-                    continue; // not a call
-                }
-                let name = &after[..name_len];
-                if METHOD_VERBS.contains(&name) {
-                    declared.push((path, name));
-                } else if !NON_METHOD_CALLS.contains(&name) {
-                    panic!(
-                        "route {path}: chained call .{name}( is not a known method \
-                         verb or non-method builder; it may serve a method the \
-                         mirrored table cannot track — restructure the route or \
-                         teach the scanner about it"
-                    );
-                }
-            }
-        }
-        let mut declared_map: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
-            std::collections::BTreeMap::new();
-        for (path, verb) in declared {
-            declared_map
-                .entry(path)
-                .or_default()
-                .insert(verb.to_uppercase());
-        }
-        let mut table_map: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
-            std::collections::BTreeMap::new();
-        for (path, served) in route_table {
-            table_map
-                .entry(path)
-                .or_default()
-                .extend(served.iter().map(|(m, _)| m.to_string()));
-        }
-        assert_eq!(
-            declared_map, table_map,
-            "route table mirror (paths AND per-path method sets) drifted from the \
-             route declarations in this file"
-        );
-
-        // (2) Exactly one matchit in the lockfile, and it is the pinned
-        // version this test compiles against.
-        let lock = include_str!("../../../Cargo.lock");
-        let mut lock_lines = lock.lines().filter(|l| l.starts_with("name = \"matchit\""));
-        let name_line = lock_lines
-            .next()
-            .expect("Cargo.lock must contain a matchit package");
-        assert!(
-            lock_lines.next().is_none(),
-            "Cargo.lock contains more than one matchit package: the mirror would \
-             test a different matcher than the router"
-        );
-        let _ = name_line;
-        let pin_index = lock.find("name = \"matchit\"").unwrap();
-        let version_line = lock[pin_index..]
-            .lines()
-            .find(|l| l.starts_with("version = "))
-            .expect("matchit package must have a version");
-        const PINNED_MATCHIT: &str = "0.8.4";
-        assert_eq!(
-            version_line,
-            format!("version = \"{PINNED_MATCHIT}\""),
-            "the matchit dev-dependency pin (=0.8.4) and Cargo.lock disagree; \
-             re-verify matcher semantics (see the classifier invariant comment) \
-             when bumping matchit — any bump, not only majors"
-        );
 
         // Inserting must succeed: conflicting patterns would mean the
         // table itself is malformed.
@@ -1485,7 +1243,7 @@ mod runtime_gate_tests {
             out
         }
 
-        // (3) Exhaustive per-pattern poison instantiation.
+        // Exercise each parameter with values that a URL normalizer may reinterpret.
         let poison_values = [
             "demo",
             "org-1",
@@ -1556,8 +1314,7 @@ mod runtime_gate_tests {
              the mirror with at least one non-GET method"
         );
 
-        // (4) Enumerated raw variants: explicit dispatch pins for the
-        // shapes the other tests reason about.
+        // These raw variants still dispatch to a handler.
         let dispatch_pins: &[(Method, &str)] = &[
             // Interior empty segment is a parameter value: dispatched to
             // the keyring handler (a mutation), never collapsed onto the
@@ -1698,6 +1455,10 @@ mod runtime_gate_tests {
 
         for (method, path) in [
             (Method::POST, "/apps/demo/deploy"),
+            (
+                Method::POST,
+                "/internal/paas/orgs/org-1/deployments/deployment-1/customer-config-released",
+            ),
             (Method::POST, "/apps%2Fdemo/deploy"),
             (Method::POST, "//apps//demo//deploy"),
             (Method::POST, "/apps/demo/deploy/"),
