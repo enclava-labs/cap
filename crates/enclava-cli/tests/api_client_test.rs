@@ -140,6 +140,7 @@ async fn create_template_instance_posts_hosted_route_with_idempotency_key() {
         customer_descriptor_blob: None,
         org_keyring_blob: None,
         signed_policy_artifact: None,
+        customer_config_roll_hold_seconds: None,
     };
     let response = client
         .create_template_instance(&request_body)

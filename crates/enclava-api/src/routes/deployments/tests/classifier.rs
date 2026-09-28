@@ -216,6 +216,7 @@ fn idempotency_request(app_name: &str) -> GenericDeploymentRequest {
                 issuer: "https://token.actions.githubusercontent.com".to_string(),
             },
             security: GenericDeploymentSecurity::default(),
+            customer_config_roll_hold_seconds: None,
         }
 }
 
@@ -578,6 +579,86 @@ fn idempotent_retry_requires_same_deployment_payload() {
 }
 
 #[test]
+fn idempotent_hold_retry_matches_after_the_app_leaves_running() {
+    let mut app = idempotency_app();
+    app.status = AppStatus::Running;
+    let mut deployment = idempotency_deployment(&app);
+    deployment.spec_snapshot["customer_config_roll_hold_seconds"] = serde_json::json!(600);
+    deployment.spec_snapshot["customer_config_roll_hold_requested_seconds"] =
+        serde_json::json!(600);
+
+    for status in [AppStatus::Running, AppStatus::Creating] {
+        app.status = status;
+        assert_hold_retry(&deployment, &app, Some(600));
+    }
+
+    app.status = AppStatus::Creating;
+    assert_hold_conflict(&deployment, &app, Some(1_200));
+    assert_hold_conflict(&deployment, &app, None);
+
+    // A first deploy can record the request while accepting no hold. The
+    // same retry still matches after that app is running.
+    app.status = AppStatus::Running;
+    deployment.spec_snapshot["customer_config_roll_hold_seconds"] = serde_json::Value::Null;
+    deployment.spec_snapshot["customer_config_roll_hold_requested_seconds"] =
+        serde_json::json!(600);
+    assert_hold_retry(&deployment, &app, Some(600));
+
+    // An unheld deployment does not adopt a retry that asks for a hold,
+    // including after apply has left the app un-running.
+    app.status = AppStatus::Creating;
+    deployment.spec_snapshot["customer_config_roll_hold_requested_seconds"] =
+        serde_json::Value::Null;
+    assert_hold_conflict(&deployment, &app, Some(600));
+    assert_hold_conflict(&deployment, &app, Some(0));
+    assert_hold_retry(&deployment, &app, None);
+
+    deployment.spec_snapshot["customer_config_roll_hold_requested_seconds"] = serde_json::json!(0);
+    assert_hold_retry(&deployment, &app, Some(0));
+}
+
+#[test]
+fn idempotent_hold_retry_without_requested_seconds_uses_the_accepted_duration() {
+    let mut app = idempotency_app();
+    app.status = AppStatus::Creating;
+    let mut deployment = idempotency_deployment(&app);
+    deployment.spec_snapshot["customer_config_roll_hold_seconds"] = serde_json::json!(30);
+
+    assert_hold_retry(&deployment, &app, Some(10));
+    assert_hold_retry(&deployment, &app, Some(30));
+    assert_hold_conflict(&deployment, &app, Some(90));
+    assert_hold_conflict(&deployment, &app, None);
+
+    deployment
+        .spec_snapshot
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("customer_config_roll_hold_seconds");
+    assert_hold_conflict(&deployment, &app, Some(600));
+    assert_hold_retry(&deployment, &app, None);
+    assert_hold_retry(&deployment, &app, Some(0));
+}
+
+fn assert_hold_retry(deployment: &Deployment, app: &App, seconds: Option<u32>) {
+    let mut request = idempotency_request(&app.name);
+    request.customer_config_roll_hold_seconds = seconds;
+    ensure_idempotent_retry_matches(deployment, app, &request)
+        .expect("same customer-config hold request");
+}
+
+fn assert_hold_conflict(deployment: &Deployment, app: &App, seconds: Option<u32>) {
+    let mut request = idempotency_request(&app.name);
+    request.customer_config_roll_hold_seconds = seconds;
+    let err = ensure_idempotent_retry_matches(deployment, app, &request)
+        .expect_err("different customer-config hold request");
+    assert_eq!(err.0, StatusCode::CONFLICT);
+    assert_eq!(
+        err.1.0["error"].as_str(),
+        Some("external_id already exists with different customer_config_roll_hold_seconds")
+    );
+}
+
+#[test]
 fn idempotent_retry_preserves_none_partial_and_full_resource_requests() {
     let app = idempotency_app();
 
@@ -694,6 +775,7 @@ async fn deploy_rejects_member_before_database_access() {
             signed_policy_artifact: None,
             workload_security_profile: None,
             log_encryption: None,
+            customer_config_roll_hold_seconds: None,
         }),
     )
     .await;
@@ -738,4 +820,71 @@ async fn generic_config_token_rejects_unscoped_api_key_before_database_access() 
     };
 
     assert_eq!(err.0, StatusCode::FORBIDDEN);
+}
+
+fn generic_roll_hold_boundary_request() -> GenericDeploymentRequest {
+    GenericDeploymentRequest {
+        external_id: None,
+        app: GenericDeploymentApp {
+            name: format!("hold-boundary-{}", Uuid::new_v4().simple()),
+            create_if_missing: false,
+            unlock_mode: "password".to_string(),
+            bootstrap_pubkey_hash: None,
+            egress_allowlist: Vec::new(),
+            egress_mode: "restricted".to_string(),
+        },
+        source: GenericDeploymentSource {
+            provider: SourceProvider::GitHub,
+            repository: "acme/confidential-app".to_string(),
+        },
+        workload: GenericDeploymentWorkload {
+            image: "ghcr.io/acme/confidential-app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            container_name: None,
+            resources: None,
+        },
+        signing: GenericDeploymentSigning {
+            subject: "https://github.com/acme/confidential-app/.github/workflows/build.yml@refs/heads/main"
+                .to_string(),
+            issuer: "https://token.actions.githubusercontent.com".to_string(),
+        },
+        security: GenericDeploymentSecurity::default(),
+        customer_config_roll_hold_seconds: None,
+    }
+}
+
+#[tokio::test]
+async fn public_generic_deployment_route_rejects_roll_hold_requests() {
+    let mut held = generic_roll_hold_boundary_request();
+    held.customer_config_roll_hold_seconds = Some(600);
+    let rejection = create_generic_deployment(
+        crate::test_support::auth_context(Role::Owner, &[]),
+        State(crate::test_support::lazy_state()),
+        Json(held),
+    )
+    .await
+    .expect_err("a public deployment request must not arm a customer-config hold");
+    assert_eq!(rejection.0, StatusCode::BAD_REQUEST);
+    assert!(
+        rejection.1.0["error"]
+            .as_str()
+            .expect("hold rejection names its field")
+            .contains("customer_config_roll_hold_seconds")
+    );
+}
+
+#[tokio::test]
+async fn internal_generic_deployment_rejects_member_before_database_access() {
+    let mut request = generic_roll_hold_boundary_request();
+    request.customer_config_roll_hold_seconds = Some(600);
+    let rejection = create_generic_deployment_inner(
+        crate::test_support::auth_context(Role::Member, &[]),
+        crate::test_support::lazy_state(),
+        request,
+        true,
+    )
+    .await
+    .expect_err("a roll hold must not bypass deployment authorization");
+
+    assert_eq!(rejection.0, StatusCode::FORBIDDEN);
 }

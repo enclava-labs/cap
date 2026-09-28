@@ -30,8 +30,9 @@ use enclava_engine::types::WorkloadSecurityProfile;
 
 use crate::commands::app::{
     BootstrapEndpointStatusDecision, DeploymentWait, SignedDeployBlobParams, StoragePasswordInput,
-    bootstrap_endpoint_status_decision, build_signed_deploy_blobs, claim_initial_ownership,
-    deployment_bound_tee_status, deployment_bound_terminal_bootstrap_error,
+    bootstrap_endpoint_status_decision, bounded_request, build_signed_deploy_blobs,
+    claim_initial_ownership, deployment_bound_tee_status,
+    deployment_bound_terminal_bootstrap_error,
     deployment_bound_terminal_bootstrap_error_on_channel, ensure_manual_deploy_keyring,
     fetch_verified_platform_release, generate_log_key_for_app,
     tee_supplemental_fields_are_consistent, tee_terminal_diagnostic_probe_due, tee_unlock_state,
@@ -465,6 +466,17 @@ async fn deploy_with_timings(
     pb.set_position(2);
     pb.set_message("Creating template instance...");
 
+    // Always request the normalized hold so the idempotency key stays stable
+    // across a first-deploy retry: this run may have created the app above,
+    // so gating the request on the app existing would change the key on the
+    // retry. CAP applies the hold only when a live workload is being
+    // replaced and reports that in the response.
+    let roll_hold_seconds = customer_config_roll_hold_seconds(args.ssh_timeout_seconds);
+    // CAP arms the hold when it accepts the request below. The deadline
+    // clock starts here, not at deploy_started, so preflight time above
+    // (discovery, app creation, key preparation, signing) does not consume
+    // the hold.
+    let hold_armed_at = Instant::now();
     let response = match timings
         .run(
             DeployPhase::DeployRequest,
@@ -476,6 +488,7 @@ async fn deploy_with_timings(
                 customer_descriptor_blob: Some(signed_blobs.customer_descriptor_blob),
                 org_keyring_blob: Some(signed_blobs.org_keyring_blob),
                 signed_policy_artifact: Some(signed_blobs.signed_policy_artifact),
+                customer_config_roll_hold_seconds: Some(roll_hold_seconds),
             }),
         )
         .await
@@ -487,12 +500,29 @@ async fn deploy_with_timings(
         &response,
         explicit_stable_endpoint.as_deref(),
     )?;
+    let customer_config_hold = response.customer_config_hold;
     let deployment_id = response
         .deployment
         .cap_deployment_id
         .as_deref()
         .unwrap_or("pending")
         .to_string();
+    if customer_config_hold && deployment_id == "pending" {
+        return Err("PaaS held the workload roll but did not return a deployment id".into());
+    }
+    // Reserve release time within the same window armed before the create request.
+    let pre_release_deadline =
+        customer_config_hold.then(|| hold_deadline(hold_armed_at, roll_hold_seconds));
+    let phase_budget =
+        |requested: u64| bounded_phase(pre_release_deadline, Duration::from_secs(requested));
+    if customer_config_hold
+        && pre_release_deadline.is_some_and(|deadline| deadline <= Instant::now())
+    {
+        return Err(
+            "customer-config roll hold expired before config delivery started; the running workload was left unchanged"
+                .into(),
+        );
+    }
     pb.set_position(3);
     // The PaaS forwards the signed descriptor unchanged and preserves the
     // returned CAP deployment id, so the trusted expectation is valid only
@@ -507,8 +537,8 @@ async fn deploy_with_timings(
                     api,
                     &instance_name,
                     deployment,
-                    Duration::from_secs(args.ssh_timeout_seconds),
-                    Duration::from_secs(3),
+                    phase_budget(args.ssh_timeout_seconds),
+                    pre_release_deadline,
                     &pb,
                     timings,
                 ),
@@ -521,11 +551,11 @@ async fn deploy_with_timings(
                     claim_initial_ownership(
                         api,
                         &ctx.paths,
-                        &ctx.cli_config,
                         &instance_name,
                         deployment,
                         &storage_password,
                         capture,
+                        pre_release_deadline,
                     ),
                 )
                 .await?;
@@ -535,10 +565,21 @@ async fn deploy_with_timings(
         pb.set_message("Delivering platform-managed config...");
         timings
             .run(DeployPhase::ManagedConfigEnqueue, async {
-                let managed = api
-                    .deliver_managed_template_config(&instance_name)
-                    .await
-                    .map_err(managed_template_config_api_error)?;
+                // The enqueue is a held pre-release request: bound it by
+                // the same deadline as the waits so a stalled response
+                // cannot consume the release reserve.
+                let managed = match bounded_request(
+                    pre_release_deadline,
+                    api.deliver_managed_template_config(&instance_name),
+                )
+                .await
+                {
+                    Some(result) => result,
+                    None => {
+                        return Err("customer-config roll hold deadline reached with the managed-config delivery request still in flight".into());
+                    }
+                };
+                let managed = managed.map_err(managed_template_config_api_error)?;
                 if !matches!(managed.status.as_str(), "queued" | "delivered") {
                     return Err(format!(
                         "PaaS managed config delivery returned unexpected status `{}`",
@@ -558,7 +599,8 @@ async fn deploy_with_timings(
                     &instance_name,
                     &template.paas_managed_config_keys,
                     deployment,
-                    Duration::from_secs(args.ssh_timeout_seconds),
+                    phase_budget(args.ssh_timeout_seconds),
+                    pre_release_deadline,
                     &pb,
                 ),
             )
@@ -577,13 +619,12 @@ async fn deploy_with_timings(
     let tee_url = template_config_endpoint_url(tee_url)?;
     let mut tee_resolve_ip = token.tee_resolve_ip;
     let tee = TeeClient::from_config_url_with_resolve_ip(&tee_url, tee_resolve_ip);
-    // No aggregate deadline here: the slow-connect attempt cap inside the
-    // retry loop bounds the unreachable-endpoint case without reducing the
-    // 121-attempt coverage fast-failure rollouts rely on.
+    // A held redeploy must stop attestation before CAP expires the hold.
+    // Unheld deploys keep the unbounded retry loop.
     let mut tee = timings
         .run(
             DeployPhase::CustomerConfigAttestation,
-            attest_template_config_tee_with_retry(tee, None),
+            attest_template_config_tee_with_retry(tee, pre_release_deadline),
         )
         .await?;
     let mut tee_url = tee_url;
@@ -591,7 +632,7 @@ async fn deploy_with_timings(
     let mut config_token = token.token.clone();
     let config_pairs = debian_ssh_config_pairs(public_keys);
     pb.set_message(counted_progress("Customer config", 0, config_pairs.len()));
-    timings
+    let delivered = timings
         .run(
             DeployPhase::CustomerConfigWrite,
             deliver_template_config_with_retry(
@@ -600,7 +641,11 @@ async fn deploy_with_timings(
                     instance_name: &instance_name,
                     deployment,
                     password_mode: template.unlock_mode == "password",
-                    owner_wait_budget: Duration::from_secs(args.ssh_timeout_seconds),
+                    owner_wait_budget: bounded_phase(
+                        pre_release_deadline,
+                        Duration::from_secs(args.ssh_timeout_seconds),
+                    ),
+                    hold_deadline: pre_release_deadline,
                     progress: &pb,
                     timings_mode: args.timings,
                 },
@@ -611,7 +656,40 @@ async fn deploy_with_timings(
                 &config_pairs,
             ),
         )
+        .await;
+    if let Err(error) = delivered {
+        let values_stored = error
+            .downcast_ref::<TemplateConfigStoredSyncFailed>()
+            .is_some();
+        if customer_config_hold && values_stored {
+            pb.set_message("Customer config stored; releasing workload roll...");
+            release_customer_config_roll_with_retry(
+                api,
+                &instance_name,
+                &deployment_id,
+                hold_expiry(hold_armed_at, roll_hold_seconds),
+            )
+            .await?;
+            return Err(error);
+        }
+        if customer_config_hold {
+            return Err(format!(
+                "{error}\nThe workload roll was not released, so this deployment will not replace the running workload."
+            )
+            .into());
+        }
+        return Err(error);
+    }
+    if customer_config_hold {
+        pb.set_message("Customer config stored; releasing workload roll...");
+        release_customer_config_roll_with_retry(
+            api,
+            &instance_name,
+            &deployment_id,
+            hold_expiry(hold_armed_at, roll_hold_seconds),
+        )
         .await?;
+    }
     pb.set_message(counted_progress(
         "Customer config",
         config_pairs.len(),
@@ -857,6 +935,141 @@ async fn ssh_command(args: TemplateSshCommandArgs) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+const CUSTOMER_CONFIG_ROLL_HOLD_MIN_SECONDS: u64 = 30;
+const CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS: u64 = 7_200;
+/// Work that happens after CAP arms the hold and before the release call:
+/// the PaaS config-token handoff (240s), untimed TEE attestation retries
+/// (121 attempts * 2s), and a release round trip. The two ssh-timeout waits
+/// cover managed-config delivery and the password-mode owner wait.
+const CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS: u64 = 240 + (121 * 2) + 60;
+
+/// The pre-request clock conservatively precedes CAP arming the hold.
+fn hold_expiry(armed_at: Instant, hold_seconds: u32) -> Instant {
+    armed_at + Duration::from_secs(u64::from(hold_seconds))
+}
+
+/// Leave 30 seconds for release after config delivery.
+fn hold_deadline(armed_at: Instant, hold_seconds: u32) -> Instant {
+    hold_expiry(armed_at, hold_seconds) - Duration::from_secs(30)
+}
+
+/// Cap a pre-release wait at the hold deadline. Unheld deploys keep the
+/// requested budget.
+fn bounded_phase(deadline: Option<Instant>, requested: Duration) -> Duration {
+    match deadline {
+        Some(deadline) => requested.min(deadline.saturating_duration_since(Instant::now())),
+        None => requested,
+    }
+}
+
+fn release_outcome_is_unknown(error: &ApiError) -> bool {
+    match error {
+        ApiError::Http(_) => true,
+        ApiError::Api { status, .. } => *status >= 500,
+        ApiError::Decode(_) | ApiError::ResponseTooLarge(_) => true,
+        ApiError::NotAuthenticated => false,
+    }
+}
+
+const CUSTOMER_CONFIG_RELEASE_MAX_ATTEMPTS: u8 = 3;
+
+#[derive(Debug, thiserror::Error)]
+enum CustomerConfigReleaseError {
+    #[error("{0}")]
+    OutcomeUnknown(String),
+    #[error("{0}")]
+    Rejected(String),
+}
+
+/// Release a held workload roll, bounded by the estimated hold expiry:
+/// every in-flight call and retry sleep is capped at the remaining window
+/// (the API client's own 900 s timeout would otherwise let one stalled
+/// call run past the hold).
+async fn release_customer_config_roll_with_retry(
+    api: &ApiClient,
+    instance_name: &str,
+    deployment_id: &str,
+    hold_expiry: Instant,
+) -> Result<(), CustomerConfigReleaseError> {
+    let mut attempt = 0u8;
+    let mut outcome_unknown = false;
+    loop {
+        let remaining = hold_expiry.saturating_duration_since(Instant::now());
+        // An abandoned request may have released the roll before expiry.
+        if remaining.is_zero() {
+            return Err(release_failure_message(
+                instance_name,
+                attempt,
+                "the roll-hold window expired before the release could be confirmed",
+                true,
+            ));
+        }
+        attempt += 1;
+        // Early attempts get half the remaining window so one stalled call
+        // still leaves time for a retry before the hold expires.
+        let budget = if attempt < CUSTOMER_CONFIG_RELEASE_MAX_ATTEMPTS {
+            remaining / 2
+        } else {
+            remaining
+        };
+        let result = tokio::time::timeout(
+            budget,
+            api.release_template_customer_config_roll(instance_name, deployment_id),
+        )
+        .await;
+        let (description, unknown) = match result {
+            Ok(Ok(())) => return Ok(()),
+            // A locally abandoned request may still reach CAP, so the
+            // outcome is exactly as ambiguous as a transport error.
+            Err(_abandoned) => (
+                format!("release request abandoned after {budget:?} without a response"),
+                true,
+            ),
+            Ok(Err(error)) => (error.to_string(), release_outcome_is_unknown(&error)),
+        };
+        outcome_unknown |= unknown;
+        if unknown && attempt < CUSTOMER_CONFIG_RELEASE_MAX_ATTEMPTS {
+            let remaining = hold_expiry.saturating_duration_since(Instant::now());
+            tokio::time::sleep(Duration::from_secs(1).min(remaining / 2)).await;
+            continue;
+        }
+        return Err(release_failure_message(
+            instance_name,
+            attempt,
+            &description,
+            outcome_unknown,
+        ));
+    }
+}
+
+fn release_failure_message(
+    instance_name: &str,
+    attempts: u8,
+    error: &str,
+    outcome_unknown: bool,
+) -> CustomerConfigReleaseError {
+    if outcome_unknown {
+        CustomerConfigReleaseError::OutcomeUnknown(format!(
+            "customer config was stored, but the roll-release result is unknown after {attempts} attempts: {error}. The roll may already be released; check `enclava status --app {instance_name}` before assuming the running workload is unchanged."
+        ))
+    } else {
+        CustomerConfigReleaseError::Rejected(format!(
+            "customer config was stored, but the workload roll was not released: {error}. The running workload was left unchanged."
+        ))
+    }
+}
+
+fn customer_config_roll_hold_seconds(ssh_timeout_seconds: u64) -> u32 {
+    let budget = ssh_timeout_seconds
+        .saturating_mul(2)
+        .saturating_add(CUSTOMER_CONFIG_ROLL_HOLD_PREFIX_SECONDS)
+        .clamp(
+            CUSTOMER_CONFIG_ROLL_HOLD_MIN_SECONDS,
+            CUSTOMER_CONFIG_ROLL_HOLD_MAX_SECONDS,
+        );
+    u32::try_from(budget).unwrap_or(u32::MAX)
+}
+
 async fn ensure_template_app(
     api: &ApiClient,
     template: &HostedTemplate,
@@ -878,7 +1091,10 @@ async fn ensure_template_app(
         .await
     {
         Ok(app) => Ok(app),
-        Err(ApiError::Api { status: 409, .. }) => Ok(api.get_app(instance_name).await?),
+        // A concurrent create won. The app already exists; fetch it.
+        Err(ApiError::Api { status: 409, .. }) => {
+            api.get_app(instance_name).await.map_err(Into::into)
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -1200,22 +1416,34 @@ fn debian_ssh_config_pairs(public_keys: String) -> Vec<(&'static str, String)> {
     vec![("DEBIAN_SSH_AUTHORIZED_KEYS", public_keys)]
 }
 
+/// Wait for the password-mode TEE bootstrap endpoint to accept a claim.
+///
+/// `hold_deadline` bounds every in-flight PaaS request and TEE probe, the
+/// whole loop, and each poll sleep on a held redeploy: the API client's own
+/// 900 s cap and the probe client's timeout would otherwise let one stalled
+/// call run past the roll hold. A cut is never a failure outcome; the wait's
+/// own expiry reports the timeout. `None` on unheld deploys keeps the
+/// unbounded behavior.
 async fn wait_for_template_bootstrap_endpoint(
     api: &ApiClient,
     app_name: &str,
     deployment: DeploymentWait<'_>,
     max_wait: Duration,
-    poll_interval: Duration,
+    hold_deadline: Option<Instant>,
     pb: &ProgressBar,
     timings: &DeployTimings<impl Fn(&[u8]) -> std::io::Result<()>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let poll_interval = Duration::from_secs(3);
     let deployment_id = deployment.deployment_id;
     let start = Instant::now();
+    // The hold deadline caps the whole wait, not just in-flight requests,
+    // so the release reserve survives; unheld deploys keep start + max_wait.
+    let wait_deadline = hold_deadline.map_or(start + max_wait, |hold| hold.min(start + max_wait));
     let mut tee = None;
 
     loop {
-        fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
-        if start.elapsed() > max_wait {
+        fail_if_template_deployment_failed(api, app_name, deployment_id, hold_deadline).await?;
+        if Instant::now() > wait_deadline {
             pb.abandon_with_message("TEE ownership timed out");
             return Err(format!(
                 "TEE ownership for app {app_name} did not become ready within {}; run `enclava status --app {app_name}` for the latest state",
@@ -1230,20 +1458,30 @@ async fn wait_for_template_bootstrap_endpoint(
             max_wait,
         ));
         if tee.is_none() {
-            match timings
-                .run(
+            // A deadline cut is indistinguishable from a transient failure:
+            // the loop's own expiry check reports the wait timeout.
+            let acquired = match bounded_request(
+                hold_deadline,
+                timings.run(
                     DeployPhase::BootstrapEndpointAcquisition,
                     api.get_unlock_endpoint(app_name),
-                )
-                .await
+                ),
+            )
+            .await
             {
-                Ok(endpoint) => {
+                Some(Ok(endpoint)) => Some(endpoint),
+                Some(Err(error)) if should_retry_template_bootstrap_endpoint_error(&error) => None,
+                Some(Err(error)) => return Err(error.into()),
+                None => None,
+            };
+            match acquired {
+                Some(endpoint) => {
                     tee = Some(TeeClient::new_for_ownership_probe_with_resolve_ip(
                         &endpoint.tee_url,
                         endpoint.tee_resolve_ip,
                     ));
                 }
-                Err(error) if should_retry_template_bootstrap_endpoint_error(&error) => {
+                None => {
                     pb.set_message(timed_progress(
                         "TEE ownership: waiting for claim endpoint",
                         start.elapsed(),
@@ -1251,32 +1489,35 @@ async fn wait_for_template_bootstrap_endpoint(
                     ));
                     let _ = timings
                         .run(DeployPhase::BootstrapPollSleep, async {
-                            tokio::time::sleep(poll_interval).await;
+                            tokio::time::sleep(bounded_phase(hold_deadline, poll_interval)).await;
                             Ok::<(), std::convert::Infallible>(())
                         })
                         .await;
                     continue;
                 }
-                Err(error) => return Err(error.into()),
             }
         }
 
         let tee = tee
             .as_ref()
             .expect("TEE client must exist after endpoint acquisition");
-        match timings
-            .run(DeployPhase::BootstrapAttestation, tee.attest_receipt_key())
-            .await
+        match bounded_request(
+            hold_deadline,
+            timings.run(DeployPhase::BootstrapAttestation, tee.attest_receipt_key()),
+        )
+        .await
         {
-            Ok((_attestation, attested_tee)) => {
-                match timings
-                    .run(
+            Some(Ok((_attestation, attested_tee))) => {
+                match bounded_request(
+                    hold_deadline,
+                    timings.run(
                         DeployPhase::BootstrapChallenge,
                         attested_tee.bootstrap_challenge(),
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
-                    Ok(_) => {
+                    Some(Ok(_)) => {
                         // A terminal diagnostic read over this attested,
                         // SPKI-pinned channel outranks a reachable challenge
                         // endpoint: stop before attempting any claim, but only
@@ -1288,7 +1529,7 @@ async fn wait_for_template_bootstrap_endpoint(
                                 app_name,
                                 deployment,
                                 &attested_tee,
-                                start + max_wait,
+                                wait_deadline,
                             )
                             .await
                         {
@@ -1300,7 +1541,7 @@ async fn wait_for_template_bootstrap_endpoint(
                         pb.set_message("Ownership claim endpoint ready");
                         return Ok(true);
                     }
-                    Err(_) => {
+                    Some(Err(_)) => {
                         // One safe status read decides the challenge-failure
                         // fallback: a terminal diagnostic is never masked by a
                         // claimed ownership state.
@@ -1308,7 +1549,7 @@ async fn wait_for_template_bootstrap_endpoint(
                             .run(
                                 DeployPhase::BootstrapStateFallback,
                                 attested_tee.bootstrap_status_within(terminal_diagnostic_budget(
-                                    Some(start + max_wait),
+                                    Some(wait_deadline),
                                 )),
                             )
                             .await
@@ -1321,7 +1562,7 @@ async fn wait_for_template_bootstrap_endpoint(
                                             app_name,
                                             deployment,
                                             &attested_tee,
-                                            start + max_wait,
+                                            wait_deadline,
                                         )
                                         .await
                                     {
@@ -1361,9 +1602,18 @@ async fn wait_for_template_bootstrap_endpoint(
                             }
                         }
                     }
+                    // A cut is not a challenge failure: no fallback reads;
+                    // the loop's expiry reports the wait timeout.
+                    None => {
+                        pb.set_message(timed_progress(
+                            "TEE ownership: waiting for claim endpoint",
+                            start.elapsed(),
+                            max_wait,
+                        ));
+                    }
                 }
             }
-            Err(_) => {
+            Some(Err(_)) | None => {
                 pb.set_message(timed_progress(
                     "TEE ownership: waiting for attested endpoint",
                     start.elapsed(),
@@ -1374,7 +1624,7 @@ async fn wait_for_template_bootstrap_endpoint(
 
         let _ = timings
             .run(DeployPhase::BootstrapPollSleep, async {
-                tokio::time::sleep(poll_interval).await;
+                tokio::time::sleep(bounded_phase(hold_deadline, poll_interval)).await;
                 Ok::<(), std::convert::Infallible>(())
             })
             .await;
@@ -1413,6 +1663,12 @@ struct DeliverTemplateConfigTarget<'a> {
     /// self-unlock and keep the default budget.
     password_mode: bool,
     owner_wait_budget: Duration,
+    /// Absolute deadline for a held redeploy: every request the delivery
+    /// makes is bounded by it, so a stalled write cannot outlive the roll
+    /// hold — including auto-unlock deliveries and password-mode requests
+    /// before the first lock response, which the owner-wait alone does not
+    /// bound. `None` on unheld deploys.
+    hold_deadline: Option<Instant>,
     progress: &'a ProgressBar,
     /// Output mode for operator notices: `--timings` owns stderr as a
     /// JSONL stream, so notices ride it as structured events instead of
@@ -1441,6 +1697,7 @@ async fn deliver_template_config_with_retry(
         locked_since: None,
         password_mode: target.password_mode,
         owner_wait_budget: target.owner_wait_budget,
+        hold_deadline: target.hold_deadline,
         delivery_started: Instant::now(),
         progress: target.progress,
         owner_wait_announced: false,
@@ -1479,11 +1736,11 @@ async fn deliver_template_config_with_retry(
         {
             // Distinct failure class from an undelivered value: the value is
             // in the TEE store; only the platform's key metadata lags.
-            return Err(format!(
-                "config value delivered to the TEE store, but the platform key sync failed \\
-                 for {key}: {error}. The platform may not report this key as managed until a \\
+            return Err(TemplateConfigStoredSyncFailed(format!(
+                "config value delivered to the TEE store, but the platform key sync failed \
+                 for {key}: {error}. The platform may not report this key as managed until a \
                  later sync succeeds."
-            )
+            ))
             .into());
         }
     }
@@ -1496,6 +1753,17 @@ async fn deliver_template_config_with_retry(
 /// The unlock prescription is reserved for an owner-blocked (persistent
 /// password-mode lock) failure; other causes get the plain re-delivery path
 /// so the reported error stays the actionable signal.
+#[derive(Debug)]
+struct TemplateConfigStoredSyncFailed(String);
+
+impl std::fmt::Display for TemplateConfigStoredSyncFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TemplateConfigStoredSyncFailed {}
+
 fn undelivered_template_config_error(
     instance_name: &str,
     undelivered: &[(&'static str, String)],
@@ -1554,6 +1822,11 @@ struct TemplateConfigDeliveryState<'a> {
     /// Sticky for the delivery: a successful write clears the lock window
     /// but must not discard the deadline the post-write sync still needs.
     engaged_deadline: Option<Instant>,
+    /// Absolute deadline of a held redeploy's roll hold. Bounds every
+    /// request the delivery makes, including auto-unlock deliveries and
+    /// password-mode requests before the first lock response. `None` on
+    /// unheld deploys.
+    hold_deadline: Option<Instant>,
 }
 
 impl TemplateConfigDeliveryState<'_> {
@@ -1717,15 +1990,25 @@ impl TemplateConfigDeliveryState<'_> {
     /// password-mode lock is even a candidate (a stalled request must not
     /// outlive the budget waiting for the persistence threshold) and
     /// retained for the rest of the delivery once engaged — a successful
-    /// write clears the lock window but not this deadline. Deliveries with
-    /// no password-mode lock state pass `None` and keep today's exact
-    /// behavior.
+    /// write clears the lock window but not this deadline. A held redeploy
+    /// additionally bounds every request by the absolute hold deadline, so
+    /// a stalled write cannot outlive the roll hold even while no
+    /// password-mode lock state exists. Deliveries with neither pass `None`
+    /// and keep today's exact behavior.
     fn request_deadline(&self) -> Option<Instant> {
-        if !self.password_mode || (self.locked_since.is_none() && self.engaged_deadline.is_none()) {
-            return None;
+        let owner_wait = if !self.password_mode
+            || (self.locked_since.is_none() && self.engaged_deadline.is_none())
+        {
+            None
+        } else {
+            self.engaged_deadline
+                .or_else(|| self.delivery_started.checked_add(self.owner_wait_budget))
+        };
+        match (self.hold_deadline, owner_wait) {
+            (Some(hold), Some(owner_wait)) => Some(hold.min(owner_wait)),
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
         }
-        self.engaged_deadline
-            .or_else(|| self.delivery_started.checked_add(self.owner_wait_budget))
     }
 
     async fn set_key(&mut self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1932,12 +2215,20 @@ fn managed_config_progress_message(
     )
 }
 
+/// Wait for the PaaS to report every platform-managed config key ready.
+///
+/// `hold_deadline` bounds each in-flight status read, the whole loop, and
+/// each retry sleep on a held redeploy: the API client's own 900 s cap would
+/// otherwise let one stalled read run past the roll hold. A cut read
+/// surfaces this wait's own not-available timeout. `None` on unheld deploys
+/// keeps the unbounded reads.
 async fn wait_for_paas_managed_config_keys(
     api: &ApiClient,
     instance_name: &str,
     expected_keys: &[String],
     deployment: DeploymentWait<'_>,
     timeout: Duration,
+    hold_deadline: Option<Instant>,
     progress: &ProgressBar,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expected = expected_keys
@@ -1951,7 +2242,10 @@ async fn wait_for_paas_managed_config_keys(
     }
     let deployment_id = deployment.deployment_id;
     let start = Instant::now();
-    let deadline = start + timeout;
+    // The hold deadline caps the whole wait so a budget larger than the
+    // remaining hold still stops at the hold, preserving the release
+    // reserve. Unheld deploys keep start + timeout.
+    let deadline = hold_deadline.map_or(start + timeout, |hold| hold.min(start + timeout));
     let mut terminal_probe_at: Option<Instant> = None;
     progress.set_message(managed_config_progress_message(
         0,
@@ -1960,7 +2254,8 @@ async fn wait_for_paas_managed_config_keys(
         timeout,
     ));
     loop {
-        fail_if_template_deployment_failed(api, instance_name, deployment_id).await?;
+        fail_if_template_deployment_failed(api, instance_name, deployment_id, hold_deadline)
+            .await?;
         // TLS provisioning starts around the claim, so a terminal bootstrap
         // diagnostic must stop this post-claim wait promptly. The probe is
         // bound to the expected deployment via CAP before and after the
@@ -1975,8 +2270,8 @@ async fn wait_for_paas_managed_config_keys(
             progress.abandon_with_message("TEE bootstrap failed");
             return Err(terminal_bootstrap_failure_message(instance_name, &diagnostic).into());
         }
-        match api.list_config_keys(instance_name).await {
-            Ok(response) => {
+        match bounded_request(hold_deadline, api.list_config_keys(instance_name)).await {
+            Some(Ok(response)) => {
                 let present = response
                     .keys
                     .into_iter()
@@ -2007,7 +2302,7 @@ async fn wait_for_paas_managed_config_keys(
                     .into());
                 }
             }
-            Err(error) if should_retry_template_config_sync_error(&error) => {
+            Some(Err(error)) if should_retry_template_config_sync_error(&error) => {
                 progress.set_message(timed_progress(
                     "Platform config: status check retrying",
                     start.elapsed(),
@@ -2021,10 +2316,17 @@ async fn wait_for_paas_managed_config_keys(
                     .into());
                 }
             }
-            Err(error) => return Err(error.into()),
+            Some(Err(error)) => return Err(error.into()),
+            None => {
+                return Err(format!(
+                    "platform config status for app {instance_name} did not become available within {}: customer-config roll hold deadline reached with the status read still in flight; this command did not deliver customer config; retry `enclava config get --app {instance_name}`",
+                    format_duration(timeout)
+                )
+                .into());
+            }
         }
         progress.tick();
-        tokio::time::sleep(template_config_delivery_retry_delay()).await;
+        template_config_sleep_until_retry(hold_deadline).await;
     }
 }
 
@@ -2788,7 +3090,9 @@ async fn wait_for_paas_ssh_command(
             start.elapsed(),
             timeout,
         ));
-        fail_if_template_deployment_failed(api, app_name, deployment_id).await?;
+        // Post-release on the deploy flow and unheld on the standalone
+        // resumption: no pre-release deadline applies to this wait.
+        fail_if_template_deployment_failed(api, app_name, deployment_id, None).await?;
         // Post-claim wait: one deployment-bound attested status read covers
         // both stop conditions -- a terminal bootstrap diagnostic, and a
         // password-mode relock (the pod rolled, the TEE came back locked, and
@@ -2856,19 +3160,30 @@ async fn latest_deployment_id(api: &ApiClient, app_name: &str) -> Result<Option<
         .map(|deployment| deployment.id))
 }
 
+/// Stop a wait when CAP reports the deployment failed. A held deploy's
+/// pre-release deadline bounds the status read: a cut is an unreadable
+/// status -- never a guessed failure -- so the enclosing wait's own expiry
+/// governs. Unheld callers pass `None` and keep the unbounded read.
 async fn fail_if_template_deployment_failed(
     api: &ApiClient,
     app_name: &str,
     deployment_id: &str,
+    deadline: Option<Instant>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if deployment_id == "pending" {
         return Ok(());
     }
-    match template_deployment_failure(api, app_name, deployment_id).await {
-        Ok(Some(message)) => Err(message.into()),
-        Ok(None) => Ok(()),
-        Err(error) if should_retry_template_deployment_status_error(&error) => Ok(()),
-        Err(error) => Err(error.into()),
+    match bounded_request(
+        deadline,
+        template_deployment_failure(api, app_name, deployment_id),
+    )
+    .await
+    {
+        Some(Ok(Some(message))) => Err(message.into()),
+        Some(Ok(None)) => Ok(()),
+        Some(Err(error)) if should_retry_template_deployment_status_error(&error) => Ok(()),
+        Some(Err(error)) => Err(error.into()),
+        None => Ok(()),
     }
 }
 
@@ -4416,6 +4731,7 @@ mod tests {
             cap: serde_json::json!({
                 "app_domain": "shell.enclava.dev"
             }),
+            customer_config_hold: false,
         }
     }
 
@@ -4481,110 +4797,456 @@ mod tests {
     }
 
     #[test]
-    fn template_deploy_claims_password_template_before_config_delivery() {
-        let source = include_str!("template.rs");
-        let deploy_start = source.find("async fn deploy").expect("deploy exists");
-        let deploy_end = source[deploy_start..]
-            .find("async fn ssh_command")
-            .expect("ssh_command follows deploy")
-            + deploy_start;
-        let body = &source[deploy_start..deploy_end];
+    fn customer_config_roll_hold_covers_both_wait_budgets() {
+        assert_eq!(customer_config_roll_hold_seconds(1_800), 4_142);
+        assert_eq!(customer_config_roll_hold_seconds(10), 562);
+        assert_eq!(customer_config_roll_hold_seconds(10_000), 7_200);
+    }
 
-        let bootstrap_hash = body
-            .find("template_bootstrap_pubkey_hash")
-            .expect("template deploy derives bootstrap hash");
-        let password_preflight = body
-            .find("storage_password.ensure_available_for_password_mode")
-            .expect("template deploy preflights password input availability");
-        let ensure_app = body
-            .find("ensure_template_app")
-            .expect("template deploy creates app");
-        let prepare_log_key = body
-            .find("prepare_template_log_key")
-            .expect("template deploy prepares tenant log encryption");
-        let create_instance = body
-            .find("create_template_instance")
-            .expect("template deploy creates template instance");
-        let wait_claim = body
-            .find("wait_for_template_bootstrap_endpoint")
-            .expect("template deploy waits for ownership claim endpoint");
-        let claim = body
-            .find("claim_initial_ownership")
-            .expect("template deploy claims ownership");
-        let managed_config = body
-            .find("deliver_managed_template_config")
-            .expect("template deploy asks PaaS to deliver managed config");
-        let wait_managed_config = body
-            .find("wait_for_paas_managed_config_keys")
-            .expect("template deploy waits for PaaS-managed config metadata");
-        let config = body
-            .find("deliver_template_config_with_retry")
-            .expect("template deploy writes customer config");
+    #[tokio::test]
+    async fn stalled_release_call_is_bounded_and_retried_within_the_hold() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        assert!(
-            !body.contains("enable_steady_tick"),
-            "template deploy progress must not redraw during password and recovery-mnemonic prompts"
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled release fixture");
+        let addr = listener.local_addr().expect("stalled release fixture addr");
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        tokio::spawn(async move {
+            let mut stalled = true;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0_u8; 1024];
+                let read = stream.read(&mut request).await.unwrap_or(0);
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..read]).to_string());
+                if stalled {
+                    stalled = false;
+                    // Hold the connection open without a response.
+                    let _ = stream.read(&mut [0_u8; 1]).await;
+                } else {
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+                        .await
+                        .expect("write release response");
+                    break;
+                }
+            }
+        });
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+
+        let expiry = Instant::now() + Duration::from_secs(6);
+        let started = Instant::now();
+        release_customer_config_roll_with_retry(&api, "shell", "deploy-1", expiry)
+            .await
+            .expect("the retry must release the roll inside the hold");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "a stalled release call must be retried, saw {requests:?}"
         );
+        for request in requests.iter() {
+            assert!(
+                request.contains("POST /apps/shell/deployments/deploy-1/customer-config-released"),
+                "unexpected release request: {request}"
+            );
+        }
+        drop(requests);
+        let elapsed = started.elapsed();
         assert!(
-            password_preflight < bootstrap_hash
-                && bootstrap_hash < ensure_app
-                && ensure_app < prepare_log_key
-                && prepare_log_key < create_instance
-                && create_instance < wait_claim
-                && wait_claim < claim
-                && claim < managed_config
-                && managed_config < wait_managed_config
-                && wait_managed_config < config,
-            "template deploy must prepare tenant log encryption before deployment, then make the config store writable before writing customer config"
+            elapsed < Duration::from_secs(6),
+            "release must complete inside the hold window, took {elapsed:?}"
         );
     }
 
-    #[test]
-    fn template_deploy_verifies_platform_trust_before_remote_mutation() {
-        let source = include_str!("template.rs");
-        let deploy_start = source.find("async fn deploy").expect("deploy exists");
-        let deploy_end = source[deploy_start..]
-            .find("async fn ssh_command")
-            .expect("ssh_command follows deploy")
-            + deploy_start;
-        let body = &source[deploy_start..deploy_end];
+    #[tokio::test]
+    async fn exhausted_hold_deadline_reports_unknown_release_promptly() {
+        use tokio::io::AsyncReadExt;
 
-        let verify_platform = body
-            .find("fetch_verified_platform_release(api, &ctx.paths)")
-            .expect("template deploy verifies the signed platform release");
-        let bootstrap = body
-            .find("template_bootstrap_pubkey_hash")
-            .expect("template deploy may bootstrap remote keyring state");
-        let ensure_app = body
-            .find("ensure_template_app")
-            .expect("template deploy may create a remote app");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalling release fixture");
+        let addr = listener
+            .local_addr()
+            .expect("stalling release fixture addr");
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = accepted.clone();
+        tokio::spawn(async move {
+            // Wait for cancellation without responding.
+            while let Ok((mut stream, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let _ = stream.read(&mut [0_u8; 1]).await;
+            }
+        });
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
 
+        let expiry = Instant::now() + Duration::from_secs(2);
+        let started = Instant::now();
+        let error = release_customer_config_roll_with_retry(&api, "shell", "deploy-1", expiry)
+            .await
+            .expect_err("an expired hold must not report a released roll");
+
+        assert!(matches!(
+            error,
+            CustomerConfigReleaseError::OutcomeUnknown(_)
+        ));
         assert!(
-            verify_platform < bootstrap && verify_platform < ensure_app,
-            "template deploy must verify platform trust before remote mutation"
+            started.elapsed() < Duration::from_secs(3),
+            "must return at the hold expiry instead of the 900s request cap, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "a short hold must still leave time for a retry"
         );
     }
 
-    #[test]
-    fn template_bootstrap_endpoint_retries_without_redeploying() {
-        let body = include_str!("template.rs")
-            .split_once("async fn wait_for_template_bootstrap_endpoint")
-            .unwrap();
-        let body = body
-            .1
-            .split_once("async fn deliver_template_config_with_retry")
-            .unwrap()
-            .0;
-        let wait_loop = body.find("loop {").unwrap();
-        let failure_check = body.find("fail_if_template_deployment_failed").unwrap();
-        let endpoint = body.find("get_unlock_endpoint").unwrap();
-        let retry = body[endpoint..].find("continue;").unwrap() + endpoint;
+    async fn stalled_api_endpoint(
+        suffix: &'static str,
+    ) -> (ApiClient, tokio::sync::oneshot::Receiver<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        assert!(wait_loop < failure_check && failure_check < endpoint && endpoint < retry);
-        assert!(body.contains("should_retry_template_bootstrap_endpoint_error"));
-        assert!(body.contains("tokio::time::sleep(poll_interval).await"));
-        assert!(!body.contains("create_template_instance"));
-        assert!(!body.contains(".deploy("));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stalled, seen) = tokio::sync::oneshot::channel();
+        let deployments = serde_json::json!([terminal_delivery_support::deployment_entry_json(
+            "deploy-1", "watching"
+        )])
+        .to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let mut buffer = [0_u8; 1024];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "fixture request ended before its headers");
+                    request.extend_from_slice(&buffer[..count]);
+                    assert!(request.len() <= 8192);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap();
+                if path.ends_with(suffix) {
+                    let _ = stalled.send(());
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                    return;
+                }
+                let (status, body) = if path.ends_with("/deployments") {
+                    ("200 OK", deployments.as_str())
+                } else {
+                    (
+                        "404 Not Found",
+                        r#"{"message":"fixture route unavailable"}"#,
+                    )
+                };
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        (
+            ApiClient::new(&format!("http://{address}"), Some("test-token".to_string())),
+            seen,
+        )
+    }
+
+    #[tokio::test]
+    async fn stalled_deployment_status_read_stops_at_the_pre_release_deadline() {
+        let (api, mut seen) = stalled_api_endpoint("/deployments").await;
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fail_if_template_deployment_failed(&api, "shell", "deploy-1", Some(deadline)),
+        )
+        .await
+        .expect("deployment status must respect the hold deadline")
+        .expect("a cut status read is unreadable, never a guessed failure");
+        seen.try_recv()
+            .expect("the deployment status read must start");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the status read must run until the deadline, returned after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the stalled status read must stop at the pre-release deadline instead of the 900s request cap, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_bootstrap_endpoint_wait_stops_at_the_pre_release_deadline() {
+        let (api, mut seen) = stalled_api_endpoint("/unlock/endpoint").await;
+        let timings = DeployTimings::new(false, |_line: &[u8]| Ok(()));
+        let progress = ProgressBar::hidden();
+
+        let hold = Instant::now() + Duration::from_millis(300);
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_template_bootstrap_endpoint(
+                &api,
+                "shell",
+                DeploymentWait::trusted("deploy-1", None),
+                Duration::from_secs(600),
+                Some(hold),
+                &progress,
+                &timings,
+            ),
+        )
+        .await
+        .expect("bootstrap endpoint must respect the hold deadline")
+        .expect_err("a stalled endpoint must not report readiness");
+        seen.try_recv()
+            .expect("the unlock endpoint read must start");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the wait must run until the deadline, returned after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the stalled wait must stop at the pre-release deadline instead of the 600s budget, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_bootstrap_tee_probe_stops_at_the_pre_release_deadline() {
+        use terminal_delivery_support::*;
+
+        // Keep the TLS handshake open without returning any attestation.
+        let tee_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled TEE fixture");
+        let tee_address = tee_listener.local_addr().expect("stalled TEE fixture addr");
+        let (connected, mut seen) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let (mut stream, _) = tee_listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let _ = connected.send(());
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let api_address = spawn_json_api_stub(move |path| {
+            if path.ends_with("/unlock/endpoint") {
+                Some(serde_json::json!({
+                    "tee_url": format!("https://localhost:{}", tee_address.port()),
+                    "tee_resolve_ip": "127.0.0.1",
+                    "unlock_endpoint": format!("https://localhost:{}/unlock", tee_address.port()),
+                    "claim_endpoint": format!(
+                        "https://localhost:{}/bootstrap/claim",
+                        tee_address.port()
+                    ),
+                }))
+            } else if path.ends_with("/deployments") {
+                Some(serde_json::json!([deployment_entry_json(
+                    "deploy-1", "watching"
+                )]))
+            } else {
+                None
+            }
+        })
+        .await;
+        let api = ApiClient::new(
+            &format!("http://{api_address}"),
+            Some("test-token".to_string()),
+        );
+        let timings = DeployTimings::new(false, |_line: &[u8]| Ok(()));
+        let progress = ProgressBar::hidden();
+
+        let hold = Instant::now() + Duration::from_millis(300);
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_template_bootstrap_endpoint(
+                &api,
+                "shell",
+                DeploymentWait::trusted("deploy-1", None),
+                Duration::from_secs(600),
+                Some(hold),
+                &progress,
+                &timings,
+            ),
+        )
+        .await
+        .expect("TEE probe must respect the hold deadline")
+        .expect_err("a stalled TEE probe must not report readiness");
+        seen.try_recv().expect("the TEE handshake must start");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the wait must run until the deadline, returned after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the stalled TEE probe must stop at the pre-release deadline instead of the probe client timeout, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_managed_config_read_stops_at_the_pre_release_deadline() {
+        let (api, mut seen) = stalled_api_endpoint("/config").await;
+        let progress = ProgressBar::hidden();
+
+        let hold = Instant::now() + Duration::from_millis(300);
+        let started = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_paas_managed_config_keys(
+                &api,
+                "shell",
+                &["MANAGED_KEY".to_string()],
+                DeploymentWait::trusted("deploy-1", None),
+                Duration::from_secs(600),
+                Some(hold),
+                &progress,
+            ),
+        )
+        .await
+        .expect("managed config must respect the hold deadline")
+        .expect_err("a stalled config read must not report readiness");
+        seen.try_recv().expect("the managed config read must start");
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the wait must run until the deadline, returned after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the stalled wait must stop at the pre-release deadline instead of the 600s budget, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_release_stays_unknown_when_the_retry_is_rejected() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rejected retry fixture");
+        let addr = listener.local_addr().expect("rejected retry fixture addr");
+        let server = tokio::spawn(async move {
+            // First connection stalls and is abandoned; the retry gets a
+            // definitive 4xx rejection.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let _ = stream.read(&mut [0_u8; 1]).await;
+
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let body = r#"{"message":"roll is not held"}"#;
+            let response = format!(
+                "HTTP/1.1 409 Conflict\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write rejected release response");
+        });
+        let api = ApiClient::new(&format!("http://{addr}"), Some("test-token".to_string()));
+
+        let expiry = Instant::now() + Duration::from_secs(4);
+        let started = Instant::now();
+        let error = release_customer_config_roll_with_retry(&api, "shell", "deploy-1", expiry)
+            .await
+            .expect_err("a rejected retry must fail the release");
+
+        assert!(matches!(
+            error,
+            CustomerConfigReleaseError::OutcomeUnknown(_)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the rejection must surface inside the hold window, took {:?}",
+            started.elapsed()
+        );
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("the retry must reach the service")
+            .expect("the release fixture must respond");
+    }
+
+    #[test]
+    fn held_roll_deadline_bounds_all_delivery_requests() {
+        let api = ApiClient::new("https://api.example.test", Some("test".to_string()));
+        let mut tee = TeeClient::new("shell.example.test");
+        let mut config_token = "token".to_string();
+        let mut tee_url = "https://shell.example.test/config".to_string();
+        let mut tee_resolve_ip = None;
+        let progress = ProgressBar::hidden();
+        let mut state = TemplateConfigDeliveryState {
+            api: &api,
+            tee: &mut tee,
+            instance_name: "shell",
+            deployment: DeploymentWait::trusted("expected-1", None),
+            config_token: &mut config_token,
+            tee_url: &mut tee_url,
+            tee_resolve_ip: &mut tee_resolve_ip,
+            terminal_probe_at: None,
+            locked_since: None,
+            password_mode: false,
+            owner_wait_budget: Duration::from_secs(1_800),
+            hold_deadline: None,
+            delivery_started: Instant::now(),
+            progress: &progress,
+            owner_wait_announced: false,
+            post_lock_note_printed: false,
+            timings_mode: false,
+            observed_lock: false,
+            engaged_deadline: None,
+        };
+
+        // Auto-unlock deliveries and password-mode deliveries before the
+        // first lock response have no owner-wait deadline; a held redeploy
+        // must still bound every request by the absolute hold deadline.
+        let hold = Instant::now() + Duration::from_secs(60);
+        state.hold_deadline = Some(hold);
+        assert_eq!(state.request_deadline(), Some(hold));
+        state.password_mode = true;
+        assert_eq!(state.request_deadline(), Some(hold));
+
+        // An engaged owner-wait keeps its own deadline; the request stops at
+        // whichever comes first.
+        let later = Instant::now() + Duration::from_secs(120);
+        state.locked_since = Some(Instant::now());
+        state.engaged_deadline = Some(later);
+        assert_eq!(state.request_deadline(), Some(hold));
+        let earlier = Instant::now() + Duration::from_secs(10);
+        state.engaged_deadline = Some(earlier);
+        assert_eq!(state.request_deadline(), Some(earlier));
+
+        // Unheld deploys keep today's behavior: only the engaged
+        // owner-wait deadline applies, and no lock state means none.
+        state.hold_deadline = None;
+        assert_eq!(state.request_deadline(), Some(earlier));
+        state.engaged_deadline = None;
+        state.locked_since = None;
+        assert_eq!(state.request_deadline(), None);
     }
 
     #[test]
@@ -6144,131 +6806,6 @@ mod tests {
     }
 
     #[test]
-    fn template_config_delivery_owner_wait_is_wired_to_deploy_metadata() {
-        // The owner-wait is caller-supplied deploy metadata (unlock mode + the
-        // shared ssh-timeout budget), never a lookup from inside the wait,
-        // and the delivery loop must consult it on both retry arms.
-        let source = include_str!("template.rs");
-
-        assert!(
-            source.contains("password_mode: template.unlock_mode == \"password\""),
-            "the deploy call site must pass the detected unlock mode"
-        );
-        assert!(
-            source.contains("owner_wait_budget: Duration::from_secs(args.ssh_timeout_seconds)"),
-            "the owner-wait budget must ride the shared ssh-timeout knob"
-        );
-
-        let fn_start = source.find("async fn set_key").expect("set_key exists");
-        let fn_end = source
-            .find("async fn attest_template_config_tee_with_retry")
-            .expect("attest retry follows the delivery state impl");
-        let body = &source[fn_start..fn_end];
-        let refresh_arm = body
-            .find("should_refresh_template_config_token")
-            .expect("refresh arm");
-        let retry_arm = body
-            .rfind("should_retry_template_config_tee_error")
-            .expect("retry arm");
-        for arm in [refresh_arm, retry_arm] {
-            let arm_body = &body[arm..];
-            assert!(
-                arm_body.contains("delivery_continues(attempt)"),
-                "both retry arms must honor the continuation predicate"
-            );
-            assert!(
-                arm_body.contains("note_delivery_error(&error)"),
-                "both retry arms must track locked persistence"
-            );
-        }
-
-        assert!(
-            source.contains("enclava unlock --app {}"),
-            "the guidance message must name the unlock command"
-        );
-        let announce_fn = source
-            .find("fn announce")
-            .expect("operator notice channel selection exists");
-        let announce_body = &source[announce_fn..announce_fn + 1200];
-        assert!(
-            announce_body.contains("is_hidden()"),
-            "hidden bars never render bar output; notices need a channel"
-        );
-        assert!(
-            announce_body.contains("timings_mode")
-                && announce_body.contains("template_deploy_notice"),
-            "stderr is the timing JSONL stream whenever --timings is set: notices \
-             must ride it as structured events, never free-form text"
-        );
-        assert!(
-            source.contains("timings_mode: args.timings"),
-            "output mode must be caller-supplied deploy metadata"
-        );
-        let set_key_fn = source.find("async fn set_key").expect("set_key exists");
-        let set_key_body = &source[set_key_fn..set_key_fn + 4000];
-        assert!(
-            set_key_body.contains("report_post_lock_delivery"),
-            "a write that lands after an unlock may have missed the workload's \
-             boot and must say so"
-        );
-        let deliver_fn = source
-            .split_once("async fn deliver_template_config_with_retry")
-            .unwrap()
-            .1
-            .split_once("struct TemplateConfigDeliveryState")
-            .unwrap()
-            .0;
-        assert!(
-            deliver_fn.contains("undelivered_template_config_error"),
-            "a terminal delivery failure must name the abandoned keys"
-        );
-        assert!(
-            deliver_fn.contains("downcast_ref::<TeeError>()"),
-            "the unlock prescription must follow the terminal error, not the \\
-             sticky wait history"
-        );
-        assert!(
-            deliver_fn.contains("delivery.password_mode"),
-            "auto-unlock apps self-unlock: a locked terminal error must not \\
-             prescribe a manual unlock for them"
-        );
-        assert!(
-            source.contains("fn request_deadline"),
-            "nested retry helpers need the phase deadline while a lock is a \\
-             candidate or the wait is engaged"
-        );
-        let refresh_arm_fn = source
-            .find("async fn refresh_template_config_token_with_retry")
-            .expect("refresh helper exists");
-        let refresh_body = &source[refresh_arm_fn..refresh_arm_fn + 2000];
-        assert!(
-            refresh_body.contains("template_config_nested_retry_continues"),
-            "the token-refresh retry loop must honor the owner-wait deadline"
-        );
-        assert!(
-            refresh_body.contains("tokio::time::timeout"),
-            "the deadline must also cut an in-flight token request, not only \
-             gate the next iteration"
-        );
-        let set_key_fn2 = source.find("async fn set_key").expect("set_key exists");
-        let set_key_body2 = &source[set_key_fn2..set_key_fn2 + 3000];
-        assert!(
-            set_key_body2.contains("tokio::time::timeout"),
-            "the deadline must also cut an in-flight config write"
-        );
-        assert!(
-            set_key_body2.contains("self.locked_since = None;"),
-            "a successful write is a non-locked outcome: the persistence window \
-             must not leak into the next key's delivery"
-        );
-        assert!(
-            deliver_fn.contains("platform key sync failed"),
-            "a sync failure after a successful TEE write is a distinct failure \
-             class and must be distinguishable from an undelivered value"
-        );
-    }
-
-    #[test]
     fn template_config_slow_connect_class_and_cap() {
         assert!(is_slow_template_config_attest_attempt(
             &TeeError::Attestation("TEE TCP connect timed out".to_string())
@@ -6378,57 +6915,6 @@ mod tests {
         let err = validate_ssh_public_keys("ssh-ed25519 cmFuZG9tLWJhc2U2NA==", None).unwrap_err();
 
         assert!(err.to_string().contains("malformed SSH public key"));
-    }
-
-    #[test]
-    fn template_waits_stop_on_verified_terminal_bootstrap_diagnostics() {
-        // Wiring check for the shared guard (the guard's behavior itself is
-        // covered by the live tests in commands::app::tests): the bootstrap
-        // wait consults the safe status read for both its fallback outcomes,
-        // and the post-claim managed-config and SSH waits probe the attested
-        // TEE for terminal diagnostics.
-        let source = include_str!("template.rs");
-
-        let bootstrap_start = source
-            .find("async fn wait_for_template_bootstrap_endpoint")
-            .unwrap();
-        let bootstrap_end = source[bootstrap_start..]
-            .find("async fn deliver_template_config_with_retry")
-            .unwrap()
-            + bootstrap_start;
-        let bootstrap = &source[bootstrap_start..bootstrap_end];
-        let status_read = bootstrap
-            .find("attested_tee.bootstrap_status_within")
-            .unwrap();
-        let terminal = bootstrap
-            .find("BootstrapEndpointStatusDecision::Terminal")
-            .unwrap();
-        let already_claimed = bootstrap
-            .find("BootstrapEndpointStatusDecision::AlreadyClaimed")
-            .unwrap();
-        assert!(
-            status_read < terminal && terminal < already_claimed,
-            "the terminal decision must outrank the already-claimed fallback"
-        );
-
-        for (marker, probe) in [
-            (
-                "async fn wait_for_paas_managed_config_keys",
-                "deployment_bound_terminal_bootstrap_error",
-            ),
-            (
-                "async fn wait_for_paas_ssh_command",
-                "deployment_bound_tee_status",
-            ),
-        ] {
-            let start = source.find(marker).unwrap();
-            let end = source[start..].find("\nasync fn ").unwrap() + start;
-            let body = &source[start..end];
-            assert!(
-                body.contains(probe) && body.contains("terminal_bootstrap_failure_message"),
-                "{marker} must stop on deployment-bound verified terminal bootstrap diagnostics"
-            );
-        }
     }
 
     fn template_test_expectation(
@@ -6674,6 +7160,7 @@ mod tests {
             timings_mode: false,
             observed_lock: false,
             engaged_deadline: None,
+            hold_deadline: None,
         };
         state
             .set_key("SKEY", "value")
@@ -6760,6 +7247,7 @@ mod tests {
             timings_mode: false,
             observed_lock: false,
             engaged_deadline: None,
+            hold_deadline: None,
         };
         assert!(
             state.terminal_bootstrap_stop().await.is_none(),
