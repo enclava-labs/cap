@@ -4734,6 +4734,122 @@ mod tests {
         }
     }
 
+    /// Regression (PR #185 review, Devin "concurrent upload leaves owner
+    /// authority drifted"): rotate_org_owner pins the replacement in the
+    /// signing service before it writes the successor keyring version and
+    /// releases the lane between those phases. In that window an upload
+    /// signed by the still-pinned owner must not be able to claim the
+    /// successor version (409), while the identical request succeeds as
+    /// soon as the service owner and the pinned owner agree again.
+    #[tokio::test]
+    async fn keyring_upload_fence_refuses_successor_while_service_owner_diverges() {
+        let pool = database_test_pool().await;
+        let org_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let suffix = org_id.simple().to_string();
+        let org_name = format!("keyring-fence-{suffix}");
+        crate::db::orgs::insert_org_pool(&pool, org_id, &org_name, None, false)
+            .await
+            .expect("insert keyring fence org");
+        sqlx::query("INSERT INTO users (id, display_name) VALUES ($1, 'Fence Owner')")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .expect("insert fence owner");
+        sqlx::query("INSERT INTO memberships (user_id, org_id, role) VALUES ($1, $2, 'owner')")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("insert fence membership");
+        let current_key = SigningKey::generate(&mut OsRng);
+        let replacement_key = SigningKey::generate(&mut OsRng);
+        sqlx::query("INSERT INTO user_signing_keys (user_id, pubkey) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(current_key.verifying_key().to_bytes().to_vec())
+            .execute(&pool)
+            .await
+            .expect("insert fence signing key");
+
+        let mut state = crate::test_support::lazy_state();
+        state.db = pool.clone();
+        // The interleave window: the signing service already holds the
+        // replacement owner while CAP still pins the current owner on v1.
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                mock_signing_service_owner_api(org_id, replacement_key.verifying_key().to_bytes())
+                    .await,
+                None,
+            )
+            .expect("build divergent mock signing service client"),
+        );
+        let auth = AuthContext {
+            user_id,
+            org_id,
+            org_name: org_name.clone(),
+            role: Role::Owner,
+            api_key: None,
+            management_origin: crate::auth::middleware::ManagementOrigin::Public,
+        };
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 1, 1)),
+        )
+        .await
+        .expect("insert v1 keyring");
+
+        let successor = signed_keyring_request(org_id, user_id, &current_key, 2, 2);
+        let fenced = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(successor),
+        )
+        .await
+        .expect_err("the successor version must not be claimable while the service owner diverges");
+        assert_eq!(fenced.0, StatusCode::CONFLICT);
+        assert_eq!(
+            fenced.1.0["error"],
+            "signing service owner does not match the current pinned owner (owner rotation in progress)"
+        );
+        let counts_after_fence: (i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put')",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows after fenced upload");
+        assert_eq!(
+            counts_after_fence,
+            (1, 1),
+            "the fenced upload must not mutate keyring or audit authority"
+        );
+
+        // Positive control: once the service owner and the pinned owner
+        // agree again, the identical successor request is accepted.
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                mock_signing_service_owner_api(org_id, current_key.verifying_key().to_bytes())
+                    .await,
+                None,
+            )
+            .expect("build aligned mock signing service client"),
+        );
+        let _ = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 2, 2)),
+        )
+        .await
+        .expect("aligned service owner accepts the successor upload");
+    }
+
     #[tokio::test]
     async fn membership_privileged_role_changes_require_owner() {
         let pool = database_test_pool().await;
