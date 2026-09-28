@@ -40,7 +40,7 @@ workload deploys require the platform services below.
 
 ## Owner Rotation Recovery
 
-Owner-rotation state spans five append-only migrations:
+Owner rotation and policy publication use these append-only migrations:
 
 | Migration | Purpose |
 | --- | --- |
@@ -48,6 +48,7 @@ Owner-rotation state spans five append-only migrations:
 | `0051_org_keyrings_created_at_clock.sql` | `org_keyrings.created_at` defaults to `clock_timestamp()` so freshness bounds measure real insertion time, not transaction start. |
 | `0053_org_rotation_intents.sql` | Presentation record for each authenticated, signature-verified directive; proof of presentation only, never of upstream success. |
 | `0054_org_keyrings_created_at_watermark.sql` | Floors directive version-recency checks for pre-0051 rows with legacy `created_at` semantics. |
+| `0058_org_keyring_payload_shape.sql` | Archives and repairs malformed keyrings, constrains future payloads, and queues publication of changed keyring authority. |
 | `0059_org_rotation_upstream_receipts.sql` | Receipts binding a validated signing-service `rotate-owner` response (owner version, `rotated_at`) to the exact directive and normalized keyring digests. |
 
 Recovery semantics: a rotation directive is first-use bounded by its
@@ -272,6 +273,29 @@ Before using it outside local experimentation:
 - configure network policy for PostgreSQL, Trustee/KBS, policy signing,
   registry metadata, DNS, and tenant TEE callbacks;
 - decide whether CAP-managed DNS and KBS policy management are required.
+
+## Keyring Revocation Completion
+
+In signed-policy mode, keyring uploads and owner rotations confirm success only
+after the filtered KBS policy has converged. A `503` response with code
+`keyring_policy_reconciliation_pending` means the keyring change committed, but
+policy publication is still unconfirmed. It does not mean the keyring rolled back.
+
+Retry the same request after restoring KBS availability. Internal PaaS callers
+must retain the same idempotency key when the response is stamped `deferred`.
+For CLI owner-rotation recovery, reuse the encrypted replacement backup:
+
+```bash
+enclava key rotate-owner --backup-out ./owner-replacement.json \
+  --passphrase-file ./backup.pass --yes
+```
+
+The CLI confirms the accepted keyring's policy before finalizing local recovery
+state. Preserve both the replacement backup and the previous backup until a
+fresh login and deployment succeed. Use the updated API and CLI together; drain
+old API replicas before relying on these completion semantics.
+Apply canonical signed-content keyring replay handling before this CLI update:
+historical payload encodings must not turn an exact signed replay into a conflict.
 
 ## Smoke Checks
 
