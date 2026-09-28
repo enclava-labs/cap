@@ -652,7 +652,13 @@ async fn load_signed_policy_candidates(
         -- manual psql fix can never take down candidate loading for every
         -- org at once.
         current_keyring_members AS (
-            SELECT latest.org_id, member.value->>'pubkey' AS pubkey
+            -- DISTINCT over (org_id, lower(pubkey)): an owner-signed keyring
+            -- may legitimately carry two members with the same public key
+            -- (PR #187 review), and every join below matches artifacts by
+            -- key, not by member identity -- without the dedupe each
+            -- matching artifact would be emitted once per member row and
+            -- inflate the policy (SignedPolicyBudgetExceeded).
+            SELECT DISTINCT latest.org_id, lower(member.value->>'pubkey') AS pubkey
               FROM (
                   SELECT DISTINCT ON (org_id)
                       org_id,
@@ -906,6 +912,26 @@ pub async fn confirm_keyring_kbs_publication(
         return Err(KbsPolicyError::NotConfigured.into());
     }
     reconcile_signed_policy_once(state).await
+}
+
+/// Call BEFORE the mutation transaction: active signed-policy mode without
+/// provider configuration would let a committed rotation withdraw signers
+/// from the desired policy that nothing can publish -- the periodic
+/// reconciler also refuses to start without configuration -- so the
+/// rotation must fail closed before anything commits (PR #187 review).
+/// Mirrors [`confirm_keyring_kbs_publication`]'s fail-closed gap check,
+/// but pre-commit, so the caller reports a clean retryable error instead
+/// of a committed-but-unpublishable mutation.
+pub async fn ensure_kbs_publication_configured(
+    state: &crate::state::AppState,
+) -> Result<(), KbsPolicyReconciliationError> {
+    if !signed_policy_mode_active(&state.db).await? {
+        return Ok(());
+    }
+    if state.kbs_policy.is_none() {
+        return Err(KbsPolicyError::NotConfigured.into());
+    }
+    Ok(())
 }
 
 /// Converge KBS authority before readiness or deployment dispatch.
@@ -3039,11 +3065,9 @@ resource_bindings := {
         pool: &PgPool,
         org_id: Uuid,
         app_id: Uuid,
-        subject: &str,
-        issuer: &str,
+        (subject, issuer): (&str, &str),
         measurement: &[u8],
         descriptor_hash: &[u8],
-        signer_hex: &str,
         created_at: chrono::DateTime<Utc>,
     ) -> crate::signing_service::SignedPolicyArtifact {
         let deploy_id = Uuid::new_v4();
@@ -3062,7 +3086,6 @@ resource_bindings := {
         artifact.metadata.app_id = app_id.to_string();
         artifact.metadata.deploy_id = deploy_id.to_string();
         artifact.metadata.descriptor_core_hash = hex::encode(descriptor_hash);
-        artifact.metadata.descriptor_signing_pubkey = signer_hex.repeat(32);
         let measurement_hex = hex::encode(measurement);
         let descriptor_payload = serde_json::json!({
             "image_ref": format!("ghcr.io/acme/workload@sha256:{measurement_hex}"),
@@ -3869,6 +3892,81 @@ resource_bindings := {
         crate::test_support::drop_isolated_database("cap130_selector_fail_closed", pool).await;
     }
 
+    /// PR #187 review: an owner-signed keyring may carry two distinct members
+    /// with the same public key. `current_keyring_members` yields one row per
+    /// member, and the legacy branch joined artifacts per member row -- the
+    /// same artifact twice, inflating the policy body. The dedupe on
+    /// (org_id, lower(pubkey)) must emit every matching artifact exactly
+    /// once on both the job-backed and the legacy paths.
+    #[tokio::test]
+    async fn selector_emits_each_artifact_once_for_duplicated_member_keys() {
+        let (_db_cleanup, pool) =
+            crate::test_support::isolated_database_test_pool("cap187_dedup_member_keys").await;
+        let now = Utc::now();
+        let signer = "bb".repeat(32);
+
+        // Job-backed path: current operation binds an artifact signed by a
+        // key that two keyring members carry.
+        let (org_id, app_id) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, org_id, 1, &[&signer, &signer]).await;
+        let deployment = Uuid::new_v4();
+        insert_test_deployment(&pool, org_id, app_id, deployment, "healthy", now).await;
+        let artifact = insert_test_artifact(&pool, app_id, deployment, "51").await;
+        insert_test_job(
+            &pool,
+            org_id,
+            app_id,
+            deployment,
+            deployment,
+            Some((deployment, &artifact)),
+        )
+        .await;
+
+        let candidates = load_signed_policy_candidates(&pool, 2)
+            .await
+            .expect("select job-backed candidates with duplicated member keys");
+        let matches = || {
+            candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate.artifact.metadata.descriptor_core_hash
+                        == artifact.metadata.descriptor_core_hash
+                })
+                .count()
+        };
+        // The helper's owner member carries the same key as the deployer.
+        assert_eq!(
+            matches(),
+            1,
+            "the job-backed path must emit the artifact exactly once for duplicated member keys"
+        );
+
+        // Legacy path (pre-0038 deployment without jobs): same duplicated
+        // membership, same single-emission requirement.
+        let (legacy_org, legacy_app) = insert_test_app(&pool, "running").await;
+        insert_test_keyring_version(&pool, legacy_org, 1, &[&signer, &signer]).await;
+        let legacy = Uuid::new_v4();
+        insert_test_deployment(&pool, legacy_org, legacy_app, legacy, "healthy", now).await;
+        let legacy_artifact = insert_test_artifact(&pool, legacy_app, legacy, "52").await;
+
+        let candidates = load_signed_policy_candidates(&pool, 1)
+            .await
+            .expect("select legacy candidates with duplicated member keys");
+        let legacy_matches = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.artifact.metadata.descriptor_core_hash
+                    == legacy_artifact.metadata.descriptor_core_hash
+            })
+            .count();
+        assert_eq!(
+            legacy_matches, 1,
+            "the legacy path must emit the artifact exactly once for duplicated member keys"
+        );
+
+        crate::test_support::drop_isolated_database("cap187_dedup_member_keys", pool).await;
+    }
+
     #[tokio::test]
     async fn selector_drops_artifacts_withdrawn_by_signer_rotation() {
         let (_db_cleanup, pool) =
@@ -3949,16 +4047,21 @@ resource_bindings := {
             &pool,
             org_id,
             app_id,
-            subject,
-            issuer,
+            (subject, issuer),
             &measurement,
             &withdrawn_hash,
-            "bb",
             now,
         )
         .await;
-        insert_measured_legacy_tls_binding(&pool, app_id, subject, issuer, &image_ref, &measurement)
-            .await;
+        insert_measured_legacy_tls_binding(
+            &pool,
+            app_id,
+            subject,
+            issuer,
+            &image_ref,
+            &measurement,
+        )
+        .await;
 
         // Baseline: the live artifact admits the binding (no withdrawal).
         let admitted = load_legacy_tls_bindings(&pool)
@@ -3982,11 +4085,9 @@ resource_bindings := {
             &pool,
             org_id,
             app_id,
-            subject,
-            issuer,
+            (subject, issuer),
             &measurement,
             &fresh_hash,
-            "bb",
             now + chrono::Duration::seconds(1),
         )
         .await;

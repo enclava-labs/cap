@@ -1,7 +1,6 @@
 use super::{
     AppDeleteFailure, CreateAppRequest, EgressAllowlistAuditReason, RotateSignerRequest,
-    SIGNER_POLICY_RECONCILIATION_PENDING_CODE, SignerRotationTokenRequest,
-    WorkloadTeardownDecision, app_delete_failure, create_app,
+    SignerRotationTokenRequest, WorkloadTeardownDecision, app_delete_failure, create_app,
     delete_tenant_namespace_with_timeouts, derive_identity, egress_allowlist_host_audit_reasons,
     issue_signer_rotation_token_route, list_apps, post_workload_teardown,
     request_workload_teardown, requires_workload_teardown, rotate_signer,
@@ -11,6 +10,7 @@ use super::{
 use crate::auth::jwt::SignerRotationTokenInput;
 use crate::auth::middleware::AuthContext;
 use crate::models::{App, AppStatus, Role, UnlockMode};
+use crate::test_support::{KbsPolicyProvider, kbs_policy_kube_client};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{Request, Response, StatusCode};
@@ -901,18 +901,20 @@ async fn read_withdrawal_reconciliation_state(pool: &sqlx::PgPool) -> (i64, i64,
     .expect("read signed policy reconciliation singleton")
 }
 
-/// Issue #119 regression: a rotation token is single-use (its jti is
-/// consumed in the rotation transaction; a replay is refused and the whole
-/// rotation, including the database trigger's withdrawal and owed bump, is
-/// rolled back), and rotation withdraws the rotated-out signer's artifacts
-/// while OWING the policy generation bump instead of performing it -- a
-/// pre-0052 replica reconciling during the rollout must never see a raw
-/// desired_generation bump it could consume with its unfiltered candidate
-/// query.  Signed mode is active without KBS configuration, so both
-/// rotations must also fail closed with the committed-but-pending outcome
-/// instead of success.  Runs against its own per-process database (see
-/// [`crate::test_support::isolated_database_test_pool`]): the trigger
-/// under test writes to the global singleton this test asserts exactly.
+fn test_kbs_policy_config() -> crate::kbs::KbsPolicyConfig {
+    crate::kbs::KbsPolicyConfig {
+        namespace: "kbs-test".to_string(),
+        configmap_name: "resource-policy".to_string(),
+        policy_key: "policy.rego".to_string(),
+        deployment_name: "trustee".to_string(),
+        required: true,
+        signed_policy_retention: 6,
+        signed_policy_max_bytes: 900 * 1024,
+    }
+}
+
+/// Rotating back to the previous identity must not make its consumed token
+/// replayable or let a rejected replay change the published generation.
 #[tokio::test]
 async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump() {
     let (_db_cleanup, pool) =
@@ -954,6 +956,78 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
         management_origin: crate::auth::middleware::ManagementOrigin::Public,
     };
 
+    // PR #187 review: active signed mode without KBS provider configuration
+    // must fail closed BEFORE the rotation commits -- the withdrawal and the
+    // deferred generation bump would otherwise strand the old policy live
+    // with no convergence path (the periodic reconciler also refuses to
+    // start without configuration). The token JTI must stay unconsumed so
+    // the same token can drive the rotation once configuration returns.
+    let unconfigured_token = crate::auth::jwt::issue_signer_rotation_token(
+        &hmac_key,
+        &SignerRotationTokenInput {
+            user_id,
+            org_id,
+            app_id,
+            previous_subject: previous_subject.to_string(),
+            previous_issuer: previous_issuer.to_string(),
+            new_subject: new_subject.to_string(),
+            new_issuer: new_issuer.to_string(),
+        },
+        chrono::Duration::seconds(600),
+    )
+    .expect("issue unconfigured-refusal token");
+    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
+        .bind(app_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load app name");
+    let unconfigured = rotate_signer(
+        clone_auth(&auth),
+        State(state.clone()),
+        Path(app_name.clone()),
+        Json(RotateSignerRequest {
+            subject: new_subject.to_string(),
+            issuer: new_issuer.to_string(),
+            email_confirmation_token: Some(unconfigured_token),
+        }),
+    )
+    .await
+    .expect_err("signed mode without KBS configuration must refuse the rotation");
+    assert_eq!(unconfigured.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(unconfigured.1.0["code"], "kbs_publication_not_configured");
+    let unconfigured_subject: Option<String> =
+        sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("load app subject after unconfigured refusal");
+    assert_eq!(
+        unconfigured_subject.as_deref(),
+        Some(previous_subject),
+        "the unconfigured refusal must not have committed any rotation"
+    );
+    assert_eq!(
+        read_withdrawal_reconciliation_state(&pool).await,
+        (1, 0, 0),
+        "the unconfigured refusal must owe no withdrawal debt"
+    );
+    let jti_rows_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+    )
+    .bind(app_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count consumed jti rows after unconfigured refusal");
+    assert_eq!(
+        jti_rows_before, 0,
+        "the unconfigured refusal must leave the rotation token unconsumed"
+    );
+
+    // Configure the KBS provider: the rotation can now commit and its
+    // withdrawal must publish before success is reported.
+    state.kbs_policy = Some(test_kbs_policy_config());
+    let provider = Arc::new(tokio::sync::Mutex::new(KbsPolicyProvider::new(true)));
+
     let token = crate::auth::jwt::issue_signer_rotation_token(
         &hmac_key,
         &SignerRotationTokenInput {
@@ -969,166 +1043,152 @@ async fn signer_rotation_token_is_single_use_and_owes_a_deferred_withdrawal_bump
     )
     .expect("issue signer rotation token");
 
-    let app_name = sqlx::query_scalar::<_, String>("SELECT name FROM apps WHERE id = $1")
-        .bind(app_id)
-        .fetch_one(&pool)
-        .await
-        .expect("load app name");
-
-    // Signed-policy mode is active and the instance has no KBS provider
-    // configured: the rotation commits (subject, withdrawal, jti) but must
-    // report committed-but-publication-pending, never success.
-    let pending = rotate_signer(
-        clone_auth(&auth),
-        State(state.clone()),
-        Path(app_name.clone()),
-        Json(RotateSignerRequest {
-            subject: new_subject.to_string(),
-            issuer: new_issuer.to_string(),
-            email_confirmation_token: Some(token.clone()),
-        }),
-    )
-    .await
-    .expect_err("signed-mode rotation without KBS config must not report success");
-    assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        pending.1.0["code"],
-        SIGNER_POLICY_RECONCILIATION_PENDING_CODE
-    );
-    let committed_subject: Option<String> =
-        sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
-            .bind(app_id)
-            .fetch_one(&pool)
+    crate::kbs::TEST_KUBE_CLIENT
+        .scope(kbs_policy_kube_client(provider.clone()), async {
+            let Json(rotated) = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: Some(token.clone()),
+                }),
+            )
             .await
-            .expect("load app subject after committed rotation");
-    assert_eq!(committed_subject.as_deref(), Some(new_subject));
+            .expect("first rotation succeeds");
+            assert_eq!(
+                rotated.signer_identity_subject.as_deref(),
+                Some(new_subject)
+            );
 
-    // The rotated-out artifact is withdrawn from KBS policy.
-    let withdrawn: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM withdrawn_signer_artifacts
+            // The rotated-out artifact is withdrawn from KBS policy.
+            let withdrawn: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM withdrawn_signer_artifacts
           WHERE descriptor_core_hash = $1 AND app_id = $2",
-    )
-    .bind(&descriptor_core_hash)
-    .bind(app_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count withdrawn artifacts");
-    assert_eq!(
-        withdrawn, 1,
-        "rotation must withdraw the old-signer artifact"
-    );
-    // The withdrawal generation bump is owed, not performed: the reconciler
-    // publishes it first and commits the increment only after the filtered
-    // ConfigMap replace succeeded (migration 0052).
-    assert_eq!(
-        read_withdrawal_reconciliation_state(&pool).await,
-        (1, 0, 1),
-        "rotation must owe the withdrawal bump, not perform it"
-    );
-    // The consumed jti ledger row is committed with the rotation.
-    let jti_rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
-    )
-    .bind(app_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count consumed jti rows");
-    assert_eq!(jti_rows, 1, "rotation must record the consumed jti");
-
-    // Rotate back so the original token's claims (previous=old, new=new)
-    // match again, then replay it: the jti was consumed, so the replay
-    // must be refused and the whole transaction -- including the trigger's
-    // withdrawal and owed bump -- rolled back.
-    let rotate_back_token = crate::auth::jwt::issue_signer_rotation_token(
-        &hmac_key,
-        &SignerRotationTokenInput {
-            user_id,
-            org_id,
-            app_id,
-            previous_subject: new_subject.to_string(),
-            previous_issuer: new_issuer.to_string(),
-            new_subject: previous_subject.to_string(),
-            new_issuer: previous_issuer.to_string(),
-        },
-        chrono::Duration::seconds(600),
-    )
-    .expect("issue rotate-back token");
-    let pending_back = rotate_signer(
-        clone_auth(&auth),
-        State(state.clone()),
-        Path(app_name.clone()),
-        Json(RotateSignerRequest {
-            subject: previous_subject.to_string(),
-            issuer: previous_issuer.to_string(),
-            email_confirmation_token: Some(rotate_back_token),
-        }),
-    )
-    .await
-    .expect_err("rotate back must commit and report publication pending");
-    assert_eq!(pending_back.0, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        pending_back.1.0["code"],
-        SIGNER_POLICY_RECONCILIATION_PENDING_CODE
-    );
-
-    // Every rotation owes one bump -- even when the artifact was already
-    // withdrawn -- and the debt stays unconsumed until the reconciler
-    // publishes.
-    assert_eq!(
-        read_withdrawal_reconciliation_state(&pool).await,
-        (1, 0, 2),
-        "rotating an already-withdrawn artifact must still owe a bump"
-    );
-
-    let replay = rotate_signer(
-        clone_auth(&auth),
-        State(state.clone()),
-        Path(app_name),
-        Json(RotateSignerRequest {
-            subject: new_subject.to_string(),
-            issuer: new_issuer.to_string(),
-            email_confirmation_token: Some(token),
-        }),
-    )
-    .await;
-    let err = match replay {
-        Ok(_) => panic!("consumed signer rotation token was replayable"),
-        Err(err) => err,
-    };
-    assert_eq!(err.0, StatusCode::FORBIDDEN);
-    // The rejected replay must not have committed any part of the rotation.
-    let replayed_subject: Option<String> =
-        sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+            )
+            .bind(&descriptor_core_hash)
             .bind(app_id)
             .fetch_one(&pool)
             .await
-            .expect("load app subject after rejected replay");
-    assert_eq!(
-        replayed_subject.as_deref(),
-        Some(previous_subject),
-        "rejected replay must roll back the signer update"
-    );
-    assert_eq!(
-        read_withdrawal_reconciliation_state(&pool).await,
-        (1, 0, 2),
-        "rejected replay must roll back the owed withdrawal bump"
-    );
-    let jti_rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
-    )
-    .bind(app_id)
-    .fetch_one(&pool)
-    .await
-    .expect("count consumed jti rows after replay");
-    assert_eq!(jti_rows, 2, "the rejected replay must not add a jti row");
+            .expect("count withdrawn artifacts");
+            assert_eq!(
+                withdrawn, 1,
+                "rotation must withdraw the old-signer artifact"
+            );
+            // The owed withdrawal bump is consumed only by the fenced reconciler
+            // AFTER the filtered ConfigMap replace succeeded (migration 0052): the
+            // route reports success only once the generation is live, so the debt
+            // is settled, never performed inside the rotation transaction.
+            assert_eq!(
+                read_withdrawal_reconciliation_state(&pool).await,
+                (2, 0, 0),
+                "success must mean the owed withdrawal bump was published and consumed"
+            );
+            {
+                let provider = provider.lock().await;
+                assert_eq!(
+                    provider.published_generation(),
+                    Some(2),
+                    "the withdrawal generation must be live in the ConfigMap before success"
+                );
+            }
+            // The consumed jti ledger row is committed with the rotation.
+            let jti_rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count consumed jti rows");
+            assert_eq!(jti_rows, 1, "rotation must record the consumed jti");
 
-    crate::test_support::drop_isolated_database("cap119_rotation_single_use", pool).await;
+            // Rotate back so the original token's claims (previous=old, new=new)
+            // match again, then replay it: the jti was consumed, so the replay
+            // must be refused and the whole transaction -- including the trigger's
+            // withdrawal and owed bump -- rolled back.
+            let rotate_back_token = crate::auth::jwt::issue_signer_rotation_token(
+                &hmac_key,
+                &SignerRotationTokenInput {
+                    user_id,
+                    org_id,
+                    app_id,
+                    previous_subject: new_subject.to_string(),
+                    previous_issuer: new_issuer.to_string(),
+                    new_subject: previous_subject.to_string(),
+                    new_issuer: previous_issuer.to_string(),
+                },
+                chrono::Duration::seconds(600),
+            )
+            .expect("issue rotate-back token");
+            let Json(_) = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name.clone()),
+                Json(RotateSignerRequest {
+                    subject: previous_subject.to_string(),
+                    issuer: previous_issuer.to_string(),
+                    email_confirmation_token: Some(rotate_back_token),
+                }),
+            )
+            .await
+            .expect("rotate back succeeds");
+            // Every rotation owes one bump -- even when the artifact was already
+            // withdrawn -- and success means the reconciler published and consumed
+            // it (generation advances again).
+            assert_eq!(
+                read_withdrawal_reconciliation_state(&pool).await,
+                (3, 0, 0),
+                "rotating an already-withdrawn artifact must publish and consume another bump"
+            );
+
+            let replay = rotate_signer(
+                clone_auth(&auth),
+                State(state.clone()),
+                Path(app_name),
+                Json(RotateSignerRequest {
+                    subject: new_subject.to_string(),
+                    issuer: new_issuer.to_string(),
+                    email_confirmation_token: Some(token),
+                }),
+            )
+            .await;
+            let err = match replay {
+                Ok(_) => panic!("consumed signer rotation token was replayable"),
+                Err(err) => err,
+            };
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            // The rejected replay must not have committed any part of the rotation.
+            let replayed_subject: Option<String> =
+                sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
+                    .bind(app_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("load app subject after rejected replay");
+            assert_eq!(
+                replayed_subject.as_deref(),
+                Some(previous_subject),
+                "rejected replay must roll back the signer update"
+            );
+            assert_eq!(
+                read_withdrawal_reconciliation_state(&pool).await,
+                (3, 0, 0),
+                "rejected replay must leave the published generation untouched"
+            );
+            let jti_rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM consumed_signer_rotation_tokens WHERE app_id = $1",
+            )
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count consumed jti rows after replay");
+            assert_eq!(jti_rows, 2, "the rejected replay must not add a jti row");
+
+            crate::test_support::drop_isolated_database("cap119_rotation_single_use", pool).await;
+        })
+        .await;
 }
 
-/// A first-time signer set behaves like a rotation at the publication
-/// boundary: with signed-policy mode active and no KBS provider configured,
-/// the identity commits but the route must fail closed with the
-/// committed-but-pending outcome instead of success.
 #[tokio::test]
 async fn initial_signer_set_in_signed_mode_without_kbs_config_fails_closed() {
     let (_db_cleanup, pool) =
@@ -1174,17 +1234,14 @@ async fn initial_signer_set_in_signed_mode_without_kbs_config_fails_closed() {
     .await
     .expect_err("initial set in signed mode without KBS config must not report success");
     assert_eq!(pending.0, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        pending.1.0["code"],
-        SIGNER_POLICY_RECONCILIATION_PENDING_CODE
-    );
+    assert_eq!(pending.1.0["code"], "kbs_publication_not_configured");
     let committed_subject: Option<String> =
         sqlx::query_scalar("SELECT signer_identity_subject FROM apps WHERE id = $1")
             .bind(app_id)
             .fetch_one(&pool)
             .await
-            .expect("load app subject after committed initial set");
-    assert_eq!(committed_subject.as_deref(), Some(new_subject));
+            .expect("load app subject after rejected initial set");
+    assert!(committed_subject.is_none());
     let set_audits: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM audit_log WHERE org_id = $1 AND action = 'app.signer.set'",
     )
@@ -1192,7 +1249,7 @@ async fn initial_signer_set_in_signed_mode_without_kbs_config_fails_closed() {
     .fetch_one(&pool)
     .await
     .expect("count initial set audits");
-    assert_eq!(set_audits, 1);
+    assert_eq!(set_audits, 0);
 
     crate::test_support::drop_isolated_database("cap119_initial_set_pending", pool).await;
 }
