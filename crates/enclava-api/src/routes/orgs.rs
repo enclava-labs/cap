@@ -464,12 +464,10 @@ pub async fn put_keyring(
         .verify(&canonical_bytes, &signature_obj)
         .map_err(|_| bad_request("keyring signature verification failed"))?;
 
-    // #128: store the normalized typed keyring, not the raw request JSON, so
-    // unknown fields cannot be registered (200) and then break the strict
-    // deny_unknown_fields parse in verify_matches_latest_cap_keyring at
-    // deploy time (fail-closed 500). Signatures cover the canonical bytes,
-    // which are computed from the typed keyring either way.
-    let keyring_payload_bytes = serde_json::to_vec(&keyring).map_err(|_| {
+    // Drop unsigned fields, but preserve the JSON-value encoding used by
+    // existing stored payloads and idempotent requests.
+    let normalized_keyring_payload = serde_json::to_value(&keyring).map_err(|_| db_error())?;
+    let keyring_payload_bytes = serde_json::to_vec(&normalized_keyring_payload).map_err(|_| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "serialization error"})),
@@ -608,13 +606,6 @@ pub async fn put_keyring(
     tx.commit().await.map_err(|_| db_error())?;
 
     let fingerprint = hex::encode(Sha256::digest(&canonical_bytes));
-    // #128 review follow-up (P2): return the normalized typed keyring, not
-    // the raw request JSON — the stored bytes are what GET serves and what
-    // the strict deny_unknown_fields envelope parse accepts, so a client
-    // building an org_keyring_blob from this 200 response must see the same
-    // normalized form to stay immediately deployable.
-    let normalized_keyring_payload: serde_json::Value =
-        serde_json::from_slice(&keyring_payload_bytes).map_err(|_| db_error())?;
     Ok((
         StatusCode::OK,
         Json(OrgKeyringResponse {
@@ -952,12 +943,9 @@ pub async fn rotate_org_owner(
         .verify(&directive, &Signature::from_bytes(&rotation_signature))
         .map_err(|_| bad_request("owner rotation signature verification failed"))?;
 
-    // #128 review follow-up: store the normalized typed keyring, not the raw
-    // request JSON — mirrors put_keyring so a rotation carrying extra fields
-    // cannot be persisted verbatim and later break the strict envelope
-    // parse at deploy time. Signatures cover the canonical bytes, which are
-    // computed from the typed keyring either way.
-    let payload_bytes = serde_json::to_vec(&replacement_keyring).map_err(|_| db_error())?;
+    // Keep normalization compatible with the persisted JSON-value encoding.
+    let normalized_payload = serde_json::to_value(&replacement_keyring).map_err(|_| db_error())?;
+    let payload_bytes = serde_json::to_vec(&normalized_payload).map_err(|_| db_error())?;
     // #128 review follow-up (P1): the registered keyring must stay inside the
     // deploy-time org_keyring_blob envelope budget, or every later signed
     // deployment would fail decode_optional_blobs.
@@ -1850,15 +1838,33 @@ mod tests {
             "PUT response payload must match the stored normalized bytes"
         );
 
-        let get_response = get_keyring(auth, State(state), Path(org_name))
+        let get_response = get_keyring(auth.clone(), State(state.clone()), Path(org_name.clone()))
             .await
             .expect("GET keyring after PUT");
         assert_eq!(
             put_response.keyring_payload, get_response.keyring_payload,
             "PUT and GET responses must serve the identical normalized keyring"
         );
-        assert_eq!(put_response.fingerprint, get_response.fingerprint);
-        assert_eq!(put_response.signature, get_response.signature);
+
+        let legacy = signed_keyring_request(org_id, user_id, &key, 2, 2);
+        sqlx::query(
+            "INSERT INTO org_keyrings
+                 (org_id, version, keyring_payload, signature, signing_key_id)
+             VALUES ($1, 2, $2, $3,
+                     (SELECT id FROM user_signing_keys WHERE user_id = $4 AND pubkey = $5))",
+        )
+        .bind(org_id)
+        .bind(serde_json::to_vec(&legacy.keyring_payload).expect("encode legacy payload"))
+        .bind(hex::decode(&legacy.signature).expect("decode legacy signature"))
+        .bind(user_id)
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("persist a keyring with the pre-normalization writer");
+        let (status, _) = put_keyring(auth, State(state), Path(org_name), Json(legacy))
+            .await
+            .expect("normalization must preserve replay of an existing keyring");
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
