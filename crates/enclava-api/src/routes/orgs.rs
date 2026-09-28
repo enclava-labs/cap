@@ -426,6 +426,21 @@ async fn active_membership(
 
 /// The keyring is already committed, so publication failure must remain
 /// retryable without repeating the mutation.
+/// The committed-pending publication error shared by the keyring routes:
+/// 503 with a stable machine-readable code so PaaS callers retry the same
+/// idempotency key instead of treating the committed change as rolled back.
+pub(crate) fn keyring_publication_pending_error(
+    _route: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "keyring committed; KBS policy reconciliation pending",
+            "code": "keyring_policy_reconciliation_pending",
+        })),
+    )
+}
+
 async fn confirm_keyring_kbs_publication(
     state: &AppState,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
