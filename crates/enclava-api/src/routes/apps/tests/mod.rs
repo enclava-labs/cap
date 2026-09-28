@@ -509,6 +509,72 @@ async fn completed_workload_teardown_skips_unreachable_retry() {
     assert!(!diagnostics.contains("app_delete_teardown_unavailable"));
 }
 
+#[tokio::test]
+async fn deletion_retry_preserves_teardown_requirement_before_policy_revocation() {
+    let (_cleanup, pool) =
+        crate::test_support::isolated_database_test_pool("cap_delete_teardown_retry").await;
+    let (org_id, user_id, app_id) = insert_signer_rotation_app(&pool, None, None).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (attempts_tx, mut attempts_rx) = tokio::sync::mpsc::channel(2);
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            attempts_tx.send(()).await.unwrap();
+            drop(stream);
+        }
+    });
+    let app_name: String =
+        sqlx::query_scalar("UPDATE apps SET tee_domain = $2 WHERE id = $1 RETURNING name")
+            .bind(app_id)
+            .bind(address.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "UPDATE kbs_signed_policy_reconciliation SET desired_generation = 1 WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let policy_before = read_withdrawal_reconciliation_state(&pool).await;
+    let mut state = unreachable_tee_state();
+    state.db = pool.clone();
+    let mut auth = crate::test_support::auth_context(Role::Owner, &["apps:write"]);
+    auth.org_id = org_id;
+    auth.user_id = user_id;
+
+    for _ in 0..2 {
+        let (status, Json(body)) = tokio::time::timeout(
+            Duration::from_secs(3),
+            super::delete_app(auth.clone(), State(state.clone()), Path(app_name.clone())),
+        )
+        .await
+        .expect("deletion must release its lanes after teardown fails")
+        .expect_err("an unavailable TEE must block both deletion attempts");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"], "app_delete_teardown_unavailable");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), attempts_rx.recv())
+                .await
+                .expect("each deletion attempt must contact the TEE"),
+            Some(())
+        );
+        let app_status: String = sqlx::query_scalar("SELECT status::text FROM apps WHERE id = $1")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(app_status, "deleting");
+        assert_eq!(
+            read_withdrawal_reconciliation_state(&pool).await,
+            policy_before,
+            "failed confidential teardown must not revoke the workload's KBS authority"
+        );
+    }
+    server.await.unwrap();
+}
+
 #[test]
 fn locked_running_workload_teardown_blocks_deletion_and_diagnostics_are_bounded() {
     const SECRET: &str = "upstream-locked-body-sentinel";
