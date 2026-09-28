@@ -62,8 +62,15 @@ pub enum KbsPolicyError {
     },
     #[error("signed KBS policy generation metadata is invalid")]
     InvalidPolicyGeneration,
-    #[error("signed KBS policy generation has conflicting content")]
-    PolicyGenerationConflict,
+    #[error(
+        "signed KBS policy generation has conflicting content: existing generation {existing_generation:?} annotates {existing_hash:?}, desired generation {desired_generation} hashes {desired_hash}"
+    )]
+    PolicyGenerationConflict {
+        existing_generation: Option<i64>,
+        existing_hash: Option<String>,
+        desired_generation: i64,
+        desired_hash: String,
+    },
     #[error("signed KBS policy artifact is not current deployment authority")]
     ArtifactNotCurrent,
     #[error("signed KBS policy compare-and-swap retries were exhausted")]
@@ -1003,7 +1010,12 @@ fn generation_decision(
         return if allow_generation_reset {
             Ok(GenerationDecision::Replace)
         } else {
-            Err(KbsPolicyError::PolicyGenerationConflict)
+            Err(KbsPolicyError::PolicyGenerationConflict {
+                existing_generation: Some(existing_generation),
+                existing_hash: Some(annotated_hash.to_string()),
+                desired_generation,
+                desired_hash: desired_hash.to_string(),
+            })
         };
     }
     // The generation annotation is content-bound. If a stale legacy writer
@@ -1299,7 +1311,12 @@ async fn wait_for_deployment_policy_generation(
             return Ok(GenerationDecision::Superseded);
         }
         if decision != GenerationDecision::Current {
-            return Err(KbsPolicyError::PolicyGenerationConflict);
+            return Err(KbsPolicyError::PolicyGenerationConflict {
+                existing_generation: annotated.map(|(generation, _)| generation),
+                existing_hash: annotated.map(|(_, policy_hash)| policy_hash.to_string()),
+                desired_generation,
+                desired_hash: desired_hash.to_string(),
+            });
         }
 
         let spec_replicas = deployment
@@ -1891,10 +1908,30 @@ mod tests {
 
     #[test]
     fn reconciliation_error_display_preserves_typed_cause() {
-        let policy = KbsPolicyReconciliationError::from(KbsPolicyError::PolicyGenerationConflict);
-        assert_eq!(
-            policy.to_string(),
-            "KBS policy reconciliation failed: signed KBS policy generation has conflicting content"
+        let policy = KbsPolicyReconciliationError::from(KbsPolicyError::PolicyGenerationConflict {
+            existing_generation: Some(7),
+            existing_hash: Some("bb".repeat(32)),
+            desired_generation: 7,
+            desired_hash: "aa".repeat(32),
+        });
+        let message = policy.to_string();
+        assert!(
+            message.starts_with(
+                "KBS policy reconciliation failed: signed KBS policy generation has conflicting content"
+            ),
+            "conflict Display keeps its stable prefix: {message}"
+        );
+        assert!(
+            message.contains("desired generation 7"),
+            "conflict Display names the generation: {message}"
+        );
+        assert!(
+            message.contains(&"b".repeat(32)),
+            "conflict Display names the annotated hash: {message}"
+        );
+        assert!(
+            message.contains(&"a".repeat(32)),
+            "conflict Display names the desired hash: {message}"
         );
 
         let mutation =
@@ -2538,16 +2575,31 @@ resource_bindings := {
             GenerationDecision::Replace,
             "reset bootstrap replaces an equal generation from a retired database"
         );
+        let conflict = generation_decision(
+            Some((3, &"bb".repeat(32))),
+            Some(&"bb".repeat(32)),
+            3,
+            &"aa".repeat(32),
+            false,
+        )
+        .unwrap_err();
         assert!(matches!(
-            generation_decision(
-                Some((3, &"bb".repeat(32))),
-                Some(&"bb".repeat(32)),
-                3,
-                &"aa".repeat(32),
-                false,
-            ),
-            Err(KbsPolicyError::PolicyGenerationConflict)
+            conflict,
+            KbsPolicyError::PolicyGenerationConflict { .. }
         ));
+        let message = conflict.to_string();
+        assert!(
+            message.contains("Some(3)"),
+            "conflict names the existing generation: {message}"
+        );
+        assert!(
+            message.contains(&"b".repeat(32)),
+            "conflict names the annotated hash: {message}"
+        );
+        assert!(
+            message.contains(&"a".repeat(32)),
+            "conflict names the desired hash: {message}"
+        );
         assert_eq!(
             generation_decision(
                 Some((3, &"aa".repeat(32))),
