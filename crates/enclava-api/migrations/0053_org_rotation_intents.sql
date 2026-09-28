@@ -1,15 +1,13 @@
 -- Durable presentation record for owner-rotation attempts (PR #185 review).
 -- Before any signing-service rotate-owner effect can happen, CAP records the
 -- exact (directive digest, keyring payload digest) pair presented for a
--- new-version rotation in its own committed transaction. If the upstream
--- rotation succeeds but the CAP transaction rolls back, the signing service
--- is pinned to the replacement while no keyring version or ledger row
--- exists; the first-use signed_at max-age waiver for retrying that exact
--- request past the window is granted only when this row matches the retry
--- byte-for-byte (directive AND keyring body) -- a different directive or a
--- different keyring payload over the same (current -> replacement) pair
--- gets no waiver, so a captured directive cannot mint a version in the
--- drift state. Rows are presentation records, never purged.
+-- new-version rotation in its own committed transaction. This row is proof
+-- of presentation only: it grants nothing. In particular the expired
+-- first-use signed_at max-age waiver is NOT granted by an intent row (an
+-- earlier design did that and let a captured, never-actioned presentation
+-- mint a version); since 0059_org_rotation_upstream_receipts that waiver
+-- requires a receipt minted from a response-validated rotate-owner call and
+-- matched against the live upstream owner. Rows are never purged.
 CREATE TABLE org_rotation_intents (
     org_id           uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     directive_sha256 bytea NOT NULL CHECK (octet_length(directive_sha256) = 32),

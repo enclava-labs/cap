@@ -574,40 +574,77 @@ pub async fn put_keyring(
                 ));
             }
             // Fence (PR #185 review, Devin "concurrent upload leaves owner
-            // authority drifted"): rotate_org_owner pins the replacement in
-            // the signing service before it writes the successor keyring
-            // version, and the signing-authority lane is released between
-            // those steps. An old-owner upload arriving in that window sees
-            // the previous owner as the pinned owner and could claim the
-            // successor version, after which the rotation's final phase
-            // conflicts and the service and keyring stay pinned to different
-            // owners. While the signing service's owner disagrees with the
-            // current pinned owner, the successor version belongs to the
-            // in-flight (or pending-recovery) rotation: new versions are
-            // refused here. Same-version replays above bypass this fence --
-            // they claim nothing. When the signing service is not configured
-            // or not readable, there is no upstream authority to diverge
-            // from and the check is skipped.
-            if let Some(signing_service) = state.signing_service.as_ref()
-                && let Ok(status) = signing_service.owner_status(org_id).await
-            {
-                let service_owner = status
-                    .owner_pubkey_hex
-                    .as_deref()
-                    .and_then(|raw| hex::decode(raw).ok());
-                let status_matches = status.org_id == org_id && status.state == "ready";
-                if status_matches
-                    && service_owner
-                        .as_deref()
-                        .is_some_and(|owner| owner != latest_signing_pubkey.as_slice())
-                {
+            // authority drifted", hardened to fail closed per self-check):
+            // rotate_org_owner pins the replacement in the signing service
+            // before it writes the successor keyring version, and the
+            // signing-authority lane is released between those phases. An
+            // old-owner upload arriving in that window sees the previous
+            // owner as the pinned owner and could claim the successor
+            // version, after which the rotation's final phase conflicts and
+            // the service and keyring stay pinned to different owners. While
+            // the signing service's owner disagrees with the current pinned
+            // owner, the successor version belongs to the in-flight (or
+            // pending-recovery) rotation and new versions are refused (409).
+            // The check must fail closed: an unreadable owner status is not
+            // evidence of agreement, so with a signing service configured the
+            // insert is refused (503) unless the status affirmatively shows
+            // the same owner -- the one exception being a successful status
+            // in a non-"ready" state, where the service pins no owner at all
+            // and there is nothing to diverge from. Same-version replays
+            // above bypass this fence -- they claim nothing. The read is
+            // bounded (5s) so holding the lane cannot stretch the inter-phase
+            // window this fence closes.
+            if let Some(signing_service) = state.signing_service.as_ref() {
+                let status = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    signing_service.owner_status(org_id),
+                )
+                .await
+                .map_err(|_| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "signing_service_unavailable" })),
+                    )
+                })?
+                .map_err(|_| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "signing_service_unavailable" })),
+                    )
+                })?;
+                if status.org_id != org_id {
                     return Err((
-                        StatusCode::CONFLICT,
-                        Json(serde_json::json!({
-                            "error": "signing service owner does not match the current pinned owner (owner rotation in progress)"
-                        })),
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({ "error": "signing_authority_status_invalid" })),
                     ));
                 }
+                if status.state == "ready" {
+                    let service_owner: Option<Vec<u8>> = status
+                        .owner_pubkey_hex
+                        .as_deref()
+                        .and_then(|raw| hex::decode(raw).ok());
+                    match service_owner {
+                        Some(owner) if owner == latest_signing_pubkey => {}
+                        Some(_) => {
+                            return Err((
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({
+                                    "error": "signing service owner does not match the current pinned owner (owner rotation in progress)"
+                                })),
+                            ));
+                        }
+                        None => {
+                            return Err((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "error": "signing_authority_status_invalid"
+                                })),
+                            ));
+                        }
+                    }
+                }
+                // Successful non-"ready" status: the service pins no owner,
+                // so there is nothing to diverge from -- skip the fence.
             }
             let latest_signing_pubkey: [u8; 32] = latest_signing_pubkey
                 .as_slice()
@@ -4828,6 +4865,43 @@ mod tests {
             counts_after_fence,
             (1, 1),
             "the fenced upload must not mutate keyring or audit authority"
+        );
+
+        // Fail closed (self-check P1): an unreadable owner status is not
+        // evidence of agreement. With a signing service configured but
+        // unreachable, the successor insert must be refused with 503 and
+        // still write nothing -- this is the exact inter-phase window where
+        // the race re-opened in the fail-open variant of this fence.
+        state.signing_service = Some(
+            crate::signing_service::SigningServiceClient::new(
+                "http://127.0.0.1:1".to_string(),
+                None,
+            )
+            .expect("build unreachable mock signing service client"),
+        );
+        let closed = put_keyring(
+            auth.clone(),
+            State(state.clone()),
+            Path(org_name.clone()),
+            Json(signed_keyring_request(org_id, user_id, &current_key, 2, 2)),
+        )
+        .await
+        .expect_err("an unreadable owner status must not clear the successor insert");
+        assert_eq!(closed.0, StatusCode::SERVICE_UNAVAILABLE);
+        let counts_after_closed: (i64, i64) = sqlx::query_as(
+            "SELECT
+                 (SELECT count(*) FROM org_keyrings WHERE org_id = $1),
+                 (SELECT count(*) FROM audit_log
+                   WHERE org_id = $1 AND action = 'org.keyring.put')",
+        )
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows after fail-closed upload");
+        assert_eq!(
+            counts_after_closed,
+            (1, 1),
+            "the fail-closed upload must not mutate keyring or audit authority"
         );
 
         // Positive control: once the service owner and the pinned owner
