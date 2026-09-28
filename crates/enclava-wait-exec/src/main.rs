@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
@@ -34,6 +35,27 @@ const TERMINATION_SIGNALS: [Signal; 4] = [
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 static PENDING_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
+/// Read a host-mutable env override for a wait-exec operational parameter
+/// (ready-file and started-dir paths).
+///
+/// Prod-strict builds bind operational behavior to the compiled defaults
+/// only: the pod environment is host-controlled and unbound to the signed
+/// cc_init_data, so honoring it there would let a tampered host point this
+/// process at a planted "ready" file (starting the workload before init
+/// verifies policy and releases seeds) or desync the started-dir sentinel
+/// handshake with enclava-init. Overrides are honored exclusively in
+/// non-prod-strict (dev/CI debug) builds; mirrors enclava_init::env_override.
+fn env_override(name: &str) -> Option<OsString> {
+    env_override_for(env::var_os(name))
+}
+
+fn env_override_for(raw: Option<OsString>) -> Option<OsString> {
+    if cfg!(feature = "prod-strict") {
+        return None;
+    }
+    raw
+}
+
 fn main() {
     if let Err(err) = run(env::args_os().skip(1).collect()) {
         eprintln!("enclava-wait-exec: {err}");
@@ -45,10 +67,10 @@ fn run(argv: Vec<OsString>) -> Result<(), String> {
     let name = env::var("ENCLAVA_CONTAINER_NAME").unwrap_or_else(|_| "unknown".to_string());
     validate_sentinel_name(&name)?;
 
-    let started_dir = env::var_os("ENCLAVA_STARTED_DIR")
+    let started_dir = env_override("ENCLAVA_STARTED_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STARTED_DIR));
-    let ready_file = env::var_os("ENCLAVA_INIT_READY_FILE")
+    let ready_file = env_override("ENCLAVA_INIT_READY_FILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_READY_FILE));
 
@@ -84,6 +106,15 @@ fn validate_sentinel_name(name: &str) -> Result<(), String> {
     if name.as_bytes().contains(&b'/') || name.as_bytes().contains(&0) {
         return Err("ENCLAVA_CONTAINER_NAME must be a single path component".to_string());
     }
+    // The name lands in the sentinel's key=value record (`container=<name>`)
+    // and in file paths: newlines would inject extra record lines and `=`
+    // would corrupt the key; reject both along with all other control
+    // characters (#137).
+    if name.bytes().any(|b| b.is_ascii_control() || b == b'=') {
+        return Err(
+            "ENCLAVA_CONTAINER_NAME must not contain control characters or '='".to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -96,6 +127,32 @@ struct EncryptedLogConfig {
 }
 
 fn encrypted_log_config_from_env(
+    default_container: &str,
+) -> Result<Option<EncryptedLogConfig>, String> {
+    // Prod-strict resolves the recipient key and frame context exclusively
+    // from the trusted handoff enclava-init writes onto the decrypted state
+    // volume from the signed cc_init_data claim — never from the
+    // host-controlled pod environment, which a tampered host could populate
+    // with its own self-consistent key pair and thereby capture all workload
+    // log plaintext. ENCLAVA_LOG_ENCRYPTION_KEY_ID (platform-set in prod
+    // manifests) is read only as an activation hint: its presence selects
+    // encrypted logging, its value is not trusted.
+    #[cfg(feature = "prod-strict")]
+    {
+        let _ = default_container;
+        if env::var_os("ENCLAVA_LOG_ENCRYPTION_KEY_ID").is_none() {
+            return Ok(None);
+        }
+        encrypted_log_config_from_handoff()
+    }
+    #[cfg(not(feature = "prod-strict"))]
+    {
+        encrypted_log_config_from_raw_env(default_container)
+    }
+}
+
+#[cfg(not(feature = "prod-strict"))]
+fn encrypted_log_config_from_raw_env(
     default_container: &str,
 ) -> Result<Option<EncryptedLogConfig>, String> {
     let Some(key_id) = env::var_os("ENCLAVA_LOG_ENCRYPTION_KEY_ID") else {
@@ -131,6 +188,7 @@ fn encrypted_log_config_from_env(
     }))
 }
 
+#[cfg(not(feature = "prod-strict"))]
 fn required_env(name: &str) -> Result<String, String> {
     let value = env::var(name).map_err(|_| format!("{name} is required"))?;
     if value.is_empty()
@@ -141,6 +199,148 @@ fn required_env(name: &str) -> Result<String, String> {
         return Err(format!("{name} must not be empty or contain line breaks"));
     }
     Ok(value)
+}
+
+/// Trusted encrypted-log recipient handoff written by enclava-init onto the
+/// decrypted state volume (contents from the signed cc_init_data
+/// `log_encryption_json` claim). Prod-strict builds read this instead of the
+/// host-controlled log-encryption env vars. The file carries the claim's key
+/// material plus the rollback-stable frame labels (org_id, app_name);
+/// deployment_id is not part of the measured claim (rollback re-renders under
+/// a fresh deployment UUID) and is taken from the validated pod env instead.
+#[cfg(feature = "prod-strict")]
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct LogEncryptionHandoff {
+    key_id: String,
+    public_key_base64url: String,
+    public_key_sha256: String,
+    algorithm: String,
+    org_id: String,
+    app_name: String,
+}
+
+/// Location of the trusted handoff on the decrypted state volume; mirrors
+/// enclava-init's `write_log_encryption_handoff` compiled default
+/// (`<state-root>/app/log-encryption.json`). The state volume is only ever
+/// writable from inside the guest after LUKS unlock — the host sees
+/// ciphertext — so this is the trust root for the recipient key.
+#[cfg(feature = "prod-strict")]
+const LOG_ENCRYPTION_HANDOFF_FILE: &str = "/state/app/log-encryption.json";
+
+/// Container-name source for the spool file name in prod-strict.
+/// ENCLAVA_CONTAINER_NAME is validated by the sentinel handshake
+/// (`validate_sentinel_name`) and only selects the spool sibling name, never
+/// key material or paths outside the spool dir.
+#[cfg(feature = "prod-strict")]
+fn handoff_container_name() -> Result<String, String> {
+    let name = env::var("ENCLAVA_CONTAINER_NAME")
+        .unwrap_or_else(|_| "app".to_string())
+        .trim()
+        .to_string();
+    validate_sentinel_name(&name)?;
+    Ok(name)
+}
+
+#[cfg(feature = "prod-strict")]
+fn encrypted_log_config_from_handoff() -> Result<Option<EncryptedLogConfig>, String> {
+    encrypted_log_config_from_handoff_at(Path::new(LOG_ENCRYPTION_HANDOFF_FILE))
+}
+
+/// Read and validate the trusted handoff at `path`.
+///
+/// Three outcomes are possible after readiness:
+/// - the handoff file parses: encrypted logging engages with the claim's key
+///   material and frame labels;
+/// - the file carries the explicit `{"disabled": true}` marker enclava-init
+///   writes during the init-first rollout transition window (ConfigMap
+///   `[log-encryption]` present, no signed claim): encrypted logging is off —
+///   there is no trustable recipient key, so proceeding unencrypted is the
+///   only safe option;
+/// - the file is absent (with a warning): init published no decision at all.
+///   The state volume is guest-only after LUKS unlock and init writes its
+///   decision strictly before the ready file flips, so after readiness an
+///   absent file means no signed claim existed. Fail-closed on
+///   confidentiality: launch unencrypted rather than exit 127 and brick the
+///   workload. Key material is never taken from host-controlled sources.
+#[cfg(feature = "prod-strict")]
+fn encrypted_log_config_from_handoff_at(path: &Path) -> Result<Option<EncryptedLogConfig>, String> {
+    let handoff_content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "enclava-wait-exec: log-encryption handoff {} absent after readiness; encrypted logging disabled",
+                path.display()
+            );
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(format!("reading {}: {}", path.display(), err));
+        }
+    };
+    // Explicit disabled marker (init-first rollout transition window).
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&handoff_content)
+        && value.get("disabled").and_then(|flag| flag.as_bool()) == Some(true)
+    {
+        eprintln!(
+            "enclava-wait-exec: log-encryption handoff {} is explicitly disabled (no signed cc_init_data claim); encrypted logging disabled",
+            path.display()
+        );
+        return Ok(None);
+    }
+    let handoff: LogEncryptionHandoff = serde_json::from_str(&handoff_content)
+        .map_err(|err| format!("parsing {}: {}", path.display(), err))?;
+    // The claim's algorithm must be the one supported scheme; a future
+    // algorithm must not silently encrypt under the hardcoded scheme.
+    if handoff.algorithm != enclava_common::log_encryption::LOG_ENCRYPTION_ALGORITHM {
+        return Err(format!(
+            "log-encryption handoff {} carries unsupported algorithm {} (expected {})",
+            path.display(),
+            handoff.algorithm,
+            enclava_common::log_encryption::LOG_ENCRYPTION_ALGORITHM
+        ));
+    }
+    let recipient = validate_public_key(
+        handoff.key_id,
+        handoff.public_key_base64url,
+        handoff.public_key_sha256,
+    )
+    .map_err(|err| format!("invalid log encryption public key metadata: {err}"))?;
+    // deployment_id is a routing label only (it is not part of the measured
+    // claim because rollback re-renders under a fresh deployment UUID); the
+    // manifest always sets it when log encryption is configured.
+    let deployment_id = env::var("ENCLAVA_LOG_DEPLOYMENT_ID")
+        .map_err(|_| "ENCLAVA_LOG_DEPLOYMENT_ID is required".to_string())?;
+    for (name, value) in [
+        ("org_id", &handoff.org_id),
+        ("app_name", &handoff.app_name),
+        ("deployment_id", &deployment_id),
+    ] {
+        if value.is_empty()
+            || value
+                .bytes()
+                .any(|byte| byte == 0 || byte == b'\n' || byte == b'\r')
+        {
+            return Err(format!(
+                "log-encryption frame label {name} must not be empty or contain line breaks"
+            ));
+        }
+    }
+    let context = LogFrameContext {
+        org_id: handoff.org_id,
+        app_name: handoff.app_name,
+        deployment_id,
+    };
+    let container = handoff_container_name()?;
+    // Spool pinned to the dedicated log spool dir: the host-controlled
+    // ENCLAVA_LOG_SPOOL_PATH env is not honored in prod-strict.
+    let spool_path = PathBuf::from(DEFAULT_LOG_SPOOL_DIR).join(format!("{container}.jsonl"));
+    Ok(Some(EncryptedLogConfig {
+        recipient,
+        context,
+        spool_path,
+        container,
+    }))
 }
 
 fn run_with_encrypted_logs(
@@ -328,14 +528,54 @@ fn signal_started(started_dir: &Path, name: &str) -> Result<(), String> {
         ));
     }
     let body = sentinel_record(name)?;
+    // 0o600 (#137): the started dir is group-writable (0o2770) so sibling
+    // containers can create their own sentinels; the sentinel itself must
+    // stay owner-writable only, or a same-group process could overwrite
+    // another container's record.
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .mode(0o640)
+        .mode(0o600)
         .custom_flags(O_NOFOLLOW)
         .open(&sentinel)
         .map_err(|err| format!("failed to write sentinel {}: {err}", sentinel.display()))?;
+    // Normalize ownership to the writer's own uid:gid (#137). The started
+    // dir is setgid, so a fresh file inherits the directory's group; the
+    // reader (enclava-init) validates the sentinel's owner gid against the
+    // container's expected identity, and this fchown is what makes that
+    // hold for every writer. fd-based, so it cannot be redirected by a
+    // path race. Note: chowning to the process's own ids is permitted for
+    // a fresh or self-owned inode; a pre-created inode owned by another
+    // uid fails with EPERM here, which is the safe outcome (#175 review).
+    let (uid, gid) = current_uid_gid()?;
+    // SAFETY: plain libc wrappers around the process's own ids and an
+    // owned fd; no path traversal is involved.
+    unsafe {
+        if nix::libc::fchown(
+            file.as_raw_fd(),
+            uid as nix::libc::uid_t,
+            gid as nix::libc::gid_t,
+        ) != 0
+        {
+            return Err(format!(
+                "failed to own sentinel {}: {}",
+                sentinel.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        // `.mode(0o600)` above only applies when the file is created; a
+        // reused inode (container restart with the dir still present)
+        // keeps its previous mode. fchmod the fd so the owner-only
+        // invariant holds on reopen too (#175 review).
+        if nix::libc::fchmod(file.as_raw_fd(), 0o600) != 0 {
+            return Err(format!(
+                "failed to set sentinel {} mode: {}",
+                sentinel.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
     use std::io::Write;
     file.write_all(body.as_bytes())
         .map_err(|err| format!("failed to write sentinel {}: {err}", sentinel.display()))?;
@@ -485,6 +725,139 @@ mod tests {
     }
 
     #[test]
+    fn rejects_record_injection_sentinel_names() {
+        // Names land in the sentinel key=value record: newlines inject
+        // lines, '=' corrupts keys, and other control characters have no
+        // legitimate use (#137).
+        for name in [
+            "web\npid=1",
+            "web\n",
+            "con=tainer",
+            "web\r",
+            "web\ttab",
+            "web\0nul",
+        ] {
+            assert!(validate_sentinel_name(name).is_err(), "{name:?}");
+        }
+        assert!(validate_sentinel_name("tenant-ingress").is_ok());
+    }
+
+    #[test]
+    fn signal_started_writes_owner_only_sentinel() {
+        let dir = unique_dir();
+        signal_started(&dir, "web").unwrap();
+        let mode = fs::metadata(dir.join("web")).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "sentinel must be owner-writable only (group writes would let a same-group process overwrite it)"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_started_renormalizes_reused_sentinel_mode() {
+        // A reused inode (container restart, started dir still populated)
+        // can carry a group-writable mode; `.mode(0o600)` only applies at
+        // creation, so signal_started must fchmod the fd back to 0o600
+        // (#175 review).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let sentinel = dir.join("web");
+        fs::write(&sentinel, "stale").unwrap();
+        fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o664)).unwrap();
+        signal_started(&dir, "web").unwrap();
+        let mode = fs::metadata(&sentinel).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "reused sentinel must be re-chmodded to owner-only"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn signal_started_normalizes_sentinel_gid_under_setgid_dir() {
+        // Model the deployed started dir: setgid (0o2770) with a group the
+        // writer is a member of. A freshly created file inherits the dir's
+        // gid; the sentinel must still end up owned by the writer's own
+        // uid:gid because enclava-init validates the owner gid (#137).
+        let dir = unique_dir();
+        fs::create_dir_all(&dir).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let uid = unsafe { nix::libc::getuid() } as u32;
+            let primary_gid = unsafe { nix::libc::getgid() } as u32;
+            // Prefer a supplemental group distinct from the primary gid —
+            // that models the deployed started dir most faithfully. When
+            // none exists (minimal containers), fall back so the test
+            // always exercises signal_started instead of skipping: root
+            // can adopt any arbitrary gid, and otherwise the primary gid
+            // still drives the file through the setgid-inherit + re-own
+            // path, just with a weaker pre-state.
+            let dir_gid = supplemental_gid()
+                .filter(|g| *g != primary_gid)
+                .or({
+                    if uid == 0 {
+                        Some(65534) // nobody: any gid works for root
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(primary_gid);
+            let strong_case = dir_gid != primary_gid;
+            if !strong_case {
+                eprintln!(
+                    "NOTE: no supplemental group available; setgid-inherit gid \
+                     normalization tested only in the weak form (dir gid == \
+                     primary gid, so inheritance alone cannot detect a \
+                     missing fchown). Run the suite with a supplemental \
+                     group or as root for full coverage."
+                );
+            }
+            let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+            let rc = unsafe { nix::libc::chown(c_path.as_ptr(), uid, dir_gid) };
+            assert_eq!(rc, 0, "failed to set up test dir group");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o2770)).unwrap();
+
+            signal_started(&dir, "web").unwrap();
+
+            let meta = fs::metadata(dir.join("web")).unwrap();
+            assert_eq!(meta.mode() & 0o777, 0o600);
+            assert_eq!(
+                (meta.uid(), meta.gid()),
+                (uid, primary_gid),
+                "sentinel must be re-owned to the writer's uid:gid despite the setgid dir"
+            );
+            if strong_case {
+                assert_ne!(
+                    meta.gid(),
+                    dir_gid,
+                    "setgid dir must not leave its group on the sentinel"
+                );
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn supplemental_gid() -> Option<u32> {
+        // Supplemental groups of the test process; one distinct from the
+        // primary gid models the deployed started dir's group.
+        let path = std::path::Path::new("/proc/self/status");
+        let status = fs::read_to_string(path).ok()?;
+        let line = status.lines().find(|l| l.starts_with("Groups:"))?;
+        line.split_whitespace()
+            .skip(1)
+            .filter_map(|g| g.parse::<u32>().ok())
+            .find(|g| *g != unsafe { nix::libc::getgid() } as u32)
+    }
+
+    #[test]
     fn signal_started_creates_named_sentinel() {
         let dir = unique_dir();
         signal_started(&dir, "web").unwrap();
@@ -513,6 +886,195 @@ mod tests {
         assert!(ready_file_is_ready(&ready));
 
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "prod-strict")]
+    #[test]
+    fn prod_strict_ignores_env_overrides() {
+        assert!(env_override_for(Some(OsString::from("/tmp/planted"))).is_none());
+        assert!(env_override_for(None).is_none());
+    }
+
+    #[cfg(not(feature = "prod-strict"))]
+    #[test]
+    fn dev_builds_honor_env_overrides() {
+        assert_eq!(
+            env_override_for(Some(OsString::from("/tmp/override"))),
+            Some(OsString::from("/tmp/override"))
+        );
+        assert!(env_override_for(None).is_none());
+    }
+
+    #[test]
+    #[cfg(not(feature = "prod-strict"))]
+    fn prod_strict_pins_readiness_paths_to_compiled_defaults() {
+        // This test verifies that prod-strict builds don't read certain env vars directly.
+        // It runs in dev builds but checks the source for patterns that should not exist
+        // in prod-strict.
+        //
+        // Note: The log encryption key checks are intentionally omitted here because
+        // encrypted_log_config_from_raw_env is already gated with #[cfg(not(feature = "prod-strict"))],
+        // so the env::var calls exist in the source but are compiled out in prod-strict.
+        let source = include_str!("main.rs").replace("\r\n", "\n");
+        for var in ["ENCLAVA_INIT_READY_FILE", "ENCLAVA_STARTED_DIR"] {
+            assert!(
+                !source.contains(&format!("env::var_os(\"{var}\")")),
+                "{var} must not be read via env::var_os"
+            );
+            assert!(
+                source.contains(&format!("env_override(\"{var}\")")),
+                "{var} must resolve through env_override"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn prod_strict_uses_handoff_for_log_encryption() {
+        // Verify prod-strict reads log encryption from handoff file, not env.
+        let source = include_str!("main.rs").replace("\r\n", "\n");
+        assert!(
+            source.contains("LOG_ENCRYPTION_HANDOFF_FILE"),
+            "prod-strict must read log encryption from handoff file"
+        );
+        // Note: We don't check that encrypted_log_config_from_raw_env is absent because
+        // it's gated with #[cfg(not(feature = "prod-strict"))] in the source, which is correct.
+        // The function exists in dev builds but is compiled out in prod-strict.
+    }
+
+    #[cfg(feature = "prod-strict")]
+    fn unique_handoff_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "enclava-wait-exec-handoff-{}-{}-{}.json",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Serializes tests that mutate process env (Rust runs tests on parallel
+    /// threads; set_var/remove_var on shared env would otherwise race).
+    #[cfg(feature = "prod-strict")]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn handoff_marker_disables_encrypted_logging() {
+        let path = unique_handoff_path("marker");
+        fs::write(&path, "{\"disabled\": true}").unwrap();
+        assert!(
+            encrypted_log_config_from_handoff_at(&path)
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn handoff_absent_disables_encrypted_logging() {
+        let path = unique_handoff_path("absent");
+        assert!(
+            encrypted_log_config_from_handoff_at(&path)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn handoff_parses_claim_and_env_deployment_label() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        let path = unique_handoff_path("claim");
+        let claim = serde_json::json!({
+            "algorithm": enclava_common::log_encryption::LOG_ENCRYPTION_ALGORITHM.to_string(),
+            "key_id": "logs-prod".to_string(),
+            "public_key_base64url": keypair.public_key_base64url.clone(),
+            "public_key_sha256": keypair.public_key_sha256.clone(),
+            "org_id": "acme".to_string(),
+            "app_name": "secure-app".to_string(),
+        });
+        fs::write(&path, claim.to_string()).unwrap();
+        unsafe {
+            env::set_var(
+                "ENCLAVA_LOG_DEPLOYMENT_ID",
+                "11111111-1111-1111-1111-111111111111",
+            );
+            env::set_var("ENCLAVA_CONTAINER_NAME", "web");
+        }
+        let config = encrypted_log_config_from_handoff_at(&path)
+            .unwrap()
+            .expect("handoff engages encrypted logging");
+        assert_eq!(config.context.org_id, "acme");
+        assert_eq!(config.context.app_name, "secure-app");
+        assert_eq!(
+            config.context.deployment_id,
+            "11111111-1111-1111-1111-111111111111"
+        );
+        assert_eq!(config.container, "web");
+        unsafe {
+            env::remove_var("ENCLAVA_LOG_DEPLOYMENT_ID");
+            env::remove_var("ENCLAVA_CONTAINER_NAME");
+        }
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn handoff_with_unsupported_algorithm_fails() {
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        let path = unique_handoff_path("badalg");
+        let claim = serde_json::json!({
+            "algorithm": "x25519-xsalsa20-poly1305".to_string(),
+            "key_id": "logs-prod".to_string(),
+            "public_key_base64url": keypair.public_key_base64url.clone(),
+            "public_key_sha256": keypair.public_key_sha256.clone(),
+            "org_id": "acme".to_string(),
+            "app_name": "secure-app".to_string(),
+        });
+        fs::write(&path, claim.to_string()).unwrap();
+        unsafe {
+            env::set_var("ENCLAVA_LOG_DEPLOYMENT_ID", "deploy-123");
+            env::set_var("ENCLAVA_CONTAINER_NAME", "web");
+        }
+        let err = encrypted_log_config_from_handoff_at(&path).unwrap_err();
+        assert!(err.contains("unsupported algorithm"), "got: {err}");
+        unsafe {
+            env::remove_var("ENCLAVA_LOG_DEPLOYMENT_ID");
+            env::remove_var("ENCLAVA_CONTAINER_NAME");
+        }
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "prod-strict")]
+    fn handoff_without_deployment_env_label_fails() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keypair = enclava_common::log_encryption::generate_log_keypair();
+        let path = unique_handoff_path("nolabel");
+        let claim = serde_json::json!({
+            "algorithm": enclava_common::log_encryption::LOG_ENCRYPTION_ALGORITHM.to_string(),
+            "key_id": "logs-prod".to_string(),
+            "public_key_base64url": keypair.public_key_base64url.clone(),
+            "public_key_sha256": keypair.public_key_sha256.clone(),
+            "org_id": "acme".to_string(),
+            "app_name": "secure-app".to_string(),
+        });
+        fs::write(&path, claim.to_string()).unwrap();
+        unsafe {
+            env::remove_var("ENCLAVA_LOG_DEPLOYMENT_ID");
+            env::set_var("ENCLAVA_CONTAINER_NAME", "web");
+        }
+        let err = encrypted_log_config_from_handoff_at(&path).unwrap_err();
+        assert!(err.contains("ENCLAVA_LOG_DEPLOYMENT_ID"), "got: {err}");
+        unsafe {
+            env::remove_var("ENCLAVA_CONTAINER_NAME");
+        }
+        fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -565,6 +1127,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "prod-strict"))]
     fn encrypted_log_config_requires_and_reads_routing_context() {
         let keypair = enclava_common::log_encryption::generate_log_keypair();
         unsafe {

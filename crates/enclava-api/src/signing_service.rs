@@ -393,6 +393,7 @@ impl DeploymentSigningArtifacts {
             descriptor_core_hash: self.descriptor_core_hash,
             descriptor_signing_pubkey: self.descriptor_signing_pubkey,
             org_keyring_fingerprint: self.org_keyring_fingerprint,
+            omit_log_encryption_claim: false,
         }
     }
 
@@ -518,6 +519,47 @@ impl DeploymentSigningArtifacts {
             ));
         }
         Ok(())
+    }
+
+    /// Validate the cc_init_data hash rendered from `app` against this
+    /// artifact's signed expectation, accepting either the modern render
+    /// (with the `log_encryption_json` claim) or — for artifacts signed
+    /// before the claim existed — the legacy render without it. When only
+    /// the legacy render matches, the app's artifact binding is pinned to
+    /// `omit_log_encryption_claim` so every downstream consumer
+    /// (statefulset, KBS policy/TLS bindings) renders the exact bytes the
+    /// artifact was signed over. The artifact then boots exactly as it did
+    /// pre-change, but encrypted logging is OFF until the app is re-signed:
+    /// the legacy render carries no claim, so init publishes the explicit
+    /// disabled marker and prod-strict wait-exec never falls back to
+    /// env-supplied key material. Logs are discarded, not emitted in
+    /// plaintext. This is backwards compatibility, not a trust downgrade;
+    /// fresh signings always match the modern render.
+    pub fn validate_and_pin_cc_init_data_render(
+        &self,
+        app: &mut enclava_engine::types::ConfidentialApp,
+    ) -> Result<(), SigningServiceError> {
+        let expected = hex::encode(self.descriptor.expected_cc_init_data_hash);
+        let (_, modern_hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
+        if modern_hash == expected {
+            if let Some(binding) = app.workload_artifact_binding.as_mut() {
+                binding.omit_log_encryption_claim = false;
+            }
+            return Ok(());
+        }
+        if let Some(binding) = app.workload_artifact_binding.as_mut() {
+            binding.omit_log_encryption_claim = true;
+        }
+        let (_, legacy_hash) = enclava_engine::manifest::cc_init_data::compute_cc_init_data(app);
+        if legacy_hash == expected {
+            return Ok(());
+        }
+        if let Some(binding) = app.workload_artifact_binding.as_mut() {
+            binding.omit_log_encryption_claim = false;
+        }
+        Err(SigningServiceError::Mismatch(
+            "expected_cc_init_data_hash".into(),
+        ))
     }
 
     pub fn validate_signed_artifact(
@@ -1186,6 +1228,14 @@ impl LoadedWorkloadArtifacts {
         self.signing_artifacts
             .validate_rendered_cc_init_data_hash(actual_hash_hex)
     }
+
+    pub fn validate_and_pin_cc_init_data_render(
+        &self,
+        app: &mut enclava_engine::types::ConfidentialApp,
+    ) -> Result<(), SigningServiceError> {
+        self.signing_artifacts
+            .validate_and_pin_cc_init_data_render(app)
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1300,6 +1350,7 @@ fn decode_loaded_workload_artifacts(
             descriptor_core_hash: stored_descriptor_core_hash,
             descriptor_signing_pubkey,
             org_keyring_fingerprint,
+            omit_log_encryption_claim: false,
         },
         trustee_policy_json: trustee_policy_json(&signed_policy_artifact)?,
         workload_artifacts_json: serde_json::to_string(&artifacts_json)?,
@@ -1465,6 +1516,7 @@ pub async fn load_workload_artifact_binding(
             descriptor_core_hash,
             descriptor_signing_pubkey,
             org_keyring_fingerprint: keyring_fingerprint(&org_keyring),
+            omit_log_encryption_claim: false,
         },
         signed_policy_artifact,
     )))

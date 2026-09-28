@@ -33,6 +33,63 @@ pub struct AppBindMountConfig {
     pub mount_path: String,
 }
 
+/// Encrypted-log recipient key material from the signed `log_encryption_json`
+/// cc_init_data claim. This is the authoritative form: enclava-init
+/// extracts it from the hash-verified cc_init_data buffer and re-publishes it
+/// as the trusted in-guest handoff for enclava-wait-exec, so a tampered host
+/// cannot swap the recipient key (and thereby capture workload log plaintext)
+/// through pod env or ConfigMap. The claim carries the key material plus the
+/// two rollback-stable frame labels (org_id, app_name) — constants of the app
+/// across rollback/unlock/replay re-renders that reuse one signed artifact.
+/// deployment_id deliberately stays OUT of the measured claim (those
+/// operations render under a fresh deployment UUID); wait-exec takes it from
+/// the validated pod env as a routing label only.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct LogEncryptionHandoff {
+    pub algorithm: String,
+    pub key_id: String,
+    pub public_key_base64url: String,
+    pub public_key_sha256: String,
+    pub org_id: String,
+    pub app_name: String,
+}
+
+/// What enclava-init publishes as the `/state/app/log-encryption.json`
+/// handoff file. Written after unlock and strictly before the ready file
+/// flips, so prod-strict enclava-wait-exec never sees readiness without a
+/// decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogEncryptionHandoffFile {
+    /// No log encryption configured anywhere (no signed claim, no ConfigMap
+    /// section): nothing is written. The manifest sets no activation hint,
+    /// so wait-exec never looks for the file.
+    Unconfigured,
+    /// ConfigMap `[log-encryption]` present but the signed cc_init_data
+    /// carries no claim: the legacy-manifest transition window during the
+    /// init-first rollout, or a pre-claim signed artifact rendered in the
+    /// legacy byte layout. An explicit `{"disabled": true}` marker is
+    /// written so prod-strict wait-exec treats encrypted logging as off
+    /// instead of failing to parse a handoff that can never exist.
+    DisabledMarker,
+    /// Signed claim present: publish the claim verbatim.
+    Enabled(LogEncryptionHandoff),
+}
+
+/// The `[log-encryption]` ConfigMap section. Host-controlled transport copy
+/// of a subset of the handoff fields; never trusted on its own — when the
+/// signed claim exists, any field present here must match it. All fields are
+/// optional so legacy ConfigMap sections (rendered without the newer fields)
+/// still parse.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct LogEncryptionSection {
+    pub algorithm: Option<String>,
+    pub key_id: Option<String>,
+    pub public_key_base64url: Option<String>,
+    pub public_key_sha256: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Config {
@@ -105,6 +162,11 @@ pub struct Config {
 
     #[serde(default)]
     pub signing_service_pubkey_hex: Option<String>,
+
+    /// `[log-encryption]` ConfigMap section (host-controlled transport copy;
+    /// cross-checked against the signed claim, never trusted alone).
+    #[serde(default)]
+    pub log_encryption: Option<LogEncryptionSection>,
 }
 
 fn default_unlock_socket() -> String {

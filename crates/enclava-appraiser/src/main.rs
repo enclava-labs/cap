@@ -98,16 +98,23 @@ async fn appraise(
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|_| ApiError::Clock)?
         .as_secs();
-    let result = verify(
-        &bundle,
-        &policy,
-        VerificationContext {
-            challenge_nonce: nonce,
-            expected_target_origin: request.expected_target_origin,
-            now_unix_seconds: now,
-            observed_channel_spki_sha256: None,
-        },
-    );
+    // Panic isolation (cap#141): a hostile or malformed bundle must fail
+    // the request, never abort the appraiser process. verify() is total
+    // over its inputs, but a latent panic in a parsing layer would
+    // otherwise take the whole service down.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        verify(
+            &bundle,
+            &policy,
+            VerificationContext {
+                challenge_nonce: nonce,
+                expected_target_origin: request.expected_target_origin,
+                now_unix_seconds: now,
+                observed_channel_spki_sha256: None,
+            },
+        )
+    }))
+    .map_err(|_| ApiError::InvalidRequest)?;
     let result_hash = canonical_result_sha256(&result);
     let receipt = state
         .signer
@@ -240,6 +247,64 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn mutated_bundles_never_abort_the_appraiser() {
+        // Panic isolation (cap#141): truncate and flip bytes across the
+        // live fixture bundle and push every mutation through the real
+        // handler. Every request must produce an HTTP response — a panic
+        // inside verification would abort this task and fail the test
+        // before the catch_unwind was added.
+        let encoded: Vec<u8> = include_str!(
+            "../../../crates/enclava-verifier/tests/fixtures/prove-it-live.bundle.b64"
+        )
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+        let bundle = general_purpose::STANDARD
+            .decode(&encoded)
+            .expect("fixture decodes");
+        let policy = include_bytes!(
+            "../../../crates/enclava-verifier/tests/fixtures/prove-it-live.policy.json"
+        );
+        let nonce = "A".repeat(43);
+        let app = router(AppState::default());
+        let request_for = |bundle: Vec<u8>| {
+            format!(
+                r#"{{"bundle_base64":"{}","policy_base64":"{}","challenge_nonce_base64url":"{nonce}","expected_target_origin":"https://prove-it-independent-dev.e72a13df.dev.enclava.work"}}"#,
+                general_purpose::STANDARD.encode(&bundle),
+                general_purpose::STANDARD.encode(policy),
+            )
+        };
+        let mut mutations: Vec<Vec<u8>> = Vec::new();
+        // Truncations at a stride, including the empty bundle.
+        for len in (0..bundle.len()).step_by(bundle.len() / 64 + 1) {
+            mutations.push(bundle[..len].to_vec());
+        }
+        // Single-byte flips at a stride.
+        for offset in (0..bundle.len()).step_by(bundle.len() / 64 + 1) {
+            let mut flipped = bundle.clone();
+            flipped[offset] ^= 0xff;
+            mutations.push(flipped);
+        }
+        for mutation in mutations {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/appraise")
+                        .header(header::CONTENT_TYPE, REQUEST_MEDIA_TYPE)
+                        .body(Body::from(request_for(mutation)))
+                        .unwrap(),
+                )
+                .await
+                .expect("handler must answer every mutated bundle");
+            assert!(
+                response.status() == StatusCode::OK || response.status() == StatusCode::BAD_REQUEST,
+                "unexpected status {}",
+                response.status()
+            );
         }
     }
 

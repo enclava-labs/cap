@@ -10,7 +10,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // logs enough (staging 2026-09-14: SSH stalled pre-banner, supervisor frozen,
 // pod 4/4 Ready). The no-recipient branch discards stdout/stderr instead, so
 // the workload completes and nothing is emitted into the undrained pipe.
+//
+// NOTE: This test requires env overrides to work (to redirect ready/started paths
+// to temp dirs), so it is skipped in prod-strict builds where env overrides are
+// compiled out.
 #[test]
+#[cfg(not(feature = "prod-strict"))]
 fn no_recipient_stdio_is_discarded_not_backpressured() {
     let dir = std::env::temp_dir().join(format!(
         "enclava-wait-exec-stdio-test-{}-{}",

@@ -30,5 +30,11 @@ path = "fuzz_targets/verify_rsa_pss_sha384.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "verify_inclusion_proof"
+path = "fuzz_targets/verify_inclusion_proof.rs"
+test = false
+doc = false
+
 [workspace]
 members = ["."]

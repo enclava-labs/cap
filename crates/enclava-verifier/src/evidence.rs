@@ -84,10 +84,19 @@ pub fn expected_report_data(
     if url.scheme() != "https" || url.host_str().is_none() {
         return Err(EvidenceError::InvalidEncoding);
     }
-    let host = url.host_str().ok_or(EvidenceError::InvalidEncoding)?;
+    // Hostnames are case-insensitive (RFC 3986 §6.2.2.1). The prover
+    // canonicalizes the TEE host to lowercase before hashing the domain
+    // into report_data (enclava-cli tee_client/tls.rs), so the verifier
+    // must apply the same normalization or a mixed-case origin makes the
+    // report_data binding fail — and would let a future prover drift from
+    // the verifier on canonicalization (cap#141).
+    let host = url
+        .host_str()
+        .ok_or(EvidenceError::InvalidEncoding)?
+        .to_ascii_lowercase();
     let domain = match url.port() {
         Some(port) if port != 443 => format!("{host}:{port}"),
-        _ => host.to_owned(),
+        _ => host,
     };
     let transcript_hash = ce_v1_hash(&[
         ("purpose", b"enclava-tee-tls-v1"),
@@ -176,6 +185,43 @@ mod tests {
             expected,
             expected_report_data(origin, &nonce, &spki, &[6; 32]).unwrap()
         );
+    }
+
+    #[test]
+    fn host_case_is_normalized_in_the_report_data_domain() {
+        // Hostnames are case-insensitive; the prover hashes a lowercased
+        // host into report_data, so the verifier must agree (cap#141).
+        let nonce = [1; 32];
+        let spki = [2; 32];
+        let key = [3; 32];
+        let lowercase = expected_report_data("https://app.example", &nonce, &spki, &key).unwrap();
+        assert_eq!(
+            lowercase,
+            expected_report_data("https://APP.example", &nonce, &spki, &key).unwrap()
+        );
+        assert_eq!(
+            lowercase,
+            expected_report_data("https://App.Example", &nonce, &spki, &key).unwrap()
+        );
+        // Port case is not affected; distinct ports stay distinct bindings.
+        assert_ne!(
+            lowercase,
+            expected_report_data("https://app.example:8443", &nonce, &spki, &key).unwrap()
+        );
+        // A report bound against the lowercased origin matches a mixed-case
+        // expectation and vice versa.
+        let mut report_bytes = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("../tests/fixtures/genoa-snp-report.b64").trim())
+            .unwrap();
+        report_bytes[0x50..0x90].copy_from_slice(&lowercase);
+        let report = crate::parse_snp_report(&report_bytes).unwrap();
+        assert!(report_data_matches(
+            &report,
+            "https://APP.example",
+            &nonce,
+            &spki,
+            &key
+        ));
     }
 
     #[test]

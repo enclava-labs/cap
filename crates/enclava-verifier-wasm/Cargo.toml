@@ -6,6 +6,11 @@ edition.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Test-only export of `debug_panic_probe` for the browser panic-isolation
+# test (web/verifier/panic-test.html); never enabled in release builds.
+debug-panic-probe = []
+
 [dependencies]
 enclava-verifier = { path = "../enclava-verifier" }
 hex = { workspace = true }

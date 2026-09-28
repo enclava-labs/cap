@@ -268,6 +268,34 @@ fn save_toml<T: Serialize>(path: &Path, value: &T) -> Result<(), ConfigError> {
             path: parent.to_path_buf(),
             source: e,
         })?;
+        // The state directory must be owner-only before anything is written
+        // into it: `config.toml` can be written before `save_credentials`
+        // ever runs (e.g. `enclava org use` right after install), so the
+        // directory perms cannot be left to the credentials path to fix.
+        // Mirrors `CliPaths::ensure_dirs`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(parent)
+                .map_err(|e| ConfigError::Io {
+                    path: parent.to_path_buf(),
+                    source: e,
+                })?
+                .permissions();
+            if perms.mode() & 0o077 != 0 {
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |e| ConfigError::Io {
+                        path: parent.to_path_buf(),
+                        source: e,
+                    },
+                )?;
+            }
+        }
+        #[cfg(windows)]
+        crate::keys::restrict_dir_to_user(parent).map_err(|e| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
     }
     let content = toml::to_string_pretty(value).map_err(ConfigError::SerializeToml)?;
     std::fs::write(path, content).map_err(|e| ConfigError::Io {

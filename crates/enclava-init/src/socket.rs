@@ -35,16 +35,32 @@ pub fn bind_with_peer_gid(socket_path: &Path, peer_gid: Option<u32>) -> Result<U
         std::fs::remove_file(socket_path)?;
     }
     let listener = UnixListener::bind(socket_path)?;
+    // NOTE (#137, TOCTOU window): if a symlink were raced in at this path
+    // between bind() and the fchownat below, the fchownat would chown the
+    // link itself (not follow it) — sound, but the bound socket would then
+    // sit at a path we no longer own. Accepted risk: this runs early in
+    // boot inside a root-owned directory before any untrusted code executes.
+    // The chmod below must stay path-based: fchmod() on a bound unix-socket
+    // fd succeeds but is silently a no-op on Linux (the socket inode keeps
+    // its umask-derived mode), verified on 6.17 — so fd-based chmod is not
+    // an option here (#175 review).
     use std::os::unix::fs::PermissionsExt;
     if let Some(gid) = peer_gid {
-        nix::unistd::chown(socket_path, None, Some(nix::unistd::Gid::from_raw(gid))).map_err(
-            |err| {
-                InitError::Config(format!(
-                    "failed to chown unlock socket {} to gid {gid}: {err}",
-                    socket_path.display()
-                ))
-            },
-        )?;
+        // lchown semantics (#137): the freshly bound socket is re-owned
+        // directly; a symlink raced in at the path is never followed.
+        nix::unistd::fchownat(
+            None,
+            socket_path,
+            None,
+            Some(nix::unistd::Gid::from_raw(gid)),
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(|err| {
+            InitError::Config(format!(
+                "failed to chown unlock socket {} to gid {gid}: {err}",
+                socket_path.display()
+            ))
+        })?;
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o660))?;
     } else {
         std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;

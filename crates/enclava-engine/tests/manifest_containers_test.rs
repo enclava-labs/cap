@@ -871,3 +871,58 @@ fn enclava_init_container_mounts_both_luks_devices_and_unlock_socket() {
         Some("Bidirectional")
     );
 }
+
+// === Prod-strict env pinning cross-check (#169) ===
+//
+// enclava-init and enclava-wait-exec compile out the env overrides for
+// these surfaces under the prod-strict feature (the pod environment is
+// host-controlled and unbound to the signed cc_init_data), pinning them
+// to the binaries' compiled DEFAULT_* constants. If the manifests ever
+// emit values that diverge from those constants, the producer/consumer
+// handshake silently desyncs in production while all tests stay green.
+// Pin the manifest values to the compiled defaults here so a divergence
+// fails CI instead.
+
+/// Compiled defaults mirrored from crates/enclava-wait-exec/src/main.rs
+/// (DEFAULT_STARTED_DIR, DEFAULT_READY_FILE) and
+/// crates/enclava-init/src/main.rs (started_dir_path default).
+const WAIT_EXEC_DEFAULT_STARTED_DIR: &str = "/run/enclava/containers";
+const WAIT_EXEC_DEFAULT_READY_FILE: &str = "/run/enclava/init-ready";
+const INIT_DEFAULT_STARTED_DIR: &str = "/run/enclava/containers";
+
+fn env_value<'a>(c: &'a k8s_openapi::api::core::v1::Container, name: &str) -> &'a str {
+    c.env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| panic!("{name} missing from container env"))
+        .value
+        .as_deref()
+        .unwrap_or_else(|| panic!("{name} has no value"))
+}
+
+#[test]
+fn prod_strict_pinned_env_values_match_compiled_defaults() {
+    let caddy = build_caddy_container(&sample_app());
+    assert_eq!(
+        env_value(&caddy, "ENCLAVA_STARTED_DIR"),
+        WAIT_EXEC_DEFAULT_STARTED_DIR
+    );
+    assert_eq!(
+        env_value(&caddy, "ENCLAVA_INIT_READY_FILE"),
+        WAIT_EXEC_DEFAULT_READY_FILE
+    );
+
+    let init = build_enclava_init_container(&sample_app());
+    assert_eq!(
+        env_value(&init, "ENCLAVA_INIT_STARTED_DIR"),
+        INIT_DEFAULT_STARTED_DIR
+    );
+
+    let proxy = build_attestation_proxy_container(&sample_app());
+    assert_eq!(
+        env_value(&proxy, "ENCLAVA_STARTED_DIR"),
+        WAIT_EXEC_DEFAULT_STARTED_DIR
+    );
+}

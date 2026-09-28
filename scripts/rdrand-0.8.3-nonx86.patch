@@ -1,0 +1,132 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -25,17 +25,13 @@
+ license = "ISC"
+ repository = "https://github.com/nagisa/rust_rdrand/"
+ 
+-[[bench]]
+-name = "rdrand"
+-harness = false
+-
+ [dependencies.rand_core]
+ version = "0.6"
+ default-features = false
+ 
+-[dev-dependencies.criterion]
+-version = "0.3"
+-
+ [features]
+ default = ["std"]
+ std = ["rand_core/std"]
++
++# Vendored from crates.io rdrand-0.8.3 with a non-x86 compile fix
++# (upstream 0.9.0 rewrote the crate; sev 7.x pins ^0.8). See PR #100.
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -60,6 +60,11 @@
+ //!
+ //! [Agner’s instruction tables]: http://agner.org/optimize/
+ #![cfg_attr(not(feature = "std"), no_std)]
++// Non-x86 fallback keeps types/API but not the instruction paths.
++#![cfg_attr(
++    not(any(target_arch = "x86", target_arch = "x86_64")),
++    allow(unused_imports, unused_macros)
++)]
+ 
+ pub mod changelog;
+ mod errors;
+@@ -159,6 +164,7 @@
+ }
+ 
+ #[inline(always)]
++#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+ fn authentic_amd() -> bool {
+     let cpuid0 = unsafe { arch::__cpuid(0) };
+     matches!(
+@@ -168,17 +174,20 @@
+ }
+ 
+ #[inline(always)]
++#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+ fn amd_family(cpuid1: &arch::CpuidResult) -> u32 {
+     ((cpuid1.eax >> 8) & 0xF) + ((cpuid1.eax >> 20) & 0xFF)
+ }
+ 
+ #[inline(always)]
++#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+ fn has_rdrand(cpuid1: &arch::CpuidResult) -> bool {
+     const FLAG: u32 = 1 << 30;
+     cpuid1.ecx & FLAG == FLAG
+ }
+ 
+ #[inline(always)]
++#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+ fn has_rdseed() -> bool {
+     const FLAG: u32 = 1 << 18;
+     unsafe { arch::__cpuid(7).ebx & FLAG == FLAG }
+@@ -498,6 +507,65 @@
+     maxty = u32
+ );
+ 
++// RDRAND/RDSEED instructions do not exist outside x86. Keep the types and
++// the API surface (sev links against `RdRand::new`/`try_fill_bytes` and
++// `ErrorCode`), but every entry point reports `UnsupportedInstruction`.
++// sev only calls these from its linux-gated SEV launch-session code, which
++// requires x86 hardware to run in the first place.
++#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
++macro_rules! impl_unavailable {
++    ($gen:ident) => {
++        impl $gen {
++            pub fn new() -> Result<Self, ErrorCode> {
++                Err(ErrorCode::UnsupportedInstruction)
++            }
++            pub unsafe fn new_unchecked() -> Self {
++                $gen(())
++            }
++            pub fn try_next_u16(&self) -> Result<u16, ErrorCode> {
++                Err(ErrorCode::UnsupportedInstruction)
++            }
++            pub fn try_next_u32(&self) -> Result<u32, ErrorCode> {
++                Err(ErrorCode::UnsupportedInstruction)
++            }
++            pub fn try_next_u64(&self) -> Result<u64, ErrorCode> {
++                Err(ErrorCode::UnsupportedInstruction)
++            }
++            pub fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), ErrorCode> {
++                Err(ErrorCode::UnsupportedInstruction)
++            }
++        }
++        // Same panic-on-failure contract as the x86 RngCore impl: these
++        // generators always fail on non-x86, so every trait method panics.
++        impl rand_core::RngCore for $gen {
++            fn next_u32(&mut self) -> u32 {
++                match self.try_next_u32() {
++                    Ok(result) => result,
++                    Err(c) => busy_loop_fail(c),
++                }
++            }
++            fn next_u64(&mut self) -> u64 {
++                match self.try_next_u64() {
++                    Ok(result) => result,
++                    Err(c) => busy_loop_fail(c),
++                }
++            }
++            fn fill_bytes(&mut self, dest: &mut [u8]) {
++                if let Err(c) = self.try_fill_bytes(dest) {
++                    busy_loop_fail(c);
++                }
++            }
++            fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
++                self.try_fill_bytes(dest).map_err(Into::into)
++            }
++        }
++    };
++}
++#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
++impl_unavailable!(RdRand);
++#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
++impl_unavailable!(RdSeed);
++
+ #[cfg(test)]
+ mod test {
+     use super::{RdRand, RdSeed};

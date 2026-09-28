@@ -32,6 +32,8 @@ pub enum SnpReportError {
     UnsupportedSignatureAlgorithm(u32),
     #[error("SNP report reserved bytes are nonzero")]
     NonzeroReserved,
+    #[error("SNP report was not signed by the VCEK")]
+    NotVcekSigned,
     #[error("SNP signature integer is not canonical P-384 encoding")]
     NoncanonicalSignature,
 }
@@ -49,6 +51,19 @@ pub fn parse_snp_report(bytes: &[u8]) -> Result<SnpReport<'_>, SnpReportError> {
         return Err(SnpReportError::UnsupportedSignatureAlgorithm(
             signature_algorithm,
         ));
+    }
+    // KeyInfo (SNP firmware ABI: bit 0 author_key_en, bit 1 mask_chip_key,
+    // bits 4:2 signing key (0=VCEK, 1=VLEK, 2-6 reserved, 7=NONE), bits
+    // 31:5 reserved). The verifier's AMD endorsements carry only a VCEK,
+    // so a report signed by anything else cannot be verified against the
+    // supplied chain — and mask_chip_key zeroes the signature outright.
+    // Every bit outside the defined fields is rejected so future firmware
+    // that assigns them meaning fails closed instead of being silently
+    // appraised (cap#141). author_key_en only marks the author-key digest
+    // as present and does not affect the signing key, so it is allowed.
+    let key_info = u32_at(bytes, 0x48);
+    if key_info & !1 != 0 {
+        return Err(SnpReportError::NotVcekSigned);
     }
     if !bytes[0x4c..0x50].iter().all(|byte| *byte == 0)
         || !bytes[0x18b..0x1a0].iter().all(|byte| *byte == 0)
@@ -147,5 +162,35 @@ mod tests {
             };
             assert_eq!(parse_snp_report(&bytes), Err(expected));
         }
+    }
+
+    #[test]
+    fn key_info_must_describe_a_vcek_signed_report() {
+        let original = fixture();
+        // key_info offset 0x48; the live fixture is VCEK-signed with no
+        // flags set, so every mutation below must be rejected (cap#141).
+        assert_eq!(u32_at(&original, 0x48), 0);
+        for mutation in [
+            1u32 << 1,  // mask_chip_key
+            1u32 << 2,  // signing_key = VLEK
+            2u32 << 2,  // signing_key = reserved
+            7u32 << 2,  // signing_key = NONE
+            1u32 << 8,  // reserved upper bits
+            1u32 << 31, // reserved top bit
+        ] {
+            let mut bytes = original.clone();
+            bytes[0x48..0x4c].copy_from_slice(&mutation.to_le_bytes());
+            assert_eq!(
+                parse_snp_report(&bytes),
+                Err(SnpReportError::NotVcekSigned),
+                "key_info {mutation:#x} must be rejected"
+            );
+        }
+        // author_key_en (bit 0) does not affect which key signed the
+        // report; it only marks the author-key digest as present, so the
+        // report remains parseable.
+        let mut bytes = original.clone();
+        bytes[0x48] = 1;
+        assert!(parse_snp_report(&bytes).is_ok());
     }
 }

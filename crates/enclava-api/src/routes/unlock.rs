@@ -372,9 +372,12 @@ async fn commit_unlock_mode_transition(
     crate::signing_service::lock_org_signing_authority_lane(&mut tx, request.org_id)
         .await
         .map_err(|_| unlock_database_error())?;
-    let current_role =
-        crate::auth::scopes::active_membership_role_in_tx(&mut tx, request.org_id, request.user_id)
-            .await?;
+    let current_role = crate::auth::scopes::lock_and_read_active_membership_role_in_tx(
+        &mut tx,
+        request.org_id,
+        request.user_id,
+    )
+    .await?;
     crate::auth::scopes::require_owner_role(current_role)?;
     crate::deploy::lock_app_deployment_lane(&mut tx, request.observed_authority.app_id())
         .await
@@ -666,10 +669,11 @@ async fn commit_unlock_mode_transition(
                 .generated_agent_policy(signed_policy_artifact)
                 .map_err(crate::routes::deployments::signing_error_response)?,
         );
-        let (_encoded, cc_init_data_hash) =
-            enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+        // Accept either the modern render (with the log_encryption_json claim)
+        // or, for artifacts signed before the claim existed, the legacy render
+        // without it; a legacy match pins the app to the legacy byte layout.
         artifacts
-            .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
+            .validate_and_pin_cc_init_data_render(&mut app_spec)
             .map_err(crate::routes::deployments::signing_error_response)?;
     }
 
@@ -1192,10 +1196,11 @@ pub async fn update_unlock_mode(
         crate::routes::deployments::select_local_signed_artifact_delivery(
             &mut app_spec.attestation,
         );
-        let (_encoded, cc_init_data_hash) =
-            enclava_engine::manifest::cc_init_data::compute_cc_init_data(&app_spec);
+        // Accept either the modern render (with the log_encryption_json claim)
+        // or, for artifacts signed before the claim existed, the legacy render
+        // without it; a legacy match pins the app to the legacy byte layout.
         artifacts
-            .validate_rendered_cc_init_data_hash(&cc_init_data_hash)
+            .validate_and_pin_cc_init_data_render(&mut app_spec)
             .map_err(crate::routes::deployments::signing_error_response)?;
         signed_policy_artifact = Some(signed);
     }
@@ -1747,8 +1752,8 @@ mod tests {
             .find("select_local_signed_artifact_delivery")
             .expect("unlock-mode signing validation must use local artifact delivery mode");
         let compute = body
-            .find("compute_cc_init_data")
-            .expect("unlock-mode signing validation computes cc_init_data hash");
+            .find("validate_and_pin_cc_init_data_render")
+            .expect("unlock-mode signing validation validates the cc_init_data render");
         assert!(
             select < compute,
             "unlock-mode redeploy hash validation must match normal deploy's signed-artifact delivery mode"

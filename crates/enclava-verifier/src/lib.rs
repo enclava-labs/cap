@@ -37,6 +37,8 @@ pub use result::{
     canonical_result_sha256,
 };
 use sha2::{Digest, Sha256};
+#[cfg(feature = "fuzzing")]
+pub use sigstore::verify_inclusion_proof_for_fuzzing;
 pub use sigstore::{SigstoreError, verify_sigstore_and_provenance};
 pub use snp::{SNP_REPORT_BYTES, SnpReport, SnpReportError, parse_snp_report};
 pub use supply_chain::{SupplyChainError, verify_portable_material};
@@ -94,7 +96,7 @@ pub fn verify(
         ));
         checks.push(equality_check(
             "binding.target_origin",
-            bundle.target_origin == context.expected_target_origin,
+            origins_equivalent(bundle.target_origin, &context.expected_target_origin),
             bundle.target_origin.into(),
             context.expected_target_origin.clone(),
             "TARGET_ORIGIN_MISMATCH",
@@ -139,23 +141,36 @@ pub fn verify(
         }
     }
 
+    // A required check only counts as satisfied by an explicit Pass. A
+    // Skipped required check (e.g. `transport.tls_channel_spki` when the
+    // appraiser cannot observe the live channel) must degrade the verdict to
+    // Fail, not Inconclusive: the policy demanded evidence the verifier did
+    // not produce. Inconclusive remains reserved for the diagnostic case
+    // where no policy was supplied at all and nothing can be appraised.
+    let required_check_satisfied = |id: &str| {
+        checks
+            .iter()
+            .any(|check| check.id == id && check.outcome == CheckOutcome::Pass)
+    };
     let verdict = if checks
         .iter()
         .any(|check| check.outcome == CheckOutcome::Fail)
     {
         Verdict::Fail
     } else if let Some(policy) = policy.as_ref()
-        && policy.required_checks.iter().all(|required| {
-            checks
-                .iter()
-                .any(|check| &check.id == required && check.outcome == CheckOutcome::Pass)
-        })
+        && policy
+            .required_checks
+            .iter()
+            .all(|required| required_check_satisfied(required))
         && (!policy.transport.require_tls_channel_spki
-            || checks.iter().any(|check| {
-                check.id == "transport.tls_channel_spki" && check.outcome == CheckOutcome::Pass
-            }))
+            || required_check_satisfied("transport.tls_channel_spki"))
     {
         Verdict::Pass
+    } else if policy.is_some() {
+        // A well-formed policy was supplied but a required check is neither
+        // Pass nor Fail (e.g. Skipped): the demanded evidence was not
+        // produced, so fail closed rather than degrade to Inconclusive.
+        Verdict::Fail
     } else {
         Verdict::Inconclusive
     };
@@ -246,13 +261,7 @@ fn verify_evidence(
         checks.push(simple_check(
             "amd.revocation.freshness",
             revocation.is_ok(),
-            match revocation {
-                Err(AmdVerificationError::RevocationDataExpired) => "REVOCATION_DATA_EXPIRED",
-                Err(AmdVerificationError::RevocationDataStale) => "REVOCATION_DATA_STALE",
-                Err(AmdVerificationError::RevocationTimeMissing) => "REVOCATION_TIME_MISSING",
-                Err(AmdVerificationError::AskRevoked) => "ASK_REVOKED",
-                _ => "AMD_REVOCATION_INVALID",
-            },
+            revocation_reason_code(revocation.err().as_ref()),
         ));
         checks.push(simple_check(
             "amd.measurement",
@@ -311,7 +320,7 @@ fn verify_evidence(
             .target
             .origins
             .iter()
-            .any(|origin| origin == bundle.target_origin),
+            .any(|origin| origins_equivalent(origin, bundle.target_origin)),
         "TARGET_ORIGIN_REJECTED",
     ));
     let artifacts = report
@@ -508,6 +517,19 @@ fn artifact_failure_checks(error: &ArtifactError) -> [CheckResult; 2] {
     ]
 }
 
+/// Maps an `amd.revocation.freshness` failure to its stable, operator-facing
+/// reason code. Extracted so tests can pin every emitted string.
+fn revocation_reason_code(error: Option<&AmdVerificationError>) -> &'static str {
+    match error {
+        Some(AmdVerificationError::RevocationDataExpired) => "REVOCATION_DATA_EXPIRED",
+        Some(AmdVerificationError::RevocationDataStale) => "REVOCATION_DATA_STALE",
+        Some(AmdVerificationError::RevocationTimeMissing) => "REVOCATION_TIME_MISSING",
+        Some(AmdVerificationError::AskRevoked) => "ASK_REVOKED",
+        Some(AmdVerificationError::VcekRevoked) => "VCEK_REVOKED",
+        _ => "AMD_REVOCATION_INVALID",
+    }
+}
+
 fn simple_check(id: &str, passes: bool, reason: &str) -> CheckResult {
     CheckResult {
         id: id.into(),
@@ -520,6 +542,63 @@ fn simple_check(id: &str, passes: bool, reason: &str) -> CheckResult {
         expected: None,
         reason_code: if passes { "OK" } else { reason }.into(),
     }
+}
+
+/// Compare origin strings case-insensitively on the host component.
+/// Bundles carry canonical lowercase origins (bundle.rs enforces
+/// `ascii_serialization() == origin`), but the caller-supplied expected
+/// origin and policy origins are raw strings; a mixed-case but otherwise
+/// identical origin must not be rejected (cap#141).
+///
+/// Both inputs must be bare HTTPS origins — the same invariant bundle.rs
+/// enforces on the bundle origin (no path, query, fragment, or credentials,
+/// and the serialized origin must round-trip to the input). A URL like
+/// `https://trusted.example/path` therefore fails closed instead of
+/// comparing equal to `https://trusted.example` after `Url::origin()`
+/// discards the path (cap#141 review). Unparseable input likewise compares
+/// unequal to everything: a malformed expected origin surfaces as a plain
+/// mismatch rather than a distinct "invalid" error, which is deliberate —
+/// unparseable input must never pass an equivalence check.
+fn origins_equivalent(left: &str, right: &str) -> bool {
+    if left == right {
+        // Identical strings skip re-validation only when they are a valid
+        // bare HTTPS origin; two identical malformed values must not pass.
+        return is_bare_https_origin(left);
+    }
+    let parse = |origin: &str| {
+        is_bare_https_origin(origin)
+            .then(|| {
+                url::Url::parse(origin)
+                    .ok()
+                    .map(|url| url.origin().ascii_serialization())
+            })
+            .flatten()
+    };
+    match (parse(left), parse(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// The bare-origin invariant enforced on bundle origins (bundle.rs): HTTPS
+/// scheme, host present, no credentials / path / query / fragment, and the
+/// serialized origin must round-trip to the input. Unlike bundle.rs (which
+/// stores canonical lowercase origins), the input here may mix case in the
+/// host — the only component `Url::parse` normalizes — so the round-trip
+/// comparison is against the lowercased input. Any other deviation (IDNA,
+/// percent-encoding, an explicit default port, a trailing dot) fails to
+/// round-trip and is rejected.
+fn is_bare_https_origin(origin: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(origin) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed.host().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+        && parsed.origin().ascii_serialization() == origin.to_ascii_lowercase()
 }
 
 fn equality_check(
@@ -598,6 +677,83 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_expected_origin_is_not_rejected() {
+        // cap#141: the bundle origin is canonical lowercase; a caller
+        // supplying the same origin with mixed host case must not fail
+        // binding.target_origin.
+        let mut mixed_case = context([7; 32]);
+        mixed_case.expected_target_origin = "https://APP.example".into();
+        let result = verify(&bundle(&[7; 32]), b"", mixed_case);
+        assert!(
+            result
+                .checks
+                .iter()
+                .any(|check| { check.id == "binding.target_origin" && check.reason_code == "OK" })
+        );
+        // A genuinely different origin still fails.
+        let mut other = context([7; 32]);
+        other.expected_target_origin = "https://other.example".into();
+        let result = verify(&bundle(&[7; 32]), b"", other);
+        assert!(result.checks.iter().any(|check| {
+            check.id == "binding.target_origin" && check.reason_code == "TARGET_ORIGIN_MISMATCH"
+        }));
+    }
+
+    #[test]
+    fn non_bare_origin_urls_fail_closed() {
+        // cap#141 review: `Url::origin()` discards path/query/fragment and
+        // credentials, so a URL like `https://trusted.example/path` must
+        // not compare equal to the bundle origin after normalization —
+        // the same bare-HTTPS-origin invariant bundle.rs enforces.
+        for hostile in [
+            "https://app.example/path",
+            "https://app.example?query=1",
+            "https://app.example/#fragment",
+            "https://user:pass@app.example",
+            "https://app.example:443",
+            "not a url",
+            "",
+        ] {
+            assert!(
+                !origins_equivalent(hostile, "https://app.example"),
+                "{hostile:?} must not be equivalent to a bare origin"
+            );
+            assert!(
+                !origins_equivalent("https://app.example", hostile),
+                "bare origin must not be equivalent to {hostile:?}"
+            );
+            // Two identical malformed values must not pass via the string
+            // equality fast path either.
+            assert!(
+                !origins_equivalent(hostile, hostile),
+                "{hostile:?} must not be equivalent to itself"
+            );
+        }
+        // The normalization this PR exists for still works: mixed-case
+        // host and nothing else.
+        assert!(origins_equivalent(
+            "https://APP.example",
+            "https://app.example"
+        ));
+        assert!(origins_equivalent(
+            "https://app.example",
+            "https://APP.example"
+        ));
+    }
+
+    #[test]
+    fn expected_origin_with_path_fails_target_origin_binding() {
+        // End-to-end: an expected origin carrying a path must fail the
+        // binding check, not silently match the bare bundle origin.
+        let mut with_path = context([7; 32]);
+        with_path.expected_target_origin = "https://app.example/attacker".into();
+        let result = verify(&bundle(&[7; 32]), b"", with_path);
+        assert!(result.checks.iter().any(|check| {
+            check.id == "binding.target_origin" && check.reason_code == "TARGET_ORIGIN_MISMATCH"
+        }));
+    }
+
+    #[test]
     fn malformed_fixture_has_stable_cross_runtime_hash() {
         let result = verify(
             &[],
@@ -629,5 +785,38 @@ mod tests {
             "POLICY_ARTIFACT_SIGNATURE_INVALID"
         );
         assert_eq!(signature[1].outcome, CheckOutcome::Skipped);
+    }
+
+    #[test]
+    fn revocation_failures_emit_distinct_stable_reason_codes() {
+        // The appraisal boundary must report each revocation failure with
+        // its own reason string (#126 pins VCEK_REVOKED alongside
+        // ASK_REVOKED); a dropped match arm would fall through to
+        // AMD_REVOCATION_INVALID and change operator-visible output.
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::RevocationDataExpired)),
+            "REVOCATION_DATA_EXPIRED"
+        );
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::RevocationDataStale)),
+            "REVOCATION_DATA_STALE"
+        );
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::RevocationTimeMissing)),
+            "REVOCATION_TIME_MISSING"
+        );
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::AskRevoked)),
+            "ASK_REVOKED"
+        );
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::VcekRevoked)),
+            "VCEK_REVOKED"
+        );
+        assert_eq!(
+            revocation_reason_code(Some(&AmdVerificationError::UntrustedArk)),
+            "AMD_REVOCATION_INVALID"
+        );
+        assert_eq!(revocation_reason_code(None), "AMD_REVOCATION_INVALID");
     }
 }

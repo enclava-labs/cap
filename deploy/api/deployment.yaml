@@ -46,6 +46,34 @@ spec:
         - name: tmp
           mountPath: /tmp
         env:
+        # Rate-limit keying behind the ingress: the peer address seen by
+        # the API pod is the ingress-nginx controller's pod/node IP, not the
+        # client. Without a trusted CIDR the extractor falls back to that
+        # shared address and every public client lands in one rate-limit
+        # bucket. 10.0.0.0/8 covers the cluster pod network; header trust
+        # is made safe in combination with three controls:
+        #   1. deploy/api/network-policy.yaml, which restricts API ingress
+        #      to the ingress-nginx controllers, the enclava-paas internal
+        #      caller, and tenant workload pods only;
+        #   2. TRUSTED_PROXY_SECRET (below) — required because the tenant
+        #      and PaaS pods that policy admits sit INSIDE 10.0.0.0/8, so
+        #      CIDR membership alone would let them rotate X-Real-IP/XFF to
+        #      mint fresh rate-limit buckets on direct ClusterIP calls.
+        #      With the secret set, forwarding headers are honoured only
+        #      from peers that also present it; the ingress controllers
+        #      inject it via their proxy-set-headers ConfigMap, so only
+        #      they qualify. Direct pod callers are keyed by pod IP.
+        #   3. the extractor's rightmost-untrusted XFF walk, which ignores
+        #      client-spoofed leftmost entries.
+        # Narrow the CIDR to the ingress-nginx controller's subnet per
+        # target cluster where that is known.
+        - name: TRUSTED_PROXY_CIDRS
+          value: "10.0.0.0/8"
+        - name: TRUSTED_PROXY_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: api-secrets
+              key: trusted-proxy-secret
         - name: DATABASE_URL
           valueFrom:
             secretKeyRef:
@@ -77,6 +105,12 @@ spec:
             secretKeyRef:
               name: api-secrets
               key: tenant-dns-target
+        # Release images ship the pinned sigstore public-good TUF root at
+        # /etc/enclava/sigstore/trusted_root.json (see the API Dockerfile);
+        # restating the path here makes the deployment contract explicit.
+        # The API fails cosign verification — by design — without it.
+        - name: SIGSTORE_TUF_ROOT_PATH
+          value: /etc/enclava/sigstore/trusted_root.json
         resources:
           requests:
             cpu: 100m

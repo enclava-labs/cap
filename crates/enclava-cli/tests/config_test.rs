@@ -150,3 +150,32 @@ fn credentials_file_has_restricted_permissions() {
     let mode = meta.permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "credentials file should be 0600, got {mode:o}");
 }
+
+#[cfg(unix)]
+#[test]
+fn save_config_restricts_state_dir_before_first_credentials_write() {
+    // config.toml can be written before any credentials exist (e.g.
+    // `enclava org use` right after install): the state dir must be forced
+    // owner-only by the config write itself, not left to the credentials
+    // path to fix later.
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".enclava");
+    // Pre-create a permissive dir to prove save_toml tightens it.
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let paths = enclava_cli::config::CliPaths::from_root(root.clone()).unwrap();
+    enclava_cli::config::save_config(
+        &paths,
+        &enclava_cli::config::CliConfig {
+            api_url: "https://api.enclava.dev".to_string(),
+            org: None,
+            org_id: None,
+        },
+    )
+    .unwrap();
+
+    let mode = std::fs::metadata(&root).unwrap().permissions().mode();
+    assert_eq!(mode & 0o077, 0, "state dir must be owner-only (0700)");
+}

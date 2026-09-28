@@ -529,7 +529,7 @@ fn provision_with_policy(
         // The attestation token is resolved per attempt: it can expire
         // while a cooldown is being waited out.
         let token = trustee_verify::resolve_kbs_attestation_token(
-            std::env::var("KBS_ATTESTATION_TOKEN").ok().as_deref(),
+            crate::env_override("KBS_ATTESTATION_TOKEN").as_deref(),
             &cfg.kbs_attestation_token_url,
             Duration::from_secs(15),
         )

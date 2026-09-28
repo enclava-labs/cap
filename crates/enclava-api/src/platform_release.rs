@@ -97,6 +97,15 @@ pub enum PlatformReleaseError {
     BadSignature(String),
     #[error("policy_template_sha256 does not match policy_template_text")]
     TemplateHashMismatch,
+    #[error(
+        "platform release downgrade refused: override is {override_version} ({override_created}) but the API bundles {bundled_version} ({bundled_created}); refusing a validly-signed stale release"
+    )]
+    DowngradeRefused {
+        override_version: String,
+        override_created: String,
+        bundled_version: String,
+        bundled_created: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,14 +162,65 @@ impl PlatformRelease {
 
 impl PlatformReleaseEnvelope {
     pub fn load_verified() -> Result<Self, PlatformReleaseError> {
-        let raw = match std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH") {
-            Ok(path) if !path.trim().is_empty() => std::fs::read_to_string(Path::new(&path))?,
-            _ => BUNDLED_PLATFORM_RELEASE.to_string(),
+        let override_path = std::env::var("ENCLAVA_PLATFORM_RELEASE_PATH")
+            .ok()
+            .filter(|path| !path.trim().is_empty());
+        let raw = match &override_path {
+            Some(path) => std::fs::read_to_string(Path::new(path))?,
+            None => BUNDLED_PLATFORM_RELEASE.to_string(),
         };
-        let envelope: PlatformReleaseEnvelope = serde_json::from_str(&raw)?;
+        Self::load_verified_from_raw(&raw, override_path.is_some())
+    }
+
+    fn load_verified_from_raw(
+        raw: &str,
+        override_active: bool,
+    ) -> Result<Self, PlatformReleaseError> {
+        let envelope: PlatformReleaseEnvelope = serde_json::from_str(raw)?;
         verify_envelope(envelope.clone())?;
+        if override_active {
+            enforce_release_not_older_than_bundled(&envelope.payload)?;
+        }
         Ok(envelope)
     }
+}
+
+/// Reject `release` when it is older than the release compiled into this
+/// binary. Ordering by the signed creation timestamp;
+/// `platform_release_version` is opaque, so distinct releases at the same
+/// timestamp are unorderable and fail closed rather than using the
+/// identifier as a tiebreak. A malformed bundled baseline also fails closed
+/// rather than silently disabling the check.
+pub fn enforce_release_not_older_than_bundled(
+    release: &PlatformRelease,
+) -> Result<(), PlatformReleaseError> {
+    let bundled: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE)?;
+    let candidate_ts = parse_release_timestamp(&release.created_at)?;
+    let bundled_ts = parse_release_timestamp(&bundled.payload.created_at)?;
+    if candidate_ts < bundled_ts
+        || (candidate_ts == bundled_ts
+            && canonical_platform_release_bytes(release)?
+                != canonical_platform_release_bytes(&bundled.payload)?)
+    {
+        return Err(PlatformReleaseError::DowngradeRefused {
+            override_version: release.platform_release_version.clone(),
+            override_created: release.created_at.clone(),
+            bundled_version: bundled.payload.platform_release_version.clone(),
+            bundled_created: bundled.payload.created_at.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_release_timestamp(
+    value: &str,
+) -> Result<chrono::DateTime<chrono::FixedOffset>, PlatformReleaseError> {
+    chrono::DateTime::parse_from_rfc3339(value).map_err(|error| {
+        PlatformReleaseError::InvalidField {
+            field: "created_at",
+            message: format!("must be RFC3339: {error}"),
+        }
+    })
 }
 
 pub fn verify_envelope(
@@ -347,12 +407,35 @@ fn validate_release_payload(release: &PlatformRelease) -> Result<(), PlatformRel
             message: "internal mode is only allowed for dev fixtures/local tests".to_string(),
         });
     }
-    reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
+    let acme_url = reqwest::Url::parse(&release.tenant_caddy_acme_ca).map_err(|err| {
         PlatformReleaseError::InvalidField {
             field: "tenant_caddy_acme_ca",
             message: err.to_string(),
         }
     })?;
+    // The tenant Caddyfile is rendered from this value; a cleartext ACME
+    // directory URL would leak ACME account credentials and challenge
+    // traffic. Mirror of the KBS URL rule.
+    if acme_url.scheme() != "https" {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_acme_ca",
+            message: "scheme must be https".to_string(),
+        });
+    }
+    // Codex P1 (cap#165): the value is interpolated VERBATIM into the
+    // tenant Caddyfile. Url::parse scheme checks (and any prefix-only
+    // check) are NOT the renderer's predicate — `HTTPS://…`, `;`,
+    // `{`/`}`, quotes, tabs/newlines, and non-ASCII all parse as valid
+    // https URLs but fail Caddyfile rendering. Apply the engine's exact
+    // validator so a release is rejected if its ACME-mode render would fail.
+    if let Err(err) =
+        enclava_engine::manifest::ingress::validate_https_url(release.tenant_caddy_acme_ca.trim())
+    {
+        return Err(PlatformReleaseError::InvalidField {
+            field: "tenant_caddy_acme_ca",
+            message: format!("must be renderable into the tenant Caddyfile ({err})"),
+        });
+    }
     if release.genpolicy_version.trim().is_empty()
         || release.genpolicy_version.contains("unconfigured")
         || release.genpolicy_version.contains("unpinned")
@@ -476,5 +559,180 @@ mod tests {
         assert!(
             matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "created_at")
         );
+    }
+
+    #[test]
+    fn release_payload_rejects_http_acme_ca() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.tenant_caddy_acme_ca =
+            "http://acme-staging-v02.api.letsencrypt.org/directory".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_non_http_acme_ca() {
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.tenant_caddy_acme_ca = "ftp://acme.example.test/directory".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca")
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_uppercase_scheme_acme_ca() {
+        // Codex P1 (cap#165): `HTTPS://` parses with scheme https, but the
+        // enclava-engine Caddyfile renderer interpolates the value verbatim
+        // and requires the literal lowercase `https://` prefix — accepting
+        // it would pass release validation and then fail ACME-mode rendering.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        let mut payload = raw.payload;
+        payload.tenant_caddy_acme_ca = "HTTPS://acme.example.test/directory".to_string();
+
+        let err = validate_release_payload(&payload).unwrap_err();
+        assert!(
+            matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca"),
+            "uppercase-scheme ACME CA must be rejected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn release_payload_rejects_url_parseable_but_unrenderable_acme_ca() {
+        // Codex P1 (cap#165, reviewer follow-up): these all pass
+        // Url::parse with scheme https yet fail the Caddyfile renderer's
+        // predicate, so a prefix-only acceptance check is insufficient.
+        let raw: PlatformReleaseEnvelope = serde_json::from_str(BUNDLED_PLATFORM_RELEASE).unwrap();
+        for bad in [
+            "https://acme.example.test/directory;extra",
+            "https://acme.example.test/dir{x}",
+            "https://acme.example.test/dir}x",
+            "https://acme.example.test/dir`x",
+            "https://acme.example.test/dir\"x",
+            "https://acme.example.test/dir'x",
+            "https://acme.example.test/directory\tx",
+            "https://acme.example.test/directory\nx",
+            "https://exämple.test/directory",
+        ] {
+            let mut payload = raw.payload.clone();
+            payload.tenant_caddy_acme_ca = bad.to_string();
+            // Sanity: the url crate DOES accept these as https (that is
+            // the trap the shared renderer predicate closes).
+            assert!(
+                reqwest::Url::parse(bad).is_ok_and(|u| u.scheme() == "https"),
+                "sample {bad:?} must parse as https for this test to pin the trap"
+            );
+            let err = validate_release_payload(&payload).unwrap_err();
+            assert!(
+                matches!(err, PlatformReleaseError::InvalidField { field, .. } if field == "tenant_caddy_acme_ca"),
+                "unrenderable ACME CA {bad:?} must be rejected: {err:?}"
+            );
+        }
+    }
+
+    fn bundled_payload() -> PlatformRelease {
+        serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE)
+            .unwrap()
+            .payload
+    }
+
+    #[test]
+    fn bundled_not_older_than_itself_and_newer_passes() {
+        let bundled = bundled_payload();
+        assert!(enforce_release_not_older_than_bundled(&bundled).is_ok());
+
+        let mut newer = bundled.clone();
+        newer.created_at = "2999-01-01T00:00:00Z".to_string();
+        newer.platform_release_version = "dev-2999.01.01-x".to_string();
+        assert!(enforce_release_not_older_than_bundled(&newer).is_ok());
+    }
+
+    #[test]
+    fn older_than_bundle_is_refused_regardless_of_version_suffix() {
+        let mut stale = bundled_payload();
+        stale.created_at = "2020-01-01T00:00:00Z".to_string();
+        stale.platform_release_version = "zzz-newer-suffix".to_string();
+        assert!(matches!(
+            enforce_release_not_older_than_bundled(&stale),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn equal_timestamp_divergent_version_fails_closed() {
+        let mut divergent = bundled_payload();
+        divergent.platform_release_version =
+            format!("{}-divergent", divergent.platform_release_version);
+        assert!(matches!(
+            enforce_release_not_older_than_bundled(&divergent),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn unparseable_override_timestamp_is_rejected_not_ignored() {
+        let mut broken = bundled_payload();
+        broken.created_at = "not-a-timestamp".to_string();
+        assert!(matches!(
+            enforce_release_not_older_than_bundled(&broken),
+            Err(PlatformReleaseError::InvalidField {
+                field: "created_at",
+                ..
+            })
+        ));
+    }
+
+    fn resigned_envelope_with_created_at(created_at: &str) -> String {
+        use ed25519_dalek::{Signer, SigningKey};
+        let key = SigningKey::from_bytes(&[0xc0; 32]);
+        let mut envelope =
+            serde_json::from_str::<PlatformReleaseEnvelope>(BUNDLED_PLATFORM_RELEASE).unwrap();
+        envelope.payload.created_at = created_at.to_string();
+        envelope.payload.platform_release_version = format!("release-{created_at}");
+        let canonical = canonical_platform_release_bytes(&envelope.payload).unwrap();
+        envelope.signature = hex::encode(key.sign(&canonical).to_bytes());
+        envelope.signing_pubkey = hex::encode(key.verifying_key().as_bytes());
+        serde_json::to_string(&envelope).unwrap()
+    }
+
+    #[test]
+    fn valid_signature_does_not_admit_a_release_older_than_the_bundle() {
+        let raw = resigned_envelope_with_created_at("2020-01-01T00:00:00Z");
+        verify_envelope(serde_json::from_str(&raw).unwrap()).unwrap();
+        assert!(matches!(
+            PlatformReleaseEnvelope::load_verified_from_raw(&raw, true),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
+        ));
+    }
+
+    #[test]
+    fn newer_override_does_not_prevent_restoring_an_older_valid_override_or_bundle() {
+        for timestamp in [
+            "2999-01-01T00:00:00Z",
+            "2999-01-02T00:00:00Z",
+            "2999-01-01T00:00:00Z",
+        ] {
+            let raw = resigned_envelope_with_created_at(timestamp);
+            let loaded = PlatformReleaseEnvelope::load_verified_from_raw(&raw, true).unwrap();
+            assert_eq!(loaded.payload.created_at, timestamp);
+        }
+        PlatformReleaseEnvelope::load_verified_from_raw(BUNDLED_PLATFORM_RELEASE, false).unwrap();
+        PlatformReleaseEnvelope::load_verified_from_raw(BUNDLED_PLATFORM_RELEASE, true).unwrap();
+    }
+
+    #[test]
+    fn equal_timestamp_divergent_payload_fails_closed() {
+        let mut divergent = bundled_payload();
+        divergent.trustee_kbs_url = "https://different.example".into();
+        assert!(matches!(
+            enforce_release_not_older_than_bundled(&divergent),
+            Err(PlatformReleaseError::DowngradeRefused { .. })
+        ));
     }
 }
