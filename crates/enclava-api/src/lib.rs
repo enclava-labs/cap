@@ -1623,6 +1623,7 @@ mod runtime_gate_tests {
         let mut state = crate::test_support::lazy_state();
         state.management_mode = crate::state::CapManagementMode::PaasManaged;
         state.deployment_dispatch_enabled = false;
+        state.mark_startup_ready();
         let app = build_router_inner(state, true);
 
         for uri in [
@@ -1639,6 +1640,10 @@ mod runtime_gate_tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unregistered write to {uri} must be fail-closed by the dispatch gate, not 404"
             );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "deploy_blocked");
+            assert_eq!(body["reason"], "deployment_dispatch_disabled");
         }
     }
 
