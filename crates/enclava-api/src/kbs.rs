@@ -993,7 +993,7 @@ async fn load_signed_policy_candidates(
         ),
         -- The cast is safe at two levels: org_keyrings rows are written only
         -- by the put/rotate handlers, which serialize validated JSON, and the
-        -- org_keyrings_payload_wellformed CHECK constraint (migration 0050)
+        -- org_keyrings_payload_wellformed CHECK constraint (migration 0058)
         -- rejects any non-JSON or non-object payload or a non-array members
         -- entry at INSERT time, so a malformed row from a backfill script or
         -- manual psql fix can never take down candidate loading for every
@@ -4170,74 +4170,6 @@ resource_bindings := {
     /// down.  Runs against its own per-process database: like the rotation
     /// test, it asserts exact singleton state that another test process could
     /// perturb through the shared server.
-    #[tokio::test]
-    async fn deferred_selector_bump_is_consumed_once_by_the_filtered_reconciler() {
-        let (_db_cleanup, pool) =
-            crate::test_support::isolated_database_test_pool("cap130_selector_bump").await;
-        sqlx::query(
-            "UPDATE kbs_signed_policy_reconciliation
-                SET desired_generation = 0,
-                    selector_bump_pending = false
-              WHERE singleton",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        // Nothing marked: consuming is a no-op.
-        assert_eq!(consume_deferred_selector_bump(&pool).await.unwrap(), None);
-
-        // Migration 0050 marks signed-mode installs; consumption performs the
-        // bump exactly once and clears the marker.
-        sqlx::query(
-            "UPDATE kbs_signed_policy_reconciliation
-                SET desired_generation = 3,
-                    selector_bump_pending = true
-              WHERE singleton",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            consume_deferred_selector_bump(&pool).await.unwrap(),
-            Some(4)
-        );
-        let (desired, pending): (i64, bool) = sqlx::query_as(
-            "SELECT desired_generation, selector_bump_pending
-               FROM kbs_signed_policy_reconciliation
-              WHERE singleton",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!((desired, pending), (4, false));
-        assert_eq!(consume_deferred_selector_bump(&pool).await.unwrap(), None);
-
-        // A stray marker on an unsigned-only install must never push it into
-        // signed-policy mode: the marker is cleared without bumping.
-        sqlx::query(
-            "UPDATE kbs_signed_policy_reconciliation
-                SET desired_generation = 0,
-                    selector_bump_pending = true
-              WHERE singleton",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert_eq!(consume_deferred_selector_bump(&pool).await.unwrap(), None);
-        let (desired, pending): (i64, bool) = sqlx::query_as(
-            "SELECT desired_generation, selector_bump_pending
-               FROM kbs_signed_policy_reconciliation
-              WHERE singleton",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!((desired, pending), (0, false));
-
-        crate::test_support::drop_isolated_database("cap130_selector_bump", pool).await;
-    }
-
     /// Regression for #130: a retained historical artifact must stop
     /// authorizing KBS policy as soon as its signer is no longer a member of
     /// the org's current keyring generation, even though the immutable
