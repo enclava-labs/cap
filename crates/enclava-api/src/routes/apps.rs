@@ -2230,7 +2230,10 @@ pub async fn rotate_signer(
     // artifacts from KBS policy (fail-closed; the new identity becomes live
     // when the next deployment commits an artifact signed under it). In
     // legacy mode the updated kbs_tls_bindings carry the new identity into
-    // the re-rendered Rego policy directly.
+    // the re-rendered Rego policy directly. The initial set owes no
+    // revocation, but it still reconciles: an existing legacy binding of a
+    // previously-unsigned app must start admitting the new identity now,
+    // not at the next deployment.
     let action = if is_initial_set {
         "app.signer.set"
     } else {
@@ -2262,8 +2265,13 @@ pub async fn rotate_signer(
     tx.commit().await.map_err(|_| internal_server_error())?;
 
     // The rotation is committed; converge the live KBS policy before
-    // reporting success, under the same fence app deletion uses. In signed
-    // mode reconcile_policy publishes the withdrawal-filtered candidate set
+    // reporting success, under the same fence app deletion uses. This runs
+    // for the initial set as well: reconcile_legacy_rego_policy_with_client
+    // renders from kbs_tls_bindings, and the 0052 trigger carries the newly
+    // committed identity into that row -- without this reconciliation an
+    // existing legacy binding would keep admitting the previous (or empty)
+    // signer set until some later deployment re-rendered the policy. In
+    // signed mode reconcile_policy publishes the withdrawal-filtered candidate set
     // at the owed generation (desired_generation + withdrawal_bumps_owed)
     // and commits the increment only after the ConfigMap replace succeeds
     // (revoking the previous signer's artifacts; the background reconciler
@@ -2274,8 +2282,8 @@ pub async fn rotate_signer(
     // here surfaces as 500 with a stable error code and the fence is
     // released (not held for the quarantine window) to unblock that
     // follow-up writer. Success is only reported when reconcile returned Ok
-    // on both layers.
-    if !is_initial_set && state.kbs_policy.is_some() {
+    // on both layers. Runs for the initial set too (see above).
+    if state.kbs_policy.is_some() {
         let lease = match crate::mutation_leases::claim_resources(
             &state,
             "kbs_signer_rotation_policy",

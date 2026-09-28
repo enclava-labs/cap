@@ -48,6 +48,25 @@ SELECT artifact.descriptor_core_hash, artifact.app_id, now()
    )
 ON CONFLICT DO NOTHING;
 
+-- Rotations that committed before this migration also left the legacy Rego
+-- render source stale: kbs_tls_bindings still holds the rotated-out signer,
+-- and reconcile_legacy_rego_policy_with_client keeps authorizing the old
+-- identity from that row. Align every live binding with the app's committed
+-- identity here; the trigger below keeps future writers in step. Bindings
+-- created by unsigned deployments (NULL signer) of an app that has since
+-- received its initial identity are repaired by the same statement.
+UPDATE kbs_tls_bindings AS binding
+   SET signer_identity_subject = app.signer_identity_subject,
+       signer_identity_issuer  = app.signer_identity_issuer,
+       updated_at              = now()
+  FROM apps AS app
+ WHERE app.id = binding.app_id
+   AND binding.deleted_at IS NULL
+   AND (
+        binding.signer_identity_subject IS DISTINCT FROM app.signer_identity_subject
+        OR binding.signer_identity_issuer  IS DISTINCT FROM app.signer_identity_issuer
+   );
+
 -- Do not bump desired_generation during migration: an old API could publish
 -- its unfiltered body at that generation before the new selector starts.
 -- Keep withdrawal debt distinct from the keyring-membership debt in 0058,
@@ -68,8 +87,11 @@ UPDATE kbs_signed_policy_reconciliation
    AND EXISTS (SELECT 1 FROM withdrawn_signer_artifacts);
 
 -- Database enforcement covers old API writers between migration and binary
--- replacement. Withdraw the previous identity and update the legacy binding
--- in the same transaction; initial identity assignment owes no revocation.
+-- replacement. Carry the committed identity into the legacy binding and
+-- withdraw the previous identity in the same transaction. Revocation is owed
+-- only when an old identity existed: the initial set (NULL -> identity)
+-- changes the binding but withdraws nothing and bumps nothing, since no
+-- artifact can be signed under a missing identity.
 --
 -- This fences identity/keyring revocations, not every generation writer.
 -- Deploy, unlock, rollback and app-delete paths can still bump generations
@@ -90,6 +112,8 @@ BEGIN
     SELECT artifact.descriptor_core_hash, artifact.app_id
       FROM workload_artifacts AS artifact
      WHERE artifact.app_id = NEW.id
+       AND OLD.signer_identity_subject IS NOT NULL
+       AND OLD.signer_identity_issuer  IS NOT NULL
        AND artifact.descriptor_payload -> 'signer_identity' ->> 'subject'
            = OLD.signer_identity_subject
        AND artifact.descriptor_payload -> 'signer_identity' ->> 'issuer'
@@ -100,7 +124,9 @@ BEGIN
        SET withdrawal_bumps_owed = withdrawal_bumps_owed + 1,
            updated_at = clock_timestamp()
      WHERE singleton
-       AND desired_generation > 0;
+       AND desired_generation > 0
+       AND OLD.signer_identity_subject IS NOT NULL
+       AND OLD.signer_identity_issuer  IS NOT NULL;
 
     RETURN NEW;
 END;
@@ -110,11 +136,7 @@ CREATE TRIGGER apps_signer_rotation_withdrawal
     AFTER UPDATE OF signer_identity_subject, signer_identity_issuer ON apps
     FOR EACH ROW
     WHEN (
-        OLD.signer_identity_subject IS NOT NULL
-        AND OLD.signer_identity_issuer IS NOT NULL
-        AND (
-             OLD.signer_identity_subject IS DISTINCT FROM NEW.signer_identity_subject
-             OR OLD.signer_identity_issuer IS DISTINCT FROM NEW.signer_identity_issuer
-        )
+        OLD.signer_identity_subject IS DISTINCT FROM NEW.signer_identity_subject
+        OR OLD.signer_identity_issuer IS DISTINCT FROM NEW.signer_identity_issuer
     )
     EXECUTE FUNCTION enforce_signer_rotation_withdrawal();
