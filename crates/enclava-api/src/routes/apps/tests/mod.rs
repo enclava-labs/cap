@@ -2092,13 +2092,6 @@ fn clone_auth(auth: &AuthContext) -> AuthContext {
     }
 }
 
-/// Codex P1 / #187 regression: a signer rotation whose post-commit KBS
-/// reconciliation fails transiently must report the explicit
-/// committed-pending 503 (`signer_rotation_publication_pending`), not a
-/// bare 500 -- and a retry of the same request (no valid unconsumed token
-/// exists anymore: the jti is consumed) must CONFIRM the committed
-/// rotation, re-drive the KBS publication, and succeed without writing a
-/// second rotation, audit row, or withdrawal bump.
 #[tokio::test]
 async fn signer_rotation_publication_failure_reports_pending_and_retry_confirms() {
     let (_db_cleanup, pool) =
