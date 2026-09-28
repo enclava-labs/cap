@@ -1055,7 +1055,7 @@ async fn derive_rotation_path(
         };
         Ok(Some((previous.0, previous.1, false)))
     } else if body_version == latest.0 + 1 {
-        Ok((latest.1, latest.3, true))
+        Ok(Some((latest.1, latest.3, true)))
     } else if body_version < latest.0 {
         Err((
             StatusCode::CONFLICT,
