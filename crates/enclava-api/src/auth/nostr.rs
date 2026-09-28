@@ -26,7 +26,7 @@ const NIP98_REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(15 * 60);
 /// is bounded by the login-event rate of a ~75-minute window, not 15.
 /// This is a table-size bound only — rows are security-inert once the
 /// event leaves the 60-second freshness window. The `first_seen` purge
-/// index (migration 0051) keeps each hourly DELETE an index scan over that
+/// index (migration 0057) keeps each hourly DELETE an index scan over that
 /// backlog instead of a full-table scan.
 const NIP98_REPLAY_CACHE_REAP_INTERVAL: Duration = Duration::from_secs(3600);
 
@@ -242,7 +242,7 @@ pub async fn verify_and_consume_nip98_event(
 /// Delete replay-cache rows older than the retention window, in bounded
 /// batches (mirroring `purge_expired_device_login_sessions`): each batch
 /// commits separately and serves its `first_seen` filter from the purge
-/// index (migration 0051), so a backlog accumulated during an outage or a
+/// index (migration 0057), so a backlog accumulated during an outage or a
 /// login flood cannot turn into one huge DELETE transaction that holds row
 /// locks until completion. Concurrent reapers on other replicas are safe —
 /// a batch that loses the race simply deletes fewer rows. Spawned as a

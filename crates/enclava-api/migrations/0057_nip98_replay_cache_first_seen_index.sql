@@ -11,7 +11,7 @@
 --      DROP INDEX IF EXISTS nip98_replay_cache_first_seen_purge;
 --   2. Clean up the dirty SQLx ledger entry (the migration runner records
 --      the attempt before executing, so a failure leaves it marked failed):
---      DELETE FROM _sqlx_migrations WHERE version = 51;
+--      DELETE FROM _sqlx_migrations WHERE version = 57;
 --   3. Retry the migration: cap_migrate will re-execute from a clean slate.
 --
 -- The NIP-98 replay-cache reaper purges with `WHERE first_seen < now() -
